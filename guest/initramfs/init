@@ -24,7 +24,46 @@ make_pattern() {
 	dd if=/dev/zero bs=1M count=$PATTERN_MIB 2>/dev/null | tr '\000' '\125' > "$1"
 }
 
+# Mounts every share the host described on the command line.
+#
+# The tag is the only thing that identifies a virtio-fs device to the guest, and
+# nothing enumerates them: the driver binds a device, and a mount by tag is how
+# you reach it. Passing the list on the command line rather than probing keeps
+# the guest from having to guess which of several shares is which.
+mount_shares() {
+	for arg in $cmdline; do
+		case "$arg" in
+		lighter.share=*)
+			spec=${arg#lighter.share=}
+			tag=${spec%%:*}
+			at=${spec#*:}
+			mkdir -p "$at"
+			if mount -t virtiofs "$tag" "$at"; then
+				echo "SHARE tag=$tag at=$at mounted"
+			else
+				echo "SHARE tag=$tag at=$at FAILED"
+			fi
+			;;
+		esac
+	done
+}
+
 case "$cmdline" in
+*lighter.fstest=*)
+	mode=${cmdline#*lighter.fstest=}
+	mode=${mode%% *}
+	echo "FSTEST mode=$mode"
+	mount_shares
+	/sbin/lighter-fstest "$mode" /mnt/share
+	status=$?
+	echo "FSTEST exit=$status"
+	# The durability mode never returns: the host kills the VMM mid-flight,
+	# which is the whole point of it. Every other mode powers off cleanly so
+	# the gate does not have to.
+	sync
+	poweroff -f
+	;;
+
 *lighter.disktest=write*)
 	echo "DISKTEST mode=write"
 	make_pattern /tmp/pattern

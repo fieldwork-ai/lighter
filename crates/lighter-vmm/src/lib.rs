@@ -20,7 +20,8 @@
 //!     ├── smp       PSCI core power state
 //!     ├── sysreg    trapped system-register policy
 //!     ├── devices   models that answer MMIO
-//!     ├── virtio    the transport and the device models on it
+//!     ├── virtio    the transport and the device models on it, file sharing
+//!     │             among them
 //!     └── net       the host end of the network, behind a process boundary
 //! ```
 

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use lighter_vmm::net::PortForward;
+use lighter_vmm::virtio::fs::Share;
 use lighter_vmm::{Machine, MachineConfig, StopReason};
 
 fn parse_forward(spec: &str) -> Option<PortForward> {
@@ -68,6 +69,22 @@ fn main() -> ExitCode {
                 }
             }
             "--run-dir" => config.run_dir = PathBuf::from(args.next().unwrap_or_default()),
+            "--share" => {
+                // TAG:PATH — a host directory the guest mounts by TAG.
+                let spec = args.next().unwrap_or_default();
+                match spec.split_once(':') {
+                    Some((tag, path)) if !tag.is_empty() && !path.is_empty() => {
+                        config.shares.push(Share {
+                            tag: tag.to_string(),
+                            path: PathBuf::from(path),
+                        })
+                    }
+                    _ => {
+                        eprintln!("--share wants TAG:PATH, got {spec:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             // Watch the guest's Docker daemon and mirror whatever it publishes
             // onto the host, for as long as the machine runs.
             "--docker-ports" => docker_socket = args.next().map(PathBuf::from),

@@ -17,8 +17,10 @@ mkdir -p "$OUT"
 # packages it. Building it here rather than requiring the caller to remember is
 # what keeps `make gate-m3-vsock` a single command.
 [ -f "$OUT/lighter-agent" ] || "$ROOT/guest/agent/build.sh"
+[ -f "$OUT/lighter-fstest" ] || "$ROOT/guest/fstest/build.sh"
 cp "$OUT/lighter-agent" "$HERE/lighter-agent"
-trap 'rm -f "$HERE/lighter-agent"' EXIT
+cp "$OUT/lighter-fstest" "$HERE/lighter-fstest"
+trap 'rm -f "$HERE/lighter-agent" "$HERE/lighter-fstest"' EXIT
 
 echo "==> Building initramfs"
 # `--output type=local` exports the final scratch stage's files directly, which

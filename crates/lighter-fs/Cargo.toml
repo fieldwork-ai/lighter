@@ -1,0 +1,16 @@
+[package]
+name = "lighter-fs"
+description = "The host end of file sharing: a passthrough FUSE server speaking the protocol virtio-fs carries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc.workspace = true
+tracing.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

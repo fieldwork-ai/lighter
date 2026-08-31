@@ -46,6 +46,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lighter-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "lighter-hv"
 version = "0.1.0"
 dependencies = [
@@ -59,6 +67,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "lighter-docker",
+ "lighter-fs",
  "lighter-hv",
  "thiserror",
  "tracing",

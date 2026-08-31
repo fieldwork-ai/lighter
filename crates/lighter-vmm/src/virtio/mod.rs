@@ -9,6 +9,7 @@
 pub mod balloon;
 pub mod block;
 pub mod disk;
+pub mod fs;
 pub mod mmio;
 pub mod net;
 pub mod queue;

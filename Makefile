@@ -65,7 +65,7 @@ smoke: ## Prove the hypervisor path works on this machine
 # One target per milestone. `make gates` runs every gate that has landed.
 
 .PHONY: gates
-gates: gate-m1 gate-m2 gate-m3-network gate-m3-vsock gate-m3-docker ## Run all landed milestone gates
+gates: gate-m1 gate-m2 gate-m3-network gate-m3-vsock gate-m3-docker gate-m4-fs ## Run all landed milestone gates
 
 .PHONY: gate-m1
 gate-m1: ## M1: a custom kernel boots to a shell on the serial console
@@ -87,6 +87,10 @@ gate-m3-vsock: ## M3: a host socket reaches a guest process over vsock
 gate-m3-docker: gvproxy ## M3: docker and compose on macOS, against our VMM
 	@scripts/gates/m3-docker.sh
 
+.PHONY: gate-m4-fs
+gate-m4-fs: ## M4: a shared host directory the guest and macOS agree about
+	@scripts/gates/m4-fs.sh
+
 .PHONY: gvproxy
 gvproxy: ## Fetch the gvproxy sidecar that backs guest networking
 	@scripts/fetch-gvproxy.sh
@@ -95,6 +99,7 @@ gvproxy: ## Fetch the gvproxy sidecar that backs guest networking
 guest: ## Build the guest kernel, agent, initramfs, and root filesystem
 	@guest/kernel/build.sh
 	@guest/agent/build.sh
+	@guest/fstest/build.sh
 	@guest/initramfs/build.sh
 	@guest/rootfs/build.sh
 

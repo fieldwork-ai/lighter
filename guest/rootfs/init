@@ -83,6 +83,29 @@ else
 	echo "INIT data=absent"
 fi
 
+# --- Shared directories ---------------------------------------------------
+# Mounted before dockerd, because a container's bind mount resolves against
+# this namespace and a share that appears later is a path the engine already
+# decided did not exist.
+#
+# The tag is the only handle the guest has on a virtio-fs device — nothing
+# enumerates them — so the host names each one on the command line.
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	lighter.share=*)
+		spec=${arg#lighter.share=}
+		tag=${spec%%:*}
+		at=${spec#*:}
+		mkdir -p "$at"
+		if mount -t virtiofs "$tag" "$at"; then
+			echo "INIT share=$tag at=$at"
+		else
+			echo "INIT share=$tag at=$at failed"
+		fi
+		;;
+	esac
+done
+
 # --- Networking -----------------------------------------------------------
 if [ -e /sys/class/net/eth0 ]; then
 	ip link set eth0 up

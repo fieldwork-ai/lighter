@@ -14,6 +14,7 @@ authors = ["Nick Rogers"]
 lighter-hv = { path = "crates/lighter-hv", version = "0.1.0" }
 lighter-vmm = { path = "crates/lighter-vmm", version = "0.1.0" }
 lighter-docker = { path = "crates/lighter-docker", version = "0.1.0" }
+lighter-fs = { path = "crates/lighter-fs", version = "0.1.0" }
 
 anyhow = "1"
 thiserror = "2"

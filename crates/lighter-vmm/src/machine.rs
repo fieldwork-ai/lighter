@@ -27,6 +27,7 @@ use crate::virtio::VirtioDevice;
 use crate::virtio::balloon::{Balloon, BalloonState};
 use crate::virtio::block::Block;
 use crate::virtio::disk::Disk;
+use crate::virtio::fs::{Fs, Share};
 use crate::virtio::mmio::VirtioMmio;
 use crate::virtio::net::Net;
 use crate::virtio::rng::Rng;
@@ -87,6 +88,8 @@ pub struct MachineConfig {
     pub gvproxy: Option<PathBuf>,
     /// Where the network's sockets live.
     pub run_dir: PathBuf,
+    /// Host directories carried into the guest, each on its own device.
+    pub shares: Vec<Share>,
 }
 
 impl Default for MachineConfig {
@@ -104,6 +107,7 @@ impl Default for MachineConfig {
             disk_size_bytes: 64 << 30,
             gvproxy: None,
             run_dir: std::env::temp_dir().join("lighter"),
+            shares: Vec::new(),
         }
     }
 }
@@ -243,6 +247,16 @@ impl Machine {
         let vsock_slot = virtio.len();
         virtio.push(Box::new(Vsock::new(vsock_state.clone())));
 
+        // Shares come after the sockets and before the housekeeping devices.
+        // Their slot indices are remembered for the same reason the network's
+        // is: each needs a waker, and the transports do not exist yet.
+        let mut share_wakers = Vec::with_capacity(config.shares.len());
+        for share in &config.shares {
+            let fs = Fs::new(share)?;
+            share_wakers.push((virtio.len(), fs.waker()));
+            virtio.push(Box::new(fs));
+        }
+
         virtio.push(Box::new(Rng::from_host()?));
         virtio.push(Box::new(Balloon::new(balloon_state.clone())));
 
@@ -270,6 +284,19 @@ impl Machine {
                     .expect("vsock transport poisoned")
                     .service_queue(virtio::vsock::RX_QUEUE);
             });
+        }
+
+        // Each share's worker pool finishes requests on host threads, and a
+        // guest whose every core is idle in WFI will not notice until the
+        // transport raises the interrupt for it.
+        for (slot, waker) in share_wakers {
+            let transport = virtio_devices[slot].clone();
+            *waker.lock().expect("fs waker poisoned") = Some(Arc::new(move || {
+                transport
+                    .lock()
+                    .expect("fs transport poisoned")
+                    .service_queue(virtio::fs::REQUEST_QUEUE);
+            }));
         }
 
         // The pump that moves frames off the network and into the guest. It runs
