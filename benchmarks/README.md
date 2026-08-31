@@ -39,7 +39,19 @@ The read cases are faster than macOS itself. That is not a trick: the guest's pa
 
 The write cases are not, and the plan's 85%-of-native target for `npm install` is not met. Two reasons, and neither is a tuning problem:
 
-- **Round trips.** A package install makes about 65,000 filesystem requests. Each one is a trap out of the guest, some work, and an interrupt back — about fifteen microseconds on Apple's hypervisor, most of which is not ours to spend. That is a second of the install before anything useful happens. Caching removes lookups; it cannot remove the create, the write and the release of a file that has to exist. Closing this needs the requests themselves to go away — a shared memory window (DAX), which virtio-fs supports and which is the obvious next thing.
+- **Round trips.** A package install makes about 65,000 filesystem requests. Each one is a trap out of the guest, some work, and an interrupt back — about fifteen microseconds on Apple's hypervisor, most of which is not ours to spend. That is a second of the install before anything useful happens. Caching removes lookups; it cannot remove the create, the write and the release of a file that has to exist, and roughly 50,000 of those 65,000 requests are metadata that no data-path change can touch.
 - **`npm ci` on APFS does not copy.** It clones from its own cache, which is nearly free. A container's cache lives on its own storage, on the other side of a device boundary, so the same install has to copy the bytes. The two commands are not doing the same amount of work, and no filesystem makes them.
 
-Things that were tried and measured to be worth nothing, so that nobody tries them again: `FUSE_WRITEBACK_CACHE` (no effect on either write case, and it would move the moment a container's output appears on the Mac from "as it is written" to "when the file is closed"), a larger worker pool, serving requests inline on the vCPU thread, and raising cache timeouts beyond thirty seconds.
+### DAX is not the answer, and this is why
+
+The obvious next move looks like virtio-fs's shared memory window: map file contents into guest physical memory and the data round trips disappear. It would make this case worse, and the guest kernel says so plainly.
+
+`fs/fuse/dax.c` fixes the granularity at `FUSE_DAX_SHIFT 21` — every mapping is 2 MiB regardless of the file's size, `inarg.len = FUSE_DAX_SZ`, one `SETUPMAPPING` request each, drawn from a fixed pool of ranges. When the pool falls below a fifth, the kernel reclaims ten at a time and each reclaim is a `REMOVEMAPPING`.
+
+Against 7,167 created files of a few kilobytes apiece: today that is about 13,672 `WRITE` requests. With DAX it becomes about 7,167 `SETUPMAPPING`s, each consuming a whole 2 MiB range — a one-gigabyte window holds 512 of them, so after the first 512 files every further one also drives reclaim, adding several thousand `REMOVEMAPPING`s and an `mmap`/`munmap` pair on our side for each. More round trips, not fewer, to replace the cheapest requests we make.
+
+And `fuse_dax_write_iter` goes through `dax_iomap_rw`, which bypasses the page cache — the very thing that makes the read cases faster than macOS. DAX is the right tool for large files and mmap-heavy reads of big data, which is the shape this already wins at by a factor of five. It is the wrong tool for creating seven thousand small files.
+
+### Tried and measured to be worth nothing
+
+So that nobody spends an afternoon rediscovering it: `FUSE_WRITEBACK_CACHE` (no effect on either write case, and it would move the moment a container's output appears on the Mac from "as it is written" to "when the file is closed"), a larger worker pool, serving requests inline on the vCPU thread, and raising cache timeouts beyond thirty seconds.
