@@ -101,6 +101,9 @@ pub mod init {
     pub const WRITEBACK_CACHE: u32 = 1 << 16;
     pub const PARALLEL_DIROPS: u32 = 1 << 18;
     pub const HANDLE_KILLPRIV: u32 = 1 << 19;
+    /// The modern form of the same promise, and the one current kernels
+    /// actually offer.
+    pub const HANDLE_KILLPRIV_V2: u32 = 1 << 28;
     pub const ABORT_ERROR: u32 = 1 << 21;
     pub const MAX_PAGES: u32 = 1 << 22;
     pub const CACHE_SYMLINKS: u32 = 1 << 23;

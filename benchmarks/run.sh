@@ -222,6 +222,9 @@ start_watch_helper() {
 		fi
 	  done ) &
 	HELPER_PID=$!
+	# Disowned so that killing it at the end of the case is silent: bash would
+	# otherwise report the job's death in the middle of a passing run.
+	disown "$HELPER_PID" 2>/dev/null || true
 }
 
 prepare_work

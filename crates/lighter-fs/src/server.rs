@@ -378,19 +378,35 @@ impl Server {
             | fuse::init::PARALLEL_DIROPS
             | fuse::init::AUTO_INVAL_DATA
             | fuse::init::MAX_PAGES
-            // Without this the kernel does the "drop setuid and file
+            // Without these the kernel does the "drop setuid and file
             // capabilities on write" dance itself, which costs it a GETXATTR
-            // and sometimes a SETATTR per written file — thirteen thousand
-            // round trips in a package install that produces nothing. With it,
-            // the server takes on that duty, which on macOS the kernel already
-            // performs for us: writing to a file clears its setuid and setgid
-            // bits, and file capabilities do not exist here at all.
+            // and sometimes a SETATTR per written file — one request in six of
+            // a package install, producing nothing. With them, the server takes
+            // on that duty, which on macOS the kernel already performs for us:
+            // writing to a file clears its setuid and setgid bits, and Linux
+            // file capabilities do not exist here at all. Both the old flag and
+            // its replacement are offered, because which one a guest
+            // understands depends on its vintage and only the newer one is
+            // offered by current kernels.
             | fuse::init::HANDLE_KILLPRIV
+            | fuse::init::HANDLE_KILLPRIV_V2
             | fuse::init::ABORT_ERROR;
         // Symlink targets are cached for the same duration as attributes, so
         // this is only offered when there is a watcher to withdraw it.
         let wanted = if self.policy.timings().caching() {
             wanted | fuse::init::CACHE_SYMLINKS
+        } else {
+            wanted
+        };
+        // Off, and switchable only so the decision can be re-checked. It would
+        // batch the guest's small writes into larger ones, and it would move
+        // the moment a container's work becomes visible on the Mac from "as it
+        // is written" to "when the file is closed" — a promise, not a tuning
+        // knob. Measured on a package install and a tree copy it was worth
+        // nothing at all, so there is no trade to weigh: the write path is
+        // bound by the number of round trips, not by their size.
+        let wanted = if std::env::var("LIGHTER_FS_WRITEBACK").as_deref() == Ok("1") {
+            wanted | fuse::init::WRITEBACK_CACHE
         } else {
             wanted
         };
