@@ -325,7 +325,7 @@ impl VirtioDevice for Block {
             Some(queue) => self.process_queue(queue, mem),
             None => false,
         };
-        Serviced { used_any }
+        Serviced::queue_if(0, used_any)
     }
 
     fn reset(&mut self) {

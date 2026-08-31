@@ -13,6 +13,7 @@ pub mod mmio;
 pub mod net;
 pub mod queue;
 pub mod rng;
+pub mod vsock;
 
 use std::sync::Arc;
 
@@ -54,10 +55,53 @@ pub mod status {
 }
 
 /// What a device wants done after servicing a notification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A bitmask rather than a flag, because servicing one queue can put work on
+/// another: a vsock packet arriving on TX produces a reply on RX. The transport
+/// decides whether to interrupt by asking each queue that actually gained used
+/// entries, and a device that reported only "something happened" would have it
+/// ask the wrong one — which suppresses the interrupt and stalls the reply
+/// until some unrelated notification happens along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Serviced {
-    /// Whether any descriptors were returned to the driver.
-    pub used_any: bool,
+    /// Bit *n* set means queue *n* had descriptors returned to the driver.
+    pub queues: u32,
+}
+
+impl Serviced {
+    /// Nothing was serviced.
+    pub const NONE: Serviced = Serviced { queues: 0 };
+
+    /// Just queue `index`.
+    pub const fn queue(index: u16) -> Serviced {
+        Serviced { queues: 1 << index }
+    }
+
+    /// Queue `index`, if `used` — otherwise nothing.
+    pub const fn queue_if(index: u16, used: bool) -> Serviced {
+        if used {
+            Serviced::queue(index)
+        } else {
+            Serviced::NONE
+        }
+    }
+
+    /// Whether anything at all was serviced.
+    pub const fn any(&self) -> bool {
+        self.queues != 0
+    }
+
+    /// Whether queue `index` was.
+    pub const fn contains(&self, index: u16) -> bool {
+        self.queues & (1 << index) != 0
+    }
+
+    #[must_use]
+    pub const fn with(self, other: Serviced) -> Serviced {
+        Serviced {
+            queues: self.queues | other.queues,
+        }
+    }
 }
 
 /// A virtio device model.
@@ -110,4 +154,35 @@ pub trait VirtioDevice: Send {
 
     /// Returns the device to its power-on state.
     fn reset(&mut self) {}
+}
+
+#[cfg(test)]
+mod serviced_tests {
+    use super::Serviced;
+
+    #[test]
+    fn nothing_serviced_is_nothing_to_interrupt_about() {
+        assert!(!Serviced::NONE.any());
+        assert!(!Serviced::queue_if(0, false).any());
+    }
+
+    /// The case the mask exists for: a vsock TX notification that also produced
+    /// an RX reply must name both, or the transport asks the wrong queue
+    /// whether to interrupt and the reply is never signalled.
+    #[test]
+    fn combining_two_queues_names_both() {
+        let both = Serviced::queue(1).with(Serviced::queue(0));
+        assert!(both.contains(0));
+        assert!(both.contains(1));
+        assert!(!both.contains(2));
+        assert!(both.any());
+    }
+
+    #[test]
+    fn a_single_queue_names_only_itself() {
+        let one = Serviced::queue(2);
+        assert!(one.contains(2));
+        assert!(!one.contains(0));
+        assert!(!one.contains(1));
+    }
 }

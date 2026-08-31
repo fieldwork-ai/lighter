@@ -251,7 +251,7 @@ impl VirtioDevice for Balloon {
                 false
             }
         };
-        Serviced { used_any }
+        Serviced::queue_if(queue, used_any)
     }
 
     fn reset(&mut self) {

@@ -56,7 +56,7 @@ impl VirtioDevice for Rng {
 
     fn notify(&mut self, _queue: u16, queues: &mut [Virtqueue], mem: &GuestMemory) -> Serviced {
         let Some(queue) = queues.first_mut() else {
-            return Serviced { used_any: false };
+            return Serviced::NONE;
         };
 
         let mut used_any = false;
@@ -92,7 +92,7 @@ impl VirtioDevice for Rng {
             used_any = true;
         }
 
-        Serviced { used_any }
+        Serviced::queue_if(0, used_any)
     }
 }
 

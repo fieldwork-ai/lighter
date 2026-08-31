@@ -158,14 +158,16 @@ impl VirtioMmio {
         }
 
         let serviced = self.device.notify(index, &mut self.queues, &self.memory);
-        if !serviced.used_any {
+        if !serviced.any() {
             return;
         }
 
-        let wants_interrupt = self
-            .queues
-            .get(index as usize)
-            .is_none_or(|q| q.needs_interrupt(&self.memory));
+        // Ask every queue that gained used entries, not just the notified one.
+        // Servicing TX can produce work on RX, and consulting TX's suppression
+        // state about an RX completion is how a reply ends up sitting in the
+        // ring with the guest asleep.
+        let wants_interrupt = (0..self.queues.len())
+            .any(|i| serviced.contains(i as u16) && self.queues[i].needs_interrupt(&self.memory));
         if wants_interrupt {
             self.interrupt_status |= INT_VRING;
             // The device tree declares these lines edge-triggered, matching
@@ -393,7 +395,7 @@ mod tests {
         }
         fn notify(&mut self, queue: u16, _q: &mut [Virtqueue], _m: &GuestMemory) -> Serviced {
             self.notified.push(queue);
-            Serviced { used_any: false }
+            Serviced::NONE
         }
         fn reset(&mut self) {
             self.reset_count += 1;
@@ -540,7 +542,7 @@ mod tests {
                 }
             }
             fn notify(&mut self, _q: u16, _qs: &mut [Virtqueue], _m: &GuestMemory) -> Serviced {
-                Serviced { used_any: false }
+                Serviced::NONE
             }
         }
 

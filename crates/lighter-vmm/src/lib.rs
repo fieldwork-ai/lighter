@@ -39,6 +39,7 @@ pub mod smp;
 pub mod sysreg;
 pub mod vcpu;
 pub mod virtio;
+pub mod vsock_proxy;
 
 pub use machine::{Machine, MachineConfig, MachineError};
 pub use vcpu::StopReason;

@@ -1,0 +1,21 @@
+[package]
+name = "lighter-agent"
+description = "The lighter guest agent: bridges vsock ports to unix sockets inside the VM"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+# Deliberately NOT a member of the root workspace. This is a linux-aarch64-musl
+# binary built inside a container; making it a member would put AF_VSOCK code in
+# every `cargo build` on macOS, where it does not compile and has no reason to.
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

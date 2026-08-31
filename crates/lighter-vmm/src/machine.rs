@@ -30,6 +30,8 @@ use crate::virtio::disk::Disk;
 use crate::virtio::mmio::VirtioMmio;
 use crate::virtio::net::Net;
 use crate::virtio::rng::Rng;
+use crate::virtio::vsock::{Vsock, VsockShared};
+use crate::vsock_proxy::VsockProxy;
 use crate::{net, virtio};
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +130,9 @@ pub struct Machine {
     /// The gvproxy sidecar, if there is one. Held because dropping it kills the
     /// process, and because port forwards are added through it at runtime.
     network: Option<Network>,
+    vsock: Arc<VsockShared>,
+    /// Socket proxies, held because dropping one unlinks its socket.
+    proxies: Vec<VsockProxy>,
 }
 
 impl Machine {
@@ -230,6 +235,14 @@ impl Machine {
                 net_inbox.clone(),
             )));
         }
+
+        // vsock is unconditional. It costs one slot and nothing else when idle,
+        // and everything host-to-guest above the network — the Docker socket,
+        // the control channel — rides on it.
+        let vsock_state = Arc::new(VsockShared::new());
+        let vsock_slot = virtio.len();
+        virtio.push(Box::new(Vsock::new(vsock_state.clone())));
+
         virtio.push(Box::new(Rng::from_host()?));
         virtio.push(Box::new(Balloon::new(balloon_state.clone())));
 
@@ -245,6 +258,18 @@ impl Machine {
             let transport = Arc::new(Mutex::new(VirtioMmio::new(device, memory.clone(), irq)));
             bus.register(window, transport.clone())?;
             virtio_devices.push(transport);
+        }
+
+        // vsock queues packets from host threads and must be able to deliver
+        // them itself; see the note on the waker in the vsock module.
+        {
+            let transport = virtio_devices[vsock_slot].clone();
+            vsock_state.set_waker(move || {
+                transport
+                    .lock()
+                    .expect("vsock transport poisoned")
+                    .service_queue(virtio::vsock::RX_QUEUE);
+            });
         }
 
         // The pump that moves frames off the network and into the guest. It runs
@@ -355,12 +380,25 @@ impl Machine {
             disks,
             balloon: balloon_state,
             network,
+            vsock: vsock_state,
+            proxies: Vec::new(),
         })
     }
 
     /// The guest's network, if one was configured.
     pub fn network(&self) -> Option<&Network> {
         self.network.as_ref()
+    }
+
+    /// Proxies a host unix socket to a port inside the guest.
+    ///
+    /// Kept on the machine rather than returned, because the proxy unlinks its
+    /// socket when dropped and a caller that let it fall out of scope would get
+    /// a path that briefly worked.
+    pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
+        let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone())?;
+        self.proxies.push(proxy);
+        Ok(())
     }
 
     /// Waits for the guest to stop, returning why.

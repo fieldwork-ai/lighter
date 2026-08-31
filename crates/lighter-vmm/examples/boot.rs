@@ -29,6 +29,7 @@ fn main() -> ExitCode {
 
     let mut config = MachineConfig::default();
     let mut forwards: Vec<PortForward> = Vec::new();
+    let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,6 +52,20 @@ fn main() -> ExitCode {
             }
             "--no-tty" => config.interactive = false,
             "--net" => config.gvproxy = Some(PathBuf::from(args.next().unwrap_or_default())),
+            "--vsock" => {
+                // PATH:GUEST_PORT — a host socket carried to a guest port.
+                let spec = args.next().unwrap_or_default();
+                match spec
+                    .rsplit_once(':')
+                    .and_then(|(p, port)| port.parse().ok().map(|port| (PathBuf::from(p), port)))
+                {
+                    Some(pair) => sockets.push(pair),
+                    None => {
+                        eprintln!("--vsock wants PATH:GUEST_PORT, got {spec:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--run-dir" => config.run_dir = PathBuf::from(args.next().unwrap_or_default()),
             "--forward" => {
                 // host:guest, added once the machine is up.
@@ -70,13 +85,20 @@ fn main() -> ExitCode {
         }
     }
 
-    let machine = match Machine::start(&config) {
+    let mut machine = match Machine::start(&config) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("lighter: {e}");
             return ExitCode::FAILURE;
         }
     };
+
+    for (path, guest_port) in &sockets {
+        if let Err(e) = machine.proxy_socket(path, *guest_port) {
+            eprintln!("lighter: cannot serve {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    }
 
     for forward in &forwards {
         // A forward the guest is not listening on yet is fine: gvproxy accepts

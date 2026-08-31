@@ -16,6 +16,14 @@
 #               a forward added at runtime over gvproxy's control socket
 set -euo pipefail
 
+# cargo lives in ~/.cargo/bin, which a non-login shell does not have on PATH —
+# a launchd job, a CI step, an editor terminal. Without this the gate fails at
+# "cargo: command not found" and looks like a broken toolchain.
+if ! command -v cargo >/dev/null 2>&1; then
+	# shellcheck disable=SC1091
+	. "$HOME/.cargo/env"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 

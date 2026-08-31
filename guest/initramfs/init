@@ -63,6 +63,31 @@ case "$cmdline" in
 	poweroff -f
 	;;
 
+*lighter.vsocktest*)
+	echo "VSOCKTEST mode=start"
+
+	# The driver binds to the virtio-vsock slot and creates this; without it
+	# nothing below can even be attempted.
+	if [ -e /dev/vsock ]; then
+		echo "VSOCKTEST device=ok"
+	else
+		echo "VSOCKTEST device=missing"
+		poweroff -f
+	fi
+
+	# The agent prints its own listening line once the port is bound, which is
+	# what the host waits for before connecting. Backgrounded because it serves
+	# until the machine stops.
+	/sbin/lighter-agent --port 2375 --echo &
+
+	# The host runs its checks against the agent; the guest's part is just to
+	# stay up long enough. Bounded rather than forever, so a host that never
+	# connects fails the gate instead of hanging it.
+	sleep 90
+	echo "VSOCKTEST done"
+	poweroff -f
+	;;
+
 *lighter.nettest*)
 	echo "NETTEST mode=start"
 

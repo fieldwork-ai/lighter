@@ -13,6 +13,13 @@ HERE="$ROOT/guest/initramfs"
 
 mkdir -p "$OUT"
 
+# The agent is a separate build with its own toolchain; the initramfs just
+# packages it. Building it here rather than requiring the caller to remember is
+# what keeps `make gate-m3-vsock` a single command.
+[ -f "$OUT/lighter-agent" ] || "$ROOT/guest/agent/build.sh"
+cp "$OUT/lighter-agent" "$HERE/lighter-agent"
+trap 'rm -f "$HERE/lighter-agent"' EXIT
+
 echo "==> Building initramfs"
 # `--output type=local` exports the final scratch stage's files directly, which
 # avoids needing a shell in an image that deliberately has nothing in it.

@@ -272,7 +272,7 @@ impl VirtioDevice for Net {
                 false
             }
         };
-        Serviced { used_any }
+        Serviced::queue_if(queue, used_any)
     }
 }
 

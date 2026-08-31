@@ -5,6 +5,9 @@
 # dies with an unhelpful "No such file or directory".
 FROM busybox:musl AS busybox
 
+# The guest agent, built separately (guest/agent) and dropped here by build.sh.
+# It arrives as a build context file rather than a stage, because its own
+# Dockerfile already produced and checked it.
 FROM debian:bookworm-slim AS build
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends cpio gzip file \
@@ -14,6 +17,7 @@ WORKDIR /rootfs
 COPY --from=busybox /bin/busybox /rootfs/bin/busybox
 COPY init /rootfs/init
 COPY udhcpc.script /rootfs/usr/share/udhcpc/default.script
+COPY lighter-agent /rootfs/sbin/lighter-agent
 
 # The initramfs has no dynamic loader, so PID 1 must need none. The test is the
 # absence of an ELF interpreter, not the word "static": busybox:musl is
@@ -24,7 +28,12 @@ RUN file /rootfs/bin/busybox | grep -q "interpreter" \
 	&& (echo "busybox needs a dynamic loader; the initramfs would not boot" >&2 && exit 1) \
 	|| file /rootfs/bin/busybox
 
-RUN chmod +x /rootfs/init /rootfs/bin/busybox /rootfs/usr/share/udhcpc/default.script \
+RUN file /rootfs/sbin/lighter-agent | grep -q "interpreter" \
+	&& (echo "the agent needs a dynamic loader; it would not run here" >&2 && exit 1) \
+	|| file /rootfs/sbin/lighter-agent
+
+RUN chmod +x /rootfs/init /rootfs/bin/busybox /rootfs/sbin/lighter-agent \
+	/rootfs/usr/share/udhcpc/default.script \
 	&& mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev /rootfs/tmp /rootfs/root /rootfs/etc \
 	&& mknod -m 622 /rootfs/dev/console c 5 1 \
 	&& mknod -m 666 /rootfs/dev/null c 1 3 \
