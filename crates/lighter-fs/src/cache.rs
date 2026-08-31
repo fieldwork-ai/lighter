@@ -34,8 +34,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// The four timeouts, and where they came from.
@@ -65,17 +65,41 @@ pub struct Timings {
 
 impl Default for Timings {
     fn default() -> Timings {
-        Timings {
-            attr: Duration::from_millis(100),
-            entry_file: Duration::from_millis(100),
-            entry_dir: Duration::from_millis(1000),
-            negative: Duration::from_millis(100),
-            cooldown: Duration::from_millis(2000),
-        }
+        Timings::POLLED
     }
 }
 
 impl Timings {
+    /// What may be promised when the guest cannot be corrected.
+    ///
+    /// Short, because the number is the staleness: whatever we say here is how
+    /// long a file edited on the Mac can look unchanged inside the container.
+    /// It is also, at these values, most of the cost of a shared filesystem —
+    /// which is why the other profile exists.
+    pub const POLLED: Timings = Timings {
+        attr: Duration::from_millis(100),
+        entry_file: Duration::from_millis(100),
+        entry_dir: Duration::from_millis(1000),
+        negative: Duration::from_millis(100),
+        cooldown: Duration::from_millis(2000),
+    };
+
+    /// What may be promised when the guest *can* be corrected.
+    ///
+    /// Thirty seconds is not the staleness — with the notification channel live
+    /// that is however long FSEvents takes to notice, which is milliseconds. It
+    /// is the backstop: notifications are queued in a bounded buffer, and a
+    /// message dropped because the guest was slow has to expire on its own
+    /// eventually. Long enough to be worth having, short enough that nothing
+    /// stays wrong for a working day.
+    pub const PUSHED: Timings = Timings {
+        attr: Duration::from_secs(30),
+        entry_file: Duration::from_secs(30),
+        entry_dir: Duration::from_secs(30),
+        negative: Duration::from_secs(30),
+        cooldown: Duration::from_millis(2000),
+    };
+
     /// Exact coherence: nothing is cached, and every path component of every
     /// syscall is a round trip. What the server falls back to when it cannot
     /// watch the host, because a timeout it has no way to withdraw is worse
@@ -92,7 +116,7 @@ impl Timings {
     ///
     /// Present so the numbers can be swept against the benchmark suite without
     /// a rebuild; the defaults are what ships, and what the suite reports.
-    pub fn from_env() -> Timings {
+    pub fn from_env_over(base: Timings) -> Timings {
         fn ms(name: &str, fallback: Duration) -> Duration {
             std::env::var(name)
                 .ok()
@@ -100,7 +124,6 @@ impl Timings {
                 .map(Duration::from_millis)
                 .unwrap_or(fallback)
         }
-        let base = Timings::default();
         Timings {
             attr: ms("LIGHTER_FS_ATTR_MS", base.attr),
             entry_file: ms("LIGHTER_FS_ENTRY_MS", base.entry_file),
@@ -126,7 +149,18 @@ pub enum Answer {
 
 /// Directories the host has touched recently, and the timeouts to apply.
 pub struct Policy {
-    timings: Timings,
+    /// What may be promised when the guest cannot be corrected, and what may be
+    /// promised when it can.
+    ///
+    /// **How long the guest may cache depends on whether we can take it back.**
+    /// That is the whole invariant: nothing has to be configured, and there is
+    /// no combination of guest kernel and host that is fast and wrong.
+    polled: Timings,
+    pushed: Timings,
+    /// Whether the guest negotiated the notification queue *and* the watcher is
+    /// running. Both are required: a channel with nothing to send on it is no
+    /// better than no channel.
+    pushing: AtomicBool,
     /// Keyed by host identity rather than by path, because the hot path already
     /// has `(dev, ino)` in hand and would otherwise need an `F_GETPATH` per
     /// lookup to ask this question.
@@ -145,17 +179,42 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn new(timings: Timings) -> Policy {
+    pub fn new(polled: Timings, pushed: Timings) -> Policy {
         Policy {
-            timings,
+            polled,
+            pushed,
+            pushing: AtomicBool::new(false),
             hot: RwLock::new(HashMap::new()),
             hot_count: AtomicUsize::new(0),
             writing: Mutex::new(()),
         }
     }
 
+    /// A policy with one profile, for a share that will never be able to
+    /// correct the guest.
+    pub fn fixed(timings: Timings) -> Policy {
+        Policy::new(timings, timings)
+    }
+
+    /// Records whether invalidations can now reach the guest.
+    pub fn set_pushing(&self, pushing: bool) {
+        let was = self.pushing.swap(pushing, Ordering::Release);
+        if was != pushing {
+            tracing::info!(
+                invalidation = if pushing { "push" } else { "timeout only" },
+                attr_ms = self.timings().attr.as_millis(),
+                entry_ms = self.timings().entry_file.as_millis(),
+                "cache lifetime set by whether the guest can be told to forget"
+            );
+        }
+    }
+
     pub fn timings(&self) -> &Timings {
-        &self.timings
+        if self.pushing.load(Ordering::Acquire) {
+            &self.pushed
+        } else {
+            &self.polled
+        }
     }
 
     /// Records that the host changed something under `(dev, ino)`.
@@ -168,7 +227,7 @@ impl Policy {
         // size: an entry past its cooldown is answering "not hot" anyway, so
         // keeping it only makes every reader's map larger. The sweep is cheap
         // because it only ever runs while the host is actively writing.
-        let cooldown = self.timings.cooldown;
+        let cooldown = self.timings().cooldown;
         if hot.len() > 256 {
             hot.retain(|_, at| now.duration_since(*at) < cooldown);
         }
@@ -181,10 +240,11 @@ impl Policy {
         if self.is_hot(dev, ino) {
             return Duration::ZERO;
         }
+        let timings = self.timings();
         match answer {
-            Answer::File => self.timings.entry_file,
-            Answer::Directory => self.timings.entry_dir,
-            Answer::Missing => self.timings.negative,
+            Answer::File => timings.entry_file,
+            Answer::Directory => timings.entry_dir,
+            Answer::Missing => timings.negative,
         }
     }
 
@@ -193,7 +253,7 @@ impl Policy {
         if self.is_hot(dev, ino) {
             return Duration::ZERO;
         }
-        self.timings.attr
+        self.timings().attr
     }
 
     fn is_hot(&self, dev: i64, ino: u64) -> bool {
@@ -203,7 +263,7 @@ impl Policy {
         }
         let hot = self.hot.read().expect("hot set poisoned");
         match hot.get(&(dev, ino)) {
-            Some(at) => at.elapsed() < self.timings.cooldown,
+            Some(at) => at.elapsed() < self.timings().cooldown,
             None => false,
         }
     }
@@ -214,36 +274,67 @@ impl Policy {
     }
 }
 
-/// Turns FSEvents paths into entries in a [`Policy`]'s hot set.
+/// What the host changed, turned into something the guest can act on.
 ///
-/// Both the changed object and its parent are marked: a write changes the
-/// file's attributes, and a create or delete changes the directory's entries,
-/// and the guest caches those two things separately.
+/// Two jobs, and they are for two different guests. The hot set stops us
+/// *handing out* long timeouts for a directory somebody is editing, which is
+/// all a guest without the notification channel can benefit from. The
+/// notifications withdraw timeouts already handed out, which is what makes the
+/// long ones safe in the first place.
 pub struct Invalidator {
-    policy: std::sync::Arc<Policy>,
+    policy: Arc<Policy>,
+    registry: Arc<crate::inode::Registry>,
+    sink: Arc<crate::notify::Sink>,
 }
 
 impl Invalidator {
-    pub fn new(policy: std::sync::Arc<Policy>) -> Invalidator {
-        Invalidator { policy }
+    pub fn new(
+        policy: Arc<Policy>,
+        registry: Arc<crate::inode::Registry>,
+        sink: Arc<crate::notify::Sink>,
+    ) -> Invalidator {
+        Invalidator {
+            policy,
+            registry,
+            sink,
+        }
     }
 
-    fn mark(&self, path: &Path) {
-        if let Ok(st) = std::fs::symlink_metadata(path) {
-            use std::os::unix::fs::MetadataExt;
-            self.policy.touched(st.dev() as i64, st.ino());
-        }
+    /// The host identity of a path, if it still has one.
+    fn identity(path: &Path) -> Option<(i64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let st = std::fs::symlink_metadata(path).ok()?;
+        Some((st.dev() as i64, st.ino()))
     }
 }
 
 impl crate::fsevents::Observer for Invalidator {
     fn changed(&self, path: &Path) {
-        // The object itself may already be gone — a delete is exactly the case
-        // the guest most needs to stop caching — so its parent is marked
-        // whether or not the object still exists.
-        self.mark(path);
-        if let Some(parent) = path.parent() {
-            self.mark(parent);
+        // The object itself may already be gone — a delete is exactly what the
+        // guest most needs to stop caching — so the parent is handled whether
+        // or not the object still exists.
+        if let Some((dev, ino)) = Invalidator::identity(path) {
+            self.policy.touched(dev, ino);
+            if let Some(nodeid) = self.registry.nodeid_for(dev, ino) {
+                self.sink.push(crate::notify::Notification::Inode { nodeid });
+            }
+        }
+
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let Some((dev, ino)) = Invalidator::identity(parent) else {
+            return;
+        };
+        self.policy.touched(dev, ino);
+        // A directory the guest has never looked at has nothing cached about
+        // it, so there is nothing to withdraw.
+        if let Some(nodeid) = self.registry.nodeid_for(dev, ino) {
+            use std::os::unix::ffi::OsStrExt;
+            self.sink.push(crate::notify::Notification::Entry {
+                parent: nodeid,
+                name: name.as_bytes().to_vec(),
+            });
         }
     }
 }
@@ -253,7 +344,7 @@ mod tests {
     use super::*;
 
     fn policy(cooldown_ms: u64) -> Policy {
-        Policy::new(Timings {
+        Policy::fixed(Timings {
             attr: Duration::from_millis(100),
             entry_file: Duration::from_millis(100),
             entry_dir: Duration::from_millis(1000),
@@ -324,6 +415,22 @@ mod tests {
         p.touched(1, 2);
         assert_eq!(p.hot_count(), 1);
         assert!(p.validity(1, 2, Answer::File).is_zero());
+    }
+
+    /// The invariant the whole design rests on: what the guest may believe
+    /// depends on whether we are able to correct it.
+    #[test]
+    fn the_lifetime_depends_on_being_able_to_take_it_back() {
+        let p = Policy::new(Timings::POLLED, Timings::PUSHED);
+        assert_eq!(p.timings().attr, Timings::POLLED.attr);
+        p.set_pushing(true);
+        assert_eq!(p.timings().attr, Timings::PUSHED.attr);
+        assert!(
+            Timings::PUSHED.attr > Timings::POLLED.attr * 10,
+            "the channel has to be worth having"
+        );
+        p.set_pushing(false);
+        assert_eq!(p.timings().attr, Timings::POLLED.attr);
     }
 
     #[test]

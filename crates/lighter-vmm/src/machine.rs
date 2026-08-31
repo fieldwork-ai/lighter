@@ -253,7 +253,7 @@ impl Machine {
         let mut share_wakers = Vec::with_capacity(config.shares.len());
         for share in &config.shares {
             let fs = Fs::new(share)?;
-            share_wakers.push((virtio.len(), fs.waker()));
+            share_wakers.push((virtio.len(), fs.waker(), fs.notifications()));
             virtio.push(Box::new(fs));
         }
 
@@ -289,13 +289,25 @@ impl Machine {
         // Each share's worker pool finishes requests on host threads, and a
         // guest whose every core is idle in WFI will not notice until the
         // transport raises the interrupt for it.
-        for (slot, waker) in share_wakers {
+        for (slot, waker, notifications) in share_wakers {
             let transport = virtio_devices[slot].clone();
-            *waker.lock().expect("fs waker poisoned") = Some(Arc::new(move || {
+            *waker.lock().expect("fs waker poisoned") = Some(Arc::new({
+                let transport = transport.clone();
+                move || {
+                    transport
+                        .lock()
+                        .expect("fs transport poisoned")
+                        .service_queue(virtio::fs::REQUEST_QUEUE);
+                }
+            }));
+            // Invalidations originate on the FSEvents thread, so the guest has
+            // to be poked for those too — and on a different queue, since it is
+            // the one the device writes rather than reads.
+            notifications.set_waker(Arc::new(move || {
                 transport
                     .lock()
                     .expect("fs transport poisoned")
-                    .service_queue(virtio::fs::REQUEST_QUEUE);
+                    .service_queue(virtio::fs::NOTIFY_QUEUE);
             }));
         }
 

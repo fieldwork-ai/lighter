@@ -17,6 +17,7 @@
 //!     ├── fuse       the wire format, and nothing else
 //!     ├── inode      what a nodeid and an fh mean
 //!     ├── opencache  descriptors held once the guest stops reporting opens
+//!     ├── notify     telling the guest to forget something
 //!     ├── cache      how long the guest may believe an answer
 //!     ├── fsevents   what the host is changing behind the guest's back
 //!     ├── sys        the only unsafe code, one libc call per function
@@ -28,6 +29,7 @@ pub mod errno;
 pub mod fsevents;
 pub mod fuse;
 pub mod inode;
+pub mod notify;
 pub mod opencache;
 pub mod server;
 pub mod stats;

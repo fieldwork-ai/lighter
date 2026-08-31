@@ -42,6 +42,19 @@ use crate::virtio::{Serviced, VirtioDevice, device_type};
 /// notification queue because we do not offer `VIRTIO_FS_F_NOTIFICATION`.
 pub const HIPRIO_QUEUE: u16 = 0;
 pub const REQUEST_QUEUE: u16 = 1;
+/// The queue *we* write to, carrying invalidations into the guest.
+///
+/// Last rather than second, so that a guest which does not know about it — an
+/// unpatched kernel — agrees with us about every other index and simply never
+/// makes this one ready.
+pub const NOTIFY_QUEUE: u16 = 2;
+
+/// Feature bit: the device can push FUSE notifications.
+///
+/// Not in any specification. It is ours, matched by a patch to the guest's
+/// virtio-fs driver (`guest/kernel/patches/`), and it is what lets the server
+/// hand out cache lifetimes measured in seconds instead of milliseconds.
+const VIRTIO_FS_F_NOTIFICATION: u64 = 1 << 0;
 
 /// Longest mount tag the config space can hold.
 pub const TAG_LEN: usize = 36;
@@ -291,6 +304,8 @@ pub struct Fs {
     pool: Option<Pool>,
     /// Held so the vCPU-served queue can build a reply sink of its own.
     memory: Option<Arc<GuestMemory>>,
+    /// Whether the guest negotiated the notification queue.
+    notifications: bool,
     /// Whether an uncontended request may be served on the vCPU thread.
     ///
     /// On by default and switchable for measurement, because "does removing the
@@ -317,6 +332,7 @@ impl Fs {
             server: Arc::new(server),
             pool: None,
             memory: None,
+            notifications: false,
             inline: std::env::var("LIGHTER_FS_INLINE").as_deref() != Ok("0"),
             waker: Arc::new(Mutex::new(None)),
         })
@@ -330,6 +346,11 @@ impl Fs {
     /// no copy to keep in step.
     pub fn waker(&self) -> Waker {
         self.waker.clone()
+    }
+
+    /// The queue of invalidations waiting to reach the guest.
+    pub fn notifications(&self) -> Arc<lighter_fs::notify::Sink> {
+        self.server.notifications().clone()
     }
 
     /// Splits a chain into the request the guest wrote and the buffers it left
@@ -355,6 +376,53 @@ impl Fs {
             }
         }
         (request, reply)
+    }
+
+    /// Moves queued invalidations into the buffers the guest posted.
+    ///
+    /// The direction is the unusual part: on every other queue the guest
+    /// supplies a request and we fill in the reply, but here it supplies empty
+    /// buffers and we decide when there is something to put in them. A message
+    /// that does not fit the buffer it was given is dropped rather than
+    /// truncated — half a notification names the wrong file.
+    fn deliver(&mut self, queues: &mut [Virtqueue], mem: &GuestMemory) -> bool {
+        if !self.notifications {
+            return false;
+        }
+        let Some(memory) = self.memory.clone() else {
+            return false;
+        };
+        let Some(queue) = queues.get_mut(NOTIFY_QUEUE as usize) else {
+            return false;
+        };
+        let sink = self.server.notifications();
+        let mut delivered = false;
+        while !sink.is_empty() {
+            let Some(chain) = queue.pop(mem) else { break };
+            let head = chain.head();
+            let (_, buffers) = Fs::split(mem, chain);
+            let Some(message) = sink.take() else {
+                // Nothing left after all; give the buffer back untouched so the
+                // guest can re-post it.
+                queue.push_used(mem, head, 0);
+                delivered = true;
+                break;
+            };
+            let mut sink_out = ChainSink::new(memory.clone(), buffers);
+            let len = message.len();
+            if sink_out.capacity() < len || sink_out.write(&message).is_err() {
+                tracing::warn!(
+                    len,
+                    capacity = sink_out.capacity(),
+                    "a notification did not fit the buffer the guest posted"
+                );
+                queue.push_used(mem, head, 0);
+            } else {
+                queue.push_used(mem, head, len as u32);
+            }
+            delivered = true;
+        }
+        delivered
     }
 
     /// Returns finished requests to the driver.
@@ -388,11 +456,19 @@ impl VirtioDevice for Fs {
     }
 
     fn features(&self) -> u64 {
-        COMMON_FEATURES
+        COMMON_FEATURES | VIRTIO_FS_F_NOTIFICATION
+    }
+
+    fn ack_features(&mut self, features: u64) {
+        // Recorded, not acted on. The driver writes its feature set one 32-bit
+        // half at a time and in whichever order it likes, so this is called
+        // with a partial answer at least once; the set is only final at
+        // DRIVER_OK, which is where the decision is made.
+        self.notifications = features & VIRTIO_FS_F_NOTIFICATION != 0;
     }
 
     fn queue_count(&self) -> usize {
-        2
+        3
     }
 
     fn config_read(&self, offset: u64, data: &mut [u8]) {
@@ -414,6 +490,15 @@ impl VirtioDevice for Fs {
             return;
         }
         self.memory = Some(mem.clone());
+        // What the guest accepted decides how long the server will let it cache
+        // anything, because a lifetime we cannot withdraw has to be short.
+        self.server.set_push_invalidation(self.notifications);
+        if !self.notifications {
+            tracing::info!(
+                tag = %self.tag,
+                "guest declined the notification queue; caching conservatively"
+            );
+        }
         // A histogram on an interval, when asked for. Tuning a filesystem
         // without one is a sequence of rebuild-boot-measure cycles spent
         // disproving theories that a single run would have settled.
@@ -519,6 +604,7 @@ impl VirtioDevice for Fs {
                 let reaped = self.reap(&mut queues[REQUEST_QUEUE as usize], mem);
                 Serviced::queue_if(REQUEST_QUEUE, used || reaped)
             }
+            NOTIFY_QUEUE => Serviced::queue_if(NOTIFY_QUEUE, self.deliver(queues, mem)),
             _ => Serviced::NONE,
         }
     }

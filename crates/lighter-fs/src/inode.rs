@@ -229,6 +229,18 @@ impl Registry {
         Some(id)
     }
 
+    /// The nodeid for a host identity, without counting it as a lookup.
+    ///
+    /// For the watcher, which needs to know whether the guest has ever heard of
+    /// something before it bothers telling it to forget.
+    pub fn nodeid_for(&self, dev: i64, ino: u64) -> Option<u64> {
+        self.by_identity
+            .read()
+            .expect("identity table poisoned")
+            .get(&(dev, ino))
+            .copied()
+    }
+
     /// Stops a nodeid answering to a pair of numbers, without destroying it.
     ///
     /// The inode itself stays: the guest may still be holding that nodeid for a

@@ -85,7 +85,7 @@ impl Sink for Vec<u8> {
 pub struct Server {
     root: PathBuf,
     root_dev: i64,
-    registry: Registry,
+    registry: Arc<Registry>,
     /// The identity every syscall actually runs as.
     host_uid: u32,
     host_gid: u32,
@@ -93,6 +93,8 @@ pub struct Server {
     max_write: AtomicU32,
     /// How long the guest may believe what we tell it.
     policy: Arc<Policy>,
+    /// Invalidations waiting to be carried to the guest.
+    notifications: Arc<crate::notify::Sink>,
     /// Descriptors held on the guest's behalf, since it no longer reports its
     /// opens. See [`crate::opencache`].
     open_cache: OpenCache,
@@ -108,13 +110,23 @@ pub struct Server {
 }
 
 impl Server {
-    /// Opens `root` and prepares to serve it, with the default timings.
+    /// Opens `root` and prepares to serve it.
     pub fn new(root: &Path) -> std::io::Result<Server> {
-        Server::with_timings(root, Timings::from_env())
+        Server::with_timings(
+            root,
+            Timings::from_env_over(Timings::POLLED),
+            Timings::from_env_over(Timings::PUSHED),
+        )
     }
 
-    /// Opens `root` with an explicit caching policy.
-    pub fn with_timings(root: &Path, timings: Timings) -> std::io::Result<Server> {
+    /// Opens `root` with explicit caching policies for both cases: what may be
+    /// promised when the guest cannot be corrected, and what may be promised
+    /// when it can.
+    pub fn with_timings(
+        root: &Path,
+        polled: Timings,
+        pushed: Timings,
+    ) -> std::io::Result<Server> {
         // A share holds a descriptor per remembered inode and per open file,
         // and macOS starts every process at 256 of them.
         let descriptors = sys::raise_file_limit();
@@ -127,14 +139,20 @@ impl Server {
         // Caching is only defensible because the watcher can withdraw it. If
         // the stream will not start, the timeouts go to zero rather than
         // becoming promises that nothing is able to take back.
-        let policy = Arc::new(Policy::new(timings));
-        let watcher = if timings.caching() {
+        let registry = Arc::new(Registry::new(fd, dev, ino));
+        let sink = Arc::new(crate::notify::Sink::new());
+        let policy = Arc::new(Policy::new(polled, pushed));
+        let watcher = if polled.caching() || pushed.caching() {
             match Watcher::start(
                 root,
                 // Short enough that the guest's staleness is dominated by the
-                // timeout rather than by FSEvents' coalescing window.
+                // channel rather than by FSEvents' own coalescing window.
                 std::time::Duration::from_millis(10),
-                Box::new(Invalidator::new(policy.clone())),
+                Box::new(Invalidator::new(
+                    policy.clone(),
+                    registry.clone(),
+                    sink.clone(),
+                )),
             ) {
                 Ok(started) => Some(started),
                 Err(why) => {
@@ -145,8 +163,9 @@ impl Server {
         } else {
             None
         };
-        let policy = if timings.caching() && watcher.is_none() {
-            Arc::new(Policy::new(Timings::NONE))
+        // Caching is only defensible because the watcher can withdraw it.
+        let policy = if watcher.is_none() {
+            Arc::new(Policy::fixed(Timings::NONE))
         } else {
             policy
         };
@@ -163,11 +182,12 @@ impl Server {
         Ok(Server {
             root: root.to_path_buf(),
             root_dev: dev,
-            registry: Registry::new(fd, dev, ino),
+            registry,
             host_uid,
             host_gid,
             max_write: AtomicU32::new(MAX_WRITE),
             policy,
+            notifications: sink,
             open_cache: OpenCache::new(),
             stats: Stats::new(),
             _watcher: watcher,
@@ -176,6 +196,17 @@ impl Server {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Invalidations waiting for the transport to carry them.
+    pub fn notifications(&self) -> &Arc<crate::notify::Sink> {
+        &self.notifications
+    }
+
+    /// Records whether the guest negotiated the notification queue, which is
+    /// what decides how long anything may be cached.
+    pub fn set_push_invalidation(&self, available: bool) {
+        self.policy.set_pushing(available);
     }
 
     /// Handles one request, writing the reply into `sink`.

@@ -16,10 +16,11 @@ of the repetitions.
 
 | case | lighter | native |
 |---|---|---|
-| npm-install | — | 2108 |
-| ripgrep | — | 166 |
-| find-walk | 805 | 99 |
-| watch-latency | — | 29 |
+| npm-install | 2265 | 880 |
+| ripgrep | 21 | 117 |
+| find-walk | 13 | 62 |
+| copy-tree | 3481 | 1902 |
+| watch-latency | 2 | 2 |
 
 ## As a fraction of `native`
 
@@ -28,10 +29,11 @@ Mac's own disk. Higher is better.
 
 | case | lighter |
 |---|---|
-| npm-install | — |
-| ripgrep | — |
-| find-walk | 12% |
-| watch-latency | — |
+| npm-install | 39% |
+| ripgrep | 557% |
+| find-walk | 477% |
+| copy-tree | 55% |
+| watch-latency | 100% |
 
 ## What each case does
 

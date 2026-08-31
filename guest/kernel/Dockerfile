@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	kmod \
 	libelf-dev \
 	libssl-dev \
+	patch \
 	rsync \
 	xz-utils \
 	&& rm -rf /var/lib/apt/lists/*
@@ -25,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY build-kernel.sh /usr/local/bin/build-kernel
 COPY lighter.config /config/lighter.config
+COPY patches /patches
 RUN chmod +x /usr/local/bin/build-kernel
 
 ENTRYPOINT ["/usr/local/bin/build-kernel"]

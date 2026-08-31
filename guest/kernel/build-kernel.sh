@@ -28,6 +28,20 @@ fi
 
 cd "$SRC"
 
+# Patches are applied to a pristine tree every time, and the tree lives in a
+# named volume across builds — so each one is reverted first. `--forward`
+# alone is not enough: a partially applied patch would be neither reverted nor
+# reapplied, and the build would silently produce the wrong kernel.
+if [ -d /patches ] && ls /patches/*.patch >/dev/null 2>&1; then
+	for patch in /patches/*.patch; do
+		log "Applying $(basename "$patch")"
+		if patch -p1 -R --dry-run --silent < "$patch" >/dev/null 2>&1; then
+			patch -p1 -R --silent < "$patch"
+		fi
+		patch -p1 --silent < "$patch"
+	done
+fi
+
 log "Configuring (defconfig + lighter fragment)"
 make ARCH=arm64 defconfig
 ./scripts/kconfig/merge_config.sh -m -O . .config /config/lighter.config
