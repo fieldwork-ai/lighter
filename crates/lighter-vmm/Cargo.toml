@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 lighter-hv.workspace = true
+lighter-docker.workspace = true
 
 libc.workspace = true
 thiserror.workspace = true

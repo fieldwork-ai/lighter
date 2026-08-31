@@ -191,11 +191,15 @@ pub fn build(params: &FdtParams<'_>) -> Result<Vec<u8>, FdtError> {
     }
 
     // --- virtio-mmio slots ------------------------------------------------
-    // Declared highest address first. Linux probes virtio-mmio nodes in tree
-    // order and names the block devices as it goes, so ascending declaration
-    // would make /dev/vda depend on how many slots happen to be populated.
-    // Descending keeps slot 0 first, which is what the rest of the VMM assumes.
-    for index in (0..params.virtio_slots.min(VIRTIO_MMIO_SLOTS)).rev() {
+    // Declared lowest slot first, and the order is load-bearing: Linux probes
+    // virtio-mmio nodes in tree order and names block devices as it goes, so
+    // the first node declared is the one that becomes /dev/vda.
+    //
+    // This was descending once, on the reasoning that Linux reverses. It does
+    // not. The guest came up with the second disk as /dev/vda and refused to
+    // mount a root filesystem that was sitting on /dev/vdb, which is a
+    // spectacular way to discover that you had the rule backwards.
+    for index in 0..params.virtio_slots.min(VIRTIO_MMIO_SLOTS) {
         let window = layout.virtio_slot(index).expect("slot index checked above");
         let node = fdt.begin_node(&format!("virtio_mmio@{:x}", window.base))?;
         fdt.property_string("compatible", "virtio,mmio")?;
@@ -255,6 +259,39 @@ mod tests {
             dtb.len() > 512,
             "tree suspiciously small: {} bytes",
             dtb.len()
+        );
+    }
+
+    /// Slot 0 must be declared before slot 1, because Linux probes in tree
+    /// order and the first virtio-blk it probes becomes /dev/vda. Getting this
+    /// backwards makes the root filesystem land on /dev/vdb, and the guest
+    /// panics with "unable to mount root fs" while both disks are plainly
+    /// present in the partition list.
+    #[test]
+    fn virtio_slots_are_declared_lowest_first() {
+        let layout = layout();
+        let dtb = build(&FdtParams {
+            layout: &layout,
+            vcpus: 1,
+            cmdline: "console=ttyAMA0",
+            initramfs: None,
+            virtio_slots: 3,
+        })
+        .unwrap();
+
+        // Node names go in the strings/structure block as plain bytes, so their
+        // relative position in the blob is their order in the tree.
+        let position = |index: usize| {
+            let name = format!("virtio_mmio@{:x}", layout.virtio_slot(index).unwrap().base);
+            dtb.windows(name.len())
+                .position(|w| w == name.as_bytes())
+                .unwrap_or_else(|| panic!("{name} missing from the tree"))
+        };
+
+        assert!(
+            position(0) < position(1) && position(1) < position(2),
+            "slots must appear in ascending order: {:?}",
+            (position(0), position(1), position(2))
         );
     }
 

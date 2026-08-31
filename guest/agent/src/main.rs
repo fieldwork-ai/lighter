@@ -76,28 +76,48 @@ fn main() -> std::process::ExitCode {
 
 /// Copies between the vsock connection and a unix socket until either ends.
 fn bridge(guest_side: OwnedFd, path: &str) {
-    let Ok(upstream) = UnixStream::connect(path) else {
-        eprintln!("lighter-agent: cannot reach {path}");
+    let upstream = match UnixStream::connect(path) {
+        Ok(stream) => stream,
+        Err(e) => {
+            // The errno is the whole diagnosis here: "no such file" means the
+            // daemon has not created its socket yet, "connection refused"
+            // means it died after creating one, and "permission denied" means
+            // something quite different again. Reporting only the path sends
+            // you looking in the wrong place.
+            eprintln!("lighter-agent: cannot reach {path}: {e}");
+            return;
+        }
+    };
+    let Ok(mut upstream_read) = upstream.try_clone() else {
         return;
     };
-    let Ok(upstream_write) = upstream.try_clone() else {
-        return;
-    };
+    let mut upstream_write = upstream;
 
     // Two threads rather than poll(): the whole point of this process is to be
     // simple enough to trust, and a stream copy in each direction is the
     // simplest thing that cannot deadlock on a half-full pipe.
+    //
+    // The two directions are named rather than inferred. They were once both
+    // written as "guest to upstream" — which connects, forwards the request,
+    // and then hangs forever waiting for a reply nobody is carrying back.
     let mut guest_read = Fd(guest_side);
-    let guest_write = match guest_read.try_clone() {
+    let mut guest_write = match guest_read.try_clone() {
         Ok(fd) => fd,
         Err(_) => return,
     };
 
-    let outbound = std::thread::spawn(move || {
-        copy(&mut guest_read, &mut { upstream });
+    // guest -> dockerd
+    let request = std::thread::spawn(move || {
+        copy(&mut guest_read, &mut upstream_write);
+        // Let dockerd see the end of the request rather than waiting on a
+        // connection that will send no more.
+        let _ = upstream_write.shutdown(std::net::Shutdown::Write);
     });
-    copy(&mut { guest_write }, &mut { upstream_write });
-    let _ = outbound.join();
+
+    // dockerd -> guest
+    copy(&mut upstream_read, &mut guest_write);
+
+    let _ = request.join();
 }
 
 /// Sends back whatever arrives, so the gate can prove the round trip.

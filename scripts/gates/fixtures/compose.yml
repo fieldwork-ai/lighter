@@ -1,0 +1,52 @@
+# A Fieldwork-shaped stack, used by the milestone 3 gate.
+#
+# Deliberately the three services the real app's infra/docker-compose.yml leads
+# with — a database, an object store, a mail catcher. Between them they cover
+# what a developer stack actually asks of a runtime: a persistent named volume,
+# published ports reached from macOS, health checks that have to go green, and
+# three images pulled concurrently.
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_PASSWORD: lighter
+      POSTGRES_DB: lighter
+    ports:
+      - "15434:5432"
+    volumes:
+      # Mounted at /var/lib/postgresql, not .../data. The postgres:18 image
+      # places its cluster in a major-version subdirectory and refuses to start
+      # against a volume mounted at the old path.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lighter"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19000:9000"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports:
+      - "18025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:

@@ -1,0 +1,170 @@
+#!/bin/sh
+# PID 1 in the lighter guest.
+#
+# Not openrc, not systemd. There are four things to do in a fixed order, none of
+# them conditional on hardware we might or might not have, and a service manager
+# here would add a second of boot and a layer of indirection over a sequence
+# that fits on one screen.
+#
+# The order matters:
+#   1. pseudo-filesystems, because everything below reads them
+#   2. the data disk, because dockerd's storage driver needs it mounted first
+#   3. dockerd, which takes a moment to come up
+#   4. the agent, which must not advertise a socket dockerd is not answering yet
+set -eu
+
+# The kernel hands init an environment of exactly HOME and TERM — there is no
+# PATH. busybox's shell falls back to a default for its own lookups, but never
+# exports one, so every child process inherits an environment with no PATH at
+# all. dockerd then starts, fails to find containerd, and reports "executable
+# file not found in $PATH" about a binary sitting in /usr/bin.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+
+/bin/busybox --install -s 2>/dev/null || true
+
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t tmpfs    tmpfs    /run
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs  tmpfs  /dev/shm
+
+# cgroup v2 only. Docker supports both, and offering v1 as well means the engine
+# picks one based on what it finds rather than on what we intended.
+mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
+
+hostname "$(cat /etc/hostname 2>/dev/null || echo lighter)"
+ip link set lo up
+
+# The machine has no RTC, so the guest starts at the epoch. That is not a
+# cosmetic problem: every TLS handshake to a registry fails on a certificate
+# that is not valid yet, and the error names the certificate rather than the
+# clock. The host passes its own time on the command line.
+#
+# This is a starting point, not timekeeping — it does not survive the host
+# sleeping. Resync over vsock is milestone 8's job.
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	lighter.time=*)
+		date -s "@${arg#lighter.time=}" >/dev/null 2>&1 \
+			&& echo "INIT clock=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+			|| echo "INIT clock=failed"
+		;;
+	esac
+done
+
+echo "INIT filesystems=ok"
+
+# --- The data disk --------------------------------------------------------
+# /dev/vdb is Docker's storage. It is separate from the root disk so that the
+# root image can be replaced on upgrade without touching anyone's images, and so
+# that the thing that grows is the thing that gets punched back to nothing.
+DATA_DEV=/dev/vdb
+if [ -b "$DATA_DEV" ]; then
+	# A blank disk has no filesystem; making one on first boot is what turns a
+	# freshly created sparse file into usable storage with no setup step.
+	if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
+		echo "INIT formatting=$DATA_DEV"
+		mke2fs -q -t ext4 -L lighter-data "$DATA_DEV"
+	fi
+	# Discard is what makes deleting an image give space back to macOS: it
+	# reaches virtio-blk as a discard request and becomes a hole punch in the
+	# host file. Without it the disk only ever grows.
+	if mount -o discard,noatime "$DATA_DEV" /mnt/data; then
+		echo "INIT data=mounted"
+		mkdir -p /mnt/data/docker
+		mount --bind /mnt/data/docker /var/lib/docker
+	else
+		echo "INIT data=mount-failed"
+	fi
+else
+	echo "INIT data=absent"
+fi
+
+# --- Networking -----------------------------------------------------------
+if [ -e /sys/class/net/eth0 ]; then
+	ip link set eth0 up
+	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok" || echo "INIT dhcp=failed"
+fi
+
+# --- The engine -----------------------------------------------------------
+# dockerd starts and supervises its own containerd. Naming one with
+# --containerd instead points it at a socket nothing is listening on, and it
+# waits for a daemon that is never coming.
+# --iptables is left on: Docker's own bridge networking needs it, and the
+# kernel carries the netfilter modules for exactly this.
+#
+# --userland-proxy=false because Alpine's docker-engine ships no docker-proxy
+# binary, and dockerd refuses to start rather than degrade ("userland-proxy is
+# enabled, but userland-proxy-path is not set"). Turning it off is the right
+# answer regardless: publishing a port then rests on netfilter DNAT alone, and
+# the host side of the journey is gvproxy's job, not a hairpin process here.
+mkdir -p /var/log
+dockerd \
+	--host=unix:///run/docker.sock \
+	--data-root=/var/lib/docker \
+	--storage-driver=overlay2 \
+	--userland-proxy=false \
+	>/var/log/dockerd.log 2>&1 &
+DOCKERD_PID=$!
+
+# Waiting for the socket rather than sleeping: dockerd's start time depends on
+# what it finds on the data disk, so a fixed sleep is either too short on a full
+# disk or wasted on an empty one.
+#
+# The liveness check is not belt-and-braces. dockerd creates its socket early
+# and can die during later setup, leaving a socket file that accepts nothing —
+# so waiting on the file alone reports "ready" for a daemon that is already
+# gone, and the failure resurfaces much later as a bare ECONNREFUSED.
+waited=0
+dockerd_state=timeout
+while [ "$waited" -lt 60 ]; do
+	if ! kill -0 "$DOCKERD_PID" 2>/dev/null; then
+		dockerd_state=died
+		break
+	fi
+	if [ -S /run/docker.sock ]; then
+		dockerd_state=ready
+		break
+	fi
+	sleep 1
+	waited=$((waited + 1))
+done
+
+echo "INIT dockerd=$dockerd_state after=${waited}s"
+if [ "$dockerd_state" != ready ]; then
+	echo "--- dockerd log ---"
+	tail -30 /var/log/dockerd.log
+	echo "--- end ---"
+fi
+
+# --- The agent ------------------------------------------------------------
+# Started last, on purpose: it is what the host connects to, and advertising it
+# before dockerd answers turns a slow start into a connection refused.
+/sbin/lighter-agent --port 2375 --to /run/docker.sock &
+
+echo "INIT ready"
+
+# dockerd can die long after it started — containerd failing, a storage driver
+# rejecting the data disk — and from outside that is indistinguishable from a
+# broken transport: the socket file is still there, and connections are simply
+# refused. Saying so, with the log, turns half an hour of bisecting into one
+# line on the console.
+(
+	while kill -0 "$DOCKERD_PID" 2>/dev/null; do
+		sleep 5
+	done
+	echo "INIT dockerd=exited"
+	echo "--- dockerd log ---"
+	tail -40 /var/log/dockerd.log
+	echo "--- end ---"
+) &
+
+# PID 1 must not exit. Reaping matters here: dockerd forks, and an unreaped
+# child on PID 1 is a zombie that never goes away.
+while true; do
+	wait || true
+	sleep 1
+done

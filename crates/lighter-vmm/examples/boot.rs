@@ -30,6 +30,7 @@ fn main() -> ExitCode {
     let mut config = MachineConfig::default();
     let mut forwards: Vec<PortForward> = Vec::new();
     let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
+    let mut docker_socket: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -67,6 +68,9 @@ fn main() -> ExitCode {
                 }
             }
             "--run-dir" => config.run_dir = PathBuf::from(args.next().unwrap_or_default()),
+            // Watch the guest's Docker daemon and mirror whatever it publishes
+            // onto the host, for as long as the machine runs.
+            "--docker-ports" => docker_socket = args.next().map(PathBuf::from),
             "--forward" => {
                 // host:guest, added once the machine is up.
                 let spec = args.next().unwrap_or_default();
@@ -108,6 +112,23 @@ fn main() -> ExitCode {
         {
             eprintln!("lighter: {e}");
             return ExitCode::FAILURE;
+        }
+    }
+
+    if let Some(socket) = &docker_socket {
+        match machine.network() {
+            Some(network) => {
+                if let Err(e) = lighter_docker::PortWatcher::start(socket, network.clone()) {
+                    eprintln!("lighter: cannot watch docker ports: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            // Without a network there is nowhere to put a forward, and silently
+            // doing nothing would look like the watcher working.
+            None => {
+                eprintln!("lighter: --docker-ports needs --net");
+                return ExitCode::from(2);
+            }
         }
     }
 

@@ -84,6 +84,9 @@ struct Conn {
     /// advertised credit allows, and credit advances only as the writer thread
     /// drains this. The protocol is the bound.
     outbound: VecDeque<u8>,
+    /// The guest has half-closed: it will send nothing further, but it is still
+    /// willing to receive. The host is owed an EOF once `outbound` drains.
+    guest_done: bool,
     /// The host end, kept for shutdown. The writer thread holds its own clone.
     socket: UnixStream,
 }
@@ -176,6 +179,7 @@ impl VsockShared {
                 state: State::Connecting,
                 credit: Credit::new(),
                 outbound: VecDeque::new(),
+                guest_done: false,
                 socket,
             },
         );
@@ -270,6 +274,27 @@ impl VsockShared {
         true
     }
 
+    /// Tells the guest we will send no more, while staying open to receive.
+    ///
+    /// This is what a peer that has finished its request but still wants the
+    /// reply does — `docker run` attaching with no stdin is the case that
+    /// matters. Sending a full close here instead loses the reply.
+    pub fn shutdown_write(&self, host_port: u32) {
+        let mut inner = self.lock();
+        let Some(conn) = inner.conns.get(&host_port) else {
+            return;
+        };
+        let guest_port = conn.guest_port;
+        let mut packet = Packet::control(Op::Shutdown, host_port, guest_port);
+        packet.flags = shutdown::SEND;
+        packet.buf_alloc = credit::BUF_ALLOC;
+        inner.outbox.push_back(packet);
+        drop(inner);
+
+        self.progress.notify_all();
+        self.wake();
+    }
+
     /// Closes our end, telling the guest we will write no more.
     pub fn shutdown(&self, host_port: u32) {
         let mut inner = self.lock();
@@ -300,7 +325,9 @@ impl VsockShared {
             if !conn.outbound.is_empty() {
                 return Some(conn.outbound.drain(..).collect());
             }
-            if conn.state == State::Closed {
+            // Nothing buffered and nothing more coming: the writer is done, and
+            // returning None is what tells it to give the host its EOF.
+            if conn.state == State::Closed || conn.guest_done {
                 return None;
             }
             let (guard, _) = self
@@ -380,13 +407,27 @@ impl Vsock {
             }
 
             Op::Shutdown => {
-                if let Some(conn) = inner.conns.get_mut(&host_port) {
-                    conn.state = State::Closed;
-                    // Half-closes are legal, but nothing we proxy uses one, and
-                    // shutting the socket down is what makes the reader thread
-                    // return rather than block forever on a dead connection.
-                    let _ = conn.socket.shutdown(std::net::Shutdown::Both);
+                let Some(conn) = inner.conns.get_mut(&host_port) else {
+                    return;
+                };
+
+                // A half-close is not a close, and treating it as one is how
+                // `docker run` loses all of its output: the CLI shuts its write
+                // side once it has sent the attach request and has no stdin to
+                // forward, and tearing the connection down there kills the
+                // direction the container's output was going to arrive on.
+                //
+                // SEND alone means the guest will write no more. The host is
+                // owed an EOF, which the writer thread delivers once it has
+                // drained what is already buffered — but the other direction
+                // stays open.
+                if packet.flags & shutdown::RCV == 0 && packet.flags & shutdown::SEND != 0 {
+                    conn.guest_done = true;
+                    return;
                 }
+
+                conn.state = State::Closed;
+                let _ = conn.socket.shutdown(std::net::Shutdown::Both);
                 let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
                 rst.buf_alloc = credit::BUF_ALLOC;
                 inner.outbox.push_back(rst);
@@ -650,13 +691,22 @@ pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
                     shared.acknowledge(host_port, data.len() as u32);
                 }
                 let _ = socket.flush();
+                // The guest will send no more, so the host peer is owed an
+                // end-of-stream. Without it a client reading to EOF — which is
+                // most of them — waits forever on a connection with nothing
+                // left to say.
+                let _ = socket.shutdown(std::net::Shutdown::Write);
             })
     };
 
     let mut buf = vec![0u8; 64 * 1024];
+    let mut host_closed = false;
     loop {
         let read = match socket.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                host_closed = true;
+                break;
+            }
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -665,6 +715,19 @@ pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
         if !shared.send(host_port, &buf[..read]) {
             break;
         }
+    }
+
+    // A host peer that closed its write side has half-closed, not closed:
+    // `docker run` sends its attach request, shuts down writing because it has
+    // no stdin to forward, and then waits for the container's output. Reporting
+    // a full close here takes that output with it.
+    if host_closed {
+        shared.shutdown_write(host_port);
+        if let Ok(writer) = writer {
+            let _ = writer.join();
+        }
+        shared.shutdown(host_port);
+        return;
     }
 
     shared.shutdown(host_port);
@@ -711,6 +774,68 @@ mod tests {
         Vsock::handle(&mut inner, response);
         assert_eq!(inner.conns[&port].state, State::Established);
         assert_eq!(inner.conns[&port].credit.available(), 4096);
+    }
+
+    /// A guest that says only "I will send no more" has half-closed. Tearing
+    /// the connection down there kills the direction the reply travels on,
+    /// which is how `docker run` came to produce a correct exit code and no
+    /// output whatsoever.
+    #[test]
+    fn a_send_only_shutdown_keeps_the_connection_open() {
+        let (shared, port, _peer) = shared_with_connection();
+        let mut inner = shared.lock();
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+
+        let mut half = Packet::control(Op::Shutdown, 2375, port);
+        half.flags = shutdown::SEND;
+        Vsock::handle(&mut inner, half);
+
+        assert!(
+            inner.conns.contains_key(&port),
+            "a half-close must not remove the connection"
+        );
+        assert!(inner.conns[&port].guest_done);
+        assert_eq!(
+            inner.conns[&port].state,
+            State::Established,
+            "the receive direction is still live"
+        );
+    }
+
+    #[test]
+    fn a_full_shutdown_closes_the_connection() {
+        let (shared, port, _peer) = shared_with_connection();
+        let mut inner = shared.lock();
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+
+        let mut full = Packet::control(Op::Shutdown, 2375, port);
+        full.flags = shutdown::BOTH;
+        Vsock::handle(&mut inner, full);
+
+        assert!(!inner.conns.contains_key(&port));
+    }
+
+    /// Once the guest has half-closed and the buffer is empty there is nothing
+    /// further to hand the writer, and that `None` is what makes it deliver the
+    /// EOF the host peer is waiting for.
+    #[test]
+    fn the_writer_is_told_to_finish_after_a_half_close() {
+        let (shared, port, _peer) = shared_with_connection();
+        let mut inner = shared.lock();
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+
+        let mut data = Packet::control(Op::Rw, 2375, port);
+        data.payload = b"tail".to_vec();
+        Vsock::handle(&mut inner, data);
+
+        let mut half = Packet::control(Op::Shutdown, 2375, port);
+        half.flags = shutdown::SEND;
+        Vsock::handle(&mut inner, half);
+        drop(inner);
+
+        // Buffered data first — a half-close must not discard it.
+        assert_eq!(shared.take_outbound(port).as_deref(), Some(&b"tail"[..]));
+        assert_eq!(shared.take_outbound(port), None, "then end of stream");
     }
 
     #[test]

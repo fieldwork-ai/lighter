@@ -59,6 +59,7 @@ required=(
 	CONFIG_NF_NAT
 	CONFIG_PACKET
 	CONFIG_INET
+	CONFIG_NFT_COMPAT
 )
 missing=0
 for opt in "${required[@]}"; do

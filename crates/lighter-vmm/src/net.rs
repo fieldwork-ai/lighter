@@ -294,6 +294,28 @@ impl NetBackend for FramedStream {
     }
 }
 
+/// The network as somewhere Docker's published ports can be sent.
+///
+/// The implementation is trivial; the point of the trait is direction. The
+/// crate that understands Docker's API must not also have to understand
+/// gvproxy, and this is the one place the two meet.
+impl lighter_docker::PortMapper for Network {
+    fn expose(&self, port: u16) -> Result<(), String> {
+        Network::expose(
+            self,
+            PortForward {
+                host_port: port,
+                guest_port: port,
+            },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn unexpose(&self, port: u16) -> Result<(), String> {
+        Network::unexpose(self, port).map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -129,7 +129,7 @@ pub struct Machine {
     balloon: Arc<BalloonState>,
     /// The gvproxy sidecar, if there is one. Held because dropping it kills the
     /// process, and because port forwards are added through it at runtime.
-    network: Option<Network>,
+    network: Option<Arc<Network>>,
     vsock: Arc<VsockShared>,
     /// Socket proxies, held because dropping one unlinks its socket.
     proxies: Vec<VsockProxy>,
@@ -210,7 +210,7 @@ impl Machine {
         // receive pump needs the transport, which does not exist until every
         // device has been placed.
         let network = match &config.gvproxy {
-            Some(path) => Some(Network::start(path, &config.run_dir)?),
+            Some(path) => Some(Arc::new(Network::start(path, &config.run_dir)?)),
             None => None,
         };
         let mut net_slot = None;
@@ -386,7 +386,11 @@ impl Machine {
     }
 
     /// The guest's network, if one was configured.
-    pub fn network(&self) -> Option<&Network> {
+    ///
+    /// Shared rather than borrowed because port forwards are added from a
+    /// thread that outlives any borrow: Docker publishes ports whenever a
+    /// container starts.
+    pub fn network(&self) -> Option<&Arc<Network>> {
         self.network.as_ref()
     }
 
