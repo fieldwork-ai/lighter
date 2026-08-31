@@ -20,6 +20,7 @@ use crate::irq::GicSpi;
 use crate::kernel::KernelLoader;
 use crate::layout::{GuestLayout, UART_SPI};
 use crate::memory::GuestMemory;
+use crate::net::Network;
 use crate::smp::CpuPark;
 use crate::vcpu::{RunContext, StopReason, VcpuRunner};
 use crate::virtio::VirtioDevice;
@@ -27,7 +28,9 @@ use crate::virtio::balloon::{Balloon, BalloonState};
 use crate::virtio::block::Block;
 use crate::virtio::disk::Disk;
 use crate::virtio::mmio::VirtioMmio;
+use crate::virtio::net::Net;
 use crate::virtio::rng::Rng;
+use crate::{net, virtio};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MachineError {
@@ -47,6 +50,8 @@ pub enum MachineError {
     Run(#[from] crate::vcpu::RunError),
     #[error("console: {0}")]
     Console(#[from] io::Error),
+    #[error("network: {0}")]
+    Network(#[from] crate::net::NetError),
     #[error(
         "this host reports no hardware virtualization support (kern.hv_support = 0); \
          lighter cannot run inside another VM"
@@ -73,6 +78,13 @@ pub struct MachineConfig {
     pub disks: Vec<PathBuf>,
     /// Logical size for a disk image that has to be created.
     pub disk_size_bytes: u64,
+    /// The gvproxy binary to run the network through. `None` builds a machine
+    /// with no network device at all, which is what the boot and device gates
+    /// want: they are testing something else, and a missing sidecar should not
+    /// fail them.
+    pub gvproxy: Option<PathBuf>,
+    /// Where the network's sockets live.
+    pub run_dir: PathBuf,
 }
 
 impl Default for MachineConfig {
@@ -88,6 +100,8 @@ impl Default for MachineConfig {
             interactive: true,
             disks: Vec::new(),
             disk_size_bytes: 64 << 30,
+            gvproxy: None,
+            run_dir: std::env::temp_dir().join("lighter"),
         }
     }
 }
@@ -111,6 +125,9 @@ pub struct Machine {
     virtio: Vec<Arc<Mutex<VirtioMmio>>>,
     disks: Vec<Arc<Disk>>,
     balloon: Arc<BalloonState>,
+    /// The gvproxy sidecar, if there is one. Held because dropping it kills the
+    /// process, and because port forwards are added through it at runtime.
+    network: Option<Network>,
 }
 
 impl Machine {
@@ -182,6 +199,18 @@ impl Machine {
         let mut virtio: Vec<Box<dyn VirtioDevice>> = Vec::new();
         let mut disks = Vec::new();
 
+        // Networking starts before the device that uses it, so that a missing
+        // or unstartable gvproxy is an error about the network rather than a
+        // half-built machine. The device's slot index is remembered because the
+        // receive pump needs the transport, which does not exist until every
+        // device has been placed.
+        let network = match &config.gvproxy {
+            Some(path) => Some(Network::start(path, &config.run_dir)?),
+            None => None,
+        };
+        let mut net_slot = None;
+        let net_inbox = Net::new_inbox();
+
         for path in &config.disks {
             let disk = Arc::new(Disk::open_or_create(path, config.disk_size_bytes, false)?);
             tracing::info!(
@@ -192,6 +221,14 @@ impl Machine {
             );
             disks.push(disk.clone());
             virtio.push(Box::new(Block::new(disk)));
+        }
+        if let Some(network) = &network {
+            net_slot = Some(virtio.len());
+            virtio.push(Box::new(Net::new(
+                network.backend(),
+                net::GUEST_MAC,
+                net_inbox.clone(),
+            )));
         }
         virtio.push(Box::new(Rng::from_host()?));
         virtio.push(Box::new(Balloon::new(balloon_state.clone())));
@@ -208,6 +245,20 @@ impl Machine {
             let transport = Arc::new(Mutex::new(VirtioMmio::new(device, memory.clone(), irq)));
             bus.register(window, transport.clone())?;
             virtio_devices.push(transport);
+        }
+
+        // The pump that moves frames off the network and into the guest. It runs
+        // outside the vCPU threads because a frame can arrive at any time,
+        // including while every core is idle in WFI — which is exactly the
+        // moment a guest is waiting for a reply.
+        if let (Some(network), Some(slot)) = (&network, net_slot) {
+            let transport = virtio_devices[slot].clone();
+            network.spawn_receiver(net_inbox, move || {
+                transport
+                    .lock()
+                    .expect("net transport poisoned")
+                    .service_queue(virtio::net::RX_QUEUE);
+            })?;
         }
 
         // 7. The device tree describes the machine built above, from the same
@@ -303,7 +354,13 @@ impl Machine {
             virtio: virtio_devices,
             disks,
             balloon: balloon_state,
+            network,
         })
+    }
+
+    /// The guest's network, if one was configured.
+    pub fn network(&self) -> Option<&Network> {
+        self.network.as_ref()
     }
 
     /// Waits for the guest to stop, returning why.

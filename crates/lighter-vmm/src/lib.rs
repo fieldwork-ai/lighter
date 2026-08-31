@@ -20,7 +20,8 @@
 //!     ├── smp       PSCI core power state
 //!     ├── sysreg    trapped system-register policy
 //!     ├── devices   models that answer MMIO
-//!     └── virtio    the transport and the device models on it
+//!     ├── virtio    the transport and the device models on it
+//!     └── net       the host end of the network, behind a process boundary
 //! ```
 
 pub mod bus;
@@ -32,6 +33,7 @@ pub mod kernel;
 pub mod layout;
 pub mod machine;
 pub mod memory;
+pub mod net;
 pub mod psci;
 pub mod smp;
 pub mod sysreg;

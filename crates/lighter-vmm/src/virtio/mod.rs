@@ -10,6 +10,7 @@ pub mod balloon;
 pub mod block;
 pub mod disk;
 pub mod mmio;
+pub mod net;
 pub mod queue;
 pub mod rng;
 

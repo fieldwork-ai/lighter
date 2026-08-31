@@ -110,9 +110,12 @@ for cpus in 1 4; do
 	# carries on with a broken device and dies somewhere unrelated, so the log
 	# is the only place the actual cause is written down.
 	#
-	# "No redistributor present" in particular was observed once and has not
-	# recurred in dozens of runs since; the cause was never established, which
-	# is exactly why it is checked for rather than assumed gone.
+	# "No redistributor present" is here because it happened: vCPU threads raced
+	# to hv_vcpu_create, so framework ids stopped matching the thread indices we
+	# were deriving MPIDR from, and roughly one SMP boot in eight came up with a
+	# core whose redistributor the GIC could not find. Creation is serialized
+	# now, but the check stays — it is the only outward sign of that whole class
+	# of bug.
 	for signature in \
 		"No redistributor present" \
 		"Unable to handle kernel" \

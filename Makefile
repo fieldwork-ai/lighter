@@ -65,7 +65,7 @@ smoke: ## Prove the hypervisor path works on this machine
 # One target per milestone. `make gates` runs every gate that has landed.
 
 .PHONY: gates
-gates: gate-m1 gate-m2 ## Run all landed milestone gates
+gates: gate-m1 gate-m2 gate-m3-network ## Run all landed milestone gates
 
 .PHONY: gate-m1
 gate-m1: ## M1: a custom kernel boots to a shell on the serial console
@@ -74,6 +74,14 @@ gate-m1: ## M1: a custom kernel boots to a shell on the serial console
 .PHONY: gate-m2
 gate-m2: ## M2: virtio block/entropy/balloon, and a disk that gives space back
 	@scripts/gates/m2-devices.sh
+
+.PHONY: gate-m3-network
+gate-m3-network: gvproxy ## M3: the guest is on the network, both directions
+	@scripts/gates/m3-network.sh
+
+.PHONY: gvproxy
+gvproxy: ## Fetch the gvproxy sidecar that backs guest networking
+	@scripts/fetch-gvproxy.sh
 
 .PHONY: help
 help:

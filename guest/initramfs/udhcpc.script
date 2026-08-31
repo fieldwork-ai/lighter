@@ -1,0 +1,23 @@
+#!/bin/busybox sh
+# The hook busybox's DHCP client calls once it has an answer.
+#
+# busybox ships no default for this, and udhcpc treats a missing script as a
+# fatal error before it ever sends a DISCOVER — so its absence looks like a
+# network that never replied rather than a client that never asked.
+case "$1" in
+bound | renew)
+	ip addr flush dev "$interface"
+	ip addr add "$ip/${mask:-24}" dev "$interface"
+	ip link set "$interface" up
+	[ -n "$router" ] && ip route add default via "${router%% *}" dev "$interface"
+	: > /etc/resolv.conf
+	for server in $dns; do
+		echo "nameserver $server" >> /etc/resolv.conf
+	done
+	;;
+deconfig)
+	ip addr flush dev "$interface"
+	ip link set "$interface" up
+	;;
+esac
+exit 0

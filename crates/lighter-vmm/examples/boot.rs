@@ -7,7 +7,16 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use lighter_vmm::net::PortForward;
 use lighter_vmm::{Machine, MachineConfig, StopReason};
+
+fn parse_forward(spec: &str) -> Option<PortForward> {
+    let (host, guest) = spec.split_once(':')?;
+    Some(PortForward {
+        host_port: host.parse().ok()?,
+        guest_port: guest.parse().ok()?,
+    })
+}
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -19,6 +28,7 @@ fn main() -> ExitCode {
         .init();
 
     let mut config = MachineConfig::default();
+    let mut forwards: Vec<PortForward> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -40,6 +50,19 @@ fn main() -> ExitCode {
                 config.disk_size_bytes = gib << 30;
             }
             "--no-tty" => config.interactive = false,
+            "--net" => config.gvproxy = Some(PathBuf::from(args.next().unwrap_or_default())),
+            "--run-dir" => config.run_dir = PathBuf::from(args.next().unwrap_or_default()),
+            "--forward" => {
+                // host:guest, added once the machine is up.
+                let spec = args.next().unwrap_or_default();
+                match parse_forward(&spec) {
+                    Some(f) => forwards.push(f),
+                    None => {
+                        eprintln!("--forward wants HOST:GUEST, got {spec:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 return ExitCode::from(2);
@@ -54,6 +77,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    for forward in &forwards {
+        // A forward the guest is not listening on yet is fine: gvproxy accepts
+        // on the host side and only then dials the guest.
+        if let Some(network) = machine.network()
+            && let Err(e) = network.expose(*forward)
+        {
+            eprintln!("lighter: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     match machine.wait() {
         Ok(StopReason::SystemOff) => {

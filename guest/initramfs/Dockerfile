@@ -13,6 +13,7 @@ RUN apt-get update \
 WORKDIR /rootfs
 COPY --from=busybox /bin/busybox /rootfs/bin/busybox
 COPY init /rootfs/init
+COPY udhcpc.script /rootfs/usr/share/udhcpc/default.script
 
 # The initramfs has no dynamic loader, so PID 1 must need none. The test is the
 # absence of an ELF interpreter, not the word "static": busybox:musl is
@@ -23,8 +24,8 @@ RUN file /rootfs/bin/busybox | grep -q "interpreter" \
 	&& (echo "busybox needs a dynamic loader; the initramfs would not boot" >&2 && exit 1) \
 	|| file /rootfs/bin/busybox
 
-RUN chmod +x /rootfs/init /rootfs/bin/busybox \
-	&& mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev /rootfs/tmp /rootfs/root \
+RUN chmod +x /rootfs/init /rootfs/bin/busybox /rootfs/usr/share/udhcpc/default.script \
+	&& mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev /rootfs/tmp /rootfs/root /rootfs/etc \
 	&& mknod -m 622 /rootfs/dev/console c 5 1 \
 	&& mknod -m 666 /rootfs/dev/null c 1 3 \
 	&& mknod -m 666 /rootfs/dev/tty c 5 0 \

@@ -57,6 +57,8 @@ required=(
 	CONFIG_BRIDGE
 	CONFIG_VETH
 	CONFIG_NF_NAT
+	CONFIG_PACKET
+	CONFIG_INET
 )
 missing=0
 for opt in "${required[@]}"; do
