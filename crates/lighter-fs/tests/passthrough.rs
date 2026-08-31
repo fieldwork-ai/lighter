@@ -142,15 +142,25 @@ impl Guest {
         Ok((nodeid, fh))
     }
 
+    /// Opens a file the way a Linux guest does.
+    ///
+    /// The server answers OPEN with ENOSYS, which the kernel records once and
+    /// then stops sending opens, closes and flushes altogether — so a real
+    /// guest reads and writes with a file handle of zero and the inode doing
+    /// the identifying. Modelling that here rather than papering over it is the
+    /// point: these tests exercise the path production actually takes.
     fn open(&mut self, nodeid: u64, flags: u32) -> Result<u64, i32> {
         let mut body = Vec::new();
         body.extend_from_slice(&flags.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
-        let reply = self.call(op::OPEN, nodeid, &body)?;
-        Ok(u64::from_le_bytes(reply[0..8].try_into().unwrap()))
+        match self.call(op::OPEN, nodeid, &body) {
+            Err(38 /* ENOSYS */) => Ok(0),
+            Err(other) => Err(other),
+            Ok(reply) => Ok(u64::from_le_bytes(reply[0..8].try_into().unwrap())),
+        }
     }
 
-    fn write(&mut self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
+    fn write(&mut self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
         let mut body = Vec::new();
         body.extend_from_slice(&fh.to_le_bytes());
         body.extend_from_slice(&offset.to_le_bytes());
@@ -160,22 +170,25 @@ impl Guest {
         body.extend_from_slice(&0u32.to_le_bytes()); // flags
         body.extend_from_slice(&0u32.to_le_bytes()); // padding
         body.extend_from_slice(data);
-        let reply = self.call(op::WRITE, 0, &body)?;
+        let reply = self.call(op::WRITE, nodeid, &body)?;
         Ok(u32::from_le_bytes(reply[0..4].try_into().unwrap()))
     }
 
-    fn read(&mut self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+    fn read(&mut self, nodeid: u64, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
         let mut body = Vec::new();
         body.extend_from_slice(&fh.to_le_bytes());
         body.extend_from_slice(&offset.to_le_bytes());
         body.extend_from_slice(&size.to_le_bytes());
         body.resize(40, 0);
-        self.call(op::READ, 0, &body)
+        self.call(op::READ, nodeid, &body)
     }
 
     fn opendir(&mut self, nodeid: u64) -> Result<u64, i32> {
-        let reply = self.call(op::OPENDIR, nodeid, &[0u8; 8])?;
-        Ok(u64::from_le_bytes(reply[0..8].try_into().unwrap()))
+        match self.call(op::OPENDIR, nodeid, &[0u8; 8]) {
+            Err(38 /* ENOSYS */) => Ok(0),
+            Err(other) => Err(other),
+            Ok(reply) => Ok(u64::from_le_bytes(reply[0..8].try_into().unwrap())),
+        }
     }
 
     /// Walks a directory to exhaustion, one page at a time, as the guest does.
@@ -235,8 +248,8 @@ fn name_body(name: &str) -> Vec<u8> {
 #[test]
 fn a_file_written_by_the_guest_appears_on_the_host() {
     let mut guest = Guest::new("write");
-    let (_, fh) = guest.create(1, "hello.txt", CREATE_RDWR).unwrap();
-    assert_eq!(guest.write(fh, 0, b"contents").unwrap(), 8);
+    let (nodeid, fh) = guest.create(1, "hello.txt", CREATE_RDWR).unwrap();
+    assert_eq!(guest.write(nodeid, fh, 0, b"contents").unwrap(), 8);
     assert_eq!(
         std::fs::read_to_string(guest.host("hello.txt")).unwrap(),
         "contents"
@@ -249,7 +262,7 @@ fn a_file_written_by_the_host_is_read_by_the_guest() {
     std::fs::write(guest.host("from-host"), b"host wrote this").unwrap();
     let nodeid = guest.lookup(1, "from-host").unwrap();
     let fh = guest.open(nodeid, 0).unwrap();
-    assert_eq!(guest.read(fh, 0, 4096).unwrap(), b"host wrote this");
+    assert_eq!(guest.read(nodeid, fh, 0, 4096).unwrap(), b"host wrote this");
 }
 
 /// The bug this exists for: Linux `O_APPEND` is `O_TRUNC | O_EXCL` in macOS's
@@ -261,7 +274,9 @@ fn appending_does_not_truncate() {
     std::fs::write(guest.host("log"), b"first\n").unwrap();
     let nodeid = guest.lookup(1, "log").unwrap();
     let fh = guest.open(nodeid, 0o2001 /* O_WRONLY | O_APPEND */).unwrap();
-    guest.write(fh, 0, b"second\n").unwrap();
+    // Without a reported open there is no append mode to remember, so the
+    // guest kernel supplies the offset — which is what it does in practice.
+    guest.write(nodeid, fh, 6, b"second\n").unwrap();
     assert_eq!(
         std::fs::read_to_string(guest.host("log")).unwrap(),
         "first\nsecond\n"
@@ -280,7 +295,7 @@ fn an_open_file_survives_being_renamed_on_the_host() {
 
     std::fs::rename(guest.host("before"), guest.host("after")).unwrap();
 
-    assert_eq!(guest.read(fh, 0, 4096).unwrap(), b"payload");
+    assert_eq!(guest.read(nodeid, fh, 0, 4096).unwrap(), b"payload");
     // And the inode still resolves, which a remembered path would not.
     assert!(guest.call(op::GETATTR, nodeid, &[0u8; 16]).is_ok());
 }
@@ -291,15 +306,19 @@ fn an_open_file_survives_being_renamed_on_the_host() {
 fn an_open_file_survives_being_unlinked() {
     let mut guest = Guest::new("unlink-open");
     let (nodeid, fh) = guest.create(1, "doomed", CREATE_RDWR).unwrap();
-    guest.write(fh, 0, b"still here").unwrap();
+    guest.write(nodeid, fh, 0, b"still here").unwrap();
 
     guest.call(op::UNLINK, 1, &name_body("doomed")).unwrap();
-    assert_eq!(guest.lookup(1, "doomed"), Err(2 /* ENOENT */));
+    // A miss is either ENOENT or a negative entry — a reply naming nodeid 0 —
+    // depending on whether the share is cached. Both mean "not there".
+    assert!(matches!(guest.lookup(1, "doomed"), Err(2) | Ok(0)));
 
-    assert_eq!(guest.read(fh, 0, 4096).unwrap(), b"still here");
-    assert_eq!(guest.write(fh, 10, b" and writable").unwrap(), 13);
-    assert_eq!(guest.read(fh, 0, 4096).unwrap(), b"still here and writable");
-    let _ = nodeid;
+    assert_eq!(guest.read(nodeid, fh, 0, 4096).unwrap(), b"still here");
+    assert_eq!(guest.write(nodeid, fh, 10, b" and writable").unwrap(), 13);
+    assert_eq!(
+        guest.read(nodeid, fh, 0, 4096).unwrap(),
+        b"still here and writable"
+    );
 }
 
 /// Two names for one file are one inode. A guest that saw two would disagree
@@ -328,6 +347,33 @@ fn symlinks_round_trip() {
     // No terminator: the kernel takes the length from the header, and a
     // trailing NUL becomes part of the path.
     assert!(!target.ends_with(b"\0"));
+}
+
+/// A directory listing must not *repeat* an entry either, and that failure is
+/// worse than losing one: `cp -a` remembers every `(dev, ino)` it has copied
+/// and hard-links anything that comes back a second time, so a repeat makes a
+/// recursive copy fail with "can't create link" for every file after it.
+#[test]
+fn a_listing_never_repeats_an_entry() {
+    let mut guest = Guest::new("repeats");
+    for index in 0..300 {
+        std::fs::write(guest.host(&format!("entry-{index:03}")), b"x").unwrap();
+    }
+    // A page smaller than one READDIRPLUS record would make no progress at
+    // all, which is a real constraint on the caller rather than on us: Linux
+    // reads a directory a page at a time.
+    for page in [512u32, 4096, 65536] {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for name in guest.list(1, page, true) {
+            *counts.entry(name).or_default() += 1;
+        }
+        let repeated: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            repeated.is_empty(),
+            "page={page}: entries returned more than once: {repeated:?}"
+        );
+        assert_eq!(counts.len(), 302, "page={page}: 300 files plus . and ..");
+    }
 }
 
 /// A directory listing must not lose entries at a page boundary. The failure is
@@ -389,7 +435,7 @@ fn concurrent_host_renames_do_not_corrupt_a_listing() {
     // Whatever it ended up called, it is still one file with its contents.
     let nodeid = guest.lookup(1, &final_name).unwrap();
     let fh = guest.open(nodeid, 0).unwrap();
-    assert_eq!(guest.read(fh, 0, 4096).unwrap(), b"payload");
+    assert_eq!(guest.read(nodeid, fh, 0, 4096).unwrap(), b"payload");
 }
 
 fn rand_suffix() -> u128 {
@@ -404,8 +450,8 @@ fn rand_suffix() -> u128 {
 #[test]
 fn a_read_is_clamped_to_the_buffer_the_guest_supplied() {
     let mut guest = Guest::new("clamp");
-    let (_, fh) = guest.create(1, "big", CREATE_RDWR).unwrap();
-    guest.write(fh, 0, &vec![b'z'; 8192]).unwrap();
+    let (nodeid, fh) = guest.create(1, "big", CREATE_RDWR).unwrap();
+    guest.write(nodeid, fh, 0, &vec![b'z'; 8192]).unwrap();
 
     let mut body = Vec::new();
     body.extend_from_slice(&fh.to_le_bytes());
@@ -413,7 +459,7 @@ fn a_read_is_clamped_to_the_buffer_the_guest_supplied() {
     body.extend_from_slice(&8192u32.to_le_bytes());
     body.resize(40, 0);
     // A 1 KiB reply chain: the reply must be a short read, not an overrun.
-    let reply = guest.call_with(op::READ, 0, &body, 1024).unwrap();
+    let reply = guest.call_with(op::READ, nodeid, &body, 1024).unwrap();
     assert_eq!(reply.len(), 1024 - fuse::OUT_HEADER_LEN);
 }
 
@@ -422,15 +468,13 @@ fn a_read_is_clamped_to_the_buffer_the_guest_supplied() {
 #[test]
 fn names_cannot_escape_the_share() {
     let mut guest = Guest::new("escape");
-    for name in ["..", ".", ""] {
+    for name in ["..", ".", "", "../../etc/passwd"] {
         assert_eq!(
             guest.lookup(1, name),
             Err(22 /* EINVAL */),
-            "{name:?} must be refused"
+            "{name:?} must be refused before it reaches a syscall"
         );
     }
-    // A slash would make one `openat` walk arbitrarily far.
-    assert_eq!(guest.lookup(1, "../../etc/passwd"), Err(22));
 }
 
 #[test]
@@ -530,12 +574,12 @@ fn extended_attributes_round_trip() {
 #[test]
 fn fsync_reaches_the_host_file() {
     let mut guest = Guest::new("fsync");
-    let (_, fh) = guest.create(1, "durable", CREATE_RDWR).unwrap();
-    guest.write(fh, 0, b"committed").unwrap();
+    let (nodeid, fh) = guest.create(1, "durable", CREATE_RDWR).unwrap();
+    guest.write(nodeid, fh, 0, b"committed").unwrap();
     let mut body = fh.to_le_bytes().to_vec();
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    guest.call(op::FSYNC, 0, &body).unwrap();
+    guest.call(op::FSYNC, nodeid, &body).unwrap();
     assert_eq!(
         std::fs::read(guest.host("durable")).unwrap(),
         b"committed".to_vec()
@@ -556,3 +600,77 @@ fn statfs_describes_a_filesystem_with_room_on_it() {
 }
 
 fn _unused(_: &Path) {}
+
+/// Offsets into a `fuse_entry_out`'s embedded `fuse_attr`.
+const ATTR_AT: usize = 40;
+const INO_AT: usize = ATTR_AT;
+const NLINK_AT: usize = ATTR_AT + 64;
+
+/// Two different files must not look like two names for one file.
+///
+/// `cp -a` remembers every `(dev, ino)` it has copied and, for anything whose
+/// link count is above one, links the second name to the first destination
+/// rather than copying it again. Report the same inode number twice, or a link
+/// count of two for a file with one name, and a recursive copy fails partway
+/// through with "can't create link" — which is what it did.
+#[test]
+fn distinct_files_have_distinct_inode_numbers_and_one_link() {
+    let mut guest = Guest::new("identity");
+    let mut seen: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for index in 0..200 {
+        let name = format!("file-{index:03}");
+        std::fs::write(guest.host(&name), b"x").unwrap();
+        let mut body = name.as_bytes().to_vec();
+        body.push(0);
+        let reply = guest.call(op::LOOKUP, 1, &body).unwrap();
+
+        let ino = u64::from_le_bytes(reply[INO_AT..INO_AT + 8].try_into().unwrap());
+        let nlink = u32::from_le_bytes(reply[NLINK_AT..NLINK_AT + 4].try_into().unwrap());
+        assert_eq!(nlink, 1, "{name} reported {nlink} links");
+        if let Some(other) = seen.insert(ino, name.clone()) {
+            panic!("{name} and {other} both report inode {ino}");
+        }
+    }
+}
+
+/// The same, through a directory listing rather than a lookup. READDIRPLUS
+/// carries a dirent *and* an entry, and they have to agree about which inode a
+/// name refers to — the dirent's number is what a caller sees from `readdir`
+/// and the entry's is what it sees from `stat`.
+#[test]
+fn a_listing_and_a_lookup_agree_about_inode_numbers() {
+    let mut guest = Guest::new("listing");
+    for index in 0..40 {
+        std::fs::write(guest.host(&format!("f{index:02}")), b"x").unwrap();
+    }
+
+    let fh = guest.opendir(1).unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&fh.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes());
+    body.extend_from_slice(&65536u32.to_le_bytes());
+    body.resize(40, 0);
+    let reply = guest.call(op::READDIRPLUS, 1, &body).unwrap();
+
+    let mut cursor = 0;
+    while cursor + fuse::ENTRY_OUT_LEN + fuse::DIRENT_HEADER_LEN <= reply.len() {
+        let entry = &reply[cursor..];
+        let attr_ino = u64::from_le_bytes(entry[INO_AT..INO_AT + 8].try_into().unwrap());
+        let dirent = &entry[fuse::ENTRY_OUT_LEN..];
+        let dirent_ino = u64::from_le_bytes(dirent[0..8].try_into().unwrap());
+        let namelen = u32::from_le_bytes(dirent[16..20].try_into().unwrap()) as usize;
+        let name = String::from_utf8_lossy(
+            &dirent[fuse::DIRENT_HEADER_LEN..fuse::DIRENT_HEADER_LEN + namelen],
+        )
+        .into_owned();
+        let nodeid = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+        // "." and ".." carry no entry, so there is nothing to agree with.
+        if nodeid != 0 {
+            assert_eq!(
+                attr_ino, dirent_ino,
+                "{name}: listing says inode {dirent_ino}, attributes say {attr_ino}"
+            );
+        }
+        cursor += fuse::ENTRY_OUT_LEN + fuse::dirent_len(namelen);
+    }
+}

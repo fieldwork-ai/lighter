@@ -65,7 +65,7 @@ smoke: ## Prove the hypervisor path works on this machine
 # One target per milestone. `make gates` runs every gate that has landed.
 
 .PHONY: gates
-gates: gate-m1 gate-m2 gate-m3-network gate-m3-vsock gate-m3-docker gate-m4-fs ## Run all landed milestone gates
+gates: gate-m1 gate-m2 gate-m3-network gate-m3-vsock gate-m3-docker gate-m4-fs gate-m5-speed ## Run all landed milestone gates
 
 .PHONY: gate-m1
 gate-m1: ## M1: a custom kernel boots to a shell on the serial console
@@ -90,6 +90,10 @@ gate-m3-docker: gvproxy ## M3: docker and compose on macOS, against our VMM
 .PHONY: gate-m4-fs
 gate-m4-fs: ## M4: a shared host directory the guest and macOS agree about
 	@scripts/gates/m4-fs.sh
+
+.PHONY: gate-m5-speed
+gate-m5-speed: gvproxy ## M5: caching earns its keep, measured against itself
+	@scripts/gates/m5-speed.sh
 
 .PHONY: gvproxy
 gvproxy: ## Fetch the gvproxy sidecar that backs guest networking

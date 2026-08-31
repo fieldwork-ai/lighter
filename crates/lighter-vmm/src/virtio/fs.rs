@@ -28,8 +28,8 @@
 //! reference-counted and an operation in flight holds a strong reference to it.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use lighter_fs::{Server, Sink, SinkFull};
 
@@ -50,9 +50,9 @@ pub const TAG_LEN: usize = 36;
 ///
 /// The work is syscall-bound rather than CPU-bound, so this is not a core
 /// count: it is how many filesystem operations may be outstanding at once, and
-/// a directory walk with everything cold wants rather more of them than the
-/// machine has cores.
-const WORKERS: usize = 8;
+/// a package install — dozens of processes each blocked on a `stat` — wants
+/// rather more of them than the machine has cores.
+const WORKERS: usize = 16;
 
 /// The callback a worker uses to poke the transport once a reply is ready.
 ///
@@ -141,37 +141,108 @@ struct Completion {
     len: u32,
 }
 
+/// Jobs waiting for a worker.
+///
+/// A `Mutex<Receiver>` around a channel would be the obvious thing and is
+/// quietly disastrous: a worker blocked in `recv` holds the mutex, so only one
+/// worker can ever be *waiting*, and every job dispatch becomes a mutex handoff
+/// between two threads. Measured on a package install, that alone was most of a
+/// twenty-microsecond round trip across a hundred thousand requests.
+///
+/// Here the lock is held only long enough to push or pop; waiting happens on
+/// the condition variable, where any number of workers can wait at once.
+struct Queue {
+    jobs: Mutex<Option<VecDeque<Job>>>,
+    arrived: Condvar,
+}
+
+impl Queue {
+    fn new() -> Queue {
+        Queue {
+            jobs: Mutex::new(Some(VecDeque::new())),
+            arrived: Condvar::new(),
+        }
+    }
+
+    /// Returns false once the queue has been closed.
+    fn push(&self, job: Job) -> bool {
+        let mut guard = self.jobs.lock().expect("fs job queue poisoned");
+        let Some(queue) = guard.as_mut() else {
+            return false;
+        };
+        queue.push_back(job);
+        drop(guard);
+        self.arrived.notify_one();
+        true
+    }
+
+    /// Blocks until there is a job, or until the queue is closed.
+    fn pop(&self) -> Option<Job> {
+        let mut guard = self.jobs.lock().expect("fs job queue poisoned");
+        loop {
+            if let Some(job) = guard.as_mut()?.pop_front() {
+                return Some(job);
+            }
+            guard = self.arrived.wait(guard).expect("fs job queue poisoned");
+        }
+    }
+
+    /// Whether a worker would find nothing to do.
+    fn is_empty(&self) -> bool {
+        self.jobs
+            .lock()
+            .expect("fs job queue poisoned")
+            .as_ref()
+            .is_none_or(|queue| queue.is_empty())
+    }
+
+    /// Wakes every worker and lets them retire.
+    fn close(&self) {
+        *self.jobs.lock().expect("fs job queue poisoned") = None;
+        self.arrived.notify_all();
+    }
+}
+
 /// State shared between the vCPU threads and the worker pool.
+/// Retiring a pool closes its queue, which is what lets its threads exit rather
+/// than waiting forever on a condition variable nothing will signal.
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
 struct Pool {
-    jobs: Sender<Job>,
+    queue: Arc<Queue>,
     done: Arc<Mutex<VecDeque<Completion>>>,
+    /// Whether a wake-up is already on its way to the transport.
+    ///
+    /// Without this, twenty-four workers finishing at once raise twenty-four
+    /// interrupts for one batch of replies, and each takes the transport lock
+    /// on the way. The guest only needs to be told once that there is
+    /// something on the used ring.
+    waking: Arc<AtomicBool>,
     _threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Pool {
     fn start(server: Arc<Server>, memory: Arc<GuestMemory>, tag: String, waker: Waker) -> Pool {
-        let (jobs, receiver) = channel::<Job>();
-        let receiver = Arc::new(Mutex::new(receiver));
+        let queue = Arc::new(Queue::new());
         let done: Arc<Mutex<VecDeque<Completion>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let waking = Arc::new(AtomicBool::new(false));
 
         let mut threads = Vec::with_capacity(WORKERS);
         for index in 0..WORKERS {
-            let receiver = receiver.clone();
+            let queue = queue.clone();
             let server = server.clone();
             let memory = memory.clone();
             let done = done.clone();
             let waker = waker.clone();
+            let waking = waking.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("fs-{tag}-{index}"))
                 .spawn(move || {
-                    loop {
-                        // The lock is held only across `recv`, so workers block
-                        // on the channel rather than on each other.
-                        let job = {
-                            let guard = receiver.lock().expect("fs job queue poisoned");
-                            guard.recv()
-                        };
-                        let Ok(job) = job else { break };
+                    while let Some(job) = queue.pop() {
 
                         let mut sink = ChainSink::new(memory.clone(), job.reply);
                         let written = server.dispatch(&job.request, &mut sink);
@@ -182,6 +253,13 @@ impl Pool {
                                 len: written as u32,
                             });
 
+                        // One wake per batch. `notify` clears the flag *before*
+                        // draining, so a completion queued in the gap sets it
+                        // again and gets its own wake-up — there is no ordering
+                        // in which a reply is left sitting on the ring.
+                        if waking.swap(true, Ordering::AcqRel) {
+                            continue;
+                        }
                         // Clone the waker out and drop the lock before calling
                         // it: it takes the transport lock, and holding two is
                         // how this deadlocks against a vCPU servicing a queue.
@@ -196,8 +274,9 @@ impl Pool {
         }
 
         Pool {
-            jobs,
+            queue,
             done,
+            waking,
             _threads: threads,
         }
     }
@@ -212,6 +291,12 @@ pub struct Fs {
     pool: Option<Pool>,
     /// Held so the vCPU-served queue can build a reply sink of its own.
     memory: Option<Arc<GuestMemory>>,
+    /// Whether an uncontended request may be served on the vCPU thread.
+    ///
+    /// On by default and switchable for measurement, because "does removing the
+    /// hand-off help?" is a question that should be answered with a number
+    /// rather than an argument.
+    inline: bool,
     waker: Waker,
 }
 
@@ -232,6 +317,7 @@ impl Fs {
             server: Arc::new(server),
             pool: None,
             memory: None,
+            inline: std::env::var("LIGHTER_FS_INLINE").as_deref() != Ok("0"),
             waker: Arc::new(Mutex::new(None)),
         })
     }
@@ -276,6 +362,7 @@ impl Fs {
         let Some(pool) = &self.pool else {
             return false;
         };
+        pool.waking.store(false, Ordering::Release);
         let mut any = false;
         loop {
             let completion = pool
@@ -327,6 +414,29 @@ impl VirtioDevice for Fs {
             return;
         }
         self.memory = Some(mem.clone());
+        // A histogram on an interval, when asked for. Tuning a filesystem
+        // without one is a sequence of rebuild-boot-measure cycles spent
+        // disproving theories that a single run would have settled.
+        if self.server.stats_enabled() {
+            let server = self.server.clone();
+            let tag = self.tag.clone();
+            std::thread::Builder::new()
+                .name(format!("fs-{tag}-stats"))
+                .spawn(move || {
+                    // `LIGHTER_FS_STATS` doubles as the interval in seconds, so
+                    // a short workload can be given windows it fits inside.
+                    let every = std::env::var("LIGHTER_FS_STATS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|seconds| *seconds > 0)
+                        .unwrap_or(5);
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(every));
+                        server.log_stats();
+                    }
+                })
+                .expect("failed to spawn the filesystem stats thread");
+        }
         self.pool = Some(Pool::start(
             self.server.clone(),
             mem,
@@ -360,31 +470,54 @@ impl VirtioDevice for Fs {
                 Serviced::queue_if(HIPRIO_QUEUE, used)
             }
             REQUEST_QUEUE => {
-                let Some(pool_present) = self.pool.as_ref().map(|p| p.jobs.clone()) else {
+                let (Some(queue), Some(memory)) = (
+                    self.pool.as_ref().map(|pool| pool.queue.clone()),
+                    self.memory.clone(),
+                ) else {
                     return Serviced::NONE;
                 };
                 let Some(requests) = queues.get_mut(REQUEST_QUEUE as usize) else {
                     return Serviced::NONE;
                 };
+                let mut used = false;
                 while let Some(chain) = requests.pop(mem) {
                     let head = chain.head();
                     let (request, reply) = Fs::split(mem, chain);
-                    if pool_present
-                        .send(Job {
-                            head,
-                            request,
-                            reply,
-                        })
-                        .is_err()
-                    {
+
+                    // The lone request in a quiet moment is served right here,
+                    // on the vCPU that asked for it.
+                    //
+                    // This is the difference between a round trip and a round
+                    // trip plus two context switches, and on a workload that
+                    // waits for each answer before asking the next question —
+                    // which is most of what a package manager does — the
+                    // context switches were the larger half. The pool still
+                    // exists and still matters: the moment a second request is
+                    // outstanding, everything goes to it, so a slow syscall
+                    // stalls one core for one operation rather than becoming a
+                    // queue everything else waits behind.
+                    if queue.is_empty() && self.inline {
+                        let mut sink = ChainSink::new(memory.clone(), reply);
+                        let written = self.server.dispatch(&request, &mut sink);
+                        requests.push_used(mem, head, written as u32);
+                        used = true;
+                        continue;
+                    }
+
+                    if !queue.push(Job {
+                        head,
+                        request,
+                        reply,
+                    }) {
                         // Every worker is gone. Return the chain rather than
                         // leaking it, so the guest sees an error instead of a
                         // hang.
                         requests.push_used(mem, head, 0);
+                        used = true;
                     }
                 }
-                let used = self.reap(&mut queues[REQUEST_QUEUE as usize], mem);
-                Serviced::queue_if(REQUEST_QUEUE, used)
+                let reaped = self.reap(&mut queues[REQUEST_QUEUE as usize], mem);
+                Serviced::queue_if(REQUEST_QUEUE, used || reaped)
             }
             _ => Serviced::NONE,
         }

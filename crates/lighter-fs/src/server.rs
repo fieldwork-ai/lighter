@@ -29,11 +29,16 @@
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::cache::{Answer, Invalidator, Policy, Timings};
 use crate::errno::linux;
+use crate::fsevents::Watcher;
 use crate::fuse::{self, Attr, EntryOut, InHeader, get_name, get_u32, get_u64, op};
 use crate::inode::{Handle, Inode, OpenDir, OpenFile, Registry};
+use crate::opencache::OpenCache;
+use crate::stats::Stats;
 use crate::sys::{self, TimeSpec};
 
 /// The largest write we accept in one request, and the readahead we permit.
@@ -86,16 +91,75 @@ pub struct Server {
     host_gid: u32,
     /// Negotiated at INIT, and read by READ to bound a reply.
     max_write: AtomicU32,
+    /// How long the guest may believe what we tell it.
+    policy: Arc<Policy>,
+    /// Descriptors held on the guest's behalf, since it no longer reports its
+    /// opens. See [`crate::opencache`].
+    open_cache: OpenCache,
+    /// Opcode counters, off unless asked for.
+    stats: Stats,
+    /// The host watcher that keeps the policy honest.
+    ///
+    /// Held rather than used: dropping it stops the stream, after which every
+    /// answer would be cached for its full timeout with nothing to shorten it.
+    /// `None` means FSEvents refused to start, and the server falls back to
+    /// exact coherence rather than to a timeout it cannot invalidate.
+    _watcher: Option<Watcher>,
 }
 
 impl Server {
-    /// Opens `root` and prepares to serve it.
+    /// Opens `root` and prepares to serve it, with the default timings.
     pub fn new(root: &Path) -> std::io::Result<Server> {
+        Server::with_timings(root, Timings::from_env())
+    }
+
+    /// Opens `root` with an explicit caching policy.
+    pub fn with_timings(root: &Path, timings: Timings) -> std::io::Result<Server> {
+        // A share holds a descriptor per remembered inode and per open file,
+        // and macOS starts every process at 256 of them.
+        let descriptors = sys::raise_file_limit();
         let fd = sys::open_root(root).map_err(std::io::Error::from_raw_os_error)?;
         let st = sys::stat_fd(fd.as_raw_fd()).map_err(std::io::Error::from_raw_os_error)?;
         let (dev, ino) = (st.st_dev as i64, st.st_ino);
         // SAFETY: both take no arguments and cannot fail.
         let (host_uid, host_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+
+        // Caching is only defensible because the watcher can withdraw it. If
+        // the stream will not start, the timeouts go to zero rather than
+        // becoming promises that nothing is able to take back.
+        let policy = Arc::new(Policy::new(timings));
+        let watcher = if timings.caching() {
+            match Watcher::start(
+                root,
+                // Short enough that the guest's staleness is dominated by the
+                // timeout rather than by FSEvents' coalescing window.
+                std::time::Duration::from_millis(10),
+                Box::new(Invalidator::new(policy.clone())),
+            ) {
+                Ok(started) => Some(started),
+                Err(why) => {
+                    tracing::warn!(%why, "cannot watch the host; serving with no caching at all");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let policy = if timings.caching() && watcher.is_none() {
+            Arc::new(Policy::new(Timings::NONE))
+        } else {
+            policy
+        };
+
+        tracing::info!(
+            root = %root.display(),
+            attr_ms = policy.timings().attr.as_millis(),
+            entry_ms = policy.timings().entry_file.as_millis(),
+            dir_entry_ms = policy.timings().entry_dir.as_millis(),
+            watched = watcher.is_some(),
+            descriptors,
+            "share opened"
+        );
         Ok(Server {
             root: root.to_path_buf(),
             root_dev: dev,
@@ -103,6 +167,10 @@ impl Server {
             host_uid,
             host_gid,
             max_write: AtomicU32::new(MAX_WRITE),
+            policy,
+            open_cache: OpenCache::new(),
+            stats: Stats::new(),
+            _watcher: watcher,
         })
     }
 
@@ -129,7 +197,7 @@ impl Server {
         match header.opcode {
             op::FORGET => {
                 if let Some(count) = get_u64(body, 0) {
-                    self.registry.forget(header.nodeid, count);
+                    self.forget(header.nodeid, count);
                 }
                 return 0;
             }
@@ -140,7 +208,11 @@ impl Server {
             _ => {}
         }
 
+        let started = self.stats.enabled().then(std::time::Instant::now);
         let outcome = self.handle(&header, body, sink.capacity());
+        if let Some(started) = started {
+            self.stats.record(header.opcode, started.elapsed());
+        }
         match outcome {
             Ok(payload) => {
                 let len = fuse::OUT_HEADER_LEN + payload.len();
@@ -173,7 +245,15 @@ impl Server {
     fn handle(&self, header: &InHeader, body: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
         match header.opcode {
             op::INIT => self.init(body),
-            op::DESTROY | op::FLUSH | op::SYNCFS => Ok(Vec::new()),
+            op::SYNCFS => Ok(Vec::new()),
+            // Likewise: a flush that can only ever succeed is a round trip on
+            // every `close`, and the kernel will stop sending them if told
+            // once that we do not implement it.
+            op::FLUSH => Err(linux::ENOSYS),
+            op::DESTROY => {
+                self.log_stats();
+                Ok(Vec::new())
+            }
             op::LOOKUP => self.lookup(header.nodeid, body),
             op::GETATTR => self.getattr(header.nodeid, body),
             op::SETATTR => self.setattr(header.nodeid, body),
@@ -186,10 +266,14 @@ impl Server {
             op::RENAME => self.rename(header.nodeid, body, false),
             op::RENAME2 => self.rename(header.nodeid, body, true),
             op::LINK => self.link(header.nodeid, body),
-            op::OPEN => self.open(header.nodeid, body),
+            // Answering ENOSYS here is not a refusal, it is a negotiation:
+            // Linux records it once and thereafter opens, closes and flushes a
+            // file without telling us. See `crate::opencache` for what that
+            // buys and what it costs.
+            op::OPEN | op::OPENDIR => Err(linux::ENOSYS),
             op::CREATE => self.create(header.nodeid, body),
-            op::READ => self.read(body, capacity),
-            op::WRITE => self.write(body),
+            op::READ => self.read(header.nodeid, body, capacity),
+            op::WRITE => self.write(header.nodeid, body),
             op::STATFS => self.statfs(),
             op::RELEASE | op::RELEASEDIR => {
                 if let Some(fh) = get_u64(body, 0) {
@@ -197,13 +281,12 @@ impl Server {
                 }
                 Ok(Vec::new())
             }
-            op::FSYNC | op::FSYNCDIR => self.fsync(body),
-            op::OPENDIR => self.opendir(header.nodeid),
-            op::READDIR => self.readdir(body, capacity, false),
-            op::READDIRPLUS => self.readdir(body, capacity, true),
+            op::FSYNC | op::FSYNCDIR => self.fsync(header.nodeid, body),
+            op::READDIR => self.readdir(header.nodeid, body, capacity, false),
+            op::READDIRPLUS => self.readdir(header.nodeid, body, capacity, true),
             op::ACCESS => self.access(header.nodeid, body),
-            op::LSEEK => self.lseek(body),
-            op::FALLOCATE => self.fallocate(body),
+            op::LSEEK => self.lseek(header.nodeid, body),
+            op::FALLOCATE => self.fallocate(header.nodeid, body),
             op::GETXATTR => self.getxattr(header.nodeid, body),
             op::SETXATTR => self.setxattr(header.nodeid, body),
             op::LISTXATTR => self.listxattr(header.nodeid, body),
@@ -213,6 +296,21 @@ impl Server {
             // learns, and for most of these the kernel then stops asking.
             op::IOCTL => Err(25), // ENOTTY: no ioctl reaches a passthrough file
             _ => Err(linux::ENOSYS),
+        }
+    }
+
+    /// Whether opcode counting is on.
+    pub fn stats_enabled(&self) -> bool {
+        self.stats.enabled()
+    }
+
+    /// Prints the opcode histogram, if one was being kept.
+    pub fn log_stats(&self) {
+        if self.stats.enabled() {
+            for line in self.stats.report().lines() {
+                tracing::info!("{line}");
+            }
+            self.stats.reset();
         }
     }
 
@@ -229,9 +327,17 @@ impl Server {
         }
 
         // Everything we are willing to do, intersected with what the guest
-        // offered. Notably absent: WRITEBACK_CACHE and CACHE_SYMLINKS, both of
-        // which trade coherence for speed, and SETXATTR_EXT, which changes a
-        // structure's size on the wire and whose absence the parser relies on.
+        // offered.
+        //
+        // Notably absent is WRITEBACK_CACHE. It would make writes faster, and
+        // it is the wrong trade: it buffers the guest's writes in the guest and
+        // hands the guest ownership of size and mtime, so a file a container
+        // has written is not on the Mac until some later flush. That is the one
+        // direction of coherence that must stay exact — you save in the editor,
+        // you run the tests; you do not want the reverse to need a sync.
+        //
+        // SETXATTR_EXT is absent for a different reason: it changes a
+        // structure's size on the wire, and the parser relies on its absence.
         let wanted = fuse::init::ASYNC_READ
             | fuse::init::BIG_WRITES
             | fuse::init::ATOMIC_O_TRUNC
@@ -241,7 +347,22 @@ impl Server {
             | fuse::init::PARALLEL_DIROPS
             | fuse::init::AUTO_INVAL_DATA
             | fuse::init::MAX_PAGES
+            // Without this the kernel does the "drop setuid and file
+            // capabilities on write" dance itself, which costs it a GETXATTR
+            // and sometimes a SETATTR per written file — thirteen thousand
+            // round trips in a package install that produces nothing. With it,
+            // the server takes on that duty, which on macOS the kernel already
+            // performs for us: writing to a file clears its setuid and setgid
+            // bits, and file capabilities do not exist here at all.
+            | fuse::init::HANDLE_KILLPRIV
             | fuse::init::ABORT_ERROR;
+        // Symlink targets are cached for the same duration as attributes, so
+        // this is only offered when there is a watcher to withdraw it.
+        let wanted = if self.policy.timings().caching() {
+            wanted | fuse::init::CACHE_SYMLINKS
+        } else {
+            wanted
+        };
         let flags = wanted & offered;
         let max_write = if flags & fuse::init::MAX_PAGES != 0 {
             MAX_WRITE
@@ -286,7 +407,20 @@ impl Server {
             else {
                 return;
             };
-            self.registry.forget(nodeid, nlookup);
+            self.forget(nodeid, nlookup);
+        }
+    }
+
+    /// Drops a lookup reference, and with it anything held on the inode's
+    /// behalf.
+    ///
+    /// The cached descriptor has to go with the inode: it is keyed by nodeid,
+    /// and nodeids are never reused, so a survivor would be a descriptor that
+    /// nothing can ever reach again.
+    fn forget(&self, nodeid: u64, count: u64) {
+        self.registry.forget(nodeid, count);
+        if self.registry.get(nodeid).is_none() {
+            self.open_cache.evict(nodeid);
         }
     }
 
@@ -313,24 +447,85 @@ impl Server {
     /// body that LOOKUP, CREATE, MKDIR and friends all end with.
     fn entry(&self, parent: &Inode, name: &CString) -> Result<EntryOut, i32> {
         let st = sys::stat_at(parent.raw_fd(), name)?;
+        self.entry_from(parent, name, st)
+    }
+
+    /// [`Server::entry`], for a caller that already has the `stat`.
+    fn entry_from(&self, parent: &Inode, name: &CString, st: libc::stat) -> Result<EntryOut, i32> {
+        self.entry_with_reference(parent, st, || {
+            let is_symlink =
+                st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
+            sys::open_reference(parent.raw_fd(), name, is_symlink)
+        })
+    }
+
+    /// The common tail of every reply that names an inode.
+    ///
+    /// `reference` is only called when the inode is new to us, which is the
+    /// whole reason it is a closure: on the hot path — a name the guest has
+    /// looked up before — no descriptor is opened at all.
+    fn entry_with_reference(
+        &self,
+        parent: &Inode,
+        st: libc::stat,
+        reference: impl FnOnce() -> Result<std::os::fd::OwnedFd, i32>,
+    ) -> Result<EntryOut, i32> {
         let mode = st.st_mode as u32;
         let is_dir = mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
         let is_symlink = mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
-        let fd = sys::open_reference(parent.raw_fd(), name, is_symlink)?;
-        let nodeid = self
-            .registry
-            .insert(fd, st.st_dev as i64, st.st_ino, is_dir, is_symlink);
+        let (dev, ino) = (st.st_dev as i64, st.st_ino);
+
+        // An inode we already hold needs no second descriptor. Worth the extra
+        // branch: this is the single hottest path in the whole server, and the
+        // descriptor it skips opening is most of the cost of a repeated lookup.
+        let nodeid = match self.registry.relookup(dev, ino) {
+            Some(existing) => existing,
+            None => self
+                .registry
+                .insert(reference()?, dev, ino, is_dir, is_symlink),
+        };
+
+        // Validity is asked of the *parent*, because that is what the host
+        // would have had to change for this name to mean something else.
+        let answer = if is_dir { Answer::Directory } else { Answer::File };
+        let entry_valid = self.policy.validity(parent.dev, parent.ino, answer);
+        let attr_valid = self.policy.attr_validity(dev, ino);
         Ok(EntryOut {
             nodeid,
             generation: 0,
-            // Zero on both timeouts: revalidate everything, every time. The
-            // next milestone earns the right to raise these.
-            entry_valid: 0,
-            attr_valid: 0,
-            entry_valid_nsec: 0,
-            attr_valid_nsec: 0,
+            entry_valid: entry_valid.as_secs(),
+            attr_valid: attr_valid.as_secs(),
+            entry_valid_nsec: entry_valid.subsec_nanos(),
+            attr_valid_nsec: attr_valid.subsec_nanos(),
             attr: self.attr(&st),
         })
+    }
+
+    /// The reply that says "this name does not exist, and you may remember
+    /// that for a while".
+    ///
+    /// Module resolution is mostly failed lookups — `require('x')` stats a
+    /// dozen paths that are not there for every one that is — so caching the
+    /// absence is worth as much as caching the presence. A `nodeid` of zero is
+    /// how the protocol spells it; with no validity it is just ENOENT, which
+    /// is what an unwatched share falls back to.
+    fn missing(&self, parent: &Inode) -> Result<Vec<u8>, i32> {
+        let valid = self.policy.validity(parent.dev, parent.ino, Answer::Missing);
+        if valid.is_zero() {
+            return Err(linux::ENOENT);
+        }
+        let mut out = Vec::with_capacity(fuse::ENTRY_OUT_LEN);
+        EntryOut {
+            nodeid: 0,
+            generation: 0,
+            entry_valid: valid.as_secs(),
+            attr_valid: 0,
+            entry_valid_nsec: valid.subsec_nanos(),
+            attr_valid_nsec: 0,
+            attr: Attr::default(),
+        }
+        .encode(&mut out);
+        Ok(out)
     }
 
     fn checked_name(&self, raw: &[u8]) -> Result<CString, i32> {
@@ -391,9 +586,12 @@ impl Server {
     }
 
     fn attr_reply(&self, st: &libc::stat) -> Vec<u8> {
+        let valid = self
+            .policy
+            .attr_validity(st.st_dev as i64, st.st_ino);
         let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
-        out.extend_from_slice(&0u64.to_le_bytes()); // attr_valid
-        out.extend_from_slice(&0u32.to_le_bytes()); // attr_valid_nsec
+        out.extend_from_slice(&valid.as_secs().to_le_bytes());
+        out.extend_from_slice(&valid.subsec_nanos().to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // padding
         self.attr(st).encode(&mut out);
         out
@@ -411,8 +609,11 @@ impl Server {
         let parent = self.directory(parent)?;
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        let entry = self.entry(&parent, &name)?;
-        Ok(self.entry_reply(&entry))
+        match self.entry(&parent, &name) {
+            Ok(entry) => Ok(self.entry_reply(&entry)),
+            Err(linux::ENOENT) => self.missing(&parent),
+            Err(other) => Err(other),
+        }
     }
 
     fn getattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
@@ -494,15 +695,16 @@ impl Server {
             let size = get_u64(body, 16).ok_or(linux::EINVAL)?;
             // Truncating needs a writable descriptor, and the handle the guest
             // supplied may be read-only or absent entirely.
-            let opened;
-            let fd = match self.writable_handle(valid, body) {
-                Some(fd) => fd,
-                None => {
-                    opened = sys::reopen(&inode.fd, 1 /* O_WRONLY */, 0)?;
-                    opened.as_raw_fd()
-                }
+            // The guest may have named a handle, but with opens no longer
+            // reported most truncations arrive without one — so the descriptor
+            // is resolved the same way a write's is.
+            let fh = if valid & fuse::fattr::FH != 0 {
+                get_u64(body, 8).unwrap_or(0)
+            } else {
+                0
             };
-            sys::truncate_fd(fd, size)?;
+            let file = self.file_for(nodeid, fh, true)?;
+            sys::truncate_fd(file.fd.as_raw_fd(), size)?;
         }
 
         let st = sys::stat_fd(inode.raw_fd())?;
@@ -603,18 +805,73 @@ impl Server {
         Ok(self.entry_reply(&entry))
     }
 
-    fn open(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+    /// What the guest may do with the page cache of a file it just created.
+    ///
+    /// CREATE is the one open the guest still reports, because it is also a
+    /// name change; every later open of the same file happens without telling
+    /// us at all. `FOPEN_KEEP_CACHE` matches what the kernel assumes for those,
+    /// so a file behaves the same whether or not the process that opened it was
+    /// the one that made it.
+    fn created_file_flags(&self) -> u32 {
+        if self.policy.timings().attr.is_zero() {
+            0
+        } else {
+            fuse::fopen::KEEP_CACHE
+        }
+    }
+
+    /// The descriptor an operation should act on.
+    ///
+    /// A non-zero `fh` names a handle the guest was given by CREATE, and is
+    /// authoritative. A zero one means the guest has stopped reporting opens,
+    /// so the inode is the only thing identifying the file and the descriptor
+    /// is ours to find or make.
+    fn file_for(&self, nodeid: u64, fh: u64, need_write: bool) -> Result<Arc<OpenFile>, i32> {
+        if fh != 0
+            && let Some(handle) = self.registry.handle(fh)
+        {
+            return handle.file().ok_or(linux::EISDIR);
+        }
+        if let Some(cached) = self.open_cache.file(nodeid, need_write) {
+            return Ok(cached);
+        }
         let inode = self.inode(nodeid)?;
         if inode.is_dir {
             return Err(linux::EISDIR);
         }
-        let flags = get_u32(body, 0).ok_or(linux::EINVAL)?;
+        // Read-write when a write is coming, read-only otherwise: most files
+        // are only ever read, and asking for write access to a read-only file
+        // fails outright rather than degrading.
+        let flags = if need_write { 2 } else { 0 };
         let fd = sys::reopen(&inode.fd, flags, 0)?;
-        let fh = self.registry.add_handle(Handle::File(OpenFile {
+        let file = Arc::new(OpenFile {
             fd,
-            append: flags & 0o2000 != 0,
-        }));
-        Ok(open_reply(fh, 0))
+            append: false,
+            writable: need_write,
+        });
+        self.open_cache.put_file(nodeid, file.clone());
+        Ok(file)
+    }
+
+    /// The listing a READDIR should serve from.
+    fn dir_for(&self, nodeid: u64) -> Result<Arc<OpenDir>, i32> {
+        if let Some(cached) = self.open_cache.directory(nodeid) {
+            return Ok(cached);
+        }
+        let dir = Arc::new(OpenDir {
+            nodeid,
+            entries: std::sync::Mutex::new(Vec::new()),
+        });
+        self.open_cache.put_directory(nodeid, dir.clone());
+        Ok(dir)
+    }
+
+    /// Reads a directory in full, from wherever it now lives.
+    fn list(&self, nodeid: u64) -> Result<Vec<sys::DirEntry>, i32> {
+        let inode = self.directory(nodeid)?;
+        // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
+        let fd = sys::reopen(&inode.fd, 0o200000, 0)?;
+        sys::Dir::from_fd(fd)?.read_all()
     }
 
     fn create(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
@@ -634,22 +891,28 @@ impl Server {
             flags | LINUX_O_CREAT,
             mode & 0o7777 & !umask,
         )?;
-        let entry = self.entry(&parent, &name)?;
-        let fh = self.registry.add_handle(Handle::File(OpenFile {
+        // Everything below avoids re-resolving a path we are already holding
+        // open. A package install creates tens of thousands of files, and the
+        // naive version costs two `openat`s and a path-based `stat` for each:
+        // `fstat` on the descriptor we have, and `dup` rather than a second
+        // `openat` for the metadata reference.
+        let st = sys::stat_fd(fd.as_raw_fd())?;
+        let entry = self.entry_with_reference(&parent, st, || sys::dup(&fd))?;
+        let fh = self.registry.add_handle(Handle::File(Arc::new(OpenFile {
             fd,
             append: flags & 0o2000 != 0,
-        }));
+            writable: flags & 0o3 != 0,
+        })));
         let mut out = self.entry_reply(&entry);
-        out.extend_from_slice(&open_reply(fh, 0));
+        out.extend_from_slice(&open_reply(fh, self.created_file_flags()));
         Ok(out)
     }
 
-    fn read(&self, body: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
+    fn read(&self, nodeid: u64, body: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
-        let handle = self.registry.handle(fh).ok_or(linux::EBADF)?;
-        let file = handle.file().ok_or(linux::EISDIR)?;
+        let file = self.file_for(nodeid, fh, false)?;
         // The guest sized the reply chain; never promise more than it can hold.
         let size = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
         let mut buf = vec![0u8; size];
@@ -658,13 +921,12 @@ impl Server {
         Ok(buf)
     }
 
-    fn write(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn write(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
         let data = body.get(40..40 + size).ok_or(linux::EINVAL)?;
-        let handle = self.registry.handle(fh).ok_or(linux::EBADF)?;
-        let file = handle.file().ok_or(linux::EISDIR)?;
+        let file = self.file_for(nodeid, fh, true)?;
         let written = if file.append {
             sys::write_append(file.fd.as_raw_fd(), data)?
         } else {
@@ -676,17 +938,16 @@ impl Server {
         Ok(out)
     }
 
-    fn fsync(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn fsync(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let datasync = get_u32(body, 8).unwrap_or(0) & 1 != 0;
-        let handle = self.registry.handle(fh).ok_or(linux::EBADF)?;
-        match &*handle {
-            Handle::File(file) => sys::fsync(file.fd.as_raw_fd(), datasync)?,
-            // A directory stream has no descriptor we can safely sync without
-            // taking its cursor lock, and the guest's own metadata is already
-            // on the host by the time the operation that changed it returned.
-            Handle::Dir(_) => {}
+        // A directory has nothing to sync: its metadata reached the host when
+        // the operation that changed it returned.
+        if self.inode(nodeid).is_ok_and(|inode| inode.is_dir) {
+            return Ok(Vec::new());
         }
+        let file = self.file_for(nodeid, fh, false)?;
+        sys::fsync(file.fd.as_raw_fd(), datasync)?;
         Ok(Vec::new())
     }
 
@@ -705,39 +966,30 @@ impl Server {
         Ok(out)
     }
 
-    fn opendir(&self, nodeid: u64) -> Result<Vec<u8>, i32> {
-        let inode = self.directory(nodeid)?;
-        // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
-        let fd = sys::reopen(&inode.fd, 0o200000, 0)?;
-        let stream = sys::Dir::from_fd(fd)?;
-        let fh = self.registry.add_handle(Handle::Dir(OpenDir {
-            nodeid,
-            stream: std::sync::Mutex::new(stream),
-        }));
-        Ok(open_reply(fh, 0))
-    }
-
-    fn readdir(&self, body: &[u8], capacity: usize, plus: bool) -> Result<Vec<u8>, i32> {
-        let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
-        let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
+    fn readdir(
+        &self,
+        nodeid: u64,
+        body: &[u8],
+        capacity: usize,
+        plus: bool,
+    ) -> Result<Vec<u8>, i32> {
+        let offset = get_u64(body, 8).ok_or(linux::EINVAL)? as usize;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
         let budget = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
 
-        let handle = self.registry.handle(fh).ok_or(linux::EBADF)?;
-        let Handle::Dir(open) = &*handle else {
-            return Err(linux::ENOTDIR);
-        };
-        let parent = self.directory(open.nodeid)?;
-        let mut dir = open.stream.lock().expect("directory stream poisoned");
-        dir.seek(offset);
+        let open = self.dir_for(nodeid)?;
+        let mut entries = open.entries.lock().expect("directory listing poisoned");
+        // A caller starting from the beginning is asking for a fresh view;
+        // anyone resuming gets the list the first page came from, so the
+        // offsets they were given still mean what they meant.
+        if offset == 0 || entries.is_empty() {
+            *entries = self.list(nodeid)?;
+        }
+        let parent = self.directory(nodeid)?;
 
         let mut out = Vec::new();
-        while let Some(entry) = dir.read()? {
-            // An entry that does not fit simply ends the reply. Nothing is
-            // rewound: the guest resumes from the `off` of the last entry we
-            // did emit, which is exactly this one. Seeking here instead —
-            // which an earlier draft did — double-counts, and a directory
-            // listing quietly loses one file per page boundary.
+        for (index, entry) in entries.iter().enumerate().skip(offset) {
+            let next = index as u64 + 1;
             if plus {
                 // A READDIRPLUS record is an entry followed by a dirent, and
                 // the entry has to be built before its size is known, so the
@@ -758,8 +1010,8 @@ impl Server {
                 };
                 match looked_up {
                     Some(found) => found.encode(&mut out),
-                    // A file that vanished between `readdir` and `stat` is
-                    // ordinary. A zeroed entry names nothing and the guest
+                    // A file that vanished between the listing and the lookup
+                    // is ordinary. A zeroed entry names nothing, and the guest
                     // treats the record as a plain dirent.
                     None => out.resize(out.len() + fuse::ENTRY_OUT_LEN, 0),
                 }
@@ -768,7 +1020,7 @@ impl Server {
                 &mut out,
                 budget,
                 entry.ino,
-                entry.next_offset,
+                next,
                 entry.kind,
                 &entry.name,
             ) {
@@ -780,16 +1032,6 @@ impl Server {
         Ok(out)
     }
 
-    /// The descriptor a SETATTR should truncate, if the guest named one.
-    fn writable_handle(&self, valid: u32, body: &[u8]) -> Option<std::os::fd::RawFd> {
-        if valid & fuse::fattr::FH == 0 {
-            return None;
-        }
-        let fh = get_u64(body, 8)?;
-        let handle = self.registry.handle(fh)?;
-        handle.raw_fd()
-    }
-
     fn access(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let mask = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let inode = self.inode(nodeid)?;
@@ -798,23 +1040,21 @@ impl Server {
         Ok(Vec::new())
     }
 
-    fn lseek(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn lseek(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let whence = get_u32(body, 16).ok_or(linux::EINVAL)?;
-        let handle = self.registry.handle(fh).ok_or(linux::EBADF)?;
-        let file = handle.file().ok_or(linux::EBADF)?;
+        let file = self.file_for(nodeid, fh, false)?;
         let at = sys::seek(file.fd.as_raw_fd(), offset, whence)?;
         Ok(at.to_le_bytes().to_vec())
     }
 
-    fn fallocate(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn fallocate(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let length = get_u64(body, 16).ok_or(linux::EINVAL)?;
         let mode = get_u32(body, 24).ok_or(linux::EINVAL)?;
-        let handle = self.registry.handle(fh).ok_or(linux::EBADF)?;
-        let file = handle.file().ok_or(linux::EBADF)?;
+        let file = self.file_for(nodeid, fh, true)?;
         sys::fallocate(file.fd.as_raw_fd(), mode, offset, length)?;
         Ok(Vec::new())
     }
@@ -824,6 +1064,9 @@ impl Server {
     fn getxattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let size = get_u32(body, 0).ok_or(linux::EINVAL)? as usize;
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
+        if is_linux_only_namespace(name) {
+            return Err(linux::ENODATA);
+        }
         let name = CString::new(name).map_err(|_| linux::EINVAL)?;
         let inode = self.inode(nodeid)?;
         let path = self.path(&inode)?;
@@ -873,6 +1116,18 @@ impl Server {
         sys::remove_xattr(&path, &name)?;
         Ok(Vec::new())
     }
+}
+
+/// Whether an extended attribute is one only Linux has.
+///
+/// `security.capability` is asked for on every `execve` and, without
+/// `FUSE_HANDLE_KILLPRIV`, on every write; `system.posix_acl_*` is asked for on
+/// every permission check. None of them can exist on a Mac, and answering from
+/// here rather than from a syscall removed about one request in nine from a
+/// package install. `user.*` and `trusted.*` still go to the filesystem, so an
+/// attribute someone actually set still works.
+fn is_linux_only_namespace(name: &[u8]) -> bool {
+    name.starts_with(b"security.") || name.starts_with(b"system.posix_acl_")
 }
 
 /// Mixes a device and inode number into one that cannot collide with either.

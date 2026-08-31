@@ -145,6 +145,77 @@ pub fn open_reference(parent: RawFd, name: &CStr, is_symlink: bool) -> Result<Ow
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// Raises this process's descriptor limit as far as the system allows.
+///
+/// Not housekeeping. A share holds one descriptor per inode the guest is
+/// remembering, plus one per file it has open, and a guest walking a package
+/// tree remembers tens of thousands. macOS ships a soft limit of 256, so
+/// without this the filesystem stops working partway through the first real
+/// workload — as `EMFILE` from an `openat`, which surfaces in the guest as a
+/// file that exists and cannot be opened.
+///
+/// Returns the limit now in force.
+pub fn raise_file_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: an output buffer we own, of the right type.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 0;
+    }
+    // The hard limit is not the real ceiling either: macOS also caps a process
+    // at `kern.maxfilesperproc`, and asking for more than that fails the whole
+    // call rather than clamping.
+    let ceiling = sysctl_u64(c"kern.maxfilesperproc").unwrap_or(10_240);
+    let wanted = limit.rlim_max.min(ceiling);
+    if wanted > limit.rlim_cur {
+        let raised = libc::rlimit {
+            rlim_cur: wanted,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: a correctly-shaped rlimit whose soft limit is within the
+        // hard one.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return wanted;
+        }
+    }
+    limit.rlim_cur
+}
+
+fn sysctl_u64(name: &CStr) -> Option<u64> {
+    let mut value: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    // SAFETY: a valid name, and an output buffer of exactly the length passed.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut i32 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value as u64)
+}
+
+/// A second descriptor for the same open file.
+///
+/// Used where a file has just been created and we need a metadata reference to
+/// it: `dup` costs a fraction of the `openat` that would otherwise re-resolve a
+/// path we are already holding open.
+pub fn dup(fd: &OwnedFd) -> Result<OwnedFd> {
+    // SAFETY: a live descriptor.
+    let raw = check(unsafe { libc::dup(fd.as_raw_fd()) })?;
+    // SAFETY: `dup` returned a fresh descriptor that nothing else owns.
+    let duplicate = unsafe { OwnedFd::from_raw_fd(raw) };
+    // `dup` does not copy FD_CLOEXEC, and a descriptor that survives an exec is
+    // a descriptor leaked into every container process we ever spawn.
+    // SAFETY: a live descriptor and a flag-setting fcntl with no pointer.
+    unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    Ok(duplicate)
+}
+
 /// Opens the root of a share.
 pub fn open_root(path: &Path) -> Result<OwnedFd> {
     let c = cpath(path)?;
@@ -615,10 +686,31 @@ pub fn c_path(path: &Path) -> Result<CString> {
 /// An open directory stream.
 ///
 /// `DIR*` is not thread-safe and its cursor is shared state, so this is not
-/// `Sync`; the server keeps one behind a mutex per open handle, which is also
-/// what the guest's own `readdir` semantics require.
+/// `Sync`; the server keeps one behind a mutex per open directory, which is
+/// also what the guest's own `readdir` semantics require.
+///
+/// # Why nothing here is resumable
+///
+/// FUSE readdir offsets are opaque to the kernel but they are *durable*: it
+/// stores them in its cached page for a directory and may hand one back long
+/// after it got it, from a different process, and — once the server stops being
+/// told about opens — after the server has closed and reopened the stream.
+///
+/// A `telldir` cookie survives none of that. On BSD it is an index into a list
+/// held inside the `DIR`, freed by `closedir` and by `rewinddir`, so a cookie
+/// presented to a different stream means something arbitrary. The symptom is
+/// not an error: `seekdir` quietly lands somewhere else, and a directory
+/// listing repeats entries it has already returned. `cp -a` then decides the
+/// repeat is a hard link to the copy it already made and fails outright, which
+/// is how this was found.
+///
+/// So a stream here is read once, in full, and the caller keeps the result;
+/// see [`crate::inode::OpenDir`]. Offsets are then indices into an immutable
+/// list, which means the same thing to everyone forever.
 pub struct Dir {
     handle: *mut libc::DIR,
+    /// How many entries have been read since the last rewind.
+    position: u64,
 }
 
 // SAFETY: a `DIR*` may be used from any one thread at a time. The server never
@@ -646,18 +738,24 @@ impl Dir {
             return Err(errno::last());
         }
         std::mem::forget(fd);
-        Ok(Dir { handle })
+        Ok(Dir {
+            handle,
+            position: 0,
+        })
     }
 
-    /// Positions the stream. Offset zero means the beginning.
-    pub fn seek(&mut self, offset: u64) {
-        if offset == 0 {
-            // SAFETY: a live DIR*.
-            unsafe { libc::rewinddir(self.handle) };
-        } else {
-            // SAFETY: a live DIR*, and an offset this same stream produced.
-            unsafe { libc::seekdir(self.handle, offset as libc::c_long) };
+    /// Reads the whole directory.
+    ///
+    /// One pass, one allocation, and then the stream is done with. Paging
+    /// through a `DIR*` across separate requests is what a server does when it
+    /// can trust the offsets it hands out, and this one cannot — see the note
+    /// on the type.
+    pub fn read_all(&mut self) -> Result<Vec<DirEntry>> {
+        let mut entries = Vec::new();
+        while let Some(entry) = self.read()? {
+            entries.push(entry);
         }
+        Ok(entries)
     }
 
     /// The next entry, or `None` at end of directory.
@@ -672,7 +770,11 @@ impl Dir {
         if entry.is_null() {
             // SAFETY: reading errno through libc's accessor.
             let err = unsafe { *libc::__error() };
-            return if err == 0 { Ok(None) } else { Err(errno::to_linux(err)) };
+            return if err == 0 {
+                Ok(None)
+            } else {
+                Err(errno::to_linux(err))
+            };
         }
         // SAFETY: non-null, and valid until the next readdir on this stream.
         let entry = unsafe { &*entry };
@@ -681,13 +783,12 @@ impl Dir {
             .iter()
             .map(|&c| c as u8)
             .collect::<Vec<u8>>();
-        // SAFETY: a live DIR*.
-        let next_offset = unsafe { libc::telldir(self.handle) } as u64;
+        self.position += 1;
         Ok(Some(DirEntry {
             ino: entry.d_ino,
             kind: u32::from(entry.d_type),
             name,
-            next_offset,
+            next_offset: self.position,
         }))
     }
 }

@@ -14,16 +14,23 @@
 //!
 //! ```text
 //!   server    one request in, one reply out
-//!     ├── fuse     the wire format, and nothing else
-//!     ├── inode    what a nodeid and an fh mean
-//!     ├── sys      the only unsafe code, one libc call per function
-//!     └── errno    macOS error numbers as Linux ones
+//!     ├── fuse       the wire format, and nothing else
+//!     ├── inode      what a nodeid and an fh mean
+//!     ├── opencache  descriptors held once the guest stops reporting opens
+//!     ├── cache      how long the guest may believe an answer
+//!     ├── fsevents   what the host is changing behind the guest's back
+//!     ├── sys        the only unsafe code, one libc call per function
+//!     └── errno      macOS error numbers as Linux ones
 //! ```
 
+pub mod cache;
 pub mod errno;
+pub mod fsevents;
 pub mod fuse;
 pub mod inode;
+pub mod opencache;
 pub mod server;
+pub mod stats;
 pub mod sys;
 
 pub use server::{MAX_WRITE, Server, Sink, SinkFull};
