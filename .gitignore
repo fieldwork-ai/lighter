@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Guest build artifacts — kernels, rootfs images, and the toolchain caches that
+# produce them. All reproducible from guest/, none belong in git.
+/guest/build/
+/guest/out/
+/guest/src/
+*.img
+*.qcow2
+Image
+vmlinux
+initramfs*.cpio*
+
+# Benchmark output: the committed results live in benchmarks/results/, raw runs
+# do not.
+/benchmarks/raw/
+
+.DS_Store
+.context/

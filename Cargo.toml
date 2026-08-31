@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/nickrogers/lighter"
+authors = ["Nick Rogers"]
+
+[workspace.dependencies]
+lighter-hv = { path = "crates/lighter-hv", version = "0.1.0" }
+
+anyhow = "1"
+thiserror = "2"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# The VMM is a latency-sensitive process: one fat binary, no unwinding cost on
+# the vCPU threads, and the optimizer allowed to see across crate boundaries.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
