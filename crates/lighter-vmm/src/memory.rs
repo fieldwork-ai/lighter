@@ -15,12 +15,15 @@
 
 use std::io;
 use std::ptr;
+use std::sync::Arc;
 
 use lighter_hv::{MemoryPerms, Vm};
 
 /// A failure addressing guest memory.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
+    #[error("this GuestMemory has no VM, so regions cannot be mapped into a guest")]
+    Detached,
     #[error("guest address {gpa:#x} (+{len}) is not backed by RAM")]
     OutOfBounds { gpa: u64, len: usize },
     #[error("mmap of {0} bytes failed: {1}")]
@@ -109,8 +112,14 @@ impl Region {
 ///
 /// Shared by every vCPU thread and every device model, so it is `Sync`; see the
 /// module comment for why that is sound despite the interior mutability.
-#[derive(Debug, Default)]
+///
+/// Holds the `Vm` because tearing a region down has a mandatory order: remove
+/// it from the guest's address space *first*, then release the host pages. The
+/// reverse leaves the guest with stage-2 entries pointing at memory the host has
+/// reused, which is a use-after-free the guest performs on our behalf.
+#[derive(Debug)]
 pub struct GuestMemory {
+    vm: Option<Arc<Vm>>,
     regions: Vec<Region>,
 }
 
@@ -123,12 +132,26 @@ unsafe impl Send for GuestMemory {}
 unsafe impl Sync for GuestMemory {}
 
 impl GuestMemory {
-    pub fn new() -> GuestMemory {
-        GuestMemory::default()
+    /// Memory belonging to a VM. Regions added here are unmapped on drop.
+    pub fn new(vm: Arc<Vm>) -> GuestMemory {
+        GuestMemory {
+            vm: Some(vm),
+            regions: Vec::new(),
+        }
+    }
+
+    /// An address space with no VM behind it, for tests of code that only
+    /// reads and writes bytes. `add_region` on one of these fails.
+    pub fn detached() -> GuestMemory {
+        GuestMemory {
+            vm: None,
+            regions: Vec::new(),
+        }
     }
 
     /// Allocates `len` bytes of host RAM and maps it into the guest at `gpa`.
-    pub fn add_region(&mut self, vm: &Vm, gpa: u64, len: usize) -> Result<()> {
+    pub fn add_region(&mut self, gpa: u64, len: usize) -> Result<()> {
+        let vm = self.vm.clone().ok_or(MemoryError::Detached)?;
         if self
             .regions
             .iter()
@@ -141,8 +164,8 @@ impl GuestMemory {
         let host = backing.ptr;
 
         // SAFETY: the backing mapping is owned by the Region we are about to
-        // push, so it outlives the guest mapping; Drop order unmaps the guest
-        // side first because GuestMemory is dropped before the Vm.
+        // push, and `Drop for GuestMemory` removes the guest mapping before
+        // that Region — and therefore the host pages — goes away.
         unsafe { vm.map(host.cast(), gpa, len, MemoryPerms::RWX)? };
 
         self.regions.push(Region {
@@ -262,6 +285,85 @@ impl GuestMemory {
         let region = self.region_for(gpa, len)?;
         Ok(region.host_addr(gpa))
     }
+
+    /// Returns a span of guest memory to macOS.
+    ///
+    /// This is the mechanism behind "the VM gives memory back": the mapping
+    /// stays, so the guest can touch these addresses again at any time, but the
+    /// physical pages are released and the next access faults in a fresh zero
+    /// page. Both users — the balloon and free page reporting — are telling us
+    /// the guest does not care what is there, which is exactly the contract
+    /// `MADV_FREE_REUSABLE` wants.
+    ///
+    /// # Guest pages are smaller than host pages
+    ///
+    /// The guest reports 4 KiB pages; Apple silicon hosts use 16 KiB ones. A
+    /// release that is not aligned to a *host* page frees nothing at all, so the
+    /// aligned interior is what gets released and the ragged edges are dropped.
+    /// This is why the balloon coalesces runs before calling: one 4 KiB page is
+    /// never releasable, but four contiguous ones are.
+    ///
+    /// Returns the number of bytes actually released.
+    pub fn release(&self, gpa: u64, len: u64) -> Result<u64> {
+        let page = host_page_size();
+        let start = gpa.div_ceil(page) * page;
+        let end = (gpa + len) / page * page;
+        if end <= start {
+            // The span does not cover a whole host page; nothing to release.
+            return Ok(0);
+        }
+
+        let span = (end - start) as usize;
+        let region = self.region_for(start, span)?;
+        let addr = region.host_addr(start);
+
+        // SAFETY: `addr` is inside a live mapping of at least `span` bytes,
+        // checked above. MADV_FREE_REUSABLE does not unmap: the address stays
+        // valid and reads fault in zeroes, which is what the guest expects of
+        // memory it told us it was not using.
+        let rc = unsafe { libc::madvise(addr.cast(), span, MADV_FREE_REUSABLE) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            // Not fatal: failing to release memory costs footprint, not
+            // correctness, and killing the guest over it would be worse.
+            tracing::debug!(%err, gpa, len, "could not release guest memory to the host");
+            return Ok(0);
+        }
+        Ok(span as u64)
+    }
+}
+
+impl Drop for GuestMemory {
+    fn drop(&mut self) {
+        // Order is the whole point: every region leaves the guest's address
+        // space before `self.regions` — and with it the host mappings — is
+        // dropped. Skipping this also leaks the guest-physical range, so a
+        // later VM in the same process cannot map the same address again.
+        if let Some(vm) = &self.vm {
+            for region in &self.regions {
+                // SAFETY: no vCPU can be running: GuestMemory is held by the
+                // Machine, which joins every vCPU thread before dropping it.
+                unsafe {
+                    let _ = vm.unmap(region.gpa, region.len);
+                }
+            }
+        }
+    }
+}
+
+/// macOS: pages can be reused by anyone.
+const MADV_FREE_REUSABLE: libc::c_int = 7;
+
+/// The host's page size, which on Apple silicon is 16 KiB rather than the 4 KiB
+/// the guest uses.
+fn host_page_size() -> u64 {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<u64> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        // SAFETY: sysconf with a valid name has no side effects.
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if size > 0 { size as u64 } else { 16384 }
+    })
 }
 
 #[cfg(test)]

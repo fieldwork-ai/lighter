@@ -32,6 +32,13 @@ fn main() -> ExitCode {
                 let mib: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(2048);
                 config.ram_bytes = mib << 20;
             }
+            "--disk" => config
+                .disks
+                .push(PathBuf::from(args.next().unwrap_or_default())),
+            "--disk-size-gib" => {
+                let gib: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(64);
+                config.disk_size_bytes = gib << 30;
+            }
             "--no-tty" => config.interactive = false,
             other => {
                 eprintln!("unknown argument: {other}");

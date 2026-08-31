@@ -1,38 +1,37 @@
-   Compiling lighter-hv v0.1.0 (/Users/nick/git/lighter/crates/lighter-hv)
    Compiling lighter-vmm v0.1.0 (/Users/nick/git/lighter/crates/lighter-vmm)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.68s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.92s
      Running unittests src/lib.rs (target/debug/deps/lighter_hv-85f6c9ffc77b0e4a)
 
 running 2 tests
-test regs::tests::gpr_index_maps_to_declaration_order ... ok
 test regs::tests::sysreg_encoding_matches_sdk_values ... ok
+test regs::tests::gpr_index_maps_to_declaration_order ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
      Running unittests src/lib.rs (target/debug/deps/lighter_vmm-f2b61a847ad21603)
 
-running 37 tests
-test bus::tests::rejects_aborts_that_are_not_device_accesses ... ok
-test bus::tests::decodes_access_width_and_direction ... ok
+running 72 tests
 test bus::tests::refuses_to_guess_without_a_syndrome ... ok
+test bus::tests::rejects_aborts_that_are_not_device_accesses ... ok
 test bus::tests::sign_extension_follows_the_access_width ... ok
-test devices::pl011::tests::identifies_as_a_pl011_to_the_amba_bus ... ok
-test bus::tests::unclaimed_addresses_read_zero_rather_than_faulting ... ok
-test devices::pl011::tests::receive_path_tracks_fifo_emptiness ... ok
-test bus::tests::dispatches_by_window_and_offsets_relative_to_it ... ok
+test bus::tests::decodes_access_width_and_direction ... ok
 test bus::tests::rejects_overlapping_windows ... ok
+test bus::tests::unclaimed_addresses_read_zero_rather_than_faulting ... ok
 test devices::pl011::tests::interrupt_status_masks_and_clears ... ok
-test kernel::tests::alignment_is_idempotent_and_rounds_up ... ok
+test devices::pl011::tests::identifies_as_a_pl011_to_the_amba_bus ... ok
+test bus::tests::dispatches_by_window_and_offsets_relative_to_it ... ok
+test devices::pl011::tests::receive_path_tracks_fifo_emptiness ... ok
 test devices::pl011::tests::guest_writes_reach_the_sink ... ok
 test devices::pl011::tests::input_is_bounded_and_drops_rather_than_growing ... ok
+test kernel::tests::alignment_is_idempotent_and_rounds_up ... ok
 test kernel::tests::parses_a_real_header_shape ... ok
-test layout::tests::device_window_clears_the_maximum_redistributor_region ... ok
 test kernel::tests::rejects_anything_that_is_not_an_image ... ok
+test layout::tests::device_window_clears_the_maximum_redistributor_region ... ok
 test layout::tests::rejects_a_redistributor_that_would_swallow_the_devices ... ok
-test layout::tests::virtio_slots_tile_their_window_without_gaps ... ok
 test fdt::tests::boots_without_an_initramfs ... ok
-test layout::tests::windows_do_not_overlap ... ok
 test fdt::tests::produces_a_wellformed_blob ... ok
+test layout::tests::virtio_slots_tile_their_window_without_gaps ... ok
+test layout::tests::windows_do_not_overlap ... ok
 test memory::tests::region_bounds ... ok
 test psci::tests::decodes_both_calling_conventions ... ok
 test psci::tests::return_codes_sign_extend_the_way_the_guest_reads_them ... ok
@@ -43,14 +42,49 @@ test smp::tests::core_zero_starts_on_and_others_start_off ... ok
 test smp::tests::a_parked_core_wakes_with_its_start_request ... ok
 test smp::tests::power_on_reports_the_states_linux_probes_for ... ok
 test sysreg::tests::decodes_every_field_independently ... ok
-test smp::tests::shutdown_releases_parked_cores ... ok
 test sysreg::tests::decodes_the_trap_that_stopped_the_first_boot ... ok
+test smp::tests::shutdown_releases_parked_cores ... ok
 test sysreg::tests::os_lock_registers_are_all_recognised ... ok
 test sysreg::tests::reads_are_answered_with_zero_and_writes_are_dropped ... ok
 test sysreg::tests::unknown_registers_are_answered_rather_than_fatal ... ok
 test vcpu::tests::affinity_ignores_the_res1_bit_and_upper_levels ... ok
+test virtio::balloon::tests::ballooned_bytes_counts_in_four_kib_pages ... ok
+test virtio::balloon::tests::config_reports_target_and_actual ... ok
+test virtio::balloon::tests::offers_free_page_reporting ... ok
+test virtio::balloon::tests::page_frames_coalesce_into_contiguous_runs ... ok
+test virtio::mmio::tests::activation_happens_once_when_the_driver_is_ready ... ok
+test virtio::mmio::tests::advertises_modern_virtio ... ok
+test virtio::mmio::tests::config_space_reads_are_byte_addressable ... ok
+test virtio::mmio::tests::driver_features_accumulate_across_both_halves ... ok
+test virtio::mmio::tests::feature_word_is_selectable_in_halves ... ok
+test virtio::mmio::tests::interrupt_status_is_write_one_to_clear ... ok
+test virtio::mmio::tests::notifications_before_driver_ok_are_refused ... ok
+test virtio::mmio::tests::ring_addresses_assemble_from_two_halves ... ok
+test virtio::mmio::tests::writing_zero_to_status_resets_the_device ... ok
+test virtio::queue::tests::a_descriptor_loop_terminates ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::a_queue_with_no_rings_is_not_ready ... ok
+test virtio::queue::tests::an_out_of_range_head_is_consumed_not_retried ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::geometry_must_be_a_power_of_two ... ok
+test virtio::queue::tests::indirect_descriptors_are_followed ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::pops_a_single_descriptor_chain ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::block::tests::config_reads_past_the_end_are_zero_filled ... ok
+test virtio::queue::tests::reset_restores_the_cursor_as_well_as_the_geometry ... ok
+test virtio::block::tests::a_read_only_disk_advertises_ro ... ok
+test virtio::queue::tests::used_ring_records_head_and_written_length ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::walks_a_multi_descriptor_chain_in_order ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::rng::tests::identifies_as_an_entropy_source ... ok
+test virtio::rng::tests::the_host_pool_is_readable ... ok
+test virtio::disk::tests::accesses_past_the_end_are_refused ... ok
+test virtio::block::tests::discard_requires_negotiation ... ok
+test virtio::disk::tests::a_new_image_is_logically_large_and_physically_empty ... ok
+test virtio::block::tests::reports_capacity_in_sectors ... ok
+test virtio::block::tests::offers_discard_so_the_disk_can_shrink ... ok
+test virtio::disk::tests::read_only_disks_refuse_every_mutation ... ok
+test virtio::disk::tests::write_zeroes_without_unmap_still_zeroes ... ok
+test virtio::disk::tests::round_trips_data ... ok
+test virtio::disk::tests::punching_a_hole_returns_space_to_the_host ... ok
 
-test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 66 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.02s
 
    Doc-tests lighter_hv
 

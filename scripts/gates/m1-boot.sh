@@ -105,6 +105,34 @@ for cpus in 1 4; do
 		grep -A3 "Kernel panic" "$log" | head -4 | sed 's/^/    /'
 	fi
 
+	# Signatures of a machine the guest could not make sense of. These have all
+	# been seen for real and none of them stop the boot on their own: the guest
+	# carries on with a broken device and dies somewhere unrelated, so the log
+	# is the only place the actual cause is written down.
+	#
+	# "No redistributor present" in particular was observed once and has not
+	# recurred in dozens of runs since; the cause was never established, which
+	# is exactly why it is checked for rather than assumed gone.
+	for signature in \
+		"No redistributor present" \
+		"Unable to handle kernel" \
+		"Internal error: Oops" \
+		"BUG: " \
+		"unhandled trapped system register"; do
+		if grep -qF "$signature" "$log"; then
+			fail "guest reported: $signature"
+			grep -F -m1 -A2 "$signature" "$log" | sed 's/^/    /'
+		fi
+	done
+
+	# The GIC has to have found every core's redistributor, not just core 0.
+	found=$(grep -c "found redistributor" "$log" || true)
+	if [ "$found" -eq "$cpus" ]; then
+		pass "GIC located $cpus redistributor(s)"
+	else
+		fail "GIC located $found redistributor(s), expected $cpus"
+	fi
+
 	rm -f "$log"
 done
 

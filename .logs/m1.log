@@ -1,0 +1,39 @@
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+   Compiling lighter-vmm v0.1.0 (/Users/nick/git/lighter/crates/lighter-vmm)
+warning: field `vm` is never read
+  --> crates/lighter-vmm/src/machine.rs:97:5
+   |
+96 | pub struct Machine {
+   |            ------- field in this struct
+97 |     vm: Arc<Vm>,
+   |     ^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lighter-vmm` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.44s
+
+==> Booting with 1 vCPU(s)
+  [32mok[0m   guest ran and exited (2s wall)
+  [32mok[0m   all 1 core(s) online
+  [32mok[0m   guest sees 1973 MiB of RAM
+  [32mok[0m   device tree parsed
+  [32mok[0m   PL011 driver bound
+  [32mok[0m   virtual timer advances
+  [32mok[0m   init completed
+  [32mok[0m   PSCI SYSTEM_OFF handled
+  [32mok[0m   GIC located 1 redistributor(s)
+
+==> Booting with 4 vCPU(s)
+  [32mok[0m   guest ran and exited (2s wall)
+  [32mok[0m   all 4 core(s) online
+  [32mok[0m   guest sees 1973 MiB of RAM
+  [32mok[0m   device tree parsed
+  [32mok[0m   PL011 driver bound
+  [32mok[0m   virtual timer advances
+  [32mok[0m   init completed
+  [32mok[0m   PSCI SYSTEM_OFF handled
+  [32mok[0m   GIC located 4 redistributor(s)
+
+[32mM1 PASS[0m — a kernel we built boots on a VMM we wrote.

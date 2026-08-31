@@ -19,7 +19,8 @@
 //!     ├── vcpu      the run loop
 //!     ├── smp       PSCI core power state
 //!     ├── sysreg    trapped system-register policy
-//!     └── devices   models that answer MMIO
+//!     ├── devices   models that answer MMIO
+//!     └── virtio    the transport and the device models on it
 //! ```
 
 pub mod bus;
@@ -35,6 +36,7 @@ pub mod psci;
 pub mod smp;
 pub mod sysreg;
 pub mod vcpu;
+pub mod virtio;
 
 pub use machine::{Machine, MachineConfig, MachineError};
 pub use vcpu::StopReason;

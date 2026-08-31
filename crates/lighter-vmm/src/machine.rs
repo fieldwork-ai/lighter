@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use lighter_hv::{Gic, GicLayout, GicParameters, Vm};
+use lighter_hv::{Gic, GicLayout, Vm};
 
 use crate::bus::MmioBus;
 use crate::console::{RawMode, spawn_input_thread};
@@ -22,6 +22,12 @@ use crate::layout::{GuestLayout, UART_SPI};
 use crate::memory::GuestMemory;
 use crate::smp::CpuPark;
 use crate::vcpu::{RunContext, StopReason, VcpuRunner};
+use crate::virtio::VirtioDevice;
+use crate::virtio::balloon::{Balloon, BalloonState};
+use crate::virtio::block::Block;
+use crate::virtio::disk::Disk;
+use crate::virtio::mmio::VirtioMmio;
+use crate::virtio::rng::Rng;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MachineError {
@@ -46,6 +52,11 @@ pub enum MachineError {
          lighter cannot run inside another VM"
     )]
     NoHypervisor,
+    #[error(
+        "{count} virtio devices requested but the memory map has only {} slots",
+        crate::layout::VIRTIO_MMIO_SLOTS
+    )]
+    TooManyDevices { count: usize },
 }
 
 /// How to build the machine.
@@ -58,6 +69,10 @@ pub struct MachineConfig {
     pub cmdline: String,
     /// Attach the host terminal to the guest console.
     pub interactive: bool,
+    /// Disk images, in order. The first becomes /dev/vda.
+    pub disks: Vec<PathBuf>,
+    /// Logical size for a disk image that has to be created.
+    pub disk_size_bytes: u64,
 }
 
 impl Default for MachineConfig {
@@ -71,13 +86,18 @@ impl Default for MachineConfig {
             // at a dead prompt; `reboot=t` makes reboot a PSCI call we see.
             cmdline: "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 reboot=t".into(),
             interactive: true,
+            disks: Vec::new(),
+            disk_size_bytes: 64 << 30,
         }
     }
 }
 
 /// A built, running machine.
 pub struct Machine {
-    vm: Arc<Vm>,
+    /// Kept alive for the machine's lifetime. Nothing reads it: the VM is
+    /// reached through the clones held by guest memory and the vCPU threads,
+    /// and `hv_vm_destroy` runs when the last of them goes.
+    _vm: Arc<Vm>,
     ctx: Arc<RunContext>,
     threads: Vec<JoinHandle<Result<StopReason, crate::vcpu::RunError>>>,
     /// Held for the machine's lifetime; restores the terminal on drop.
@@ -86,6 +106,11 @@ pub struct Machine {
     _gic: Arc<Gic>,
     /// Kept alive because the guest's mappings point into it.
     _memory: Arc<GuestMemory>,
+    /// The virtio transports, held so the policy loop can reach them and so
+    /// they outlive the guest that is using them.
+    virtio: Vec<Arc<Mutex<VirtioMmio>>>,
+    disks: Vec<Arc<Disk>>,
+    balloon: Arc<BalloonState>,
 }
 
 impl Machine {
@@ -98,27 +123,37 @@ impl Machine {
         // 1. The VM must exist before anything else can be created for it.
         let vm = Arc::new(Vm::create()?);
 
-        // 2. The layout depends on the host's GIC geometry, so query before
-        //    placing anything.
-        let gic_params = GicParameters::query()?;
-        let layout = GuestLayout::new(&gic_params, config.vcpus, config.ram_bytes)?;
-
-        // 3. The GIC must be created after the VM and *before the first vCPU* —
-        //    it allocates per-core interrupt state and refuses once a vCPU
-        //    exists. This is why no vCPU is created until step 8.
+        // 2. The GIC comes before the layout, not after. Its windows sit at
+        //    fixed addresses that are ours to choose, but its *sizes* are the
+        //    host's to report, and those sizes go straight into the device tree
+        //    as the region the guest scans for its redistributors. Reading them
+        //    from a GIC that exists removes a class of question about whether
+        //    they were meaningful yet.
+        //
+        //    It must also be created before the first vCPU: it allocates
+        //    per-core interrupt state and refuses once a vCPU has claimed it.
+        //    That is why no vCPU is created until step 8.
         let gic = Arc::new(Gic::create(
             &vm,
             GicLayout {
-                distributor_base: layout.gicd.base,
-                redistributor_base: layout.gicr.base,
+                distributor_base: GuestLayout::GICD_BASE,
+                redistributor_base: GuestLayout::GICR_BASE,
                 msi_region_base: None,
                 msi_intid_range: (0, 0),
             },
         )?);
 
+        // 3. The rest of the map, derived from the geometry the GIC reported.
+        let layout = GuestLayout::new(&gic.params(), config.vcpus, config.ram_bytes)?;
+        tracing::debug!(
+            gicd = format_args!("{:#x}..{:#x}", layout.gicd.base, layout.gicd.end()),
+            gicr = format_args!("{:#x}..{:#x}", layout.gicr.base, layout.gicr.end()),
+            "interrupt controller placed"
+        );
+
         // 4. Guest RAM.
-        let mut memory = GuestMemory::new();
-        memory.add_region(&vm, layout.ram.base, layout.ram.size as usize)?;
+        let mut memory = GuestMemory::new(vm.clone());
+        memory.add_region(layout.ram.base, layout.ram.size as usize)?;
         let memory = Arc::new(memory);
 
         // 5. Kernel and initramfs.
@@ -128,18 +163,7 @@ impl Machine {
         }
         let (boot, initramfs) = loader.load(&memory)?;
 
-        // 6. The device tree describes what step 7 is about to build, so it is
-        //    written from the same layout rather than a parallel description.
-        let dtb = fdt::build(&FdtParams {
-            layout: &layout,
-            vcpus: config.vcpus,
-            cmdline: &config.cmdline,
-            initramfs,
-            virtio_slots: 0,
-        })?;
-        memory.write(boot.dtb, &dtb)?;
-
-        // 7. Devices.
+        // 6. Devices, and the bus they sit on.
         let raw_mode = if config.interactive {
             RawMode::enable()?
         } else {
@@ -149,6 +173,53 @@ impl Machine {
         let uart = Arc::new(Mutex::new(Pl011::new(Box::new(io::stdout()), uart_irq)));
         let mut bus = MmioBus::new();
         bus.register(layout.uart, uart.clone())?;
+
+        // virtio devices occupy consecutive slots, and the device tree must
+        // describe exactly the ones that exist: an advertised slot with nothing
+        // behind it costs the guest a failed probe, and a populated slot with no
+        // node is a device the guest never finds.
+        let balloon_state = Arc::new(BalloonState::default());
+        let mut virtio: Vec<Box<dyn VirtioDevice>> = Vec::new();
+        let mut disks = Vec::new();
+
+        for path in &config.disks {
+            let disk = Arc::new(Disk::open_or_create(path, config.disk_size_bytes, false)?);
+            tracing::info!(
+                path = %path.display(),
+                capacity_mib = disk.len() / (1 << 20),
+                allocated_kib = disk.allocated_bytes().unwrap_or(0) / 1024,
+                "attached disk"
+            );
+            disks.push(disk.clone());
+            virtio.push(Box::new(Block::new(disk)));
+        }
+        virtio.push(Box::new(Rng::from_host()?));
+        virtio.push(Box::new(Balloon::new(balloon_state.clone())));
+
+        let virtio_slots = virtio.len();
+        let mut virtio_devices = Vec::with_capacity(virtio_slots);
+        for (index, device) in virtio.into_iter().enumerate() {
+            let window = layout
+                .virtio_slot(index)
+                .ok_or(MachineError::TooManyDevices {
+                    count: virtio_slots,
+                })?;
+            let irq = Arc::new(GicSpi::new(gic.clone(), layout.virtio_spi(index))?);
+            let transport = Arc::new(Mutex::new(VirtioMmio::new(device, memory.clone(), irq)));
+            bus.register(window, transport.clone())?;
+            virtio_devices.push(transport);
+        }
+
+        // 7. The device tree describes the machine built above, from the same
+        //    layout rather than a parallel description of it.
+        let dtb = fdt::build(&FdtParams {
+            layout: &layout,
+            vcpus: config.vcpus,
+            cmdline: &config.cmdline,
+            initramfs,
+            virtio_slots,
+        })?;
+        memory.write(boot.dtb, &dtb)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         if config.interactive {
@@ -171,12 +242,31 @@ impl Machine {
             let handle = std::thread::Builder::new()
                 .name(format!("vcpu-{index}"))
                 .spawn(move || {
-                    let vcpu =
+                    // Creation is serialized so that thread index, vCPU id and
+                    // MPIDR affinity all agree; see CpuPark::await_creation_turn
+                    // for what goes wrong when they do not.
+                    ctx.park.await_creation_turn(index);
+                    let created =
                         vm.create_vcpu()
                             .map_err(|source| crate::vcpu::RunError::Hypervisor {
                                 vcpu: u64::from(index),
                                 source,
-                            })?;
+                            });
+                    // Release the next core either way, rather than deadlocking
+                    // the whole machine behind a failure on this one.
+                    ctx.park.finish_creation(index);
+                    let vcpu = created?;
+
+                    // The invariant the ordering exists to guarantee. Checked
+                    // here so a violation is named, rather than reaching the
+                    // guest as a missing redistributor.
+                    if vcpu.id() != u64::from(index) {
+                        return Err(crate::vcpu::RunError::VcpuIdMismatch {
+                            expected: u64::from(index),
+                            actual: vcpu.id(),
+                        });
+                    }
+
                     // Publish before running: from here on this core can be
                     // forced out of the guest by whoever stops the machine.
                     ctx.handles
@@ -204,12 +294,15 @@ impl Machine {
         );
 
         Ok(Machine {
-            vm,
+            _vm: vm,
             ctx,
             threads,
             _raw_mode: raw_mode,
             _gic: gic,
             _memory: memory,
+            virtio: virtio_devices,
+            disks,
+            balloon: balloon_state,
         })
     }
 
@@ -221,6 +314,21 @@ impl Machine {
 
         self.stop_others();
         Ok(reason)
+    }
+
+    /// The balloon's shared state, for the memory policy loop.
+    pub fn balloon(&self) -> &Arc<BalloonState> {
+        &self.balloon
+    }
+
+    /// The attached disks, for reporting host allocation.
+    pub fn disks(&self) -> &[Arc<Disk>] {
+        &self.disks
+    }
+
+    /// The virtio transports, for host-driven queue servicing.
+    pub fn virtio(&self) -> &[Arc<Mutex<VirtioMmio>>] {
+        &self.virtio
     }
 
     /// Asks every core to stop.
@@ -239,12 +347,17 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         // Destroying the VM while a vCPU thread is still executing is
-        // undefined, so threads are joined before `vm` can be dropped.
+        // undefined, so every core is stopped and joined first.
         self.stop_others();
-        debug_assert_eq!(
-            Arc::strong_count(&self.vm),
-            1,
-            "vCPU threads outlived the VM"
+        debug_assert!(
+            self.threads.is_empty(),
+            "a vCPU thread was still running when the machine was dropped"
         );
+
+        // The VM itself outliving its guest mappings is handled by `Arc`
+        // rather than by drop order: `GuestMemory` holds its own clone and
+        // unmaps each region on the way out, so `hv_vm_destroy` cannot run
+        // until that has happened. Counting clones here would just encode how
+        // many things legitimately hold one.
     }
 }

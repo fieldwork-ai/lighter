@@ -52,6 +52,12 @@ pub enum RunError {
     },
     #[error("the hypervisor could not determine why vCPU {vcpu} exited")]
     UnknownExit { vcpu: u64 },
+    #[error(
+        "core {expected} was given vCPU id {actual}: the framework hands out ids \
+         in call order and the GIC assigns redistributors by id, so a mismatch \
+         means the device tree describes a different machine than the one running"
+    )]
+    VcpuIdMismatch { expected: u64, actual: u64 },
 }
 
 /// Shared state every vCPU thread needs.

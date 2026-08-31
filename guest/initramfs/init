@@ -6,10 +6,8 @@
 # execve fails with ENOENT and the kernel panics with "No working init found",
 # which reads like a missing initramfs rather than a missing symlink.
 #
-# Two modes, chosen from the kernel command line so one image serves both:
-# interactive gives you a shell, and `lighter.selftest` runs the checks the
-# milestone gate greps for and powers off. Keeping them in one image means the
-# gate exercises the same guest a human does.
+# Modes are chosen from the kernel command line so one image serves all of them,
+# and the milestone gates exercise the same guest a human gets interactively.
 
 /bin/busybox --install -s /bin 2>/dev/null
 
@@ -17,15 +15,63 @@ mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
 
-echo
-echo "  lighter guest"
-echo "  $(uname -srm)"
-echo
+cmdline=$(cat /proc/cmdline)
 
-if grep -q lighter.selftest /proc/cmdline; then
-	# Each line is checked by scripts/gates/m1-boot.sh. The point is not that
-	# the kernel booted — the banner already proved that — but that the
-	# machine we described in the device tree is the machine it found.
+# 64 MiB of a fixed byte, regenerated identically on any boot, so a later boot
+# can verify what an earlier one wrote.
+PATTERN_MIB=64
+make_pattern() {
+	dd if=/dev/zero bs=1M count=$PATTERN_MIB 2>/dev/null | tr '\000' '\125' > "$1"
+}
+
+case "$cmdline" in
+*lighter.disktest=write*)
+	echo "DISKTEST mode=write"
+	make_pattern /tmp/pattern
+	if dd if=/tmp/pattern of=/dev/vda bs=1M conv=fsync 2>/dev/null; then
+		echo "DISKTEST wrote_mib=$PATTERN_MIB"
+	else
+		echo "DISKTEST write=failed"
+	fi
+	sync
+	poweroff -f
+	;;
+
+*lighter.disktest=discard*)
+	echo "DISKTEST mode=discard"
+
+	# The disk was written by a previous boot of this same image. If the bytes
+	# are still there, virtio-blk persisted them to the host file and read them
+	# back across a full machine restart.
+	make_pattern /tmp/pattern
+	dd if=/dev/vda of=/tmp/readback bs=1M count=$PATTERN_MIB 2>/dev/null
+	if cmp -s /tmp/pattern /tmp/readback; then
+		echo "DISKTEST persisted=ok"
+	else
+		echo "DISKTEST persisted=corrupt"
+	fi
+
+	# Hand the blocks back. This becomes a hole punch on the host image, which
+	# is the entire point: a disk that only ever grows is the thing lighter
+	# exists to avoid.
+	if blkdiscard /dev/vda 2>/dev/null; then
+		echo "DISKTEST discard=ok"
+	else
+		echo "DISKTEST discard=failed"
+	fi
+	sync
+	poweroff -f
+	;;
+
+*lighter.selftest*)
+	echo
+	echo "  lighter guest"
+	echo "  $(uname -srm)"
+	echo
+
+	# Each line is checked by a milestone gate. The point is not that the
+	# kernel booted — the banner already proved that — but that the machine we
+	# described in the device tree is the machine it found.
 	echo "SELFTEST cpus=$(grep -c ^processor /proc/cpuinfo)"
 	echo "SELFTEST memtotal_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
 
@@ -35,17 +81,16 @@ if grep -q lighter.selftest /proc/cmdline; then
 		echo "SELFTEST dt=missing"
 	fi
 
-	# The console is a PL011 the driver actually bound to, not just an
-	# earlycon: if amba-pl011 failed to probe, this output would have stopped
-	# the moment the kernel handed over from earlycon.
+	# A PL011 the driver actually bound to, not just an earlycon: if amba-pl011
+	# had failed to probe, output would have stopped when the kernel handed over.
 	if [ -e /sys/class/tty/ttyAMA0 ]; then
 		echo "SELFTEST console=ttyAMA0"
 	else
 		echo "SELFTEST console=missing"
 	fi
 
-	# A timer that never ticks is the classic silent VMM bug: everything
-	# works until something sleeps. Prove the clock advances.
+	# A timer that never ticks is the classic silent VMM bug: everything works
+	# until something sleeps.
 	before=$(cut -d' ' -f1 /proc/uptime)
 	sleep 1
 	after=$(cut -d' ' -f1 /proc/uptime)
@@ -56,9 +101,37 @@ if grep -q lighter.selftest /proc/cmdline; then
 		echo "SELFTEST timer=stopped"
 	fi
 
+	# virtio: every device that probed leaves a bound driver behind.
+	for dev in /sys/bus/virtio/devices/virtio*; do
+		[ -e "$dev" ] || continue
+		id=$(cat "$dev/device" 2>/dev/null)
+		drv=$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)
+		echo "SELFTEST virtio id=$id driver=${drv:-none}"
+	done
+
+	if [ -b /dev/vda ]; then
+		echo "SELFTEST blockdev=vda size_sectors=$(cat /sys/block/vda/size)"
+
+		# Exercise the disk for real rather than trusting that it appeared.
+		dd if=/dev/urandom of=/tmp/pattern bs=4096 count=64 2>/dev/null
+		dd if=/tmp/pattern of=/dev/vda bs=4096 count=64 conv=fsync 2>/dev/null
+		dd if=/dev/vda of=/tmp/readback bs=4096 count=64 2>/dev/null
+		if cmp -s /tmp/pattern /tmp/readback; then
+			echo "SELFTEST blockio=ok"
+		else
+			echo "SELFTEST blockio=corrupt"
+		fi
+	else
+		echo "SELFTEST blockdev=missing"
+	fi
+
+	# Without virtio-rng this either blocks or reports a nearly empty pool.
+	echo "SELFTEST entropy_avail=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null)"
+
 	echo "SELFTEST done"
 	poweroff -f
-fi
+	;;
+esac
 
 echo "Type 'poweroff -f' to stop the machine."
 echo

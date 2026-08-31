@@ -37,6 +37,11 @@ pub struct CpuPark {
     cpus: Vec<Cpu>,
     /// Set when the machine is going away, so parked cores stop waiting.
     shutdown: Mutex<bool>,
+    /// How many cores have created their vCPU so far.
+    ///
+    /// See [`CpuPark::await_creation_turn`] for why this exists.
+    created: Mutex<u32>,
+    creation_turn: Condvar,
 }
 
 impl CpuPark {
@@ -55,7 +60,46 @@ impl CpuPark {
         CpuPark {
             cpus,
             shutdown: Mutex::new(false),
+            created: Mutex::new(0),
+            creation_turn: Condvar::new(),
         }
+    }
+
+    /// Blocks until it is core `index`'s turn to create its vCPU.
+    ///
+    /// # Why creation must be ordered
+    ///
+    /// `hv_vcpu_create` hands out ids in call order, and Apple's GIC gives
+    /// vCPU *id* N the Nth redistributor. Meanwhile the device tree says the
+    /// core whose `MPIDR` affinity is N uses that same Nth redistributor. So
+    /// the three numbers — thread index, vCPU id, and MPIDR — all have to
+    /// agree.
+    ///
+    /// Left to race, they do not: whichever thread reaches `create_vcpu` first
+    /// gets id 0, and it is not reliably thread 0. The core the kernel calls
+    /// CPU0 then owns a redistributor the device tree assigned to a different
+    /// core, and the guest dies during `init_IRQ` with "GICv3: No
+    /// redistributor present" — intermittently, and only with more than one
+    /// core, which is exactly how this was found.
+    ///
+    /// Serializing creation costs one handshake per core at boot and makes the
+    /// invariant hold by construction.
+    pub fn await_creation_turn(&self, index: u32) {
+        let mut created = self.created.lock().expect("creation counter poisoned");
+        while *created != index {
+            created = self
+                .creation_turn
+                .wait(created)
+                .expect("creation counter poisoned");
+        }
+    }
+
+    /// Records that core `index` has created its vCPU, releasing the next one.
+    pub fn finish_creation(&self, index: u32) {
+        let mut created = self.created.lock().expect("creation counter poisoned");
+        debug_assert_eq!(*created, index, "cores created out of order");
+        *created = index + 1;
+        self.creation_turn.notify_all();
     }
 
     pub fn len(&self) -> u32 {

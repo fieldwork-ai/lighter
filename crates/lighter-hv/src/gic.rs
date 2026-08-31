@@ -133,27 +133,6 @@ impl Gic {
     /// Since the Xcode 26 SDK the base addresses are mandatory: the older
     /// `hv_gic_create(NULL)` form, where the framework picked them, is gone.
     pub fn create(_vm: &Vm, layout: GicLayout) -> Result<Gic> {
-        let params = GicParameters::query()?;
-
-        if !layout
-            .distributor_base
-            .is_multiple_of(params.distributor_alignment as u64)
-        {
-            return Err(crate::HvError::BadArgument);
-        }
-        if !layout
-            .redistributor_base
-            .is_multiple_of(params.redistributor_alignment as u64)
-        {
-            return Err(crate::HvError::BadArgument);
-        }
-        // Overlapping windows are accepted by the config calls and only surface
-        // as a guest that mysteriously takes no interrupts, so reject here.
-        let gicd_end = layout.distributor_base + params.distributor_size as u64;
-        if gicd_end > layout.redistributor_base {
-            return Err(crate::HvError::BadArgument);
-        }
-
         unsafe {
             let config = sys::hv_gic_config_create();
             if config.is_null() {
@@ -181,7 +160,33 @@ impl Gic {
             result?;
         }
 
+        // Geometry is read only once the GIC exists. It measures the same
+        // before creation on this host, but a device tree built from these
+        // numbers is what tells the guest where to look for its redistributors,
+        // and reading them from a device that definitely exists costs nothing.
+        let params = GicParameters::query()?;
+
+        // These are the sizes the guest will be told about, so a value that
+        // cannot be right must not reach the device tree — the symptom there is
+        // "GICv3: No redistributor present" followed by the guest dereferencing
+        // the null it got back, which is a long way from the cause.
+        if params.distributor_size == 0 || params.redistributor_size == 0 {
+            return Err(crate::HvError::Error);
+        }
+        let gicd_end = layout.distributor_base + params.distributor_size as u64;
+        if gicd_end > layout.redistributor_base {
+            return Err(crate::HvError::BadArgument);
+        }
+
         Ok(Gic { layout, params })
+    }
+
+    /// The bytes of address space this machine's redistributors occupy.
+    ///
+    /// One per core, packed from the region base. The device tree must declare
+    /// at least this much or the guest's scan stops before it finds them all.
+    pub fn redistributor_region_len(&self, vcpus: u32) -> u64 {
+        self.params.redistributor_size as u64 * u64::from(vcpus)
     }
 
     pub const fn layout(&self) -> GicLayout {
