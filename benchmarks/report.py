@@ -20,9 +20,12 @@ RESULTS = HERE / "results"
 # The order they are reported in, and what each one is actually measuring.
 CASES = [
     ("npm-install", "npm ci of a pinned tree", "lower is better"),
+    ("pnpm-install", "pnpm install --frozen-lockfile", "lower is better"),
+    ("yarn-install", "yarn install --frozen-lockfile", "lower is better"),
     ("ripgrep", "reading every file in node_modules", "lower is better"),
     ("find-walk", "metadata-only walk of node_modules", "lower is better"),
     ("copy-tree", "copying node_modules within the share", "lower is better"),
+    ("rm-rf", "rm -rf of a node_modules tree", "lower is better"),
     ("watch-latency", "host change to guest visibility, round trip", "lower is better"),
 ]
 
@@ -71,6 +74,8 @@ def main():
         f"- Node: {tool_version('node', '--version')}",
         f"- npm: {tool_version('npm', '--version')}",
         f"- ripgrep: {tool_version('rg', '--version')}",
+        f"- pnpm: {tool_version('pnpm', '--version')}",
+        f"- yarn: {tool_version('yarn', '--version')}",
         "",
         "## Wall time, milliseconds",
         "",

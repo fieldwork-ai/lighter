@@ -107,6 +107,10 @@ guest: ## Build the guest kernel, agent, initramfs, and root filesystem
 	@guest/initramfs/build.sh
 	@guest/rootfs/build.sh
 
+.PHONY: dogfood
+dogfood: gvproxy ## Rebuild the guest using lighter itself, not somebody else's VM
+	@scripts/dogfood.sh
+
 .PHONY: help
 help:
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \

@@ -31,9 +31,10 @@ cd "$ROOT"
 TARGET=""
 LABEL=""
 REPS=3
-CASES="npm-install ripgrep find-walk copy-tree watch-latency"
+CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency"
 IMAGE="lighter-bench:1"
 KEEP=0
+ALLOW_NOISY=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -42,6 +43,7 @@ while [ $# -gt 0 ]; do
 	--cases)  CASES="$2"; shift 2 ;;
 	--keep)   KEEP=1; shift ;;
 	--label)  LABEL="$2"; shift 2 ;;
+	--allow-noisy) ALLOW_NOISY=1; shift ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -66,14 +68,68 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --------------------------------------------------------------- exclusivity --
+
+# Refuses to measure while another virtual machine is running.
+#
+# Not fussiness. A second hypervisor on the same laptop competes for the same
+# cores and the same page cache, and it does not compete evenly: the native
+# target and the guest target feel it differently, so the *ratio* between them
+# moves. These numbers are the whole claim, and a claim that depends on what
+# else the machine happened to be doing is not one.
+#
+# The obvious irony is not lost: for now, the thing most likely to be running
+# is the container runtime that builds lighter's own guest. `scripts/dogfood.sh`
+# is how that stops being true.
+check_exclusive() {
+	local noisy=()
+	# Colima and Lima both run their VM through the same Apple XPC service, so
+	# the process to look for is the hypervisor rather than the CLI.
+	if pgrep -f "limactl hostagent" >/dev/null 2>&1; then
+		noisy+=("Colima or Lima (limactl hostagent)")
+	fi
+	if pgrep -x "com.docker.backend" >/dev/null 2>&1; then
+		noisy+=("Docker Desktop")
+	fi
+	if pgrep -x "OrbStack Helper" >/dev/null 2>&1 || pgrep -x "xbin" >/dev/null 2>&1; then
+		noisy+=("OrbStack")
+	fi
+	[ "${#noisy[@]}" -eq 0 ] && return 0
+
+	echo "==> Another virtual machine is running:" >&2
+	printf '      %s
+' "${noisy[@]}" >&2
+	if [ "$ALLOW_NOISY" -eq 1 ]; then
+		echo "    --allow-noisy given; the numbers will not be comparable." >&2
+		return 0
+	fi
+	cat >&2 <<-EOF
+
+	    Stop it and run again, or pass --allow-noisy to measure anyway.
+	    A second hypervisor moves the ratio between the native and guest
+	    figures, which is the only thing this suite reports.
+	EOF
+	exit 1
+}
+
+check_exclusive
+
 # ------------------------------------------------------------------ fixture --
 
 prepare_work() {
 	rm -rf "$WORK"
 	mkdir -p "$WORK/npm" "$WORK/cases"
-	cp benchmarks/fixtures/npm/package.json "$WORK/npm/"
-	[ -f benchmarks/fixtures/npm/package-lock.json ] \
-		&& cp benchmarks/fixtures/npm/package-lock.json "$WORK/npm/"
+	# Spotlight indexes anything under $HOME, and a package tree is sixty
+	# thousand files it very much wants to read, thumbnail and index. Left
+	# alone it costs more CPU than the benchmark does and lands in the middle
+	# of the measurement. This marker is how macOS is told not to.
+	: > "$WORK/.metadata_never_index"
+	# Every lockfile, so each package manager installs the identical tree.
+	cp benchmarks/fixtures/npm/package.json \
+		benchmarks/fixtures/npm/package-lock.json \
+		benchmarks/fixtures/npm/pnpm-lock.yaml \
+		benchmarks/fixtures/npm/yarn.lock \
+		"$WORK/npm/"
 	cp benchmarks/cases/*.sh benchmarks/cases/*.js "$WORK/cases/"
 	chmod +x "$WORK/cases"/*.sh
 
@@ -130,7 +186,9 @@ setup_container() {
 	# The package cache lives on the runtime's own storage, not on the share:
 	# putting it on the share would make every target's cache as slow as its
 	# file sharing, which is a second measurement smuggled into the first.
-	docker "${DOCKER_ARGS[@]}" volume create "lighter-bench-npm-$TARGET" >/dev/null
+	for cache in npm pnpm yarn; do
+		docker "${DOCKER_ARGS[@]}" volume create "lighter-bench-$cache-$TARGET" >/dev/null
+	done
 }
 
 run_case_container() {
@@ -140,6 +198,8 @@ run_case_container() {
 	docker "${DOCKER_ARGS[@]}" run --rm \
 		-v "$WORK:/work" \
 		-v "lighter-bench-npm-$TARGET:/root/.npm" \
+		-v "lighter-bench-pnpm-$TARGET:/root/.local/share/pnpm/store" \
+		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \
 		-e WORK=/work \
 		-e "REPS=$REPS" \
 		"$IMAGE" node $script
@@ -191,7 +251,9 @@ setup_lighter() {
 	export DOCKER_HOST="unix://$SOCKET"
 	DOCKER_ARGS=()
 	docker build -q -t "$IMAGE" benchmarks >/dev/null
-	docker volume create "lighter-bench-npm-$TARGET" >/dev/null
+	for cache in npm pnpm yarn; do
+		docker volume create "lighter-bench-$cache-$TARGET" >/dev/null
+	done
 	# The share is mounted at a different path inside this guest than the host
 	# path, so the bind mount names the guest path.
 	SHARE_MOUNT="/mnt/bench"
@@ -204,6 +266,8 @@ run_case_lighter() {
 	docker run --rm \
 		-v "$SHARE_MOUNT:/work" \
 		-v "lighter-bench-npm-$TARGET:/root/.npm" \
+		-v "lighter-bench-pnpm-$TARGET:/root/.local/share/pnpm/store" \
+		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \
 		-e WORK=/work \
 		-e "REPS=$REPS" \
 		"$IMAGE" node $script
@@ -248,7 +312,19 @@ echo "case,rep,ms" > "$RESULTS"
 }
 
 echo "==> $TARGET: warming caches (not timed)"
-REPS=1 run_case npm-install >/dev/null 2>&1 || true
+# Each package manager populates its own cache once. An install that downloads
+# is measuring the network, and the three do not share a cache.
+for warm in npm-install pnpm-install yarn-install; do
+	case " $CASES " in
+	*" $warm "*) REPS=1 run_case "$warm" >/dev/null 2>&1 || true ;;
+	esac
+done
+# `rm-rf` and `copy-tree` need a tree to work on, whichever installs ran.
+case " $CASES " in
+*rm-rf*|*copy-tree*|*ripgrep*|*find-walk*)
+	[ -d "$WORK/npm/node_modules" ] || REPS=1 run_case npm-install >/dev/null 2>&1 || true
+	;;
+esac
 
 for name in $CASES; do
 	printf '==> %s: %s' "$TARGET" "$name"
