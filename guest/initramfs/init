@@ -1,0 +1,65 @@
+#!/bin/busybox sh
+# PID 1 for the lighter boot initramfs.
+#
+# The interpreter is busybox by absolute path, not /bin/sh: this script *is*
+# what creates /bin/sh, on the line below. A `#!/bin/sh` shebang here means
+# execve fails with ENOENT and the kernel panics with "No working init found",
+# which reads like a missing initramfs rather than a missing symlink.
+#
+# Two modes, chosen from the kernel command line so one image serves both:
+# interactive gives you a shell, and `lighter.selftest` runs the checks the
+# milestone gate greps for and powers off. Keeping them in one image means the
+# gate exercises the same guest a human does.
+
+/bin/busybox --install -s /bin 2>/dev/null
+
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+echo
+echo "  lighter guest"
+echo "  $(uname -srm)"
+echo
+
+if grep -q lighter.selftest /proc/cmdline; then
+	# Each line is checked by scripts/gates/m1-boot.sh. The point is not that
+	# the kernel booted — the banner already proved that — but that the
+	# machine we described in the device tree is the machine it found.
+	echo "SELFTEST cpus=$(grep -c ^processor /proc/cpuinfo)"
+	echo "SELFTEST memtotal_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+
+	if [ -d /proc/device-tree ]; then
+		echo "SELFTEST dt=ok"
+	else
+		echo "SELFTEST dt=missing"
+	fi
+
+	# The console is a PL011 the driver actually bound to, not just an
+	# earlycon: if amba-pl011 failed to probe, this output would have stopped
+	# the moment the kernel handed over from earlycon.
+	if [ -e /sys/class/tty/ttyAMA0 ]; then
+		echo "SELFTEST console=ttyAMA0"
+	else
+		echo "SELFTEST console=missing"
+	fi
+
+	# A timer that never ticks is the classic silent VMM bug: everything
+	# works until something sleeps. Prove the clock advances.
+	before=$(cut -d' ' -f1 /proc/uptime)
+	sleep 1
+	after=$(cut -d' ' -f1 /proc/uptime)
+	echo "SELFTEST uptime_before=$before uptime_after=$after"
+	if [ "$before" != "$after" ]; then
+		echo "SELFTEST timer=ok"
+	else
+		echo "SELFTEST timer=stopped"
+	fi
+
+	echo "SELFTEST done"
+	poweroff -f
+fi
+
+echo "Type 'poweroff -f' to stop the machine."
+echo
+exec setsid cttyhack /bin/sh

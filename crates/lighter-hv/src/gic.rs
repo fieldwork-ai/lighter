@@ -7,6 +7,19 @@
 //! `&Vm` to make "after the VM" a type error and documents "before any vCPU"
 //! where it cannot.
 
+// Every `unsafe` block below is a single call into Hypervisor.framework whose
+// safety argument is identical and is stated here once rather than repeated
+// verbatim on each of them: the framework's calls are safe to make with
+// well-formed arguments, and this module's types are what make the arguments
+// well-formed — the VM exists (proved by holding a `Vm`), the vCPU handle came
+// from `hv_vcpu_create` on this thread (proved by `Vcpu` being `!Send`), and
+// out-parameters are stack locals of the right type.
+//
+// Blocks whose safety rests on anything more than that — raw pointers into
+// guest memory, lifetimes the compiler cannot see — carry their own comment and
+// live in modules where this allow is not in force.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use crate::error::{Result, check};
 use crate::sys;
 use crate::vm::Vm;
@@ -79,7 +92,9 @@ impl GicParameters {
             check(sys::hv_gic_get_distributor_base_alignment(
                 &mut p.distributor_alignment,
             ))?;
-            check(sys::hv_gic_get_redistributor_size(&mut p.redistributor_size))?;
+            check(sys::hv_gic_get_redistributor_size(
+                &mut p.redistributor_size,
+            ))?;
             check(sys::hv_gic_get_redistributor_region_size(
                 &mut p.redistributor_region_size,
             ))?;
@@ -120,10 +135,16 @@ impl Gic {
     pub fn create(_vm: &Vm, layout: GicLayout) -> Result<Gic> {
         let params = GicParameters::query()?;
 
-        if layout.distributor_base % params.distributor_alignment as u64 != 0 {
+        if !layout
+            .distributor_base
+            .is_multiple_of(params.distributor_alignment as u64)
+        {
             return Err(crate::HvError::BadArgument);
         }
-        if layout.redistributor_base % params.redistributor_alignment as u64 != 0 {
+        if !layout
+            .redistributor_base
+            .is_multiple_of(params.redistributor_alignment as u64)
+        {
             return Err(crate::HvError::BadArgument);
         }
         // Overlapping windows are accepted by the config calls and only surface

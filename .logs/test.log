@@ -1,0 +1,66 @@
+   Compiling lighter-hv v0.1.0 (/Users/nick/git/lighter/crates/lighter-hv)
+   Compiling lighter-vmm v0.1.0 (/Users/nick/git/lighter/crates/lighter-vmm)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.68s
+     Running unittests src/lib.rs (target/debug/deps/lighter_hv-85f6c9ffc77b0e4a)
+
+running 2 tests
+test regs::tests::gpr_index_maps_to_declaration_order ... ok
+test regs::tests::sysreg_encoding_matches_sdk_values ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/lighter_vmm-f2b61a847ad21603)
+
+running 37 tests
+test bus::tests::rejects_aborts_that_are_not_device_accesses ... ok
+test bus::tests::decodes_access_width_and_direction ... ok
+test bus::tests::refuses_to_guess_without_a_syndrome ... ok
+test bus::tests::sign_extension_follows_the_access_width ... ok
+test devices::pl011::tests::identifies_as_a_pl011_to_the_amba_bus ... ok
+test bus::tests::unclaimed_addresses_read_zero_rather_than_faulting ... ok
+test devices::pl011::tests::receive_path_tracks_fifo_emptiness ... ok
+test bus::tests::dispatches_by_window_and_offsets_relative_to_it ... ok
+test bus::tests::rejects_overlapping_windows ... ok
+test devices::pl011::tests::interrupt_status_masks_and_clears ... ok
+test kernel::tests::alignment_is_idempotent_and_rounds_up ... ok
+test devices::pl011::tests::guest_writes_reach_the_sink ... ok
+test devices::pl011::tests::input_is_bounded_and_drops_rather_than_growing ... ok
+test kernel::tests::parses_a_real_header_shape ... ok
+test layout::tests::device_window_clears_the_maximum_redistributor_region ... ok
+test kernel::tests::rejects_anything_that_is_not_an_image ... ok
+test layout::tests::rejects_a_redistributor_that_would_swallow_the_devices ... ok
+test layout::tests::virtio_slots_tile_their_window_without_gaps ... ok
+test fdt::tests::boots_without_an_initramfs ... ok
+test layout::tests::windows_do_not_overlap ... ok
+test fdt::tests::produces_a_wellformed_blob ... ok
+test memory::tests::region_bounds ... ok
+test psci::tests::decodes_both_calling_conventions ... ok
+test psci::tests::return_codes_sign_extend_the_way_the_guest_reads_them ... ok
+test psci::tests::unknown_functions_are_refused_not_guessed ... ok
+test psci::tests::version_is_one_point_one ... ok
+test smp::tests::a_core_that_powers_off_can_be_started_again ... ok
+test smp::tests::core_zero_starts_on_and_others_start_off ... ok
+test smp::tests::a_parked_core_wakes_with_its_start_request ... ok
+test smp::tests::power_on_reports_the_states_linux_probes_for ... ok
+test sysreg::tests::decodes_every_field_independently ... ok
+test smp::tests::shutdown_releases_parked_cores ... ok
+test sysreg::tests::decodes_the_trap_that_stopped_the_first_boot ... ok
+test sysreg::tests::os_lock_registers_are_all_recognised ... ok
+test sysreg::tests::reads_are_answered_with_zero_and_writes_are_dropped ... ok
+test sysreg::tests::unknown_registers_are_answered_rather_than_fatal ... ok
+test vcpu::tests::affinity_ignores_the_res1_bit_and_upper_levels ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lighter_hv
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lighter_vmm
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

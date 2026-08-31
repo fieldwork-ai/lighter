@@ -1,5 +1,18 @@
 //! A virtual CPU, pinned to the thread that created it.
 
+// Every `unsafe` block below is a single call into Hypervisor.framework whose
+// safety argument is identical and is stated here once rather than repeated
+// verbatim on each of them: the framework's calls are safe to make with
+// well-formed arguments, and this module's types are what make the arguments
+// well-formed — the VM exists (proved by holding a `Vm`), the vCPU handle came
+// from `hv_vcpu_create` on this thread (proved by `Vcpu` being `!Send`), and
+// out-parameters are stack locals of the right type.
+//
+// Blocks whose safety rests on anything more than that — raw pointers into
+// guest memory, lifetimes the compiler cannot see — carry their own comment and
+// live in modules where this allow is not in force.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::marker::PhantomData;
 
 use crate::error::{Result, check};
@@ -116,7 +129,11 @@ impl Vm {
         let mut id: sys::hv_vcpu_t = 0;
         let mut exit: *mut sys::hv_vcpu_exit_t = std::ptr::null_mut();
         unsafe {
-            check(sys::hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut()))?;
+            check(sys::hv_vcpu_create(
+                &mut id,
+                &mut exit,
+                std::ptr::null_mut(),
+            ))?;
         }
         debug_assert!(!exit.is_null(), "framework returned a null exit pointer");
         Ok(Vcpu {
@@ -183,7 +200,11 @@ impl Vcpu {
     /// With an in-kernel GIC this is only the virtual-timer path; device
     /// interrupts are raised as SPIs through [`crate::Gic::set_spi`].
     pub fn set_pending_interrupt(&mut self, typ: InterruptType, pending: bool) -> Result<()> {
-        unsafe { check(sys::hv_vcpu_set_pending_interrupt(self.id, typ as u32, pending)) }
+        unsafe {
+            check(sys::hv_vcpu_set_pending_interrupt(
+                self.id, typ as u32, pending,
+            ))
+        }
     }
 
     pub fn pending_interrupt(&self, typ: InterruptType) -> Result<bool> {

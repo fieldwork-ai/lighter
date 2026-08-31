@@ -5,8 +5,6 @@
 //! reasons a first run fails, and it says which one it was. Run it with
 //! `make smoke`.
 
-use std::ffi::c_void;
-
 use lighter_hv::{Exception, Exit, Gic, GicLayout, MemoryPerms, Reg, Vm, hv_supported};
 
 /// Where the test's instructions live in guest-physical space. Arbitrary, but
@@ -35,7 +33,10 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("ok   created VM (max vCPUs: {})", vm.max_vcpu_count().unwrap());
+    println!(
+        "ok   created VM (max vCPUs: {})",
+        vm.max_vcpu_count().unwrap()
+    );
 
     // The GIC must exist before any vCPU does. Creating it here, before
     // create_vcpu below, is the ordering the whole boot path depends on.
@@ -79,20 +80,19 @@ fn main() {
     // SAFETY: `mem` is a valid PAGE-sized writable allocation and no guest is
     // running yet, so nothing else can observe these bytes mid-write.
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            GUEST_CODE.as_ptr(),
-            mem.cast::<u32>(),
-            GUEST_CODE.len(),
-        );
+        std::ptr::copy_nonoverlapping(GUEST_CODE.as_ptr(), mem.cast::<u32>(), GUEST_CODE.len());
     }
 
     // SAFETY: the mapping stays valid for the rest of the process, which
     // outlives the VM.
-    if let Err(e) = unsafe { vm.map(mem as *mut c_void, CODE_BASE, PAGE, MemoryPerms::RWX) } {
+    if let Err(e) = unsafe { vm.map(mem, CODE_BASE, PAGE, MemoryPerms::RWX) } {
         eprintln!("FAIL: could not map guest memory: {e}");
         std::process::exit(1);
     }
-    println!("ok   mapped {} KiB of guest RAM at {CODE_BASE:#x}", PAGE / 1024);
+    println!(
+        "ok   mapped {} KiB of guest RAM at {CODE_BASE:#x}",
+        PAGE / 1024
+    );
 
     let mut vcpu = match vm.create_vcpu() {
         Ok(v) => v,

@@ -109,8 +109,7 @@ unsafe extern "C" {
         typ: u32,
         pending: *mut bool,
     ) -> hv_return_t;
-    pub fn hv_vcpu_set_pending_interrupt(vcpu: hv_vcpu_t, typ: u32, pending: bool)
-    -> hv_return_t;
+    pub fn hv_vcpu_set_pending_interrupt(vcpu: hv_vcpu_t, typ: u32, pending: bool) -> hv_return_t;
 
     pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
     pub fn hv_vcpu_set_trap_debug_reg_accesses(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
@@ -140,8 +139,10 @@ unsafe extern "C" {
         config: hv_gic_config_t,
         base: hv_ipa_t,
     ) -> hv_return_t;
-    pub fn hv_gic_config_set_msi_region_base(config: hv_gic_config_t, base: hv_ipa_t)
-    -> hv_return_t;
+    pub fn hv_gic_config_set_msi_region_base(
+        config: hv_gic_config_t,
+        base: hv_ipa_t,
+    ) -> hv_return_t;
     pub fn hv_gic_config_set_msi_interrupt_range(
         config: hv_gic_config_t,
         msi_intid_base: u32,

@@ -1,5 +1,18 @@
 //! The per-process virtual machine.
 
+// Every `unsafe` block below is a single call into Hypervisor.framework whose
+// safety argument is identical and is stated here once rather than repeated
+// verbatim on each of them: the framework's calls are safe to make with
+// well-formed arguments, and this module's types are what make the arguments
+// well-formed — the VM exists (proved by holding a `Vm`), the vCPU handle came
+// from `hv_vcpu_create` on this thread (proved by `Vcpu` being `!Send`), and
+// out-parameters are stack locals of the right type.
+//
+// Blocks whose safety rests on anything more than that — raw pointers into
+// guest memory, lifetimes the compiler cannot see — carry their own comment and
+// live in modules where this allow is not in force.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 

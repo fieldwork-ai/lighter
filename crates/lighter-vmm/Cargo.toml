@@ -1,0 +1,27 @@
+[package]
+name = "lighter-vmm"
+description = "The lighter machine model: memory map, boot protocol, devices, and the vCPU run loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lighter-hv.workspace = true
+
+libc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+vm-fdt = "0.3"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "boot"
+path = "examples/boot.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
