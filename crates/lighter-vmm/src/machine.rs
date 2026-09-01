@@ -308,16 +308,25 @@ impl Machine {
             {
                 let mut held = transport.lock().expect("fs transport poisoned");
                 let signal = kicks.clone();
+                let first = virtio::fs::REQUEST_QUEUE;
+                let last = first + virtio::fs::request_queues();
                 held.set_kick_observer(Arc::new(move |queue| {
-                    if queue == virtio::fs::REQUEST_QUEUE {
+                    if (first..last).contains(&queue) {
                         signal.kicked();
                     }
                 }));
             }
+            // One thread for every request queue rather than one each: a
+            // watcher is a thread that spins, and the probe it spins on is a
+            // single memory read, so covering four rings costs four reads a
+            // turn instead of four threads.
+            let watched: Vec<u16> = (virtio::fs::REQUEST_QUEUE
+                ..virtio::fs::REQUEST_QUEUE + virtio::fs::request_queues())
+                .collect();
             let poller = virtio::poll::spawn(
                 &format!("fs{slot}"),
                 transport.clone(),
-                virtio::fs::REQUEST_QUEUE,
+                watched,
                 kicks.clone(),
             )?;
             pollers.push((kicks, poller));
@@ -338,7 +347,7 @@ impl Machine {
                 transport
                     .lock()
                     .expect("fs transport poisoned")
-                    .service_queue(virtio::fs::NOTIFY_QUEUE);
+                    .service_queue(virtio::fs::notify_queue());
             }));
         }
 

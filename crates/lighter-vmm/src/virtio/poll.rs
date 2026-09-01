@@ -118,19 +118,25 @@ fn idle_window() -> std::time::Duration {
 pub fn spawn(
     name: &str,
     transport: Arc<Mutex<VirtioMmio>>,
-    queue: u16,
+    watched: Vec<u16>,
     kicks: Arc<Kicks>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let window = idle_window();
-    let (signal, memory) = {
+    let (signals, memory) = {
         let held = transport.lock().expect("polled transport poisoned");
-        (held.signal(queue), held.memory().clone())
+        (
+            watched
+                .iter()
+                .filter_map(|index| held.signal(*index).map(|signal| (*index, signal)))
+                .collect::<Vec<_>>(),
+            held.memory().clone(),
+        )
     };
-    let Some(signal) = signal else {
+    if signals.is_empty() {
         return std::thread::Builder::new()
             .name(format!("poll-{name}"))
             .spawn(|| ());
-    };
+    }
     std::thread::Builder::new()
         .name(format!("poll-{name}"))
         .spawn(move || {
@@ -140,12 +146,20 @@ pub fn spawn(
             while kicks.wait() {
                 // The kick that woke us has already been serviced by the vCPU
                 // that made it; from here the guest is told to stop bothering.
-                transport
-                    .lock()
-                    .expect("polled transport poisoned")
-                    .suppress_notifications(queue, true);
+                //
+                // All of the watched queues, not just the one that kicked: a
+                // driver spreads its requests across them by CPU, so the next
+                // one is as likely to arrive on any other, and a queue left
+                // un-suppressed traps for every request while this thread is
+                // already watching it.
+                {
+                    let mut held = transport.lock().expect("polled transport poisoned");
+                    for (index, _) in &signals {
+                        held.suppress_notifications(*index, true);
+                    }
+                }
 
-                watch(&transport, &signal, &memory, queue, window);
+                watch(&transport, &signals, &memory, window);
 
                 // Clearing, then looking again — repeatedly. A driver that saw
                 // the flag set and skipped its kick is relying on this, and one
@@ -154,20 +168,29 @@ pub fn spawn(
                 // Going round until the ring is genuinely empty is the only
                 // version of this with no window in it.
                 let mut held = transport.lock().expect("polled transport poisoned");
-                held.suppress_notifications(queue, false);
+                for (index, _) in &signals {
+                    held.suppress_notifications(*index, false);
+                }
+                let mut stranded = 0;
                 loop {
-                    held.poll_queue(queue);
-                    if held.outstanding(queue) == 0 {
+                    let mut left = 0;
+                    for (index, _) in &signals {
+                        held.poll_queue(*index);
+                        left += held.outstanding(*index);
+                    }
+                    if left == 0 {
                         break;
                     }
                 }
-                let stranded = held.outstanding(queue);
+                for (index, _) in &signals {
+                    stranded += held.outstanding(*index);
+                }
                 drop(held);
                 if stranded != 0 {
                     // Benign by construction: the loop above only exits with an
                     // empty ring, so anything here arrived afterwards — and the
                     // flag is clear by then, so the guest will kick for it.
-                    tracing::debug!(queue, stranded, "a chain arrived as the poller parked");
+                    tracing::debug!(stranded, "a chain arrived as the poller parked");
                 }
             }
         })
@@ -181,23 +204,29 @@ pub fn spawn(
 /// is waiting for.
 fn watch(
     transport: &Arc<Mutex<VirtioMmio>>,
-    signal: &Arc<crate::virtio::mmio::QueueSignal>,
+    signals: &[(u16, Arc<crate::virtio::mmio::QueueSignal>)],
     memory: &GuestMemory,
-    queue: u16,
     window: std::time::Duration,
 ) {
     let mut last_work = std::time::Instant::now();
     while last_work.elapsed() < window {
-        if !signal.has_work(memory) {
-            std::hint::spin_loop();
-            continue;
+        let mut found = false;
+        for (index, signal) in signals {
+            if !signal.has_work(memory) {
+                continue;
+            }
+            if transport
+                .lock()
+                .expect("polled transport poisoned")
+                .poll_queue(*index)
+            {
+                found = true;
+            }
         }
-        if transport
-            .lock()
-            .expect("polled transport poisoned")
-            .poll_queue(queue)
-        {
+        if found {
             last_work = std::time::Instant::now();
+        } else {
+            std::hint::spin_loop();
         }
     }
 }

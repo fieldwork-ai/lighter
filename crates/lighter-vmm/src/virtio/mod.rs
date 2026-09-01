@@ -93,6 +93,13 @@ impl Serviced {
         }
     }
 
+    /// Both, for a device that finished work on more than one queue.
+    pub const fn and(self, other: Serviced) -> Serviced {
+        Serviced {
+            queues: self.queues | other.queues,
+        }
+    }
+
     /// Whether anything at all was serviced.
     pub const fn any(&self) -> bool {
         self.queues != 0

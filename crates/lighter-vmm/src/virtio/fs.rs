@@ -38,16 +38,44 @@ use crate::virtio::mmio::COMMON_FEATURES;
 use crate::virtio::queue::{Descriptor, Virtqueue};
 use crate::virtio::{Serviced, VirtioDevice, device_type};
 
-/// Queue indices, as the virtio-fs specification fixes them. There is no
-/// notification queue because we do not offer `VIRTIO_FS_F_NOTIFICATION`.
+/// Queue indices, as the virtio-fs specification fixes them.
 pub const HIPRIO_QUEUE: u16 = 0;
+/// The first request queue. There may be several, and they are consecutive.
 pub const REQUEST_QUEUE: u16 = 1;
+
+/// How many request queues the device advertises.
+///
+/// One is not a neutral choice. The driver serialises submission on a lock per
+/// queue, so every guest thread doing filesystem work at once queues behind
+/// the same one — which is measurable: sixteen concurrent creates cost 75
+/// microseconds apiece against 18 on the guest's own disk, and the host is
+/// idle for three fifths of that. Linux picks a queue per CPU when it is given
+/// more than one, which is what the lock was sharded for.
+///
+/// Four rather than one per vCPU because each queue is a ring the host has to
+/// watch, and a watcher per queue is a thread per queue. One watcher covering
+/// four is cheap; eight rings each with a spinning thread is not.
+pub fn request_queues() -> u16 {
+    std::env::var("LIGHTER_FS_QUEUES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=8).contains(n))
+        .unwrap_or(4)
+}
+
 /// The queue *we* write to, carrying invalidations into the guest.
 ///
 /// Last rather than second, so that a guest which does not know about it — an
 /// unpatched kernel — agrees with us about every other index and simply never
 /// makes this one ready.
-pub const NOTIFY_QUEUE: u16 = 2;
+pub fn notify_queue() -> u16 {
+    REQUEST_QUEUE + request_queues()
+}
+
+/// Whether `index` is one of the request queues.
+fn is_request_queue(index: u16) -> bool {
+    (REQUEST_QUEUE..REQUEST_QUEUE + request_queues()).contains(&index)
+}
 
 /// Feature bit: the device can push FUSE notifications.
 ///
@@ -196,12 +224,17 @@ struct Job {
     head: u16,
     request: Vec<u8>,
     reply: Vec<(u64, u32)>,
+    /// Which request queue it came from, and must go back to. Workers finish
+    /// out of order and out of queue; a completion returned to the wrong ring
+    /// is a descriptor id the driver never issued there.
+    queue: u16,
 }
 
 /// A finished request, waiting to go back on the used ring.
 struct Completion {
     head: u16,
     len: u32,
+    queue: u16,
 }
 
 /// Jobs waiting for a worker.
@@ -314,6 +347,7 @@ impl Pool {
                             .push_back(Completion {
                                 head: job.head,
                                 len: written as u32,
+                                queue: job.queue,
                             });
 
                         // One wake per batch. `notify` clears the flag *before*
@@ -442,7 +476,7 @@ impl Fs {
         let Some(memory) = self.memory.clone() else {
             return false;
         };
-        let Some(queue) = queues.get_mut(NOTIFY_QUEUE as usize) else {
+        let Some(queue) = queues.get_mut(notify_queue() as usize) else {
             return false;
         };
         let sink = self.server.notifications();
@@ -476,12 +510,13 @@ impl Fs {
     }
 
     /// Returns finished requests to the driver.
-    fn reap(&mut self, queue: &mut Virtqueue, memory: &GuestMemory) -> bool {
+    /// Returns finished work to whichever queues it came from.
+    fn reap(&mut self, queues: &mut [Virtqueue], memory: &GuestMemory) -> Serviced {
         let Some(pool) = &self.pool else {
-            return false;
+            return Serviced::NONE;
         };
         pool.waking.store(false, Ordering::Release);
-        let mut any = false;
+        let mut serviced = Serviced::NONE;
         loop {
             let completion = pool
                 .done
@@ -489,10 +524,13 @@ impl Fs {
                 .expect("fs completions poisoned")
                 .pop_front();
             let Some(completion) = completion else { break };
+            let Some(queue) = queues.get_mut(completion.queue as usize) else {
+                continue;
+            };
             queue.push_used(memory, completion.head, completion.len);
-            any = true;
+            serviced = serviced.and(Serviced::queue(completion.queue));
         }
-        any
+        serviced
     }
 }
 
@@ -518,7 +556,8 @@ impl VirtioDevice for Fs {
     }
 
     fn queue_count(&self) -> usize {
-        3
+        // Hiprio, the request queues, and the one we write invalidations into.
+        2 + request_queues() as usize
     }
 
     fn config_read(&self, offset: u64, data: &mut [u8]) {
@@ -528,7 +567,7 @@ impl VirtioDevice for Fs {
         let mut config = [0u8; TAG_LEN + 8];
         let tag = self.tag.as_bytes();
         config[..tag.len()].copy_from_slice(tag);
-        config[TAG_LEN..TAG_LEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        config[TAG_LEN..TAG_LEN + 4].copy_from_slice(&u32::from(request_queues()).to_le_bytes());
         let start = offset as usize;
         for (index, byte) in data.iter_mut().enumerate() {
             *byte = config.get(start + index).copied().unwrap_or(0);
@@ -604,14 +643,14 @@ impl VirtioDevice for Fs {
                 }
                 Serviced::queue_if(HIPRIO_QUEUE, used)
             }
-            REQUEST_QUEUE => {
+            index if is_request_queue(index) => {
                 let (Some(queue), Some(memory)) = (
                     self.pool.as_ref().map(|pool| pool.queue.clone()),
                     self.memory.clone(),
                 ) else {
                     return Serviced::NONE;
                 };
-                let Some(requests) = queues.get_mut(REQUEST_QUEUE as usize) else {
+                let Some(requests) = queues.get_mut(index as usize) else {
                     return Serviced::NONE;
                 };
                 let mut used = false;
@@ -643,6 +682,7 @@ impl VirtioDevice for Fs {
                         head,
                         request,
                         reply,
+                        queue: index,
                     }) {
                         // Every worker is gone. Return the chain rather than
                         // leaking it, so the guest sees an error instead of a
@@ -651,10 +691,15 @@ impl VirtioDevice for Fs {
                         used = true;
                     }
                 }
-                let reaped = self.reap(&mut queues[REQUEST_QUEUE as usize], mem);
-                Serviced::queue_if(REQUEST_QUEUE, used || reaped)
+                // Reaping is not per-queue: a worker finishes whatever it
+                // picked up, from whichever ring, so one pass returns them all
+                // and says which rings gained entries.
+                let reaped = self.reap(queues, mem);
+                reaped.and(Serviced::queue_if(index, used))
             }
-            NOTIFY_QUEUE => Serviced::queue_if(NOTIFY_QUEUE, self.deliver(queues, mem)),
+            index if index == notify_queue() => {
+                Serviced::queue_if(index, self.deliver(queues, mem))
+            }
             _ => Serviced::NONE,
         }
     }
@@ -680,8 +725,47 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(config[TAG_LEN..TAG_LEN + 4].try_into().unwrap()),
-            1,
-            "one request queue"
+            u32::from(request_queues()),
+            "the advertised queue count is what the device actually has"
+        );
+    }
+
+    /// Every queue index has exactly one meaning, and the notification queue
+    /// is the last of them.
+    ///
+    /// The indices are computed rather than constant now, because the number
+    /// of request queues is a runtime choice. Getting the arithmetic wrong
+    /// does not fail loudly: it puts invalidations on a request queue, where
+    /// the guest reads them as replies to things it never asked.
+    #[test]
+    fn queue_indices_do_not_overlap() {
+        let n = request_queues();
+        assert!(n >= 1);
+        assert_eq!(HIPRIO_QUEUE, 0);
+        assert_eq!(REQUEST_QUEUE, 1);
+        assert_eq!(
+            notify_queue(),
+            1 + n,
+            "notifications come after the requests"
+        );
+
+        assert!(!is_request_queue(HIPRIO_QUEUE));
+        assert!(!is_request_queue(notify_queue()));
+        for index in REQUEST_QUEUE..REQUEST_QUEUE + n {
+            assert!(
+                is_request_queue(index),
+                "queue {index} should be a request queue"
+            );
+        }
+
+        let share = Share {
+            tag: "t".into(),
+            path: std::env::temp_dir(),
+        };
+        assert_eq!(
+            Fs::new(&share).unwrap().queue_count(),
+            usize::from(n) + 2,
+            "hiprio, the request queues, and the notification queue"
         );
     }
 
