@@ -4,4 +4,4 @@
 # copying, which is why it is worth measuring separately from npm.
 set -eu
 cd "$WORK/npm"
-pnpm install --frozen-lockfile --ignore-scripts
+pnpm install --frozen-lockfile --reporter=silent --ignore-scripts
