@@ -193,6 +193,14 @@ fn bridge(guest_side: OwnedFd, path: &str) {
 
     // dockerd -> guest
     copy(&mut upstream_read, &mut guest_write);
+    // The daemon has said everything it will say. The host client is owed the
+    // end of the response even though its own stdin may stay open forever —
+    // `docker exec` with a terminal for stdin does exactly that, and without
+    // this half-close it hangs on a reply that finished long ago. SHUT_WR
+    // rather than dropping the fd: the request direction may still be
+    // draining, and it ends on its own terms.
+    // SAFETY: a live descriptor; shutdown of the write half only.
+    unsafe { libc::shutdown(guest_write.0.as_raw_fd(), libc::SHUT_WR) };
 
     let _ = request.join();
 }

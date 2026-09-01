@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The reproducible benchmark suite.
 #
-#   benchmarks/run.sh --target native --reps 5
-#   benchmarks/run.sh --target lighter --reps 5
-#   benchmarks/run.sh --target orbstack --reps 5
+#   benchmarks/run.sh --target native --reps 3
+#   benchmarks/run.sh --target lighter --reps 3
+#   benchmarks/run.sh --target orbstack --reps 3
 #
 # Every target runs the same case scripts against the same fixture on the same
 # machine. What differs is only how the directory gets to the process: on
