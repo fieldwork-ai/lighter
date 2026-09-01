@@ -37,6 +37,12 @@ CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf w
 # changes what they see, and pnpm in particular builds a farm of symlinks.
 TREE_CASES=" ripgrep find-walk copy-tree rm-rf "
 IMAGE="lighter-bench:1"
+# What the guest is given. Defaults suit the machine this was written on;
+# `BENCH_MEMORY_MIB` and `BENCH_CPUS` are how it runs somewhere smaller.
+#
+# The memory is a ceiling rather than an allocation — the guest reports free
+# pages back and the host reclaims them — so the number to set is what the
+# workload's page cache wants, not what the machine can spare.
 KEEP=0
 ALLOW_NOISY=0
 # Where the fixture lives for a container target.
@@ -317,7 +323,7 @@ setup_lighter() {
 		--net "$GVPROXY" --run-dir "$RUN_DIR" \
 		--vsock "$SOCKET:2375" \
 		--share "bench:$WORK" \
-		--no-tty --cpus 8 --memory-mib 8192 \
+		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "${BENCH_MEMORY_MIB:-8192}" \
 		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
