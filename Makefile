@@ -31,6 +31,14 @@ sign: ## Ad-hoc sign built binaries with the hypervisor entitlement
 		| grep -vE '/(build|deps|incremental)/' || true); \
 	if [ -n "$$bins" ]; then $(SIGN) $$bins; fi
 
+.PHONY: quick
+quick: ## The inner loop: lint, unit tests, and a real boot (~15s)
+	@scripts/quick.sh
+
+.PHONY: latency
+latency: ## Per-operation latency, macOS against the share (~15s)
+	@benchmarks/latency.sh
+
 .PHONY: fmt
 fmt: ## Format
 	$(CARGO) fmt --all
@@ -65,7 +73,8 @@ smoke: ## Prove the hypervisor path works on this machine
 # One target per milestone. `make gates` runs every gate that has landed.
 
 .PHONY: gates
-gates: gate-m1 gate-m2 gate-m3-network gate-m3-vsock gate-m3-docker gate-m4-fs gate-m5-speed gate-m6-memory gate-m7-amd64 gate-m8-daily ## Run all landed milestone gates
+gates: gvproxy ## Run all landed milestone gates, and report what each one cost
+	@scripts/gates/run-all.sh
 
 .PHONY: gate-m1
 gate-m1: ## M1: a custom kernel boots to a shell on the serial console

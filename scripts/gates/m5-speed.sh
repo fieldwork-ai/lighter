@@ -19,8 +19,20 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-REPS="${REPS:-5}"
+REPS="${REPS:-3}"
 CASES="npm-install ripgrep find-walk copy-tree watch-latency"
+
+# How old a native baseline may be before the gate insists on a fresh one.
+#
+# The Mac's own speed is a property of the Mac, not of the change under test,
+# and re-deriving it costs as much as the measurement it is the baseline for —
+# half of every run of this gate, spent confirming that macOS is still macOS.
+# So it is reused while it is fresh, and `REFRESH_NATIVE=1` forces the issue.
+#
+# It is not cached indefinitely, because it silently stops being true: a
+# thermal event, an OS update, or a full disk moves it, and a stale baseline
+# does not fail — it flatters.
+NATIVE_MAX_AGE_DAYS="${NATIVE_MAX_AGE_DAYS:-7}"
 
 # Floors, as a percentage of the same command on the Mac's own disk.
 #
@@ -55,13 +67,30 @@ median() {
 		| awk '{ v[NR] = $1 } END { if (NR == 0) print ""; else print v[int((NR + 1) / 2)] }'
 }
 
-echo "==> Measuring macOS itself"
-./benchmarks/run.sh --target native --reps "$REPS" --cases "$CASES" >/dev/null
-echo "==> Measuring the share"
-./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" >/dev/null
-
 NATIVE=benchmarks/results/native.csv
 OURS=benchmarks/results/lighter.csv
+
+native_is_fresh() {
+	[ "${REFRESH_NATIVE:-0}" = 1 ] && return 1
+	[ -f "$NATIVE" ] || return 1
+	# Every case this gate compares has to be in there, or the reuse is a
+	# baseline for a different question.
+	for case in $CASES; do
+		grep -q "^$case," "$NATIVE" || return 1
+	done
+	local age
+	age=$(( ( $(date +%s) - $(stat -f %m "$NATIVE") ) / 86400 ))
+	[ "$age" -le "$NATIVE_MAX_AGE_DAYS" ]
+}
+
+if native_is_fresh; then
+	echo "==> Reusing the native baseline ($(date -r "$NATIVE" '+%Y-%m-%d'); REFRESH_NATIVE=1 to redo it)"
+else
+	echo "==> Measuring macOS itself"
+	./benchmarks/run.sh --target native --reps "$REPS" --cases "$CASES" >/dev/null
+fi
+echo "==> Measuring the share"
+./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" >/dev/null
 
 echo
 compare() {

@@ -18,12 +18,12 @@ of the repetitions.
 
 | case | native | lighter | orbstack |
 |---|---|---|---|
-| npm-install | 6287 | 11984 | 8945 |
+| npm-install | 6217 | 11901 | 8945 |
 | pnpm-install | — | — | 5415 |
 | yarn-install | — | — | 8611 |
-| ripgrep | 928 | 98 | 991 |
-| find-walk | 373 | 110 | 480 |
-| copy-tree | 14341 | 7016 | 9327 |
+| ripgrep | 934 | 110 | 991 |
+| find-walk | 368 | 111 | 480 |
+| copy-tree | 14452 | 6984 | 9327 |
 | rm-rf | — | — | 3206 |
 | watch-latency | 2 | 2 | 12 |
 
@@ -37,9 +37,9 @@ division by noise — read it from the table above in milliseconds.
 | case | lighter | orbstack |
 |---|---|---|
 | npm-install | 52% | 70% |
-| ripgrep | 947% | 94% |
-| find-walk | 339% | 78% |
-| copy-tree | 204% | 154% |
+| ripgrep | 849% | 94% |
+| find-walk | 332% | 77% |
+| copy-tree | 207% | 155% |
 
 ## Sweeps
 
