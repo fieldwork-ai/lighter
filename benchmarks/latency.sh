@@ -28,7 +28,7 @@ cp benchmarks/cases/op-latency.js "$WORK/cases/"
 
 native=""
 if [ "$WHICH" != lighter ]; then
-	native="$(DIR="$WORK" OPS="${OPS:-3000}" node "$WORK/cases/op-latency.js")"
+	native="$(DIR="$WORK" OPS="${OPS:-3000}" ONLY="${ONLY:-}" node "$WORK/cases/op-latency.js")"
 fi
 
 ours=""
@@ -57,8 +57,8 @@ if [ "$WHICH" != native ]; then
 	done
 	export DOCKER_HOST="unix://$RUN_DIR/docker.sock"
 	docker build -q -t "$IMAGE" benchmarks >/dev/null
-	ours="$(docker run --rm -v /mnt/lat:/work -e DIR=/work -e "OPS=${OPS:-3000}" "$IMAGE" \
-		node /work/cases/op-latency.js)"
+	ours="$(docker run --rm -v /mnt/lat:/work -e DIR=/work -e "OPS=${OPS:-3000}" \
+		-e "ONLY=${ONLY:-}" "$IMAGE" node /work/cases/op-latency.js)"
 fi
 
 printf '\n%-14s %10s %10s %10s\n' "operation" "macOS" "lighter" "overhead"

@@ -38,6 +38,15 @@ const NAMED: [(u32, &str); 23] = [
     (35, "create"),
 ];
 
+/// What to call an opcode in a log line.
+pub fn name(opcode: u32) -> &'static str {
+    NAMED
+        .iter()
+        .find(|(code, _)| *code == opcode)
+        .map(|(_, name)| *name)
+        .unwrap_or("other")
+}
+
 /// How many independent copies of the counters to keep.
 ///
 /// Not paranoia: seventeen threads incrementing two atomics on one cache line,

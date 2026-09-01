@@ -18,16 +18,33 @@ const reps = Number(process.env.OPS || 3000);
 fs.rmSync(dir, { recursive: true, force: true });
 fs.mkdirSync(dir, { recursive: true });
 
-function bench(name, fn) {
+// `ONLY=create+close` narrows it to one operation, which is what attributing
+// a request count to a syscall needs: with five benches running, a server-side
+// opcode histogram is a sum and says nothing about which one produced what.
+const only = process.env.ONLY;
+
+// Each bench makes whatever it needs, untimed. Depending on the one before it
+// is fine until `ONLY` runs one on its own and it fails on a file that was
+// never created — which is the point of being able to run one on its own.
+function bench(name, fn, setup) {
+  if (only && only !== name) return;
+  if (setup) setup();
   const started = process.hrtime.bigint();
   for (let i = 0; i < reps; i++) fn(i);
   const each = Number(process.hrtime.bigint() - started) / 1000 / reps;
   console.log(`US ${name} ${each.toFixed(2)}`);
 }
 
+const touch = (prefix) => () => {
+  for (let i = 0; i < reps; i++) {
+    const p = path.join(dir, `${prefix}${i}`);
+    if (!fs.existsSync(p)) fs.closeSync(fs.openSync(p, "w"));
+  }
+};
+
 bench("create+close", (i) => fs.closeSync(fs.openSync(path.join(dir, `f${i}`), "w")));
 // Cached: the guest should answer these without crossing the boundary at all.
-bench("stat-cached", (i) => fs.statSync(path.join(dir, `f${i % 100}`)));
+bench("stat-cached", (i) => fs.statSync(path.join(dir, `f${i % 100}`)), touch("f"));
 // A name that is not there, which no cache can answer for.
 bench("stat-missing", (i) => {
   try {
@@ -35,6 +52,6 @@ bench("stat-missing", (i) => {
   } catch {}
 });
 bench("write-4k", (i) => fs.writeFileSync(path.join(dir, `w${i}`), Buffer.alloc(4096)));
-bench("unlink", (i) => fs.unlinkSync(path.join(dir, `f${i}`)));
+bench("unlink", (i) => fs.unlinkSync(path.join(dir, `f${i}`)), touch("f"));
 
 fs.rmSync(dir, { recursive: true, force: true });

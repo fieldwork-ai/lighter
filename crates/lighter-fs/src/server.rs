@@ -30,7 +30,7 @@ use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::cache::{Answer, Invalidator, Policy, Timings};
 use crate::errno::linux;
@@ -91,6 +91,8 @@ pub struct Server {
     host_gid: u32,
     /// Negotiated at INIT, and read by READ to bound a reply.
     max_write: AtomicU32,
+    /// How many more requests to log in order. See [`Server::trace`].
+    trace_left: AtomicUsize,
     /// How long the guest may believe what we tell it.
     policy: Arc<Policy>,
     /// Invalidations waiting to be carried to the guest.
@@ -182,6 +184,12 @@ impl Server {
             host_uid,
             host_gid,
             max_write: AtomicU32::new(MAX_WRITE),
+            trace_left: AtomicUsize::new(
+                std::env::var("LIGHTER_FS_TRACE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+            ),
             policy,
             notifications: sink,
             open_cache: OpenCache::new(),
@@ -237,6 +245,7 @@ impl Server {
             _ => {}
         }
 
+        self.trace(&header);
         let started = self.stats.enabled().then(std::time::Instant::now);
         let outcome = self.handle(&header, body, sink.capacity());
         if let Some(started) = started {
@@ -326,6 +335,31 @@ impl Server {
             op::IOCTL => Err(25), // ENOTTY: no ioctl reaches a passthrough file
             _ => Err(linux::ENOSYS),
         }
+    }
+
+    /// Logs the first few requests, in order, when `LIGHTER_FS_TRACE` is set.
+    ///
+    /// The histogram says a package install sends two GETATTRs per created
+    /// file; only the sequence says whether they come before the create, after
+    /// the close, or from something else entirely — and that is the difference
+    /// between a guest patch that removes them and one that does nothing.
+    fn trace(&self, header: &fuse::InHeader) {
+        let left = self.trace_left.load(Ordering::Relaxed);
+        if left == 0 {
+            return;
+        }
+        if self
+            .trace_left
+            .compare_exchange(left, left - 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        tracing::info!(
+            op = crate::stats::name(header.opcode),
+            nodeid = header.nodeid,
+            "FSTRACE"
+        );
     }
 
     /// Whether opcode counting is on.
