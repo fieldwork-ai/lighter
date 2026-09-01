@@ -232,6 +232,10 @@ impl Server {
             });
             return 0;
         };
+        // Ops revive parked descriptors without inserting anything, so the
+        // budget has to be re-checked here, not only on insert. One atomic
+        // load when the share is under budget.
+        self.registry.reclaim_if_over_budget();
         // The header's own length field bounds the body; a guest that lied
         // about it must not let us read the tail of the previous request.
         let end = (header.len as usize)

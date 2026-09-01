@@ -373,6 +373,9 @@ pub struct Registry {
     /// inside the slack, because past that a wasted sweep is cheaper than
     /// EMFILE.
     quiet_until: AtomicUsize,
+    /// Whether a thread is already in the forced phase of a sweep, so the
+    /// others go back to work instead of queueing up to park the same inodes.
+    forcing: AtomicBool,
 }
 
 impl Registry {
@@ -415,6 +418,7 @@ impl Registry {
             reported: Mutex::new(std::time::Instant::now()),
             hands: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
             quiet_until: AtomicUsize::new(0),
+            forcing: AtomicBool::new(false),
         }
     }
 
@@ -584,7 +588,10 @@ impl Registry {
     /// next insert sweeps again, and the second pass sees the bits the first
     /// one cleared. Refusing to loop here is what stops a share whose inodes
     /// are genuinely all hot from spinning instead of running.
-    fn reclaim_if_over_budget(&self) {
+    /// Cheap when under budget — one atomic load — so it is called on every
+    /// request as well as every insert: a revival storm holds no inserts, and
+    /// reclaim that only ran on insert let one climb to the ceiling unchecked.
+    pub(crate) fn reclaim_if_over_budget(&self) {
         let open = self.census.descriptors();
         if open <= self.budget {
             return;
@@ -640,6 +647,52 @@ impl Registry {
                     parked_total += 1;
                 }
             }
+        }
+
+        // The pass above defers to recency, which is right up to the moment it
+        // stops working: a working set hotter than the budget re-sets every
+        // reference bit faster than the hand comes round, so the polite pass
+        // parks nothing while the count ratchets up — a thousand a second, on
+        // a machine where it was watched — until it meets the kernel's ceiling
+        // and the guest sees EMFILE. Past the slack, recency is a luxury: one
+        // thread keeps the hand turning and parks whatever is held, reference
+        // bit or no, until the count is back under target or it has been all
+        // the way around. The others skip past and go back to work.
+        if self.census.descriptors() > self.budget + slack
+            && self
+                .forcing
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            let mut remaining = self.census.inodes();
+            while remaining > 0 && self.census.descriptors() > target {
+                let index = self.sweep.fetch_add(1, Ordering::Relaxed) % SHARDS;
+                let batch: Vec<u64> = {
+                    let mut hand = self.hands[index].lock().expect("reclaim hand poisoned");
+                    let take = SWEEP_BATCH.min(hand.len());
+                    hand.drain(..take).collect()
+                };
+                remaining = remaining.saturating_sub(SWEEP_BATCH.max(batch.len()));
+                for id in batch {
+                    let inode = self.by_id[index]
+                        .lock()
+                        .expect("inode table poisoned")
+                        .get(&id)
+                        .cloned();
+                    let Some(inode) = inode else { continue };
+                    self.hands[index]
+                        .lock()
+                        .expect("reclaim hand poisoned")
+                        .push_back(id);
+                    if !inode.held.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if inode.park() {
+                        parked_total += 1;
+                    }
+                }
+            }
+            self.forcing.store(false, Ordering::Release);
         }
 
         let open = self.census.descriptors();
@@ -794,9 +847,15 @@ fn descriptor_budget() -> usize {
     {
         return budget.max(8);
     }
-    const RESERVE: u64 = 8192;
-    let ceiling = crate::sys::descriptor_ceiling().saturating_sub(RESERVE);
-    ((ceiling / 4) * 3).max(1024) as usize
+    // The reserve is proportional with a floor, not flat. A flat 8192 was
+    // sized on a machine whose ceiling was 184,320 and left a stock Mac —
+    // `kern.maxfilesperproc` of 10,240 — a budget of 1,536, which a pnpm
+    // install walks straight through. A fifth of the ceiling covers the
+    // guest's open files, the VMM's disks and sockets, and the sidecar on
+    // either machine.
+    let ceiling = crate::sys::descriptor_ceiling();
+    let reserve = (ceiling / 8).max(2048);
+    ((ceiling.saturating_sub(reserve) / 4) * 3).max(1024) as usize
 }
 
 #[cfg(test)]
@@ -1155,6 +1214,49 @@ mod tests {
         assert!(
             open <= budget * 2,
             "held {open} descriptors against a budget of {budget} over {FILES} inodes"
+        );
+    }
+
+    /// A working set hotter than the budget must still be held near it.
+    ///
+    /// The shape that produced EMFILE on a stock Mac (`kern.maxfilesperproc`
+    /// of 10,240): every inode is touched again before the hand comes back
+    /// around, so the recency pass clears reference bits and parks nothing,
+    /// every pass, while the count climbs about a thousand a second until it
+    /// meets the kernel's ceiling. Past the slack the reclaim has to stop
+    /// deferring to recency and park hot inodes anyway.
+    #[test]
+    fn a_working_set_hotter_than_the_budget_is_still_bounded() {
+        // SAFETY: single-threaded test setup, before any registry is built.
+        unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "256") };
+        let scratch = Scratch::new("hot");
+        let reg = scratch.registry();
+        let mut ids = Vec::new();
+        let mut worst = 0usize;
+        for n in 0..1200 {
+            let (fd, dev, ino) = scratch.file(&format!("h{n}"));
+            ids.push(reg.insert(fd, dev, ino, false, false));
+            // Everything stays hot — and parked inodes are revived, the way
+            // an install re-walks the tree it is writing.
+            if n % 64 == 0 {
+                for &id in &ids {
+                    if let Some(inode) = reg.get(id) {
+                        let _ = inode.reference();
+                    }
+                }
+                // Every real op runs the same check through dispatch; the
+                // revival loop above stands in for a burst of them.
+                reg.reclaim_if_over_budget();
+            }
+            worst = worst.max(reg.descriptor_usage().0);
+        }
+        let budget = reg.descriptor_usage().1;
+        unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+        // Revival between sweeps means the count breathes above the budget;
+        // what it must never do is ratchet toward the ceiling.
+        assert!(
+            worst <= budget * 3,
+            "descriptors reached {worst} against a budget of {budget} with everything hot"
         );
     }
 
