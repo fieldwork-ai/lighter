@@ -45,7 +45,9 @@ Boot to a served Docker socket: about two seconds. Idle: 0.2% of one core, and a
 
 Read the table honestly, because it says two things. **Reading a shared tree, lighter is between four and nine times faster than the best commercial option**, and faster than the Mac itself: the guest's page cache answers without crossing the VM boundary at all, and Linux's VFS is quicker than the one underneath it. That is only allowed because the cache can be *corrected* — a patch to the guest's virtio-fs driver adds a notification queue, macOS FSEvents says what changed, and an invalidation goes out naming the exact file. Without a channel like that, a shared filesystem has to guess a timeout and live with being wrong for it.
 
-**Writing one, lighter is behind, and by a lot on `pnpm`.** The cost is per-operation and not per-byte: a package install is several hundred thousand small requests, each one a round trip that macOS answers in microseconds and that costs microseconds more to deliver. `benchmarks/README.md` has the measurements, including what was tried and found worthless so nobody repeats it. The same fixture installed on the guest's own disk takes 7.7s against the Mac's 6.6s, which is where the ceiling is if the boundary were free.
+**Writing one, lighter is behind, and by a lot on `pnpm`.** The cost is per-operation and not per-byte. An install is about 636,000 filesystem requests, of which 66,000 are creates costing 39 microseconds apiece on the host — that is APFS making a file, and two thirds of all the host time in a run. The round trips on top are one to two microseconds each: a missing `stat` costs 4.7 microseconds on the Mac and 6.6 through the share. So the boundary is no longer the story; sixty-six thousand files is. `benchmarks/README.md` has the measurements, what was tried and dropped, and what can be resolved at all — the workload cases have a 2.4% standard deviation, so an effect below five percent cannot be found with them however many times they are run.
+
+The same fixture installed on the guest's own disk takes 7.7s against the Mac's 6.6s, which is where the ceiling is if the boundary were free.
 
 Run them yourself:
 

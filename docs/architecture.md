@@ -50,12 +50,16 @@ virtio-mmio rather than PCI: no host bridge to model, no enumeration, and a devi
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and two patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and three patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
-The two kernel patches are the interesting part:
+The kernel patches are the interesting part:
 
 - **A notification queue for virtio-fs.** Linux's driver has a high-priority queue and request queues, both guest-to-host, so FUSE's reverse channel — the one a server uses to say "forget what you cached" — has nowhere to go. Without it, a share can only be cached for a duration chosen in advance and chosen for the worst case. With it, the timeouts are thirty seconds and a host edit still lands in milliseconds.
-- **Spinning for a reply instead of sleeping for one.** A synchronous FUSE request costs far more to deliver than the server takes to answer: an interrupt, a work item, and two trips through the scheduler for work that finished microseconds ago. Ten microseconds of spinning took a package install from eighteen seconds to thirteen and a half.
+- **Spinning for a reply instead of sleeping for one.** A synchronous FUSE request costs far more to deliver than the server takes to answer: an interrupt, a work item, and two trips through the scheduler for work that finished microseconds ago. Spinning took a package install from eighteen seconds to thirteen and a half.
+
+  How long to spin depends on what the other end is doing, and the spin must not take a lock to ask. The queue's lock is the one every other thread needs to *submit*, so a spin that grabs it to check for a reply starves the queue it is waiting on — worth 75 microseconds a create against 59 with sixteen threads at work. It is asked lock-free now, and the window is a hundred microseconds rather than ten: with the device watching the ring there is no longer a trap to rendezvous inside, so the spin has to cover the operation rather than the delivery.
+
+- **Not asking for `security.capability` the server has promised to clear.** `FUSE_HANDLE_KILLPRIV_V2` is a connection-wide undertaking that the server strips setuid, setgid and file capabilities on write. The kernel sends `FUSE_WRITE_KILL_SUIDGID` to say so, and then reads the attribute itself anyway — two round trips per written file, ten percent of all requests on an install, every one answered ENODATA.
 
 Both are in `guest/kernel/patches/`, each with the reasoning in its header.
 
