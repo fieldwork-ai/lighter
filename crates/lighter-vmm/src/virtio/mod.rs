@@ -44,6 +44,11 @@ pub mod features {
     /// legacy layout, which places the rings differently and which we do not
     /// implement.
     pub const VERSION_1: u64 = 1 << 32;
+    /// One ring instead of three, with availability carried in each
+    /// descriptor's own flags. The driver decides; a device offering both has
+    /// to implement both, because it does not find out which until the feature
+    /// word comes back.
+    pub const RING_PACKED: u64 = 1 << 34;
 }
 
 /// Device status bits the driver writes as it brings a device up.

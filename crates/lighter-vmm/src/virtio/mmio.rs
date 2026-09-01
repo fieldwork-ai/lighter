@@ -98,8 +98,17 @@ pub struct VirtioMmio {
 #[derive(Debug, Default)]
 pub struct QueueSignal {
     ready: AtomicBool,
-    avail_addr: AtomicU64,
+    /// Split: the available ring. Packed: the descriptor ring.
+    ring_addr: AtomicU64,
     next_avail: AtomicU16,
+    /// Packed rings answer the question differently, and reading one as the
+    /// other is not a crash — it is a watcher that spins on the driver's event
+    /// flags believing they are an index, and so either never sleeps or never
+    /// wakes.
+    packed: AtomicBool,
+    /// The device's lap counter, which is half of what makes a packed
+    /// descriptor available.
+    avail_wrap: AtomicBool,
 }
 
 impl QueueSignal {
@@ -108,16 +117,38 @@ impl QueueSignal {
         if !self.ready.load(Ordering::Relaxed) {
             return false;
         }
+        let addr = self.ring_addr.load(Ordering::Relaxed);
+        if self.packed.load(Ordering::Relaxed) {
+            // The flags of the descriptor at the cursor, at offset 14 of a
+            // sixteen-byte entry. Available means the availability bit matches
+            // our lap and the used bit does not.
+            let at = addr + u64::from(self.next_avail.load(Ordering::Relaxed)) * 16 + 14;
+            let wrap = self.avail_wrap.load(Ordering::Relaxed);
+            return memory.read_u16(at).is_ok_and(|flags| {
+                let avail = flags & (1 << 7) != 0;
+                let used = flags & (1 << 15) != 0;
+                avail == wrap && used != avail
+            });
+        }
         // Offset 2 in the available ring: past `flags`, at `idx`.
-        let addr = self.avail_addr.load(Ordering::Relaxed);
         memory
             .read_u16(addr + 2)
             .is_ok_and(|idx| idx != self.next_avail.load(Ordering::Relaxed))
     }
 
     fn publish(&self, queue: &Virtqueue) {
-        self.avail_addr.store(queue.avail_addr, Ordering::Relaxed);
+        let packed = queue.is_packed();
+        self.packed.store(packed, Ordering::Relaxed);
+        self.ring_addr.store(
+            if packed {
+                queue.desc_addr
+            } else {
+                queue.avail_addr
+            },
+            Ordering::Relaxed,
+        );
         self.next_avail.store(queue.next_avail(), Ordering::Relaxed);
+        self.avail_wrap.store(queue.avail_wrap(), Ordering::Relaxed);
         // Published last: it is the field that authorizes reading the others.
         self.ready.store(queue.is_ready(), Ordering::Relaxed);
     }
@@ -211,6 +242,16 @@ impl VirtioMmio {
 
         let serviced = self.device.notify(index, &mut self.queues, &self.memory);
         self.publish_signals();
+        // Re-arm before deciding about the interrupt: the driver stops kicking
+        // a queue whose event index it has overtaken, and it overtakes one
+        // that is never written. A device that negotiates the feature owes
+        // this on every pass — but only where the cursor has actually moved,
+        // because the write carries a fence and paying for one per queue per
+        // request costs more than the notification it saves.
+        let memory = self.memory.clone();
+        for queue in &mut self.queues {
+            queue.arm_notifications(&memory);
+        }
         if !serviced.any() {
             return;
         }
@@ -219,8 +260,16 @@ impl VirtioMmio {
         // Servicing TX can produce work on RX, and consulting TX's suppression
         // state about an RX completion is how a reply ends up sitting in the
         // ring with the guest asleep.
-        let wants_interrupt = (0..self.queues.len())
-            .any(|i| serviced.contains(i as u16) && self.queues[i].needs_interrupt(&self.memory));
+        // Deliberately not `any`, and not `filter().any()` either:
+        // `needs_interrupt` records that the driver has been told, so
+        // short-circuiting would leave a later queue believing it had
+        // signalled a used index it never mentioned.
+        let mut wants_interrupt = false;
+        for i in 0..self.queues.len() {
+            if serviced.contains(i as u16) && self.queues[i].needs_interrupt(&memory) {
+                wants_interrupt = true;
+            }
+        }
         if wants_interrupt {
             self.interrupt_status |= INT_VRING;
             // The device tree declares these lines edge-triggered, matching
@@ -245,7 +294,7 @@ impl VirtioMmio {
             DEVICE_FEATURES => {
                 // The 64-bit feature word is read 32 bits at a time, selected
                 // by DeviceFeaturesSel.
-                let all = self.device.features();
+                let all = offered_features(self.device.features());
                 if self.device_features_sel == 0 {
                     all as u32
                 } else {
@@ -294,6 +343,16 @@ impl VirtioMmio {
                 let shifted = u64::from(value) << (32 * u64::from(self.driver_features_sel));
                 self.acked_features |= shifted;
                 self.device.ack_features(self.acked_features);
+                // The event index changes what the ring's trailing fields
+                // mean, so every queue has to learn it before the driver can
+                // set one up.
+                let negotiated = self.negotiated_features();
+                let event_idx = negotiated & features::RING_EVENT_IDX != 0;
+                let packed = negotiated & features::RING_PACKED != 0;
+                for queue in &mut self.queues {
+                    queue.set_event_idx(event_idx);
+                    queue.set_packed(packed);
+                }
             }
             QUEUE_SEL => self.queue_sel = value,
             QUEUE_NUM => {
@@ -429,8 +488,9 @@ impl VirtioMmio {
 
     /// Sets or clears the "do not kick us" flag on a queue.
     pub fn suppress_notifications(&mut self, index: u16, suppress: bool) {
-        if let Some(queue) = self.queues.get(index as usize) {
-            queue.suppress_notifications(&self.memory, suppress);
+        let memory = self.memory.clone();
+        if let Some(queue) = self.queues.get_mut(index as usize) {
+            queue.suppress_notifications(&memory, suppress);
         }
     }
 
@@ -491,7 +551,23 @@ impl MmioDevice for VirtioMmio {
 /// `VERSION_1` is mandatory — without it the driver uses the legacy ring layout
 /// we do not implement — and indirect descriptors matter enough for block
 /// throughput to be on by default.
-pub const COMMON_FEATURES: u64 = features::VERSION_1 | features::RING_INDIRECT_DESC;
+pub const COMMON_FEATURES: u64 = features::VERSION_1
+    | features::RING_INDIRECT_DESC
+    | features::RING_EVENT_IDX
+    | features::RING_PACKED;
+
+/// What a device should actually offer.
+///
+/// The packed layout is withheld by `LIGHTER_VIRTIO_PACKED=0`, which exists
+/// because the answer to "is it faster" turned out to be workload-dependent
+/// and worth being able to re-ask without a rebuild. The driver chooses it
+/// whenever it is offered, so withholding is the only way to compare.
+pub fn offered_features(device: u64) -> u64 {
+    if std::env::var("LIGHTER_VIRTIO_PACKED").as_deref() == Ok("0") {
+        return device & !features::RING_PACKED;
+    }
+    device
+}
 
 #[cfg(test)]
 mod tests {
