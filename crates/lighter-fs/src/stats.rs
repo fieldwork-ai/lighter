@@ -12,8 +12,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The opcodes worth naming in a report. Everything else lands in `other`.
-const NAMED: [(u32, &str); 23] = [
+const NAMED: [(u32, &str); 24] = [
     (1, "lookup"),
+    (2, "forget"),
     (3, "getattr"),
     (4, "setattr"),
     (5, "readlink"),
@@ -140,6 +141,7 @@ impl Stats {
         let opcode = match opcode {
             44 => 28, // READDIRPLUS -> READDIR
             45 => 12, // RENAME2 -> RENAME
+            42 => 2,  // BATCH_FORGET -> FORGET (one request, many forgets)
             _ => opcode,
         };
         match NAMED.iter().position(|(code, _)| *code == opcode) {

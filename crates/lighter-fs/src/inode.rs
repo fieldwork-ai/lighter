@@ -1191,6 +1191,16 @@ impl Registry {
                     if !inode.held.load(Ordering::Relaxed) {
                         continue;
                     }
+                    // Files first, here too. Parking a hot directory by force
+                    // was measured as a hundred milliseconds per directory on
+                    // a tree walk: the walk revived it, revival re-admitted
+                    // it, the count crossed the slack, and this pass swept
+                    // the whole hand again — per readdir, for sixteen minutes.
+                    // `parkable` still lets directories go once they alone
+                    // exceed half the budget, so this always terminates.
+                    if !inode.parkable() {
+                        continue;
+                    }
                     if inode.park() {
                         parked_total += 1;
                     }

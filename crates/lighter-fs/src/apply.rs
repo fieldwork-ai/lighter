@@ -285,8 +285,14 @@ impl Shared {
                     state = self.arrived.wait(state).expect("apply queue poisoned");
                 }
             };
-            (job.run)();
-            self.bytes.fetch_sub(job.bytes, Ordering::Relaxed);
+            // A job that panics must not take the drainer with it: with no
+            // drainer every barrier waits forever, which is a hung guest.
+            let bytes = job.bytes;
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || (job.run)())).is_err()
+            {
+                tracing::error!("an apply job panicked; the queue continues");
+            }
+            self.bytes.fetch_sub(bytes, Ordering::Relaxed);
             self.depth.fetch_sub(1, Ordering::Relaxed);
             let done = self.jobs_done.fetch_add(1, Ordering::Relaxed) + 1;
             if done.is_multiple_of(FREE_EVERY) {

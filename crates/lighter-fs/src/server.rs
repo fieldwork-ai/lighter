@@ -258,10 +258,17 @@ impl Server {
                 if let Some(count) = get_u64(body, 0) {
                     self.forget(header.nodeid, count);
                 }
+                if self.stats.enabled() {
+                    self.stats.record(op::FORGET, std::time::Duration::ZERO);
+                }
                 return 0;
             }
             op::BATCH_FORGET => {
                 self.batch_forget(body);
+                if self.stats.enabled() {
+                    self.stats
+                        .record(op::BATCH_FORGET, std::time::Duration::ZERO);
+                }
                 return 0;
             }
             _ => {}
@@ -407,6 +414,11 @@ impl Server {
 
     pub fn stats_enabled(&self) -> bool {
         self.stats.enabled()
+    }
+
+    /// How many inodes the registry holds. Diagnostics and tests.
+    pub fn live_inodes(&self) -> usize {
+        self.registry.inode_count()
     }
 
     /// Prints the opcode histogram, if one was being kept.
@@ -619,11 +631,35 @@ impl Server {
     /// terminating; the scoped drain inside is what makes the wait cost the
     /// inode's own backlog rather than the whole queue's.
     fn settle_while(&self, inode: &Inode, still: impl Fn(&Inode) -> bool) {
+        let mut idle_spins = 0u32;
         while still(inode) {
             self.apply.drain_to(inode.settle_seq());
-            if still(inode) {
-                std::thread::yield_now();
+            if !still(inode) {
+                break;
             }
+            // A flag still up with nothing queued is a flag nothing will ever
+            // lower: the host has applied everything, so the host is the
+            // truth and waiting is a hang. Say so, loudly, and answer from
+            // the host. The spins tolerate the push/stamp gap, which is
+            // nanoseconds; a thousand of them with an empty queue is a leak.
+            if self.apply.depth() == 0 {
+                idle_spins += 1;
+                if idle_spins > 1000 {
+                    tracing::error!(
+                        dev = inode.dev(),
+                        ino = inode.ino(),
+                        pending = inode.is_pending(),
+                        dirty = inode.is_dirty(),
+                        meta_shadowed = inode.meta_shadowed(),
+                        listing_shadowed = inode.listing_shadowed(),
+                        "a settle flag is up with an empty queue; answering from the host"
+                    );
+                    break;
+                }
+            } else {
+                idle_spins = 0;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -1058,7 +1094,7 @@ impl Server {
             && let Ok(st) = sys::stat_at(parent.reference()?.raw_fd(), &name)
             && let Some(child) = self
                 .registry
-                .relookup(st.st_dev as i64, st.st_ino)
+                .nodeid_for(st.st_dev as i64, st.st_ino)
                 .and_then(|id| self.registry.get(id))
         {
             self.settle_while(&child, |child| child.listing_shadowed());
@@ -1079,9 +1115,14 @@ impl Server {
             // stale link count until the unlink applies; shadow it so GETATTR
             // waits. The stat is two microseconds against the twenty-seven
             // this path no longer spends.
+            // `nodeid_for`, not `relookup`: this is the server finding its
+            // own entry, not the guest looking the name up. Counting it as a
+            // lookup left every unlinked file one FORGET short of release —
+            // pinned in the table with its descriptor, until the sweep had
+            // nothing left it was allowed to park.
             let target_out = sys::stat_at(parent.reference()?.raw_fd(), &name)
                 .ok()
-                .and_then(|st| self.registry.relookup(st.st_dev as i64, st.st_ino))
+                .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
                 .and_then(|id| self.registry.get(id));
             if let Some(target) = &target_out {
                 target.shadow_meta();
@@ -1254,25 +1295,98 @@ impl Server {
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let source = self.inode(nodeid_in)?;
-        self.settle_while(&source, |source| source.is_dirty() || source.is_pending());
+        let parent = self.directory(parent_out)?;
+        // The source's path is stable once the file exists; its queued writes
+        // need no waiting for, because the clone joins the same queue behind
+        // them and lands after they do.
+        self.settle_while(&source, |source| source.is_pending());
         let source_path = self.path(&source)?;
         let size = {
             let reference = source.reference()?;
-            sys::stat_fd(reference.raw_fd())?.st_size
+            source.overlay_size(sys::stat_fd(reference.raw_fd())?.st_size as u64)
         };
-        let parent = self.directory(parent_out)?;
-        let parent_ref = parent.reference()?;
-        let tmp = sys::c_path(&std::path::PathBuf::from(format!(
-            ".lighter-clone-{}",
-            std::process::id() as u64 ^ nodeid_in
-        )))?;
-        sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
-        if let Err(e) = sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &name, 0) {
-            let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
-            return Err(e);
+        let mode = {
+            let reference = source.reference()?;
+            sys::stat_fd(reference.raw_fd())?.st_mode as u32
+        };
+        if !self.apply.accepting() {
+            self.settle_while(&source, |source| source.is_dirty());
+            let parent_ref = parent.reference()?;
+            let tmp = sys::c_path(&std::path::PathBuf::from(format!(
+                ".lighter-clone-{}",
+                std::process::id() as u64 ^ nodeid_in
+            )))?;
+            sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
+            if let Err(e) = sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &name, 0)
+            {
+                let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
+                return Err(e);
+            }
+            let mut out = Vec::with_capacity(8);
+            out.extend_from_slice(&size.to_le_bytes());
+            return Ok(out);
         }
+        // Acknowledged: the destination is a pending inode with the source's
+        // size and mode, and the guest's re-lookup of the name (patch 0005
+        // invalidates the dentry) resolves to it until the clone lands.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let meta = crate::inode::PendingMeta {
+            mode,
+            born: (now.as_secs() as i64, now.subsec_nanos() as i64),
+        };
+        let (nodeid, dest) = self.registry.insert_pending(parent.dev(), meta);
+        dest.write_acked(size);
+        parent.add_pending_child(name.to_bytes(), nodeid);
+        let job = {
+            let registry = self.registry.clone();
+            let parent = parent.clone();
+            let dest = dest.clone();
+            let name = name.clone();
+            move || {
+                let result = (|| {
+                    let parent_ref = parent.reference()?;
+                    // Unique per job: one source is cloned to many names at
+                    // once, and a temporary keyed on the source alone collides.
+                    let tmp = sys::c_path(&std::path::PathBuf::from(format!(
+                        ".lighter-clone-{}-{}",
+                        std::process::id(),
+                        nodeid
+                    )))?;
+                    sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
+                    if let Err(e) =
+                        sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &name, 0)
+                    {
+                        let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
+                        return Err(e);
+                    }
+                    let fd = sys::open_reference(parent_ref.raw_fd(), &name, false)?;
+                    let st = sys::stat_fd(fd.as_raw_fd())?;
+                    Ok((fd, st))
+                })();
+                match result {
+                    Ok((fd, st)) => {
+                        registry.bind_pending(nodeid, &dest, fd, st.st_dev as i64, st.st_ino);
+                    }
+                    Err(errno) => {
+                        tracing::warn!(
+                            errno,
+                            name = %name.to_string_lossy(),
+                            "an acknowledged clone failed to apply"
+                        );
+                        dest.bind_failed(errno);
+                    }
+                }
+                dest.write_applied(Ok(()));
+                parent.remove_pending_child(name.to_bytes());
+            }
+        };
+        let seq = self.apply.push(crate::apply::Job::new(0, job));
+        parent.settled_by(seq);
+        dest.settled_by(seq);
         let mut out = Vec::with_capacity(8);
-        out.extend_from_slice(&(size as u64).to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
         Ok(out)
     }
 

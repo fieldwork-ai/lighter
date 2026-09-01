@@ -1,0 +1,9 @@
+case,rep,ms
+npm-install,1,10938
+npm-install,2,10710
+pnpm-install,1,30951
+pnpm-install,2,27252
+yarn-install,1,19686
+yarn-install,2,19300
+find-walk,1,2043
+find-walk,2,513

@@ -487,7 +487,7 @@ for name in $CASES; do
 	elif [ "$name" != watch-latency ]; then
 		# A case that finishes instantly finished because there was nothing
 		# there. Saying so is the difference between a bug and a headline.
-		fastest="$(awk -F, -v w="$name" '$1 == w { print $3 }' "$RESULTS" | sort -n | head -1)"
+		fastest="$(awk -F, -v w="$name" '$1 == w && $3 ~ /^[0-9]+$/ { print $3 }' "$RESULTS" | sort -n | head -1)"
 		if [ "${fastest:-1}" -lt 5 ]; then
 			printf '  <- implausible; the fixture was probably missing'
 		fi

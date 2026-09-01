@@ -828,6 +828,9 @@ fn a_clone_replaces_the_destination_name() {
         .expect("clone must work");
     let size = u64::from_le_bytes(reply[0..8].try_into().unwrap());
     assert_eq!(size, 16, "the reply carries the cloned size");
+    // The clone is applied asynchronously; syncfs is the settling point
+    // after which the host directory answers for it.
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
     assert_eq!(
         std::fs::read(guest.host("dest")).unwrap(),
         b"the real content"
@@ -983,4 +986,50 @@ fn fsync_settles_the_apply_queue_before_replying() {
     // Durability was claimed, so the host file answers for itself now.
     let on_disk = std::fs::read(guest.root.join("durable")).expect("host read");
     assert_eq!(on_disk, payload, "fsync means the bytes are on the Mac");
+}
+
+/// The kernel counts every reply that names a nodeid and forgets with the
+/// total; the registry must count the same way, or a forgotten inode stays
+/// in the table forever — holding its descriptor — and the sweep starves.
+/// Measured: 150,000 forgets across an install cycle and a table that never
+/// shrank.
+#[test]
+fn a_forgotten_async_file_leaves_the_registry() {
+    let mut guest = Guest::new("forget-async");
+    let before = guest.server.live_inodes();
+    let (nodeid, fh) = guest.create(1, "f", 0x8241).expect("create");
+    guest.write(nodeid, fh, 0, b"x").expect("write");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    // Two more replies name it: one lookup while it may still be pending
+    // from the kernel's point of view, one after the host has it.
+    assert_eq!(guest.lookup(1, "f").expect("lookup"), nodeid);
+    assert_eq!(guest.lookup(1, "f").expect("lookup"), nodeid);
+    let mut body = Vec::new();
+    body.extend_from_slice(&3u64.to_le_bytes());
+    guest.call(op::FORGET, nodeid, &body).ok();
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "create + two lookups + forget(3) must leave nothing behind"
+    );
+}
+
+#[test]
+fn a_forgotten_unlinked_file_leaves_the_registry() {
+    let mut guest = Guest::new("forget-unlinked");
+    let before = guest.server.live_inodes();
+    let (nodeid, fh) = guest.create(1, "gone", 0x8241).expect("create");
+    guest.write(nodeid, fh, 0, b"x").expect("write");
+    guest
+        .call(op::UNLINK, 1, &name_body("gone"))
+        .expect("unlink");
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes());
+    guest.call(op::FORGET, nodeid, &body).ok();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "an unlinked, forgotten file is gone"
+    );
 }
