@@ -30,7 +30,7 @@ uses for requests that may block.
 
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtio_fs.c
-@@ -51,6 +51,35 @@
+@@ -51,6 +51,45 @@
  
  /* The device can push FUSE notifications to the driver. */
  #define VIRTIO_FS_F_NOTIFICATION 0
@@ -47,26 +47,36 @@ uses for requests that may block.
 + * Spinning instead skips all of it: the submitting task drains its own reply
 + * in its own context, so nothing is scheduled and nothing is woken.
 + *
-+ * Ten microseconds is where it measured best on a package install, and the
-+ * curve is flat from five to fifteen — long enough for a lookup the server
-+ * answers out of its own caches, too short to sit through a create. Beyond
-+ * fifty it gets worse, and at two milliseconds it is twice as slow as not
-+ * polling at all: the spin stops being a shortcut and becomes a core taken
-+ * away from the work that would have filled the ring.
++ * How long to spin depends on what the other end is doing, and there are two
++ * regimes. With the device relying on the notification register, the trap the
++ * driver takes to ring it is also a rendezvous: the host answers inside the
++ * trap, so the reply is already there when the write retires and ten
++ * microseconds is plenty. Spinning longer than that only takes a core away
++ * from the work that would have filled the ring, and at two milliseconds it is
++ * twice as slow as not polling at all.
++ *
++ * With a device that watches the ring instead, there is no trap and so no
++ * rendezvous: a reply that arrives after the spin gives up costs an interrupt
++ * and a wake-up, which is dearer than the trap that was removed. The spin then
++ * has to cover the operation rather than the delivery, and a create on APFS is
++ * twenty-five microseconds of it. Measured against such a device the curve
++ * bottoms out at a hundred: create-and-close falls from 50.3 microseconds to
++ * 35.3, and a four-kilobyte write from 60.6 to 45.7. Thirty is most of the
++ * win and three hundred is no better.
 + *
 + * Zero disables it, and `virtiofs.poll_usecs=` on the kernel command line
 + * changes it, so the trade can be re-measured without rebuilding anything.
 + * The module is `virtiofs` and not `virtio_fs`; getting that wrong silently
 + * leaves the default in place and makes an A/B compare a value with itself.
 + */
-+static unsigned int poll_usecs = 10;
++static unsigned int poll_usecs = 100;
 +module_param_named(poll_usecs, poll_usecs, uint, 0644);
 +MODULE_PARM_DESC(poll_usecs,
 +		 "microseconds to spin for a reply before sleeping (0 disables)");
  
  /*
   * How many notification buffers to keep posted, and how large each is.
-@@ -1654,6 +1683,94 @@
+@@ -1654,6 +1693,94 @@
  	}
  
  	return ret;
@@ -161,7 +171,7 @@ uses for requests that may block.
  }
  
  static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
-@@ -1679,6 +1796,17 @@
+@@ -1679,6 +1806,17 @@
  
  	fsvq = &fs->vqs[queue_id];
  	ret = virtio_fs_enqueue_req(fsvq, req, false);

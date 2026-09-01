@@ -6,6 +6,7 @@
 //! the interrupt — so a device model contains only what makes it that device.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use crate::bus::MmioDevice;
 use crate::irq::IrqLine;
@@ -77,6 +78,49 @@ pub struct VirtioMmio {
     /// Called when the guest writes the notification register. See
     /// [`VirtioMmio::set_kick_observer`].
     kick_observer: Option<Arc<dyn Fn(u16) + Send + Sync>>,
+    /// A lock-free mirror of each queue's cursor, for whoever is watching it.
+    ///
+    /// The point is that a watcher must not need this transport's lock to ask
+    /// "is there anything yet?". Taking it in a spin loop is what made the
+    /// first host poller *slower* than letting the guest trap: the answer was
+    /// no ninety-nine times in a hundred, and every one of those cost the vCPU
+    /// a lock it was about to need.
+    signals: Vec<Arc<QueueSignal>>,
+}
+
+/// What a queue watcher needs to know, without a lock.
+///
+/// Three relaxed atomics and a read straight out of guest memory. Relaxed is
+/// enough because this answers a *hint*: a stale "yes" costs one wasted trip
+/// through `poll_queue`, which re-checks under the lock, and a stale "no" is
+/// corrected on the next turn of the loop microseconds later. The correctness
+/// of what is consumed is the queue's business, not this structure's.
+#[derive(Debug, Default)]
+pub struct QueueSignal {
+    ready: AtomicBool,
+    avail_addr: AtomicU64,
+    next_avail: AtomicU16,
+}
+
+impl QueueSignal {
+    /// Whether the driver has offered anything we have not taken.
+    pub fn has_work(&self, memory: &GuestMemory) -> bool {
+        if !self.ready.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Offset 2 in the available ring: past `flags`, at `idx`.
+        let addr = self.avail_addr.load(Ordering::Relaxed);
+        memory
+            .read_u16(addr + 2)
+            .is_ok_and(|idx| idx != self.next_avail.load(Ordering::Relaxed))
+    }
+
+    fn publish(&self, queue: &Virtqueue) {
+        self.avail_addr.store(queue.avail_addr, Ordering::Relaxed);
+        self.next_avail.store(queue.next_avail(), Ordering::Relaxed);
+        // Published last: it is the field that authorizes reading the others.
+        self.ready.store(queue.is_ready(), Ordering::Relaxed);
+    }
 }
 
 impl VirtioMmio {
@@ -86,6 +130,9 @@ impl VirtioMmio {
         irq: Arc<dyn IrqLine>,
     ) -> VirtioMmio {
         let max = device.queue_max_size();
+        let signals = (0..device.queue_count())
+            .map(|_| Arc::new(QueueSignal::default()))
+            .collect();
         let queues = (0..device.queue_count())
             .map(|_| Virtqueue::new(max))
             .collect();
@@ -103,6 +150,7 @@ impl VirtioMmio {
             config_generation: 0,
             activated: false,
             kick_observer: None,
+            signals,
         }
     }
 
@@ -162,6 +210,7 @@ impl VirtioMmio {
         }
 
         let serviced = self.device.notify(index, &mut self.queues, &self.memory);
+        self.publish_signals();
         if !serviced.any() {
             return;
         }
@@ -229,7 +278,15 @@ impl VirtioMmio {
             self.config_generation = self.config_generation.wrapping_add(1);
             return;
         }
+        // Any register write can move a queue's geometry — its addresses, its
+        // size, whether it is live at all — so the mirror is refreshed after
+        // all of them rather than after an enumerated few that would go stale
+        // the first time a register was added.
+        self.write_register_inner(offset, value);
+        self.publish_signals();
+    }
 
+    fn write_register_inner(&mut self, offset: u64, value: u32) {
         match offset {
             DEVICE_FEATURES_SEL => self.device_features_sel = value,
             DRIVER_FEATURES_SEL => self.driver_features_sel = value,
@@ -342,6 +399,24 @@ impl VirtioMmio {
         }
         self.notify_queue(index);
         true
+    }
+
+    /// The lock-free view of a queue, for a watcher.
+    pub fn signal(&self, index: u16) -> Option<Arc<QueueSignal>> {
+        self.signals.get(index as usize).cloned()
+    }
+
+    /// Republishes every queue's cursor to its signal.
+    ///
+    /// Called wherever the guest could have changed a queue's geometry and
+    /// wherever we could have consumed from one — which is deliberately more
+    /// often than strictly necessary. A signal is a hint, and the cost of
+    /// refreshing one is three relaxed stores; the cost of forgetting to is a
+    /// watcher that sleeps through a burst.
+    fn publish_signals(&self) {
+        for (signal, queue) in self.signals.iter().zip(self.queues.iter()) {
+            signal.publish(queue);
+        }
     }
 
     /// Chains the driver has offered that we have not taken.

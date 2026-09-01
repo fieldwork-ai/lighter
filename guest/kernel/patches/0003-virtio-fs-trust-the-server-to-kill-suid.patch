@@ -26,7 +26,7 @@ have changed something behaves exactly as before.
 
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -1430,9 +1430,25 @@
+@@ -1430,9 +1430,26 @@
  
  	task_io_account_write(count);
  
@@ -34,15 +34,15 @@ have changed something behaves exactly as before.
 -	if (err)
 -		goto out;
 +	/*
-+	 * With FUSE_HANDLE_KILLPRIV_V2 the server strips setuid, setgid and
-+	 * file capabilities itself — fuse_send_write_pages() sets
++	 * With FUSE_HANDLE_KILLPRIV_V2 the server strips setuid, setgid and file
++	 * capabilities itself: fuse_send_write_pages() sets
 +	 * FUSE_WRITE_KILL_SUIDGID on every write, and fuse_send_open() sets
-+	 * FUSE_OPEN_KILL_SUIDGID on a truncating open. Doing it here as well
-+	 * is not belt and braces: file_remove_privs() reads
-+	 * security.capability, and because fuse_change_attributes_common()
-+	 * clears S_NOSEC on every attribute refresh the VFS fast path that
-+	 * would normally skip that read never survives a lookup. On a
-+	 * virtio-fs share it is two round trips per write, answered ENODATA.
++	 * FUSE_OPEN_KILL_SUIDGID on a truncating open. Doing it here as well is
++	 * not belt and braces. file_remove_privs() reads security.capability,
++	 * and because fuse_change_attributes_common() clears S_NOSEC on every
++	 * attribute refresh, the VFS fast path that would normally skip that
++	 * read never survives a lookup -- so on a virtio-fs share it is two
++	 * round trips per write, every one of them answered ENODATA.
 +	 *
 +	 * A file that actually carries a setuid or setgid bit still takes the
 +	 * original path, so the only behaviour that changes is the question

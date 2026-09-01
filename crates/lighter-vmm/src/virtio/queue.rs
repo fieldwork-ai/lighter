@@ -113,6 +113,14 @@ impl Virtqueue {
         self.ready
     }
 
+    /// How far the available ring has been consumed.
+    ///
+    /// Exposed so a watcher outside the transport lock can mirror it; see
+    /// [`crate::virtio::mmio::QueueSignal`].
+    pub const fn next_avail(&self) -> u16 {
+        self.next_avail
+    }
+
     /// Marks the queue live, if its geometry is usable.
     ///
     /// A queue whose size is zero or not a power of two would make the ring

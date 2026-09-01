@@ -4,9 +4,10 @@
 //!
 //! Submitting one virtio request normally costs a write to the notification
 //! register. That write is an MMIO trap: the vCPU leaves the guest, our
-//! handler runs, and the core re-enters. On Apple's hypervisor that crossing is
-//! a few microseconds, which is nothing next to a disk but is most of the cost
-//! of a `stat`. A package install makes several hundred thousand of them.
+//! handler runs, and the core re-enters. Measured on this machine that crossing
+//! is about two and a half microseconds — nothing next to a disk, but a third
+//! of a `stat` across a shared filesystem, and a package install makes several
+//! hundred thousand of them.
 //!
 //! The driver already offers a way out. Before every notification it reads a
 //! flag in the used ring, and skips the write if the device has set it. So a
@@ -14,13 +15,27 @@
 //! guest stops trapping altogether — the request appears in shared memory and
 //! is picked up on the next turn of a loop that was running anyway.
 //!
-//! # Why it parks, and why that is not a compromise
+//! # The mistake that made the first version slower
 //!
-//! A thread spinning on a ring burns a core, which is exactly the wrong thing
-//! on a laptop that is supposed to idle at nothing. So it only spins while the
-//! guest is actually asking for things: after a short quiet period it clears
-//! the flag, takes one last look, and sleeps until a real kick wakes it. An
-//! idle guest sends no kicks and the thread stays asleep.
+//! Asking "is there anything yet?" used to mean taking the transport lock. In
+//! a spin loop the answer is no almost every time, and every one of those noes
+//! cost the vCPU a lock it was about to want; the yield between attempts cost a
+//! syscall on top. Measured on a package install it was 15.2 seconds against
+//! 14.5 with the guest trapping normally — the watcher was paying more in
+//! contention than the traps had cost in the first place.
+//!
+//! So the question is now answered without a lock at all.
+//! [`crate::virtio::mmio::QueueSignal`] mirrors the ring's address and our
+//! cursor into three relaxed atomics, and the probe is one read out of guest
+//! memory. The lock is taken only when there is something to take it for.
+//!
+//! # Why it still parks
+//!
+//! A thread spinning on a ring burns a core, which is the wrong thing on a
+//! laptop that is supposed to idle at nothing. So it only spins while the guest
+//! is actually asking for things: after a short quiet period it clears the
+//! flag, takes one last look, and sleeps until a real kick wakes it. An idle
+//! guest sends no kicks and the thread stays asleep.
 //!
 //! **Clearing the flag is the delicate part.** A driver that looked at the flag
 //! while it was set, and decided not to kick, will not look again. So the
@@ -28,28 +43,11 @@
 //! and a request that sits in the queue until something unrelated happens
 //! along. The fence is in [`crate::virtio::queue::Virtqueue::suppress_notifications`];
 //! the re-examination is here.
-//!
-//! # This is off, because it does not pay
-//!
-//! It works — the first version wedged the guest, which one look after clearing
-//! the flag was not enough to prevent; draining until the ring is genuinely
-//! empty fixes that. What it does not do is help. Measured on a package
-//! install it is *slower*: 15.2 seconds against 14.5 with the guest trapping
-//! normally.
-//!
-//! The reason is that the trap was never the expensive part. An MMIO exit on
-//! Apple's hypervisor is a couple of microseconds out of a round trip that
-//! costs thirteen, and a thread taking the transport lock in a loop to save
-//! them costs more in contention than it removes.
-//!
-//! Kept, off, because the primitives are correct and tested, and because the
-//! measurement is the point: the next person to think the guest's kick is
-//! worth eliminating can turn it on with `LIGHTER_HOST_POLL_US` and see for
-//! themselves in ten minutes rather than a day.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::memory::GuestMemory;
 use crate::virtio::mmio::VirtioMmio;
 
 /// How long to keep watching after the last request before going back to
@@ -59,8 +57,9 @@ use crate::virtio::mmio::VirtioMmio;
 /// workload — a package manager waiting on its own `stat` before issuing the
 /// following one — and short enough that a burst which has genuinely ended
 /// costs a fraction of a millisecond of one core.
-/// Zero: off. See the note at the top of the file about why.
-const IDLE_WINDOW: std::time::Duration = std::time::Duration::ZERO;
+///
+/// Zero turns it off, which is what `LIGHTER_HOST_POLL_US=0` is for.
+const IDLE_WINDOW: std::time::Duration = std::time::Duration::from_micros(200);
 
 /// The handle a poller parks on, and that the transport pokes.
 #[derive(Default)]
@@ -123,6 +122,15 @@ pub fn spawn(
     kicks: Arc<Kicks>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let window = idle_window();
+    let (signal, memory) = {
+        let held = transport.lock().expect("polled transport poisoned");
+        (held.signal(queue), held.memory().clone())
+    };
+    let Some(signal) = signal else {
+        return std::thread::Builder::new()
+            .name(format!("poll-{name}"))
+            .spawn(|| ());
+    };
     std::thread::Builder::new()
         .name(format!("poll-{name}"))
         .spawn(move || {
@@ -137,22 +145,7 @@ pub fn spawn(
                     .expect("polled transport poisoned")
                     .suppress_notifications(queue, true);
 
-                let mut last_work = std::time::Instant::now();
-                while last_work.elapsed() < window {
-                    let worked = transport
-                        .lock()
-                        .expect("polled transport poisoned")
-                        .poll_queue(queue);
-                    if worked {
-                        last_work = std::time::Instant::now();
-                    } else {
-                        // Nothing yet. Yielding rather than spinning hot: the
-                        // thread that will fill this ring is a vCPU, and taking
-                        // its core away to watch for it is self-defeating.
-                        std::hint::spin_loop();
-                        std::thread::yield_now();
-                    }
-                }
+                watch(&transport, &signal, &memory, queue, window);
 
                 // Clearing, then looking again — repeatedly. A driver that saw
                 // the flag set and skipped its kick is relying on this, and one
@@ -178,6 +171,35 @@ pub fn spawn(
                 }
             }
         })
+}
+
+/// Spins on the ring until it has been quiet for `window`.
+///
+/// The probe is lock-free and the spin has no syscall in it. Both matter: the
+/// thread being waited on is a vCPU, and anything this loop does that the
+/// scheduler or the transport lock can see is taken directly out of the work it
+/// is waiting for.
+fn watch(
+    transport: &Arc<Mutex<VirtioMmio>>,
+    signal: &Arc<crate::virtio::mmio::QueueSignal>,
+    memory: &GuestMemory,
+    queue: u16,
+    window: std::time::Duration,
+) {
+    let mut last_work = std::time::Instant::now();
+    while last_work.elapsed() < window {
+        if !signal.has_work(memory) {
+            std::hint::spin_loop();
+            continue;
+        }
+        if transport
+            .lock()
+            .expect("polled transport poisoned")
+            .poll_queue(queue)
+        {
+            last_work = std::time::Instant::now();
+        }
+    }
 }
 
 #[cfg(test)]
