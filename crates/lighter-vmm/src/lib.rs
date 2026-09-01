@@ -44,6 +44,7 @@ pub mod sysreg;
 pub mod vcpu;
 pub mod virtio;
 pub mod vsock_proxy;
+pub mod wake;
 
 pub use machine::{Machine, MachineConfig, MachineError};
 pub use vcpu::StopReason;

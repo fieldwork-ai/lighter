@@ -25,6 +25,7 @@ fn main() -> std::process::ExitCode {
     let mut port: u32 = 2375;
     let mut target: Option<String> = None;
     let mut echo = false;
+    let mut control = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -34,6 +35,10 @@ fn main() -> std::process::ExitCode {
             // Answers connections itself instead of bridging. The vsock gate
             // uses it to prove the transport with nothing else installed.
             "--echo" => echo = true,
+            // Answers the host's control commands. Small on purpose: the only
+            // one that exists sets the clock, and the only reason it exists is
+            // that a Mac that slept wakes with a guest whose clock did not.
+            "--control" => control = true,
             other => {
                 eprintln!("lighter-agent: unknown argument {other}");
                 return std::process::ExitCode::from(2);
@@ -41,8 +46,8 @@ fn main() -> std::process::ExitCode {
         }
     }
 
-    if target.is_none() && !echo {
-        eprintln!("lighter-agent: one of --to <path> or --echo is required");
+    if target.is_none() && !echo && !control {
+        eprintln!("lighter-agent: one of --to <path>, --echo or --control is required");
         return std::process::ExitCode::from(2);
     }
 
@@ -67,11 +72,83 @@ fn main() -> std::process::ExitCode {
             }
         };
         let target = target.clone();
-        std::thread::spawn(move || match target {
-            Some(path) => bridge(stream, &path),
-            None => echo_back(stream),
+        std::thread::spawn(move || match (&target, control) {
+            (Some(path), _) => bridge(stream, path),
+            (None, true) => serve_control(stream),
+            (None, false) => echo_back(stream),
         });
     }
+}
+
+/// Answers one control connection.
+///
+/// A line protocol, because the vocabulary is two words and a number and
+/// anything more would be a serialization format to maintain. Each command
+/// gets one line back so the host can tell "done" from "this build does not
+/// know that word".
+fn serve_control(stream: OwnedFd) {
+    let mut reader = Fd(stream);
+    let mut writer = match reader.try_clone() {
+        Ok(fd) => fd,
+        Err(_) => return,
+    };
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buffer.extend_from_slice(&chunk[..read]);
+        while let Some(end) = buffer.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buffer.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line[..end]).trim().to_string();
+            let reply = handle_control(&line);
+            if writer.write_all(reply.as_bytes()).is_err() {
+                return;
+            }
+        }
+        if buffer.len() > 4096 {
+            // Nothing legitimate is this long; a peer sending it is confused.
+            return;
+        }
+    }
+}
+
+fn handle_control(line: &str) -> String {
+    let mut words = line.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some("ping"), _) => "pong\n".into(),
+        (Some("time"), Some(seconds)) => match seconds.parse::<i64>() {
+            Ok(epoch) => match set_clock(epoch) {
+                Ok(()) => "ok\n".into(),
+                Err(e) => format!("error {e}\n"),
+            },
+            Err(_) => "error not-a-number\n".into(),
+        },
+        _ => "error unknown\n".into(),
+    }
+}
+
+/// Sets the guest's wall clock.
+///
+/// The machine has no real-time clock, so the guest's idea of the time comes
+/// from the host at boot and then drifts — and after the Mac sleeps, it does
+/// not so much drift as stop. Everything that checks a certificate breaks, and
+/// the error names the certificate rather than the clock.
+fn set_clock(epoch: i64) -> Result<(), std::io::Error> {
+    let tv = libc::timeval {
+        tv_sec: epoch as libc::time_t,
+        tv_usec: 0,
+    };
+    // SAFETY: a correctly-shaped timeval and a null timezone, which is the
+    // documented way to leave the timezone alone.
+    let rc = unsafe { libc::settimeofday(&tv, std::ptr::null()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Copies between the vsock connection and a unix socket until either ends.

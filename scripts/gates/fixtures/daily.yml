@@ -1,0 +1,80 @@
+# A day's worth of stack, used by the milestone 8 gate.
+#
+# Bigger than the milestone 3 fixture on purpose. That one proves compose works
+# at all; this one is what somebody actually leaves running while they work — a
+# database with a real volume, a cache, an object store, a mail catcher, a
+# reverse proxy, and a bind mount of the project directory. It is the shape the
+# whole project is for, and the thing that has to survive a night's sleep.
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_PASSWORD: lighter
+      POSTGRES_DB: lighter
+    ports:
+      - "15434:5432"
+    volumes:
+      # /var/lib/postgresql, not .../data: the postgres:18 image puts its
+      # cluster in a major-version subdirectory and refuses to start against a
+      # volume mounted at the old path.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: lighter
+      MINIO_ROOT_PASSWORD: lighterlighter
+    ports:
+      - "19000:9000"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "18025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # A bind mount of the working directory, served over HTTP. This is the part
+  # that exercises the shared filesystem rather than the block device: the file
+  # it serves lives on the Mac, and editing it there has to be visible here.
+  web:
+    image: nginx:alpine
+    ports:
+      - "18080:80"
+    volumes:
+      - ${LIGHTER_GATE_SHARE:-/tmp}:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/ || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
+  miniodata:

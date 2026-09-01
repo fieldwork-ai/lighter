@@ -207,6 +207,12 @@ fi
 # before dockerd answers turns a slow start into a connection refused.
 /sbin/lighter-agent --port 2375 --to /run/docker.sock &
 
+# The control channel, on its own port. The host uses it to put the clock right
+# after the Mac has slept: the machine has no real-time clock, so a guest whose
+# host suspended for an hour wakes an hour behind, and everything that checks a
+# certificate starts failing with an error about the certificate.
+/sbin/lighter-agent --port 2376 --control &
+
 echo "INIT ready"
 
 # dockerd can die long after it started — containerd failing, a storage driver

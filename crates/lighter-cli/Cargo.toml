@@ -1,0 +1,29 @@
+[package]
+name = "lighter-cli"
+description = "The lighter command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lighter"
+path = "src/main.rs"
+
+[dependencies]
+lighter-hv.workspace = true
+lighter-vmm.workspace = true
+lighter-docker.workspace = true
+
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
