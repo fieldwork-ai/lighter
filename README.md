@@ -28,27 +28,31 @@ lighter stop
 
 ## What it is like
 
-Numbers from `benchmarks/`, as a fraction of the same command run directly on macOS. Higher is better; above 100% means the container is faster than the Mac's own disk.
+Numbers from `benchmarks/`, measured on one machine on one afternoon against the same 1,232-package fixture. Each figure is the median of three runs, as a fraction of the same command run directly on macOS: higher is better, and above 100% means the container beat the Mac's own disk. OrbStack was measured here, by this suite, not quoted.
 
-| | lighter |
-|---|---|
-| `rg` over `node_modules` | **581%** |
-| metadata walk of the same tree | **462%** |
-| a file changed on the Mac, seen in a container | 2 ms |
-| `cp -a node_modules` | 57% |
-| `npm ci` of a 1,232-package tree | 39% |
+| | lighter | OrbStack |
+|---|---|---|
+| `rg` over `node_modules` | **844%** | 94% |
+| metadata walk of the same tree | **355%** | 80% |
+| `cp -a node_modules` | **207%** | 157% |
+| `npm ci` | 52% | **72%** |
+| `yarn install` | 44% | **73%** |
+| `pnpm install` | 28% | **83%** |
+| `rm -rf node_modules` | 75% | **127%** |
+| a file changed on the Mac, seen in a container | **5 ms** | 12 ms |
 
 Boot to a served Docker socket: about two seconds. Idle: 0.2% of one core, and around 700 MB — a guest that used eight gigabytes for a build gives them back within five seconds of the build ending.
 
-The read numbers are faster than macOS because the guest's page cache answers without crossing the VM boundary at all, and Linux's VFS is quicker than the one underneath it. That is only allowed because the cache can be *corrected*: a patch to the guest's virtio-fs driver adds a notification queue, macOS FSEvents says what changed, and an invalidation goes out naming the exact file. Without a channel like that, a shared filesystem has to guess a timeout and live with being wrong for it.
+Read the table honestly, because it says two things. **Reading a shared tree, lighter is between four and nine times faster than the best commercial option**, and faster than the Mac itself: the guest's page cache answers without crossing the VM boundary at all, and Linux's VFS is quicker than the one underneath it. That is only allowed because the cache can be *corrected* — a patch to the guest's virtio-fs driver adds a notification queue, macOS FSEvents says what changed, and an invalidation goes out naming the exact file. Without a channel like that, a shared filesystem has to guess a timeout and live with being wrong for it.
 
-The write numbers are honest and not yet good. `benchmarks/README.md` says exactly why, and records what was tried and found worthless so nobody repeats it.
+**Writing one, lighter is behind, and by a lot on `pnpm`.** The cost is per-operation and not per-byte: a package install is several hundred thousand small requests, each one a round trip that macOS answers in microseconds and that costs microseconds more to deliver. `benchmarks/README.md` has the measurements, including what was tried and found worthless so nobody repeats it. The same fixture installed on the guest's own disk takes 7.7s against the Mac's 6.6s, which is where the ceiling is if the boundary were free.
 
 Run them yourself:
 
 ```bash
-benchmarks/run.sh --target native  --reps 5
-benchmarks/run.sh --target lighter --reps 5
+benchmarks/run.sh --target native   --reps 5
+benchmarks/run.sh --target lighter  --reps 5
+benchmarks/run.sh --target orbstack --reps 5
 python3 benchmarks/report.py
 ```
 

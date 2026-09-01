@@ -11,34 +11,57 @@ of the repetitions.
 - Node: v24.18.0
 - npm: 11.16.0
 - ripgrep: ripgrep 15.1.0
+- pnpm: 11.23.0
+- yarn: 1.22.22
 
 ## Wall time, milliseconds
 
-| case | lighter | native |
-|---|---|---|
-| npm-install | 2275 | 898 |
-| ripgrep | 21 | 122 |
-| find-walk | 13 | 60 |
-| copy-tree | 3446 | 1947 |
-| watch-latency | 2 | 2 |
+| case | native | lighter | orbstack |
+|---|---|---|---|
+| npm-install | 6484 | 12432 | 8945 |
+| pnpm-install | 4481 | 16281 | 5415 |
+| yarn-install | 6267 | 14185 | 8611 |
+| ripgrep | 928 | 110 | 991 |
+| find-walk | 383 | 108 | 480 |
+| copy-tree | 14598 | 7061 | 9327 |
+| rm-rf | 4086 | 5460 | 3206 |
+| watch-latency | 1 | 5 | 12 |
 
 ## As a fraction of `native`
 
 100% would mean the shared filesystem costs nothing at all next to the
-Mac's own disk. Higher is better.
+Mac's own disk. Higher is better. `watch-latency` is left out: it is a
+latency against a reference of about a millisecond, so the ratio is a
+division by noise — read it from the table above in milliseconds.
 
-| case | lighter |
-|---|---|
-| npm-install | 39% |
-| ripgrep | 581% |
-| find-walk | 462% |
-| copy-tree | 57% |
-| watch-latency | 100% |
+| case | lighter | orbstack |
+|---|---|---|
+| npm-install | 52% | 72% |
+| pnpm-install | 28% | 83% |
+| yarn-install | 44% | 73% |
+| ripgrep | 844% | 94% |
+| find-walk | 355% | 80% |
+| copy-tree | 207% | 157% |
+| rm-rf | 75% | 127% |
+
+## Sweeps
+
+One runtime measured twice under different settings, so a tuning
+decision can be re-checked without taking anyone's word for it.
+The names are the settings; the code that reads them says which.
+
+| case | lighter-guestfs | lighter-hp | lighter-hp0 | lighter-hp200 | lighter-ilalways | lighter-ilnever | lighter-nopoll | lighter-poll2000 | lighter-poll500 | lighter-vp0 | lighter-vp10 | lighter-vp100 | lighter-vp15 | lighter-vp200 | lighter-vp2000 | lighter-vp25 | lighter-vp5 | lighter-wb |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| npm-install | 7755 | 15184 | 15048 | — | 14438 | 14710 | 14544 | 14642 | 14494 | 17998 | 13564 | 15791 | 13657 | 17206 | 34856 | 14156 | 13601 | 15860 |
+| pnpm-install | 1219 | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
 ## What each case does
 
 - **npm-install** — npm ci of a pinned tree (lower is better)
+- **pnpm-install** — pnpm install --frozen-lockfile (lower is better)
+- **yarn-install** — yarn install --frozen-lockfile (lower is better)
 - **ripgrep** — reading every file in node_modules (lower is better)
 - **find-walk** — metadata-only walk of node_modules (lower is better)
 - **copy-tree** — copying node_modules within the share (lower is better)
+- **rm-rf** — rm -rf of a node_modules tree (lower is better)
 - **watch-latency** — host change to guest visibility, round trip (lower is better)

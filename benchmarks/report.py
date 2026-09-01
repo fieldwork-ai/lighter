@@ -29,6 +29,13 @@ CASES = [
     ("watch-latency", "host change to guest visibility, round trip", "lower is better"),
 ]
 
+# Cases the native ratio says nothing useful about. `watch-latency` is the
+# only one: on the Mac a file is visible the moment it is written, so the
+# reference is nearly zero and every ratio against it is a division by noise —
+# a container seeing a change in 5ms would read as "20% of native", which
+# sounds like a failure and is in fact a millisecond.
+UNRATIOED = {"watch-latency"}
+
 # `native` is the reference: the same command on the Mac's own disk.
 REFERENCE = "native"
 
@@ -52,12 +59,21 @@ def tool_version(*command):
         return "not installed"
 
 
+# The runtimes the report is a comparison *of*. Everything else in
+# `results/` is a sweep — one target measured twice under different settings,
+# recorded so a tuning decision can be re-checked — and belongs in its own
+# section rather than as thirty more columns nobody can read across.
+RUNTIMES = ("native", "lighter", "orbstack", "colima", "docker-desktop")
+
+
 def main():
-    targets = sorted(p.stem for p in RESULTS.glob("*.csv"))
+    found = sorted(p.stem for p in RESULTS.glob("*.csv"))
+    targets = [t for t in RUNTIMES if t in found]
+    sweeps = [t for t in found if t not in RUNTIMES]
     if not targets:
         print("no results yet; run benchmarks/run.sh --target <t>", file=sys.stderr)
         return 1
-    measured = {target: load(target) for target in targets}
+    measured = {target: load(target) for target in found}
     reference = measured.get(REFERENCE, {})
 
     lines = [
@@ -99,14 +115,16 @@ def main():
             f"## As a fraction of `{REFERENCE}`",
             "",
             f"100% would mean the shared filesystem costs nothing at all next to the",
-            f"Mac's own disk. Higher is better.",
+            f"Mac's own disk. Higher is better. `watch-latency` is left out: it is a",
+            f"latency against a reference of about a millisecond, so the ratio is a",
+            f"division by noise — read it from the table above in milliseconds.",
             "",
             "| case | " + " | ".join(t for t in targets if t != REFERENCE) + " |",
             "|" + "---|" * len([t for t in targets if t != REFERENCE] + [1]),
         ]
         for case, _, _ in CASES:
             base = reference.get(case)
-            if not base:
+            if not base or case in UNRATIOED:
                 continue
             cells = []
             for target in targets:
@@ -114,6 +132,27 @@ def main():
                     continue
                 value = measured[target].get(case)
                 cells.append("—" if not value else f"{base / value * 100:.0f}%")
+            lines.append(f"| {case} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    if sweeps:
+        lines += [
+            "## Sweeps",
+            "",
+            "One runtime measured twice under different settings, so a tuning",
+            "decision can be re-checked without taking anyone's word for it.",
+            "The names are the settings; the code that reads them says which.",
+            "",
+            "| case | " + " | ".join(sweeps) + " |",
+            "|" + "---|" * (len(sweeps) + 1),
+        ]
+        for case, _, _ in CASES:
+            if not any(case in measured[t] for t in sweeps):
+                continue
+            cells = [
+                "—" if measured[t].get(case) is None else f"{int(measured[t][case])}"
+                for t in sweeps
+            ]
             lines.append(f"| {case} | " + " | ".join(cells) + " |")
         lines.append("")
 
