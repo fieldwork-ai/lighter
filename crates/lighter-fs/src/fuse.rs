@@ -155,7 +155,9 @@ pub mod fattr {
     pub const FH: u32 = 1 << 6;
     pub const ATIME_NOW: u32 = 1 << 7;
     pub const MTIME_NOW: u32 = 1 << 8;
+    pub const LOCKOWNER: u32 = 1 << 9;
     pub const CTIME: u32 = 1 << 10;
+    pub const KILL_SUIDGID: u32 = 1 << 11;
 }
 
 /// `fuse_getattr_in.getattr_flags`.

@@ -292,6 +292,9 @@ fn appending_does_not_truncate() {
     // Without a reported open there is no append mode to remember, so the
     // guest kernel supplies the offset — which is what it does in practice.
     guest.write(nodeid, fh, 6, b"second\n").unwrap();
+    // Writes apply asynchronously; syncfs is the point after which the host
+    // file must answer for them.
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
     assert_eq!(
         std::fs::read_to_string(guest.host("log")).unwrap(),
         "first\nsecond\n"
@@ -1031,5 +1034,105 @@ fn a_forgotten_unlinked_file_leaves_the_registry() {
         guest.server.live_inodes(),
         before,
         "an unlinked, forgotten file is gone"
+    );
+}
+
+/// pnpm's shapes: a file renamed into place, and a symlink. Each reply that
+/// names a nodeid is one the kernel will forget with its total.
+#[test]
+fn renamed_and_symlinked_files_are_forgotten_cleanly() {
+    let mut guest = Guest::new("forget-pnpm");
+    let before = guest.server.live_inodes();
+    let (nodeid, fh) = guest.create(1, "tmp", 0x8241).expect("create");
+    guest.write(nodeid, fh, 0, b"x").expect("write");
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes()); // newdir: root
+    body.extend_from_slice(b"tmp\0final\0");
+    guest.call(op::RENAME, 1, &body).expect("rename");
+    assert_eq!(guest.lookup(1, "final").expect("lookup"), nodeid);
+    let mut forget = Vec::new();
+    forget.extend_from_slice(&2u64.to_le_bytes());
+    guest.call(op::FORGET, nodeid, &forget).ok();
+
+    let mut body = Vec::new();
+    body.extend_from_slice(b"link\0final\0");
+    let reply = guest.call(op::SYMLINK, 1, &body).expect("symlink");
+    let link = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    assert_eq!(guest.lookup(1, "link").expect("lookup"), link);
+    let mut forget = Vec::new();
+    forget.extend_from_slice(&2u64.to_le_bytes());
+    guest.call(op::FORGET, link, &forget).ok();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "rename and symlink shapes release cleanly"
+    );
+}
+
+/// A setattr acknowledged ahead of its apply must be what every read sees:
+/// the mode and mtime the guest set, from getattr and from lookup, before
+/// and after the queue settles.
+#[test]
+fn promised_attributes_are_what_readers_see() {
+    let mut guest = Guest::new("setattr-async");
+    let (nodeid, fh) = guest.create(1, "f", 0x8241).expect("create");
+    guest.write(nodeid, fh, 0, b"abc").expect("write");
+    // fuse_setattr_in: valid at 0, mode at 68, mtime at 40 / mtimensec at 60.
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&(fuse::fattr::MODE | fuse::fattr::MTIME).to_le_bytes());
+    body[68..72].copy_from_slice(&0o755u32.to_le_bytes());
+    body[40..48].copy_from_slice(&1_000_000_000u64.to_le_bytes());
+    body[60..64].copy_from_slice(&7u32.to_le_bytes());
+    let reply = guest.call(op::SETATTR, nodeid, &body).expect("setattr");
+    let mode = u32::from_le_bytes(reply[16 + 60..16 + 64].try_into().unwrap());
+    assert_eq!(mode & 0o7777, 0o755, "the reply carries the promised mode");
+    let mtime = u64::from_le_bytes(reply[16 + 32..16 + 40].try_into().unwrap());
+    assert_eq!(mtime, 1_000_000_000, "the reply carries the promised mtime");
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(
+        u32::from_le_bytes(ga[16 + 60..16 + 64].try_into().unwrap()) & 0o7777,
+        0o755
+    );
+    assert_eq!(
+        u64::from_le_bytes(ga[16 + 32..16 + 40].try_into().unwrap()),
+        1_000_000_000
+    );
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::metadata(guest.host("f")).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o7777,
+        0o755,
+        "the mode reached the Mac"
+    );
+    assert_eq!(meta.mtime(), 1_000_000_000, "the mtime reached the Mac");
+    assert_eq!(meta.len(), 3);
+}
+
+/// Setattrs coalesce into one job — but never across a write, which moves
+/// mtime: the time set after the write must be the one that lands.
+#[test]
+fn a_time_set_after_a_write_outlives_the_write() {
+    let mut guest = Guest::new("setattr-order");
+    let (nodeid, fh) = guest.create(1, "f", 0x8241).expect("create");
+    let set_mtime = |guest: &mut Guest, secs: u64| {
+        let mut body = vec![0u8; 88];
+        body[0..4].copy_from_slice(&fuse::fattr::MTIME.to_le_bytes());
+        body[40..48].copy_from_slice(&secs.to_le_bytes());
+        guest.call(op::SETATTR, nodeid, &body).expect("setattr");
+    };
+    set_mtime(&mut guest, 1_000_000_000);
+    set_mtime(&mut guest, 1_000_000_001);
+    guest.write(nodeid, fh, 0, b"bump").expect("write");
+    set_mtime(&mut guest, 1_000_000_002);
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(guest.host("f")).unwrap().mtime(),
+        1_000_000_002,
+        "the last time set, after the write, is what the Mac has"
     );
 }

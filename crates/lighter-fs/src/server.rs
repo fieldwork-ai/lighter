@@ -280,6 +280,26 @@ impl Server {
             std::time::Instant::now()
         });
         let outcome = self.handle(&header, body, sink.capacity());
+        if let Err(errno) = &outcome
+            && *errno == linux::ESTALE
+            && self.stats.enabled()
+        {
+            tracing::warn!(
+                op = crate::stats::name(header.opcode),
+                opcode = header.opcode,
+                nodeid = header.nodeid,
+                valid = format_args!("{:#x}", get_u32(body, 0).unwrap_or(0)),
+                "ESTALE returned"
+            );
+        }
+        if header.opcode == op::LIGHTER_CLONE
+            && let Err(errno) = &outcome
+        {
+            // A refused clone turns a whole install from clones into
+            // hardlinks — pnpm decides on the first one — so a refusal is
+            // never silent.
+            tracing::warn!(errno, nodeid = header.nodeid, "LIGHTER_CLONE refused");
+        }
         if let Some(started) = started {
             self.stats.record(header.opcode, started.elapsed());
             self.stats.exit();
@@ -314,6 +334,7 @@ impl Server {
 
     /// Everything with a reply.
     fn handle(&self, header: &InHeader, body: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
+        let nodeid = self.resolve(header.nodeid);
         match header.opcode {
             op::INIT => self.init(body),
             op::SYNCFS => {
@@ -332,27 +353,27 @@ impl Server {
                 self.log_stats();
                 Ok(Vec::new())
             }
-            op::LOOKUP => self.lookup(header.nodeid, body),
-            op::GETATTR => self.getattr(header.nodeid, body),
-            op::SETATTR => self.setattr(header.nodeid, body),
-            op::READLINK => self.readlink(header.nodeid),
-            op::SYMLINK => self.symlink(header.nodeid, body),
-            op::MKNOD => self.mknod(header.nodeid, body),
-            op::MKDIR => self.mkdir(header.nodeid, body),
-            op::UNLINK => self.unlink(header.nodeid, body, false),
-            op::RMDIR => self.unlink(header.nodeid, body, true),
-            op::RENAME => self.rename(header.nodeid, body, false),
-            op::RENAME2 => self.rename(header.nodeid, body, true),
-            op::LINK => self.link(header.nodeid, body),
+            op::LOOKUP => self.lookup(nodeid, body),
+            op::GETATTR => self.getattr(nodeid, body),
+            op::SETATTR => self.setattr(nodeid, body),
+            op::READLINK => self.readlink(nodeid),
+            op::SYMLINK => self.symlink(nodeid, body),
+            op::MKNOD => self.mknod(nodeid, body),
+            op::MKDIR => self.mkdir(nodeid, body),
+            op::UNLINK => self.unlink(nodeid, body, false),
+            op::RMDIR => self.unlink(nodeid, body, true),
+            op::RENAME => self.rename(nodeid, body, false),
+            op::RENAME2 => self.rename(nodeid, body, true),
+            op::LINK => self.link(nodeid, body),
             // Answering ENOSYS here is not a refusal, it is a negotiation:
             // Linux records it once and thereafter opens, closes and flushes a
             // file without telling us. See `crate::opencache` for what that
             // buys and what it costs.
             op::OPEN | op::OPENDIR => Err(linux::ENOSYS),
-            op::CREATE => self.create(header.nodeid, body),
+            op::CREATE => self.create(nodeid, body),
             op::LIGHTER_CLONE => self.clone_over(body),
-            op::READ => self.read(header.nodeid, body, capacity),
-            op::WRITE => self.write(header.nodeid, body),
+            op::READ => self.read(nodeid, body, capacity),
+            op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
             op::RELEASE | op::RELEASEDIR => {
                 if let Some(fh) = get_u64(body, 0) {
@@ -360,16 +381,16 @@ impl Server {
                 }
                 Ok(Vec::new())
             }
-            op::FSYNC | op::FSYNCDIR => self.fsync(header.nodeid, body),
-            op::READDIR => self.readdir(header.nodeid, body, capacity, false),
-            op::READDIRPLUS => self.readdir(header.nodeid, body, capacity, true),
-            op::ACCESS => self.access(header.nodeid, body),
-            op::LSEEK => self.lseek(header.nodeid, body),
-            op::FALLOCATE => self.fallocate(header.nodeid, body),
-            op::GETXATTR => self.getxattr(header.nodeid, body),
-            op::SETXATTR => self.setxattr(header.nodeid, body),
-            op::LISTXATTR => self.listxattr(header.nodeid, body),
-            op::REMOVEXATTR => self.removexattr(header.nodeid, body),
+            op::FSYNC | op::FSYNCDIR => self.fsync(nodeid, body),
+            op::READDIR => self.readdir(nodeid, body, capacity, false),
+            op::READDIRPLUS => self.readdir(nodeid, body, capacity, true),
+            op::ACCESS => self.access(nodeid, body),
+            op::LSEEK => self.lseek(nodeid, body),
+            op::FALLOCATE => self.fallocate(nodeid, body),
+            op::GETXATTR => self.getxattr(nodeid, body),
+            op::SETXATTR => self.setxattr(nodeid, body),
+            op::LISTXATTR => self.listxattr(nodeid, body),
+            op::REMOVEXATTR => self.removexattr(nodeid, body),
             // Everything below is answered by the guest's own fallback path
             // once it knows we do not implement it. Answering ENOSYS is how it
             // learns, and for most of these the kernel then stops asking.
@@ -631,20 +652,24 @@ impl Server {
     /// terminating; the scoped drain inside is what makes the wait cost the
     /// inode's own backlog rather than the whole queue's.
     fn settle_while(&self, inode: &Inode, still: impl Fn(&Inode) -> bool) {
-        let mut idle_spins = 0u32;
+        let mut idle_since: Option<std::time::Instant> = None;
         while still(inode) {
             self.apply.drain_to(inode.settle_seq());
             if !still(inode) {
                 break;
             }
-            // A flag still up with nothing queued is a flag nothing will ever
-            // lower: the host has applied everything, so the host is the
-            // truth and waiting is a hang. Say so, loudly, and answer from
-            // the host. The spins tolerate the push/stamp gap, which is
-            // nanoseconds; a thousand of them with an empty queue is a leak.
+            // A flag still up with nothing queued, for longer than any
+            // acknowledgement takes to push its job, is a flag nothing will
+            // ever lower: the host has applied everything, so the host is
+            // the truth and waiting is a hang. Say so, loudly, and answer
+            // from the host. Wall time, not spins: an acknowledgement raises
+            // its flag before it pushes, and under a burst another worker
+            // can arrive in that gap — a thousand yields was measured
+            // giving up inside it, and answering ESTALE for a file whose
+            // create was a microsecond from the queue.
             if self.apply.depth() == 0 {
-                idle_spins += 1;
-                if idle_spins > 1000 {
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > std::time::Duration::from_millis(200) {
                     tracing::error!(
                         dev = inode.dev(),
                         ino = inode.ino(),
@@ -657,7 +682,7 @@ impl Server {
                     break;
                 }
             } else {
-                idle_spins = 0;
+                idle_since = None;
             }
             std::thread::yield_now();
         }
@@ -665,6 +690,24 @@ impl Server {
 
     fn inode(&self, nodeid: u64) -> Result<std::sync::Arc<Inode>, i32> {
         self.registry.get(nodeid).ok_or(linux::ENOENT)
+    }
+
+    /// The nodeid a request should be served under.
+    ///
+    /// A clone replaced a file under the guest's open descriptor; the
+    /// descriptor still names the old nodeid, and everything keyed by nodeid
+    /// — the inode, its cached descriptors, its overlays — belongs to the
+    /// replacement. Resolved once, at dispatch, so no handler can see the
+    /// old one. Bounded, since a replacement can itself be replaced.
+    fn resolve(&self, nodeid: u64) -> u64 {
+        let mut id = nodeid;
+        for _ in 0..8 {
+            match self.registry.get(id).and_then(|inode| inode.forwarded()) {
+                Some(next) => id = next,
+                None => break,
+            }
+        }
+        id
     }
 
     fn directory(&self, nodeid: u64) -> Result<std::sync::Arc<Inode>, i32> {
@@ -680,7 +723,24 @@ impl Server {
         // Path-based operations (access, xattr, link, setattr) need a file
         // that exists; settle it once, here, for all of them.
         self.settle_while(inode, |inode| inode.is_pending());
-        let fd = inode.reference()?;
+        let fd = match inode.reference() {
+            Ok(fd) => fd,
+            Err(errno) => {
+                if self.stats.enabled() {
+                    tracing::warn!(
+                        errno,
+                        pending = inode.is_pending(),
+                        cancelled = inode.is_cancelled(),
+                        forwarded = inode.forwarded().is_some(),
+                        dirty = inode.is_dirty(),
+                        dev = inode.dev(),
+                        ino = inode.ino(),
+                        "path(): no descriptor"
+                    );
+                }
+                return Err(errno);
+            }
+        };
         // By identity when the volume allows it. F_GETPATH answers from the
         // vnode name cache, which for a file created under a temporary name
         // and renamed into place can still be the temporary name — pnpm does
@@ -750,14 +810,13 @@ impl Server {
         let entry_valid = self.policy.validity(parent.dev(), parent.ino(), answer);
         let attr_valid = self.policy.attr_validity(dev, ino);
         let mut attr = self.attr(&st);
-        // While writes for this file sit on the apply queue, the host stat
-        // lags the size the guest was promised; the overlay is the truth.
+        // While writes or setattrs for this file sit on the apply queue, the
+        // host stat lags what the guest was promised; the overlay is the truth.
         if !is_dir
             && self.apply.busy()
             && let Some(inode) = self.registry.get(nodeid)
-            && inode.is_dirty()
         {
-            attr.size = inode.overlay_size(attr.size);
+            self.overlay_attr(&inode, &mut attr);
         }
         Ok(EntryOut {
             nodeid,
@@ -883,9 +942,15 @@ impl Server {
         // cached ENOENT — would be a lie.
         if let Some(nodeid) = parent.pending_child(name.to_bytes())
             && let Some(inode) = self.registry.get(nodeid)
-            && inode.is_pending()
         {
-            let entry = self.pending_entry(&parent, &inode, nodeid);
+            let entry = if inode.is_pending() {
+                self.registry.count_lookup(nodeid);
+                self.pending_entry(&parent, &inode, nodeid)
+            } else {
+                // Promised here by a queued rename: a real file, answering
+                // under a name the host does not have yet.
+                self.promised_entry(&parent, &inode, nodeid)?
+            };
             return Ok(self.entry_reply(&entry));
         }
         if parent.name_pending_gone(name.to_bytes()) {
@@ -941,23 +1006,297 @@ impl Server {
             sys::stat_fd(fd)?
         } else {
             let inode = self.inode(nodeid)?;
-            sys::stat_fd(inode.reference()?.raw_fd())?
+            self.stat_inode(nodeid, &inode)?
         };
-        let mut st = st;
+        let mut out = self.attr_reply(&st);
         if let Ok(inode) = self.inode(nodeid)
-            && inode.is_dirty()
+            && (inode.is_dirty() || inode.has_pending_attrs())
         {
-            st.st_size = st.st_size.max(inode.overlay_size(st.st_size as u64) as i64);
+            let mut attr = self.attr(&st);
+            self.overlay_attr(&inode, &mut attr);
+            out.truncate(16);
+            attr.encode(&mut out);
         }
-        Ok(self.attr_reply(&st))
+        Ok(out)
+    }
+
+    /// Requests for nothing, answered before they cost anything.
+    ///
+    /// Two shapes a package install sends by the hundred thousand. Every
+    /// `open(O_TRUNC)` on a file the guest has just created arrives as a
+    /// truncate to zero (ATOMIC_O_TRUNC is deliberately off), against a file
+    /// that is still a pending, empty promise. And a chown to root, which
+    /// after the identity map is the ownership the file already has. Both
+    /// used to settle the file's queued create and revive it by path first,
+    /// then discover there was nothing to do.
+    fn setattr_noop(
+        &self,
+        inode: &std::sync::Arc<Inode>,
+        nodeid: u64,
+        valid: u32,
+        body: &[u8],
+    ) -> Result<Option<Vec<u8>>, i32> {
+        const OWNERSHIP: u32 = fuse::fattr::UID | fuse::fattr::GID;
+        const HARMLESS: u32 = fuse::fattr::FH
+            | fuse::fattr::LOCKOWNER
+            | fuse::fattr::KILL_SUIDGID
+            | fuse::fattr::CTIME;
+        let effective = valid & !HARMLESS;
+        let noop = if effective == fuse::fattr::SIZE {
+            let size = get_u64(body, 16).ok_or(linux::EINVAL)?;
+            // A pending file that has had nothing written is empty already.
+            size == 0 && inode.is_pending() && !inode.is_dirty() && inode.overlay_size(0) == 0
+        } else if effective & !OWNERSHIP == 0 && effective != 0 {
+            let uid = if valid & fuse::fattr::UID != 0 {
+                self.to_host_uid(get_u32(body, 76).ok_or(linux::EINVAL)?)
+            } else {
+                self.host_uid
+            };
+            let gid = if valid & fuse::fattr::GID != 0 {
+                self.to_host_gid(get_u32(body, 80).ok_or(linux::EINVAL)?)
+            } else {
+                self.host_gid
+            };
+            uid == self.host_uid && gid == self.host_gid
+        } else {
+            false
+        };
+        if !noop {
+            return Ok(None);
+        }
+        let attr = if inode.is_pending() {
+            self.pending_entry(inode, inode, nodeid).attr
+        } else {
+            let st = self.stat_inode(nodeid, inode)?;
+            let mut attr = self.attr(&st);
+            self.overlay_attr(inode, &mut attr);
+            attr
+        };
+        let valid_for = self.policy.attr_validity(inode.dev(), inode.ino());
+        let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
+        out.extend_from_slice(&valid_for.as_secs().to_le_bytes());
+        out.extend_from_slice(&valid_for.subsec_nanos().to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        attr.encode(&mut out);
+        Ok(Some(out))
+    }
+
+    /// The asynchronous half of SETATTR: mode and times, which is what a
+    /// package manager sets on every file it has just written — a quarter of
+    /// a million times per pnpm install, each one having to wait for that
+    /// file's queued create and writes before a synchronous chmod or utimes
+    /// could even start. Queued behind them instead, in order, with the
+    /// promised values laid over every read until the job lands. Ownership
+    /// and size keep the synchronous path: one needs a privilege decision,
+    /// the other is a truncate.
+    fn setattr_pending(
+        &self,
+        inode: &std::sync::Arc<Inode>,
+        nodeid: u64,
+        valid: u32,
+        body: &[u8],
+    ) -> Result<Option<Vec<u8>>, i32> {
+        const ASYNC_OK: u32 = fuse::fattr::MODE
+            | fuse::fattr::ATIME
+            | fuse::fattr::MTIME
+            | fuse::fattr::ATIME_NOW
+            | fuse::fattr::MTIME_NOW
+            | fuse::fattr::CTIME
+            | fuse::fattr::FH
+            | fuse::fattr::LOCKOWNER
+            | fuse::fattr::KILL_SUIDGID;
+        if !self.apply.accepting()
+            || valid & !ASYNC_OK != 0
+            || valid
+                & (fuse::fattr::MODE
+                    | fuse::fattr::ATIME
+                    | fuse::fattr::MTIME
+                    | fuse::fattr::ATIME_NOW
+                    | fuse::fattr::MTIME_NOW)
+                == 0
+            || inode.is_dir
+            || inode.is_symlink
+        {
+            return Ok(None);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now = (now.as_secs() as i64, now.subsec_nanos() as i64);
+        let time = |set: u32, set_now: u32, sec: usize, nsec: usize| {
+            if valid & set_now != 0 {
+                Some(now)
+            } else if valid & set != 0 {
+                match (get_u64(body, sec), get_u32(body, nsec)) {
+                    (Some(s), Some(ns)) => Some((s as i64, ns as i64)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        let mut change = crate::inode::AttrOverride {
+            mode: (valid & fuse::fattr::MODE != 0).then(|| get_u32(body, 68).unwrap_or(0) & 0o7777),
+            atime: time(fuse::fattr::ATIME, fuse::fattr::ATIME_NOW, 32, 56),
+            mtime: time(fuse::fattr::MTIME, fuse::fattr::MTIME_NOW, 40, 60),
+        };
+        // A chmod to the mode the file already has is a request for nothing,
+        // and a package manager makes a great many of them; the syscall it
+        // would queue is fifteen microseconds of APFS the drainer can spend
+        // on something that changes a file.
+        if change.mode.is_some() {
+            let current_mode = if let Some(meta) = inode.pending_meta() {
+                Some(meta.mode & 0o7777)
+            } else {
+                inode
+                    .attr_override()
+                    .and_then(|over| over.mode)
+                    .or_else(|| {
+                        self.stat_inode(nodeid, inode)
+                            .ok()
+                            .map(|st| st.st_mode as u32 & 0o7777)
+                    })
+            };
+            if change.mode == current_mode {
+                change.mode = None;
+            }
+        }
+        if change.mode.is_none() && change.atime.is_none() && change.mtime.is_none() {
+            // Nothing to do; answer with what the file already is — which,
+            // for a file still pending, is what it was promised. (A stat
+            // here was the ESTALE that turned every pnpm import into a
+            // hardlink: libuv's copyfile chmods the destination it has just
+            // created, to the mode it already has.)
+            let mut attr = if inode.is_pending() {
+                self.pending_entry(inode, inode, nodeid).attr
+            } else {
+                self.attr(&self.stat_inode(nodeid, inode)?)
+            };
+            self.overlay_attr(inode, &mut attr);
+            let valid_for = self.policy.attr_validity(inode.dev(), inode.ino());
+            let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
+            out.extend_from_slice(&valid_for.as_secs().to_le_bytes());
+            out.extend_from_slice(&valid_for.subsec_nanos().to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            attr.encode(&mut out);
+            return Ok(Some(out));
+        }
+        inode.attr_acked(change);
+        // Four setattrs per file is what pnpm sends; one job per file is
+        // what APFS should hear. A job still waiting takes the merge, unless
+        // a write has been queued since it was opened.
+        if !inode.merge_attr(change) {
+            let batch = std::sync::Arc::new(std::sync::Mutex::new(change));
+            let job = {
+                let inode = inode.clone();
+                let open_cache = self.open_cache.clone();
+                let batch = batch.clone();
+                let seq_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let seq_out = seq_cell.clone();
+                (
+                    move || {
+                        let seq = seq_cell.load(std::sync::atomic::Ordering::Relaxed);
+                        let change = inode
+                            .take_attr_batch(seq)
+                            .unwrap_or_else(|| *batch.lock().expect("attr batch poisoned"));
+                        let result = (|| {
+                            let cached = open_cache.file(nodeid, false);
+                            let held;
+                            let raw = match &cached {
+                                Some(file) => file.fd.as_raw_fd(),
+                                None => {
+                                    held = inode.reference()?;
+                                    held.raw_fd()
+                                }
+                            };
+                            if let Some(mode) = change.mode {
+                                sys::chmod_fd(raw, mode)?;
+                            }
+                            if change.atime.is_some() || change.mtime.is_some() {
+                                let at = |t: Option<(i64, i64)>| match t {
+                                    Some((s, ns)) => TimeSpec::At(s, ns as u32),
+                                    None => TimeSpec::Omit,
+                                };
+                                sys::utimes_fd(raw, at(change.atime), at(change.mtime))?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(errno) = result
+                            && !inode.is_cancelled()
+                        {
+                            tracing::warn!(errno, "an acknowledged setattr failed to apply");
+                        }
+                        inode.attr_applied(result);
+                    },
+                    seq_out,
+                )
+            };
+            let (job, seq_out) = job;
+            let seq = self.apply.push(crate::apply::Job::new(0, job));
+            seq_out.store(seq, std::sync::atomic::Ordering::Relaxed);
+            inode.open_attr_batch(seq, batch);
+            inode.settled_by(seq);
+        } else {
+            // Merged: this request's promise lands with the job already
+            // queued, and counts as applied when that job runs.
+            inode.attr_merged();
+        }
+        // The reply: what the guest will see from here on.
+        let entry = if inode.is_pending() {
+            self.pending_entry(inode, inode, nodeid)
+        } else {
+            let st = self.stat_inode(nodeid, inode)?;
+            let mut attr = self.attr(&st);
+            self.overlay_attr(inode, &mut attr);
+            EntryOut {
+                nodeid,
+                generation: 0,
+                entry_valid: 0,
+                attr_valid: 0,
+                entry_valid_nsec: 0,
+                attr_valid_nsec: 0,
+                attr,
+            }
+        };
+        let valid_for = self.policy.attr_validity(inode.dev(), inode.ino());
+        let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
+        out.extend_from_slice(&valid_for.as_secs().to_le_bytes());
+        out.extend_from_slice(&valid_for.subsec_nanos().to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        entry.attr.encode(&mut out);
+        Ok(Some(out))
     }
 
     fn setattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let valid = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let inode = self.inode(nodeid)?;
+        if self.stats.enabled() {
+            // Which shapes of setattr a workload sends, once each: the async
+            // path only takes some of them, and which ones arrive decides
+            // whether it is taking any.
+            static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().expect("seen masks poisoned");
+            if !seen.contains(&valid) {
+                seen.push(valid);
+                tracing::info!(
+                    valid = format_args!("{valid:#x}"),
+                    dir = inode.is_dir,
+                    symlink = inode.is_symlink,
+                    "SETATTR-MASK"
+                );
+            }
+        }
+        if let Some(reply) = self.setattr_noop(&inode, nodeid, valid, body)? {
+            return Ok(reply);
+        }
+        if let Some(reply) = self.setattr_pending(&inode, nodeid, valid, body)? {
+            return Ok(reply);
+        }
         // A truncate must land after every write already acknowledged, and
         // the times a `touch` sets must not be overwritten by a stale apply.
-        self.settle_while(&inode, |inode| inode.is_dirty() || inode.is_pending());
+        self.settle_while(&inode, |inode| {
+            inode.is_dirty() || inode.is_pending() || inode.has_pending_attrs()
+        });
         let path = self.path(&inode)?;
 
         if valid & fuse::fattr::MODE != 0 {
@@ -1084,8 +1423,10 @@ impl Server {
         let parent = self.directory(parent)?;
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        // A promised name has no host file yet; removing a directory must
-        // also wait for whatever is still on its way into or out of it.
+        // A promised name has no host file yet, and its create cannot be
+        // withdrawn: the guest may hold it open, and an unlinked file keeps
+        // its bytes for whoever does — the server never learns about opens,
+        // so it cannot tell. Settled, then removed like any other.
         self.settle_while(&parent, |parent| {
             parent.pending_child(name.to_bytes()).is_some()
         });
@@ -1158,9 +1499,109 @@ impl Server {
         Ok(Vec::new())
     }
 
+    /// The asynchronous half of RENAME, for a plain file the guest knows.
+    ///
+    /// pnpm writes every store file under a temporary name and renames it
+    /// into place: seventeen thousand renames an install, each one queued
+    /// behind the file's own create and writes by the order it arrives in.
+    /// The overlay says the old name is gone and the new one resolves to the
+    /// same inode — pending or bound — until the job lands. Directories,
+    /// flags and files the registry has never seen keep the synchronous path.
+    fn rename_pending(
+        &self,
+        old_parent: &std::sync::Arc<Inode>,
+        old: &CString,
+        new_parent: &std::sync::Arc<Inode>,
+        new: &CString,
+    ) -> Result<Option<Vec<u8>>, i32> {
+        if !self.apply.accepting() || old_parent.name_pending_gone(old.to_bytes()) {
+            return Ok(None);
+        }
+        let nodeid = match old_parent.pending_child(old.to_bytes()) {
+            Some(nodeid) => nodeid,
+            None => {
+                let st = match sys::stat_at(old_parent.reference()?.raw_fd(), old) {
+                    Ok(st) => st,
+                    Err(_) => return Ok(None),
+                };
+                if st.st_mode & 0o170000 != 0o100000 {
+                    return Ok(None);
+                }
+                match self.registry.nodeid_for(st.st_dev as i64, st.st_ino) {
+                    Some(nodeid) => nodeid,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let Some(inode) = self.registry.get(nodeid) else {
+            return Ok(None);
+        };
+        if inode.is_dir {
+            return Ok(None);
+        }
+        // Whatever the new name held loses it; if the guest knows that
+        // inode, its link count is about to change.
+        let displaced = if let Some(id) = new_parent.pending_child(new.to_bytes()) {
+            self.registry.get(id)
+        } else {
+            sys::stat_at(new_parent.reference()?.raw_fd(), new)
+                .ok()
+                .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
+                .and_then(|id| self.registry.get(id))
+        };
+        if let Some(displaced) = &displaced {
+            if displaced.is_dir {
+                return Ok(None);
+            }
+            // Not withdrawn: a descriptor the guest holds on the displaced
+            // file keeps reading it after the rename, so it must exist.
+            displaced.shadow_meta();
+        }
+        old_parent.add_pending_gone(old.to_bytes());
+        new_parent.add_pending_child(new.to_bytes(), nodeid);
+        let job = {
+            let old_parent = old_parent.clone();
+            let new_parent = new_parent.clone();
+            let old = old.clone();
+            let new = new.clone();
+            let displaced = displaced.clone();
+            move || {
+                if let Err(errno) = (|| {
+                    sys::rename_at(
+                        old_parent.reference()?.raw_fd(),
+                        &old,
+                        new_parent.reference()?.raw_fd(),
+                        &new,
+                        0,
+                    )
+                })() {
+                    tracing::warn!(
+                        errno,
+                        from = %old.to_string_lossy(),
+                        to = %new.to_string_lossy(),
+                        "an acknowledged rename failed to apply"
+                    );
+                }
+                old_parent.remove_pending_gone(old.to_bytes());
+                new_parent.remove_pending_child(new.to_bytes(), nodeid);
+                if let Some(displaced) = &displaced {
+                    displaced.unshadow_meta();
+                }
+            }
+        };
+        let seq = self.apply.push(crate::apply::Job::new(0, job));
+        old_parent.settled_by(seq);
+        new_parent.settled_by(seq);
+        inode.settled_by(seq);
+        if let Some(displaced) = &displaced {
+            displaced.settled_by(seq);
+        }
+        Ok(Some(Vec::new()))
+    }
+
     fn rename(&self, parent: u64, body: &[u8], two: bool) -> Result<Vec<u8>, i32> {
         let old_parent = self.directory(parent)?;
-        let newdir = get_u64(body, 0).ok_or(linux::EINVAL)?;
+        let newdir = self.resolve(get_u64(body, 0).ok_or(linux::EINVAL)?);
         let (flags, names) = if two {
             (
                 get_u32(body, 8).ok_or(linux::EINVAL)?,
@@ -1174,6 +1615,11 @@ impl Server {
         let (new, _) = get_name(rest).ok_or(linux::EINVAL)?;
         let old = self.checked_name(old)?;
         let new = self.checked_name(new)?;
+        if flags == 0
+            && let Some(reply) = self.rename_pending(&old_parent, &old, &new_parent, &new)?
+        {
+            return Ok(reply);
+        }
         self.settle_while(&old_parent, |parent| {
             parent.pending_child(old.to_bytes()).is_some()
                 || parent.name_pending_gone(old.to_bytes())
@@ -1194,7 +1640,7 @@ impl Server {
 
     fn link(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
-        let oldnodeid = get_u64(body, 0).ok_or(linux::EINVAL)?;
+        let oldnodeid = self.resolve(get_u64(body, 0).ok_or(linux::EINVAL)?);
         let target = self.inode(oldnodeid)?;
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
@@ -1290,8 +1736,11 @@ impl Server {
     /// the name flips atomically from old content to new; the guest kernel
     /// drops its caches for the replaced inode itself.
     fn clone_over(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
-        let nodeid_in = get_u64(body, 0).ok_or(linux::EINVAL)?;
-        let parent_out = get_u64(body, 8).ok_or(linux::EINVAL)?;
+        // Both name nodeids in the body, not the header, so the dispatch-time
+        // resolution has not seen them: the source may be the guest's open
+        // descriptor on a file a clone has since replaced.
+        let nodeid_in = self.resolve(get_u64(body, 0).ok_or(linux::EINVAL)?);
+        let parent_out = self.resolve(get_u64(body, 8).ok_or(linux::EINVAL)?);
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let source = self.inode(nodeid_in)?;
@@ -1301,14 +1750,9 @@ impl Server {
         // them and lands after they do.
         self.settle_while(&source, |source| source.is_pending());
         let source_path = self.path(&source)?;
-        let size = {
-            let reference = source.reference()?;
-            source.overlay_size(sys::stat_fd(reference.raw_fd())?.st_size as u64)
-        };
-        let mode = {
-            let reference = source.reference()?;
-            sys::stat_fd(reference.raw_fd())?.st_mode as u32
-        };
+        let st = self.stat_inode(nodeid_in, &source)?;
+        let size = source.overlay_size(st.st_size as u64);
+        let mode = st.st_mode as u32;
         if !self.apply.accepting() {
             self.settle_while(&source, |source| source.is_dirty());
             let parent_ref = parent.reference()?;
@@ -1332,11 +1776,33 @@ impl Server {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
+        let born = (now.as_secs() as i64, now.subsec_nanos() as i64);
         let meta = crate::inode::PendingMeta {
             mode,
-            born: (now.as_secs() as i64, now.subsec_nanos() as i64),
+            born,
+            atime: born,
+            mtime: born,
+        };
+        // A destination whose create is still queued is withdrawn: the
+        // clone replaces it before it ever existed, and the queue is spared
+        // a create, a clone to a temporary and a rename — the three
+        // operations pnpm's open-then-FICLONE import used to cost.
+        let displaced = if let Some(old) = parent.pending_child(name.to_bytes()) {
+            self.registry.get(old)
+        } else {
+            sys::stat_at(parent.reference()?.raw_fd(), &name)
+                .ok()
+                .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
+                .and_then(|id| self.registry.get(id))
         };
         let (nodeid, dest) = self.registry.insert_pending(parent.dev(), meta);
+        if let Some(old) = &displaced {
+            // The guest's descriptor on the old file keeps working, and sees
+            // the clone — as FICLONE promises — because the old inode now
+            // answers with the new one. A create still queued is withdrawn.
+            old.cancel_pending();
+            old.forward_to(nodeid);
+        }
         dest.write_acked(size);
         parent.add_pending_child(name.to_bytes(), nodeid);
         let job = {
@@ -1347,19 +1813,42 @@ impl Server {
             move || {
                 let result = (|| {
                     let parent_ref = parent.reference()?;
-                    // Unique per job: one source is cloned to many names at
-                    // once, and a temporary keyed on the source alone collides.
-                    let tmp = sys::c_path(&std::path::PathBuf::from(format!(
-                        ".lighter-clone-{}-{}",
-                        std::process::id(),
-                        nodeid
-                    )))?;
-                    sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
-                    if let Err(e) =
-                        sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &name, 0)
-                    {
-                        let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
-                        return Err(e);
+                    // Straight to the name when nothing holds it — the
+                    // common case, pnpm importing into a fresh store — and
+                    // the rename is saved: forty-seven microseconds of APFS
+                    // per import, fifty thousand imports an install. Only
+                    // a name that is taken goes through a temporary, so the
+                    // replacement stays atomic.
+                    match sys::clonefile_at(&source_path, parent_ref.raw_fd(), &name) {
+                        Ok(()) => {}
+                        Err(e)
+                            if e == linux::EEXIST
+                                && sys::unlink_at(parent_ref.raw_fd(), &name, false).is_ok()
+                                && sys::clonefile_at(&source_path, parent_ref.raw_fd(), &name)
+                                    .is_ok() => {}
+                        Err(e) if e == linux::EEXIST => {
+                            // Unlink-then-clone was refused; the atomic route.
+                            // Unique per job: one source is cloned to many
+                            // names at once, and a temporary keyed on the
+                            // source alone collides.
+                            let tmp = sys::c_path(&std::path::PathBuf::from(format!(
+                                ".lighter-clone-{}-{}",
+                                std::process::id(),
+                                nodeid
+                            )))?;
+                            sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
+                            if let Err(e) = sys::rename_at(
+                                parent_ref.raw_fd(),
+                                &tmp,
+                                parent_ref.raw_fd(),
+                                &name,
+                                0,
+                            ) {
+                                let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
                     }
                     let fd = sys::open_reference(parent_ref.raw_fd(), &name, false)?;
                     let st = sys::stat_fd(fd.as_raw_fd())?;
@@ -1379,7 +1868,7 @@ impl Server {
                     }
                 }
                 dest.write_applied(Ok(()));
-                parent.remove_pending_child(name.to_bytes());
+                parent.remove_pending_child(name.to_bytes(), nodeid);
             }
         };
         let seq = self.apply.push(crate::apply::Job::new(0, job));
@@ -1434,9 +1923,12 @@ impl Server {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
+        let born = (now.as_secs() as i64, now.subsec_nanos() as i64);
         let meta = crate::inode::PendingMeta {
             mode: libc::S_IFREG as u32 | mode,
-            born: (now.as_secs() as i64, now.subsec_nanos() as i64),
+            born,
+            atime: born,
+            mtime: born,
         };
         let (nodeid, inode) = self.registry.insert_pending(parent.dev(), meta);
         parent.add_pending_child(name.to_bytes(), nodeid);
@@ -1449,6 +1941,12 @@ impl Server {
             move || {
                 const LINUX_O_CREAT: u32 = 0o100;
                 const LINUX_O_NOFOLLOW: u32 = 0o400000;
+                if inode.is_cancelled() {
+                    // Replaced before it existed; nothing to make.
+                    inode.bind_failed(linux::ENOENT);
+                    parent.remove_pending_child(name.to_bytes(), nodeid);
+                    return;
+                }
                 let result = (|| {
                     let parent_fd = parent.reference()?;
                     let fd = sys::openat_path(
@@ -1469,13 +1967,11 @@ impl Server {
                         // exactly as a real file handle would.
                         match sys::dup(&fd) {
                             Ok(meta) => {
-                                registry.bind_pending(
-                                    nodeid,
-                                    &inode,
-                                    meta,
-                                    st.st_dev as i64,
-                                    st.st_ino,
-                                );
+                                // Cache first, bind second: a reader that
+                                // settles the instant `pending` clears must
+                                // find the descriptor already there, or it
+                                // reopens by path — which an unlinked file
+                                // no longer has.
                                 open_cache.put_file(
                                     nodeid,
                                     std::sync::Arc::new(OpenFile {
@@ -1484,6 +1980,13 @@ impl Server {
                                         append: false,
                                         writable: flags & 0o3 != 0,
                                     }),
+                                );
+                                registry.bind_pending(
+                                    nodeid,
+                                    &inode,
+                                    meta,
+                                    st.st_dev as i64,
+                                    st.st_ino,
                                 );
                             }
                             Err(_) => {
@@ -1508,7 +2011,7 @@ impl Server {
                 }
                 // Settled either way: the host directory answers for this
                 // name now — with the file, or honestly without it.
-                parent.remove_pending_child(name.to_bytes());
+                parent.remove_pending_child(name.to_bytes(), nodeid);
             }
         };
         let seq = self.apply.push(crate::apply::Job::new(0, job));
@@ -1521,11 +2024,94 @@ impl Server {
         Ok(Some(out))
     }
 
+    /// A stat of the inode by the cheapest descriptor to hand.
+    ///
+    /// The open cache holds the descriptor a recent create or write left,
+    /// and a file the guest is still working on is almost always in it.
+    /// Going through `reference()` instead revives a parked inode by path —
+    /// at a full share, transiently, every time — which was seventy
+    /// microseconds of every setattr a pnpm install made.
+    fn stat_inode(&self, nodeid: u64, inode: &Inode) -> Result<libc::stat, i32> {
+        if let Some(file) = self.open_cache.file(nodeid, false) {
+            return sys::stat_fd(file.fd.as_raw_fd());
+        }
+        match inode.reference() {
+            Ok(fd) => sys::stat_fd(fd.raw_fd()),
+            Err(errno) => {
+                if self.stats.enabled() {
+                    tracing::warn!(
+                        errno,
+                        nodeid,
+                        pending = inode.is_pending(),
+                        cancelled = inode.is_cancelled(),
+                        forwarded = inode.forwarded().is_some(),
+                        dirty = inode.is_dirty(),
+                        is_dir = inode.is_dir,
+                        "stat_inode: no descriptor"
+                    );
+                }
+                Err(errno)
+            }
+        }
+    }
+
+    /// Lays what a bound inode was promised by queued setattrs over the
+    /// attributes the host stat produced.
+    fn overlay_attr(&self, inode: &Inode, attr: &mut Attr) {
+        if inode.is_dirty() {
+            attr.size = inode.overlay_size(attr.size);
+            attr.blocks = attr.size.div_ceil(512);
+        }
+        if let Some(over) = inode.attr_override() {
+            if let Some(mode) = over.mode {
+                attr.mode = (attr.mode & !0o7777) | (mode & 0o7777);
+            }
+            if let Some((s, ns)) = over.atime {
+                attr.atime = s;
+                attr.atimensec = ns as u32;
+            }
+            if let Some((s, ns)) = over.mtime {
+                attr.mtime = s;
+                attr.mtimensec = ns as u32;
+            }
+        }
+    }
+
+    /// The entry for a bound inode reached through the overlay — a file a
+    /// queued rename has promised to this name. It counts as a lookup, as
+    /// any reply naming a nodeid does.
+    fn promised_entry(
+        &self,
+        parent: &Inode,
+        inode: &std::sync::Arc<Inode>,
+        nodeid: u64,
+    ) -> Result<EntryOut, i32> {
+        let st = self.stat_inode(nodeid, inode)?;
+        let mut attr = self.attr(&st);
+        self.overlay_attr(inode, &mut attr);
+        self.registry.count_lookup(nodeid);
+        let entry_valid = self
+            .policy
+            .validity(parent.dev(), parent.ino(), Answer::File);
+        let attr_valid = self.policy.attr_validity(inode.dev(), inode.ino());
+        Ok(EntryOut {
+            nodeid,
+            generation: 0,
+            entry_valid: entry_valid.as_secs(),
+            attr_valid: attr_valid.as_secs(),
+            entry_valid_nsec: entry_valid.subsec_nanos(),
+            attr_valid_nsec: attr_valid.subsec_nanos(),
+            attr,
+        })
+    }
+
     /// The entry a pending inode answers with, from what the guest was told.
     fn pending_entry(&self, parent: &Inode, inode: &Inode, nodeid: u64) -> EntryOut {
         let meta = inode.pending_meta().unwrap_or(crate::inode::PendingMeta {
             mode: libc::S_IFREG as u32 | 0o644,
             born: (0, 0),
+            atime: (0, 0),
+            mtime: (0, 0),
         });
         let size = inode.overlay_size(0);
         let entry_valid = self
@@ -1543,11 +2129,11 @@ impl Server {
                 ino: inode.ino(),
                 size,
                 blocks: size.div_ceil(512),
-                atime: meta.born.0,
-                mtime: meta.born.0,
+                atime: meta.atime.0,
+                mtime: meta.mtime.0,
                 ctime: meta.born.0,
-                atimensec: meta.born.1 as u32,
-                mtimensec: meta.born.1 as u32,
+                atimensec: meta.atime.1 as u32,
+                mtimensec: meta.mtime.1 as u32,
                 ctimensec: meta.born.1 as u32,
                 mode: meta.mode,
                 nlink: 1,
@@ -1721,6 +2307,7 @@ impl Server {
             };
             let seq = self.apply.push(crate::apply::Job::new(size, job));
             inode.settled_by(seq);
+            inode.note_write(seq);
             let mut out = Vec::with_capacity(8);
             out.extend_from_slice(&(size as u32).to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
@@ -1766,6 +2353,7 @@ impl Server {
             };
             let seq = self.apply.push(crate::apply::Job::new(size, job));
             inode.settled_by(seq);
+            inode.note_write(seq);
             size
         } else {
             sys::write_at(file.fd.as_raw_fd(), data, offset)?

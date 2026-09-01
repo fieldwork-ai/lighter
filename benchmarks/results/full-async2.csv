@@ -1,0 +1,13 @@
+case,rep,ms
+npm-install,1,timeout
+npm-install,2,timeout
+pnpm-install,1,timeout
+pnpm-install,2,timeout
+yarn-install,1,timeout
+yarn-install,2,timeout
+ripgrep,1,79922
+ripgrep,2,58590
+find-walk,1,timeout
+find-walk,2,timeout
+copy-tree,1,timeout
+copy-tree,2,timeout

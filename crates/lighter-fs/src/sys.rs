@@ -556,6 +556,21 @@ pub fn utimes_at(parent: RawFd, name: &CStr, atime: TimeSpec, mtime: TimeSpec) -
     .map(|_| ())
 }
 
+/// `fchmod`: the descriptor form, for the apply queue, which holds the file
+/// rather than a path that may have moved by the time the job runs.
+pub fn chmod_fd(fd: RawFd, mode: u32) -> Result<()> {
+    // SAFETY: live descriptor.
+    check(unsafe { libc::fchmod(fd, mode as libc::mode_t) }).map(|_| ())
+}
+
+/// `futimens`, for the same reason as [`chmod_fd`].
+pub fn utimes_fd(fd: RawFd, atime: TimeSpec, mtime: TimeSpec) -> Result<()> {
+    let times = [atime.to_timespec(), mtime.to_timespec()];
+    // SAFETY: live descriptor and a two-element array, which is what
+    // `futimens` reads.
+    check(unsafe { libc::futimens(fd, times.as_ptr()) }).map(|_| ())
+}
+
 pub fn truncate_fd(fd: RawFd, size: u64) -> Result<()> {
     // SAFETY: live descriptor.
     check(unsafe { libc::ftruncate(fd, size as libc::off_t) }).map(|_| ())

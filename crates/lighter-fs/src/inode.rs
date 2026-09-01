@@ -109,6 +109,16 @@ pub struct Inode {
     /// operation on this file to report — the same posture as the kernel's
     /// own writeback. Taken (cleared) when reported.
     write_error: Mutex<Option<i32>>,
+    /// Where operations on this inode now belong: the inode a clone put in
+    /// its place. The guest's open descriptor still names this one — FICLONE
+    /// on Linux leaves the descriptor looking at the cloned bytes — so any
+    /// request arriving here is answered by the replacement. Zero is none.
+    forward: AtomicU64,
+    /// A pending create the guest has since replaced — cloned over, renamed
+    /// over, or unlinked — before its job ran. The job then does nothing:
+    /// the file was never going to be observed, and skipping it is one APFS
+    /// operation fewer on a queue that is the bottleneck.
+    cancelled: AtomicBool,
     /// True from an acknowledged CREATE until the apply queue performs it.
     ///
     /// A pending inode has no descriptor and no host identity yet: `dev`/
@@ -140,14 +150,35 @@ pub struct Inode {
     /// inode: its own create or writes, or — for a directory — the naming
     /// operations inside it. A barrier waits to here and no further.
     settle_seq: AtomicU64,
+    /// Setattrs acknowledged but not yet applied, and what they promised.
+    attr_pending: AtomicU32,
+    attr_override: Mutex<AttrOverride>,
+    /// The batch an unapplied setattr job will read when it runs, and the
+    /// job's sequence number: a later setattr can merge into it rather than
+    /// queue a job of its own — as long as no write has been acknowledged
+    /// since, because a write moves mtime and the batch must land after it.
+    attr_batch: Mutex<Option<(u64, Arc<Mutex<AttrOverride>>)>>,
+    last_write_seq: AtomicU64,
 }
 
-/// The attributes a pending file was promised at creation.
+/// The attributes a pending file was promised at creation, and any it has
+/// been promised since by a queued setattr.
 #[derive(Clone, Copy)]
 pub struct PendingMeta {
     pub mode: u32,
     /// Seconds and nanoseconds since the epoch, captured at acknowledgement.
     pub born: (i64, i64),
+    pub atime: (i64, i64),
+    pub mtime: (i64, i64),
+}
+
+/// Attributes a bound inode has been promised by setattrs still on the
+/// queue. Reads must show them; the host stat lags until the jobs land.
+#[derive(Clone, Copy, Default)]
+pub struct AttrOverride {
+    pub mode: Option<u32>,
+    pub atime: Option<(i64, i64)>,
+    pub mtime: Option<(i64, i64)>,
 }
 
 /// What a share is holding, counted where it changes.
@@ -232,6 +263,8 @@ impl Inode {
             dirty: AtomicU32::new(0),
             pending_size: AtomicU64::new(0),
             write_error: Mutex::new(None),
+            forward: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             pending_meta: Mutex::new(None),
             pending_children: Mutex::new(std::collections::HashMap::new()),
@@ -240,6 +273,10 @@ impl Inode {
             gone_count: AtomicUsize::new(0),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
+            attr_pending: AtomicU32::new(0),
+            attr_override: Mutex::new(AttrOverride::default()),
+            attr_batch: Mutex::new(None),
+            last_write_seq: AtomicU64::new(0),
         }
     }
 
@@ -261,6 +298,8 @@ impl Inode {
             dirty: AtomicU32::new(0),
             pending_size: AtomicU64::new(0),
             write_error: Mutex::new(None),
+            forward: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
             pending: AtomicBool::new(true),
             pending_meta: Mutex::new(Some(meta)),
             pending_children: Mutex::new(std::collections::HashMap::new()),
@@ -269,11 +308,41 @@ impl Inode {
             gone_count: AtomicUsize::new(0),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
+            attr_pending: AtomicU32::new(0),
+            attr_override: Mutex::new(AttrOverride::default()),
+            attr_batch: Mutex::new(None),
+            last_write_seq: AtomicU64::new(0),
         }
     }
 
     pub fn is_pending(&self) -> bool {
         self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Withdraws a pending create whose file the guest has already replaced.
+    /// Only meaningful while still pending; returns whether it was.
+    pub fn cancel_pending(&self) -> bool {
+        if !self.pending.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.cancelled.store(true, Ordering::Relaxed);
+        true
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Redirects everything that arrives at this inode to `nodeid`.
+    pub fn forward_to(&self, nodeid: u64) {
+        self.forward.store(nodeid, Ordering::Relaxed);
+    }
+
+    pub fn forwarded(&self) -> Option<u64> {
+        match self.forward.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        }
     }
 
     pub fn pending_meta(&self) -> Option<PendingMeta> {
@@ -316,13 +385,17 @@ impl Inode {
         self.pending_count.store(children.len(), Ordering::Relaxed);
     }
 
-    /// The promise is settled (kept or failed); the host directory answers now.
-    pub fn remove_pending_child(&self, name: &[u8]) {
+    /// The promise is settled (kept or failed); the host directory answers
+    /// now — unless a later promise has taken the name, in which case that
+    /// one is the truth and this removal must not erase it.
+    pub fn remove_pending_child(&self, name: &[u8], nodeid: u64) {
         let mut children = self
             .pending_children
             .lock()
             .expect("pending children poisoned");
-        children.remove(name);
+        if children.get(name) == Some(&nodeid) {
+            children.remove(name);
+        }
         self.pending_count.store(children.len(), Ordering::Relaxed);
     }
 
@@ -365,6 +438,116 @@ impl Inode {
             .lock()
             .expect("pending gone poisoned")
             .contains(name)
+    }
+
+    /// A write job with this sequence number was queued: any setattr batch
+    /// opened before it must not absorb later setattrs.
+    pub fn note_write(&self, seq: u64) {
+        self.last_write_seq.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    /// Merges a setattr into the batch of a job still waiting to run, if
+    /// there is one and no write has been queued since it was opened.
+    /// Returns whether it merged; if not the caller queues a job and opens a
+    /// batch with [`Inode::open_attr_batch`].
+    pub fn merge_attr(&self, change: AttrOverride) -> bool {
+        let batch = self.attr_batch.lock().expect("attr batch poisoned");
+        let Some((seq, values)) = batch.as_ref() else {
+            return false;
+        };
+        if *seq <= self.last_write_seq.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut values = values.lock().expect("attr batch poisoned");
+        if change.mode.is_some() {
+            values.mode = change.mode;
+        }
+        if change.atime.is_some() {
+            values.atime = change.atime;
+        }
+        if change.mtime.is_some() {
+            values.mtime = change.mtime;
+        }
+        true
+    }
+
+    /// Opens the batch a freshly queued setattr job will read.
+    pub fn open_attr_batch(&self, seq: u64, values: Arc<Mutex<AttrOverride>>) {
+        *self.attr_batch.lock().expect("attr batch poisoned") = Some((seq, values));
+    }
+
+    /// The job with this sequence number is about to run: its batch is
+    /// closed to merges from here on, and its contents are what to apply.
+    pub fn take_attr_batch(&self, seq: u64) -> Option<AttrOverride> {
+        let mut batch = self.attr_batch.lock().expect("attr batch poisoned");
+        match batch.as_ref() {
+            Some((open_seq, values)) if *open_seq == seq => {
+                let taken = *values.lock().expect("attr batch poisoned");
+                *batch = None;
+                Some(taken)
+            }
+            _ => None,
+        }
+    }
+
+    /// A setattr has been acknowledged: what it promised is the truth until
+    /// the job lands. A pending inode takes it into its meta; a bound one
+    /// into an override the readers apply over the host stat.
+    pub fn attr_acked(&self, change: AttrOverride) {
+        self.attr_pending.fetch_add(1, Ordering::Relaxed);
+        let mut meta = self.pending_meta.lock().expect("pending meta poisoned");
+        if let Some(meta) = meta.as_mut() {
+            if let Some(mode) = change.mode {
+                meta.mode = (meta.mode & !0o7777) | (mode & 0o7777);
+            }
+            if let Some(atime) = change.atime {
+                meta.atime = atime;
+            }
+            if let Some(mtime) = change.mtime {
+                meta.mtime = mtime;
+            }
+        }
+        let mut current = self.attr_override.lock().expect("attr override poisoned");
+        if change.mode.is_some() {
+            current.mode = change.mode;
+        }
+        if change.atime.is_some() {
+            current.atime = change.atime;
+        }
+        if change.mtime.is_some() {
+            current.mtime = change.mtime;
+        }
+    }
+
+    /// The setattr was folded into a job already queued: one job, one
+    /// decrement, so the count it added is taken back here.
+    pub fn attr_merged(&self) {
+        self.attr_pending.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// A queued setattr landed; on the last one the host answers for itself.
+    pub fn attr_applied(&self, result: Result<(), i32>) {
+        if let Err(errno) = result {
+            self.write_error
+                .lock()
+                .expect("write error poisoned")
+                .get_or_insert(errno);
+        }
+        if self.attr_pending.fetch_sub(1, Ordering::Relaxed) == 1 {
+            *self.attr_override.lock().expect("attr override poisoned") = AttrOverride::default();
+        }
+    }
+
+    /// What a reader must lay over the host stat, if anything.
+    pub fn attr_override(&self) -> Option<AttrOverride> {
+        if self.attr_pending.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(*self.attr_override.lock().expect("attr override poisoned"))
+    }
+
+    pub fn has_pending_attrs(&self) -> bool {
+        self.attr_pending.load(Ordering::Relaxed) != 0
     }
 
     /// Remembers that the job with this sequence number touches this inode.
@@ -593,9 +776,19 @@ impl Inode {
     /// files, and the forced phase, which exists for the case where nothing
     /// else works, ignores this entirely.
     fn parkable(&self) -> bool {
-        !self.is_dir
-            || self.census.resident_dirs.load(Ordering::Relaxed)
-                > self.census.budget.load(Ordering::Relaxed) / 2
+        if !self.is_dir {
+            return true;
+        }
+        let budget = self.census.budget.load(Ordering::Relaxed);
+        // The privilege is for the common case, not a right. Past the slack
+        // the sweep is already in the regime where it would otherwise force,
+        // and a privilege that holds there starves it: pnpm's tree is
+        // directories most of the way down, and with them exempt a pass
+        // examined eight thousand inodes and parked none while every request
+        // swept. Under pressure a directory is an ordinary candidate.
+        let slack = (budget / SWEEP_SLACK_DIVISOR).max(64);
+        self.census.descriptors.load(Ordering::Relaxed) > budget + slack
+            || self.census.resident_dirs.load(Ordering::Relaxed) > budget / 2
     }
 
     /// Whether this inode is still the file those numbers name.
@@ -860,6 +1053,19 @@ impl Registry {
         Some(id)
     }
 
+    /// A reply named this nodeid outside the usual paths: count it, so the
+    /// kernel's FORGET total and ours agree.
+    pub fn count_lookup(&self, id: u64) {
+        if let Some(inode) = self.by_id[shard(id)]
+            .lock()
+            .expect("inode table poisoned")
+            .get(&id)
+        {
+            let mut lookups = inode.lookups.lock().expect("lookup count poisoned");
+            *lookups = lookups.saturating_add(1);
+        }
+    }
+
     /// The nodeid for a host identity, without counting it as a lookup.
     ///
     /// For the watcher, which needs to know whether the guest has ever heard of
@@ -1092,6 +1298,11 @@ impl Registry {
         let mut examined = 0usize;
         let mut parked_total = 0usize;
         let mut promoted_total = 0usize;
+        // Why the pass skipped what it saw: the numbers that say whether a
+        // sweep that frees nothing is looking at a hot set, a parked set, a
+        // privileged set, or files it cannot park (unlinked, nlink zero).
+        let (mut skip_unheld, mut skip_used, mut skip_privileged, mut skip_unparkable) =
+            (0usize, 0usize, 0usize, 0usize);
 
         while examined < SWEEP_STEPS && parked_total < SWEEP_TAKE {
             if self.census.descriptors() <= target {
@@ -1122,6 +1333,7 @@ impl Registry {
                     .expect("reclaim hand poisoned")
                     .push_back(id);
                 if !inode.held.load(Ordering::Relaxed) {
+                    skip_unheld += 1;
                     // Parked but touched since the hand last came round: hot,
                     // and resident is where hot belongs. Promotion spends the
                     // room the parks on this pass have made (plus any slack
@@ -1139,9 +1351,11 @@ impl Registry {
                 // `swap` is the ageing: an inode used since the hand last came
                 // round survives this pass and is a candidate on the next.
                 if inode.used.swap(false, Ordering::Relaxed) {
+                    skip_used += 1;
                     continue;
                 }
                 if !inode.parkable() {
+                    skip_privileged += 1;
                     continue;
                 }
                 // Parked outside the shard lock: parking stats and closes a
@@ -1149,6 +1363,8 @@ impl Registry {
                 // every worker whose path runs through that shard.
                 if inode.park() {
                     parked_total += 1;
+                } else {
+                    skip_unparkable += 1;
                 }
             }
         }
@@ -1227,6 +1443,10 @@ impl Registry {
                 live = self.census.inodes(),
                 examined,
                 parked = parked_total,
+                unheld = skip_unheld,
+                used = skip_used,
+                privileged = skip_privileged,
+                unparkable = skip_unparkable,
                 "the share is holding more descriptors than it may"
             );
         }

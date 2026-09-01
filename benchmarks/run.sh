@@ -463,7 +463,19 @@ for name in $CASES; do
 	# measurement can say why. Silently printing a dash for a case that has
 	# been failing for a week is the worst thing a benchmark harness can do.
 	CASE_OUT="$(mktemp -t lighter-case)"
-	run_case "$name" >"$CASE_OUT" 2>&1 || true
+	# A host-side cap on top of the runner's own: the runner cannot help
+	# when `docker run` itself never returns — a container that has exited
+	# but whose exit never reached the client sat here for seventy minutes
+	# with the in-container limit long expired. Every repetition's limit
+	# plus a minute of grace, then the client is killed and the case is
+	# recorded as timed out.
+	cap=$(( ${CASE_TIMEOUT_S:-300} * REPS + 60 ))
+	run_case "$name" >"$CASE_OUT" 2>&1 &
+	case_pid=$!
+	( sleep "$cap"; kill "$case_pid" 2>/dev/null && echo "TIME_MS TIMEOUT host-watchdog ${cap}s" >>"$CASE_OUT" ) &
+	watchdog_pid=$!
+	wait "$case_pid" 2>/dev/null || true
+	kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null || true
 	while read -r ms; do
 		rep=$((rep + 1))
 		printf ' %s' "$ms"

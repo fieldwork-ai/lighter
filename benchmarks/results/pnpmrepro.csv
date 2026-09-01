@@ -1,0 +1,3 @@
+case,rep,ms
+pnpm-install,1,timeout
+pnpm-install,2,timeout
