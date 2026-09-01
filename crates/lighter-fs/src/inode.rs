@@ -33,6 +33,15 @@ use std::sync::{Arc, Mutex, RwLock};
 pub const ROOT_ID: u64 = 1;
 
 /// One file, as long as the guest remembers it.
+/// Where a parked inode can be found again, and how to be sure it is still
+/// the same file.
+#[derive(Clone)]
+struct Parked {
+    path: PathBuf,
+    /// `(st_birthtime, st_birthtime_nsec)` at the moment of parking.
+    birthtime: (i64, i64),
+}
+
 pub struct Inode {
     /// A metadata-only descriptor, or nothing if it has been parked.
     ///
@@ -46,7 +55,7 @@ pub struct Inode {
     /// Only meaningful when the slot is empty, and only a hint even then:
     /// whether it still names this file is settled by `(dev, ino)` after the
     /// reopen, never assumed.
-    parked_at: Mutex<Option<PathBuf>>,
+    parked_at: Mutex<Option<Parked>>,
     /// The reference bit of a clock: set on use, cleared as the reclaimer
     /// passes. An inode found with it clear is one nothing has touched since
     /// the last sweep.
@@ -166,23 +175,53 @@ impl Inode {
         if let Some(fd) = slot.as_ref() {
             return Ok(Reference(fd.clone()));
         }
-        let path = self
+        let parked = self
             .parked_at
             .lock()
             .expect("parked path poisoned")
             .clone()
             .ok_or(crate::errno::linux::ESTALE)?;
-        let fd = crate::sys::open_reference_path(&path, self.is_symlink)
-            .map_err(|_| crate::errno::linux::ESTALE)?;
-        match crate::sys::stat_fd(fd.as_raw_fd()) {
-            Ok(st) if st.st_ino == self.ino && st.st_dev as i64 == self.dev => {}
-            _ => return Err(crate::errno::linux::ESTALE),
-        }
+        let fd = self.reopen(&parked)?;
         let fd = Arc::new(fd);
         self.held.store(true, Ordering::Relaxed);
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
         *slot = Some(fd.clone());
         Ok(Reference(fd))
+    }
+
+    /// Reopens a parked inode: by its remembered path, and failing that by
+    /// its identity.
+    ///
+    /// The path is tried first and checked against `(dev, ino)`, so a name
+    /// that now belongs to a different file cannot be mistaken for ours. When
+    /// the path no longer answers — the file was renamed while parked — the
+    /// volume can still open the inode itself, via macOS's `/.vol/dev/ino`
+    /// namespace. That door needs a stronger check than the numbers: APFS
+    /// recycles inode numbers briskly, and `/.vol` would open the recycled
+    /// number's new owner with a matching `(dev, ino)` by construction. Birth
+    /// time is the tiebreak — it is immutable for the life of a file, so the
+    /// same numbers with the same birth time is the same file, and anything
+    /// else is `ESTALE`.
+    fn reopen(&self, parked: &Parked) -> Result<std::os::fd::OwnedFd, i32> {
+        if let Ok(fd) = crate::sys::open_reference_path(&parked.path, self.is_symlink) {
+            match crate::sys::stat_fd(fd.as_raw_fd()) {
+                Ok(st) if st.st_ino == self.ino && st.st_dev as i64 == self.dev => return Ok(fd),
+                _ => {}
+            }
+        }
+        let vol = PathBuf::from(format!("/.vol/{}/{}", self.dev, self.ino));
+        let fd = crate::sys::open_reference_path(&vol, self.is_symlink)
+            .map_err(|_| crate::errno::linux::ESTALE)?;
+        match crate::sys::stat_fd(fd.as_raw_fd()) {
+            Ok(st)
+                if st.st_ino == self.ino
+                    && st.st_dev as i64 == self.dev
+                    && (st.st_birthtime, st.st_birthtime_nsec) == parked.birthtime =>
+            {
+                Ok(fd)
+            }
+            _ => Err(crate::errno::linux::ESTALE),
+        }
     }
 
     /// Closes the descriptor, remembering where it was.
@@ -194,10 +233,10 @@ impl Inode {
         let Some(fd) = self.fd.read().expect("inode slot poisoned").clone() else {
             return false;
         };
-        match crate::sys::stat_fd(fd.as_raw_fd()) {
-            Ok(st) if st.st_nlink > 0 => {}
+        let birthtime = match crate::sys::stat_fd(fd.as_raw_fd()) {
+            Ok(st) if st.st_nlink > 0 => (st.st_birthtime, st.st_birthtime_nsec),
             _ => return false,
-        }
+        };
         let Ok(path) = crate::sys::path_of(fd.as_raw_fd()) else {
             return false;
         };
@@ -206,7 +245,7 @@ impl Inode {
         if slot.is_none() {
             return false;
         }
-        *self.parked_at.lock().expect("parked path poisoned") = Some(path);
+        *self.parked_at.lock().expect("parked path poisoned") = Some(Parked { path, birthtime });
         *slot = None;
         self.held.store(false, Ordering::Relaxed);
         self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
@@ -1158,6 +1197,45 @@ mod tests {
             "a file with no links must keep its descriptor"
         );
         assert!(inode.reference().is_ok());
+    }
+
+    /// A parked inode revives across a rename.
+    ///
+    /// The remembered path is stale the moment anything moves the file, and
+    /// answering ESTALE for a file that plainly exists — merely elsewhere —
+    /// punishes the guest for the host's tidying. `/.vol` opens the inode by
+    /// identity, and the birth time check keeps a recycled inode number from
+    /// impersonating it.
+    #[test]
+    fn a_parked_inode_survives_being_renamed() {
+        let scratch = Scratch::new("volfs");
+        let reg = scratch.registry();
+        let (fd, dev, ino) = scratch.file("original");
+        let id = reg.insert(fd, dev, ino, false, false);
+        let inode = reg.get(id).unwrap();
+        assert!(inode.park());
+        std::fs::rename(scratch.0.join("original"), scratch.0.join("moved")).unwrap();
+        let reference = inode
+            .reference()
+            .expect("a renamed file is still the same file");
+        let st = crate::sys::stat_fd(reference.raw_fd()).unwrap();
+        assert_eq!(st.st_ino, ino, "the revived descriptor must be the same inode");
+    }
+
+    /// A parked inode whose file is gone answers ESTALE, not somebody else.
+    #[test]
+    fn a_parked_inode_does_not_survive_deletion() {
+        let scratch = Scratch::new("volfs-gone");
+        let reg = scratch.registry();
+        let (fd, dev, ino) = scratch.file("doomed");
+        let id = reg.insert(fd, dev, ino, false, false);
+        let inode = reg.get(id).unwrap();
+        assert!(inode.park());
+        std::fs::remove_file(scratch.0.join("doomed")).unwrap();
+        assert!(
+            inode.reference().is_err(),
+            "a deleted file must not revive as anything"
+        );
     }
 
     /// The tally is the only thing standing between a share and the kernel's
