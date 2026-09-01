@@ -508,8 +508,16 @@ impl Server {
             wanted
         };
         let flags = wanted & offered;
+        // Clone gets its own off-switch for the same reason the create
+        // dialect has one: the same kernel measured with and without is the
+        // only honest account of what it is worth.
+        let clone = if std::env::var("LIGHTER_FS_CLONE").as_deref() == Ok("0") {
+            0
+        } else {
+            fuse::init2::LIGHTER_CLONE
+        };
         let flags2 = if flags & fuse::init::INIT_EXT != 0 {
-            (fuse::init2::LIGHTER_CREATE | fuse::init2::LIGHTER_CLONE) & offered2
+            (fuse::init2::LIGHTER_CREATE | clone) & offered2
         } else {
             0
         };

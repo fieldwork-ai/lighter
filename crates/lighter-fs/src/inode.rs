@@ -237,6 +237,27 @@ impl Inode {
         }
     }
 
+    /// Reopens a parked inode and installs the descriptor, making it
+    /// resident. The sweep's other half: parking makes room, promotion
+    /// spends it on something the guest has touched since the hand last
+    /// came round.
+    fn promote(&self) -> bool {
+        let mut slot = self.fd.write().expect("inode slot poisoned");
+        if slot.is_some() {
+            return false;
+        }
+        let Some(parked) = self.parked_at.lock().expect("parked path poisoned").clone() else {
+            return false;
+        };
+        let Ok(fd) = self.reopen(&parked) else {
+            return false;
+        };
+        self.held.store(true, Ordering::Relaxed);
+        self.census.descriptors.fetch_add(1, Ordering::Relaxed);
+        *slot = Some(Arc::new(fd));
+        true
+    }
+
     /// Closes the descriptor, remembering where it was.
     ///
     /// Refuses for anything that could not be found again: a file with no
@@ -676,7 +697,11 @@ impl Registry {
     /// reclaim that only ran on insert let one climb to the ceiling unchecked.
     pub(crate) fn reclaim_if_over_budget(&self) {
         let open = self.census.descriptors();
-        if open <= self.budget {
+        // Strictly under, not at: admission control parks newcomers the
+        // moment the budget fills, so a busy share sits exactly AT budget —
+        // and that is when the paced sweep has its real work, rotating
+        // residency toward what is actually being touched.
+        if open < self.budget {
             return;
         }
         // Between the budget and the red line, sweeps are paced, not
@@ -705,6 +730,7 @@ impl Registry {
         let target = self.budget - self.budget / 8;
         let mut examined = 0usize;
         let mut parked_total = 0usize;
+        let mut promoted_total = 0usize;
 
         while examined < SWEEP_STEPS && parked_total < SWEEP_TAKE {
             if self.census.descriptors() <= target {
@@ -735,6 +761,17 @@ impl Registry {
                     .expect("reclaim hand poisoned")
                     .push_back(id);
                 if !inode.held.load(Ordering::Relaxed) {
+                    // Parked but touched since the hand last came round: hot,
+                    // and resident is where hot belongs. Promotion spends the
+                    // room the parks on this pass have made (plus any slack
+                    // under the budget), so the census never grows past the
+                    // budget by rotation — the sets swap.
+                    if inode.used.swap(false, Ordering::Relaxed) {
+                        let room = parked_total + self.budget.saturating_sub(self.census.descriptors());
+                        if promoted_total < room && inode.promote() {
+                            promoted_total += 1;
+                        }
+                    }
                     continue;
                 }
                 // `swap` is the ageing: an inode used since the hand last came
