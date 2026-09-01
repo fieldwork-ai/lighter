@@ -74,7 +74,7 @@ measure_once() {
 	local target=/work
 	[ "${GUEST_LOCAL:-0}" = 1 ] && target=/tmp
 	DOCKER_HOST="unix://$run_dir/docker.sock" docker run --rm -v /mnt/lat:/work \
-		-e "DIR=$target" -e "OPS=${OPS:-3000}" -e "ONLY=${ONLY:-}" \
+		-e "DIR=$target" -e "OPS=${OPS:-3000}" -e "ONLY=${ONLY:-}" -e "ROUNDS=${ROUNDS:-3}" \
 		-e "PARALLEL=${PARALLEL:-16}" -e "UV_THREADPOOL_SIZE=${PARALLEL:-16}" "$IMAGE" \
 		node /work/cases/op-latency.js
 	kill -9 "$vmm" 2>/dev/null || true
@@ -85,9 +85,10 @@ measure_once() {
 native=""
 if [ "$WHICH" != lighter ]; then
 	DIR="$WORK" OPS="${OPS:-3000}" ONLY="${ONLY:-}" PARALLEL="${PARALLEL:-16}" \
-		UV_THREADPOOL_SIZE="${PARALLEL:-16}" node "$WORK/cases/op-latency.js" >/dev/null
+		ROUNDS="${ROUNDS:-3}" UV_THREADPOOL_SIZE="${PARALLEL:-16}" \
+		node "$WORK/cases/op-latency.js" >/dev/null
 	for _ in $(seq 1 "$REPEAT"); do
-		native+="$(DIR="$WORK" OPS="${OPS:-3000}" ONLY="${ONLY:-}" PARALLEL="${PARALLEL:-16}" UV_THREADPOOL_SIZE="${PARALLEL:-16}" node "$WORK/cases/op-latency.js")"$'\n'
+		native+="$(DIR="$WORK" OPS="${OPS:-3000}" ONLY="${ONLY:-}" PARALLEL="${PARALLEL:-16}" ROUNDS="${ROUNDS:-3}" UV_THREADPOOL_SIZE="${PARALLEL:-16}" node "$WORK/cases/op-latency.js")"$'\n'
 	done
 fi
 
@@ -119,20 +120,36 @@ summarise() {
 		}'
 }
 
+cat <<'NOTE'
+
+`share` and `in-guest` are the same case run against the share and against the
+guest's own disk, alternating, in the same boot. The control is what says
+whether a change landed on the guest side or the host side, which the absolute
+figures cannot: if `in-guest` moved, the guest did; if only `share` moved, we
+did.
+
+It is not a cure for a busy machine. The two paths do not share a bottleneck —
+one ends at APFS and the other at a virtual disk — so contention inflates
+`share` and `boundary` and leaves `in-guest` alone. On a contended host, treat
+this as a decomposition rather than a measurement, and compare `boundary`
+against a run taken under the same conditions rather than against a number
+from a quiet afternoon.
+NOTE
 if [ "$REPEAT" -gt 1 ]; then
-	printf '\n%d boots each; the spread is worst-to-best across them.\n' "$REPEAT"
+	printf '\n%d boots each; spread is worst-to-best across them.\n' "$REPEAT"
 fi
-printf '\n%-14s %10s %10s %10s %9s\n' "operation" "macOS" "lighter" "overhead" "spread"
+printf '\n%-14s %10s %10s %10s %11s %8s\n' \
+	"operation" "macOS" "share" "in-guest" "boundary" "spread"
 for op in create+close create-parallel stat-cached stat-missing write-4k write-chunked unlink; do
-	read -r a _ <<<"$(summarise "$native" "$op")"
-	read -r b spread <<<"$(summarise "$ours" "$op")"
-	if [ "$a" != "-" ] && [ "$b" != "-" ]; then
-		printf '%-14s %9sus %9sus %9sus %8sus\n' "$op" "$a" "$b" \
-			"$(awk -v a="$a" -v b="$b" 'BEGIN { printf "%+.2f", b - a }')" "$spread"
-	elif [ "$b" != "-" ]; then
-		printf '%-14s %10s %9sus %10s %8sus\n' "$op" "-" "$b" "-" "$spread"
-	elif [ "$a" != "-" ]; then
-		printf '%-14s %9sus %10s %10s %9s\n' "$op" "$a" "-" "-" "-"
+	read -r host _ <<<"$(summarise "$native" "$op")"
+	read -r share spread <<<"$(summarise "$ours" "$op")"
+	read -r local _ <<<"$(summarise "$ours" "$op@local")"
+	[ "$share" = "-" ] && continue
+	boundary="-"
+	if [ "$local" != "-" ]; then
+		boundary="$(awk -v a="$local" -v b="$share" 'BEGIN { printf "%+.2f", b - a }')us"
 	fi
+	printf '%-14s %9sus %9sus %9sus %11s %7sus\n' \
+		"$op" "${host}" "$share" "$local" "$boundary" "$spread"
 done
 echo

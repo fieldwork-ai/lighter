@@ -83,10 +83,24 @@ issues its work concurrently, which makes it the only one that can see a lock
 on either side of the boundary — a change that removes contention shows up in
 every other case as nothing at all.
 
-`GUEST_LOCAL=1` runs a case against the guest's own disk instead of the share.
-It is not a comparison anybody ships; it is the decomposition, and it is what
-separates "our filesystem is slow" from "the virtual machine is slow", which
-look identical from outside and have different fixes.
+Every case is measured twice, in the same boot and alternating: once against
+the share and once against the guest's own disk. The second is a control. It is
+what separates "our filesystem is slow" from "the virtual machine is slow",
+which look identical from outside and have different fixes — and it is what
+says whether a change landed on the guest side or the host side.
+
+It is not a cure for a busy machine, and should not be sold as one. The two
+paths do not share a bottleneck: one ends at APFS and the other at a virtual
+disk, so contention inflates the share column and the boundary column and
+leaves the control alone. On a contended host this is a decomposition rather
+than a measurement, and the honest thing is to compare against a run taken
+under the same conditions rather than against a number from a quiet afternoon.
+
+The stronger technique for a machine you cannot make quiet is to **interleave**:
+alternate the two configurations boot by boot rather than running all of one
+and then all of the other. Drift and interference then hit both arms equally,
+which is not true of A-then-B. `ROUNDS` does this within a boot; for anything
+that needs a reboot to change, alternate the boots.
 
 ## Where lighter stands, and why
 
