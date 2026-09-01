@@ -50,7 +50,7 @@ virtio-mmio rather than PCI: no host bridge to model, no enumeration, and a devi
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and three patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and four patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
 The kernel patches are the interesting part:
 
@@ -60,8 +60,15 @@ The kernel patches are the interesting part:
   How long to spin depends on what the other end is doing, and the spin must not take a lock to ask. The queue's lock is the one every other thread needs to *submit*, so a spin that grabs it to check for a reply starves the queue it is waiting on — worth 75 microseconds a create against 59 with sixteen threads at work. It is asked lock-free now, and the window is a hundred microseconds rather than ten: with the device watching the ring there is no longer a trap to rendezvous inside, so the spin has to cover the operation rather than the delivery.
 
 - **Not asking for `security.capability` the server has promised to clear.** `FUSE_HANDLE_KILLPRIV_V2` is a connection-wide undertaking that the server strips setuid, setgid and file capabilities on write. The kernel sends `FUSE_WRITE_KILL_SUIDGID` to say so, and then reads the attribute itself anyway — two round trips per written file, ten percent of all requests on an install, every one answered ENODATA.
+- **Not asking questions CREATE already answers.** Creating a file invalidates the parent directory's attributes — which the driver itself just changed, so the next walk through that directory pays a GETATTR to learn what it already knew. With the server's create dialect negotiated, the driver advances the parent's times in place (4,721 GETATTRs on the small npm fixture become 24), and skips the pre-create LOOKUP where the dentry is still unhashed. The skip needs one honesty guarantee in return: `FMODE_CREATED` suppresses the guest-side permission check, so the server creates with `O_EXCL` first and reports whether it really created, refuses a directory with the EISDIR that `open(2)` would give anyway, and answers a trailing symlink with ELOOP — on which the driver falls back to the ordinary lookup path so the VFS can walk it.
 
-Both are in `guest/kernel/patches/`, each with the reasoning in its header.
+All four are in `guest/kernel/patches/`, each with the reasoning in its header.
+
+## The guest decides how much the host remembers
+
+The server keeps a descriptor per inode the guest has looked up, because reopening by path on every operation is what makes shared directories slow everywhere else. But the guest is under no obligation to forget: nothing pressures a dentry cache in an idle VM, so a tree walked once is remembered forever — and a stock Mac allows a process 10,240 descriptors (`kern.maxfilesperproc`), which one pnpm install walks straight through.
+
+So the descriptor is treated as a cache of where the file lives, never as the file's identity. A budget proportional to the ceiling bounds how many stay open; a clock sweep parks the cold ones (close the descriptor, remember the path, verify `(dev, ino)` on revival); and the sweep escalates in three regimes — deferring to recency while the budget holds, pacing itself while a hot working set breathes above it, and parking regardless of recency at a red line short of the ceiling, because past that the next event is `EMFILE` inside the guest on a file that is plainly there.
 
 ## The one invariant worth naming
 
