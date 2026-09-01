@@ -81,9 +81,16 @@ pub fn machine() -> anyhow::Result<()> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)?;
     // SAFETY: a valid descriptor, held (leaked) for the process lifetime.
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if unsafe {
+        libc::flock(
+            std::os::fd::AsRawFd::as_raw_fd(&lock),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    } != 0
+    {
         eprintln!("lighter is already running; this copy has nothing to do");
         return Ok(());
     }

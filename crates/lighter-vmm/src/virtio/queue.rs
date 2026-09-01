@@ -308,6 +308,27 @@ impl Virtqueue {
     }
 
     /// Takes the next available descriptor chain, if there is one.
+    /// Whether the driver has published another chain, without taking it.
+    ///
+    /// The filesystem device asks this to decide where to serve a request: a
+    /// chain that arrived alone is answered on the vCPU thread, and one that
+    /// arrived with company goes to the worker pool. Read-only — the cursor
+    /// does not move — so a `pop` after it sees the same chain.
+    pub fn more_available(&self, mem: &GuestMemory) -> bool {
+        if !self.ready {
+            return false;
+        }
+        if self.packed {
+            let head_at = self.desc_at(self.next_avail);
+            return mem
+                .read_u16(head_at + 14)
+                .ok()
+                .is_some_and(|flags| self.is_available(flags));
+        }
+        self.avail_idx(mem)
+            .is_some_and(|idx| idx != self.next_avail)
+    }
+
     pub fn pop<'m>(&mut self, mem: &'m GuestMemory) -> Option<DescriptorChain<'m>> {
         if !self.ready {
             return None;

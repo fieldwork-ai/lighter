@@ -470,9 +470,7 @@ impl Registry {
         // a count that could reach zero would let a buggy guest drop it and
         // take the whole mount with it.
         let census = Arc::new(Census::default());
-        census
-            .budget
-            .store(descriptor_budget(), Ordering::Relaxed);
+        census.budget.store(descriptor_budget(), Ordering::Relaxed);
         let root = Arc::new(Inode::new(
             root_fd,
             dev,
@@ -767,7 +765,8 @@ impl Registry {
                     // under the budget), so the census never grows past the
                     // budget by rotation — the sets swap.
                     if inode.used.swap(false, Ordering::Relaxed) {
-                        let room = parked_total + self.budget.saturating_sub(self.census.descriptors());
+                        let room =
+                            parked_total + self.budget.saturating_sub(self.census.descriptors());
                         if promoted_total < room && inode.promote() {
                             promoted_total += 1;
                         }
@@ -1285,7 +1284,10 @@ mod tests {
             .reference()
             .expect("a renamed file is still the same file");
         let st = crate::sys::stat_fd(reference.raw_fd()).unwrap();
-        assert_eq!(st.st_ino, ino, "the revived descriptor must be the same inode");
+        assert_eq!(
+            st.st_ino, ino,
+            "the revived descriptor must be the same inode"
+        );
     }
 
     /// A parked inode whose file is gone answers ESTALE, not somebody else.

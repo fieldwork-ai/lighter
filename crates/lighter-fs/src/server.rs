@@ -263,10 +263,14 @@ impl Server {
         }
 
         self.trace(&header);
-        let started = self.stats.enabled().then(std::time::Instant::now);
+        let started = self.stats.enabled().then(|| {
+            self.stats.enter();
+            std::time::Instant::now()
+        });
         let outcome = self.handle(&header, body, sink.capacity());
         if let Some(started) = started {
             self.stats.record(header.opcode, started.elapsed());
+            self.stats.exit();
         }
         match outcome {
             Ok(payload) => {

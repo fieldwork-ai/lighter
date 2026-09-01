@@ -72,10 +72,27 @@ impl Lane {
     }
 }
 
+/// How many requests were being served at the moment each new one arrived.
+///
+/// The histogram above answers "what is being asked and what does each answer
+/// cost"; this answers the other half of a workload number — how many of those
+/// answers overlap. A share can be slow two ways: each operation is slow, or
+/// the guest sends one at a time and pays a round trip's latency serially. The
+/// levers for those are disjoint, so tuning without this gauge is guessing at
+/// which problem exists.
+#[repr(align(128))]
+struct Gauge {
+    cur: AtomicU64,
+    max: AtomicU64,
+    sum: AtomicU64,
+    arrivals: AtomicU64,
+}
+
 /// One counter per named opcode, plus a catch-all.
 pub struct Stats {
     on: AtomicBool,
     lanes: [Lane; LANES],
+    inflight: Gauge,
 }
 
 /// Which lane this thread writes to. Any stable spread will do; the report sums
@@ -103,6 +120,12 @@ impl Stats {
         Stats {
             on: AtomicBool::new(std::env::var_os("LIGHTER_FS_STATS").is_some()),
             lanes: std::array::from_fn(|_| Lane::new()),
+            inflight: Gauge {
+                cur: AtomicU64::new(0),
+                max: AtomicU64::new(0),
+                sum: AtomicU64::new(0),
+                arrivals: AtomicU64::new(0),
+            },
         }
     }
 
@@ -123,6 +146,18 @@ impl Stats {
             Some(index) => index,
             None => NAMED.len(),
         }
+    }
+
+    /// A request is about to be served; counts itself among the concurrent.
+    pub fn enter(&self) {
+        let seen = self.inflight.cur.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inflight.max.fetch_max(seen, Ordering::Relaxed);
+        self.inflight.sum.fetch_add(seen, Ordering::Relaxed);
+        self.inflight.arrivals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn exit(&self) {
+        self.inflight.cur.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Records one served request.
@@ -160,7 +195,16 @@ impl Stats {
         rows.sort_by_key(|(_, _, nanos)| std::cmp::Reverse(*nanos));
 
         let total: u64 = rows.iter().map(|(_, count, _)| count).sum();
-        let mut out = format!("FSSTATS requests={total}\n");
+        let arrivals = self.inflight.arrivals.load(Ordering::Relaxed);
+        let mean = if arrivals > 0 {
+            self.inflight.sum.load(Ordering::Relaxed) as f64 / arrivals as f64
+        } else {
+            0.0
+        };
+        let mut out = format!(
+            "FSSTATS requests={total} inflight_mean={mean:.1} inflight_max={}\n",
+            self.inflight.max.load(Ordering::Relaxed)
+        );
         for (name, count, nanos) in rows {
             out.push_str(&format!(
                 "FSSTATS {name:12} n={count:<9} total_ms={:<8} mean_us={:.1}\n",
@@ -178,6 +222,9 @@ impl Stats {
                 lane.nanos[slot].store(0, Ordering::Relaxed);
             }
         }
+        self.inflight.max.store(0, Ordering::Relaxed);
+        self.inflight.sum.store(0, Ordering::Relaxed);
+        self.inflight.arrivals.store(0, Ordering::Relaxed);
     }
 }
 

@@ -150,10 +150,10 @@ impl Inline {
         }
     }
 
-    fn applies(&self, queue: &Queue) -> bool {
+    fn applies(&self, alone: bool) -> bool {
         match self {
             Inline::Never => false,
-            Inline::WhenIdle => queue.is_empty(),
+            Inline::WhenIdle => alone,
             Inline::Always => true,
         }
     }
@@ -672,12 +672,21 @@ impl VirtioDevice for Fs {
                     // trip plus two context switches, and on a workload that
                     // waits for each answer before asking the next question —
                     // which is most of what a package manager does — the
-                    // context switches were the larger half. The pool still
-                    // exists and still matters: the moment a second request is
-                    // outstanding, everything goes to it, so a slow syscall
-                    // stalls one core for one operation rather than becoming a
-                    // queue everything else waits behind.
-                    if self.inline.applies(&queue) {
+                    // context switches were the larger half.
+                    //
+                    // "Alone" has to mean the ring as well as the pool. The
+                    // first version asked only whether the pool had jobs
+                    // waiting — but inline service never gives it any, so the
+                    // answer was "idle" forever and a burst of sixteen chains
+                    // was served one at a time on this thread, holding the
+                    // device lock against every other vCPU: a measured
+                    // in-flight ceiling of exactly one, on a workload the
+                    // guest was issuing sixteen wide. A chain with company —
+                    // behind it on the ring, or already queued for a worker —
+                    // goes to the pool, so concurrency the guest offers is
+                    // kept rather than flattened.
+                    let alone = queue.is_empty() && !requests.more_available(mem);
+                    if self.inline.applies(alone) {
                         let mut sink = ChainSink::new(memory.clone(), reply);
                         let written = self.server.dispatch(&request, &mut sink);
                         requests.push_used(mem, head, written as u32);

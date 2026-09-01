@@ -22,8 +22,8 @@ vm-fdt = "0.3"
 tracing-subscriber.workspace = true
 
 [[example]]
-name = "boot"
-path = "examples/boot.rs"
+name = "lighter-bench"
+path = "examples/lighter-bench.rs"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
