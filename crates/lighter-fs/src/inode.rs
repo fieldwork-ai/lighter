@@ -336,6 +336,8 @@ pub struct Registry {
     budget: usize,
     /// Which shard the hand is on, so successive sweeps cover all of them.
     sweep: AtomicUsize,
+    /// When the descriptor pressure was last reported.
+    reported: Mutex<std::time::Instant>,
     /// Every live nodeid, in the order the hand will consider it.
     ///
     /// A clock needs somewhere to point, and a hash map is the wrong shape for
@@ -393,6 +395,7 @@ impl Registry {
             census,
             budget: descriptor_budget(),
             sweep: AtomicUsize::new(0),
+            reported: Mutex::new(std::time::Instant::now()),
             hands: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
             quiet_until: AtomicUsize::new(0),
         }
@@ -627,7 +630,7 @@ impl Registry {
         // slack is the other thing, and the next event after it is `EMFILE`
         // inside the guest on a file that is plainly there — which is a
         // miserable thing to diagnose from that end, so it is said here.
-        if open > self.budget + slack {
+        if open > self.budget + slack && self.should_report() {
             tracing::warn!(
                 open,
                 budget = self.budget,
@@ -638,6 +641,22 @@ impl Registry {
                 "the share is holding more descriptors than it may"
             );
         }
+    }
+
+    /// Whether enough time has passed to say this again.
+    ///
+    /// Throttled because the thing being reported is a condition, not an
+    /// event: a share that is over budget is over budget on every insert, and
+    /// twenty-two thousand identical lines is both useless and, at the rate
+    /// inserts arrive, a measurable cost of its own.
+    fn should_report(&self) -> bool {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+        let mut last = self.reported.lock().expect("report clock poisoned");
+        if last.elapsed() < EVERY {
+            return false;
+        }
+        *last = std::time::Instant::now();
+        true
     }
 
     /// How many metadata descriptors are open, and the ceiling. Diagnostics
