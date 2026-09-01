@@ -23,7 +23,7 @@
 //! limit; getting it wrong in the other direction hands the guest a `nodeid`
 //! that resolves to nothing, which surfaces as random `ESTALE` under load.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -334,8 +334,20 @@ pub struct Registry {
     census: Arc<Census>,
     /// The most it may hold before parking the cold ones.
     budget: usize,
-    /// Where the clock hand is, so successive sweeps cover every shard.
+    /// Which shard the hand is on, so successive sweeps cover all of them.
     sweep: AtomicUsize,
+    /// Every live nodeid, in the order the hand will consider it.
+    ///
+    /// A clock needs somewhere to point, and a hash map is the wrong shape for
+    /// it: there is no cursor into one that survives an insert, so every sweep
+    /// has to start at the beginning and read its way in. That is fine for a
+    /// few thousand inodes and quadratic for a few hundred thousand.
+    ///
+    /// So the hand is its own queue. An id is pushed when its inode is made,
+    /// popped when the hand reaches it, and pushed back behind everything
+    /// else. An id whose inode the guest has forgotten is simply not put back,
+    /// which is the whole of the cleanup.
+    hands: [Mutex<VecDeque<u64>>; SHARDS],
     /// The count at which a full pass last found nothing to park.
     ///
     /// Hysteresis, and the difference between degrading and collapsing. A
@@ -381,6 +393,7 @@ impl Registry {
             census,
             budget: descriptor_budget(),
             sweep: AtomicUsize::new(0),
+            hands: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
             quiet_until: AtomicUsize::new(0),
         }
     }
@@ -491,6 +504,10 @@ impl Registry {
                     self.census.clone(),
                 )),
             );
+        self.hands[shard(id)]
+            .lock()
+            .expect("reclaim hand poisoned")
+            .push_back(id);
         self.reclaim_if_over_budget();
         id
     }
@@ -552,74 +569,62 @@ impl Registry {
             return;
         }
         let target = self.budget - self.budget / 8;
-        let mut visited = 0usize;
-        let mut chosen_total = 0usize;
+        let mut examined = 0usize;
         let mut parked_total = 0usize;
-        for _ in 0..SHARDS {
+
+        while examined < SWEEP_STEPS && parked_total < SWEEP_TAKE {
             if self.census.descriptors() <= target {
-                return;
+                break;
             }
             let index = self.sweep.fetch_add(1, Ordering::Relaxed) % SHARDS;
-            // The inodes are cloned out under the lock and parked outside it:
-            // parking stats and closes a descriptor, and a shard lock held
-            // across those would stall every worker whose path runs through it.
-            //
-            // Bounded on both sides. Cloning a whole shard would be thousands
-            // of atomic increments on a path that runs on every insert while
-            // over budget, and the ageing pass is what makes an inode a
-            // candidate at all — so a sweep visits a fixed number and takes a
-            // fixed number, and the next one picks up where the budget is
-            // still exceeded.
-            let candidates: Vec<Arc<Inode>> = {
-                let table = self.by_id[index].lock().expect("inode table poisoned");
-                let mut chosen = Vec::new();
-                let mut scanned = 0usize;
-                for (&id, inode) in table.iter() {
-                    scanned += 1;
-                    if scanned > SWEEP_SCAN {
-                        break;
-                    }
-                    // An inode with no descriptor has nothing to give, and it
-                    // is permanently cold — so it would otherwise be chosen
-                    // first, every time, and crowd out the ones that do. It
-                    // does not count against the candidates either, or the
-                    // parked majority would spend the whole budget.
-                    if id == ROOT_ID || !inode.held.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    visited += 1;
-                    // `swap` is the ageing: an inode that was used since the
-                    // last sweep survives this one and is a candidate for the
-                    // next.
-                    if !inode.used.swap(false, Ordering::Relaxed) {
-                        chosen.push(inode.clone());
-                        if chosen.len() >= SWEEP_TAKE {
-                            break;
-                        }
-                    }
-                }
-                chosen
+            let batch: Vec<u64> = {
+                let mut hand = self.hands[index].lock().expect("reclaim hand poisoned");
+                let take = SWEEP_BATCH.min(hand.len());
+                hand.drain(..take).collect()
             };
-            chosen_total += candidates.len();
-            for inode in candidates {
+            if batch.is_empty() {
+                examined += SWEEP_BATCH;
+                continue;
+            }
+            for id in batch {
+                examined += 1;
+                let inode = self.by_id[index]
+                    .lock()
+                    .expect("inode table poisoned")
+                    .get(&id)
+                    .cloned();
+                // Gone: the guest forgot it, and the hand cleans itself up by
+                // simply not putting it back.
+                let Some(inode) = inode else { continue };
+                self.hands[index]
+                    .lock()
+                    .expect("reclaim hand poisoned")
+                    .push_back(id);
+                if !inode.held.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // `swap` is the ageing: an inode used since the hand last came
+                // round survives this pass and is a candidate on the next.
+                if inode.used.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                // Parked outside the shard lock: parking stats and closes a
+                // descriptor, and holding the lock across those would stall
+                // every worker whose path runs through that shard.
                 if inode.park() {
                     parked_total += 1;
                 }
             }
         }
-        // A full pass that could not get back under budget means every inode
-        // in the table is either hot or unparkable, and the next thing that
-        // happens is `EMFILE` inside the guest on a file that is plainly
-        // there. That is a miserable thing to diagnose from the guest end, so
-        // it is said here, where the number is known.
+
         let open = self.census.descriptors();
         if open > self.budget {
             self.quiet_until
                 .store(open.saturating_add(slack), Ordering::Relaxed);
         }
-        // Sitting exactly at the budget with nothing to park is the reclaim
-        // working, not failing: everything it can see is in use. Drifting past
-        // the slack is the other thing, and the next event after it is EMFILE
+        // Sitting at the budget with nothing to park is the reclaim working,
+        // not failing: everything it can reach is in use. Drifting past the
+        // slack is the other thing, and the next event after it is `EMFILE`
         // inside the guest on a file that is plainly there — which is a
         // miserable thing to diagnose from that end, so it is said here.
         if open > self.budget + slack {
@@ -628,8 +633,7 @@ impl Registry {
                 budget = self.budget,
                 inodes = self.inode_count(),
                 live = self.census.inodes(),
-                visited,
-                chosen = chosen_total,
+                examined,
                 parked = parked_total,
                 "the share is holding more descriptors than it may"
             );
@@ -690,14 +694,15 @@ impl Registry {
 /// to be wanted again. Neither has to be exactly right, because a sweep that
 /// did not free enough is followed by another once the count has grown.
 ///
-/// The scan counts *entries read*, not candidates considered, and the
-/// distinction is the whole thing. Already-parked inodes stay in the table and
-/// cluster in iteration order, so a bound on candidates is spent entirely on
-/// them: measured on a package tree, a sweep read sixty-five thousand entries,
-/// found one inode that still held a descriptor, and parked it, while the
-/// share drifted sixteen thousand descriptors over budget.
-const SWEEP_SCAN: usize = 32_768;
+/// The step bound is what makes the reclaim cost independent of how big the
+/// share has become. Walking the inode table instead does not: a sweep of a
+/// three-hundred-thousand-inode table, repeated on every insert that finds
+/// itself over budget, is billions of loads — measured, it turned a
+/// ten-second tree copy into eight minutes.
+const SWEEP_STEPS: usize = 8192;
 const SWEEP_TAKE: usize = 1024;
+/// How many ids are taken from one shard's hand before moving to the next.
+const SWEEP_BATCH: usize = 256;
 
 /// How far above the budget a share may drift before every insert sweeps
 /// again, as a fraction of the budget.
