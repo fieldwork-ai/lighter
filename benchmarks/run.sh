@@ -56,6 +56,21 @@ ALLOW_NOISY=0
 # it costs, and without that split every number is a sum of two things and
 # tuning aims at whichever one you guessed.
 WHERE="share"
+# Which fixture to install.
+#
+#   npm    1,232 packages, 66,213 files, 908 MB — what the published table uses
+#   small  128 packages, 6,246 files, 62 MB — the same shape at a tenth of it
+#
+# The small one exists because iteration speed is a property of the harness. An
+# install of the big fixture is fifteen seconds, so comparing two settings at
+# two repetitions is five minutes of waiting for a question that is usually
+# answered in the first ten seconds. Same file shape — thousands of small
+# JavaScript files — so the operation mix is the same and only the wait is not.
+#
+# It is not for published numbers. A tenth of the tree is a tenth of the page
+# cache pressure and a tenth of the directory sizes, and those matter at the
+# margin; the table is measured on the real one.
+FIXTURE="${FIXTURE:-npm}"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -66,6 +81,7 @@ while [ $# -gt 0 ]; do
 	--label)  LABEL="$2"; shift 2 ;;
 	--allow-noisy) ALLOW_NOISY=1; shift ;;
 	--where)  WHERE="$2"; shift 2 ;;
+	--fixture) FIXTURE="$2"; shift 2 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -76,6 +92,9 @@ WORK="${LIGHTER_BENCH_WORK:-$HOME/.lighter-bench/$TARGET}"
 # the second run overwriting the first — which is how the speed gate compares
 # caching on against caching off.
 RESULTS="benchmarks/results/${LABEL:-$TARGET}.csv"
+# The fixture is part of what a number means, so a run on the small one does
+# not overwrite the published CSV unless it was asked to by name.
+[ "$FIXTURE" = npm ] || [ -n "$LABEL" ] || RESULTS="benchmarks/results/$TARGET-$FIXTURE.csv"
 [ "$WHERE" = share ] || [ "$WHERE" = guest ] || { echo "--where wants share or guest, got $WHERE" >&2; exit 2; }
 VMM_PID=""
 HELPER_PID=""
@@ -176,11 +195,10 @@ prepare_work() {
 	# whose cases can destroy each other's inputs measures the order they ran
 	# in.
 	mkdir -p "$WORK/fixture"
-	cp benchmarks/fixtures/npm/package.json \
-		benchmarks/fixtures/npm/package-lock.json \
-		benchmarks/fixtures/npm/pnpm-lock.yaml \
-		benchmarks/fixtures/npm/yarn.lock \
-		"$WORK/fixture/"
+	local from="benchmarks/fixtures/$FIXTURE"
+	[ -d "$from" ] || { echo "no such fixture: $FIXTURE" >&2; exit 2; }
+	cp "$from/package.json" "$from/package-lock.json" \
+		"$from/pnpm-lock.yaml" "$from/yarn.lock" "$WORK/fixture/"
 	cp "$WORK"/fixture/* "$WORK/npm/"
 	cp benchmarks/cases/*.sh benchmarks/cases/*.js "$WORK/cases/"
 	chmod +x "$WORK/cases"/*.sh
@@ -393,9 +411,9 @@ echo "case,rep,ms" > "$RESULTS"
 # The lockfile is committed, not generated: `npm ci` installs exactly what it
 # says, so every target and every run installs a byte-identical tree. Generating
 # it here would make the benchmark depend on whatever npm resolved that morning.
-[ -f benchmarks/fixtures/npm/package-lock.json ] || {
-	echo "benchmarks/fixtures/npm/package-lock.json is missing; regenerate it with" >&2
-	echo "  (cd benchmarks/fixtures/npm && npm install --package-lock-only)" >&2
+[ -f "benchmarks/fixtures/$FIXTURE/package-lock.json" ] || {
+	echo "benchmarks/fixtures/$FIXTURE/package-lock.json is missing; regenerate it with" >&2
+	echo "  (cd benchmarks/fixtures/$FIXTURE && npm install --package-lock-only)" >&2
 	exit 1
 }
 

@@ -8,10 +8,21 @@ it cost the most time.
 
 | | resolves | costs | answers |
 |---|---|---|---|
-| `benchmarks/latency.sh` | ~2 us | 15s | did this change help, and on which side |
-| `run.sh --cases npm-install --reps 3` | ~5% | 6 min | did it land, and by how much |
-| `run.sh` | ~5% | 20 min | the published table |
+| `make quick` | pass/fail | 15s | did I break it |
+| `make latency` | ~2 us | 15s | did this change help, and on which side |
+| `make bench` | ~5% | 30s | did it land, roughly |
+| `make bench-full` | ~5% | 20 min | the published table |
 | `make gates` | pass/fail | ~45 min | is it still correct |
+
+The first three are phase one, for iterating: run them on every change. The
+last two are phase two, for a group of changes already believed to be good.
+
+`make bench` runs the real cases against a fixture a tenth the size — 128
+packages and 6,246 files rather than 1,232 and 66,213. Same shape of work, a
+tenth of the wait. It tracks the real thing on the write cases (54% of native
+against 52%) and **not** on the read cases (91% against 844%), because sixty-two
+megabytes fits in the Mac's own page cache and nine hundred does not, so there
+is no advantage left to win. It is a regression detector there, not a proxy.
 
 The workload cases have a standard deviation of 2.4%, measured across twenty
 runs under configurations that turned out to be equivalent. Three repetitions

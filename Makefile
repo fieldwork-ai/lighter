@@ -39,6 +39,16 @@ quick: ## The inner loop: lint, unit tests, and a real boot (~15s)
 latency: ## Per-operation latency, macOS against the share (~15s)
 	@benchmarks/latency.sh
 
+.PHONY: bench
+bench: gvproxy ## Phase one: the workload cases on a small fixture (~60s)
+	@benchmarks/quick.sh
+
+.PHONY: bench-full
+bench-full: gvproxy ## Phase two: the real fixture, for numbers that get published (~20min)
+	@./benchmarks/run.sh --target native --reps 3
+	@./benchmarks/run.sh --target lighter --reps 3
+	@python3 benchmarks/report.py
+
 .PHONY: fmt
 fmt: ## Format
 	$(CARGO) fmt --all

@@ -1,0 +1,13 @@
+{
+  "name": "lighter-bench-small",
+  "private": true,
+  "description": "A tenth of the main fixture, for iteration. Same shape, a fraction of the wait.",
+  "dependencies": {
+    "@babel/core": "^7.26.0",
+    "typescript": "^5.7.2",
+    "express": "^4.21.2",
+    "lodash": "^4.17.21",
+    "rxjs": "^7.8.1",
+    "axios": "^1.7.9"
+  }
+}
