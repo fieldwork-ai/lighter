@@ -781,3 +781,75 @@ fn the_reclaim_keeps_up_while_the_tree_is_being_walked() {
         "the reclaim lost the race: {open} descriptors against a budget of {budget}"
     );
 }
+
+/// CREATE, returning the `open_flags` word of the reply as well, which is
+/// where the server says whether it really created the file.
+fn create_verbose(guest: &mut Guest, parent: u64, name: &str, flags: u32) -> Result<u32, i32> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(&0o644u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // umask
+    body.extend_from_slice(&0u32.to_le_bytes()); // open_flags
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    let reply = guest.call(op::CREATE, parent, &body)?;
+    Ok(u32::from_le_bytes(
+        reply[fuse::ENTRY_OUT_LEN + 8..fuse::ENTRY_OUT_LEN + 12]
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+/// The guest may skip its pre-create LOOKUP (kernel patch 0004), which makes
+/// "did this CREATE create?" a fact the server must report rather than one the
+/// guest can assume — FMODE_CREATED skips the guest-side permission check, so
+/// a wrong answer is a security bug in the guest, not a cosmetic one.
+#[test]
+fn create_reports_whether_it_created() {
+    let mut guest = Guest::new("create-honesty");
+    let first = create_verbose(&mut guest, 1, "fresh", CREATE_RDWR).unwrap();
+    assert!(
+        first & fuse::fopen::LIGHTER_CREATED != 0,
+        "a create of a new file must say it created"
+    );
+    let second = create_verbose(&mut guest, 1, "fresh", CREATE_RDWR).unwrap();
+    assert!(
+        second & fuse::fopen::LIGHTER_CREATED == 0,
+        "a create that opened an existing file must not claim otherwise"
+    );
+}
+
+/// Linux refuses O_CREAT on an existing directory outright; macOS happily
+/// opens one read-only, and with the pre-create LOOKUP skipped the guest no
+/// longer discovers the directory first.
+#[test]
+fn create_refuses_a_directory() {
+    let mut guest = Guest::new("create-on-dir");
+    std::fs::create_dir(guest.host("subdir")).unwrap();
+    let err = create_verbose(&mut guest, 1, "subdir", CREATE_RDWR).unwrap_err();
+    assert_eq!(err, 21, "EISDIR, as open(2) itself would answer");
+}
+
+/// A trailing symlink belongs to the guest's VFS: the server must refuse to
+/// walk it, and ELOOP is what sends the patched guest back to its ordinary
+/// lookup path.
+#[test]
+fn create_refuses_a_symlink() {
+    let mut guest = Guest::new("create-on-symlink");
+    std::fs::write(guest.host("target"), b"real").unwrap();
+    std::os::unix::fs::symlink("target", guest.host("alias")).unwrap();
+    let err = create_verbose(&mut guest, 1, "alias", CREATE_RDWR).unwrap_err();
+    assert_eq!(err, 40, "ELOOP, in the guest's numbering");
+    // And the file it points at was neither truncated nor replaced.
+    assert_eq!(std::fs::read(guest.host("target")).unwrap(), b"real");
+}
+
+/// O_EXCL still means what it says.
+#[test]
+fn create_excl_on_an_existing_file_is_eexist() {
+    let mut guest = Guest::new("create-excl");
+    std::fs::write(guest.host("taken"), b"").unwrap();
+    const LINUX_O_EXCL: u32 = 0o200;
+    let err = create_verbose(&mut guest, 1, "taken", CREATE_RDWR | LINUX_O_EXCL).unwrap_err();
+    assert_eq!(err, 17, "EEXIST");
+}

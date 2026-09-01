@@ -115,12 +115,27 @@ pub mod init {
     pub const INIT_EXT: u32 = 1 << 30;
 }
 
+/// INIT feature flags carried in `flags2`, honored by the kernel only when
+/// `INIT_EXT` was negotiated. Bit N here is overall bit N + 32.
+pub mod init2 {
+    /// Ours, matched by guest patch 0004: FUSE_CREATE without a prior LOOKUP
+    /// is handled for existing files too, `fopen::LIGHTER_CREATED` is
+    /// truthful, and this server pushes invalidations for whatever it changes
+    /// underneath the driver. Overall bit 60, far above anything mainline has
+    /// assigned.
+    pub const LIGHTER_CREATE: u32 = 1 << 28;
+}
+
 /// `fuse_open_out.open_flags`.
 pub mod fopen {
     pub const DIRECT_IO: u32 = 1 << 0;
     pub const KEEP_CACHE: u32 = 1 << 1;
     pub const NONSEEKABLE: u32 = 1 << 2;
     pub const CACHE_DIR: u32 = 1 << 3;
+    /// Ours (guest patch 0004): this CREATE really created the file, known
+    /// truthfully because the server creates with O_EXCL first. Mainline has
+    /// assigned up to bit 7.
+    pub const LIGHTER_CREATED: u32 = 1 << 15;
 }
 
 /// `fuse_setattr_in.valid`.

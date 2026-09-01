@@ -1,0 +1,190 @@
+fuse: skip the LOOKUP a create pays for an answer CREATE already gives
+
+Opening a file with O_CREAT costs this driver two round trips before the
+CREATE itself: a LOOKUP whose only purpose is to learn "no such file" —
+which for a package install is the answer every single time — and, after
+the create, a GETATTR of the parent directory the driver invalidated
+with its own hands.
+
+Both questions have answers the driver already holds. The LOOKUP exists
+so FMODE_CREATED can be set truthfully and so a directory or symlink in
+the way is discovered before committing; but a server that creates with
+O_EXCL first knows whether it created, says so in the open reply
+(FOPEN_LIGHTER_CREATED), refuses a directory with EISDIR — the answer
+open(2) gives anyway — and turns a trailing symlink into ELOOP, on
+which the driver falls back to the ordinary lookup path so the VFS can
+walk it. The parent invalidation exists in case the server's view of
+the directory moved; but this change was ours, the server pushes an
+invalidation when anyone else's shows up, and the attribute timeout
+already bounds the drift for host-side changes — so the driver
+advances mtime and ctime in place instead.
+
+Gated on FUSE_LIGHTER_CREATE, an init flag no other server sets, so an
+unpatched server keeps the stock behavior bit for bit.
+
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -131,6 +131,24 @@
+ 
+ static void fuse_dir_changed(struct inode *dir)
+ {
++	struct fuse_conn *fc = get_fuse_conn(dir);
++
++	/*
++	 * lighter: this change is one we made ourselves, so the attributes in
++	 * hand are the freshest anyone has. Advance the times locally instead
++	 * of paying a GETATTR on the next walk through this directory; the
++	 * server pushes an invalidation if anything changes underneath us,
++	 * and size/nlink drift no further than the attribute timeout — the
++	 * same promise a host-side change already has.
++	 */
++	if (fc->lighter_create) {
++		struct timespec64 now = current_time(dir);
++
++		inode_set_mtime_to_ts(dir, now);
++		inode_set_ctime_to_ts(dir, now);
++		inode_maybe_inc_iversion(dir, false);
++		return;
++	}
+ 	fuse_invalidate_attr(dir);
+ 	inode_maybe_inc_iversion(dir, false);
+ }
+@@ -687,6 +705,16 @@
+ 	    fuse_invalid_attr(&outentry.attr))
+ 		goto out_free_ff;
+ 
++	/*
++	 * lighter: when the LOOKUP was skipped, whether this open CREATED the
++	 * file is the server's answer, not our assumption. FMODE_CREATED
++	 * zeroes acc_mode in do_open(), so claiming it for a file that
++	 * already existed would skip the permission check on it.
++	 */
++	if (opcode == FUSE_CREATE && fm->fc->lighter_create &&
++	    !(outopenp->open_flags & FOPEN_LIGHTER_CREATED))
++		file->f_mode &= ~FMODE_CREATED;
++
+ 	ff->fh = outopenp->fh;
+ 	ff->nodeid = outentry.nodeid;
+ 	ff->open_flags = outopenp->open_flags;
+@@ -700,7 +728,15 @@
+ 		goto out_err;
+ 	}
+ 	kfree(forget);
+-	d_instantiate(entry, inode);
++	/*
++	 * lighter: with the LOOKUP skipped the dentry is still in lookup;
++	 * d_add() hashes it and wakes waiters, so the next walk to this name
++	 * hits the dcache instead of paying the LOOKUP later.
++	 */
++	if (d_in_lookup(entry))
++		d_add(entry, inode);
++	else
++		d_instantiate(entry, inode);
+ 	fuse_change_entry_timeout(entry, &outentry);
+ 	fuse_dir_changed(dir);
+ 	err = generic_file_open(inode, file);
+@@ -742,6 +778,16 @@
+ 		return -EIO;
+ 
+ 	if (d_in_lookup(entry)) {
++		/*
++		 * lighter: for O_CREAT the CREATE reply carries everything a
++		 * LOOKUP would have said, so asking first is a wasted round
++		 * trip — two thirds of the requests a package install makes.
++		 * The one shape CREATE cannot express, a trailing symlink the
++		 * VFS must walk itself, comes back as ELOOP and takes the
++		 * ordinary path below.
++		 */
++		if (fc->lighter_create && (flags & O_CREAT) && !fc->no_create)
++			goto create;
+ 		res = fuse_lookup(dir, entry, 0);
+ 		if (IS_ERR(res))
+ 			return PTR_ERR(res);
+@@ -753,6 +799,7 @@
+ 	if (!(flags & O_CREAT) || d_really_is_positive(entry))
+ 		goto no_open;
+ 
++create:
+ 	/* Only creates */
+ 	file->f_mode |= FMODE_CREATED;
+ 
+@@ -763,8 +810,17 @@
+ 	if (err == -ENOSYS) {
+ 		fc->no_create = 1;
+ 		goto mknod;
+-	} else if (err == -EEXIST)
++	} else if (err == -EEXIST) {
+ 		fuse_invalidate_entry(entry);
++	} else if (err == -ELOOP && d_in_lookup(entry)) {
++		file->f_mode &= ~FMODE_CREATED;
++		res = fuse_lookup(dir, entry, 0);
++		if (IS_ERR(res))
++			return PTR_ERR(res);
++		if (res)
++			entry = res;
++		goto no_open;
++	}
+ out_dput:
+ 	dput(res);
+ 	return err;
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1315,6 +1315,8 @@
+ 				fc->handle_killpriv_v2 = 1;
+ 				fm->sb->s_flags |= SB_NOSEC;
+ 			}
++			if (flags & FUSE_LIGHTER_CREATE)
++				fc->lighter_create = 1;
+ 			if (flags & FUSE_SETXATTR_EXT)
+ 				fc->setxattr_ext = 1;
+ 			if (flags & FUSE_SECURITY_CTX)
+@@ -1401,7 +1403,8 @@
+ 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
+ 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
+ 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
+-		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP;
++		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
++		FUSE_LIGHTER_CREATE;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm->fc->dax)
+ 		flags |= FUSE_MAP_ALIGNMENT;
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -722,6 +722,12 @@
+ 	 * file has group execute permission.
+ 	 */
+ 	unsigned handle_killpriv_v2:1;
++
++	/*
++	 * lighter: FUSE_CREATE may be sent without a prior LOOKUP, and the
++	 * reply says whether the file was created (FOPEN_LIGHTER_CREATED).
++	 */
++	unsigned lighter_create:1;
+ 
+ 	/*
+ 	 * The following bitfields are only for optimization purposes
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -372,6 +372,10 @@
+ #define FOPEN_NOFLUSH		(1 << 5)
+ #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
+ #define FOPEN_PASSTHROUGH	(1 << 7)
++/* lighter: this CREATE really created the file. Truthful by construction on
++ * the server (it creates with O_EXCL first), which is what lets the driver
++ * skip its pre-create LOOKUP and still set FMODE_CREATED honestly. */
++#define FOPEN_LIGHTER_CREATED	(1 << 15)
+ 
+ /**
+  * INIT request/reply flags
+@@ -471,6 +475,11 @@
+ /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
+ #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
+ #define FUSE_ALLOW_IDMAP	(1ULL << 40)
++/* lighter: the server speaks lighter's create dialect. FUSE_CREATE without a
++ * prior LOOKUP is handled for existing files too, FOPEN_LIGHTER_CREATED is
++ * truthful, and the server pushes invalidations for whatever it changes
++ * underneath the driver. */
++#define FUSE_LIGHTER_CREATE	(1ULL << 60)
+ 
+ /**
+  * CUSE INIT request/reply flags

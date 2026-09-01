@@ -219,7 +219,17 @@ impl Server {
     /// that have no reply at all.
     pub fn dispatch(&self, request: &[u8], sink: &mut dyn Sink) -> usize {
         let Some(header) = InHeader::parse(request) else {
-            tracing::warn!(len = request.len(), "fuse request shorter than its header");
+            // Once per server, not per request: a guest whose queue layout
+            // disagrees with ours delivers these by the million, and a warn
+            // apiece turns a protocol bug into a full disk.
+            static SHORT: std::sync::Once = std::sync::Once::new();
+            SHORT.call_once(|| {
+                tracing::warn!(
+                    len = request.len(),
+                    "fuse request shorter than its header (reported once; \
+                     later occurrences are counted silently)"
+                );
+            });
             return 0;
         };
         // The header's own length field bounds the body; a guest that lied
@@ -463,7 +473,26 @@ impl Server {
         } else {
             wanted
         };
+        // The second flags word exists only behind INIT_EXT, and carries our
+        // create dialect (guest patch 0004). Offered only when there is a
+        // watcher, because the dialect's promise — "the server will tell you
+        // when the directory changes underneath you" — is the watcher.
+        let offered2 = if offered & fuse::init::INIT_EXT != 0 {
+            get_u32(body, 16).unwrap_or(0)
+        } else {
+            0
+        };
+        let wanted = if self.policy.timings().caching() {
+            wanted | fuse::init::INIT_EXT
+        } else {
+            wanted
+        };
         let flags = wanted & offered;
+        let flags2 = if flags & fuse::init::INIT_EXT != 0 {
+            fuse::init2::LIGHTER_CREATE & offered2
+        } else {
+            0
+        };
         let max_write = if flags & fuse::init::MAX_PAGES != 0 {
             MAX_WRITE
         } else {
@@ -491,8 +520,9 @@ impl Server {
         out.extend_from_slice(&1u32.to_le_bytes()); // time_gran: nanoseconds
         out.extend_from_slice(&MAX_PAGES.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // map_alignment: no DAX
-        // flags2 and the reserved tail. `fuse_init_out` is a fixed 64 bytes and
-        // a short reply is read as garbage rather than as a short reply.
+        out.extend_from_slice(&flags2.to_le_bytes());
+        // The reserved tail. `fuse_init_out` is a fixed 64 bytes and a short
+        // reply is read as garbage rather than as a short reply.
         out.resize(64, 0);
         Ok(out)
     }
@@ -987,19 +1017,59 @@ impl Server {
         // CREATE creates, whatever the guest put in `flags`. The kernel always
         // sets O_CREAT, but a request that did not would otherwise be answered
         // with ENOENT for a file the operation was supposed to make.
+        //
+        // O_EXCL first, then the existing file: the guest may have skipped
+        // its pre-create LOOKUP (patch 0004), so whether this open CREATED
+        // the file has to be a fact we report, not an assumption it makes —
+        // and creation is what CREATE is almost always asked for, so the
+        // common case stays one syscall. O_NOFOLLOW because a trailing
+        // symlink belongs to the guest's VFS: it comes back as ELOOP and the
+        // guest walks it itself.
         const LINUX_O_CREAT: u32 = 0o100;
-        let fd = sys::openat_path(
-            parent.reference()?.raw_fd(),
-            &name,
-            flags | LINUX_O_CREAT,
-            mode & 0o7777 & !umask,
-        )?;
+        const LINUX_O_EXCL: u32 = 0o200;
+        const LINUX_O_NOFOLLOW: u32 = 0o400000;
+        let parent_fd = parent.reference()?;
+        let mut created = true;
+        let mut attempt = 0;
+        let fd = loop {
+            match sys::openat_path(
+                parent_fd.raw_fd(),
+                &name,
+                flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
+                mode & 0o7777 & !umask,
+            ) {
+                Ok(fd) => break fd,
+                Err(e) if e == linux::EEXIST && flags & LINUX_O_EXCL == 0 => {}
+                Err(e) => return Err(e),
+            }
+            match sys::openat_path(
+                parent_fd.raw_fd(),
+                &name,
+                (flags & !LINUX_O_CREAT) | LINUX_O_NOFOLLOW,
+                0,
+            ) {
+                Ok(fd) => {
+                    created = false;
+                    break fd;
+                }
+                // Unlinked between the two opens: go create it after all,
+                // once, so a delete storm cannot pin us here.
+                Err(e) if e == linux::ENOENT && attempt == 0 => attempt = 1,
+                Err(e) => return Err(e),
+            }
+        };
         // Everything below avoids re-resolving a path we are already holding
         // open. A package install creates tens of thousands of files, and the
         // naive version costs two `openat`s and a path-based `stat` for each:
         // `fstat` on the descriptor we have, and `dup` rather than a second
         // `openat` for the metadata reference.
         let st = sys::stat_fd(fd.as_raw_fd())?;
+        // Linux refuses O_CREAT on an existing directory outright; macOS
+        // happily opens it read-only, and the guest may not have looked
+        // before asking (patch 0004).
+        if st.st_mode & 0o170000 == 0o040000 {
+            return Err(linux::EISDIR);
+        }
         let entry = self.entry_with_reference(&parent, st, || sys::dup(&fd))?;
         let fh = self.registry.add_handle(Handle::File(Arc::new(OpenFile {
             fd,
@@ -1007,7 +1077,11 @@ impl Server {
             writable: flags & 0o3 != 0,
         })));
         let mut out = self.entry_reply(&entry);
-        out.extend_from_slice(&open_reply(fh, self.created_file_flags()));
+        let mut open_flags = self.created_file_flags();
+        if created {
+            open_flags |= fuse::fopen::LIGHTER_CREATED;
+        }
+        out.extend_from_slice(&open_reply(fh, open_flags));
         Ok(out)
     }
 
