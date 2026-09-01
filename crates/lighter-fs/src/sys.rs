@@ -269,8 +269,30 @@ pub fn open_root(path: &Path) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// Re-opens an inode for real I/O, at whatever path it currently occupies.
+/// The volume's own name for whatever `fd` holds open: `/.vol/dev/ino`.
+///
+/// `F_GETPATH` is best-effort: it answers from the vnode name cache, and for
+/// a file created under a temporary name and renamed into place it can
+/// answer with the temporary name — which no longer exists. The identity
+/// path has no name to go stale; the descriptor keeps the numbers pinned to
+/// the right file. Not every filesystem serves `/.vol`, so callers keep
+/// `path_of` as the fallback.
+pub fn identity_path(fd: RawFd) -> Result<PathBuf> {
+    let st = stat_fd(fd)?;
+    Ok(PathBuf::from(format!("/.vol/{}/{}", st.st_dev, st.st_ino)))
+}
+
+/// Re-opens an inode for real I/O.
+///
+/// By identity first: reopening "at whatever path it currently occupies" was
+/// the design, and F_GETPATH quietly does not promise that (see
+/// [`identity_path`]). The path is the fallback for a filesystem with no
+/// `/.vol`, and the error reported is the fallback's, which is what this
+/// function has always returned.
 pub fn reopen(reference: RawFd, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+    if let Ok(fd) = identity_path(reference).and_then(|p| open_path(&p, linux_flags, mode)) {
+        return Ok(fd);
+    }
     let path = path_of(reference)?;
     open_path(&path, linux_flags, mode)
 }

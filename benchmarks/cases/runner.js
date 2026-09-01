@@ -22,7 +22,10 @@ const reps = Number(process.env.REPS || 3);
 function sh(script) {
   // Errors are inherited rather than swallowed: a case that fails should say
   // why, in the harness output, rather than becoming a missing row.
-  execFileSync("/bin/sh", [script], { stdio: ["ignore", "ignore", "inherit"], env: process.env });
+  // Both streams, not just stderr: pnpm reports its failures through its
+  // reporter, which writes to stdout. The TIME_MS lines are extracted by
+  // pattern, so case chatter on stdout costs nothing.
+  execFileSync("/bin/sh", [script], { stdio: ["ignore", "inherit", "inherit"], env: process.env });
 }
 
 const setup = `${work}/cases/${name}.setup.sh`;

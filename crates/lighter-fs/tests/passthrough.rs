@@ -782,6 +782,33 @@ fn the_reclaim_keeps_up_while_the_tree_is_being_walked() {
     );
 }
 
+/// The pnpm store shape: a file is created under one name, renamed into
+/// place, and then hardlinked from — addressed by nodeid, so the server has
+/// to name the source itself. F_GETPATH answers from the vnode name cache,
+/// which can still hold the pre-rename name; naming the inode by identity
+/// (/.vol) cannot go stale. One install in three died on this before it was
+/// found.
+#[test]
+fn a_link_source_survives_being_renamed() {
+    let mut guest = Guest::new("link-after-rename");
+    std::fs::write(guest.host("first-name"), b"content").unwrap();
+    let nodeid = guest.lookup(1, "first-name").unwrap();
+    std::fs::rename(guest.host("first-name"), guest.host("second-name")).unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&nodeid.to_le_bytes());
+    body.extend_from_slice(b"the-link\0");
+    guest
+        .call(op::LINK, 1, &body)
+        .expect("linking a renamed source must work; the inode did not move");
+    assert_eq!(std::fs::read(guest.host("the-link")).unwrap(), b"content");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(guest.host("the-link")).unwrap().ino(),
+        std::fs::metadata(guest.host("second-name")).unwrap().ino(),
+        "the link must share the renamed file's inode"
+    );
+}
+
 /// CREATE, returning the `open_flags` word of the reply as well, which is
 /// where the server says whether it really created the file.
 fn create_verbose(guest: &mut Guest, parent: u64, name: &str, flags: u32) -> Result<u32, i32> {

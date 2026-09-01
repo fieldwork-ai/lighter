@@ -91,6 +91,8 @@ pub struct Server {
     host_gid: u32,
     /// Negotiated at INIT, and read by READ to bound a reply.
     max_write: AtomicU32,
+    /// Whether the share's volume serves `/.vol` identity paths. Probed once.
+    volfs: std::sync::OnceLock<bool>,
     /// How many more requests to log in order. See [`Server::trace`].
     trace_left: AtomicUsize,
     /// How long the guest may believe what we tell it.
@@ -184,6 +186,7 @@ impl Server {
             host_uid,
             host_gid,
             max_write: AtomicU32::new(MAX_WRITE),
+            volfs: std::sync::OnceLock::new(),
             trace_left: AtomicUsize::new(
                 std::env::var("LIGHTER_FS_TRACE")
                     .ok()
@@ -579,7 +582,23 @@ impl Server {
 
     /// The live host path of an inode, as a C string.
     fn path(&self, inode: &Inode) -> Result<CString, i32> {
-        sys::c_path(&sys::path_of(inode.reference()?.raw_fd())?)
+        let fd = inode.reference()?;
+        // By identity when the volume allows it. F_GETPATH answers from the
+        // vnode name cache, which for a file created under a temporary name
+        // and renamed into place can still be the temporary name — pnpm does
+        // exactly that to every store file, and the resulting ENOENT killed
+        // one install in three. Probed once against the share root; a share
+        // on something exotic keeps the old behavior.
+        if *self.volfs.get_or_init(|| {
+            self.registry
+                .get(1)
+                .and_then(|root| root.reference().ok())
+                .and_then(|r| sys::identity_path(r.raw_fd()).ok())
+                .is_some_and(|p| std::fs::metadata(&p).is_ok())
+        }) {
+            return sys::c_path(&sys::identity_path(fd.raw_fd())?);
+        }
+        sys::c_path(&sys::path_of(fd.raw_fd())?)
     }
 
     /// Looks a name up under `parent` and registers it, producing the reply
@@ -753,7 +772,21 @@ impl Server {
         let name = self.checked_name(name)?;
         match self.entry(&parent, &name) {
             Ok(entry) => Ok(self.entry_reply(&entry)),
-            Err(linux::ENOENT) => self.missing(&parent),
+            Err(linux::ENOENT) => {
+                if std::env::var("LIGHTER_FS_DEBUG_ENOENT").as_deref() == Ok("1") {
+                    let held = sys::path_of(parent.reference()?.raw_fd())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|e| format!("<no path: {e}>"));
+                    tracing::warn!(
+                        parent_dev = parent.dev,
+                        parent_ino = parent.ino,
+                        held,
+                        name = %name.to_string_lossy(),
+                        "ENOENT-DEBUG lookup miss"
+                    );
+                }
+                self.missing(&parent)
+            }
             Err(other) => Err(other),
         }
     }
@@ -942,17 +975,8 @@ impl Server {
         // by its live path — which is correct even if it has been renamed since
         // the guest looked it up.
         let source = self.path(&target)?;
-        let reference = target.reference()?;
         sys::link_at(libc::AT_FDCWD, &source, parent.reference()?.raw_fd(), &name)?;
-        // A hardlink IS its source's inode, so the attributes come from the
-        // descriptor already in hand — `fstat` with a fresh `st_nlink` —
-        // rather than a path walk to stat the name just made. The registry
-        // resolves the identity to the inode it already holds, so no second
-        // descriptor is opened either.
-        let st = sys::stat_fd(reference.raw_fd())?;
-        let entry = self.entry_with_reference(&parent, st, || {
-            sys::open_reference(parent.reference()?.raw_fd(), &name, false)
-        })?;
+        let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
 
