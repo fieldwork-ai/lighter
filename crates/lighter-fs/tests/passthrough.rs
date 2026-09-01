@@ -782,6 +782,35 @@ fn the_reclaim_keeps_up_while_the_tree_is_being_walked() {
     );
 }
 
+/// A whole-file clone over an existing name (guest patch 0005), which is how
+/// pnpm imports on the share once its FICLONE probe succeeds.
+#[test]
+fn a_clone_replaces_the_destination_name() {
+    let mut guest = Guest::new("clone-over");
+    std::fs::write(guest.host("source"), b"the real content").unwrap();
+    std::fs::write(guest.host("dest"), b"").unwrap();
+    let src = guest.lookup(1, "source").unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&src.to_le_bytes());
+    body.extend_from_slice(&1u64.to_le_bytes()); // parent: the root
+    body.extend_from_slice(b"dest\0");
+    let reply = guest.call(op::LIGHTER_CLONE, 1, &body).expect("clone must work");
+    let size = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    assert_eq!(size, 16, "the reply carries the cloned size");
+    assert_eq!(
+        std::fs::read(guest.host("dest")).unwrap(),
+        b"the real content"
+    );
+    // A clone, not a link: writing the copy must not touch the source.
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(guest.host("dest")).unwrap().nlink(), 1);
+    std::fs::write(guest.host("dest"), b"changed").unwrap();
+    assert_eq!(
+        std::fs::read(guest.host("source")).unwrap(),
+        b"the real content"
+    );
+}
+
 /// The pnpm store shape: a file is created under one name, renamed into
 /// place, and then hardlinked from — addressed by nodeid, so the server has
 /// to name the source itself. F_GETPATH answers from the vnode name cache,

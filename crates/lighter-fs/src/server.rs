@@ -327,6 +327,7 @@ impl Server {
             // buys and what it costs.
             op::OPEN | op::OPENDIR => Err(linux::ENOSYS),
             op::CREATE => self.create(header.nodeid, body),
+            op::LIGHTER_CLONE => self.clone_over(body),
             op::READ => self.read(header.nodeid, body, capacity),
             op::WRITE => self.write(header.nodeid, body),
             op::STATFS => self.statfs(),
@@ -500,7 +501,7 @@ impl Server {
         };
         let flags = wanted & offered;
         let flags2 = if flags & fuse::init::INIT_EXT != 0 {
-            fuse::init2::LIGHTER_CREATE & offered2
+            (fuse::init2::LIGHTER_CREATE | fuse::init2::LIGHTER_CLONE) & offered2
         } else {
             0
         };
@@ -1047,6 +1048,40 @@ impl Server {
         // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
         let fd = sys::reopen(inode.reference()?.raw_fd(), 0o200000, 0)?;
         sys::Dir::from_fd(fd)?.read_all()
+    }
+
+    /// A whole-file clone of one inode over another name (guest patch 0005).
+    ///
+    /// The reply to pnpm's FICLONE probe, and the reason its imports run in
+    /// clone mode on the share the way they do on the Mac itself. The clone
+    /// lands under a temporary name and is renamed over the destination, so
+    /// the name flips atomically from old content to new; the guest kernel
+    /// drops its caches for the replaced inode itself.
+    fn clone_over(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+        let nodeid_in = get_u64(body, 0).ok_or(linux::EINVAL)?;
+        let parent_out = get_u64(body, 8).ok_or(linux::EINVAL)?;
+        let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
+        let name = self.checked_name(name)?;
+        let source = self.inode(nodeid_in)?;
+        let source_path = self.path(&source)?;
+        let size = {
+            let reference = source.reference()?;
+            sys::stat_fd(reference.raw_fd())?.st_size
+        };
+        let parent = self.directory(parent_out)?;
+        let parent_ref = parent.reference()?;
+        let tmp = sys::c_path(&std::path::PathBuf::from(format!(
+            ".lighter-clone-{}",
+            std::process::id() as u64 ^ nodeid_in
+        )))?;
+        sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
+        if let Err(e) = sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &name, 0) {
+            let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
+            return Err(e);
+        }
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&(size as u64).to_le_bytes());
+        Ok(out)
     }
 
     fn create(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {

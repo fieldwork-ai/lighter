@@ -34,6 +34,9 @@ pub const DIRENT_HEADER_LEN: usize = 24;
 
 /// Opcodes. Named exactly as the kernel names them, minus the `FUSE_` prefix.
 pub mod op {
+    /// Ours (guest patch 0005): a whole-file clone of one inode over another
+    /// name. Numbered far above anything mainline assigns.
+    pub const LIGHTER_CLONE: u32 = 62000;
     pub const LOOKUP: u32 = 1;
     pub const FORGET: u32 = 2;
     pub const GETATTR: u32 = 3;
@@ -124,6 +127,9 @@ pub mod init2 {
     /// underneath the driver. Overall bit 60, far above anything mainline has
     /// assigned.
     pub const LIGHTER_CREATE: u32 = 1 << 28;
+    /// Ours, matched by guest patch 0005: `op::LIGHTER_CLONE` is answered
+    /// with a clonefile. Overall bit 61.
+    pub const LIGHTER_CLONE: u32 = 1 << 29;
 }
 
 /// `fuse_open_out.open_flags`.

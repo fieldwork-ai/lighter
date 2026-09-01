@@ -269,6 +269,17 @@ pub fn open_root(path: &Path) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// Clones `source` (an absolute path) to `name` under `parent`, copy-on-write.
+///
+/// APFS metadata operation: the clone shares extents with the source and
+/// costs less than half a hardlink. The destination must not exist.
+pub fn clonefile_at(source: &CStr, parent: RawFd, name: &CStr) -> Result<()> {
+    // SAFETY: valid NUL-terminated paths and a live directory descriptor. An
+    // absolute source makes the source dirfd irrelevant.
+    check(unsafe { libc::clonefileat(libc::AT_FDCWD, source.as_ptr(), parent, name.as_ptr(), 0) })
+        .map(|_| ())
+}
+
 /// The volume's own name for whatever `fd` holds open: `/.vol/dev/ino`.
 ///
 /// `F_GETPATH` is best-effort: it answers from the vnode name cache, and for

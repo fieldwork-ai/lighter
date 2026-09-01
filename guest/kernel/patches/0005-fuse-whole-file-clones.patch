@@ -1,0 +1,175 @@
+fuse: whole-file clones, answered by a server that has clonefile
+
+pnpm decides how to import every file by probing one copy_file_range
+with FICLONE_FORCE: if cloning works it clones, and if it does not it
+falls back to hardlinks — which on APFS cost 150 microseconds to a
+clonefile's 70. This driver had no remap_file_range at all, so through
+a shared directory the probe always failed and every install paid the
+expensive path, fifteen thousand times.
+
+Whole-file clones only, gated on the server declaring support: the
+server replaces the destination's name with a clone of the source, so
+the inode behind the caller's open file is orphaned — its pages and
+attributes are dropped and the dentry invalidated, and the next path
+access finds the clone. That matches how the callers that matter use
+the result: probe, clone, close, read back by path.
+
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -3336,6 +3336,75 @@
+ 	fuse_flush_time_update(inode_out);
+ 
+ 	return err;
++}
++
++/*
++ * lighter: FICLONE, answered by the server with a clonefile on the host.
++ *
++ * Whole-file clones only, because that is the shape the callers that matter
++ * actually use — pnpm probes with copy_file_range(FICLONE_FORCE) and imports
++ * every package file this way when it works, and a hardlink on APFS costs
++ * twice what a clonefile does. The server replaces the destination NAME with
++ * a clone of the source, so the inode behind the open file is orphaned: its
++ * pages and attributes are dropped and the dentry invalidated, and the next
++ * path access finds the clone. The destination's name is read without
++ * rename locking — a caller racing a rename of a file it is mid-clone gets
++ * an outcome no better defined than the race itself.
++ */
++static loff_t fuse_remap_file_range(struct file *file_in, loff_t pos_in,
++				    struct file *file_out, loff_t pos_out,
++				    loff_t len, unsigned int remap_flags)
++{
++	struct fuse_file *ff_in = file_in->private_data;
++	struct fuse_file *ff_out = file_out->private_data;
++	struct inode *inode_in = file_inode(file_in);
++	struct inode *inode_out = file_inode(file_out);
++	struct fuse_mount *fm = ff_out->fm;
++	struct fuse_conn *fc = fm->fc;
++	struct dentry *entry = file_dentry(file_out);
++	struct dentry *parent;
++	struct fuse_lighter_clone_in inarg;
++	struct fuse_lighter_clone_out outarg;
++	FUSE_ARGS(args);
++	int err;
++
++	if (!fc->lighter_clone)
++		return -EOPNOTSUPP;
++	if (remap_flags & ~REMAP_FILE_ADVISORY)
++		return -EOPNOTSUPP;
++	if (pos_in || pos_out)
++		return -EOPNOTSUPP;
++	if (len && len != i_size_read(inode_in))
++		return -EOPNOTSUPP;
++	if (!S_ISREG(inode_in->i_mode) || !S_ISREG(inode_out->i_mode))
++		return -EINVAL;
++
++	inode_lock(inode_out);
++	parent = dget_parent(entry);
++	memset(&inarg, 0, sizeof(inarg));
++	inarg.nodeid_in = ff_in->nodeid;
++	inarg.parent_out = get_fuse_inode(d_inode(parent))->nodeid;
++	args.opcode = FUSE_LIGHTER_CLONE;
++	args.nodeid = ff_out->nodeid;
++	args.in_numargs = 2;
++	args.in_args[0].size = sizeof(inarg);
++	args.in_args[0].value = &inarg;
++	args.in_args[1].size = entry->d_name.len + 1;
++	args.in_args[1].value = entry->d_name.name;
++	args.out_numargs = 1;
++	args.out_args[0].size = sizeof(outarg);
++	args.out_args[0].value = &outarg;
++	err = fuse_simple_request(fm, &args);
++	if (!err) {
++		truncate_inode_pages(inode_out->i_mapping, 0);
++		fuse_invalidate_attr(inode_out);
++		d_invalidate(entry);
++	}
++	dput(parent);
++	inode_unlock(inode_out);
++	if (err)
++		return err;
++	return outarg.size ? outarg.size : len;
+ }
+ 
+ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3372,6 +3441,7 @@
+ 	.poll		= fuse_file_poll,
+ 	.fallocate	= fuse_file_fallocate,
+ 	.copy_file_range = fuse_copy_file_range,
++	.remap_file_range = fuse_remap_file_range,
+ };
+ 
+ static const struct address_space_operations fuse_file_aops  = {
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1317,6 +1317,8 @@
+ 			}
+ 			if (flags & FUSE_LIGHTER_CREATE)
+ 				fc->lighter_create = 1;
++			if (flags & FUSE_LIGHTER_CLONE_SUPPORT)
++				fc->lighter_clone = 1;
+ 			if (flags & FUSE_SETXATTR_EXT)
+ 				fc->setxattr_ext = 1;
+ 			if (flags & FUSE_SECURITY_CTX)
+@@ -1404,7 +1406,7 @@
+ 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
+ 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
+ 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
+-		FUSE_LIGHTER_CREATE;
++		FUSE_LIGHTER_CREATE | FUSE_LIGHTER_CLONE_SUPPORT;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm->fc->dax)
+ 		flags |= FUSE_MAP_ALIGNMENT;
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -729,6 +729,9 @@
+ 	 */
+ 	unsigned lighter_create:1;
+ 
++	/* lighter: the server answers FUSE_LIGHTER_CLONE. */
++	unsigned lighter_clone:1;
++
+ 	/*
+ 	 * The following bitfields are only for optimization purposes
+ 	 * and hence races in setting them will not cause malfunction
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -480,6 +480,11 @@
+  * truthful, and the server pushes invalidations for whatever it changes
+  * underneath the driver. */
+ #define FUSE_LIGHTER_CREATE	(1ULL << 60)
++/* lighter: the server answers FUSE_LIGHTER_CLONE — a whole-file FICLONE,
++ * implemented on the host as an APFS clonefile of the source over the
++ * destination's name. What pnpm and cp -c ask for before falling back to
++ * hardlinks or copies, at less than half a hardlink's cost. */
++#define FUSE_LIGHTER_CLONE_SUPPORT	(1ULL << 61)
+ 
+ /**
+  * CUSE INIT request/reply flags
+@@ -642,6 +647,8 @@
+ 	FUSE_RENAME2		= 45,
+ 	FUSE_LSEEK		= 46,
+ 	FUSE_COPY_FILE_RANGE	= 47,
++	/* lighter's dialect: numbered far above anything mainline assigns. */
++	FUSE_LIGHTER_CLONE	= 62000,
+ 	FUSE_SETUPMAPPING	= 48,
+ 	FUSE_REMOVEMAPPING	= 49,
+ 	FUSE_SYNCFS		= 50,
+@@ -1124,8 +1131,17 @@
+ 
+ struct fuse_lseek_out {
+ 	uint64_t	offset;
++};
++
++struct fuse_lighter_clone_in {
++	uint64_t	nodeid_in;
++	uint64_t	parent_out;
+ };
+ 
++struct fuse_lighter_clone_out {
++	uint64_t	size;
++};
++
+ struct fuse_copy_file_range_in {
+ 	uint64_t	fh_in;
+ 	uint64_t	off_in;
