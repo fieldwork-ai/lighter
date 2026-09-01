@@ -80,6 +80,16 @@ pub struct Virtqueue {
     next_avail: u16,
     /// The index we will write next into the used ring.
     next_used: u16,
+    /// Which descriptor heads the driver has offered and we have not returned.
+    ///
+    /// A head is outstanding from the moment it is popped until the moment it
+    /// is pushed used, exactly once each way. Returning one twice, or one that
+    /// was never taken, corrupts the driver's own bookkeeping — Linux answers
+    /// `id %u is not a head!`, marks the queue broken, and every subsequent
+    /// submission fails with EIO. That surfaces as a filesystem that stops
+    /// dead, several seconds and one subsystem away from whatever caused it,
+    /// which is why the queue checks itself rather than trusting its callers.
+    outstanding: Vec<bool>,
 }
 
 impl Virtqueue {
@@ -93,6 +103,7 @@ impl Virtqueue {
             ready: false,
             next_avail: 0,
             next_used: 0,
+            outstanding: Vec::new(),
         }
     }
 
@@ -188,7 +199,25 @@ impl Virtqueue {
         }
 
         self.next_avail = self.next_avail.wrapping_add(1);
+        self.mark_taken(head);
         Some(DescriptorChain::new(mem, self.desc_addr, self.size, head))
+    }
+
+    /// Records that a head has been taken, and complains if it already was.
+    fn mark_taken(&mut self, head: u16) {
+        if self.outstanding.len() != usize::from(self.size) {
+            self.outstanding = vec![false; usize::from(self.size)];
+        }
+        match self.outstanding.get_mut(usize::from(head)) {
+            Some(slot) if *slot => {
+                tracing::error!(
+                    head,
+                    "the driver offered a head that is already outstanding"
+                )
+            }
+            Some(slot) => *slot = true,
+            None => tracing::error!(head, size = self.size, "head outside the ring"),
+        }
     }
 
     /// Returns a consumed chain to the driver.
@@ -198,6 +227,20 @@ impl Virtqueue {
     /// size the response, so an inflated value leaks host memory contents and a
     /// short one truncates the answer.
     pub fn push_used(&mut self, mem: &GuestMemory, head: u16, len: u32) {
+        match self.outstanding.get_mut(usize::from(head)) {
+            Some(slot) if *slot => *slot = false,
+            // Returning a head twice is what breaks the driver's ring, so it is
+            // refused here rather than written. Dropping the completion strands
+            // one request; writing it strands the whole filesystem.
+            Some(_) => {
+                tracing::error!(head, "refusing to return a head that is not outstanding");
+                return;
+            }
+            None => {
+                tracing::error!(head, size = self.size, "refusing a head outside the ring");
+                return;
+            }
+        }
         let slot = u64::from(self.next_used % self.size);
         // The used ring starts with 2-byte flags and 2-byte idx, then 8-byte
         // elements of {id: u32, len: u32}.

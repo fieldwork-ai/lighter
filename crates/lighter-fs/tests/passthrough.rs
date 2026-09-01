@@ -684,3 +684,100 @@ fn a_listing_and_a_lookup_agree_about_inode_numbers() {
         cursor += fuse::ENTRY_OUT_LEN + fuse::dirent_len(namelen);
     }
 }
+
+/// Reading a file whose descriptor was parked must return the file, not a
+/// truncation of it.
+///
+/// The descriptor a share holds per inode is a cache of where the file lives,
+/// and over budget the cold ones are closed and reopened by path on next use.
+/// That machinery sits underneath every read, so a mistake in it does not
+/// announce itself: it hands back a short read, and what surfaces two layers
+/// up is a package manager reporting a syntax error at line 7784 of a lockfile
+/// that is perfectly good on disk. Which is exactly how it surfaced.
+///
+/// The budget is forced low so that a few hundred files is enough to make the
+/// reclaim run — at the real budget this would need a hundred thousand.
+#[test]
+fn a_parked_inode_still_reads_back_what_was_written() {
+    // SAFETY: set before the server is built, and the value is read once.
+    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "64") };
+    let mut guest = Guest::new("parked-read");
+
+    const FILES: usize = 400;
+    let content = |n: usize| format!("file {n} says the same thing every time\n").repeat(64);
+
+    let mut ids = Vec::new();
+    for n in 0..FILES {
+        let name = format!("f{n}");
+        let (nodeid, fh) = guest.create(1, &name, 0o2).unwrap();
+        let body = content(n);
+        assert_eq!(
+            guest.write(nodeid, fh, 0, body.as_bytes()).unwrap() as usize,
+            body.len()
+        );
+        ids.push((name, nodeid));
+    }
+
+    // The reclaim has to have actually run. Asserting only that the reads come
+    // back right would pass just as well if nothing were ever parked, which is
+    // how a reclaim that freed nothing at all survived a green test suite and
+    // was found instead by `cp` reporting "No file descriptors available"
+    // inside a guest.
+    let (open, budget) = guest.server.descriptor_usage();
+    assert!(
+        open <= budget * 2,
+        "the reclaim freed nothing: {open} descriptors against a budget of {budget}"
+    );
+
+    // Read them back in the order they were made, which is the order the
+    // reclaim will have parked them in.
+    for (n, (name, _)) in ids.iter().enumerate() {
+        let expected = content(n);
+        let nodeid = guest.lookup(1, name).unwrap();
+        let fh = guest.open(nodeid, 0).unwrap();
+        let got = guest.read(nodeid, fh, 0, expected.len() as u32).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            expected,
+            "{name} came back wrong after its descriptor was parked"
+        );
+    }
+    unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+}
+
+/// The same, with the tree being walked while it is written.
+///
+/// This is the shape that actually broke: `cp -a` of a package tree creates
+/// inodes as fast as it looks up the ones it already made, so nothing is cold
+/// for long. A reclaim that only ever ages the front of each shard has most of
+/// the table permanently out of reach, and the count climbs past the budget
+/// while every sweep reports finding nothing to park.
+#[test]
+fn the_reclaim_keeps_up_while_the_tree_is_being_walked() {
+    // SAFETY: set before the server is built, and the value is read once.
+    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "128") };
+    let mut guest = Guest::new("parked-hot");
+
+    const FILES: usize = 1500;
+    let mut names = Vec::new();
+    for n in 0..FILES {
+        let name = format!("h{n}");
+        let (nodeid, fh) = guest.create(1, &name, 0o2).unwrap();
+        guest.write(nodeid, fh, 0, b"x").unwrap();
+        names.push(name);
+        // Touch a spread of what already exists, which is what keeps the
+        // reference bits set.
+        for step in [1usize, 7, 53, 211] {
+            if let Some(earlier) = names.get(n.saturating_sub(step)) {
+                guest.lookup(1, earlier).unwrap();
+            }
+        }
+    }
+
+    let (open, budget) = guest.server.descriptor_usage();
+    unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+    assert!(
+        open <= budget * 2,
+        "the reclaim lost the race: {open} descriptors against a budget of {budget}"
+    );
+}

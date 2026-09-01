@@ -100,20 +100,27 @@ trap cleanup EXIT
 # is how that stops being true.
 check_exclusive() {
 	local noisy=()
+	# The runtime being measured is not noise — it is the measurement. Every
+	# check below skips itself when it is the target, which is the difference
+	# between a guard and a refusal to ever benchmark anything.
+	#
 	# Colima and Lima both run their VM through the same Apple XPC service, so
 	# the process to look for is the hypervisor rather than the CLI.
-	if pgrep -f "limactl hostagent" >/dev/null 2>&1; then
+	if [ "$TARGET" != colima ] && pgrep -f "limactl hostagent" >/dev/null 2>&1; then
 		noisy+=("Colima or Lima (limactl hostagent)")
 	fi
-	if pgrep -x "com.docker.backend" >/dev/null 2>&1; then
+	if [ "$TARGET" != docker-desktop ] && pgrep -x "com.docker.backend" >/dev/null 2>&1; then
 		noisy+=("Docker Desktop")
 	fi
-	if pgrep -x "OrbStack Helper" >/dev/null 2>&1 || pgrep -x "xbin" >/dev/null 2>&1; then
+	if [ "$TARGET" != orbstack ] \
+		&& { pgrep -x "OrbStack Helper" >/dev/null 2>&1 || pgrep -x "xbin" >/dev/null 2>&1; }; then
 		noisy+=("OrbStack")
 	fi
 	# Ours too. The `lighter` target starts a machine of its own, and a second
 	# one already running competes with it for exactly the resources being
-	# measured — which is the same objection as for anybody else's.
+	# measured — which is the same objection as for anybody else's. It is not
+	# skipped for the `lighter` target: this looks for a *daemon* machine that
+	# `lighter start` left running, and the suite starts its own.
 	if [ -f "$HOME/.lighter/lighter.pid" ] \
 		&& kill -0 "$(cat "$HOME/.lighter/lighter.pid" 2>/dev/null)" 2>/dev/null; then
 		noisy+=("a lighter machine (stop it with \`lighter stop\`)")
@@ -419,7 +426,14 @@ for name in $CASES; do
 	if [ "$rep" -eq 0 ]; then
 		printf ' no measurement:'
 		printf '\n'
-		tail -25 "$CASE_OUT" | sed 's/^/      /'
+		# Both ends, not just the tail. A package manager prints the reason
+		# first and a Node stack trace last, and a tail alone shows only the
+		# stack — which says a command failed and never says why.
+		head -20 "$CASE_OUT" | sed 's/^/      /'
+		[ "$(wc -l < "$CASE_OUT")" -le 40 ] || {
+			printf '      ...\n'
+			tail -20 "$CASE_OUT" | sed 's/^/      /'
+		}
 	elif [ "$name" != watch-latency ]; then
 		# A case that finishes instantly finished because there was nothing
 		# there. Saying so is the difference between a bug and a headline.

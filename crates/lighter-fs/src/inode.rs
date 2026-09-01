@@ -51,6 +51,25 @@ pub struct Inode {
     /// passes. An inode found with it clear is one nothing has touched since
     /// the last sweep.
     used: AtomicBool,
+    /// Whether the slot currently holds a descriptor.
+    ///
+    /// A mirror of `fd.is_some()`, kept so the reclaimer can skip an inode
+    /// without taking its lock — and, more to the point, so it skips parked
+    /// ones at all. A parked inode is by definition not being used, so its
+    /// reference bit stays clear forever and it is the *first* thing every
+    /// sweep chooses. Without this it fills the batch, `park()` refuses it for
+    /// having nothing to park, and the sweep frees nothing while reporting
+    /// that it looked at sixteen thousand candidates.
+    held: AtomicBool,
+    /// The registry's tally of open metadata descriptors.
+    ///
+    /// Held here rather than adjusted by the registry because every edge that
+    /// moves it is an inode's own: construction, parking, reviving a parked
+    /// one, and being dropped. Splitting the accounting across the two is how
+    /// the first version came to leak — parking decremented, reviving did not
+    /// increment, and the tally drifted down until it stopped triggering a
+    /// reclaim while the real descriptor count climbed to the kernel's ceiling.
+    open_fds: Arc<AtomicUsize>,
     /// Host identity, which is what makes two paths to one file share a
     /// `nodeid` — as hard links must.
     pub dev: i64,
@@ -59,6 +78,14 @@ pub struct Inode {
     pub is_symlink: bool,
     /// How many times the guest has been told about this inode.
     lookups: Mutex<u64>,
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        if self.fd.get_mut().expect("inode slot poisoned").is_some() {
+            self.open_fds.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A descriptor borrowed from an inode for the length of one operation.
@@ -75,11 +102,22 @@ impl Reference {
 }
 
 impl Inode {
-    fn new(fd: OwnedFd, dev: i64, ino: u64, is_dir: bool, is_symlink: bool, lookups: u64) -> Inode {
+    fn new(
+        fd: OwnedFd,
+        dev: i64,
+        ino: u64,
+        is_dir: bool,
+        is_symlink: bool,
+        lookups: u64,
+        open_fds: Arc<AtomicUsize>,
+    ) -> Inode {
+        open_fds.fetch_add(1, Ordering::Relaxed);
         Inode {
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
             used: AtomicBool::new(true),
+            held: AtomicBool::new(true),
+            open_fds,
             dev,
             ino,
             is_dir,
@@ -117,6 +155,8 @@ impl Inode {
             _ => return Err(crate::errno::linux::ESTALE),
         }
         let fd = Arc::new(fd);
+        self.held.store(true, Ordering::Relaxed);
+        self.open_fds.fetch_add(1, Ordering::Relaxed);
         *slot = Some(fd.clone());
         Ok(Reference(fd))
     }
@@ -144,6 +184,8 @@ impl Inode {
         }
         *self.parked_at.lock().expect("parked path poisoned") = Some(path);
         *slot = None;
+        self.held.store(false, Ordering::Relaxed);
+        self.open_fds.fetch_sub(1, Ordering::Relaxed);
         true
     }
 
@@ -262,14 +304,24 @@ pub struct Registry {
     next_handle: AtomicU64,
     /// How many metadata descriptors the inode table is holding open.
     ///
-    /// An estimate, and deliberately so: it counts descriptors handed to
-    /// inodes rather than descriptors the kernel has, which is close enough to
-    /// steer a reclaim and cheap enough to keep on a hot path.
-    open_fds: AtomicUsize,
+    /// Shared with every inode, which is the only arrangement that stays
+    /// honest: each of the four edges that moves it — construction, parking,
+    /// reviving, dropping — belongs to an inode and adjusts it there.
+    open_fds: Arc<AtomicUsize>,
     /// The most it may hold before parking the cold ones.
     budget: usize,
     /// Where the clock hand is, so successive sweeps cover every shard.
     sweep: AtomicUsize,
+    /// The count at which a full pass last found nothing to park.
+    ///
+    /// Hysteresis, and the difference between degrading and collapsing. A
+    /// share whose whole working set is hot has nothing to give, and asking it
+    /// again on the very next insert costs a sweep of every shard for the same
+    /// answer. So after a fruitless pass the question is not re-asked until the
+    /// count has grown a little further — and only while the drift is still
+    /// inside the slack, because past that a wasted sweep is cheaper than
+    /// EMFILE.
+    quiet_until: AtomicUsize,
 }
 
 impl Registry {
@@ -278,7 +330,16 @@ impl Registry {
         // The root is never forgotten: the kernel does not FORGET nodeid 1, and
         // a count that could reach zero would let a buggy guest drop it and
         // take the whole mount with it.
-        let root = Arc::new(Inode::new(root_fd, dev, ino, true, false, u64::MAX));
+        let open_fds = Arc::new(AtomicUsize::new(0));
+        let root = Arc::new(Inode::new(
+            root_fd,
+            dev,
+            ino,
+            true,
+            false,
+            u64::MAX,
+            open_fds.clone(),
+        ));
         let by_id: [Mutex<HashMap<u64, Arc<Inode>>>; SHARDS] =
             std::array::from_fn(|_| Mutex::new(HashMap::new()));
         by_id[shard(ROOT_ID)]
@@ -293,9 +354,10 @@ impl Registry {
             handles: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(ROOT_ID + 1),
             next_handle: AtomicU64::new(1),
-            open_fds: AtomicUsize::new(1),
+            open_fds,
             budget: descriptor_budget(),
             sweep: AtomicUsize::new(0),
+            quiet_until: AtomicUsize::new(0),
         }
     }
 
@@ -395,9 +457,16 @@ impl Registry {
             .expect("inode table poisoned")
             .insert(
                 id,
-                Arc::new(Inode::new(fd, dev, ino, is_dir, is_symlink, 1)),
+                Arc::new(Inode::new(
+                    fd,
+                    dev,
+                    ino,
+                    is_dir,
+                    is_symlink,
+                    1,
+                    self.open_fds.clone(),
+                )),
             );
-        self.open_fds.fetch_add(1, Ordering::Relaxed);
         self.reclaim_if_over_budget();
         id
     }
@@ -425,12 +494,8 @@ impl Registry {
             return;
         }
         let identity = (inode.dev, inode.ino);
-        let held = inode.fd.read().expect("inode slot poisoned").is_some();
         table.remove(&id);
         drop(table);
-        if held {
-            self.open_fds.fetch_sub(1, Ordering::Relaxed);
-        }
 
         let mut map = self.by_identity.write().expect("identity table poisoned");
         // Only unmap the identity if it still points at us: a file removed and
@@ -454,10 +519,18 @@ impl Registry {
     /// one cleared. Refusing to loop here is what stops a share whose inodes
     /// are genuinely all hot from spinning instead of running.
     fn reclaim_if_over_budget(&self) {
-        if self.open_fds.load(Ordering::Relaxed) <= self.budget {
+        let open = self.open_fds.load(Ordering::Relaxed);
+        if open <= self.budget {
+            return;
+        }
+        let slack = (self.budget / SWEEP_SLACK_DIVISOR).max(64);
+        if open <= self.budget + slack && open < self.quiet_until.load(Ordering::Relaxed) {
             return;
         }
         let target = self.budget - self.budget / 8;
+        let mut visited = 0usize;
+        let mut chosen_total = 0usize;
+        let mut parked_total = 0usize;
         for _ in 0..SHARDS {
             if self.open_fds.load(Ordering::Relaxed) <= target {
                 return;
@@ -466,21 +539,68 @@ impl Registry {
             // The inodes are cloned out under the lock and parked outside it:
             // parking stats and closes a descriptor, and a shard lock held
             // across those would stall every worker whose path runs through it.
-            let candidates: Vec<Arc<Inode>> = self.by_id[index]
-                .lock()
-                .expect("inode table poisoned")
-                .iter()
-                .filter(|&(&id, _)| id != ROOT_ID)
-                .map(|(_, inode)| inode.clone())
-                .collect();
-            for inode in candidates {
-                if inode.used.swap(false, Ordering::Relaxed) {
-                    continue;
+            //
+            // Bounded on both sides. Cloning a whole shard would be thousands
+            // of atomic increments on a path that runs on every insert while
+            // over budget, and the ageing pass is what makes an inode a
+            // candidate at all — so a sweep visits a fixed number and takes a
+            // fixed number, and the next one picks up where the budget is
+            // still exceeded.
+            let candidates: Vec<Arc<Inode>> = {
+                let table = self.by_id[index].lock().expect("inode table poisoned");
+                let mut chosen = Vec::new();
+                for (&id, inode) in table.iter().take(SWEEP_VISIT) {
+                    visited += 1;
+                    // An inode with no descriptor has nothing to give, and it
+                    // is permanently cold — so it would otherwise be chosen
+                    // first, every time, and crowd out the ones that do.
+                    if id == ROOT_ID || !inode.held.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    // `swap` is the ageing: an inode that was used since the
+                    // last sweep survives this one and is a candidate for the
+                    // next.
+                    if !inode.used.swap(false, Ordering::Relaxed) {
+                        chosen.push(inode.clone());
+                        if chosen.len() >= SWEEP_TAKE {
+                            break;
+                        }
+                    }
                 }
+                chosen
+            };
+            chosen_total += candidates.len();
+            for inode in candidates {
                 if inode.park() {
-                    self.open_fds.fetch_sub(1, Ordering::Relaxed);
+                    parked_total += 1;
                 }
             }
+        }
+        // A full pass that could not get back under budget means every inode
+        // in the table is either hot or unparkable, and the next thing that
+        // happens is `EMFILE` inside the guest on a file that is plainly
+        // there. That is a miserable thing to diagnose from the guest end, so
+        // it is said here, where the number is known.
+        let open = self.open_fds.load(Ordering::Relaxed);
+        if open > self.budget {
+            self.quiet_until
+                .store(open.saturating_add(slack), Ordering::Relaxed);
+        }
+        // Sitting exactly at the budget with nothing to park is the reclaim
+        // working, not failing: everything it can see is in use. Drifting past
+        // the slack is the other thing, and the next event after it is EMFILE
+        // inside the guest on a file that is plainly there — which is a
+        // miserable thing to diagnose from that end, so it is said here.
+        if open > self.budget + slack {
+            tracing::warn!(
+                open,
+                budget = self.budget,
+                inodes = self.inode_count(),
+                visited,
+                chosen = chosen_total,
+                parked = parked_total,
+                "the share is holding more descriptors than it may"
+            );
         }
     }
 
@@ -530,6 +650,26 @@ impl Registry {
     }
 }
 
+/// How many inodes one sweep of a shard looks at, and how many it may park.
+///
+/// The visit bound keeps the cost of a sweep flat as a share grows; the take
+/// bound keeps one sweep from closing thousands of descriptors that are about
+/// to be wanted again. Neither has to be exactly right, because a sweep that
+/// did not free enough is followed by another on the next insert.
+const SWEEP_VISIT: usize = 4096;
+const SWEEP_TAKE: usize = 1024;
+
+/// How far above the budget a share may drift before every insert sweeps
+/// again, as a fraction of the budget.
+///
+/// Both bounds matter. Without hysteresis, a share whose whole working set is
+/// hot sweeps every shard on every insert to be told the same thing, which is
+/// what turned a twelve-second install into a four-minute one. Without a hard
+/// limit on the drift, hysteresis is just the original unbounded growth with
+/// extra steps, and the process still meets the kernel's ceiling. So the drift
+/// is capped well inside the reserve the budget already leaves.
+const SWEEP_SLACK_DIVISOR: usize = 64;
+
 /// How many metadata descriptors one share may hold open.
 ///
 /// The guest decides how many inodes it remembers, and it is under no
@@ -546,8 +686,28 @@ impl Registry {
 ///
 /// Three quarters of the ceiling, less a reserve for everything else the
 /// process opens — the guest's open files, its directories, the VMM's disks,
-/// sockets and the network sidecar.
+/// its sockets, the network sidecar's.
+///
+/// Generous on purpose. Parking is not free: a parked inode is reopened by
+/// path on next use, which is an `open` the workload did not ask for, and if
+/// the name has moved in between it is an ESTALE the workload has to recover
+/// from. So the budget is a ceiling to stay under, not a size to run at, and
+/// it is set high enough that an ordinary package tree never reaches it.
+///
+/// Halving it, briefly, proved the point: a sixty-six-thousand-file install
+/// wants about ninety thousand inodes, and against a ninety-two-thousand
+/// budget it thrashed — park, revive, park — turning a twelve-second install
+/// into a four-minute one.
 fn descriptor_budget() -> usize {
+    // Overridable so the reclaim can be exercised against a few thousand
+    // inodes instead of a hundred thousand, which is the difference between a
+    // test that runs in a second and one nobody runs.
+    if let Some(budget) = std::env::var("LIGHTER_FS_FD_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return budget.max(8);
+    }
     const RESERVE: u64 = 8192;
     let ceiling = crate::sys::descriptor_ceiling().saturating_sub(RESERVE);
     ((ceiling / 4) * 3).max(1024) as usize
@@ -805,6 +965,107 @@ mod tests {
             "a file with no links must keep its descriptor"
         );
         assert!(inode.reference().is_ok());
+    }
+
+    /// The tally is the only thing standing between a share and the kernel's
+    /// descriptor ceiling, so it has to survive the full cycle. It did not:
+    /// parking decremented it and reviving did not increment it, so on a
+    /// workload that parks and revives — which is every workload big enough to
+    /// park at all — it drifted down, stopped triggering a reclaim, and the
+    /// process climbed to exactly `kern.maxfilesperproc` while the counter
+    /// insisted it was well under budget.
+    #[test]
+    fn the_descriptor_tally_survives_park_and_revive() {
+        let scratch = Scratch::new("tally");
+        let reg = scratch.registry();
+        let root_held = reg.descriptor_usage().0;
+
+        let (fd, dev, ino) = scratch.file("counted");
+        let id = reg.insert(fd, dev, ino, false, false);
+        assert_eq!(reg.descriptor_usage().0, root_held + 1);
+
+        let inode = reg.get(id).unwrap();
+        assert!(inode.park());
+        assert_eq!(
+            reg.descriptor_usage().0,
+            root_held,
+            "parking must be counted"
+        );
+
+        inode.reference().expect("a parked inode must reopen");
+        assert_eq!(
+            reg.descriptor_usage().0,
+            root_held + 1,
+            "reviving must be counted too, or the tally drifts down forever"
+        );
+
+        drop(inode);
+        reg.forget(id, 1);
+        assert_eq!(
+            reg.descriptor_usage().0,
+            root_held,
+            "a forgotten inode must give its descriptor back"
+        );
+    }
+
+    /// The reclaim has to actually reclaim. It did not: parked at exactly the
+    /// budget, finding nothing to park, and re-sweeping every shard on every
+    /// insert — which turned a twelve-second package install into a
+    /// four-minute one and logged a hundred thousand warnings doing it.
+    ///
+    /// This is the shape of that failure, at a thousandth of the size.
+    #[test]
+    fn the_reclaim_keeps_a_share_under_its_budget() {
+        // SAFETY: single-threaded test setup, before any registry is built.
+        unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "256") };
+        let scratch = Scratch::new("budget");
+        let reg = scratch.registry();
+        assert_eq!(reg.descriptor_usage().1, 256);
+
+        for n in 0..2000 {
+            let (fd, dev, ino) = scratch.file(&format!("f{n}"));
+            reg.insert(fd, dev, ino, false, false);
+        }
+
+        let (open, budget) = reg.descriptor_usage();
+        unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+        assert!(
+            open <= budget + budget / 4,
+            "held {open} descriptors against a budget of {budget}"
+        );
+    }
+
+    /// A share bigger than one sweep can carry must still be kept under its
+    /// budget.
+    ///
+    /// Sized deliberately: the failure this catches only appears once a shard
+    /// holds more inodes than one sweep may take from it. Below that every
+    /// candidate fits in the batch and the reclaim looks fine. Above it the
+    /// batch filled with inodes that were *already* parked — permanently cold,
+    /// so chosen first every time, and refused by `park()` for having nothing
+    /// to park — and the sweep freed almost nothing while reporting sixteen
+    /// thousand candidates considered. Measured on a package install, 16,384
+    /// chosen and 27 parked.
+    #[test]
+    fn a_share_larger_than_one_sweep_is_still_kept_in_budget() {
+        // SAFETY: single-threaded test setup, before any registry is built.
+        unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "4096") };
+        let scratch = Scratch::new("big");
+        let reg = scratch.registry();
+
+        // More than SHARDS * SWEEP_TAKE, so no single sweep can empty a shard.
+        const FILES: usize = 24_000;
+        for n in 0..FILES {
+            let (fd, dev, ino) = scratch.file(&format!("b{n}"));
+            reg.insert(fd, dev, ino, false, false);
+        }
+
+        let (open, budget) = reg.descriptor_usage();
+        unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+        assert!(
+            open <= budget * 2,
+            "held {open} descriptors against a budget of {budget} over {FILES} inodes"
+        );
     }
 
     /// The budget has to be under what the kernel will actually allow, or it

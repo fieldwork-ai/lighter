@@ -329,6 +329,14 @@ impl Server {
     }
 
     /// Whether opcode counting is on.
+    /// How many metadata descriptors the share holds, and the most it may.
+    ///
+    /// Diagnostics, and the thing a test has to be able to see: a reclaim that
+    /// silently frees nothing looks exactly like one that was never needed.
+    pub fn descriptor_usage(&self) -> (usize, usize) {
+        self.registry.descriptor_usage()
+    }
+
     pub fn stats_enabled(&self) -> bool {
         self.stats.enabled()
     }
