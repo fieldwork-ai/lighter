@@ -41,7 +41,10 @@ unsafe extern "C" {
         mask: usize,
         queue: *mut c_void,
     ) -> *mut c_void;
-    fn dispatch_source_set_event_handler_f(source: *mut c_void, handler: extern "C" fn(*mut c_void));
+    fn dispatch_source_set_event_handler_f(
+        source: *mut c_void,
+        handler: extern "C" fn(*mut c_void),
+    );
     fn dispatch_source_get_data(source: *mut c_void) -> usize;
     fn dispatch_set_context(object: *mut c_void, context: *mut c_void);
     fn dispatch_resume(object: *mut c_void);

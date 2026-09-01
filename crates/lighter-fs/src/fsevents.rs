@@ -97,12 +97,7 @@ unsafe extern "C" {
         callbacks: *const c_void,
     ) -> CFRef;
     fn CFRelease(cf: CFRef);
-    fn CFStringGetCString(
-        string: CFRef,
-        buffer: *mut u8,
-        buffer_size: isize,
-        encoding: u32,
-    ) -> u8;
+    fn CFStringGetCString(string: CFRef, buffer: *mut u8, buffer_size: isize, encoding: u32) -> u8;
 
     static kCFTypeArrayCallBacks: c_void;
 
@@ -193,7 +188,10 @@ impl Watcher {
             )
         };
         if cf_path.is_null() {
-            return Err(format!("{} is not a path Core Foundation accepts", root.display()));
+            return Err(format!(
+                "{} is not a path Core Foundation accepts",
+                root.display()
+            ));
         }
         // SAFETY: a one-element array of the CFString just created, with Core
         // Foundation's own retain/release callbacks.
@@ -323,7 +321,8 @@ mod tests {
     }
 
     fn watched_root(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("lighter-watch-{name}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("lighter-watch-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // FSEvents reports resolved paths, and /var/folders is a symlink.
@@ -372,7 +371,10 @@ mod tests {
         let paths = seen.lock().unwrap().clone();
         drop(watcher);
         let _ = std::fs::remove_dir_all(&root);
-        assert!(found, "FSEvents never reported the write; it reported {paths:?}");
+        assert!(
+            found,
+            "FSEvents never reported the write; it reported {paths:?}"
+        );
     }
 
     /// The teardown race, run enough times to catch it. A stream torn down
@@ -442,6 +444,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(control, "the stream was not delivering events at all");
-        assert_eq!(ours, 0, "{ours} of our own writes came back as host activity");
+        assert_eq!(
+            ours, 0,
+            "{ours} of our own writes came back as host activity"
+        );
     }
 }

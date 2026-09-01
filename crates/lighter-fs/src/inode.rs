@@ -25,18 +25,32 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-
 
 /// The `nodeid` of a mount's root. Fixed by the protocol.
 pub const ROOT_ID: u64 = 1;
 
 /// One file, as long as the guest remembers it.
 pub struct Inode {
-    /// A metadata-only descriptor. Never read or written through; it exists so
-    /// the file can be found again after any amount of renaming.
-    pub fd: OwnedFd,
+    /// A metadata-only descriptor, or nothing if it has been parked.
+    ///
+    /// Shared rather than owned so that parking is never a race: a reclaimer
+    /// takes the `Arc` out of the slot, and the descriptor is closed by
+    /// whichever thread lets go of it last. A worker mid-syscall keeps it
+    /// alive without holding a lock for the duration.
+    fd: RwLock<Option<Arc<OwnedFd>>>,
+    /// Where the descriptor was, so it can be found again after parking.
+    ///
+    /// Only meaningful when the slot is empty, and only a hint even then:
+    /// whether it still names this file is settled by `(dev, ino)` after the
+    /// reopen, never assumed.
+    parked_at: Mutex<Option<PathBuf>>,
+    /// The reference bit of a clock: set on use, cleared as the reclaimer
+    /// passes. An inode found with it clear is one nothing has touched since
+    /// the last sweep.
+    used: AtomicBool,
     /// Host identity, which is what makes two paths to one file share a
     /// `nodeid` — as hard links must.
     pub dev: i64,
@@ -47,9 +61,90 @@ pub struct Inode {
     lookups: Mutex<u64>,
 }
 
-impl Inode {
+/// A descriptor borrowed from an inode for the length of one operation.
+///
+/// Holding it keeps the descriptor open even if the reclaimer parks the inode
+/// underneath — which is the whole point, because otherwise every call site
+/// would need to hold a lock across its syscall.
+pub struct Reference(Arc<OwnedFd>);
+
+impl Reference {
     pub fn raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.0.as_raw_fd()
+    }
+}
+
+impl Inode {
+    fn new(fd: OwnedFd, dev: i64, ino: u64, is_dir: bool, is_symlink: bool, lookups: u64) -> Inode {
+        Inode {
+            fd: RwLock::new(Some(Arc::new(fd))),
+            parked_at: Mutex::new(None),
+            used: AtomicBool::new(true),
+            dev,
+            ino,
+            is_dir,
+            is_symlink,
+            lookups: Mutex::new(lookups),
+        }
+    }
+
+    /// Borrows the descriptor, reopening it first if it was parked.
+    ///
+    /// The reopen is where a parked inode discovers it has been overtaken: the
+    /// path is reopened and the result checked against `(dev, ino)`, so a name
+    /// that now belongs to a different file produces `ESTALE` rather than
+    /// silent work on the wrong one.
+    pub fn reference(&self) -> Result<Reference, i32> {
+        self.used.store(true, Ordering::Relaxed);
+        if let Some(fd) = self.fd.read().expect("inode slot poisoned").as_ref() {
+            return Ok(Reference(fd.clone()));
+        }
+        let mut slot = self.fd.write().expect("inode slot poisoned");
+        // Another thread may have revived it between the two locks.
+        if let Some(fd) = slot.as_ref() {
+            return Ok(Reference(fd.clone()));
+        }
+        let path = self
+            .parked_at
+            .lock()
+            .expect("parked path poisoned")
+            .clone()
+            .ok_or(crate::errno::linux::ESTALE)?;
+        let fd = crate::sys::open_reference_path(&path, self.is_symlink)
+            .map_err(|_| crate::errno::linux::ESTALE)?;
+        match crate::sys::stat_fd(fd.as_raw_fd()) {
+            Ok(st) if st.st_ino == self.ino && st.st_dev as i64 == self.dev => {}
+            _ => return Err(crate::errno::linux::ESTALE),
+        }
+        let fd = Arc::new(fd);
+        *slot = Some(fd.clone());
+        Ok(Reference(fd))
+    }
+
+    /// Closes the descriptor, remembering where it was.
+    ///
+    /// Refuses for anything that could not be found again: a file with no
+    /// remaining links has no path, and its descriptor is the only way the
+    /// guest's open handle on it keeps working.
+    fn park(&self) -> bool {
+        let Some(fd) = self.fd.read().expect("inode slot poisoned").clone() else {
+            return false;
+        };
+        match crate::sys::stat_fd(fd.as_raw_fd()) {
+            Ok(st) if st.st_nlink > 0 => {}
+            _ => return false,
+        }
+        let Ok(path) = crate::sys::path_of(fd.as_raw_fd()) else {
+            return false;
+        };
+        drop(fd);
+        let mut slot = self.fd.write().expect("inode slot poisoned");
+        if slot.is_none() {
+            return false;
+        }
+        *self.parked_at.lock().expect("parked path poisoned") = Some(path);
+        *slot = None;
+        true
     }
 
     /// Whether this inode is still the file those numbers name.
@@ -68,7 +163,10 @@ impl Inode {
     /// opened on, so if that file has been unlinked its link count is zero, and
     /// if the number now belongs to something else the numbers no longer match.
     fn still_is(&self, dev: i64, ino: u64) -> bool {
-        match crate::sys::stat_fd(self.raw_fd()) {
+        let Ok(reference) = self.reference() else {
+            return false;
+        };
+        match crate::sys::stat_fd(reference.raw_fd()) {
             Ok(st) => st.st_nlink > 0 && st.st_ino == ino && st.st_dev as i64 == dev,
             Err(_) => false,
         }
@@ -162,22 +260,25 @@ pub struct Registry {
     handles: [Mutex<HashMap<u64, Arc<Handle>>>; SHARDS],
     next_id: AtomicU64,
     next_handle: AtomicU64,
+    /// How many metadata descriptors the inode table is holding open.
+    ///
+    /// An estimate, and deliberately so: it counts descriptors handed to
+    /// inodes rather than descriptors the kernel has, which is close enough to
+    /// steer a reclaim and cheap enough to keep on a hot path.
+    open_fds: AtomicUsize,
+    /// The most it may hold before parking the cold ones.
+    budget: usize,
+    /// Where the clock hand is, so successive sweeps cover every shard.
+    sweep: AtomicUsize,
 }
 
 impl Registry {
     /// Builds a registry whose root is `root_fd`.
     pub fn new(root_fd: OwnedFd, dev: i64, ino: u64) -> Registry {
-        let root = Arc::new(Inode {
-            fd: root_fd,
-            dev,
-            ino,
-            is_dir: true,
-            is_symlink: false,
-            // The root is never forgotten: the kernel does not FORGET nodeid 1,
-            // and a count that could reach zero would let a buggy guest drop it
-            // and take the whole mount with it.
-            lookups: Mutex::new(u64::MAX),
-        });
+        // The root is never forgotten: the kernel does not FORGET nodeid 1, and
+        // a count that could reach zero would let a buggy guest drop it and
+        // take the whole mount with it.
+        let root = Arc::new(Inode::new(root_fd, dev, ino, true, false, u64::MAX));
         let by_id: [Mutex<HashMap<u64, Arc<Inode>>>; SHARDS] =
             std::array::from_fn(|_| Mutex::new(HashMap::new()));
         by_id[shard(ROOT_ID)]
@@ -192,6 +293,9 @@ impl Registry {
             handles: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(ROOT_ID + 1),
             next_handle: AtomicU64::new(1),
+            open_fds: AtomicUsize::new(1),
+            budget: descriptor_budget(),
+            sweep: AtomicUsize::new(0),
         }
     }
 
@@ -291,15 +395,10 @@ impl Registry {
             .expect("inode table poisoned")
             .insert(
                 id,
-                Arc::new(Inode {
-                    fd,
-                    dev,
-                    ino,
-                    is_dir,
-                    is_symlink,
-                    lookups: Mutex::new(1),
-                }),
+                Arc::new(Inode::new(fd, dev, ino, is_dir, is_symlink, 1)),
             );
+        self.open_fds.fetch_add(1, Ordering::Relaxed);
+        self.reclaim_if_over_budget();
         id
     }
 
@@ -326,8 +425,12 @@ impl Registry {
             return;
         }
         let identity = (inode.dev, inode.ino);
+        let held = inode.fd.read().expect("inode slot poisoned").is_some();
         table.remove(&id);
         drop(table);
+        if held {
+            self.open_fds.fetch_sub(1, Ordering::Relaxed);
+        }
 
         let mut map = self.by_identity.write().expect("identity table poisoned");
         // Only unmap the identity if it still points at us: a file removed and
@@ -335,6 +438,56 @@ impl Registry {
         if map.get(&identity) == Some(&id) {
             map.remove(&identity);
         }
+    }
+
+    /// Parks cold inodes until the descriptor count is back under budget.
+    ///
+    /// A clock, not an LRU. Keeping a true recency order would mean a global
+    /// list every lookup has to move an entry in, which is exactly the kind of
+    /// shared write the sharded tables exist to avoid. A reference bit costs a
+    /// relaxed store on use and one pass to read, and the two agree about
+    /// which inodes are cold — which is all the decision needs.
+    ///
+    /// Sweeping is bounded: one pass over every shard, parking whatever it
+    /// finds cold and clearing the bit on the rest. If that is not enough the
+    /// next insert sweeps again, and the second pass sees the bits the first
+    /// one cleared. Refusing to loop here is what stops a share whose inodes
+    /// are genuinely all hot from spinning instead of running.
+    fn reclaim_if_over_budget(&self) {
+        if self.open_fds.load(Ordering::Relaxed) <= self.budget {
+            return;
+        }
+        let target = self.budget - self.budget / 8;
+        for _ in 0..SHARDS {
+            if self.open_fds.load(Ordering::Relaxed) <= target {
+                return;
+            }
+            let index = self.sweep.fetch_add(1, Ordering::Relaxed) % SHARDS;
+            // The inodes are cloned out under the lock and parked outside it:
+            // parking stats and closes a descriptor, and a shard lock held
+            // across those would stall every worker whose path runs through it.
+            let candidates: Vec<Arc<Inode>> = self.by_id[index]
+                .lock()
+                .expect("inode table poisoned")
+                .iter()
+                .filter(|&(&id, _)| id != ROOT_ID)
+                .map(|(_, inode)| inode.clone())
+                .collect();
+            for inode in candidates {
+                if inode.used.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                if inode.park() {
+                    self.open_fds.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// How many metadata descriptors are open, and the ceiling. Diagnostics
+    /// only.
+    pub fn descriptor_usage(&self) -> (usize, usize) {
+        (self.open_fds.load(Ordering::Relaxed), self.budget)
     }
 
     /// How many inodes are live. Diagnostics only.
@@ -375,6 +528,29 @@ impl Registry {
             .map(|shard| shard.lock().expect("handle table poisoned").len())
             .sum()
     }
+}
+
+/// How many metadata descriptors one share may hold open.
+///
+/// The guest decides how many inodes it remembers, and it is under no
+/// obligation to remember few: nothing pressures a dentry cache in an idle
+/// eight-gigabyte VM, so FORGET may never come for a tree the container walked
+/// once. Left unbounded, one descriptor per remembered inode meets
+/// `kern.maxfilesperproc` — which it does, three copies into a
+/// sixty-six-thousand-file package tree, and the guest sees `EMFILE` from
+/// `open` on a file that is plainly there.
+///
+/// So the descriptor is treated as what it is: a cache of where the file lives,
+/// not the file's identity. Identity is `(dev, ino)`, and a parked inode
+/// reopens by path and re-checks it.
+///
+/// Three quarters of the ceiling, less a reserve for everything else the
+/// process opens — the guest's open files, its directories, the VMM's disks,
+/// sockets and the network sidecar.
+fn descriptor_budget() -> usize {
+    const RESERVE: u64 = 8192;
+    let ceiling = crate::sys::descriptor_ceiling().saturating_sub(RESERVE);
+    ((ceiling / 4) * 3).max(1024) as usize
 }
 
 #[cfg(test)]
@@ -531,7 +707,10 @@ mod tests {
 
         // The name goes; our descriptor, and the guest's nodeid, remain.
         std::fs::remove_file(scratch.path().join("doomed")).unwrap();
-        assert!(reg.get(first).is_some(), "an unlinked open file must survive");
+        assert!(
+            reg.get(first).is_some(),
+            "an unlinked open file must survive"
+        );
 
         // A different file, which the filesystem has handed the same numbers.
         let (fresh, _, _) = scratch.file("successor");
@@ -551,12 +730,94 @@ mod tests {
     fn handles_are_issued_and_released() {
         let scratch = Scratch::new("handles");
         let reg = scratch.registry();
-        let fh = reg.add_handle(Handle::File(Arc::new(OpenFile { fd: spare_fd(), append: false, writable: true })));
+        let fh = reg.add_handle(Handle::File(Arc::new(OpenFile {
+            fd: spare_fd(),
+            append: false,
+            writable: true,
+        })));
         assert!(reg.handle(fh).is_some());
         assert_eq!(reg.handle_count(), 1);
         reg.release_handle(fh);
         assert!(reg.handle(fh).is_none());
         assert_eq!(reg.handle_count(), 0);
+    }
+
+    /// Parking is a descriptor decision, not an identity one: the inode keeps
+    /// answering to the same nodeid and the same numbers, and the next use
+    /// reopens it.
+    #[test]
+    fn a_parked_inode_comes_back() {
+        let scratch = Scratch::new("park-revive");
+        let reg = scratch.registry();
+        let (fd, dev, ino) = scratch.file("parked");
+        let id = reg.insert(fd, dev, ino, false, false);
+        let inode = reg.get(id).unwrap();
+
+        assert!(inode.park(), "an ordinary file must be parkable");
+        assert!(
+            inode.fd.read().unwrap().is_none(),
+            "parking must actually let the descriptor go"
+        );
+
+        let reference = inode.reference().expect("a parked inode must reopen");
+        let st = crate::sys::stat_fd(reference.raw_fd()).unwrap();
+        assert_eq!((st.st_dev as i64, st.st_ino), (dev, ino));
+    }
+
+    /// The path a descriptor was parked at is a hint, not a promise. If it now
+    /// names a different file the guest must be told its nodeid is stale
+    /// rather than handed the wrong file — which is the same failure APFS
+    /// inode reuse produces, arriving by a different route.
+    #[test]
+    fn a_parked_inode_whose_name_was_taken_is_stale() {
+        let scratch = Scratch::new("park-stolen");
+        let reg = scratch.registry();
+        let (fd, dev, ino) = scratch.file("victim");
+        let id = reg.insert(fd, dev, ino, false, false);
+        let inode = reg.get(id).unwrap();
+        assert!(inode.park());
+
+        let path = scratch.0.join("victim");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"someone else").unwrap();
+
+        assert_eq!(
+            inode.reference().err(),
+            Some(crate::errno::linux::ESTALE),
+            "a reopen that lands on another file must not be handed out"
+        );
+    }
+
+    /// An unlinked file has no path to be reopened by, and its descriptor is
+    /// the only thing keeping the guest's open handle working. Parking it
+    /// would lose the file.
+    #[test]
+    fn an_unlinked_inode_is_never_parked() {
+        let scratch = Scratch::new("park-unlinked");
+        let reg = scratch.registry();
+        let (fd, dev, ino) = scratch.file("doomed");
+        let id = reg.insert(fd, dev, ino, false, false);
+        std::fs::remove_file(scratch.0.join("doomed")).unwrap();
+
+        let inode = reg.get(id).unwrap();
+        assert!(
+            !inode.park(),
+            "a file with no links must keep its descriptor"
+        );
+        assert!(inode.reference().is_ok());
+    }
+
+    /// The budget has to be under what the kernel will actually allow, or it
+    /// is not a budget at all — which is how a package tree three copies deep
+    /// produced EMFILE inside the guest on a file that was plainly there.
+    #[test]
+    fn the_descriptor_budget_leaves_room() {
+        let budget = descriptor_budget() as u64;
+        let ceiling = crate::sys::descriptor_ceiling();
+        assert!(
+            budget < ceiling,
+            "budget {budget} must be under the ceiling {ceiling}"
+        );
     }
 
     /// Handle numbers are never reused. A stale `fh` from a released file must
@@ -565,9 +826,17 @@ mod tests {
     fn handle_numbers_are_not_recycled() {
         let scratch = Scratch::new("recycle");
         let reg = scratch.registry();
-        let first = reg.add_handle(Handle::File(Arc::new(OpenFile { fd: spare_fd(), append: false, writable: true })));
+        let first = reg.add_handle(Handle::File(Arc::new(OpenFile {
+            fd: spare_fd(),
+            append: false,
+            writable: true,
+        })));
         reg.release_handle(first);
-        let second = reg.add_handle(Handle::File(Arc::new(OpenFile { fd: spare_fd(), append: false, writable: true })));
+        let second = reg.add_handle(Handle::File(Arc::new(OpenFile {
+            fd: spare_fd(),
+            append: false,
+            writable: true,
+        })));
         assert_ne!(first, second);
     }
 }

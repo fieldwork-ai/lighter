@@ -316,7 +316,8 @@ impl crate::fsevents::Observer for Invalidator {
         if let Some((dev, ino)) = Invalidator::identity(path) {
             self.policy.touched(dev, ino);
             if let Some(nodeid) = self.registry.nodeid_for(dev, ino) {
-                self.sink.push(crate::notify::Notification::Inode { nodeid });
+                self.sink
+                    .push(crate::notify::Notification::Inode { nodeid });
             }
         }
 
@@ -357,8 +358,14 @@ mod tests {
     fn a_quiet_directory_gets_the_configured_validity() {
         let p = policy(2000);
         assert_eq!(p.validity(1, 2, Answer::File), Duration::from_millis(100));
-        assert_eq!(p.validity(1, 2, Answer::Directory), Duration::from_millis(1000));
-        assert_eq!(p.validity(1, 2, Answer::Missing), Duration::from_millis(100));
+        assert_eq!(
+            p.validity(1, 2, Answer::Directory),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            p.validity(1, 2, Answer::Missing),
+            Duration::from_millis(100)
+        );
         assert_eq!(p.attr_validity(1, 2), Duration::from_millis(100));
     }
 

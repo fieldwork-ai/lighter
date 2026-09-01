@@ -117,8 +117,7 @@ pub struct Watcher {
 impl Watcher {
     /// Starts watching. The callback runs on a thread of its own.
     pub fn start(observer: Box<dyn Observer>) -> Result<Watcher, String> {
-        let run_loop: Arc<std::sync::Mutex<Option<usize>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let run_loop: Arc<std::sync::Mutex<Option<usize>>> = Arc::new(std::sync::Mutex::new(None));
         let (ready, wait) = std::sync::mpsc::channel::<Result<Arc<Held>, String>>();
         let loop_slot = run_loop.clone();
 

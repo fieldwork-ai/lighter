@@ -153,8 +153,8 @@ pub fn status() -> anyhow::Result<Status> {
 /// hand-rolled client. The first version here spoke HTTP/1.0, which dockerd
 /// answers with a 500 — a detail worth exactly one discovery.
 pub fn docker_version(socket: &Path) -> anyhow::Result<String> {
-    let value = lighter_docker::http::get_json(socket, "/version")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let value =
+        lighter_docker::http::get_json(socket, "/version").map_err(|e| anyhow::anyhow!("{e}"))?;
     let version = value
         .get("Version")
         .and_then(|v| v.as_str())
@@ -184,7 +184,10 @@ fn footprint_mib(pid: u32) -> Option<u64> {
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
         .ok()?;
-    let kib: u64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    let kib: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
     Some(kib / 1024)
 }
 

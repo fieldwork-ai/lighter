@@ -253,7 +253,14 @@ impl EntryOut {
 
 /// Appends a `fuse_dirent`, padded to the 8-byte alignment the guest's parser
 /// assumes. Returns false if the entry would not fit in `budget`.
-pub fn push_dirent(out: &mut Vec<u8>, budget: usize, ino: u64, off: u64, kind: u32, name: &[u8]) -> bool {
+pub fn push_dirent(
+    out: &mut Vec<u8>,
+    budget: usize,
+    ino: u64,
+    off: u64,
+    kind: u32,
+    name: &[u8],
+) -> bool {
     let entry_len = dirent_len(name.len());
     if out.len() + entry_len > budget {
         return false;

@@ -108,8 +108,15 @@ impl Guest {
         let len = u32::from_le_bytes(reply[0..4].try_into().unwrap()) as usize;
         let error = i32::from_le_bytes(reply[4..8].try_into().unwrap());
         let unique = u64::from_le_bytes(reply[8..16].try_into().unwrap());
-        assert_eq!(unique, self.unique, "reply must name the request it answers");
-        assert_eq!(len, reply.len(), "header length must match what was written");
+        assert_eq!(
+            unique, self.unique,
+            "reply must name the request it answers"
+        );
+        assert_eq!(
+            len,
+            reply.len(),
+            "header length must match what was written"
+        );
         if error != 0 {
             return Err(-error);
         }
@@ -214,7 +221,8 @@ impl Guest {
                 }
                 let off = u64::from_le_bytes(reply[cursor + 8..cursor + 16].try_into().unwrap());
                 let namelen =
-                    u32::from_le_bytes(reply[cursor + 16..cursor + 20].try_into().unwrap()) as usize;
+                    u32::from_le_bytes(reply[cursor + 16..cursor + 20].try_into().unwrap())
+                        as usize;
                 let start = cursor + fuse::DIRENT_HEADER_LEN;
                 names.push(String::from_utf8_lossy(&reply[start..start + namelen]).into_owned());
                 offset = off;
@@ -273,7 +281,9 @@ fn appending_does_not_truncate() {
     let mut guest = Guest::new("append");
     std::fs::write(guest.host("log"), b"first\n").unwrap();
     let nodeid = guest.lookup(1, "log").unwrap();
-    let fh = guest.open(nodeid, 0o2001 /* O_WRONLY | O_APPEND */).unwrap();
+    let fh = guest
+        .open(nodeid, 0o2001 /* O_WRONLY | O_APPEND */)
+        .unwrap();
     // Without a reported open there is no append mode to remember, so the
     // guest kernel supplies the offset — which is what it does in practice.
     guest.write(nodeid, fh, 6, b"second\n").unwrap();

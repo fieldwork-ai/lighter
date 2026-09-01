@@ -126,11 +126,7 @@ pub fn run() -> Vec<Finding> {
             format!("{name} is selected, not {}", crate::context::NAME),
             "run `lighter start`, or `docker context use lighter`",
         ),
-        Ok(None) => Finding::bad(
-            "docker context",
-            "not registered",
-            "run `lighter start`",
-        ),
+        Ok(None) => Finding::bad("docker context", "not registered", "run `lighter start`"),
         Err(e) => Finding::bad("docker context", e.to_string(), "check the docker CLI"),
     });
 

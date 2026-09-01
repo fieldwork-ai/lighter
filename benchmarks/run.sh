@@ -39,6 +39,17 @@ TREE_CASES=" ripgrep find-walk copy-tree rm-rf "
 IMAGE="lighter-bench:1"
 KEEP=0
 ALLOW_NOISY=0
+# Where the fixture lives for a container target.
+#
+#   share — the Mac's own directory, bind-mounted in. What the suite is for.
+#   guest — a volume on the runtime's own disk, with no host filesystem in the
+#           picture at all.
+#
+# The second is not a comparison anybody ships, it is the decomposition: it
+# separates what the virtual machine costs from what sharing a filesystem with
+# it costs, and without that split every number is a sum of two things and
+# tuning aims at whichever one you guessed.
+WHERE="share"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -48,6 +59,7 @@ while [ $# -gt 0 ]; do
 	--keep)   KEEP=1; shift ;;
 	--label)  LABEL="$2"; shift 2 ;;
 	--allow-noisy) ALLOW_NOISY=1; shift ;;
+	--where)  WHERE="$2"; shift 2 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -58,6 +70,7 @@ WORK="${LIGHTER_BENCH_WORK:-$HOME/.lighter-bench/$TARGET}"
 # the second run overwriting the first — which is how the speed gate compares
 # caching on against caching off.
 RESULTS="benchmarks/results/${LABEL:-$TARGET}.csv"
+[ "$WHERE" = share ] || [ "$WHERE" = guest ] || { echo "--where wants share or guest, got $WHERE" >&2; exit 2; }
 VMM_PID=""
 HELPER_PID=""
 
@@ -97,6 +110,13 @@ check_exclusive() {
 	fi
 	if pgrep -x "OrbStack Helper" >/dev/null 2>&1 || pgrep -x "xbin" >/dev/null 2>&1; then
 		noisy+=("OrbStack")
+	fi
+	# Ours too. The `lighter` target starts a machine of its own, and a second
+	# one already running competes with it for exactly the resources being
+	# measured — which is the same objection as for anybody else's.
+	if [ -f "$HOME/.lighter/lighter.pid" ] \
+		&& kill -0 "$(cat "$HOME/.lighter/lighter.pid" 2>/dev/null)" 2>/dev/null; then
+		noisy+=("a lighter machine (stop it with \`lighter stop\`)")
 	fi
 	[ "${#noisy[@]}" -eq 0 ] && return 0
 
@@ -151,6 +171,39 @@ setup_native() {
 	command -v rg   >/dev/null || { echo "ripgrep is required for the native target" >&2; exit 1; }
 }
 
+# What gets mounted at /work inside a container.
+#
+# On `share` it is the host directory, which is the measurement. On `guest` it
+# is a named volume seeded from that directory once, so the case scripts see an
+# identical tree with no host filesystem underneath it.
+work_mount() {
+	if [ "$WHERE" = guest ]; then
+		echo "lighter-bench-work-$TARGET"
+	else
+		echo "$SHARE_MOUNT"
+	fi
+}
+
+# Copies the fixture onto the runtime's own disk, for `--where guest`.
+#
+# Not timed, and deliberately done with the same `docker cp` for every target:
+# the seeding is setup, and a target that seeded faster would be flattering
+# itself with work the cases are not measuring.
+seed_guest_volume() {
+	[ "$WHERE" = guest ] || return 0
+	local volume; volume="lighter-bench-work-$TARGET"
+	# Bash 3.2 — which is the one macOS ships — treats an empty array under
+	# `set -u` as unset, so an unadorned "${DOCKER_ARGS[@]}" aborts the run for
+	# every target that needs no context flag.
+	local dk=(docker); [ "${#DOCKER_ARGS[@]}" -eq 0 ] || dk=(docker "${DOCKER_ARGS[@]}")
+	"${dk[@]}" volume rm -f "$volume" >/dev/null 2>&1 || true
+	"${dk[@]}" volume create "$volume" >/dev/null
+	local id
+	id="$("${dk[@]}" create -v "$volume:/work" "$IMAGE" true)"
+	"${dk[@]}" cp "$WORK/." "$id:/work"
+	"${dk[@]}" rm "$id" >/dev/null
+}
+
 # Every target runs the same runner, which does its own timing and prints one
 # `TIME_MS` line per repetition.
 #
@@ -184,6 +237,7 @@ docker_context() {
 
 setup_container() {
 	local ctx; ctx="$(docker_context)"
+	SHARE_MOUNT="$WORK"
 	DOCKER_ARGS=()
 	[ -n "$ctx" ] && DOCKER_ARGS=(--context "$ctx")
 	docker "${DOCKER_ARGS[@]}" build -q -t "$IMAGE" benchmarks >/dev/null
@@ -193,6 +247,7 @@ setup_container() {
 	for cache in npm pnpm yarn; do
 		docker "${DOCKER_ARGS[@]}" volume create "lighter-bench-$cache-$TARGET" >/dev/null
 	done
+	seed_guest_volume
 }
 
 run_case_container() {
@@ -200,7 +255,7 @@ run_case_container() {
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
 	docker "${DOCKER_ARGS[@]}" run --rm \
-		-v "$WORK:/work" \
+		-v "$(work_mount)":/work \
 		-v "lighter-bench-npm-$TARGET:/root/.npm" \
 		-v "lighter-bench-pnpm-$TARGET:/root/.local/share/pnpm/store" \
 		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \
@@ -261,6 +316,7 @@ setup_lighter() {
 	# The share is mounted at a different path inside this guest than the host
 	# path, so the bind mount names the guest path.
 	SHARE_MOUNT="/mnt/bench"
+	seed_guest_volume
 }
 
 run_case_lighter() {
@@ -268,7 +324,7 @@ run_case_lighter() {
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
 	docker run --rm \
-		-v "$SHARE_MOUNT:/work" \
+		-v "$(work_mount)":/work \
 		-v "lighter-bench-npm-$TARGET:/root/.npm" \
 		-v "lighter-bench-pnpm-$TARGET:/root/.local/share/pnpm/store" \
 		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \

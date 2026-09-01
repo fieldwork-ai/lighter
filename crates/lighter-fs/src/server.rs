@@ -122,11 +122,7 @@ impl Server {
     /// Opens `root` with explicit caching policies for both cases: what may be
     /// promised when the guest cannot be corrected, and what may be promised
     /// when it can.
-    pub fn with_timings(
-        root: &Path,
-        polled: Timings,
-        pushed: Timings,
-    ) -> std::io::Result<Server> {
+    pub fn with_timings(root: &Path, polled: Timings, pushed: Timings) -> std::io::Result<Server> {
         // A share holds a descriptor per remembered inode and per open file,
         // and macOS starts every process at 256 of them.
         let descriptors = sys::raise_file_limit();
@@ -220,7 +216,9 @@ impl Server {
         };
         // The header's own length field bounds the body; a guest that lied
         // about it must not let us read the tail of the previous request.
-        let end = (header.len as usize).min(request.len()).max(fuse::IN_HEADER_LEN);
+        let end = (header.len as usize)
+            .min(request.len())
+            .max(fuse::IN_HEADER_LEN);
         let body = &request[fuse::IN_HEADER_LEN..end];
 
         // FORGET is the only shape with no reply: the guest sends no writable
@@ -487,22 +485,21 @@ impl Server {
 
     /// The live host path of an inode, as a C string.
     fn path(&self, inode: &Inode) -> Result<CString, i32> {
-        sys::c_path(&sys::path_of(&inode.fd)?)
+        sys::c_path(&sys::path_of(inode.reference()?.raw_fd())?)
     }
 
     /// Looks a name up under `parent` and registers it, producing the reply
     /// body that LOOKUP, CREATE, MKDIR and friends all end with.
     fn entry(&self, parent: &Inode, name: &CString) -> Result<EntryOut, i32> {
-        let st = sys::stat_at(parent.raw_fd(), name)?;
+        let st = sys::stat_at(parent.reference()?.raw_fd(), name)?;
         self.entry_from(parent, name, st)
     }
 
     /// [`Server::entry`], for a caller that already has the `stat`.
     fn entry_from(&self, parent: &Inode, name: &CString, st: libc::stat) -> Result<EntryOut, i32> {
         self.entry_with_reference(parent, st, || {
-            let is_symlink =
-                st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
-            sys::open_reference(parent.raw_fd(), name, is_symlink)
+            let is_symlink = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
+            sys::open_reference(parent.reference()?.raw_fd(), name, is_symlink)
         })
     }
 
@@ -534,7 +531,11 @@ impl Server {
 
         // Validity is asked of the *parent*, because that is what the host
         // would have had to change for this name to mean something else.
-        let answer = if is_dir { Answer::Directory } else { Answer::File };
+        let answer = if is_dir {
+            Answer::Directory
+        } else {
+            Answer::File
+        };
         let entry_valid = self.policy.validity(parent.dev, parent.ino, answer);
         let attr_valid = self.policy.attr_validity(dev, ino);
         Ok(EntryOut {
@@ -557,7 +558,9 @@ impl Server {
     /// how the protocol spells it; with no validity it is just ENOENT, which
     /// is what an unwatched share falls back to.
     fn missing(&self, parent: &Inode) -> Result<Vec<u8>, i32> {
-        let valid = self.policy.validity(parent.dev, parent.ino, Answer::Missing);
+        let valid = self
+            .policy
+            .validity(parent.dev, parent.ino, Answer::Missing);
         if valid.is_zero() {
             return Err(linux::ENOENT);
         }
@@ -633,9 +636,7 @@ impl Server {
     }
 
     fn attr_reply(&self, st: &libc::stat) -> Vec<u8> {
-        let valid = self
-            .policy
-            .attr_validity(st.st_dev as i64, st.st_ino);
+        let valid = self.policy.attr_validity(st.st_dev as i64, st.st_ino);
         let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
         out.extend_from_slice(&valid.as_secs().to_le_bytes());
         out.extend_from_slice(&valid.subsec_nanos().to_le_bytes());
@@ -673,7 +674,7 @@ impl Server {
             sys::stat_fd(fd)?
         } else {
             let inode = self.inode(nodeid)?;
-            sys::stat_fd(inode.raw_fd())?
+            sys::stat_fd(inode.reference()?.raw_fd())?
         };
         Ok(self.attr_reply(&st))
     }
@@ -754,7 +755,7 @@ impl Server {
             sys::truncate_fd(file.fd.as_raw_fd(), size)?;
         }
 
-        let st = sys::stat_fd(inode.raw_fd())?;
+        let st = sys::stat_fd(inode.reference()?.raw_fd())?;
         Ok(self.attr_reply(&st))
     }
 
@@ -775,7 +776,7 @@ impl Server {
         let (target, _) = get_name(rest).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let target = CString::new(target).map_err(|_| linux::EINVAL)?;
-        sys::symlink_at(&target, parent.raw_fd(), &name)?;
+        sys::symlink_at(&target, parent.reference()?.raw_fd(), &name)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
@@ -787,7 +788,7 @@ impl Server {
         let umask = get_u32(body, 8).unwrap_or(0);
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        sys::mknod_at(&parent.fd, &name, mode & !umask, rdev)?;
+        sys::mknod_at(parent.reference()?.raw_fd(), &name, mode & !umask, rdev)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
@@ -798,7 +799,7 @@ impl Server {
         let umask = get_u32(body, 4).unwrap_or(0);
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        sys::mkdir_at(parent.raw_fd(), &name, mode & 0o7777 & !umask)?;
+        sys::mkdir_at(parent.reference()?.raw_fd(), &name, mode & 0o7777 & !umask)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
@@ -807,7 +808,7 @@ impl Server {
         let parent = self.directory(parent)?;
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        sys::unlink_at(parent.raw_fd(), &name, dir)?;
+        sys::unlink_at(parent.reference()?.raw_fd(), &name, dir)?;
         Ok(Vec::new())
     }
 
@@ -828,9 +829,9 @@ impl Server {
         let old = self.checked_name(old)?;
         let new = self.checked_name(new)?;
         sys::rename_at(
-            old_parent.raw_fd(),
+            old_parent.reference()?.raw_fd(),
             &old,
-            new_parent.raw_fd(),
+            new_parent.reference()?.raw_fd(),
             &new,
             flags,
         )?;
@@ -847,7 +848,7 @@ impl Server {
         // by its live path — which is correct even if it has been renamed since
         // the guest looked it up.
         let source = self.path(&target)?;
-        sys::link_at(libc::AT_FDCWD, &source, parent.raw_fd(), &name)?;
+        sys::link_at(libc::AT_FDCWD, &source, parent.reference()?.raw_fd(), &name)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
@@ -890,7 +891,7 @@ impl Server {
         // are only ever read, and asking for write access to a read-only file
         // fails outright rather than degrading.
         let flags = if need_write { 2 } else { 0 };
-        let fd = sys::reopen(&inode.fd, flags, 0)?;
+        let fd = sys::reopen(inode.reference()?.raw_fd(), flags, 0)?;
         let file = Arc::new(OpenFile {
             fd,
             append: false,
@@ -917,7 +918,7 @@ impl Server {
     fn list(&self, nodeid: u64) -> Result<Vec<sys::DirEntry>, i32> {
         let inode = self.directory(nodeid)?;
         // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
-        let fd = sys::reopen(&inode.fd, 0o200000, 0)?;
+        let fd = sys::reopen(inode.reference()?.raw_fd(), 0o200000, 0)?;
         sys::Dir::from_fd(fd)?.read_all()
     }
 
@@ -933,7 +934,7 @@ impl Server {
         // with ENOENT for a file the operation was supposed to make.
         const LINUX_O_CREAT: u32 = 0o100;
         let fd = sys::openat_path(
-            parent.raw_fd(),
+            parent.reference()?.raw_fd(),
             &name,
             flags | LINUX_O_CREAT,
             mode & 0o7777 & !umask,
@@ -1063,14 +1064,7 @@ impl Server {
                     None => out.resize(out.len() + fuse::ENTRY_OUT_LEN, 0),
                 }
             }
-            if !fuse::push_dirent(
-                &mut out,
-                budget,
-                entry.ino,
-                next,
-                entry.kind,
-                &entry.name,
-            ) {
+            if !fuse::push_dirent(&mut out, budget, entry.ino, next, entry.kind, &entry.name) {
                 // Only reachable in the plain READDIR case; the READDIRPLUS
                 // path checked the whole record above.
                 break;
@@ -1217,4 +1211,3 @@ fn write_error(sink: &mut dyn Sink, unique: u64, code: i32) -> usize {
     }
     fuse::OUT_HEADER_LEN
 }
-

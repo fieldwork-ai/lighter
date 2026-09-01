@@ -94,10 +94,7 @@ impl Kicks {
             if self.stopped.load(Ordering::Acquire) {
                 return false;
             }
-            pending = self
-                .arrived
-                .wait(pending)
-                .expect("poller signal poisoned");
+            pending = self.arrived.wait(pending).expect("poller signal poisoned");
         }
         *pending = false;
         !self.stopped.load(Ordering::Acquire)
@@ -109,7 +106,10 @@ impl Kicks {
 /// The default is zero, which is off. Setting it enables an experiment that
 /// currently hangs the guest; see the note at the top of the file.
 fn idle_window() -> std::time::Duration {
-    match std::env::var("LIGHTER_HOST_POLL_US").ok().and_then(|v| v.parse().ok()) {
+    match std::env::var("LIGHTER_HOST_POLL_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         Some(micros) => std::time::Duration::from_micros(micros),
         None => IDLE_WINDOW,
     }
@@ -211,6 +211,9 @@ mod tests {
         let waiter = std::thread::spawn(move || signal.wait());
         std::thread::sleep(Duration::from_millis(20));
         kicks.stop();
-        assert!(!waiter.join().unwrap(), "a stopped poller must not report work");
+        assert!(
+            !waiter.join().unwrap(),
+            "a stopped poller must not report work"
+        );
     }
 }

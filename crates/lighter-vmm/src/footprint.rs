@@ -63,9 +63,8 @@ unsafe extern "C" {
 /// This process's physical footprint, in bytes. Zero if it cannot be read.
 pub fn bytes() -> u64 {
     let mut info = TaskVmInfo::default();
-    let mut count = TASK_VM_INFO_COUNT.min(
-        (std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<u32>()) as libc::c_uint,
-    );
+    let mut count = TASK_VM_INFO_COUNT
+        .min((std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<u32>()) as libc::c_uint);
     // SAFETY: an output buffer we own, and a count that says how much of it the
     // kernel may fill — which is the whole contract of `task_info`.
     let rc = unsafe {

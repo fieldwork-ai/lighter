@@ -45,9 +45,8 @@ pub fn machine() -> anyhow::Result<()> {
     // The guest is told where to mount each share, and what time it is. It has
     // no real-time clock, so without the second one every TLS handshake fails
     // with a complaint about a certificate.
-    let mut cmdline = String::from(
-        "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t",
-    );
+    let mut cmdline =
+        String::from("console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t");
     cmdline.push_str(&format!(
         " lighter.time={}",
         std::time::SystemTime::now()
@@ -56,7 +55,11 @@ pub fn machine() -> anyhow::Result<()> {
             .unwrap_or(0)
     ));
     for share in &shares {
-        cmdline.push_str(&format!(" lighter.share={}:{}", share.tag, share.path.display()));
+        cmdline.push_str(&format!(
+            " lighter.share={}:{}",
+            share.tag,
+            share.path.display()
+        ));
     }
 
     let machine_config = MachineConfig {
@@ -147,7 +150,10 @@ fn install_signal_handler() {
     // SAFETY: installing a handler for SIGTERM and SIGINT. The handler does
     // nothing but set a flag and write to a self-pipe-free path — see below.
     unsafe {
-        libc::signal(libc::SIGTERM, handle_stop as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            handle_stop as *const () as libc::sighandler_t,
+        );
         libc::signal(libc::SIGINT, handle_stop as *const () as libc::sighandler_t);
     }
 }

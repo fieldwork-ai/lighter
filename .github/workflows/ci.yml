@@ -1,0 +1,34 @@
+name: ci
+
+# GitHub's macOS runners are themselves virtual machines with no nested
+# virtualization, so nothing here can start a guest. That is a real limit and
+# it is stated rather than worked around: the unit tests run here, and the
+# gates — which boot real machines and check real claims — run on hardware.
+# `make gates` is the CI of record.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Lints
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        # The hypervisor-backed tests are marked `#[ignore]` and skipped here;
+        # `make test-hv` runs them where there is a hypervisor to talk to.
+        run: cargo test --all
+      - name: Shell scripts parse
+        run: |
+          for script in scripts/*.sh scripts/gates/*.sh benchmarks/*.sh guest/*/build.sh; do
+            bash -n "$script"
+          done

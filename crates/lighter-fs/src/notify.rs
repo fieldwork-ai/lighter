@@ -187,7 +187,11 @@ mod tests {
         let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let code = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let unique = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        assert_eq!(len, bytes.len(), "the header must describe the whole message");
+        assert_eq!(
+            len,
+            bytes.len(),
+            "the header must describe the whole message"
+        );
         assert_eq!(code, code::INVAL_ENTRY);
         assert_eq!(unique, 0, "a notification is not a reply to anything");
 

@@ -34,6 +34,9 @@ pub mod linux {
     pub const EPROTO: i32 = 71;
     pub const EOVERFLOW: i32 = 75;
     pub const EOPNOTSUPP: i32 = 95;
+    /// What a parked inode returns when the path it was parked at now names
+    /// something else. The guest re-looks-up rather than failing the syscall.
+    pub const ESTALE: i32 = 116;
 }
 
 /// Maps a macOS `errno` to the Linux value with the same meaning.
@@ -47,8 +50,8 @@ pub fn to_linux(host: i32) -> i32 {
         return host;
     }
     match host {
-        libc::EAGAIN => 11,          // == EWOULDBLOCK on macOS (35)
-        libc::EDEADLK => 35,         // macOS 11
+        libc::EAGAIN => 11,  // == EWOULDBLOCK on macOS (35)
+        libc::EDEADLK => 35, // macOS 11
         libc::ENOTSOCK => 88,
         libc::EDESTADDRREQ => 89,
         libc::EMSGSIZE => 90,
@@ -115,9 +118,17 @@ mod tests {
     /// unmapped, produces a specific and very confusing lie.
     #[test]
     fn the_divergent_values_are_mapped() {
-        assert_eq!(to_linux(libc::ENOTEMPTY), 39, "macOS 66 is EDESTADDRREQ-ish nonsense on Linux");
+        assert_eq!(
+            to_linux(libc::ENOTEMPTY),
+            39,
+            "macOS 66 is EDESTADDRREQ-ish nonsense on Linux"
+        );
         assert_eq!(to_linux(libc::ENOSYS), 38);
-        assert_eq!(to_linux(libc::ENODATA), 61, "macOS ENOATTR must become Linux ENODATA");
+        assert_eq!(
+            to_linux(libc::ENODATA),
+            61,
+            "macOS ENOATTR must become Linux ENODATA"
+        );
         assert_eq!(to_linux(libc::ELOOP), 40);
         assert_eq!(to_linux(libc::ENAMETOOLONG), 36);
     }

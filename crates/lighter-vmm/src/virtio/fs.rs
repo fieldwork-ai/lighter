@@ -292,7 +292,6 @@ impl Pool {
                 .name(format!("fs-{tag}-{index}"))
                 .spawn(move || {
                     while let Some(job) = queue.pop() {
-
                         let mut sink = ChainSink::new(memory.clone(), job.reply);
                         let written = server.dispatch(&job.request, &mut sink);
                         done.lock()
@@ -394,7 +393,10 @@ impl Fs {
     /// descriptor flags rather than by position, because trusting the guest's
     /// ordering would let a malformed chain make us write into a buffer it
     /// meant us to read.
-    fn split(memory: &GuestMemory, chain: impl Iterator<Item = Descriptor>) -> (Vec<u8>, Vec<(u64, u32)>) {
+    fn split(
+        memory: &GuestMemory,
+        chain: impl Iterator<Item = Descriptor>,
+    ) -> (Vec<u8>, Vec<(u64, u32)>) {
         let mut request = Vec::new();
         let mut reply = Vec::new();
         for desc in chain {

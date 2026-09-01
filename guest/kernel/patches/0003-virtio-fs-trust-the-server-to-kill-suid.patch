@@ -1,0 +1,58 @@
+fuse: stop asking for security.capability the server already promised to clear
+
+FUSE_HANDLE_KILLPRIV_V2 is a connection-wide promise that the *server* strips
+setuid, setgid and file capabilities when a file is written: every write below
+carries FUSE_WRITE_KILL_SUIDGID and every truncating open carries
+FUSE_OPEN_KILL_SUIDGID. The kernel has delegated the job.
+
+It does it anyway. `fuse_file_write_iter`'s writethrough path — which is every
+buffered write on a connection without writeback caching — calls
+`file_remove_privs()` unconditionally, and the only shortcut that would make
+that cheap is unavailable here: `fuse_change_attributes_common()` clears
+S_NOSEC on *every* attribute refresh, so IS_NOSEC() is false for any inode that
+has ever been looked up. The result is two `getxattr("security.capability")`
+round trips per write, asking a question whose answer the connection has
+already been told not to care about.
+
+On a virtio-fs share where a round trip crosses into another address space,
+that is not a micro-optimisation. Extracting a 66,000-file package tree makes
+one such pair per written file, ten percent of all requests, and every one of
+them is answered ENODATA.
+
+So skip it when there is nothing local to do: the connection handles killpriv
+and the file carries no setuid or setgid bit. A file that *does* carry one
+still takes the original path, so the case where `file_remove_privs()` would
+have changed something behaves exactly as before.
+
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1430,9 +1430,25 @@
+ 
+ 	task_io_account_write(count);
+ 
+-	err = file_remove_privs(file);
+-	if (err)
+-		goto out;
++	/*
++	 * With FUSE_HANDLE_KILLPRIV_V2 the server strips setuid, setgid and
++	 * file capabilities itself — fuse_send_write_pages() sets
++	 * FUSE_WRITE_KILL_SUIDGID on every write, and fuse_send_open() sets
++	 * FUSE_OPEN_KILL_SUIDGID on a truncating open. Doing it here as well
++	 * is not belt and braces: file_remove_privs() reads
++	 * security.capability, and because fuse_change_attributes_common()
++	 * clears S_NOSEC on every attribute refresh the VFS fast path that
++	 * would normally skip that read never survives a lookup. On a
++	 * virtio-fs share it is two round trips per write, answered ENODATA.
++	 *
++	 * A file that actually carries a setuid or setgid bit still takes the
++	 * original path, so the only behaviour that changes is the question
++	 * nobody was going to act on.
++	 */
++	if (!fc->handle_killpriv_v2 || setattr_should_drop_suidgid(idmap, inode)) {
++		err = file_remove_privs(file);
++		if (err)
++			goto out;
++	}
+ 
+ 	err = file_update_time(file);
+ 	if (err)

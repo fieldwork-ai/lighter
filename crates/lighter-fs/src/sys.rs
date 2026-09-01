@@ -116,11 +116,11 @@ fn cpath(path: &Path) -> Result<CString> {
 /// This is what stands in for `/proc/self/fd`, and it is better than the Linux
 /// original in one respect: it is resolved from the vnode at call time, so a
 /// file renamed since it was opened reports its new path.
-pub fn path_of(fd: &OwnedFd) -> Result<PathBuf> {
+pub fn path_of(fd: RawFd) -> Result<PathBuf> {
     let mut buf = [0i8; libc::PATH_MAX as usize];
     // SAFETY: `buf` is PATH_MAX bytes, which is the size F_GETPATH documents
     // as required, and `fd` is a live descriptor for the call's duration.
-    check(unsafe { libc::fcntl(fd.as_raw_fd(), F_GETPATH, buf.as_mut_ptr()) })?;
+    check(unsafe { libc::fcntl(fd, F_GETPATH, buf.as_mut_ptr()) })?;
     // SAFETY: F_GETPATH NUL-terminates on success.
     let bytes = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_bytes();
     Ok(PathBuf::from(OsStr::from_bytes(bytes).to_os_string()))
@@ -143,6 +143,45 @@ pub fn open_reference(parent: RawFd, name: &CStr, is_symlink: bool) -> Result<Ow
     let raw = check(unsafe { libc::openat(parent, name.as_ptr(), flags) })?;
     // SAFETY: `openat` returned a fresh descriptor that nothing else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Opens a metadata-only reference to an absolute path.
+///
+/// The parking half of [`crate::inode::Inode`]: a descriptor that was closed to
+/// stay under the process limit is reopened by the path it was last known by.
+/// Whether that path still names the same file is the caller's question to ask,
+/// not this function's to answer.
+pub fn open_reference_path(path: &Path, is_symlink: bool) -> Result<OwnedFd> {
+    let flags = if is_symlink {
+        O_SYMLINK | libc::O_CLOEXEC | libc::O_NONBLOCK
+    } else {
+        O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+    };
+    let name = cpath(path)?;
+    // SAFETY: `name` is a valid NUL-terminated string.
+    let raw = check(unsafe { libc::open(name.as_ptr(), flags) })?;
+    // SAFETY: `open` returned a fresh descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// The ceiling macOS puts on one process's open descriptors.
+///
+/// `setrlimit` is not the whole story: the kernel also enforces
+/// `kern.maxfilesperproc`, and an `openat` past it fails with `EMFILE` however
+/// generous the rlimit was. The share's descriptor budget is derived from this
+/// number, so it has to be the real one.
+pub fn descriptor_ceiling() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: an output buffer we own, of the right type.
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        limit.rlim_cur
+    } else {
+        u64::MAX
+    };
+    soft.min(sysctl_u64(c"kern.maxfilesperproc").unwrap_or(10_240))
 }
 
 /// Raises this process's descriptor limit as far as the system allows.
@@ -231,7 +270,7 @@ pub fn open_root(path: &Path) -> Result<OwnedFd> {
 }
 
 /// Re-opens an inode for real I/O, at whatever path it currently occupies.
-pub fn reopen(reference: &OwnedFd, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+pub fn reopen(reference: RawFd, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
     let path = path_of(reference)?;
     open_path(&path, linux_flags, mode)
 }
@@ -321,9 +360,7 @@ pub fn stat_at(parent: RawFd, name: &CStr) -> Result<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: valid name, live descriptor, and `st` is a correctly-sized
     // output buffer we own.
-    check(unsafe {
-        libc::fstatat(parent, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
-    })?;
+    check(unsafe { libc::fstatat(parent, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
     Ok(st)
 }
 
@@ -409,13 +446,12 @@ pub fn readlink_at(parent: RawFd, name: &CStr) -> Result<Vec<u8>> {
 /// between reading the path and using it is the same window every other
 /// path-based syscall has, and the alternative is not supporting device nodes
 /// and FIFOs at all.
-pub fn mknod_at(parent: &OwnedFd, name: &CStr, mode: u32, rdev: u32) -> Result<()> {
+pub fn mknod_at(parent: RawFd, name: &CStr, mode: u32, rdev: u32) -> Result<()> {
     let mut path = path_of(parent)?;
     path.push(OsStr::from_bytes(name.to_bytes()));
     let c = cpath(&path)?;
     // SAFETY: a valid NUL-terminated path.
-    check(unsafe { libc::mknod(c.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t) })
-        .map(|_| ())
+    check(unsafe { libc::mknod(c.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t) }).map(|_| ())
 }
 
 pub fn chmod_at(parent: RawFd, name: &CStr, mode: u32) -> Result<()> {
@@ -477,7 +513,12 @@ pub fn utimes_at(parent: RawFd, name: &CStr, atime: TimeSpec, mtime: TimeSpec) -
     // SAFETY: valid name, live descriptor, and a two-element array which is
     // what `utimensat` reads.
     check(unsafe {
-        libc::utimensat(parent, name.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        libc::utimensat(
+            parent,
+            name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
     })
     .map(|_| ())
 }
@@ -875,7 +916,7 @@ mod tests {
     fn a_descriptor_reports_its_own_path() {
         let dir = std::env::temp_dir();
         let fd = open_root(&dir).unwrap();
-        let reported = path_of(&fd).unwrap();
+        let reported = path_of(fd.as_raw_fd()).unwrap();
         assert!(
             reported.starts_with("/"),
             "F_GETPATH must give an absolute path, got {reported:?}"
