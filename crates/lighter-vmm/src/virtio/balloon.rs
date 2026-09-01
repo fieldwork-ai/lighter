@@ -25,7 +25,22 @@ use crate::virtio::{Serviced, VirtioDevice, device_type};
 /// The balloon counts in 4 KiB units regardless of the guest's page size.
 pub const BALLOON_PAGE_SIZE: u64 = 4096;
 
-// Queue indices.
+// Queue indices, which depend on the transport and not only on the device.
+//
+// The balloon driver asks for five queues by name — inflate, deflate, stats,
+// free-page-hint, reporting — and leaves the names of the ones its negotiated
+// features do not call for as NULL. What happens next is where the two virtio
+// transports part company. PCI honours the positions, so an unoffered stats
+// queue leaves a hole and reporting stays at index four. **virtio-mmio
+// compacts**: `vm_find_vqs` advances its index only for queues that have a
+// name, so with stats and free-page-hint unoffered, reporting arrives as index
+// two.
+//
+// We are mmio, so reporting is two. Assuming otherwise costs nothing visible:
+// the guest kicks a queue the device is not watching, the driver blocks
+// forever in `wait_event` waiting for a buffer that is never returned, and
+// free page reporting stops after its very first attempt — with no error
+// anywhere and a guest that holds every page it has ever touched.
 const QUEUE_INFLATE: u16 = 0;
 const QUEUE_DEFLATE: u16 = 1;
 const QUEUE_REPORTING: u16 = 2;
@@ -47,6 +62,12 @@ pub struct BalloonState {
     actual_pages: AtomicU32,
     /// Bytes released through free page reporting since boot.
     reported_bytes: std::sync::atomic::AtomicU64,
+    /// Bytes the guest *offered*, whether or not the host took them.
+    ///
+    /// The two apart are what tells "the guest is not reporting" from "the
+    /// guest reported and macOS would not take the pages back" — which look
+    /// identical from outside and have nothing in common as problems.
+    offered_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl BalloonState {
@@ -64,6 +85,11 @@ impl BalloonState {
 
     pub fn reported_bytes(&self) -> u64 {
         self.reported_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the guest has offered back, whether or not the host took them.
+    pub fn offered_bytes(&self) -> u64 {
+        self.offered_bytes.load(Ordering::Relaxed)
     }
 
     /// Bytes the guest is currently holding out of use on our behalf.
@@ -183,9 +209,14 @@ impl Balloon {
         while let Some(chain) = queue.pop(mem) {
             let head = chain.head();
             let mut released = 0u64;
+            let mut offered = 0u64;
             for desc in chain {
+                offered += u64::from(desc.len);
                 released += mem.release(desc.addr, u64::from(desc.len)).unwrap_or(0);
             }
+            self.state
+                .offered_bytes
+                .fetch_add(offered, Ordering::Relaxed);
             if released > 0 {
                 self.state
                     .reported_bytes
@@ -219,8 +250,9 @@ impl VirtioDevice for Balloon {
     }
 
     fn queue_count(&self) -> usize {
-        // inflate, deflate, and reporting. The stats queue is deliberately not
-        // offered: it would only feed a metric nothing acts on.
+        // Three: inflate, deflate and reporting, in the order this transport
+        // hands them out. See the note on the constants — under mmio there is
+        // no gap for the stats queue we do not offer.
         3
     }
 
@@ -236,18 +268,21 @@ impl VirtioDevice for Balloon {
     }
 
     fn notify(&mut self, queue: u16, queues: &mut [Virtqueue], mem: &GuestMemory) -> Serviced {
+        // Indexed by the queue that was notified, never by a number written out
+        // a second time. Writing it twice is how this came to match on
+        // `QUEUE_REPORTING` and then drain a different queue entirely — which
+        // costs nothing visible, because the queue it drained was one the guest
+        // never makes ready, so the reporting simply never happened.
+        let Some(ring) = queues.get_mut(queue as usize) else {
+            tracing::debug!(queue, "balloon notified on a queue it does not have");
+            return Serviced::NONE;
+        };
         let used_any = match queue {
-            QUEUE_INFLATE => queues
-                .get_mut(0)
-                .is_some_and(|q| self.drain_pfn_queue_at(q, mem, true)),
-            QUEUE_DEFLATE => queues
-                .get_mut(1)
-                .is_some_and(|q| self.drain_pfn_queue_at(q, mem, false)),
-            QUEUE_REPORTING => queues
-                .get_mut(2)
-                .is_some_and(|q| self.drain_reporting_queue_at(q, mem)),
+            QUEUE_INFLATE => self.drain_pfn_queue_at(ring, mem, true),
+            QUEUE_DEFLATE => self.drain_pfn_queue_at(ring, mem, false),
+            QUEUE_REPORTING => self.drain_reporting_queue_at(ring, mem),
             other => {
-                tracing::debug!(queue = other, "balloon notified on an unknown queue");
+                tracing::debug!(queue = other, "balloon notified on an unused queue");
                 false
             }
         };

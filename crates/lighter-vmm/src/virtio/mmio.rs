@@ -74,6 +74,9 @@ pub struct VirtioMmio {
     config_generation: u32,
     /// Set once `DRIVER_OK` has been seen, so activation happens exactly once.
     activated: bool,
+    /// Called when the guest writes the notification register. See
+    /// [`VirtioMmio::set_kick_observer`].
+    kick_observer: Option<Arc<dyn Fn(u16) + Send + Sync>>,
 }
 
 impl VirtioMmio {
@@ -99,6 +102,7 @@ impl VirtioMmio {
             interrupt_status: 0,
             config_generation: 0,
             activated: false,
+            kick_observer: None,
         }
     }
 
@@ -257,7 +261,15 @@ impl VirtioMmio {
                     );
                 }
             }
-            QUEUE_NOTIFY => self.notify_queue(value as u16),
+            QUEUE_NOTIFY => {
+                // A real kick, as distinct from a host thread deciding to look
+                // at the ring. Only this tells us the guest has started asking
+                // for things, which is when a poller is worth waking.
+                if let Some(observer) = &self.kick_observer {
+                    observer(value as u16);
+                }
+                self.notify_queue(value as u16)
+            }
             INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
             }
@@ -304,6 +316,47 @@ impl VirtioMmio {
     /// vsock peer) push completions without the guest notifying first.
     pub fn service_queue(&mut self, index: u16) {
         self.notify_queue(index);
+    }
+
+    /// Services a queue if the driver has left anything on it, without having
+    /// been notified. Returns whether there was anything to do.
+    ///
+    /// This is the host half of busy-polling: paired with
+    /// [`VirtioMmio::suppress_notifications`], a request can cross into the
+    /// VMM with no trap at all.
+    /// Installs a callback for genuine guest notifications.
+    ///
+    /// Deliberately fired from the register write rather than from the device,
+    /// because the device cannot tell a guest kick from a host thread's own
+    /// polling — and a poller woken by its own work never sleeps again.
+    pub fn set_kick_observer(&mut self, observer: Arc<dyn Fn(u16) + Send + Sync>) {
+        self.kick_observer = Some(observer);
+    }
+
+    pub fn poll_queue(&mut self, index: u16) -> bool {
+        let Some(queue) = self.queues.get(index as usize) else {
+            return false;
+        };
+        if !queue.has_work(&self.memory) {
+            return false;
+        }
+        self.notify_queue(index);
+        true
+    }
+
+    /// Chains the driver has offered that we have not taken.
+    pub fn outstanding(&self, index: u16) -> u16 {
+        self.queues
+            .get(index as usize)
+            .map(|queue| queue.outstanding(&self.memory))
+            .unwrap_or(0)
+    }
+
+    /// Sets or clears the "do not kick us" flag on a queue.
+    pub fn suppress_notifications(&mut self, index: u16, suppress: bool) {
+        if let Some(queue) = self.queues.get(index as usize) {
+            queue.suppress_notifications(&self.memory, suppress);
+        }
     }
 
     pub fn queues(&mut self) -> &mut [Virtqueue] {

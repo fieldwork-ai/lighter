@@ -317,19 +317,63 @@ impl GuestMemory {
         let region = self.region_for(start, span)?;
         let addr = region.host_addr(start);
 
+        // The guest is what dirtied these pages, through the second-stage
+        // translation the hypervisor set up — and while that translation
+        // exists, macOS will not take them back. `madvise` returns success and
+        // the process's footprint does not move, which is the most unhelpful
+        // combination of outcomes available.
+        //
+        // So the mapping is withdrawn for the length of the call. That is safe
+        // precisely here and nowhere else: the guest reports free pages
+        // synchronously, having first taken them off its own free lists, and
+        // it waits for this buffer to come back before it releases them again.
+        // There is no moment in between when it could fault on one.
+        //
+        // SAFETY: no vCPU can be executing code that touches this range, for
+        // the reason above.
+        let unmapped = match &self.vm {
+            // SAFETY: no vCPU can be executing code that touches this range,
+            // for the reason above.
+            Some(vm) => unsafe { vm.unmap(start, span) }.is_ok(),
+            None => false,
+        };
+
         // SAFETY: `addr` is inside a live mapping of at least `span` bytes,
         // checked above. MADV_FREE_REUSABLE does not unmap: the address stays
         // valid and reads fault in zeroes, which is what the guest expects of
         // memory it told us it was not using.
         let rc = unsafe { libc::madvise(addr.cast(), span, MADV_FREE_REUSABLE) };
-        if rc != 0 {
+        let released = if rc == 0 {
+            span as u64
+        } else {
             let err = io::Error::last_os_error();
             // Not fatal: failing to release memory costs footprint, not
-            // correctness, and killing the guest over it would be worse.
-            tracing::debug!(%err, gpa, len, "could not release guest memory to the host");
-            return Ok(0);
+            // correctness, and killing the guest over it would be worse. Loud,
+            // though — a share of memory that never comes back is the single
+            // thing people notice about running containers in a VM, and a
+            // silent `madvise` failure is how it would happen.
+            tracing::warn!(%err, gpa, len, span, "could not release guest memory to the host");
+            0
+        };
+
+        if unmapped {
+            // Back before anything can want it. A failure here is not
+            // recoverable — the guest would fault on memory it is entitled to
+            // — so it is reported rather than swallowed.
+            // SAFETY: the same range that was just unmapped, restored to the
+            // permissions it had.
+            let restored = match &self.vm {
+                // SAFETY: the same range that was just unmapped, restored to
+                // the permissions it had.
+                Some(vm) => unsafe { vm.map(addr.cast(), start, span, MemoryPerms::RWX) },
+                None => Ok(()),
+            };
+            if let Err(err) = restored {
+                tracing::error!(%err, gpa = start, span, "could not restore a released mapping");
+                return Err(MemoryError::Map(err));
+            }
         }
-        Ok(span as u64)
+        Ok(released)
     }
 }
 

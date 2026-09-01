@@ -206,6 +206,42 @@ impl Virtqueue {
         let _ = mem.write_u16(self.used_addr + 2, self.next_used);
     }
 
+    /// How many chains the driver has made available that we have not taken.
+    ///
+    /// Diagnostics, and the one number that matters when a polled queue stops:
+    /// a poller that goes to sleep while this is non-zero has lost a wake-up,
+    /// and the guest will wait forever for a reply nobody is going to produce.
+    pub fn outstanding(&self, mem: &GuestMemory) -> u16 {
+        self.avail_idx(mem)
+            .map(|idx| idx.wrapping_sub(self.next_avail))
+            .unwrap_or(0)
+    }
+
+    /// Tells the driver not to bother kicking us.
+    ///
+    /// The driver reads this flag before every notification and skips the
+    /// write when it is set. That write is an MMIO trap — a vCPU leaving the
+    /// guest, our handler running, and the core re-entering — so suppressing it
+    /// while a host thread is already watching the ring removes the whole
+    /// crossing from the submission path.
+    ///
+    /// **Clearing it is the dangerous direction.** A driver that decided not to
+    /// kick, because the flag was set when it looked, will not look again — so
+    /// whoever clears this has to re-examine the ring afterwards or the request
+    /// sits there until something unrelated happens along.
+    pub fn suppress_notifications(&self, mem: &GuestMemory, suppress: bool) {
+        const VRING_USED_F_NO_NOTIFY: u16 = 1;
+        if self.used_addr == 0 {
+            return;
+        }
+        let flags = if suppress { VRING_USED_F_NO_NOTIFY } else { 0 };
+        let _ = mem.write_u16(self.used_addr, flags);
+        // The driver must see the flag before we look at its ring, and must see
+        // it cleared before we stop looking. Either way round, the ordering is
+        // what makes the hand-off safe.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Whether the driver wants an interrupt for the work just completed.
     ///
     /// Honouring `VIRTQ_AVAIL_F_NO_INTERRUPT` is not an optimization we can

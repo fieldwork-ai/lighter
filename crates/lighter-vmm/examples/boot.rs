@@ -32,6 +32,7 @@ fn main() -> ExitCode {
     let mut forwards: Vec<PortForward> = Vec::new();
     let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
     let mut docker_socket: Option<PathBuf> = None;
+    let mut report_memory = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -53,6 +54,10 @@ fn main() -> ExitCode {
                 config.disk_size_bytes = gib << 30;
             }
             "--no-tty" => config.interactive = false,
+            // Logs the process's own physical footprint on an interval. The
+            // memory gate has no other way to watch a number only this process
+            // can see.
+            "--report-memory" => report_memory = true,
             "--net" => config.gvproxy = Some(PathBuf::from(args.next().unwrap_or_default())),
             "--vsock" => {
                 // PATH:GUEST_PORT — a host socket carried to a guest port.
@@ -113,6 +118,28 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if report_memory {
+        // Footprint and what the guest has handed back, together: the first
+        // alone cannot tell "the guest is not reporting" from "the guest
+        // reported and macOS kept the pages anyway".
+        let balloon = machine.balloon().clone();
+        std::thread::Builder::new()
+            .name("memory-report".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    tracing::info!(
+                        mib = lighter_vmm::footprint::bytes() / (1 << 20),
+                        offered_mib = balloon.offered_bytes() / (1 << 20),
+                        reported_mib = balloon.reported_bytes() / (1 << 20),
+                        ballooned_mib = balloon.ballooned_bytes() / (1 << 20),
+                        "FOOTPRINT"
+                    );
+                }
+            })
+            .expect("failed to spawn the memory reporter");
+    }
 
     for (path, guest_port) in &sockets {
         if let Err(e) = machine.proxy_socket(path, *guest_port) {

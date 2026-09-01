@@ -32,6 +32,10 @@ TARGET=""
 LABEL=""
 REPS=3
 CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency"
+# Cases that read a package tree rather than making one. They run after the
+# installs, on a tree materialized once by npm — which installer produced it
+# changes what they see, and pnpm in particular builds a farm of symlinks.
+TREE_CASES=" ripgrep find-walk copy-tree rm-rf "
 IMAGE="lighter-bench:1"
 KEEP=0
 ALLOW_NOISY=0
@@ -237,7 +241,7 @@ setup_lighter() {
 		--vsock "$SOCKET:2375" \
 		--share "bench:$WORK" \
 		--no-tty --cpus 8 --memory-mib 8192 \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=bench:/mnt/bench" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
@@ -326,7 +330,20 @@ case " $CASES " in
 	;;
 esac
 
+materialized=0
 for name in $CASES; do
+	# A tree the previous case deleted is a case that measures nothing and
+	# says so in milliseconds. This is not timed.
+	case "$TREE_CASES" in
+	*" $name "*)
+		if [ "$materialized" -eq 0 ] || [ ! -d "$WORK/npm/node_modules" ]; then
+			printf '==> %s: materializing the package tree\n' "$TARGET"
+			REPS=1 run_case npm-install >/dev/null 2>&1 || true
+			materialized=1
+		fi
+		;;
+	esac
+
 	printf '==> %s: %s' "$TARGET" "$name"
 	[ "$name" = watch-latency ] && start_watch_helper
 	rep=0
@@ -347,6 +364,13 @@ for name in $CASES; do
 		printf ' no measurement:'
 		printf '\n'
 		tail -25 "$CASE_OUT" | sed 's/^/      /'
+	elif [ "$name" != watch-latency ]; then
+		# A case that finishes instantly finished because there was nothing
+		# there. Saying so is the difference between a bug and a headline.
+		fastest="$(awk -F, -v w="$name" '$1 == w { print $3 }' "$RESULTS" | sort -n | head -1)"
+		if [ "${fastest:-1}" -lt 5 ]; then
+			printf '  <- implausible; the fixture was probably missing'
+		fi
 	fi
 	rm -f "$CASE_OUT"
 	printf '\n'

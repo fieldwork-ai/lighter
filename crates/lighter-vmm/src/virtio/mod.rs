@@ -12,6 +12,7 @@ pub mod disk;
 pub mod fs;
 pub mod mmio;
 pub mod net;
+pub mod poll;
 pub mod queue;
 pub mod rng;
 pub mod vsock;

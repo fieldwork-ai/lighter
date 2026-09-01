@@ -65,7 +65,7 @@ smoke: ## Prove the hypervisor path works on this machine
 # One target per milestone. `make gates` runs every gate that has landed.
 
 .PHONY: gates
-gates: gate-m1 gate-m2 gate-m3-network gate-m3-vsock gate-m3-docker gate-m4-fs gate-m5-speed ## Run all landed milestone gates
+gates: gate-m1 gate-m2 gate-m3-network gate-m3-vsock gate-m3-docker gate-m4-fs gate-m5-speed gate-m6-memory ## Run all landed milestone gates
 
 .PHONY: gate-m1
 gate-m1: ## M1: a custom kernel boots to a shell on the serial console
@@ -106,6 +106,10 @@ guest: ## Build the guest kernel, agent, initramfs, and root filesystem
 	@guest/fstest/build.sh
 	@guest/initramfs/build.sh
 	@guest/rootfs/build.sh
+
+.PHONY: gate-m6-memory
+gate-m6-memory: gvproxy ## M6: memory tracks load, and idling costs nothing
+	@scripts/gates/m6-memory.sh
 
 .PHONY: dogfood
 dogfood: gvproxy ## Rebuild the guest using lighter itself, not somebody else's VM

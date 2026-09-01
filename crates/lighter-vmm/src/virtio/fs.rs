@@ -74,6 +74,42 @@ const WORKERS: usize = 16;
 /// placed on the bus.
 type Waker = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
+/// When a request is served on the vCPU thread instead of a worker.
+///
+/// The hand-off to a worker costs a wake-up and a scheduler hop, and the guest
+/// is now spinning for its own reply — so for a short operation, serving it
+/// right here is strictly faster. The reason not to always do it is that a slow
+/// syscall then stops a core rather than a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inline {
+    /// Never; every request goes to the pool.
+    Never,
+    /// Only when no other request is waiting, so one slow call cannot become a
+    /// queue that everything else sits behind.
+    WhenIdle,
+    /// Always. Fastest when the guest is spinning, at the cost of a vCPU
+    /// stalling on whatever macOS takes to answer.
+    Always,
+}
+
+impl Inline {
+    fn from_env() -> Inline {
+        match std::env::var("LIGHTER_FS_INLINE").as_deref() {
+            Ok("0") | Ok("never") => Inline::Never,
+            Ok("always") => Inline::Always,
+            _ => Inline::WhenIdle,
+        }
+    }
+
+    fn applies(&self, queue: &Queue) -> bool {
+        match self {
+            Inline::Never => false,
+            Inline::WhenIdle => queue.is_empty(),
+            Inline::Always => true,
+        }
+    }
+}
+
 /// A host directory, and the name the guest mounts it by.
 #[derive(Debug, Clone)]
 pub struct Share {
@@ -306,12 +342,9 @@ pub struct Fs {
     memory: Option<Arc<GuestMemory>>,
     /// Whether the guest negotiated the notification queue.
     notifications: bool,
-    /// Whether an uncontended request may be served on the vCPU thread.
-    ///
-    /// On by default and switchable for measurement, because "does removing the
-    /// hand-off help?" is a question that should be answered with a number
-    /// rather than an argument.
-    inline: bool,
+    /// When a request may be served on the vCPU thread rather than handed to a
+    /// worker.
+    inline: Inline,
     waker: Waker,
 }
 
@@ -333,7 +366,7 @@ impl Fs {
             pool: None,
             memory: None,
             notifications: false,
-            inline: std::env::var("LIGHTER_FS_INLINE").as_deref() != Ok("0"),
+            inline: Inline::from_env(),
             waker: Arc::new(Mutex::new(None)),
         })
     }
@@ -581,7 +614,7 @@ impl VirtioDevice for Fs {
                     // outstanding, everything goes to it, so a slow syscall
                     // stalls one core for one operation rather than becoming a
                     // queue everything else waits behind.
-                    if queue.is_empty() && self.inline {
+                    if self.inline.applies(&queue) {
                         let mut sink = ChainSink::new(memory.clone(), reply);
                         let written = self.server.dispatch(&request, &mut sink);
                         requests.push_used(mem, head, written as u32);

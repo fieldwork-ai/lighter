@@ -137,6 +137,12 @@ pub struct Machine {
     vsock: Arc<VsockShared>,
     /// Socket proxies, held because dropping one unlinks its socket.
     proxies: Vec<VsockProxy>,
+    /// Held for the machine's lifetime: dropping it ends the subscription to
+    /// host memory pressure and the balloon stops responding.
+    _memory_policy: Option<crate::memory_policy::MemoryPolicy>,
+    /// Queue watchers, and the handles that retire them. Held because a
+    /// detached poller would outlive the transport it polls.
+    pollers: Vec<(Arc<virtio::poll::Kicks>, JoinHandle<()>)>,
 }
 
 impl Machine {
@@ -251,6 +257,7 @@ impl Machine {
         // Their slot indices are remembered for the same reason the network's
         // is: each needs a waker, and the transports do not exist yet.
         let mut share_wakers = Vec::with_capacity(config.shares.len());
+        let mut pollers = Vec::new();
         for share in &config.shares {
             let fs = Fs::new(share)?;
             share_wakers.push((virtio.len(), fs.waker(), fs.notifications()));
@@ -258,6 +265,7 @@ impl Machine {
         }
 
         virtio.push(Box::new(Rng::from_host()?));
+        let balloon_slot = virtio.len();
         virtio.push(Box::new(Balloon::new(balloon_state.clone())));
 
         let virtio_slots = virtio.len();
@@ -291,6 +299,29 @@ impl Machine {
         // transport raises the interrupt for it.
         for (slot, waker, notifications) in share_wakers {
             let transport = virtio_devices[slot].clone();
+
+            // A thread that watches the request queue, so a guest making
+            // hundreds of thousands of requests need not trap for each one. It
+            // sleeps until the guest kicks, which is why an idle machine costs
+            // nothing for having it.
+            let kicks = virtio::poll::Kicks::new();
+            {
+                let mut held = transport.lock().expect("fs transport poisoned");
+                let signal = kicks.clone();
+                held.set_kick_observer(Arc::new(move |queue| {
+                    if queue == virtio::fs::REQUEST_QUEUE {
+                        signal.kicked();
+                    }
+                }));
+            }
+            let poller = virtio::poll::spawn(
+                &format!("fs{slot}"),
+                transport.clone(),
+                virtio::fs::REQUEST_QUEUE,
+                kicks.clone(),
+            )?;
+            pollers.push((kicks, poller));
+
             *waker.lock().expect("fs waker poisoned") = Some(Arc::new({
                 let transport = transport.clone();
                 move || {
@@ -324,6 +355,25 @@ impl Machine {
                     .service_queue(virtio::net::RX_QUEUE);
             })?;
         }
+
+        // The balloon only matters when the Mac itself is short, so it is
+        // driven by the same signal macOS uses to decide it is short. A machine
+        // whose host never reports pressure never inflates, and gives memory
+        // back purely through the guest volunteering it.
+        let memory_policy = match crate::memory_policy::MemoryPolicy::start(
+            balloon_state.clone(),
+            virtio_devices[balloon_slot].clone(),
+            config.ram_bytes,
+        ) {
+            Ok(policy) => Some(policy),
+            Err(why) => {
+                tracing::warn!(
+                    %why,
+                    "cannot watch host memory pressure; the guest keeps whatever it takes"
+                );
+                None
+            }
+        };
 
         // 7. The device tree describes the machine built above, from the same
         //    layout rather than a parallel description of it.
@@ -421,6 +471,8 @@ impl Machine {
             network,
             vsock: vsock_state,
             proxies: Vec::new(),
+            _memory_policy: memory_policy,
+            pollers,
         })
     }
 
@@ -476,6 +528,13 @@ impl Machine {
 
     fn stop_others(&mut self) {
         self.shutdown();
+        // Before the vCPUs are joined: a poller holds the transport lock in a
+        // loop, and a core trying to take it on its way out would wait for a
+        // thread nobody had told to stop.
+        for (kicks, thread) in self.pollers.drain(..) {
+            kicks.stop();
+            let _ = thread.join();
+        }
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
