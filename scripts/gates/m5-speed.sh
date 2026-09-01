@@ -96,6 +96,20 @@ else
 	fail "host-to-guest visibility was ${watch:-unmeasured}ms (budget ${MAX_WATCH_MS}ms)"
 fi
 
+# A share that cannot keep its own descriptor count under control is one boot
+# away from EMFILE inside the guest, and the symptom there is `cp` reporting
+# "No file descriptors available" on a file that is plainly present — a long
+# way from the reclaim that failed to run. The server says so itself when its
+# count drifts past the budget, so the gate reads that rather than waiting for
+# the guest to fall over.
+BOOT_LOG="benchmarks/results/lighter-boot.log"
+drift="$(grep -ac "more descriptors than it may" "$BOOT_LOG" 2>/dev/null || true)"
+if [ "${drift:-0}" -eq 0 ]; then
+	pass "the share stayed inside its descriptor budget"
+else
+	fail "the descriptor reclaim fell behind ${drift} times; see $BOOT_LOG"
+fi
+
 echo
 if [ "${RIPGREP_RATIO:-0}" -ge "$TARGET_READ" ] && [ "${WALK_RATIO:-0}" -ge "$TARGET_READ" ]; then
 	note "read targets met: ripgrep ${RIPGREP_RATIO}% and the metadata walk ${WALK_RATIO}% of native, against a ${TARGET_READ}% target"

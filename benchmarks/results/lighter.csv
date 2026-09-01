@@ -1,4 +1,13 @@
 case,rep,ms
-npm-install,1,12302
-npm-install,2,12376
-npm-install,3,12231
+npm-install,1,12183
+npm-install,2,12174
+npm-install,3,12358
+pnpm-install,1,20468
+pnpm-install,2,16932
+pnpm-install,3,13861
+ripgrep,1,2027
+ripgrep,2,107
+ripgrep,3,106
+find-walk,1,296
+find-walk,2,107
+find-walk,3,109
