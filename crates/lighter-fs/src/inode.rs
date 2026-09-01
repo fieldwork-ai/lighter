@@ -26,7 +26,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// The `nodeid` of a mount's root. Fixed by the protocol.
@@ -41,6 +41,11 @@ struct Parked {
     /// `(st_birthtime, st_birthtime_nsec)` at the moment of parking.
     birthtime: (i64, i64),
 }
+
+/// The bit that marks an inode number as provisional: handed out for a
+/// pending create, reported to the guest until the real number exists. High
+/// enough that no filesystem's real numbers reach it.
+const PROVISIONAL_INO: u64 = 1 << 62;
 
 pub struct Inode {
     /// A metadata-only descriptor, or nothing if it has been parked.
@@ -80,13 +85,69 @@ pub struct Inode {
     /// reclaim while the real descriptor count climbed to the kernel's ceiling.
     census: Arc<Census>,
     /// Host identity, which is what makes two paths to one file share a
-    /// `nodeid` — as hard links must.
-    pub dev: i64,
-    pub ino: u64,
+    /// `nodeid` — as hard links must. Atomics because an inode born pending
+    /// (acknowledged before its create has been applied) binds its real
+    /// identity when the apply lands; for every other inode they are set at
+    /// construction and never move.
+    dev: std::sync::atomic::AtomicI64,
+    ino: AtomicU64,
     pub is_dir: bool,
     pub is_symlink: bool,
     /// How many times the guest has been told about this inode.
     lookups: Mutex<u64>,
+    /// Writes acknowledged to the guest but not yet applied to the host file.
+    ///
+    /// Nonzero is what makes this inode "dirty": a read of its bytes must
+    /// wait for the apply queue, and its reported size must take the overlay
+    /// below into account.
+    dirty: AtomicU32,
+    /// The size the guest believes, while writes are still queued: the
+    /// furthest end of any acknowledged write. Zero whenever `dirty` is zero,
+    /// which is what lets `overlay_size` be an unconditional `max`.
+    pending_size: AtomicU64,
+    /// The errno of a queued write that failed, parked here for the next
+    /// operation on this file to report — the same posture as the kernel's
+    /// own writeback. Taken (cleared) when reported.
+    write_error: Mutex<Option<i32>>,
+    /// True from an acknowledged CREATE until the apply queue performs it.
+    ///
+    /// A pending inode has no descriptor and no host identity yet: `dev`/
+    /// `ino` hold a provisional number, attribute replies come from
+    /// `pending_meta`, and anything that genuinely needs the host file
+    /// drains the queue first. `bind` ends the state.
+    pending: AtomicBool,
+    /// What the guest was told at creation, until the host file can answer.
+    pending_meta: Mutex<Option<PendingMeta>>,
+    /// Children promised inside this directory but not yet applied, by name.
+    ///
+    /// The overlay that keeps lookups truthful while creates are queued: a
+    /// name in here resolves to its pending inode, never to ENOENT. Kept on
+    /// the parent because that is who lookup asks.
+    pending_children: Mutex<std::collections::HashMap<Vec<u8>, u64>>,
+    /// Mirror of `pending_children.len()`, so the empty case — every
+    /// directory, almost always — costs one load and no lock.
+    pending_count: AtomicUsize,
+    /// Names removed from this directory by acknowledged unlinks that have
+    /// not applied yet: the host still lists them, the guest must not.
+    pending_gone: Mutex<std::collections::HashSet<Vec<u8>>>,
+    /// Mirror of `pending_gone.len()`, same reason as `pending_count`.
+    gone_count: AtomicUsize,
+    /// Queued operations that will change this inode's *metadata* — an
+    /// unlink of one of its names changes the link count — counted so a
+    /// GETATTR knows a host stat would be stale.
+    meta_shadow: AtomicU32,
+    /// The apply-queue sequence number of the last job that touches this
+    /// inode: its own create or writes, or — for a directory — the naming
+    /// operations inside it. A barrier waits to here and no further.
+    settle_seq: AtomicU64,
+}
+
+/// The attributes a pending file was promised at creation.
+#[derive(Clone, Copy)]
+pub struct PendingMeta {
+    pub mode: u32,
+    /// Seconds and nanoseconds since the epoch, captured at acknowledgement.
+    pub born: (i64, i64),
 }
 
 /// What a share is holding, counted where it changes.
@@ -94,6 +155,8 @@ pub struct Inode {
 pub struct Census {
     /// Open metadata descriptors. The number the budget is about.
     descriptors: AtomicUsize,
+    /// Of those, directories. See [`Inode::parkable`].
+    resident_dirs: AtomicUsize,
     /// Live `Inode` values, as against how many the table lists. The two
     /// disagreeing means something is holding `Arc`s the table has already
     /// forgotten, which from the outside looks exactly like a descriptor leak
@@ -120,6 +183,9 @@ impl Drop for Inode {
         self.census.inodes.fetch_sub(1, Ordering::Relaxed);
         if self.fd.get_mut().expect("inode slot poisoned").is_some() {
             self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
+            if self.is_dir {
+                self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -149,18 +215,232 @@ impl Inode {
     ) -> Inode {
         census.descriptors.fetch_add(1, Ordering::Relaxed);
         census.inodes.fetch_add(1, Ordering::Relaxed);
+        if is_dir {
+            census.resident_dirs.fetch_add(1, Ordering::Relaxed);
+        }
         Inode {
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
             used: AtomicBool::new(true),
             held: AtomicBool::new(true),
             census,
-            dev,
-            ino,
+            dev: std::sync::atomic::AtomicI64::new(dev),
+            ino: AtomicU64::new(ino),
             is_dir,
             is_symlink,
             lookups: Mutex::new(lookups),
+            dirty: AtomicU32::new(0),
+            pending_size: AtomicU64::new(0),
+            write_error: Mutex::new(None),
+            pending: AtomicBool::new(false),
+            pending_meta: Mutex::new(None),
+            pending_children: Mutex::new(std::collections::HashMap::new()),
+            pending_count: AtomicUsize::new(0),
+            pending_gone: Mutex::new(std::collections::HashSet::new()),
+            gone_count: AtomicUsize::new(0),
+            meta_shadow: AtomicU32::new(0),
+            settle_seq: AtomicU64::new(0),
         }
+    }
+
+    /// An inode acknowledged before it exists: no descriptor, provisional
+    /// identity, attributes served from `meta` until [`Registry::bind_pending`].
+    fn new_pending(dev: i64, ino: u64, meta: PendingMeta, census: Arc<Census>) -> Inode {
+        census.inodes.fetch_add(1, Ordering::Relaxed);
+        Inode {
+            fd: RwLock::new(None),
+            parked_at: Mutex::new(None),
+            used: AtomicBool::new(true),
+            held: AtomicBool::new(false),
+            census,
+            dev: std::sync::atomic::AtomicI64::new(dev),
+            ino: AtomicU64::new(ino),
+            is_dir: false,
+            is_symlink: false,
+            lookups: Mutex::new(1),
+            dirty: AtomicU32::new(0),
+            pending_size: AtomicU64::new(0),
+            write_error: Mutex::new(None),
+            pending: AtomicBool::new(true),
+            pending_meta: Mutex::new(Some(meta)),
+            pending_children: Mutex::new(std::collections::HashMap::new()),
+            pending_count: AtomicUsize::new(0),
+            pending_gone: Mutex::new(std::collections::HashSet::new()),
+            gone_count: AtomicUsize::new(0),
+            meta_shadow: AtomicU32::new(0),
+            settle_seq: AtomicU64::new(0),
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    pub fn pending_meta(&self) -> Option<PendingMeta> {
+        *self.pending_meta.lock().expect("pending meta poisoned")
+    }
+
+    /// The apply queue performed the create: install the descriptor and the
+    /// real identity, and let the host file answer from here on.
+    fn bind(&self, fd: OwnedFd, dev: i64, ino: u64) {
+        self.dev.store(dev, Ordering::Relaxed);
+        self.ino.store(ino, Ordering::Relaxed);
+        *self.fd.write().expect("inode slot poisoned") = Some(Arc::new(fd));
+        self.census.descriptors.fetch_add(1, Ordering::Relaxed);
+        self.held.store(true, Ordering::Relaxed);
+        *self.pending_meta.lock().expect("pending meta poisoned") = None;
+        self.pending.store(false, Ordering::Relaxed);
+    }
+
+    /// The create itself failed; the file will never exist. The errno parks
+    /// where the next operation on this inode reports it.
+    pub fn bind_failed(&self, errno: i32) {
+        self.write_error
+            .lock()
+            .expect("write error poisoned")
+            .get_or_insert(errno);
+        // Pending ends here even in failure — a barrier loops while the flag
+        // is up, and a corpse that stays "pending" forever would hold it up
+        // forever. With no descriptor and no parked path, `reference` answers
+        // ESTALE, which is the truth about this file.
+        self.pending.store(false, Ordering::Relaxed);
+    }
+
+    /// Promises `name` inside this directory to the pending inode `nodeid`.
+    pub fn add_pending_child(&self, name: &[u8], nodeid: u64) {
+        let mut children = self
+            .pending_children
+            .lock()
+            .expect("pending children poisoned");
+        children.insert(name.to_vec(), nodeid);
+        self.pending_count.store(children.len(), Ordering::Relaxed);
+    }
+
+    /// The promise is settled (kept or failed); the host directory answers now.
+    pub fn remove_pending_child(&self, name: &[u8]) {
+        let mut children = self
+            .pending_children
+            .lock()
+            .expect("pending children poisoned");
+        children.remove(name);
+        self.pending_count.store(children.len(), Ordering::Relaxed);
+    }
+
+    /// The pending inode `name` resolves to, if it is promised here.
+    pub fn pending_child(&self, name: &[u8]) -> Option<u64> {
+        if self.pending_count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        self.pending_children
+            .lock()
+            .expect("pending children poisoned")
+            .get(name)
+            .copied()
+    }
+
+    pub fn has_pending_children(&self) -> bool {
+        self.pending_count.load(Ordering::Relaxed) != 0
+    }
+
+    /// Promises that `name` is gone from this directory.
+    pub fn add_pending_gone(&self, name: &[u8]) {
+        let mut gone = self.pending_gone.lock().expect("pending gone poisoned");
+        gone.insert(name.to_vec());
+        self.gone_count.store(gone.len(), Ordering::Relaxed);
+    }
+
+    /// The unlink applied (or failed, loudly); the host answers again.
+    pub fn remove_pending_gone(&self, name: &[u8]) {
+        let mut gone = self.pending_gone.lock().expect("pending gone poisoned");
+        gone.remove(name);
+        self.gone_count.store(gone.len(), Ordering::Relaxed);
+    }
+
+    /// Whether `name` has been promised away.
+    pub fn name_pending_gone(&self, name: &[u8]) -> bool {
+        if self.gone_count.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        self.pending_gone
+            .lock()
+            .expect("pending gone poisoned")
+            .contains(name)
+    }
+
+    /// Remembers that the job with this sequence number touches this inode.
+    pub fn settled_by(&self, seq: u64) {
+        self.settle_seq.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    /// The sequence a barrier on this inode must wait to.
+    pub fn settle_seq(&self) -> u64 {
+        self.settle_seq.load(Ordering::Relaxed)
+    }
+
+    /// A queued operation will change this inode's metadata when it applies.
+    pub fn shadow_meta(&self) {
+        self.meta_shadow.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn unshadow_meta(&self) {
+        self.meta_shadow.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn meta_shadowed(&self) -> bool {
+        self.meta_shadow.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether any queued operation still shadows this directory's listing.
+    pub fn listing_shadowed(&self) -> bool {
+        self.pending_count.load(Ordering::Relaxed) != 0
+            || self.gone_count.load(Ordering::Relaxed) != 0
+    }
+
+    /// A write to this file has been acknowledged and queued; `end` is where
+    /// it will finish. Called before the job is pushed, which is what makes
+    /// the "reset on last applied" in `write_applied` race-free.
+    pub fn write_acked(&self, end: u64) {
+        self.dirty.fetch_add(1, Ordering::Relaxed);
+        self.pending_size.fetch_max(end, Ordering::Relaxed);
+    }
+
+    /// A queued write finished. On the last one the overlay resets: the host
+    /// file now answers for itself.
+    pub fn write_applied(&self, result: Result<(), i32>) {
+        if let Err(errno) = result {
+            let mut slot = self.write_error.lock().expect("write error poisoned");
+            // The first failure is the story; later ones are usually its echo.
+            slot.get_or_insert(errno);
+        }
+        if self.dirty.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.pending_size.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether acknowledged writes are still queued.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed) != 0
+    }
+
+    /// The size the guest should be told, given what the host file says.
+    pub fn overlay_size(&self, host: u64) -> u64 {
+        host.max(self.pending_size.load(Ordering::Relaxed))
+    }
+
+    /// Reports and clears a parked write failure, if one is waiting.
+    pub fn take_write_error(&self) -> Option<i32> {
+        self.write_error
+            .lock()
+            .expect("write error poisoned")
+            .take()
+    }
+
+    pub fn dev(&self) -> i64 {
+        self.dev.load(Ordering::Relaxed)
+    }
+
+    pub fn ino(&self) -> u64 {
+        self.ino.load(Ordering::Relaxed)
     }
 
     /// Borrows the descriptor, reopening it first if it was parked.
@@ -193,11 +473,17 @@ impl Inode {
         // descriptor serves this one operation and is dropped with it; the
         // inode stays parked and nothing else is evicted to make space.
         let budget = self.census.budget.load(Ordering::Relaxed);
-        if budget > 0 && self.census.descriptors.load(Ordering::Relaxed) >= budget {
+        if budget > 0
+            && self.census.descriptors.load(Ordering::Relaxed) >= budget
+            && self.parkable()
+        {
             return Ok(Reference(fd));
         }
         self.held.store(true, Ordering::Relaxed);
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
+        }
         *slot = Some(fd.clone());
         Ok(Reference(fd))
     }
@@ -218,17 +504,19 @@ impl Inode {
     fn reopen(&self, parked: &Parked) -> Result<std::os::fd::OwnedFd, i32> {
         if let Ok(fd) = crate::sys::open_reference_path(&parked.path, self.is_symlink) {
             match crate::sys::stat_fd(fd.as_raw_fd()) {
-                Ok(st) if st.st_ino == self.ino && st.st_dev as i64 == self.dev => return Ok(fd),
+                Ok(st) if st.st_ino == self.ino() && st.st_dev as i64 == self.dev() => {
+                    return Ok(fd);
+                }
                 _ => {}
             }
         }
-        let vol = PathBuf::from(format!("/.vol/{}/{}", self.dev, self.ino));
+        let vol = PathBuf::from(format!("/.vol/{}/{}", self.dev(), self.ino()));
         let fd = crate::sys::open_reference_path(&vol, self.is_symlink)
             .map_err(|_| crate::errno::linux::ESTALE)?;
         match crate::sys::stat_fd(fd.as_raw_fd()) {
             Ok(st)
-                if st.st_ino == self.ino
-                    && st.st_dev as i64 == self.dev
+                if st.st_ino == self.ino()
+                    && st.st_dev as i64 == self.dev()
                     && (st.st_birthtime, st.st_birthtime_nsec) == parked.birthtime =>
             {
                 Ok(fd)
@@ -254,6 +542,9 @@ impl Inode {
         };
         self.held.store(true, Ordering::Relaxed);
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
+        }
         *slot = Some(Arc::new(fd));
         true
     }
@@ -283,7 +574,28 @@ impl Inode {
         *slot = None;
         self.held.store(false, Ordering::Relaxed);
         self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
+        }
         true
+    }
+
+    /// Whether the polite sweep may park this inode.
+    ///
+    /// A parked file costs nothing until that file is touched again. A parked
+    /// directory taxes every name inside it: each lookup revives it by path —
+    /// an `open` against the host, at a full share transiently, so every
+    /// lookup — and a package install is nothing but lookups into the
+    /// directories it just made. Profiled mid-install, that revival was the
+    /// single hottest frame on the request thread. So directories stay
+    /// resident while they are less than half the budget, which on a stock
+    /// Mac is three thousand of them; only past that do they compete with
+    /// files, and the forced phase, which exists for the case where nothing
+    /// else works, ignores this entirely.
+    fn parkable(&self) -> bool {
+        !self.is_dir
+            || self.census.resident_dirs.load(Ordering::Relaxed)
+                > self.census.budget.load(Ordering::Relaxed) / 2
     }
 
     /// Whether this inode is still the file those numbers name.
@@ -339,6 +651,10 @@ pub struct OpenDir {
 /// An open regular file.
 pub struct OpenFile {
     pub fd: OwnedFd,
+    /// Whether the descriptor can be read through. False only for a guest
+    /// write-only open kept for the apply queue; a read must not be handed
+    /// a descriptor that will EBADF.
+    pub readable: bool,
     /// Whether the descriptor can be written through.
     ///
     /// Only meaningful for the descriptors the server opens on its own
@@ -626,7 +942,7 @@ impl Registry {
         // longer push the count past the budget at all; the paced sweep is
         // left with only its real job, keeping the RESIDENT set the
         // recently-used one.
-        if self.census.descriptors() > self.budget {
+        if self.census.descriptors() > self.budget && inode.parkable() {
             let _ = inode.park();
         }
         self.by_id[shard(id)]
@@ -647,6 +963,53 @@ impl Registry {
     /// operation still in flight holds an `Arc` and keeps the descriptor alive
     /// until it finishes — which is why the worker pool needs no ordering
     /// guarantee between FORGET and everything else.
+    /// Registers an inode for a file that does not exist yet.
+    ///
+    /// The identity is provisional — a number from a range no real device
+    /// uses — and the entry deliberately stays out of the identity map: there
+    /// is no host identity to claim until [`Registry::bind_pending`].
+    pub fn insert_pending(&self, dev: i64, meta: PendingMeta) -> (u64, Arc<Inode>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let inode = Arc::new(Inode::new_pending(
+            dev,
+            PROVISIONAL_INO | id,
+            meta,
+            self.census.clone(),
+        ));
+        self.by_id[shard(id)]
+            .lock()
+            .expect("inode table poisoned")
+            .insert(id, inode.clone());
+        (id, inode)
+    }
+
+    /// The apply queue performed a pending create: bind the real identity.
+    ///
+    /// The identity map only gains the entry if the guest still knows the
+    /// nodeid — a FORGET may have raced the apply — and if no other entry
+    /// claimed these numbers first, which the same lock arbitration as
+    /// [`Registry::insert`] settles.
+    pub fn bind_pending(&self, id: u64, inode: &Arc<Inode>, fd: OwnedFd, dev: i64, ino: u64) {
+        inode.bind(fd, dev, ino);
+        // The same admission control as `insert`: a bind must not push the
+        // descriptor count past the budget, or a create storm larger than the
+        // budget outruns the sweep and climbs to the kernel's ceiling.
+        if self.census.descriptors() > self.budget {
+            let _ = inode.park();
+        }
+        let still_known = self.by_id[shard(id)]
+            .lock()
+            .expect("inode table poisoned")
+            .contains_key(&id);
+        if !still_known {
+            return;
+        }
+        let mut identity = self.by_identity[identity_shard(ino)]
+            .write()
+            .expect("identity table poisoned");
+        identity.entry((dev, ino)).or_insert(id);
+    }
+
     pub fn forget(&self, id: u64, count: u64) {
         if id == ROOT_ID {
             return;
@@ -663,7 +1026,7 @@ impl Registry {
         if remaining > 0 {
             return;
         }
-        let identity = (inode.dev, inode.ino);
+        let identity = (inode.dev(), inode.ino());
         table.remove(&id);
         drop(table);
 
@@ -776,6 +1139,9 @@ impl Registry {
                 // `swap` is the ageing: an inode used since the hand last came
                 // round survives this pass and is a candidate on the next.
                 if inode.used.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                if !inode.parkable() {
                     continue;
                 }
                 // Parked outside the shard lock: parking stats and closes a
@@ -1189,6 +1555,7 @@ mod tests {
         let reg = scratch.registry();
         let fh = reg.add_handle(Handle::File(Arc::new(OpenFile {
             fd: spare_fd(),
+            readable: true,
             append: false,
             writable: true,
         })));
@@ -1475,12 +1842,14 @@ mod tests {
         let reg = scratch.registry();
         let first = reg.add_handle(Handle::File(Arc::new(OpenFile {
             fd: spare_fd(),
+            readable: true,
             append: false,
             writable: true,
         })));
         reg.release_handle(first);
         let second = reg.add_handle(Handle::File(Arc::new(OpenFile {
             fd: spare_fd(),
+            readable: true,
             append: false,
             writable: true,
         })));

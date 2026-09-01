@@ -100,10 +100,14 @@ pub struct Server {
     /// Invalidations waiting to be carried to the guest.
     notifications: Arc<crate::notify::Sink>,
     /// Descriptors held on the guest's behalf, since it no longer reports its
-    /// opens. See [`crate::opencache`].
-    open_cache: OpenCache,
+    /// opens. See [`crate::opencache`]. Shared with apply-queue jobs, which
+    /// register a pending create's descriptor here once it exists.
+    open_cache: Arc<OpenCache>,
     /// Opcode counters, off unless asked for.
     stats: Stats,
+    /// The ordered queue that applies acknowledged mutations. See
+    /// [`crate::apply`] for the promises it keeps.
+    apply: crate::apply::Apply,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -195,8 +199,9 @@ impl Server {
             ),
             policy,
             notifications: sink,
-            open_cache: OpenCache::new(),
+            open_cache: Arc::new(OpenCache::new()),
             stats: Stats::new(),
+            apply: crate::apply::Apply::start(root.to_path_buf()),
             _watcher: watcher,
         })
     }
@@ -304,12 +309,19 @@ impl Server {
     fn handle(&self, header: &InHeader, body: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
         match header.opcode {
             op::INIT => self.init(body),
-            op::SYNCFS => Ok(Vec::new()),
+            op::SYNCFS => {
+                // `sync` on the share is the settling point for everything
+                // acknowledged: after it returns, the host answers for all
+                // of it.
+                self.apply.drain();
+                Ok(Vec::new())
+            }
             // Likewise: a flush that can only ever succeed is a round trip on
             // every `close`, and the kernel will stop sending them if told
             // once that we do not implement it.
             op::FLUSH => Err(linux::ENOSYS),
             op::DESTROY => {
+                self.apply.drain();
                 self.log_stats();
                 Ok(Vec::new())
             }
@@ -400,6 +412,14 @@ impl Server {
     /// Prints the opcode histogram, if one was being kept.
     pub fn log_stats(&self) {
         if self.stats.enabled() {
+            let (open, budget) = self.registry.descriptor_usage();
+            tracing::info!(
+                open,
+                budget,
+                inodes = self.registry.inode_count(),
+                queued = self.apply.depth(),
+                "FSSTATE"
+            );
             for line in self.stats.report().lines() {
                 tracing::info!("{line}");
             }
@@ -589,6 +609,24 @@ impl Server {
 
     // --- name resolution ---------------------------------------------------
 
+    /// Waits until `still` reports false of the inode, advancing the apply
+    /// queue to the inode's own settle mark between looks.
+    ///
+    /// The loop, rather than a single scoped drain, closes a real gap: an
+    /// overlay flag is raised before its job is pushed, so a barrier can see
+    /// the flag while the sequence number is not stamped yet. The flag only
+    /// falls when the job applies, so looping on the flag is both correct and
+    /// terminating; the scoped drain inside is what makes the wait cost the
+    /// inode's own backlog rather than the whole queue's.
+    fn settle_while(&self, inode: &Inode, still: impl Fn(&Inode) -> bool) {
+        while still(inode) {
+            self.apply.drain_to(inode.settle_seq());
+            if still(inode) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
     fn inode(&self, nodeid: u64) -> Result<std::sync::Arc<Inode>, i32> {
         self.registry.get(nodeid).ok_or(linux::ENOENT)
     }
@@ -603,6 +641,9 @@ impl Server {
 
     /// The live host path of an inode, as a C string.
     fn path(&self, inode: &Inode) -> Result<CString, i32> {
+        // Path-based operations (access, xattr, link, setattr) need a file
+        // that exists; settle it once, here, for all of them.
+        self.settle_while(inode, |inode| inode.is_pending());
         let fd = inode.reference()?;
         // By identity when the volume allows it. F_GETPATH answers from the
         // vnode name cache, which for a file created under a temporary name
@@ -670,8 +711,18 @@ impl Server {
         } else {
             Answer::File
         };
-        let entry_valid = self.policy.validity(parent.dev, parent.ino, answer);
+        let entry_valid = self.policy.validity(parent.dev(), parent.ino(), answer);
         let attr_valid = self.policy.attr_validity(dev, ino);
+        let mut attr = self.attr(&st);
+        // While writes for this file sit on the apply queue, the host stat
+        // lags the size the guest was promised; the overlay is the truth.
+        if !is_dir
+            && self.apply.busy()
+            && let Some(inode) = self.registry.get(nodeid)
+            && inode.is_dirty()
+        {
+            attr.size = inode.overlay_size(attr.size);
+        }
         Ok(EntryOut {
             nodeid,
             generation: 0,
@@ -679,7 +730,7 @@ impl Server {
             attr_valid: attr_valid.as_secs(),
             entry_valid_nsec: entry_valid.subsec_nanos(),
             attr_valid_nsec: attr_valid.subsec_nanos(),
-            attr: self.attr(&st),
+            attr,
         })
     }
 
@@ -694,7 +745,7 @@ impl Server {
     fn missing(&self, parent: &Inode) -> Result<Vec<u8>, i32> {
         let valid = self
             .policy
-            .validity(parent.dev, parent.ino, Answer::Missing);
+            .validity(parent.dev(), parent.ino(), Answer::Missing);
         if valid.is_zero() {
             return Err(linux::ENOENT);
         }
@@ -791,6 +842,20 @@ impl Server {
         let parent = self.directory(parent)?;
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
+        // A name promised to a pending create resolves to its pending inode:
+        // the host directory does not know it yet, and ENOENT — worse, a
+        // cached ENOENT — would be a lie.
+        if let Some(nodeid) = parent.pending_child(name.to_bytes())
+            && let Some(inode) = self.registry.get(nodeid)
+            && inode.is_pending()
+        {
+            let entry = self.pending_entry(&parent, &inode, nodeid);
+            return Ok(self.entry_reply(&entry));
+        }
+        if parent.name_pending_gone(name.to_bytes()) {
+            // The host still lists it; the guest was promised it is gone.
+            return self.missing(&parent);
+        }
         match self.entry(&parent, &name) {
             Ok(entry) => Ok(self.entry_reply(&entry)),
             Err(linux::ENOENT) => {
@@ -799,8 +864,8 @@ impl Server {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|e| format!("<no path: {e}>"));
                     tracing::warn!(
-                        parent_dev = parent.dev,
-                        parent_ino = parent.ino,
+                        parent_dev = parent.dev(),
+                        parent_ino = parent.ino(),
                         held,
                         name = %name.to_string_lossy(),
                         "ENOENT-DEBUG lookup miss"
@@ -813,6 +878,24 @@ impl Server {
     }
 
     fn getattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+        if let Ok(inode) = self.inode(nodeid)
+            && inode.is_pending()
+        {
+            // No host file to stat yet; the promise is the truth.
+            let entry = self.pending_entry(&inode, &inode, nodeid);
+            let valid = self.policy.attr_validity(inode.dev(), inode.ino());
+            let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
+            out.extend_from_slice(&valid.as_secs().to_le_bytes());
+            out.extend_from_slice(&valid.subsec_nanos().to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // padding
+            entry.attr.encode(&mut out);
+            return Ok(out);
+        }
+        if let Ok(inode) = self.inode(nodeid) {
+            // A queued unlink will change this inode's link count; a stat
+            // now would answer with the past.
+            self.settle_while(&inode, |inode| inode.meta_shadowed());
+        }
         let flags = get_u32(body, 0).unwrap_or(0);
         let st = if flags & fuse::GETATTR_FH != 0
             && let Some(fh) = get_u64(body, 8)
@@ -824,12 +907,21 @@ impl Server {
             let inode = self.inode(nodeid)?;
             sys::stat_fd(inode.reference()?.raw_fd())?
         };
+        let mut st = st;
+        if let Ok(inode) = self.inode(nodeid)
+            && inode.is_dirty()
+        {
+            st.st_size = st.st_size.max(inode.overlay_size(st.st_size as u64) as i64);
+        }
         Ok(self.attr_reply(&st))
     }
 
     fn setattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let valid = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let inode = self.inode(nodeid)?;
+        // A truncate must land after every write already acknowledged, and
+        // the times a `touch` sets must not be overwritten by a stale apply.
+        self.settle_while(&inode, |inode| inode.is_dirty() || inode.is_pending());
         let path = self.path(&inode)?;
 
         if valid & fuse::fattr::MODE != 0 {
@@ -956,6 +1048,71 @@ impl Server {
         let parent = self.directory(parent)?;
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
+        // A promised name has no host file yet; removing a directory must
+        // also wait for whatever is still on its way into or out of it.
+        self.settle_while(&parent, |parent| {
+            parent.pending_child(name.to_bytes()).is_some()
+        });
+        if dir
+            && self.apply.busy()
+            && let Ok(st) = sys::stat_at(parent.reference()?.raw_fd(), &name)
+            && let Some(child) = self
+                .registry
+                .relookup(st.st_dev as i64, st.st_ino)
+                .and_then(|id| self.registry.get(id))
+        {
+            self.settle_while(&child, |child| child.listing_shadowed());
+        }
+        if !dir && parent.name_pending_gone(name.to_bytes()) {
+            // Already promised away; the guest's own dentry cache should have
+            // stopped this, so answer what the settled state will say.
+            return Err(linux::ENOENT);
+        }
+        if !dir && self.apply.accepting() {
+            // The guest only unlinks a name it holds a positive dentry for,
+            // and permission is its own check (`default_permissions`), so the
+            // outcome is known now. A failure here is external interference
+            // inside a millisecond window; it is logged, not silent, and the
+            // next listing tells the truth.
+            parent.add_pending_gone(name.to_bytes());
+            // The dying name's inode — if the guest knows it — will report a
+            // stale link count until the unlink applies; shadow it so GETATTR
+            // waits. The stat is two microseconds against the twenty-seven
+            // this path no longer spends.
+            let target_out = sys::stat_at(parent.reference()?.raw_fd(), &name)
+                .ok()
+                .and_then(|st| self.registry.relookup(st.st_dev as i64, st.st_ino))
+                .and_then(|id| self.registry.get(id));
+            if let Some(target) = &target_out {
+                target.shadow_meta();
+            }
+            let job = {
+                let parent = parent.clone();
+                let name = name.clone();
+                let target = target_out.clone();
+                move || {
+                    if let Err(errno) =
+                        (|| sys::unlink_at(parent.reference()?.raw_fd(), &name, false))()
+                    {
+                        tracing::warn!(
+                            errno,
+                            name = %name.to_string_lossy(),
+                            "an acknowledged unlink failed to apply"
+                        );
+                    }
+                    parent.remove_pending_gone(name.to_bytes());
+                    if let Some(target) = &target {
+                        target.unshadow_meta();
+                    }
+                }
+            };
+            let seq = self.apply.push(crate::apply::Job::new(0, job));
+            parent.settled_by(seq);
+            if let Some(target) = &target_out {
+                target.settled_by(seq);
+            }
+            return Ok(Vec::new());
+        }
         sys::unlink_at(parent.reference()?.raw_fd(), &name, dir)?;
         Ok(Vec::new())
     }
@@ -976,6 +1133,14 @@ impl Server {
         let (new, _) = get_name(rest).ok_or(linux::EINVAL)?;
         let old = self.checked_name(old)?;
         let new = self.checked_name(new)?;
+        self.settle_while(&old_parent, |parent| {
+            parent.pending_child(old.to_bytes()).is_some()
+                || parent.name_pending_gone(old.to_bytes())
+        });
+        self.settle_while(&new_parent, |parent| {
+            parent.pending_child(new.to_bytes()).is_some()
+                || parent.name_pending_gone(new.to_bytes())
+        });
         sys::rename_at(
             old_parent.reference()?.raw_fd(),
             &old,
@@ -992,6 +1157,11 @@ impl Server {
         let target = self.inode(oldnodeid)?;
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
+        self.settle_while(&target, |target| target.is_pending() || target.is_dirty());
+        self.settle_while(&parent, |parent| {
+            parent.pending_child(name.to_bytes()).is_some()
+                || parent.name_pending_gone(name.to_bytes())
+        });
         // `linkat` has no descriptor-only form on macOS, so the source is named
         // by its live path — which is correct even if it has been renamed since
         // the guest looked it up.
@@ -1042,6 +1212,7 @@ impl Server {
         let fd = sys::reopen(inode.reference()?.raw_fd(), flags, 0)?;
         let file = Arc::new(OpenFile {
             fd,
+            readable: true,
             append: false,
             writable: need_write,
         });
@@ -1083,6 +1254,7 @@ impl Server {
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let source = self.inode(nodeid_in)?;
+        self.settle_while(&source, |source| source.is_dirty() || source.is_pending());
         let source_path = self.path(&source)?;
         let size = {
             let reference = source.reference()?;
@@ -1102,6 +1274,175 @@ impl Server {
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&(size as u64).to_le_bytes());
         Ok(out)
+    }
+
+    /// The asynchronous half of CREATE: a fresh name is acknowledged with a
+    /// pending inode and the open itself joins the apply queue.
+    ///
+    /// Only the clean case goes this way — a name the host does not have and
+    /// no queued operation has promised. Anything else returns `None` and the
+    /// synchronous path decides, exactly as it always has. The probe that
+    /// establishes "fresh" is a stat: two microseconds against the forty-seven
+    /// the create costs, which is the whole trade.
+    fn create_pending(
+        &self,
+        parent: &std::sync::Arc<Inode>,
+        name: &CString,
+        flags: u32,
+        mode: u32,
+    ) -> Result<Option<Vec<u8>>, i32> {
+        const LINUX_O_EXCL: u32 = 0o200;
+        const LINUX_O_APPEND: u32 = 0o2000;
+        if flags & LINUX_O_APPEND != 0 {
+            // Append keeps the size overlay honest by never being async.
+            return Ok(None);
+        }
+        if parent.pending_child(name.to_bytes()).is_some() {
+            // Promised already: to the guest this file exists.
+            if flags & LINUX_O_EXCL != 0 {
+                return Err(linux::EEXIST);
+            }
+            // Opening it needs the real file; settle the promise first.
+            self.settle_while(parent, |parent| {
+                parent.pending_child(name.to_bytes()).is_some()
+            });
+            return Ok(None);
+        }
+        // A name promised away is fresh — the unlink is queued ahead of the
+        // create this acknowledges, so the order the guest asked for is the
+        // order the host applies. Otherwise the host answers freshness.
+        if !parent.name_pending_gone(name.to_bytes()) {
+            match sys::stat_at(parent.reference()?.raw_fd(), name) {
+                Err(errno) if errno == linux::ENOENT => {}
+                _ => return Ok(None),
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let meta = crate::inode::PendingMeta {
+            mode: libc::S_IFREG as u32 | mode,
+            born: (now.as_secs() as i64, now.subsec_nanos() as i64),
+        };
+        let (nodeid, inode) = self.registry.insert_pending(parent.dev(), meta);
+        parent.add_pending_child(name.to_bytes(), nodeid);
+        let job = {
+            let registry = self.registry.clone();
+            let open_cache = self.open_cache.clone();
+            let parent = parent.clone();
+            let inode = inode.clone();
+            let name = name.clone();
+            move || {
+                const LINUX_O_CREAT: u32 = 0o100;
+                const LINUX_O_NOFOLLOW: u32 = 0o400000;
+                let result = (|| {
+                    let parent_fd = parent.reference()?;
+                    let fd = sys::openat_path(
+                        parent_fd.raw_fd(),
+                        &name,
+                        flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
+                        mode,
+                    )?;
+                    let st = sys::stat_fd(fd.as_raw_fd())?;
+                    Ok((fd, st))
+                })();
+                match result {
+                    Ok((fd, st)) => {
+                        // Two descriptors, as the synchronous path keeps two:
+                        // a metadata reference for the inode, and the open
+                        // file itself in the open cache — which is what lets
+                        // the guest keep reading and writing after an unlink,
+                        // exactly as a real file handle would.
+                        match sys::dup(&fd) {
+                            Ok(meta) => {
+                                registry.bind_pending(
+                                    nodeid,
+                                    &inode,
+                                    meta,
+                                    st.st_dev as i64,
+                                    st.st_ino,
+                                );
+                                open_cache.put_file(
+                                    nodeid,
+                                    std::sync::Arc::new(OpenFile {
+                                        fd,
+                                        readable: flags & 0o3 != 1,
+                                        append: false,
+                                        writable: flags & 0o3 != 0,
+                                    }),
+                                );
+                            }
+                            Err(_) => {
+                                registry.bind_pending(
+                                    nodeid,
+                                    &inode,
+                                    fd,
+                                    st.st_dev as i64,
+                                    st.st_ino,
+                                );
+                            }
+                        }
+                    }
+                    Err(errno) => {
+                        tracing::warn!(
+                            errno,
+                            name = %name.to_string_lossy(),
+                            "an acknowledged create failed to apply"
+                        );
+                        inode.bind_failed(errno);
+                    }
+                }
+                // Settled either way: the host directory answers for this
+                // name now — with the file, or honestly without it.
+                parent.remove_pending_child(name.to_bytes());
+            }
+        };
+        let seq = self.apply.push(crate::apply::Job::new(0, job));
+        parent.settled_by(seq);
+        inode.settled_by(seq);
+        let entry = self.pending_entry(parent, &inode, nodeid);
+        let mut out = self.entry_reply(&entry);
+        let open_flags = self.created_file_flags() | fuse::fopen::LIGHTER_CREATED;
+        out.extend_from_slice(&open_reply(0, open_flags));
+        Ok(Some(out))
+    }
+
+    /// The entry a pending inode answers with, from what the guest was told.
+    fn pending_entry(&self, parent: &Inode, inode: &Inode, nodeid: u64) -> EntryOut {
+        let meta = inode.pending_meta().unwrap_or(crate::inode::PendingMeta {
+            mode: libc::S_IFREG as u32 | 0o644,
+            born: (0, 0),
+        });
+        let size = inode.overlay_size(0);
+        let entry_valid = self
+            .policy
+            .validity(parent.dev(), parent.ino(), Answer::File);
+        let attr_valid = self.policy.attr_validity(inode.dev(), inode.ino());
+        EntryOut {
+            nodeid,
+            generation: 0,
+            entry_valid: entry_valid.as_secs(),
+            attr_valid: attr_valid.as_secs(),
+            entry_valid_nsec: entry_valid.subsec_nanos(),
+            attr_valid_nsec: attr_valid.subsec_nanos(),
+            attr: Attr {
+                ino: inode.ino(),
+                size,
+                blocks: size.div_ceil(512),
+                atime: meta.born.0,
+                mtime: meta.born.0,
+                ctime: meta.born.0,
+                atimensec: meta.born.1 as u32,
+                mtimensec: meta.born.1 as u32,
+                ctimensec: meta.born.1 as u32,
+                mode: meta.mode,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 4096,
+            },
+        }
     }
 
     fn create(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
@@ -1125,6 +1466,15 @@ impl Server {
         const LINUX_O_CREAT: u32 = 0o100;
         const LINUX_O_EXCL: u32 = 0o200;
         const LINUX_O_NOFOLLOW: u32 = 0o400000;
+        if self.apply.accepting()
+            && let Some(reply) =
+                self.create_pending(&parent, &name, flags, mode & 0o7777 & !umask)?
+        {
+            return Ok(reply);
+        }
+        // The synchronous path is about to consult the host about a name
+        // whose truth may still be in the queue.
+        self.settle_while(&parent, |parent| parent.name_pending_gone(name.to_bytes()));
         let parent_fd = parent.reference()?;
         let mut created = true;
         let mut attempt = 0;
@@ -1170,6 +1520,7 @@ impl Server {
         let entry = self.entry_with_reference(&parent, st, || sys::dup(&fd))?;
         let fh = self.registry.add_handle(Handle::File(Arc::new(OpenFile {
             fd,
+            readable: true,
             append: flags & 0o2000 != 0,
             writable: flags & 0o3 != 0,
         })));
@@ -1186,6 +1537,13 @@ impl Server {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
+        // Reads never lie: bytes this file was promised must be in it first —
+        // and a pending file must exist at all.
+        let inode = self.inode(nodeid)?;
+        self.settle_while(&inode, |inode| inode.is_dirty() || inode.is_pending());
+        if let Some(errno) = inode.take_write_error() {
+            return Err(errno);
+        }
         let file = self.file_for(nodeid, fh, false)?;
         // The guest sized the reply chain; never promise more than it can hold.
         let size = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
@@ -1200,9 +1558,101 @@ impl Server {
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
         let data = body.get(40..40 + size).ok_or(linux::EINVAL)?;
+        let inode = self.inode(nodeid)?;
+        // A failure parked by an earlier acknowledged write surfaces on the
+        // next one, so a writer learns within one operation, not at fsync.
+        if let Some(errno) = inode.take_write_error() {
+            return Err(errno);
+        }
+        // A write to a pending file cannot open a descriptor yet; the job
+        // resolves one at apply time, after the create it is ordered behind.
+        if inode.is_pending() && self.apply.accepting() {
+            inode.write_acked(offset + size as u64);
+            let data = data.to_vec();
+            let job = {
+                let inode = inode.clone();
+                let open_cache = self.open_cache.clone();
+                move || {
+                    let result = (|| {
+                        // The create that precedes this in the queue put the
+                        // open descriptor in the cache; it survives unlink,
+                        // which a path reopen does not.
+                        let fd: std::sync::Arc<OpenFile>;
+                        let raw = if let Some(cached) = open_cache.file(nodeid, true) {
+                            fd = cached;
+                            fd.fd.as_raw_fd()
+                        } else {
+                            let reference = inode.reference()?;
+                            fd = std::sync::Arc::new(OpenFile {
+                                fd: sys::reopen(reference.raw_fd(), 2, 0)?,
+                                readable: true,
+                                append: false,
+                                writable: true,
+                            });
+                            fd.fd.as_raw_fd()
+                        };
+                        let _hold = &fd;
+                        let mut at = 0usize;
+                        while at < data.len() {
+                            match sys::write_at(raw, &data[at..], offset + at as u64) {
+                                Ok(0) => return Err(linux::EIO),
+                                Ok(n) => at += n,
+                                Err(errno) => return Err(errno),
+                            }
+                        }
+                        Ok(())
+                    })();
+                    inode.write_applied(result);
+                }
+            };
+            let seq = self.apply.push(crate::apply::Job::new(size, job));
+            inode.settled_by(seq);
+            let mut out = Vec::with_capacity(8);
+            out.extend_from_slice(&(size as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            return Ok(out);
+        }
+        // The queue is refusing work (full disk, retired); the file must
+        // exist before a synchronous write can reach it.
+        self.settle_while(&inode, |inode| inode.is_pending());
         let file = self.file_for(nodeid, fh, true)?;
+        // Append is served synchronously: its end position is unknowable
+        // before the syscall, and the size overlay must never have to guess.
         let written = if file.append {
             sys::write_append(file.fd.as_raw_fd(), data)?
+        } else if self.apply.accepting() {
+            // Acknowledged now, applied in order on the queue. The guest's
+            // own kernel keeps the pages it just wrote, reads on this inode
+            // drain first, and lookup answers with the overlay size — so
+            // nothing can observe the gap except as latency it no longer
+            // pays.
+            inode.write_acked(offset + data.len() as u64);
+            let data = data.to_vec();
+            let job = {
+                let file = file.clone();
+                let inode = inode.clone();
+                move || {
+                    let mut at = 0usize;
+                    let mut result = Ok(());
+                    while at < data.len() {
+                        match sys::write_at(file.fd.as_raw_fd(), &data[at..], offset + at as u64) {
+                            Ok(0) => {
+                                result = Err(linux::EIO);
+                                break;
+                            }
+                            Ok(n) => at += n,
+                            Err(errno) => {
+                                result = Err(errno);
+                                break;
+                            }
+                        }
+                    }
+                    inode.write_applied(result);
+                }
+            };
+            let seq = self.apply.push(crate::apply::Job::new(size, job));
+            inode.settled_by(seq);
+            size
         } else {
             sys::write_at(file.fd.as_raw_fd(), data, offset)?
         };
@@ -1215,10 +1665,22 @@ impl Server {
     fn fsync(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let datasync = get_u32(body, 8).unwrap_or(0) & 1 != 0;
-        // A directory has nothing to sync: its metadata reached the host when
-        // the operation that changed it returned.
-        if self.inode(nodeid).is_ok_and(|inode| inode.is_dir) {
+        // A directory's own sync is a settling point for the names inside
+        // it: entries reach the host when their queued operations apply, so
+        // apply them.
+        if let Ok(inode) = self.inode(nodeid)
+            && inode.is_dir
+        {
+            self.settle_while(&inode, |inode| inode.listing_shadowed());
             return Ok(Vec::new());
+        }
+        // Durability is never claimed early: everything acknowledged reaches
+        // the file before the sync, and a parked failure surfaces here rather
+        // than being flushed into silence.
+        let inode = self.inode(nodeid)?;
+        self.settle_while(&inode, |inode| inode.is_dirty() || inode.is_pending());
+        if let Some(errno) = inode.take_write_error() {
+            return Err(errno);
         }
         let file = self.file_for(nodeid, fh, false)?;
         sys::fsync(file.fd.as_raw_fd(), datasync)?;
@@ -1226,6 +1688,7 @@ impl Server {
     }
 
     fn statfs(&self) -> Result<Vec<u8>, i32> {
+        self.apply.drain();
         let st = sys::statfs(&self.root)?;
         let mut out = Vec::with_capacity(80);
         out.extend_from_slice(&st.f_blocks.to_le_bytes());
@@ -1251,6 +1714,11 @@ impl Server {
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
         let budget = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
 
+        if let Ok(inode) = self.inode(nodeid) {
+            // The host listing cannot show a file that is still a promise,
+            // nor keep showing one that is promised away.
+            self.settle_while(&inode, |inode| inode.listing_shadowed());
+        }
         let open = self.dir_for(nodeid)?;
         let mut entries = open.entries.lock().expect("directory listing poisoned");
         // A caller starting from the beginning is asking for a fresh view;

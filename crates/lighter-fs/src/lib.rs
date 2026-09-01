@@ -24,6 +24,7 @@
 //!     └── errno      macOS error numbers as Linux ones
 //! ```
 
+pub mod apply;
 pub mod cache;
 pub mod errno;
 pub mod fsevents;

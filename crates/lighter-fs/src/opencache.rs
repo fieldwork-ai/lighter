@@ -52,9 +52,14 @@ impl OpenCache {
     pub fn file(&self, nodeid: u64, need_write: bool) -> Option<Arc<OpenFile>> {
         let files = self.files.lock().expect("open cache poisoned");
         let file = files.get(&nodeid)?;
-        // A read-only descriptor cannot serve a write, and the caller will
-        // replace it. Reporting a miss is how it finds out.
-        (!need_write || file.writable).then(|| file.clone())
+        // A read-only descriptor cannot serve a write, nor a write-only one a
+        // read; the caller replaces it. Reporting a miss is how it finds out.
+        let fits = if need_write {
+            file.writable
+        } else {
+            file.readable
+        };
+        fits.then(|| file.clone())
     }
 
     pub fn put_file(&self, nodeid: u64, file: Arc<OpenFile>) {
@@ -130,6 +135,7 @@ mod tests {
     fn file(writable: bool) -> Arc<OpenFile> {
         Arc::new(OpenFile {
             fd: spare_fd(),
+            readable: true,
             append: false,
             writable,
         })

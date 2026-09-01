@@ -258,6 +258,11 @@ fn a_file_written_by_the_guest_appears_on_the_host() {
     let mut guest = Guest::new("write");
     let (nodeid, fh) = guest.create(1, "hello.txt", CREATE_RDWR).unwrap();
     assert_eq!(guest.write(nodeid, fh, 0, b"contents").unwrap(), 8);
+    // Mutations are applied asynchronously; fsync is the settling point at
+    // which the host file must answer for everything acknowledged.
+    let mut body = vec![0u8; 16];
+    body[0..8].copy_from_slice(&fh.to_le_bytes());
+    guest.call(op::FSYNC, nodeid, &body).unwrap();
     assert_eq!(
         std::fs::read_to_string(guest.host("hello.txt")).unwrap(),
         "contents"
@@ -934,4 +939,48 @@ fn create_excl_on_an_existing_file_is_eexist() {
     const LINUX_O_EXCL: u32 = 0o200;
     let err = create_verbose(&mut guest, 1, "taken", CREATE_RDWR | LINUX_O_EXCL).unwrap_err();
     assert_eq!(err, 17, "EEXIST");
+}
+
+/// The asynchronous write path, held to its three promises: reads never lie,
+/// durability is never claimed early, and the size the guest is told never
+/// runs behind what it was promised. Each is checked under a storm of small
+/// writes, because a queue that is momentarily behind is exactly the state
+/// the barriers exist for.
+#[test]
+fn acknowledged_writes_are_never_observable_as_missing() {
+    let mut guest = Guest::new("async-writes");
+    for i in 0..64 {
+        let name = format!("f{i}");
+        let (nodeid, fh) = guest.create(1, &name, 0x8241).expect("create");
+        let chunk = vec![i as u8; 4096];
+        for n in 0..8u64 {
+            let written = guest.write(nodeid, fh, n * 4096, &chunk).expect("write");
+            assert_eq!(written, 4096, "every write is acknowledged in full");
+        }
+        // Reads never lie: the bytes promised must come back, however far
+        // behind the apply queue is.
+        let back = guest.read(nodeid, 0, 3 * 4096, 4096).expect("read");
+        assert_eq!(back, chunk, "a read observes every acknowledged write");
+        // The size the guest is told never runs behind its own writes.
+        let mut body = vec![0u8; 16];
+        body[0..4].copy_from_slice(&fuse::GETATTR_FH.to_le_bytes());
+        body[8..16].copy_from_slice(&fh.to_le_bytes());
+        let reply = guest.call(op::GETATTR, nodeid, &body).expect("getattr");
+        let size = u64::from_le_bytes(reply[16 + 8..16 + 16].try_into().unwrap());
+        assert_eq!(size, 8 * 4096, "getattr reports at least the promised size");
+    }
+}
+
+#[test]
+fn fsync_settles_the_apply_queue_before_replying() {
+    let mut guest = Guest::new("async-fsync");
+    let (nodeid, fh) = guest.create(1, "durable", 0x8241).expect("create");
+    let payload = b"promised bytes".to_vec();
+    guest.write(nodeid, fh, 0, &payload).expect("write");
+    let mut body = vec![0u8; 16];
+    body[0..8].copy_from_slice(&fh.to_le_bytes());
+    guest.call(op::FSYNC, nodeid, &body).expect("fsync");
+    // Durability was claimed, so the host file answers for itself now.
+    let on_disk = std::fs::read(guest.root.join("durable")).expect("host read");
+    assert_eq!(on_disk, payload, "fsync means the bytes are on the Mac");
 }
