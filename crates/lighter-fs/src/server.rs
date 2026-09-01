@@ -942,8 +942,17 @@ impl Server {
         // by its live path — which is correct even if it has been renamed since
         // the guest looked it up.
         let source = self.path(&target)?;
+        let reference = target.reference()?;
         sys::link_at(libc::AT_FDCWD, &source, parent.reference()?.raw_fd(), &name)?;
-        let entry = self.entry(&parent, &name)?;
+        // A hardlink IS its source's inode, so the attributes come from the
+        // descriptor already in hand — `fstat` with a fresh `st_nlink` —
+        // rather than a path walk to stat the name just made. The registry
+        // resolves the identity to the inode it already holds, so no second
+        // descriptor is opened either.
+        let st = sys::stat_fd(reference.raw_fd())?;
+        let entry = self.entry_with_reference(&parent, st, || {
+            sys::open_reference(parent.reference()?.raw_fd(), &name, false)
+        })?;
         Ok(self.entry_reply(&entry))
     }
 

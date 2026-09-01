@@ -85,7 +85,7 @@ lighter (CLI)  ──spawns──▶  lighter run  ─────────�
 
 One crate, one secret, in the sense Parnas meant: `lighter-hv` is the only thing that knows there is an Apple framework underneath, `lighter-fs` is the only thing that knows what a FUSE request looks like, and neither knows about the other. [`docs/architecture.md`](docs/architecture.md) is the longer version.
 
-The guest is ours too: a kernel built from source with a configuration in this repository, two patches to its virtio-fs driver, an init that fits on two screens, and a small Rust agent. `make guest` builds all of it — and `make dogfood` builds it *using lighter*, which is both a good test and the point.
+The guest is ours too: a kernel built from source with a configuration in this repository, four patches to its FUSE and virtio-fs drivers, an init that fits on two screens, and a small Rust agent. `make guest` builds all of it — and `make dogfood` builds it *using lighter*, which is both a good test and the point.
 
 ## Building it
 

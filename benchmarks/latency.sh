@@ -141,7 +141,7 @@ if [ "$REPEAT" -gt 1 ]; then
 fi
 printf '\n%-14s %10s %10s %10s %11s %8s\n' \
 	"operation" "macOS" "share" "in-guest" "boundary" "spread"
-for op in create+close create-parallel stat-cached stat-missing write-4k write-chunked unlink; do
+for op in create+close create-parallel stat-cached stat-missing write-4k write-chunked unlink link rename; do
 	read -r host _ <<<"$(summarise "$native" "$op")"
 	read -r share spread <<<"$(summarise "$ours" "$op")"
 	read -r local _ <<<"$(summarise "$ours" "$op@local")"

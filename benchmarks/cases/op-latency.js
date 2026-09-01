@@ -103,6 +103,21 @@ bench(
   }),
 );
 bench("unlink", each((d, i) => fs.unlinkSync(path.join(d, `f${i}`))), touch("f"));
+// The shape pnpm installs in: every file it imports is hardlinked into the
+// virtual store, so an install is as fast as the filesystem's link — and on
+// APFS a hardlink is not a cheap operation.
+bench(
+  "link",
+  each((d, i) => fs.linkSync(path.join(d, "source"), path.join(d, `l${i}`))),
+  (d) => fs.closeSync(fs.openSync(path.join(d, "source"), "w")),
+);
+// The other half of an atomic import: write under a temporary name, rename
+// into place.
+bench(
+  "rename",
+  each((d, i) => fs.renameSync(path.join(d, `f${i}`), path.join(d, `r${i}`))),
+  touch("f"),
+);
 
 // The same creates, issued concurrently.
 //
