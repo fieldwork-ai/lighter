@@ -115,6 +115,12 @@ impl Network {
             .arg(format!("unix://{}", socket_path.display()))
             .arg("--mtu")
             .arg("1500")
+            // gvproxy's built-in SSH forward binds 127.0.0.1:2222 by default,
+            // which we never use and which makes every second machine on the
+            // Mac die at boot — the benchmark harness beside the daily
+            // driver, most memorably. -1 turns the service off entirely.
+            .arg("-ssh-port")
+            .arg("-1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
