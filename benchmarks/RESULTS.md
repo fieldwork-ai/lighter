@@ -18,14 +18,14 @@ of the repetitions.
 
 | case | native | lighter | orbstack |
 |---|---|---|---|
-| npm-install | 6484 | 12432 | 8945 |
-| pnpm-install | 4481 | 16281 | 5415 |
-| yarn-install | 6267 | 14185 | 8611 |
-| ripgrep | 928 | 110 | 991 |
-| find-walk | 383 | 108 | 480 |
-| copy-tree | 14598 | 7061 | 9327 |
-| rm-rf | 4086 | 5460 | 3206 |
-| watch-latency | 1 | 5 | 12 |
+| npm-install | 6287 | 11984 | 8945 |
+| pnpm-install | — | — | 5415 |
+| yarn-install | — | — | 8611 |
+| ripgrep | 928 | 98 | 991 |
+| find-walk | 373 | 110 | 480 |
+| copy-tree | 14341 | 7016 | 9327 |
+| rm-rf | — | — | 3206 |
+| watch-latency | 2 | 2 | 12 |
 
 ## As a fraction of `native`
 
@@ -36,13 +36,10 @@ division by noise — read it from the table above in milliseconds.
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 52% | 72% |
-| pnpm-install | 28% | 83% |
-| yarn-install | 44% | 73% |
-| ripgrep | 844% | 94% |
-| find-walk | 355% | 80% |
-| copy-tree | 207% | 157% |
-| rm-rf | 75% | 127% |
+| npm-install | 52% | 70% |
+| ripgrep | 947% | 94% |
+| find-walk | 339% | 78% |
+| copy-tree | 204% | 154% |
 
 ## Sweeps
 

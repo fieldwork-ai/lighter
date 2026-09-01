@@ -117,7 +117,10 @@ check_port "mailpit" "http://127.0.0.1:18025/"
 check_port "minio" "http://127.0.0.1:19000/minio/health/live"
 check_port "nginx" "http://127.0.0.1:18080/"
 
-if docker compose -f "$COMPOSE" exec -T postgres pg_isready -U postgres >/dev/null 2>&1; then
+# stdin from /dev/null, not inherited: `compose exec` attaches it even with
+# -T, so a gate run from a pipe that never closes waits forever on input
+# nobody is going to type. It hung here for an hour before that was obvious.
+if docker compose -f "$COMPOSE" exec -T postgres pg_isready -U postgres </dev/null >/dev/null 2>&1; then
 	pass "postgres is serving on its named volume"
 else
 	fail "postgres is not answering"
@@ -167,7 +170,7 @@ fi
 
 echo
 echo "==> Everything still works afterwards"
-if docker compose -f "$COMPOSE" exec -T postgres pg_isready -U postgres >/dev/null 2>&1; then
+if docker compose -f "$COMPOSE" exec -T postgres pg_isready -U postgres </dev/null >/dev/null 2>&1; then
 	pass "postgres survived it"
 else
 	fail "postgres did not survive it"
