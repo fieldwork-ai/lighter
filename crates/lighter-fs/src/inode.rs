@@ -99,6 +99,10 @@ pub struct Census {
     /// forgotten, which from the outside looks exactly like a descriptor leak
     /// — so it is worth being able to tell them apart.
     inodes: AtomicUsize,
+    /// The registry's descriptor budget, mirrored here so an inode reviving
+    /// itself can ask whether there is room without a pointer back to the
+    /// registry. Zero until the registry sets it.
+    budget: AtomicUsize,
 }
 
 impl Census {
@@ -181,8 +185,17 @@ impl Inode {
             .expect("parked path poisoned")
             .clone()
             .ok_or(crate::errno::linux::ESTALE)?;
-        let fd = self.reopen(&parked)?;
-        let fd = Arc::new(fd);
+        let fd = Arc::new(self.reopen(&parked)?);
+        // Reviving into a full share is how a working set larger than the
+        // budget turns into thrash: every revival forces the sweep to park
+        // something else, which the next operation revives in turn — cache
+        // churn plus sweep scanning, on every request. With no room, the
+        // descriptor serves this one operation and is dropped with it; the
+        // inode stays parked and nothing else is evicted to make space.
+        let budget = self.census.budget.load(Ordering::Relaxed);
+        if budget > 0 && self.census.descriptors.load(Ordering::Relaxed) >= budget {
+            return Ok(Reference(fd));
+        }
         self.held.store(true, Ordering::Relaxed);
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
         *slot = Some(fd.clone());
@@ -436,6 +449,9 @@ impl Registry {
         // a count that could reach zero would let a buggy guest drop it and
         // take the whole mount with it.
         let census = Arc::new(Census::default());
+        census
+            .budget
+            .store(descriptor_budget(), Ordering::Relaxed);
         let root = Arc::new(Inode::new(
             root_fd,
             dev,
