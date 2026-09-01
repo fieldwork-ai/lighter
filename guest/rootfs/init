@@ -21,7 +21,15 @@ set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 
-/bin/busybox --install -s 2>/dev/null || true
+# No `busybox --install -s` here, and it matters. Alpine already ships every
+# applet symlink, and busybox resolves its own path through /proc/self/exe —
+# which is not mounted yet at this point in init. Without it, the install
+# writes a symlink from /bin/busybox to itself, and every applet in the image
+# becomes ELOOP. What that looks like from outside is init exiting 127 several
+# steps later, at whichever command happened to be next.
+#
+# The initramfs does need it, because there busybox is the only binary in the
+# image and nothing else has made the links.
 
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
@@ -81,6 +89,37 @@ if [ -b "$DATA_DEV" ]; then
 	fi
 else
 	echo "INIT data=absent"
+fi
+
+# --- Running x86-64 containers --------------------------------------------
+# `binfmt_misc` is how Linux learns that an ELF it cannot execute should be
+# handed to an interpreter instead. With this registered, `docker run
+# --platform linux/amd64` works with no further arrangement: the kernel sees an
+# x86-64 header, and runs qemu against it.
+#
+# The `F` flag is the load-bearing one. Without it the kernel resolves the
+# interpreter path at exec time — inside the container's mount namespace, where
+# /usr/bin/qemu-x86_64 does not exist. With it, the interpreter is opened once,
+# here, and the open file is what every later exec uses. That is the difference
+# between this working everywhere and working only outside containers.
+if mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null; then
+	# `%s` and not a bare format string, because the escapes must reach the
+	# kernel *as text*: binfmt_misc unquotes `\xHH` itself. Letting the shell
+	# expand them first writes real NUL bytes, `write` stops at the first one,
+	# and the kernel registers a truncated magic — which then matches every
+	# 64-bit ELF, hands each one to an x86 emulator, and turns the next
+	# command in this script into `exit 127`.
+	printf '%s\n' ':qemu-x86_64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-x86_64:FP' \
+		> /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+	# Checked by looking, not by the exit status of a redirect into procfs,
+	# which is not a reliable report of whether the kernel accepted the entry.
+	if [ -f /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; then
+		echo "INIT binfmt=x86_64"
+	else
+		echo "INIT binfmt=failed"
+	fi
+else
+	echo "INIT binfmt=unavailable"
 fi
 
 # --- Shared directories ---------------------------------------------------

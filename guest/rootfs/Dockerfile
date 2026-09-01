@@ -10,6 +10,11 @@ FROM alpine:3.21 AS rootfs
 # docker-cli is not needed in the guest — the CLI runs on macOS — but dockerd
 # pulls its own runtime deps. e2fsprogs is here for the overlay2 storage driver
 # and for fsck of the data volume on boot.
+#
+# `qemu-x86_64` is what makes `--platform linux/amd64` work. Rosetta would be
+# faster and is not available to us: it refuses to run outside
+# Virtualization.framework, which is a check we are not going to work around.
+# See `docs/x86-64.md`.
 RUN apk add --no-cache \
 	docker-engine \
 	containerd \
@@ -23,7 +28,8 @@ RUN apk add --no-cache \
 	ca-certificates \
 	tzdata \
 	openrc \
-	busybox-openrc
+	busybox-openrc \
+	qemu-x86_64
 
 COPY init /sbin/lighter-init
 COPY lighter-agent /sbin/lighter-agent
@@ -47,12 +53,23 @@ RUN apt-get update \
 
 COPY --from=rootfs / /rootfs
 
-# Sized for the tree plus room for logs and a little growth. Docker images do
-# NOT land here — they go on the separate data disk — so this does not need to
-# grow with what the user pulls.
+# Sized for the tree plus room for logs and growth. Docker images do NOT land
+# here — they go on the separate data disk — so this does not grow with what
+# the user pulls. It is a sparse file, so the size is a ceiling rather than a
+# cost.
+#
+# The two commands are separate on purpose. They used to be one chain ending in
+# `|| [ $? -le 1 ]`, which was meant to forgive `e2fsck` reporting that it had
+# fixed something — and forgave `mke2fs` running out of room as well. The build
+# then succeeded with a filesystem missing whatever had not fitted, and the
+# guest panicked at the first missing binary with `exitcode=0x7f00`, several
+# steps into init and nowhere near the cause.
 RUN rm -rf /rootfs/proc/* /rootfs/sys/* /rootfs/dev/* \
-	&& mke2fs -q -t ext4 -d /rootfs -L lighter-root -b 4096 /rootfs.ext4 1G \
-	&& e2fsck -fp /rootfs.ext4 || [ $? -le 1 ]
+	&& echo "rootfs tree: $(du -sm /rootfs | cut -f1) MiB in $(find /rootfs | wc -l) files" \
+	&& mke2fs -q -t ext4 -d /rootfs -L lighter-root -b 4096 /rootfs.ext4 2G
+# `e2fsck` exits 1 when it corrected something, which is not a failure; anything
+# above that is.
+RUN e2fsck -fp /rootfs.ext4 || [ $? -le 1 ]
 
 FROM scratch
 COPY --from=image /rootfs.ext4 /rootfs.ext4
