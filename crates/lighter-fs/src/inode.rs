@@ -306,6 +306,15 @@ impl Handle {
 /// it. Sharding is the cheapest fix that does not change the interface.
 const SHARDS: usize = 16;
 
+/// Which identity shard a host inode number belongs to.
+///
+/// Keyed on the inode rather than the pair, because the device is the same for
+/// every file on a share and mixing it in would only cost an instruction. APFS
+/// hands out inode numbers sequentially, so the low bits spread on their own.
+fn identity_shard(ino: u64) -> usize {
+    (ino as usize) % SHARDS
+}
+
 fn shard(key: u64) -> usize {
     // The keys are consecutive counters, so the low bits are already uniform
     // and a hash would be pure cost.
@@ -319,9 +328,13 @@ pub struct Registry {
     /// Host identity to `nodeid`, so a second path to the same file resolves to
     /// the same inode rather than a second one with its own descriptor.
     ///
-    /// Not sharded, but read-mostly: it is written once per new inode and read
-    /// on every lookup, which is exactly the shape an `RwLock` is for.
-    by_identity: RwLock<HashMap<(i64, u64), u64>>,
+    /// Sharded, and it has to be. `insert` holds the write side across an
+    /// `fstat` — it must, because deciding whether an existing entry still
+    /// names this file is what that syscall is for — so one lock here is one
+    /// lock every thread creating a file queues behind. Measured on a package
+    /// install, a create costs 26 microseconds on one thread and 39 under
+    /// sixteen, and the difference is this.
+    by_identity: [RwLock<HashMap<(i64, u64), u64>>; SHARDS],
     /// Sharded by `fh`.
     handles: [Mutex<HashMap<u64, Arc<Handle>>>; SHARDS],
     next_id: AtomicU64,
@@ -384,11 +397,15 @@ impl Registry {
             .lock()
             .expect("inode table poisoned")
             .insert(ROOT_ID, root);
-        let mut by_identity = HashMap::new();
-        by_identity.insert((dev, ino), ROOT_ID);
+        let by_identity: [RwLock<HashMap<(i64, u64), u64>>; SHARDS] =
+            std::array::from_fn(|_| RwLock::new(HashMap::new()));
+        by_identity[identity_shard(ino)]
+            .write()
+            .expect("identity table poisoned")
+            .insert((dev, ino), ROOT_ID);
         Registry {
             by_id,
-            by_identity: RwLock::new(by_identity),
+            by_identity,
             handles: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(ROOT_ID + 1),
             next_handle: AtomicU64::new(1),
@@ -416,8 +433,7 @@ impl Registry {
     /// package install looks up the same few thousand directories tens of
     /// thousands of times.
     pub fn relookup(&self, dev: i64, ino: u64) -> Option<u64> {
-        let id = *self
-            .by_identity
+        let id = *self.by_identity[identity_shard(ino)]
             .read()
             .expect("identity table poisoned")
             .get(&(dev, ino))?;
@@ -440,7 +456,7 @@ impl Registry {
     /// For the watcher, which needs to know whether the guest has ever heard of
     /// something before it bothers telling it to forget.
     pub fn nodeid_for(&self, dev: i64, ino: u64) -> Option<u64> {
-        self.by_identity
+        self.by_identity[identity_shard(ino)]
             .read()
             .expect("identity table poisoned")
             .get(&(dev, ino))
@@ -454,11 +470,13 @@ impl Registry {
     /// to go is only the claim that those numbers *mean* this inode, so that
     /// whatever holds them now gets an identity of its own.
     fn retire_identity(&self, id: u64, dev: i64, ino: u64) {
-        let _writer = self.by_identity.write().map(|mut map| {
-            if map.get(&(dev, ino)) == Some(&id) {
-                map.remove(&(dev, ino));
-            }
-        });
+        let _writer = self.by_identity[identity_shard(ino)]
+            .write()
+            .map(|mut map| {
+                if map.get(&(dev, ino)) == Some(&id) {
+                    map.remove(&(dev, ino));
+                }
+            });
     }
 
     /// Records an inode the guest is about to be told about, and counts the
@@ -470,7 +488,9 @@ impl Registry {
     pub fn insert(&self, fd: OwnedFd, dev: i64, ino: u64, is_dir: bool, is_symlink: bool) -> u64 {
         // Two threads can miss `relookup` for the same file at once; the
         // identity map is the arbiter, and the loser's descriptor is dropped.
-        let mut identity = self.by_identity.write().expect("identity table poisoned");
+        let mut identity = self.by_identity[identity_shard(ino)]
+            .write()
+            .expect("identity table poisoned");
         if let Some(&id) = identity.get(&(dev, ino)) {
             // Someone installed it between our caller's miss and this lock.
             // Their entry wins if it is still the file these numbers name; if
@@ -541,7 +561,9 @@ impl Registry {
         table.remove(&id);
         drop(table);
 
-        let mut map = self.by_identity.write().expect("identity table poisoned");
+        let mut map = self.by_identity[identity_shard(identity.1)]
+            .write()
+            .expect("identity table poisoned");
         // Only unmap the identity if it still points at us: a file removed and
         // recreated could have reused the inode number and repointed it.
         if map.get(&identity) == Some(&id) {
