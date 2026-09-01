@@ -17,7 +17,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 KERNEL="guest/out/Image"
-ROOTFS="guest/out/rootfs.ext4"
+# A private clone, not the master: the master is an artifact, and any second
+# machine mounting it read-write beside the first corrupts both.
+ROOTFS_MASTER="guest/out/rootfs.ext4"
+ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 GVPROXY="${GVPROXY:-vendor/gvproxy}"
 PROFILE="${PROFILE:-release}"
 BIN="target/$PROFILE/examples/lighter-bench"

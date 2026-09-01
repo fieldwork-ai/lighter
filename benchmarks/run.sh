@@ -312,11 +312,16 @@ run_case_container() {
 
 setup_lighter() {
 	KERNEL="guest/out/Image"
-	ROOTFS="guest/out/rootfs.ext4"
 	GVPROXY="${GVPROXY:-vendor/gvproxy}"
 	BIN="target/release/examples/lighter-bench"
 	[ -f "$KERNEL" ] || ./guest/kernel/build.sh
-	[ -f "$ROOTFS" ] || ./guest/rootfs/build.sh
+	# A private clone, not the master: the master is an artifact, and any
+	# second machine mounting it read-write beside the first — a daily
+	# driver, another gate — corrupts both. clonefile makes the copy free.
+	ROOTFS_MASTER="guest/out/rootfs.ext4"
+	[ -f "$ROOTFS_MASTER" ] || ./guest/rootfs/build.sh
+	ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+	cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 	# Release, because a debug VMM is measuring the compiler.
 	cargo build --release --example lighter-bench -p lighter-vmm
 	./scripts/sign.sh "$BIN" >/dev/null

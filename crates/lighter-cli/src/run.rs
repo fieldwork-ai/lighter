@@ -17,6 +17,44 @@ use crate::paths;
 
 /// Builds the machine described by the configuration and runs it until it
 /// stops.
+/// The machine's own copy of the root filesystem.
+///
+/// The master in the guest directory is an artifact, and mounting an
+/// artifact read-write is how it stopped being one: the running machine
+/// dirtied it continuously, a gate or benchmark booting the same file
+/// beside it would have corrupted both, and copying it anywhere produced a
+/// torn snapshot. The machine clones it into its own home instead — an APFS
+/// clonefile, so the copy is instant and costs nothing until blocks diverge
+/// — refreshed whenever the master is newer, which is what makes `make
+/// guest` reach the next start.
+fn private_rootfs() -> anyhow::Result<std::path::PathBuf> {
+    let master = paths::rootfs()?;
+    let private = paths::home()?.join("rootfs.ext4");
+    let stale = match (std::fs::metadata(&master), std::fs::metadata(&private)) {
+        (Ok(m), Ok(p)) => m.modified()? > p.modified()?,
+        _ => true,
+    };
+    if stale {
+        let staging = paths::home()?.join(".rootfs.next");
+        let _ = std::fs::remove_file(&staging);
+        clonefile(&master, &staging)?;
+        std::fs::rename(&staging, &private)?;
+    }
+    Ok(private)
+}
+
+/// An APFS clonefile, falling back to a plain copy on filesystems without it.
+fn clonefile(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+    let src = std::ffi::CString::new(from.as_os_str().as_encoded_bytes())?;
+    let dst = std::ffi::CString::new(to.as_os_str().as_encoded_bytes())?;
+    // SAFETY: two valid NUL-terminated paths.
+    if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    std::fs::copy(from, to)?;
+    Ok(())
+}
+
 pub fn machine() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -90,7 +128,7 @@ pub fn machine() -> anyhow::Result<()> {
         initramfs: None,
         cmdline,
         interactive: false,
-        disks: vec![paths::rootfs()?, paths::data_disk()?],
+        disks: vec![private_rootfs()?, paths::data_disk()?],
         disk_size_bytes: config.disk_gib << 30,
         gvproxy: Some(paths::gvproxy()?),
         run_dir: home.clone(),

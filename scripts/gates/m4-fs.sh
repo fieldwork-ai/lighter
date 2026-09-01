@@ -250,7 +250,11 @@ reap
 echo
 echo "==> Boot 4: a macOS directory bind-mounted into a container"
 GVPROXY="${GVPROXY:-vendor/gvproxy}"
-ROOTFS="guest/out/rootfs.ext4"
+# A private clone, not the master: the master is an artifact, and any second
+# machine mounting it read-write beside the first corrupts both.
+ROOTFS_MASTER="guest/out/rootfs.ext4"
+ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 if ! command -v docker >/dev/null 2>&1; then
 	echo "  (skipped: no docker client on this machine)"
 elif [ ! -x "$GVPROXY" ]; then
