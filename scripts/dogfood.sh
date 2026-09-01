@@ -37,7 +37,7 @@ cd "$ROOT"
 KERNEL="guest/out/Image"
 ROOTFS="guest/out/rootfs.ext4"
 GVPROXY="${GVPROXY:-vendor/gvproxy}"
-BIN="target/release/examples/boot"
+BIN="target/release/examples/lighter-bench"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 CPUS="${CPUS:-$(sysctl -n hw.ncpu)}"
 MEMORY_MIB="${MEMORY_MIB:-12288}"
@@ -52,7 +52,7 @@ done
 [ -x "$GVPROXY" ] || { echo "gvproxy missing; run scripts/fetch-gvproxy.sh" >&2; exit 1; }
 
 echo "==> Building and signing the VMM"
-cargo build --release --example boot -p lighter-vmm
+cargo build --release --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 
 RUN_DIR="$(mktemp -d -t lighter-dogfood)"

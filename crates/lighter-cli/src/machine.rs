@@ -60,9 +60,17 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
     // would make the Docker CLI hang against nothing.
     let _ = std::fs::remove_file(&socket);
 
-    let exe = std::env::current_exe()?;
+    // From the bundle, not from wherever the CLI binary happens to sit:
+    // that is what gives the process a name and the flame in Activity
+    // Monitor. The guest directory is resolved here and passed down,
+    // because the bundled copy cannot find it by walking up from itself.
+    let exe = crate::bundle::ensure()?;
+    let guest = paths::guest_dir()?;
+    let gvproxy = paths::gvproxy()?;
     let mut command = std::process::Command::new(exe);
     command.arg("run");
+    command.env("LIGHTER_GUEST_DIR", &guest);
+    command.env("LIGHTER_GVPROXY", &gvproxy);
     let log_file = std::fs::File::create(&log)?;
     command
         .stdin(std::process::Stdio::null())

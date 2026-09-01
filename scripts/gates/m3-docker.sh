@@ -32,7 +32,7 @@ ROOTFS="guest/out/rootfs.ext4"
 GVPROXY="${GVPROXY:-vendor/gvproxy}"
 COMPOSE="scripts/gates/fixtures/compose.yml"
 PROFILE="${PROFILE:-debug}"
-BIN="target/$PROFILE/examples/boot"
+BIN="target/$PROFILE/examples/lighter-bench"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
 
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
@@ -49,7 +49,7 @@ echo "==> Building guest artifacts if missing"
 [ -f "$ROOTFS" ] || ./guest/rootfs/build.sh
 
 echo "==> Building and signing the VMM"
-cargo build $([ "$PROFILE" = release ] && echo --release) --example boot -p lighter-vmm
+cargo build $([ "$PROFILE" = release ] && echo --release) --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 
 RUN_DIR="$(mktemp -d -t lighter-m3d)"

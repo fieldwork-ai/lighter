@@ -28,7 +28,7 @@ KERNEL="guest/out/Image"
 INITRAMFS="guest/out/initramfs.cpio.gz"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-60}"
 PROFILE="${PROFILE:-debug}"
-BIN="target/$PROFILE/examples/boot"
+BIN="target/$PROFILE/examples/lighter-bench"
 
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
@@ -57,7 +57,7 @@ echo "==> Building guest artifacts if missing"
 [ -f "$INITRAMFS" ] || ./guest/initramfs/build.sh
 
 echo "==> Building and signing the VMM"
-cargo build $([ "$PROFILE" = release ] && echo --release) --example boot -p lighter-vmm
+cargo build $([ "$PROFILE" = release ] && echo --release) --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 
 # One boot per core count: 1 exercises the plain path, 4 exercises PSCI CPU_ON

@@ -25,7 +25,7 @@ KERNEL="guest/out/Image"
 INITRAMFS="guest/out/initramfs.cpio.gz"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 PROFILE="${PROFILE:-debug}"
-BIN="target/$PROFILE/examples/boot"
+BIN="target/$PROFILE/examples/lighter-bench"
 TAG=share
 MOUNT=/mnt/share
 
@@ -65,7 +65,7 @@ echo "==> Building guest artifacts if missing"
 [ -f "$INITRAMFS" ] || ./guest/initramfs/build.sh
 
 echo "==> Building and signing the VMM"
-cargo build $([ "$PROFILE" = release ] && echo --release) --example boot -p lighter-vmm
+cargo build $([ "$PROFILE" = release ] && echo --release) --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 
 SHARE="$(mktemp -d -t lighter-share)"

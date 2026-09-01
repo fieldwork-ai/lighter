@@ -26,7 +26,7 @@ KERNEL="guest/out/Image"
 INITRAMFS="guest/out/initramfs.cpio.gz"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-90}"
 PROFILE="${PROFILE:-debug}"
-BIN="target/$PROFILE/examples/boot"
+BIN="target/$PROFILE/examples/lighter-bench"
 GUEST_PORT=2375
 
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
@@ -38,7 +38,7 @@ echo "==> Building guest artifacts if missing"
 [ -f "$INITRAMFS" ] || ./guest/initramfs/build.sh
 
 echo "==> Building and signing the VMM"
-cargo build $([ "$PROFILE" = release ] && echo --release) --example boot -p lighter-vmm
+cargo build $([ "$PROFILE" = release ] && echo --release) --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 
 SOCKET="$(mktemp -u -t lighter-vsock).sock"

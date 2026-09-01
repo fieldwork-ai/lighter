@@ -50,7 +50,7 @@ measure_once() {
 	log="${LIGHTER_LATENCY_LOG:-.logs/latency-boot.log}"
 	mkdir -p "$(dirname "$log")"
 	: > "$log"
-	target/release/examples/boot \
+	target/release/examples/lighter-bench \
 		--kernel guest/out/Image --disk guest/out/rootfs.ext4 \
 		--disk "$run_dir/data.img" --disk-size-gib 16 \
 		--net vendor/gvproxy --run-dir "$run_dir" \
@@ -95,8 +95,8 @@ fi
 
 ours=""
 if [ "$WHICH" != native ]; then
-	cargo build --release --example boot -p lighter-vmm >/dev/null
-	./scripts/sign.sh target/release/examples/boot >/dev/null
+	cargo build --release --example lighter-bench -p lighter-vmm >/dev/null
+	./scripts/sign.sh target/release/examples/lighter-bench >/dev/null
 	# The first boot is a warm-up and is thrown away: it pays for a cold host
 	# page cache and whatever the image build left behind, and counting it
 	# puts a spread of two hundred microseconds on a number that varies by

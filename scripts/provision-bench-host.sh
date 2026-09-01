@@ -82,8 +82,8 @@ remote "cd $REMOTE_DIR && bash scripts/fetch-gvproxy.sh"
 
 step "Building and signing"
 remote "cd $REMOTE_DIR && export PATH=\$HOME/.cargo/bin:/opt/homebrew/bin:\$HOME/.orbstack/bin:\$PATH &&
-	cargo build --release --example boot -p lighter-vmm &&
-	./scripts/sign.sh target/release/examples/boot"
+	cargo build --release --example lighter-bench -p lighter-vmm &&
+	./scripts/sign.sh target/release/examples/lighter-bench"
 
 step "A docker client"
 # The suite drives our own daemon over a socket, so it needs the client and not

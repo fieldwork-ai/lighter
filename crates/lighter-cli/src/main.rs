@@ -9,6 +9,7 @@
 //! `lighter status` answerable by anyone rather than only by whoever is
 //! holding the console.
 
+mod bundle;
 mod config;
 mod context;
 mod doctor;

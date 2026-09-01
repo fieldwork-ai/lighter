@@ -314,11 +314,11 @@ setup_lighter() {
 	KERNEL="guest/out/Image"
 	ROOTFS="guest/out/rootfs.ext4"
 	GVPROXY="${GVPROXY:-vendor/gvproxy}"
-	BIN="target/release/examples/boot"
+	BIN="target/release/examples/lighter-bench"
 	[ -f "$KERNEL" ] || ./guest/kernel/build.sh
 	[ -f "$ROOTFS" ] || ./guest/rootfs/build.sh
 	# Release, because a debug VMM is measuring the compiler.
-	cargo build --release --example boot -p lighter-vmm
+	cargo build --release --example lighter-bench -p lighter-vmm
 	./scripts/sign.sh "$BIN" >/dev/null
 
 	RUN_DIR="$(mktemp -d -t lighter-bench)"
