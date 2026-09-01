@@ -117,13 +117,32 @@ check_port "mailpit" "http://127.0.0.1:18025/"
 check_port "minio" "http://127.0.0.1:19000/minio/health/live"
 check_port "nginx" "http://127.0.0.1:18080/"
 
-# stdin from /dev/null, not inherited: `compose exec` attaches it even with
-# -T, so a gate run from a pipe that never closes waits forever on input
-# nobody is going to type. It hung here for an hour before that was obvious.
-if docker compose -f "$COMPOSE" exec -T postgres pg_isready -U postgres </dev/null >/dev/null 2>&1; then
-	pass "postgres is serving on its named volume"
+# Deliberately WITH an open stdin that never closes. This exact shape hung
+# for an hour once, and the /dev/null redirect that "fixed" it was masking
+# a real bug: the guest agent only tore the docker relay down when BOTH
+# directions ended, so an exec whose stdin never EOFs never saw the reply
+# to a command that finished in milliseconds. The agent half-closes now,
+# and this check holds it there — a hang here is that regression, and the
+# sleep-pipe plus timeout turns it into a failure instead of an hour.
+EXEC_FIFO="$(mktemp -u -t lighter-exec-fifo)"
+mkfifo "$EXEC_FIFO"
+# Open read-write so the fifo never delivers EOF: exactly the stdin a
+# terminal presents.
+exec 8<>"$EXEC_FIFO"
+docker compose -f "$COMPOSE" exec -T postgres pg_isready -U postgres <&8 >/dev/null 2>&1 &
+EXEC_PID=$!
+EXEC_OK=0
+for _ in $(seq 1 30); do
+	kill -0 "$EXEC_PID" 2>/dev/null || { EXEC_OK=1; break; }
+	sleep 1
+done
+exec 8<&-
+rm -f "$EXEC_FIFO"
+if [ "$EXEC_OK" = 1 ] && wait "$EXEC_PID"; then
+	pass "postgres is serving, and exec returns with stdin held open"
 else
-	fail "postgres is not answering"
+	kill "$EXEC_PID" 2>/dev/null
+	fail "exec did not return with stdin held open (the agent's half-close regressed)"
 fi
 
 echo
