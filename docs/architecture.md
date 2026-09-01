@@ -69,6 +69,12 @@ Both are in `guest/kernel/patches/`, each with the reasoning in its header.
 
 If the notification channel is live, timeouts are seconds and staleness is however long FSEvents takes to notice. If it is not — an unpatched kernel, or one that declined the feature — they fall back to a hundred milliseconds and the share is merely slower. Nothing has to be configured, and there is no combination of guest and host that is fast and wrong.
 
+## Measuring
+
+`docs/measuring.md` — which instrument answers which question, what can be
+resolved at all, and the three explanations in here that turned out to be
+wrong.
+
 ## Testing
 
 The unit tests are fast and prove much less than the gates. Each gate is a script that boots a real machine and checks a real claim:

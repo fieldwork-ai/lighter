@@ -85,11 +85,21 @@ remote "cd $REMOTE_DIR && export PATH=\$HOME/.cargo/bin:/opt/homebrew/bin:\$HOME
 	cargo build --release --example boot -p lighter-vmm &&
 	./scripts/sign.sh target/release/examples/boot"
 
+step "A docker client"
+# The suite drives our own daemon over a socket, so it needs the client and not
+# a runtime. Whatever brought one to this machine will do; if nothing did, brew
+# has one. It is on the PATH the runner uses either way, because a suite that
+# fails four minutes in with "docker: command not found" has wasted four
+# minutes.
+remote 'command -v ~/.orbstack/bin/docker >/dev/null \
+	|| command -v /opt/homebrew/bin/docker >/dev/null \
+	|| /opt/homebrew/bin/brew install docker'
+
 step "Ready"
 cat <<EOF
 Run a suite there with, for a machine this size:
 
-  ssh $HOST 'cd $REMOTE_DIR && PATH=/opt/homebrew/bin:\$HOME/.cargo/bin:\$PATH \\
+  ssh $HOST 'cd $REMOTE_DIR && PATH=\$HOME/.orbstack/bin:/opt/homebrew/bin:\$HOME/.cargo/bin:\$PATH \\
     BENCH_MEMORY_MIB=2048 BENCH_CPUS=4 benchmarks/run.sh --target native --reps 3'
 
 Numbers from there are not comparable with numbers from here — different
