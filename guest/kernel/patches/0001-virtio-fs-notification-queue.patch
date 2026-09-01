@@ -233,11 +233,19 @@ waiting on the result.
  		INIT_WORK(&fsvq->done_work, virtio_fs_requests_done_work);
  		INIT_WORK(&fsvq->dispatch_work,
  				virtio_fs_request_dispatch_work);
-@@ -943,7 +1110,9 @@
- 	/* Truncate nr of request queues to nr_cpu_id */
- 	fs->num_request_queues = min_t(unsigned int, fs->num_request_queues,
- 					nr_cpu_ids);
+@@ -943,7 +1110,14 @@
+-	/* Truncate nr of request queues to nr_cpu_id */
+-	fs->num_request_queues = min_t(unsigned int, fs->num_request_queues,
+-					nr_cpu_ids);
 -	fs->nvqs = VQ_REQUEST + fs->num_request_queues;
++	/*
++	 * Mainline truncates the request queue count to nr_cpu_ids here. This
++	 * driver must not: the device places its notification queue
++	 * immediately after the request queues it ADVERTISED, so a driver
++	 * that silently uses fewer renumbers every later queue and the two
++	 * sides no longer agree about which ring carries what. The device
++	 * already bounds the count it offers.
++	 */
 +	fs->notify_enabled = virtio_has_feature(vdev, VIRTIO_FS_F_NOTIFICATION);
 +	fs->nvqs = VQ_REQUEST + fs->num_request_queues +
 +		   (fs->notify_enabled ? 1 : 0);

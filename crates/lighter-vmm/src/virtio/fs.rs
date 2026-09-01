@@ -54,7 +54,14 @@ pub const REQUEST_QUEUE: u16 = 1;
 ///
 /// Four rather than one per vCPU because each queue is a ring the host has to
 /// watch, and a watcher per queue is a thread per queue. One watcher covering
-/// four is cheap; eight rings each with a spinning thread is not.
+/// four is cheap; eight rings each with a spinning thread is not. Swept on a
+/// quiet 4-vCPU guest (npm-install, ms): one queue 15.9k, two 15.4k, four
+/// 14.5k — four is where it flattens.
+///
+/// The count is also a LAYOUT commitment: the notification queue sits at
+/// `1 + request_queues()`, and the guest derives the same index from the
+/// advertised count (patch 0001 removes mainline's nr_cpu_ids clamp so the
+/// two sides cannot disagree).
 pub fn request_queues() -> u16 {
     std::env::var("LIGHTER_FS_QUEUES")
         .ok()
