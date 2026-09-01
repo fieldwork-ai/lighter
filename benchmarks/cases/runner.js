@@ -18,14 +18,24 @@ const fs = require("node:fs");
 const work = process.env.WORK;
 const name = process.argv[2];
 const reps = Number(process.env.REPS || 3);
+// A case that runs this far past any plausible result is a finding, not a
+// measurement: a sixteen-minute tree walk once sat in the suite where a
+// one-second one belonged, and the only thing the extra fifteen minutes
+// bought was the wait. Killed, recorded as a timeout, and the suite goes on.
+const limitS = Number(process.env.CASE_TIMEOUT_S || 300);
 
-function sh(script) {
+function sh(script, limitMs) {
   // Errors are inherited rather than swallowed: a case that fails should say
   // why, in the harness output, rather than becoming a missing row.
   // Both streams, not just stderr: pnpm reports its failures through its
   // reporter, which writes to stdout. The TIME_MS lines are extracted by
   // pattern, so case chatter on stdout costs nothing.
-  execFileSync("/bin/sh", [script], { stdio: ["ignore", "inherit", "inherit"], env: process.env });
+  execFileSync("/bin/sh", [script], {
+    stdio: ["ignore", "inherit", "inherit"],
+    env: process.env,
+    timeout: limitMs,
+    killSignal: "SIGKILL",
+  });
 }
 
 const setup = `${work}/cases/${name}.setup.sh`;
@@ -40,7 +50,15 @@ for (let rep = 0; rep < reps; rep++) {
     } catch {}
   }
   const started = process.hrtime.bigint();
-  sh(body);
+  try {
+    sh(body, limitS * 1000);
+  } catch (err) {
+    if (err.code === "ETIMEDOUT" || err.signal === "SIGKILL") {
+      console.log(`TIME_MS TIMEOUT ${limitS}s`);
+      continue;
+    }
+    throw err;
+  }
   const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
   console.log(`TIME_MS ${Math.round(elapsed)}`);
 }

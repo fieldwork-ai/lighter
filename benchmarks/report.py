@@ -47,6 +47,11 @@ def load(target):
     runs = {}
     with path.open() as handle:
         for row in csv.DictReader(handle):
+            if row["ms"] == "timeout":
+                # Killed by the runner's per-case limit. Not a measurement,
+                # and not silently a gap either.
+                print(f"note: {target} {row['case']} rep {row['rep']} timed out", file=sys.stderr)
+                continue
             runs.setdefault(row["case"], []).append(int(row["ms"]))
     return {case: statistics.median(values) for case, values in runs.items() if values}
 

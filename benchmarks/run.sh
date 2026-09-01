@@ -267,7 +267,7 @@ runner_args() {
 
 run_case_native() {
 	# shellcheck disable=SC2046
-	WORK="$WORK" REPS="$REPS" node $(runner_args "$1" "$WORK")
+	WORK="$WORK" REPS="$REPS" CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-300}" node $(runner_args "$1" "$WORK")
 }
 
 # Every container target is the same command against a different daemon; only
@@ -307,6 +307,7 @@ run_case_container() {
 		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \
 		-e WORK=/work \
 		-e "REPS=$REPS" \
+		-e "CASE_TIMEOUT_S=${CASE_TIMEOUT_S:-300}" \
 		"$IMAGE" node $script
 }
 
@@ -381,6 +382,7 @@ run_case_lighter() {
 		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \
 		-e WORK=/work \
 		-e "REPS=$REPS" \
+		-e "CASE_TIMEOUT_S=${CASE_TIMEOUT_S:-300}" \
 		"$IMAGE" node $script
 }
 
@@ -465,8 +467,12 @@ for name in $CASES; do
 	while read -r ms; do
 		rep=$((rep + 1))
 		printf ' %s' "$ms"
+		# A timeout is recorded as such rather than as a number or a gap: a
+		# missing row reads as "not run", and a huge number would be averaged
+		# into a median as if it were a measurement. The report skips it and
+		# says so.
 		echo "$name,$rep,$ms" >> "$RESULTS"
-	done < <(sed -n 's/^TIME_MS //p' "$CASE_OUT")
+	done < <(sed -n 's/^TIME_MS //p' "$CASE_OUT" | sed 's/^TIMEOUT .*/timeout/')
 	if [ "$rep" -eq 0 ]; then
 		printf ' no measurement:'
 		printf '\n'
