@@ -782,6 +782,30 @@ fn the_reclaim_keeps_up_while_the_tree_is_being_walked() {
     );
 }
 
+/// The flag pair that silently ate truncates. This server answers OPEN with
+/// ENOSYS, and ATOMIC_O_TRUNC tells the kernel to entrust truncation to the
+/// OPEN request — so advertising both made open(O_TRUNC) not truncate at
+/// all: a dense overwrite masks it, and a sparse copy keeps the old file's
+/// bytes in every range the new write skipped. A kernel Image copied over
+/// its predecessor booted as neither. The INIT reply is the contract, so
+/// the INIT reply is what this test reads.
+#[test]
+fn atomic_o_trunc_is_never_advertised() {
+    let mut guest = Guest::new("no-atomic-trunc");
+    let mut body = vec![0u8; 64];
+    body[0..4].copy_from_slice(&7u32.to_le_bytes()); // major
+    body[4..8].copy_from_slice(&41u32.to_le_bytes()); // minor
+    body[12..16].copy_from_slice(&u32::MAX.to_le_bytes()); // offer everything
+    let reply = guest.call(op::INIT, 0, &body).unwrap();
+    let flags = u32::from_le_bytes(reply[12..16].try_into().unwrap());
+    const ATOMIC_O_TRUNC: u32 = 1 << 3;
+    assert_eq!(
+        flags & ATOMIC_O_TRUNC,
+        0,
+        "ATOMIC_O_TRUNC with an ENOSYS OPEN loses truncates; it must stay off"
+    );
+}
+
 /// A whole-file clone over an existing name (guest patch 0005), which is how
 /// pnpm imports on the share once its FICLONE probe succeeds.
 #[test]

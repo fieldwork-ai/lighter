@@ -8,24 +8,24 @@ machine, with caches warmed by an untimed run first. The figure is the median
 of the repetitions.
 
 - Machine: arm64, macOS 26.6.2
-- Node: v24.18.0
-- npm: 11.16.0
-- ripgrep: ripgrep 15.1.0
-- pnpm: 11.23.0
+- Node: v26.8.1
+- npm: 11.19.0
+- ripgrep: ripgrep 15.2.0
+- pnpm: 10.28.0
 - yarn: 1.22.22
 
 ## Wall time, milliseconds
 
 | case | native | lighter | orbstack |
 |---|---|---|---|
-| npm-install | 6217 | 11901 | 8945 |
-| pnpm-install | — | — | 5415 |
-| yarn-install | — | — | 8611 |
-| ripgrep | 934 | 110 | 991 |
-| find-walk | 368 | 111 | 480 |
-| copy-tree | 14452 | 6984 | 9327 |
-| rm-rf | — | — | 3206 |
-| watch-latency | 2 | 2 | 12 |
+| npm-install | 7817 | 14250 | 10713 |
+| pnpm-install | 4437 | 30002 | 5868 |
+| yarn-install | 9448 | 16260 | 10010 |
+| ripgrep | 1317 | 159 | 1125 |
+| find-walk | 498 | 125 | 513 |
+| copy-tree | 22119 | 14219 | 11910 |
+| rm-rf | 5278 | 5839 | 3831 |
+| watch-latency | 2 | 2 | 33 |
 
 ## As a fraction of `native`
 
@@ -36,21 +36,13 @@ division by noise — read it from the table above in milliseconds.
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 52% | 70% |
-| ripgrep | 849% | 94% |
-| find-walk | 332% | 77% |
-| copy-tree | 207% | 155% |
-
-## Sweeps
-
-One runtime measured twice under different settings, so a tuning
-decision can be re-checked without taking anyone's word for it.
-The names are the settings; the code that reads them says which.
-
-| case | lighter-guestfs | lighter-hp | lighter-hp0 | lighter-hp200 | lighter-ilalways | lighter-ilnever | lighter-nopoll | lighter-poll2000 | lighter-poll500 | lighter-vp0 | lighter-vp10 | lighter-vp100 | lighter-vp15 | lighter-vp200 | lighter-vp2000 | lighter-vp25 | lighter-vp5 | lighter-wb |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| npm-install | 7755 | 15184 | 15048 | — | 14438 | 14710 | 14544 | 14642 | 14494 | 17998 | 13564 | 15791 | 13657 | 17206 | 34856 | 14156 | 13601 | 15860 |
-| pnpm-install | 1219 | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| npm-install | 55% | 73% |
+| pnpm-install | 15% | 76% |
+| yarn-install | 58% | 94% |
+| ripgrep | 828% | 117% |
+| find-walk | 398% | 97% |
+| copy-tree | 156% | 186% |
+| rm-rf | 90% | 138% |
 
 ## What each case does
 

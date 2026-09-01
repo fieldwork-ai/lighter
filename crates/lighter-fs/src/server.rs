@@ -427,9 +427,17 @@ impl Server {
         //
         // SETXATTR_EXT is absent for a different reason: it changes a
         // structure's size on the wire, and the parser relies on its absence.
+        // ATOMIC_O_TRUNC is deliberately absent, and not for the usual
+        // reason. This server answers OPEN with ENOSYS — three round trips
+        // deleted per file — and ATOMIC_O_TRUNC tells the kernel to entrust
+        // truncation to the OPEN request. Together those made open(O_TRUNC)
+        // silently not truncate: a dense overwrite masks it, and a sparse
+        // copy or a shrinking rewrite quietly keeps the old file's bytes in
+        // every range the new write skipped. A kernel build's Image, copied
+        // over its predecessor by cp, booted as neither. Without the flag
+        // the VFS truncates through SETATTR, which no_open never bypasses.
         let wanted = fuse::init::ASYNC_READ
             | fuse::init::BIG_WRITES
-            | fuse::init::ATOMIC_O_TRUNC
             | fuse::init::DO_READDIRPLUS
             | fuse::init::READDIRPLUS_AUTO
             | fuse::init::ASYNC_DIO

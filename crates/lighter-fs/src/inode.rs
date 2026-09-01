@@ -586,21 +586,34 @@ impl Registry {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         identity.insert((dev, ino), id);
         drop(identity);
+        let inode = Arc::new(Inode::new(
+            fd,
+            dev,
+            ino,
+            is_dir,
+            is_symlink,
+            1,
+            self.census.clone(),
+        ));
+        // Admission control, and the difference between degrading and
+        // seizing. A full share used to admit the newcomer and lean on the
+        // sweep to evict something — but the sweep finds the few thousand
+        // held descriptors by walking a hand that lists EVERY live inode,
+        // and an insert storm at the ceiling (cp -a of a big tree on a
+        // stock Mac) ran that walk per insert: quadratic, hours, and
+        // indistinguishable from a hang. A newcomer to a full share is
+        // parked on arrival instead — one close(), no walk — and revives
+        // transiently on use like anything else parked. Inserts can no
+        // longer push the count past the budget at all; the paced sweep is
+        // left with only its real job, keeping the RESIDENT set the
+        // recently-used one.
+        if self.census.descriptors() > self.budget {
+            let _ = inode.park();
+        }
         self.by_id[shard(id)]
             .lock()
             .expect("inode table poisoned")
-            .insert(
-                id,
-                Arc::new(Inode::new(
-                    fd,
-                    dev,
-                    ino,
-                    is_dir,
-                    is_symlink,
-                    1,
-                    self.census.clone(),
-                )),
-            );
+            .insert(id, inode);
         self.hands[shard(id)]
             .lock()
             .expect("reclaim hand poisoned")
