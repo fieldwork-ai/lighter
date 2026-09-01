@@ -65,6 +65,20 @@ pub const TAG_LEN: usize = 36;
 /// count: it is how many filesystem operations may be outstanding at once, and
 /// a package install — dozens of processes each blocked on a `stat` — wants
 /// rather more of them than the machine has cores.
+///
+/// It is a knob because the reasoning above is only half of it. APFS
+/// serializes metadata: a create measured on one thread costs 25 microseconds
+/// and the same create under sixteen costs 39, which is queueing rather than
+/// work. More threads buy nothing once the filesystem underneath has stopped
+/// going any faster, and past that they cost.
+fn workers() -> usize {
+    std::env::var("LIGHTER_FS_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(WORKERS)
+}
+
 const WORKERS: usize = 16;
 
 /// The callback a worker uses to poke the transport once a reply is ready.
@@ -280,8 +294,9 @@ impl Pool {
         let done: Arc<Mutex<VecDeque<Completion>>> = Arc::new(Mutex::new(VecDeque::new()));
         let waking = Arc::new(AtomicBool::new(false));
 
-        let mut threads = Vec::with_capacity(WORKERS);
-        for index in 0..WORKERS {
+        let count = workers();
+        let mut threads = Vec::with_capacity(count);
+        for index in 0..count {
             let queue = queue.clone();
             let server = server.clone();
             let memory = memory.clone();

@@ -41,12 +41,23 @@ NATIVE_MAX_AGE_DAYS="${NATIVE_MAX_AGE_DAYS:-7}"
 # round trip at all, and Linux's VFS is quicker than the one underneath it — so
 # their floors are set well above the target and act as regression guards.
 #
-# The install does not clear it and will not: it is bound by the number of
-# round trips a package manager makes, roughly sixty-five thousand of them at
-# fifteen microseconds each, and by the fact that `npm ci` on APFS clones files
-# from its cache rather than copying them, which a container cannot do across a
-# device boundary. Its floor is set where the architecture actually lands, and
-# the shortfall is printed every run rather than quietly forgotten.
+# The install does not clear it. What it is bound by, measured rather than
+# assumed: one install is about 636,000 filesystem requests, of which 66,000
+# are creates costing 39 microseconds apiece on the host — APFS making a file,
+# under sixteen threads, and two thirds of all the host time in the run. The
+# round trips on top are about a microsecond each now, so they are no longer
+# the story; the story is that a package manager makes sixty-six thousand
+# files and the file system underneath charges for every one.
+#
+# An earlier version of this comment blamed `npm ci` cloning from its cache
+# with `clonefile`, which a container cannot do across a device boundary. That
+# was wrong and worth recording as wrong: the npm cache holds gzip tarballs,
+# not unpacked trees, so a native install decompresses and writes every file
+# exactly as ours does. The advantage is only that it does it without a
+# boundary in the way.
+#
+# So the floor is set where the architecture actually lands, and the shortfall
+# is printed every run rather than quietly forgotten.
 FLOOR_RIPGREP=200
 FLOOR_WALK=200
 FLOOR_NPM=30

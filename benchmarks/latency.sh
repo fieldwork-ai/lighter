@@ -63,7 +63,7 @@ fi
 
 printf '\n%-14s %10s %10s %10s\n' "operation" "macOS" "lighter" "overhead"
 value() { echo "$1" | awk -v k="$2" '$1 == "US" && $2 == k { print $3 }'; }
-for op in create+close stat-cached stat-missing write-4k unlink; do
+for op in create+close stat-cached stat-missing write-4k write-chunked unlink; do
 	a="$(value "$native" "$op")"
 	b="$(value "$ours" "$op")"
 	if [ -n "$a" ] && [ -n "$b" ]; then

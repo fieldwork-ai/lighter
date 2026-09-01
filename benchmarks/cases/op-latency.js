@@ -52,6 +52,16 @@ bench("stat-missing", (i) => {
   } catch {}
 });
 bench("write-4k", (i) => fs.writeFileSync(path.join(dir, `w${i}`), Buffer.alloc(4096)));
+// The shape a package manager actually writes in: one file, opened once and
+// filled by a decompressor a chunk at a time. Whether those chunks reach the
+// server as one request or eight is the whole question a write-back cache
+// exists to answer, and a single `writeFileSync` never asks it.
+const chunk = Buffer.alloc(8192);
+bench("write-chunked", (i) => {
+  const fd = fs.openSync(path.join(dir, `c${i}`), "w");
+  for (let n = 0; n < 8; n++) fs.writeSync(fd, chunk);
+  fs.closeSync(fd);
+});
 bench("unlink", (i) => fs.unlinkSync(path.join(dir, `f${i}`)), touch("f"));
 
 fs.rmSync(dir, { recursive: true, force: true });
