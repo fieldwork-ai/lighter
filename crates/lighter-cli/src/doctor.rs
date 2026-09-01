@@ -117,18 +117,28 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("machine", e.to_string(), "check ~/.lighter"),
     });
 
-    findings.push(match crate::context::current() {
-        Ok(Some(name)) if name == crate::context::NAME => {
-            Finding::good("docker context", format!("{name} (selected)"))
-        }
-        Ok(Some(name)) => Finding::bad(
+    // A custom home never owns the global context; its machine is reached
+    // by DOCKER_HOST, and telling someone to `docker context use lighter`
+    // would point them at a machine this doctor is not examining.
+    if crate::paths::is_default_home() {
+        findings.push(match crate::context::current() {
+            Ok(Some(name)) if name == crate::context::NAME => {
+                Finding::good("docker context", format!("{name} (selected)"))
+            }
+            Ok(Some(name)) => Finding::bad(
+                "docker context",
+                format!("{name} is selected, not {}", crate::context::NAME),
+                "run `lighter start`, or `docker context use lighter`",
+            ),
+            Ok(None) => Finding::bad("docker context", "not registered", "run `lighter start`"),
+            Err(e) => Finding::bad("docker context", e.to_string(), "check the docker CLI"),
+        });
+    } else {
+        findings.push(Finding::good(
             "docker context",
-            format!("{name} is selected, not {}", crate::context::NAME),
-            "run `lighter start`, or `docker context use lighter`",
-        ),
-        Ok(None) => Finding::bad("docker context", "not registered", "run `lighter start`"),
-        Err(e) => Finding::bad("docker context", e.to_string(), "check the docker CLI"),
-    });
+            "custom home; reached by DOCKER_HOST, context not touched",
+        ));
+    }
 
     findings
 }

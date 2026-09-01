@@ -161,17 +161,27 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     );
     let pid = machine::start(&config, timeout)?;
     let socket = paths::docker_socket()?;
-    context::install(&socket)?;
     let version = machine::docker_version(&socket)?;
     println!("Docker {version}");
-    println!("Running as pid {pid}; the docker CLI now points at it.");
+    if paths::is_default_home() {
+        context::install(&socket)?;
+        println!("Running as pid {pid}; the docker CLI now points at it.");
+    } else {
+        println!(
+            "Running as pid {pid}; custom home, context untouched — use DOCKER_HOST=unix://{}",
+            socket.display()
+        );
+    }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
 fn stop() -> anyhow::Result<std::process::ExitCode> {
     // The context goes first. A CLI pointed at a socket that is about to
-    // vanish fails in a way that reads as Docker being broken.
-    let _ = context::select_default();
+    // vanish fails in a way that reads as Docker being broken. A custom home
+    // never owned the context, so it has nothing to put back.
+    if paths::is_default_home() {
+        let _ = context::select_default();
+    }
     if machine::stop(Duration::from_secs(30))? {
         println!("Stopped.");
     } else {

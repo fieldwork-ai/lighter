@@ -7,6 +7,18 @@
 
 use std::path::{Path, PathBuf};
 
+/// Whether this process is using the default home.
+///
+/// The Docker context is global state, and it belongs to the default home
+/// alone: a machine on a custom `LIGHTER_HOME` — a gate, a benchmark, a
+/// test — is private, reached by `DOCKER_HOST`, and must not repoint the
+/// docker CLI everyone else is using. The m8 gate once stopped the daily
+/// driver and stole its context mid-afternoon, which is how this rule got
+/// written down.
+pub fn is_default_home() -> bool {
+    std::env::var_os("LIGHTER_HOME").is_none()
+}
+
 /// The root of everything lighter owns.
 pub fn home() -> anyhow::Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("LIGHTER_HOME") {

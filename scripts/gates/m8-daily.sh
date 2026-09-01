@@ -45,9 +45,17 @@ for tool in docker curl; do
 	command -v "$tool" >/dev/null 2>&1 || { echo "$tool is required" >&2; exit 1; }
 done
 
+# The gate gets its own machine in its own home. The docker context is
+# global and belongs to the default home alone, so none of this touches a
+# daily-driver lighter that may be running right beside it — which it once
+# did, stopping the machine the person at the keyboard was using.
+export LIGHTER_HOME="$(mktemp -d -t lighter-m8-home)"
+export DOCKER_HOST="unix://$LIGHTER_HOME/docker.sock"
+
 cleanup() {
 	docker compose -f "$COMPOSE" down -v --timeout 10 >/dev/null 2>&1 || true
-	rm -rf "$SHARE"
+	"$LIGHTER" stop >/dev/null 2>&1 || true
+	rm -rf "$SHARE" "$LIGHTER_HOME"
 }
 trap cleanup EXIT
 
@@ -60,9 +68,8 @@ echo "<h1>lighter</h1>" > "$SHARE/index.html"
 
 echo
 echo "==> Starting the way a person does"
-"$LIGHTER" stop >/dev/null 2>&1 || true
 if "$LIGHTER" start >/dev/null 2>&1; then
-	pass "lighter start brought up a machine and pointed docker at it"
+	pass "lighter start brought up a machine reachable at DOCKER_HOST"
 else
 	fail "lighter start failed"
 	"$LIGHTER" logs 2>/dev/null | tail -15 | sed 's/^/    /'
@@ -78,10 +85,12 @@ fi
 
 # Reachable through the context rather than an exported DOCKER_HOST, because
 # that is what a person's shell looks like.
-if [ "$(docker context show 2>/dev/null)" = lighter ]; then
-	pass "the docker CLI points at lighter by default"
+# DOCKER_HOST is how a custom home is reached; the global context belongs to
+# the default home and this gate must never touch it.
+if docker version >/dev/null 2>&1; then
+	pass "the docker CLI reaches the gate's machine through DOCKER_HOST"
 else
-	fail "the docker context was not selected"
+	fail "DOCKER_HOST does not answer"
 fi
 
 echo
@@ -163,7 +172,7 @@ echo
 echo "==> What a closed lid does"
 # Exactly what a suspend does to a guest with no real-time clock.
 skewed=$(( $(date +%s) - 3600 ))
-printf 'time %s\n' "$skewed" | nc -U "$HOME/.lighter/control.sock" -w 2 >/dev/null 2>&1 || true
+printf 'time %s\n' "$skewed" | nc -U "$LIGHTER_HOME/control.sock" -w 2 >/dev/null 2>&1 || true
 guest_hour() { docker run --rm alpine:3.21 date -u +%s 2>/dev/null; }
 before="$(guest_hour)"
 drift=$(( $(date -u +%s) - ${before:-0} ))
