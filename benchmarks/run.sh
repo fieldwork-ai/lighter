@@ -155,12 +155,27 @@ prepare_work() {
 	# alone it costs more CPU than the benchmark does and lands in the middle
 	# of the measurement. This marker is how macOS is told not to.
 	: > "$WORK/.metadata_never_index"
-	# Every lockfile, so each package manager installs the identical tree.
+	# Every lockfile, so each package manager installs the identical tree —
+	# twice, because one of them does not survive the others.
+	#
+	# `npm ci` rewrites a `yarn.lock` it finds beside a `package-lock.json`,
+	# into npm's own dialect: registry.npmjs.org URLs and no `#sha` fragment.
+	# It is a perfectly good file and yarn 1.x cannot parse a word of it, so
+	# after one npm run the yarn case fails with a syntax error at line 7784 of
+	# a lockfile that is pristine in the repository. That took a while to stop
+	# looking like a filesystem returning the wrong bytes.
+	#
+	# So `fixture/` is the pristine copy and `npm/` is the working one, and
+	# every install case restores what it needs before it runs. A benchmark
+	# whose cases can destroy each other's inputs measures the order they ran
+	# in.
+	mkdir -p "$WORK/fixture"
 	cp benchmarks/fixtures/npm/package.json \
 		benchmarks/fixtures/npm/package-lock.json \
 		benchmarks/fixtures/npm/pnpm-lock.yaml \
 		benchmarks/fixtures/npm/yarn.lock \
-		"$WORK/npm/"
+		"$WORK/fixture/"
+	cp "$WORK"/fixture/* "$WORK/npm/"
 	cp benchmarks/cases/*.sh benchmarks/cases/*.js "$WORK/cases/"
 	chmod +x "$WORK/cases"/*.sh
 
