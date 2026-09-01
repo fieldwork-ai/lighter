@@ -30,6 +30,27 @@ pub fn machine() -> anyhow::Result<()> {
     let home = paths::home()?;
     std::fs::create_dir_all(&home)?;
 
+    // Exactly one machine per home directory, enforced with a lock held for
+    // the life of the process. Without this, `lighter install` while a
+    // machine was already running had launchd start a second one — which
+    // unlinked the first one's network sockets while failing to start, on a
+    // KeepAlive loop, every few seconds. The guest kept its established
+    // connections, so the breakage was maximally confusing: image pulls
+    // worked and every new port forward died. The second copy exits
+    // SUCCESSFULLY on purpose: launchd only restarts an unsuccessful exit,
+    // so answering "already running" politely is what ends the loop.
+    let lock_path = home.join("machine.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    // SAFETY: a valid descriptor, held (leaked) for the process lifetime.
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("lighter is already running; this copy has nothing to do");
+        return Ok(());
+    }
+    std::mem::forget(lock);
+
     let shares = config
         .shares
         .iter()
