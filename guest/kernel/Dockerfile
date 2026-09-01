@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	cpio \
 	curl \
 	flex \
+	git \
 	gzip \
 	kmod \
 	libelf-dev \

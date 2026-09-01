@@ -17,6 +17,7 @@ log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 log "Building Linux ${KERNEL_VERSION} for arm64 with ${JOBS} jobs"
 
+EXTRACTED=0
 if [ ! -d "$SRC" ]; then
 	log "Fetching kernel source"
 	curl -fsSL --retry 3 \
@@ -24,21 +25,39 @@ if [ ! -d "$SRC" ]; then
 		-o /build/linux.tar.xz
 	tar -xf /build/linux.tar.xz -C /build
 	rm -f /build/linux.tar.xz
+	EXTRACTED=1
 fi
 
 cd "$SRC"
 
 # Patches are applied to a pristine tree every time, and the tree lives in a
-# named volume across builds — so each one is reverted first. `--forward`
-# alone is not enough: a partially applied patch would be neither reverted nor
-# reapplied, and the build would silently produce the wrong kernel.
+# named volume across builds — so pristine has to be something the build can
+# get back to, not something it assumes. Reverting the previous patches almost
+# works, until a patch is EDITED between builds: the old version cannot be
+# found to revert, the new one conflicts with its residue, and the build
+# produced a kernel from a tree that was neither. Git makes pristine a fact:
+# the extracted tarball is committed once, and every build resets tracked
+# sources to that commit before patching — object files are untracked and
+# survive, so the build stays incremental.
+if [ ! -d .git ]; then
+	if [ "$EXTRACTED" != 1 ]; then
+		echo "error: the source volume predates git-tracked pristine trees and" >&2
+		echo "may hold residue of old patches. Remove it and rebuild:" >&2
+		echo "    docker volume rm lighter-kernel-src" >&2
+		exit 1
+	fi
+	log "Recording the pristine tree"
+	git init -q
+	git add -A
+	git -c user.name=lighter -c user.email=build@invalid commit -qm pristine
+fi
+git checkout -q -- .
+git clean -qf '*.rej' '*.orig' 2>/dev/null || true
+
 if [ -d /patches ] && ls /patches/*.patch >/dev/null 2>&1; then
 	for patch in /patches/*.patch; do
 		log "Applying $(basename "$patch")"
-		if patch -p1 -R --dry-run --silent < "$patch" >/dev/null 2>&1; then
-			patch -p1 -R --silent < "$patch"
-		fi
-		patch -p1 --silent < "$patch"
+		patch -p1 --batch --silent < "$patch"
 	done
 fi
 

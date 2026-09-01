@@ -376,6 +376,18 @@ pub struct Registry {
     /// Whether a thread is already in the forced phase of a sweep, so the
     /// others go back to work instead of queueing up to park the same inodes.
     forcing: AtomicBool,
+    /// When the registry was built, so times can be atomics of elapsed millis.
+    born: std::time::Instant,
+    /// Elapsed millis at the last over-budget sweep.
+    last_sweep: AtomicUsize,
+    /// The count above which a sweep may no longer be deferred.
+    ///
+    /// Between the budget and this line, sweeps are rate-limited and the count
+    /// breathes: a working set genuinely hotter and larger than the budget is
+    /// a fact, and holding the line by sweeping on every request turns a
+    /// ten-second install into ten minutes of parking the same inodes. Past
+    /// the line, the ceiling is near and EMFILE is worse than any stall.
+    red_line: usize,
 }
 
 impl Registry {
@@ -419,6 +431,9 @@ impl Registry {
             hands: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
             quiet_until: AtomicUsize::new(0),
             forcing: AtomicBool::new(false),
+            born: std::time::Instant::now(),
+            last_sweep: AtomicUsize::new(0),
+            red_line: descriptor_budget() + descriptor_red_headroom(),
         }
     }
 
@@ -595,6 +610,25 @@ impl Registry {
         let open = self.census.descriptors();
         if open <= self.budget {
             return;
+        }
+        // Between the budget and the red line, sweeps are paced, not
+        // per-request: a working set larger than the budget revives inodes as
+        // fast as they are parked, and a sweep per request is how a correct
+        // bound becomes a ten-minute install. Ten sweeps a second keeps the
+        // count breathing inside the headroom for a fraction of a percent of
+        // the machine; at the red line every request sweeps, because the next
+        // stop after the headroom is the kernel's ceiling.
+        if open < self.red_line {
+            let now = self.born.elapsed().as_millis() as usize;
+            let last = self.last_sweep.load(Ordering::Relaxed);
+            if now.saturating_sub(last) < SWEEP_EVERY_MS
+                || self
+                    .last_sweep
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+            {
+                return;
+            }
         }
         let slack = (self.budget / SWEEP_SLACK_DIVISOR).max(64);
         if open <= self.budget + slack && open < self.quiet_until.load(Ordering::Relaxed) {
@@ -808,6 +842,20 @@ const SWEEP_BATCH: usize = 256;
 /// extra steps, and the process still meets the kernel's ceiling. So the drift
 /// is capped well inside the reserve the budget already leaves.
 const SWEEP_SLACK_DIVISOR: usize = 64;
+
+/// How often an over-budget share is swept while it is still under the red
+/// line.
+const SWEEP_EVERY_MS: usize = 100;
+
+/// How far past the budget the count may breathe before sweeps stop being
+/// paced. Bounded by both scales: a slice of the ceiling so the process's
+/// other descriptors keep their room at the worst moment between sweeps, and
+/// a slice of the budget so a deliberately tiny test budget still meets its
+/// red line instead of hiding under a machine-sized one.
+fn descriptor_red_headroom() -> usize {
+    let ceiling = crate::sys::descriptor_ceiling() as usize;
+    (ceiling / 32).min(descriptor_budget() / 4).max(64)
+}
 
 /// How many metadata descriptors one share may hold open.
 ///

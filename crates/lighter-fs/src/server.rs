@@ -486,7 +486,11 @@ impl Server {
         } else {
             0
         };
-        let wanted = if self.policy.timings().caching() {
+        // Off-switch for measurement: the same kernel can then be run with
+        // and without the dialect, which is how its worth is established.
+        let dialect = self.policy.timings().caching()
+            && std::env::var("LIGHTER_FS_CREATE_DIALECT").as_deref() != Ok("0");
+        let wanted = if dialect {
             wanted | fuse::init::INIT_EXT
         } else {
             wanted
@@ -510,6 +514,7 @@ impl Server {
             guest = format_args!("{major}.{minor}"),
             max_write,
             readdirplus = flags & fuse::init::DO_READDIRPLUS != 0,
+            create_dialect = flags2 & fuse::init2::LIGHTER_CREATE != 0,
             "filesystem negotiated"
         );
 
