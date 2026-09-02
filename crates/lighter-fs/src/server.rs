@@ -81,6 +81,33 @@ impl Sink for Vec<u8> {
     }
 }
 
+/// Why held-back creates were queued, by trigger: diagnostics, under
+/// `LIGHTER_FS_STATS`, for the question "who is making pnpm's files early".
+const MATERIALIZE_WHY: [&str; 10] = [
+    "settle-file",
+    "settle-dir",
+    "all",
+    "write",
+    "setattr",
+    "rename",
+    "link",
+    "release",
+    "fsync",
+    "other",
+];
+static MATERIALIZE_N: [std::sync::atomic::AtomicU64; 10] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 /// A shared directory.
 pub struct Server {
     root: PathBuf,
@@ -108,6 +135,11 @@ pub struct Server {
     /// The ordered queue that applies acknowledged mutations. See
     /// [`crate::apply`] for the promises it keeps.
     apply: crate::apply::Apply,
+    /// Creates acknowledged and not yet queued — the job and the directory
+    /// it changes, by the nodeid promised. See [`Server::materialize`].
+    deferred: std::sync::Mutex<
+        std::collections::HashMap<u64, (std::sync::Arc<Inode>, crate::apply::Job)>,
+    >,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -202,6 +234,7 @@ impl Server {
             open_cache: Arc::new(OpenCache::new()),
             stats: Stats::new(),
             apply: crate::apply::Apply::start(root.to_path_buf()),
+            deferred: std::sync::Mutex::new(std::collections::HashMap::new()),
             _watcher: watcher,
         })
     }
@@ -341,6 +374,7 @@ impl Server {
                 // `sync` on the share is the settling point for everything
                 // acknowledged: after it returns, the host answers for all
                 // of it.
+                self.materialize_all();
                 self.apply.drain();
                 Ok(Vec::new())
             }
@@ -349,6 +383,7 @@ impl Server {
             // once that we do not implement it.
             op::FLUSH => Err(linux::ENOSYS),
             op::DESTROY => {
+                self.materialize_all();
                 self.apply.drain();
                 self.log_stats();
                 Ok(Vec::new())
@@ -376,6 +411,9 @@ impl Server {
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
             op::RELEASE | op::RELEASEDIR => {
+                // The guest is done with it: a create still held back is
+                // made now, not at the next barrier.
+                self.materialize_why(nodeid, 7);
                 if let Some(fh) = get_u64(body, 0) {
                     self.registry.release_handle(fh);
                 }
@@ -458,6 +496,12 @@ impl Server {
             }
             for line in self.apply.report().lines() {
                 tracing::info!("{line}");
+            }
+            for (i, why) in MATERIALIZE_WHY.iter().enumerate() {
+                let n = MATERIALIZE_N[i].swap(0, Ordering::Relaxed);
+                if n > 0 {
+                    tracing::info!("MATERIALIZE {why:12} n={n}");
+                }
             }
             self.stats.reset();
         }
@@ -645,19 +689,29 @@ impl Server {
 
     // --- name resolution ---------------------------------------------------
 
-    /// Waits until `still` reports false of the inode, advancing the apply
-    /// queue to the inode's own settle mark between looks.
+    /// Waits until `still` reports false of the inode, sleeping on the apply
+    /// queue's completions between looks.
     ///
-    /// The loop, rather than a single scoped drain, closes a real gap: an
-    /// overlay flag is raised before its job is pushed, so a barrier can see
-    /// the flag while the sequence number is not stamped yet. The flag only
-    /// falls when the job applies, so looping on the flag is both correct and
-    /// terminating; the scoped drain inside is what makes the wait cost the
-    /// inode's own backlog rather than the whole queue's.
+    /// The loop, rather than a single wait, closes a real gap: an overlay
+    /// flag is raised before its job is pushed, so a barrier can see the
+    /// flag while the queue is still empty. The flag only falls when the job
+    /// applies, so looping on the flag is both correct and terminating; the
+    /// wait inside costs the inode's own job rather than the whole queue's
+    /// backlog.
     fn settle_while(&self, inode: &Inode, still: impl Fn(&Inode) -> bool) {
+        if !still(inode) {
+            return;
+        }
+        // Whatever is waited for must be on the queue to be waited for: a
+        // held-back create, of this file or of the names in this directory.
+        if inode.is_dir {
+            self.materialize_children(inode);
+        } else {
+            self.materialize_why(inode.id(), 0);
+        }
         let mut idle_since: Option<std::time::Instant> = None;
         while still(inode) {
-            self.apply.drain_to(inode.settle_seq());
+            self.apply.wait_while(|| still(inode));
             if !still(inode) {
                 break;
             }
@@ -689,6 +743,60 @@ impl Server {
             }
             std::thread::yield_now();
         }
+    }
+
+    /// Queues the create a nodeid was promised with, if it has not been.
+    ///
+    /// A create is acknowledged as a promise and its job held back until
+    /// something needs the file — a write, a rename, a link, a barrier — or
+    /// the guest releases the handle. pnpm opens every file it imports and
+    /// then clones over it: queued at once, the create had run before the
+    /// clone arrived, and every import paid a create, an unlink and a clone.
+    /// Held back, the clone withdraws it and pays for the clone alone.
+    fn materialize_why(&self, nodeid: u64, why: usize) {
+        let held = self
+            .deferred
+            .lock()
+            .expect("deferred creates poisoned")
+            .remove(&nodeid);
+        let Some((parent, job)) = held else {
+            return;
+        };
+        MATERIALIZE_N[why].fetch_add(1, Ordering::Relaxed);
+        let seq = self.apply.push(job);
+        parent.settled_by(seq);
+        if let Some(inode) = self.registry.get(nodeid) {
+            inode.settled_by(seq);
+        }
+    }
+
+    fn materialize_children(&self, dir: &Inode) {
+        for (_, nodeid) in dir.pending_children_snapshot() {
+            self.materialize_why(nodeid, 1);
+        }
+    }
+
+    fn materialize_all(&self) {
+        let all: Vec<u64> = self
+            .deferred
+            .lock()
+            .expect("deferred creates poisoned")
+            .keys()
+            .copied()
+            .collect();
+        for nodeid in all {
+            self.materialize_why(nodeid, 2);
+        }
+    }
+
+    /// Withdraws a held-back create: the file it promised is never made.
+    /// `true` if it was still held.
+    fn withdraw(&self, nodeid: u64) -> bool {
+        self.deferred
+            .lock()
+            .expect("deferred creates poisoned")
+            .remove(&nodeid)
+            .is_some()
     }
 
     fn inode(&self, nodeid: u64) -> Result<std::sync::Arc<Inode>, i32> {
@@ -1204,62 +1312,81 @@ impl Server {
             attr.encode(&mut out);
             return Ok(Some(out));
         }
-        inode.attr_acked(change);
+        // A create still held back takes the change into its promise and
+        // its job applies it: no second job and — the point — nothing that
+        // forces the create early. libuv chmods every file it copies into
+        // before it clones over it, and that chmod was making the file it
+        // was about to replace. Under the same lock the job is taken with,
+        // so a change cannot fall between the job reading its promise and
+        // keeping it.
+        let kept_by_create = {
+            let held = self.deferred.lock().expect("deferred creates poisoned");
+            if held.contains_key(&nodeid) {
+                inode.attr_acked(change);
+                inode.attr_merged();
+                true
+            } else {
+                false
+            }
+        };
+        if !kept_by_create {
+            inode.attr_acked(change);
+        }
         // Four setattrs per file is what pnpm sends; one job per file is
         // what APFS should hear. A job still waiting takes the merge, unless
         // a write has been queued since it was opened.
-        if !inode.merge_attr(change) {
+        if kept_by_create {
+            // Already kept.
+        } else if !inode.merge_attr(change) {
+            self.materialize_why(nodeid, 4);
             let batch = std::sync::Arc::new(std::sync::Mutex::new(change));
+            // Opened before the push: `Inode::open_attr_batch` says why.
+            inode.open_attr_batch(batch.clone());
             let job = {
                 let inode = inode.clone();
                 let open_cache = self.open_cache.clone();
                 let batch = batch.clone();
-                let seq_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let seq_out = seq_cell.clone();
-                (
-                    move || {
-                        let seq = seq_cell.load(std::sync::atomic::Ordering::Relaxed);
-                        let change = inode
-                            .take_attr_batch(seq)
-                            .unwrap_or_else(|| *batch.lock().expect("attr batch poisoned"));
-                        let result = (|| {
-                            let cached = open_cache.file(nodeid, false);
-                            let held;
-                            let raw = match &cached {
-                                Some(file) => file.fd.as_raw_fd(),
-                                None => {
-                                    held = inode.reference()?;
-                                    held.raw_fd()
-                                }
-                            };
-                            if let Some(mode) = change.mode {
-                                sys::chmod_fd(raw, mode)?;
+                move || {
+                    let change = inode
+                        .take_attr_batch(&batch)
+                        .unwrap_or_else(|| *batch.lock().expect("attr batch poisoned"));
+                    let result = (|| {
+                        let cached = open_cache.file(nodeid, false);
+                        let held;
+                        let raw = match &cached {
+                            Some(file) => file.fd.as_raw_fd(),
+                            None => {
+                                held = inode.reference()?;
+                                held.raw_fd()
                             }
-                            if change.atime.is_some() || change.mtime.is_some() {
-                                let at = |t: Option<(i64, i64)>| match t {
-                                    Some((s, ns)) => TimeSpec::At(s, ns as u32),
-                                    None => TimeSpec::Omit,
-                                };
-                                sys::utimes_fd(raw, at(change.atime), at(change.mtime))?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(errno) = result
-                            && !inode.is_cancelled()
-                        {
-                            tracing::warn!(errno, "an acknowledged setattr failed to apply");
+                        };
+                        if let Some(mode) = change.mode {
+                            sys::chmod_fd(raw, mode)?;
                         }
-                        inode.attr_applied(result);
-                    },
-                    seq_out,
-                )
+                        if change.atime.is_some() || change.mtime.is_some() {
+                            let at = |t: Option<(i64, i64)>| match t {
+                                Some((s, ns)) => TimeSpec::At(s, ns as u32),
+                                None => TimeSpec::Omit,
+                            };
+                            sys::utimes_fd(raw, at(change.atime), at(change.mtime))?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(errno) = result
+                        && !inode.is_cancelled()
+                    {
+                        tracing::warn!(errno, "an acknowledged setattr failed to apply");
+                    }
+                    inode.attr_applied(result);
+                }
             };
-            let (job, seq_out) = job;
-            let seq = self
-                .apply
-                .push(crate::apply::Job::of(crate::apply::Kind::Setattr, 0, job));
-            seq_out.store(seq, std::sync::atomic::Ordering::Relaxed);
-            inode.open_attr_batch(seq, batch);
+            let seq = self.apply.push(crate::apply::Job::of(
+                crate::apply::Kind::Setattr,
+                crate::apply::Keys::of(&[nodeid]),
+                0,
+                job,
+            ));
+            inode.stamp_attr_batch(seq, &batch);
             inode.settled_by(seq);
         } else {
             // Merged: this request's promise lands with the job already
@@ -1511,9 +1638,15 @@ impl Server {
                     }
                 }
             };
-            let seq = self
-                .apply
-                .push(crate::apply::Job::of(crate::apply::Kind::Unlink, 0, job));
+            let seq = self.apply.push(crate::apply::Job::of(
+                crate::apply::Kind::Unlink,
+                crate::apply::Keys::of(&[
+                    parent.id(),
+                    target_out.as_ref().map(|t| t.id()).unwrap_or(0),
+                ]),
+                0,
+                job,
+            ));
             parent.settled_by(seq);
             if let Some(target) = &target_out {
                 target.settled_by(seq);
@@ -1543,7 +1676,10 @@ impl Server {
             return Ok(None);
         }
         let nodeid = match old_parent.pending_child(old.to_bytes()) {
-            Some(nodeid) => nodeid,
+            Some(nodeid) => {
+                self.materialize_why(nodeid, 5);
+                nodeid
+            }
             None => {
                 let st = match sys::stat_at(old_parent.reference()?.raw_fd(), old) {
                     Ok(st) => st,
@@ -1619,9 +1755,17 @@ impl Server {
                 }
             }
         };
-        let seq = self
-            .apply
-            .push(crate::apply::Job::of(crate::apply::Kind::Rename, 0, job));
+        let seq = self.apply.push(crate::apply::Job::of(
+            crate::apply::Kind::Rename,
+            crate::apply::Keys::of(&[
+                old_parent.id(),
+                new_parent.id(),
+                inode.id(),
+                displaced.as_ref().map(|d| d.id()).unwrap_or(0),
+            ]),
+            0,
+            job,
+        ));
         old_parent.settled_by(seq);
         new_parent.settled_by(seq);
         inode.settled_by(seq);
@@ -1676,6 +1820,9 @@ impl Server {
         let target = self.inode(oldnodeid)?;
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
+        if let Some(reply) = self.link_pending(&parent, &target, oldnodeid, &name)? {
+            return Ok(reply);
+        }
         self.settle_while(&target, |target| target.is_pending() || target.is_dirty());
         self.settle_while(&parent, |parent| {
             parent.pending_child(name.to_bytes()).is_some()
@@ -1688,6 +1835,88 @@ impl Server {
         sys::link_at(libc::AT_FDCWD, &source, parent.reference()?.raw_fd(), &name)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
+    }
+
+    /// The asynchronous half of LINK: acknowledged with the target's own
+    /// entry under the new name, the `linkat` queued behind whatever the
+    /// target still has queued.
+    ///
+    /// pnpm's import when clones are not on offer — which is every other
+    /// Docker on a Mac, and so what the comparison is against — is a
+    /// hardlink from its store for every file it installs, sixty thousand
+    /// an install. Served synchronously each one waited for the store
+    /// file's own create and write to land at the back of a full window:
+    /// three hundred microseconds a link, seventeen seconds an install.
+    /// Queued, it costs the acknowledgement; the job orders itself behind
+    /// the target's create by sharing its key, and needs nothing settled.
+    fn link_pending(
+        &self,
+        parent: &std::sync::Arc<Inode>,
+        target: &std::sync::Arc<Inode>,
+        nodeid: u64,
+        name: &CString,
+    ) -> Result<Option<Vec<u8>>, i32> {
+        if !self.apply.accepting() || target.is_dir || target.is_cancelled() {
+            return Ok(None);
+        }
+        if parent.pending_child(name.to_bytes()).is_some() {
+            // Promised to someone: settled, the host would say the same.
+            return Err(linux::EEXIST);
+        }
+        if !parent.name_pending_gone(name.to_bytes()) {
+            match sys::stat_at(parent.reference()?.raw_fd(), name) {
+                Err(errno) if errno == linux::ENOENT => {}
+                _ => return Ok(None),
+            }
+        }
+        self.materialize_why(nodeid, 6);
+        target.link_acked();
+        parent.add_pending_child(name.to_bytes(), nodeid);
+        let job = {
+            let parent = parent.clone();
+            let target = target.clone();
+            let name = name.clone();
+            move || {
+                let result = (|| {
+                    let parent_ref = parent.reference()?;
+                    // Bound by now, or its create failed — and a provisional
+                    // number names nothing on the volume.
+                    if target.is_pending() || target.ino() & crate::inode::PROVISIONAL_INO != 0 {
+                        return Err(linux::ESTALE);
+                    }
+                    let source = sys::c_path(&std::path::PathBuf::from(format!(
+                        "/.vol/{}/{}",
+                        target.dev(),
+                        target.ino()
+                    )))?;
+                    sys::link_at(libc::AT_FDCWD, &source, parent_ref.raw_fd(), &name)
+                })();
+                if let Err(errno) = result {
+                    tracing::warn!(
+                        errno,
+                        name = %name.to_string_lossy(),
+                        "an acknowledged link failed to apply"
+                    );
+                }
+                target.link_applied();
+                parent.remove_pending_child(name.to_bytes(), nodeid);
+            }
+        };
+        let seq = self.apply.push(crate::apply::Job::of(
+            crate::apply::Kind::Link,
+            crate::apply::Keys::of(&[parent.id(), nodeid]),
+            0,
+            job,
+        ));
+        parent.settled_by(seq);
+        target.settled_by(seq);
+        let entry = if target.is_pending() {
+            self.registry.count_lookup(nodeid);
+            self.pending_entry(parent, target, nodeid)
+        } else {
+            self.promised_entry(parent, target, nodeid)?
+        };
+        Ok(Some(self.entry_reply(&entry)))
     }
 
     /// What the guest may do with the page cache of a file it just created.
@@ -1763,10 +1992,17 @@ impl Server {
     /// A whole-file clone of one inode over another name (guest patch 0005).
     ///
     /// The reply to pnpm's FICLONE probe, and the reason its imports run in
-    /// clone mode on the share the way they do on the Mac itself. The clone
-    /// lands under a temporary name and is renamed over the destination, so
-    /// the name flips atomically from old content to new; the guest kernel
-    /// drops its caches for the replaced inode itself.
+    /// clone mode on the share the way they do on the Mac itself.
+    ///
+    /// Queued, like every other mutation, and that was measured rather than
+    /// assumed. An APFS clone costs fifty to a hundred microseconds however
+    /// its source is named (the syscall is the whole job; its other phases
+    /// time at seven), and pnpm makes sixty thousand an install. Served on
+    /// the request thread instead, four wide as libuv issues them, the guest
+    /// waited a hundred and eighteen microseconds for each one and the
+    /// install took ten seconds against eight. Hardlinks, pnpm's fallback on
+    /// every other Docker, cost a hundred and sixty-six each on APFS — twice
+    /// a clone — and took seventeen.
     fn clone_over(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
         // Both name nodeids in the body, not the header, so the dispatch-time
         // resolution has not seen them: the source may be the guest's open
@@ -1796,9 +2032,11 @@ impl Server {
                 }
             }
         }
+        // A write-only descriptor cannot be cloned from (EBADF); the
+        // event-only reference can, and costs no open.
         let source_fd = match self.open_cache.file(nodeid_in, false) {
-            Some(file) => Source::Cached(file),
-            None => Source::Held(source.reference()?),
+            Some(file) if file.readable => Source::Cached(file),
+            _ => Source::Held(source.reference()?),
         };
         let st = sys::stat_fd(source_fd.raw_fd())?;
         let size = source.overlay_size(st.st_size as u64);
@@ -1849,7 +2087,13 @@ impl Server {
         if let Some(old) = &displaced {
             // The guest's descriptor on the old file keeps working, and sees
             // the clone — as FICLONE promises — because the old inode now
-            // answers with the new one. A create still queued is withdrawn.
+            // answers with the new one. A create still held back is
+            // withdrawn for nothing (`materialize`); one already queued is
+            // cancelled, and skips itself if it has not run.
+            if old.is_pending() && self.withdraw(old.id()) {
+                old.bind_failed(linux::ENOENT);
+                parent.remove_pending_child(name.to_bytes(), old.id());
+            }
             old.cancel_pending();
             old.forward_to(nodeid);
         }
@@ -1938,9 +2182,17 @@ impl Server {
                 parent.remove_pending_child(name.to_bytes(), nodeid);
             }
         };
-        let seq = self
-            .apply
-            .push(crate::apply::Job::of(crate::apply::Kind::Clone, 0, job));
+        let seq = self.apply.push(crate::apply::Job::of(
+            crate::apply::Kind::Clone,
+            crate::apply::Keys::of(&[
+                parent_out,
+                nodeid,
+                nodeid_in,
+                displaced.as_ref().map(|d| d.id()).unwrap_or(0),
+            ]),
+            0,
+            job,
+        ));
         parent.settled_by(seq);
         dest.settled_by(seq);
         let mut out = Vec::with_capacity(8);
@@ -2029,6 +2281,20 @@ impl Server {
                 })();
                 match result {
                     Ok((fd, st)) => {
+                        // Attributes promised while the create was held back
+                        // are the create's to keep.
+                        if let Some(meta) = inode.pending_meta() {
+                            if meta.mode & 0o7777 != mode & 0o7777 {
+                                let _ = sys::chmod_fd(fd.as_raw_fd(), meta.mode & 0o7777);
+                            }
+                            if meta.atime != meta.born || meta.mtime != meta.born {
+                                let _ = sys::utimes_fd(
+                                    fd.as_raw_fd(),
+                                    TimeSpec::At(meta.atime.0, meta.atime.1 as u32),
+                                    TimeSpec::At(meta.mtime.0, meta.mtime.1 as u32),
+                                );
+                            }
+                        }
                         // Two descriptors, as the synchronous path keeps two:
                         // a metadata reference for the inode, and the open
                         // file itself in the open cache — which is what lets
@@ -2083,11 +2349,21 @@ impl Server {
                 parent.remove_pending_child(name.to_bytes(), nodeid);
             }
         };
-        let seq = self
-            .apply
-            .push(crate::apply::Job::of(crate::apply::Kind::Create, 0, job));
-        parent.settled_by(seq);
-        inode.settled_by(seq);
+        self.deferred
+            .lock()
+            .expect("deferred creates poisoned")
+            .insert(
+                nodeid,
+                (
+                    parent.clone(),
+                    crate::apply::Job::of(
+                        crate::apply::Kind::Create,
+                        crate::apply::Keys::of(&[parent.id(), nodeid]),
+                        0,
+                        job,
+                    ),
+                ),
+            );
         let entry = self.pending_entry(parent, &inode, nodeid);
         let mut out = self.entry_reply(&entry);
         let open_flags = self.created_file_flags() | fuse::fopen::LIGHTER_CREATED;
@@ -2146,6 +2422,7 @@ impl Server {
     }
 
     fn overlay_attr(&self, overlay: &crate::inode::Overlay, attr: &mut Attr) {
+        attr.nlink += overlay.links;
         if let Some(size) = overlay.size {
             attr.size = attr.size.max(size);
             attr.blocks = attr.size.div_ceil(512);
@@ -2222,7 +2499,7 @@ impl Server {
                 mtimensec: meta.mtime.1 as u32,
                 ctimensec: meta.born.1 as u32,
                 mode: meta.mode,
-                nlink: 1,
+                nlink: 1 + inode.extra_links(),
                 uid: 0,
                 gid: 0,
                 rdev: 0,
@@ -2354,6 +2631,7 @@ impl Server {
         // A write to a pending file cannot open a descriptor yet; the job
         // resolves one at apply time, after the create it is ordered behind.
         if inode.is_pending() && self.apply.accepting() {
+            self.materialize_why(nodeid, 3);
             inode.write_acked(offset + size as u64);
             let data = data.to_vec();
             let job = {
@@ -2392,7 +2670,12 @@ impl Server {
                     inode.write_applied(result);
                 }
             };
-            let seq = self.apply.push(crate::apply::Job::new(size, job));
+            let seq = self.apply.push(crate::apply::Job::of(
+                crate::apply::Kind::Write,
+                crate::apply::Keys::of(&[nodeid]),
+                size,
+                job,
+            ));
             inode.settled_by(seq);
             inode.note_write(seq);
             let mut out = Vec::with_capacity(8);
@@ -2438,7 +2721,12 @@ impl Server {
                     inode.write_applied(result);
                 }
             };
-            let seq = self.apply.push(crate::apply::Job::new(size, job));
+            let seq = self.apply.push(crate::apply::Job::of(
+                crate::apply::Kind::Write,
+                crate::apply::Keys::of(&[nodeid]),
+                size,
+                job,
+            ));
             inode.settled_by(seq);
             inode.note_write(seq);
             size
@@ -2742,4 +3030,11 @@ fn write_error(sink: &mut dyn Sink, unique: u64, code: i32) -> usize {
         return 0;
     }
     fuse::OUT_HEADER_LEN
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Every promise is kept before the queue behind it is drained.
+        self.materialize_all();
+    }
 }

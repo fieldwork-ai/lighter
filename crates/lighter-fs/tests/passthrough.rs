@@ -339,6 +339,28 @@ fn an_open_file_survives_being_unlinked() {
     );
 }
 
+/// A create is a promise the host has not been asked to keep yet. It is
+/// kept at the next barrier, and by the guest's release, with nothing
+/// written in between.
+#[test]
+fn an_empty_create_reaches_the_host() {
+    let mut guest = Guest::new("create-deferred");
+    let (nodeid, _fh) = guest.create(1, "touched", CREATE_RDWR).unwrap();
+    assert_eq!(
+        guest.lookup(1, "touched").unwrap(),
+        nodeid,
+        "promised, so found"
+    );
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::metadata(guest.host("touched")).unwrap().len(), 0);
+    let (nodeid, _fh) = guest.create(1, "released", CREATE_RDWR).unwrap();
+    guest
+        .call(op::RELEASE, nodeid, &[0u8; 24])
+        .expect("release");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert!(guest.host("released").exists(), "released, so made");
+}
+
 /// The guest kernel revalidates size before a read. A write acknowledged
 /// after an unlink must show in the next GETATTR, or the kernel truncates
 /// its own view of the file to the old size and the read stops short.
@@ -359,6 +381,29 @@ fn a_write_after_an_unlink_is_what_getattr_and_read_report() {
         guest.read(nodeid, fh, 0, 4096).unwrap(),
         b"before and after"
     );
+}
+
+/// A link is acknowledged with the target's own entry — same nodeid, one
+/// more link — before the host has it, and the host has it by the next
+/// barrier.
+#[test]
+fn a_link_is_acknowledged_and_reaches_the_host() {
+    use std::os::unix::fs::MetadataExt;
+    let mut guest = Guest::new("link-async");
+    let (nodeid, fh) = guest.create(1, "a", CREATE_RDWR).unwrap();
+    guest.write(nodeid, fh, 0, b"shared").unwrap();
+    let mut body = nodeid.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("b"));
+    let reply = guest.call(op::LINK, 1, &body).expect("link");
+    let linked = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    assert_eq!(linked, nodeid, "a link is the same inode");
+    // fuse_entry_out: the attr starts at 40; nlink is at 64 within it.
+    let nlink = u32::from_le_bytes(reply[40 + 64..40 + 68].try_into().unwrap());
+    assert_eq!(nlink, 2, "the reply counts the promised link");
+    assert_eq!(guest.lookup(1, "b").unwrap(), nodeid);
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::metadata(guest.host("b")).unwrap().nlink(), 2);
+    assert_eq!(std::fs::read(guest.host("b")).unwrap(), b"shared");
 }
 
 /// Two names for one file are one inode. A guest that saw two would disagree
@@ -888,6 +933,7 @@ fn a_link_source_survives_being_renamed() {
     guest
         .call(op::LINK, 1, &body)
         .expect("linking a renamed source must work; the inode did not move");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
     assert_eq!(std::fs::read(guest.host("the-link")).unwrap(), b"content");
     use std::os::unix::fs::MetadataExt;
     assert_eq!(
@@ -1132,6 +1178,34 @@ fn promised_attributes_are_what_readers_see() {
     );
     assert_eq!(meta.mtime(), 1_000_000_000, "the mtime reached the Mac");
     assert_eq!(meta.len(), 3);
+}
+
+/// Two chmods in quick succession, on an empty queue: the first's job can
+/// run before its batch is even opened, and the second must not vanish
+/// into a batch nothing will ever apply.
+#[test]
+fn a_chmod_after_a_chmod_reaches_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut guest = Guest::new("setattr-twice");
+    let chmod = |guest: &mut Guest, nodeid: u64, mode: u32| {
+        let mut body = vec![0u8; 88];
+        body[0..4].copy_from_slice(&fuse::fattr::MODE.to_le_bytes());
+        body[68..72].copy_from_slice(&mode.to_le_bytes());
+        guest.call(op::SETATTR, nodeid, &body).expect("setattr");
+    };
+    for i in 0..64 {
+        let name = format!("f{i}");
+        let (nodeid, _fh) = guest.create(1, &name, 0x8241).expect("create");
+        chmod(&mut guest, nodeid, 0o600);
+        chmod(&mut guest, nodeid, 0o755);
+        guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+        let mode = std::fs::metadata(guest.host(&name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "file {i}: the second chmod reached the Mac");
+    }
 }
 
 /// Setattrs coalesce into one job — but never across a write, which moves

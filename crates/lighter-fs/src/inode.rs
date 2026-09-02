@@ -45,7 +45,7 @@ struct Parked {
 /// The bit that marks an inode number as provisional: handed out for a
 /// pending create, reported to the guest until the real number exists. High
 /// enough that no filesystem's real numbers reach it.
-const PROVISIONAL_INO: u64 = 1 << 62;
+pub const PROVISIONAL_INO: u64 = 1 << 62;
 
 pub struct Inode {
     /// A metadata-only descriptor, or nothing if it has been parked.
@@ -150,6 +150,12 @@ pub struct Inode {
     /// inode: its own create or writes, or — for a directory — the naming
     /// operations inside it. A barrier waits to here and no further.
     settle_seq: AtomicU64,
+    /// Our own nodeid, once the registry has issued it: what a queued job
+    /// names to be ordered against the other jobs on this inode.
+    id: AtomicU64,
+    /// Links acknowledged to this inode and not yet made: what readers add
+    /// to the host's link count.
+    extra_links: AtomicU32,
     /// Setattrs acknowledged but not yet applied, and what they promised.
     attr_pending: AtomicU32,
     attr_override: Mutex<AttrOverride>,
@@ -157,7 +163,7 @@ pub struct Inode {
     /// job's sequence number: a later setattr can merge into it rather than
     /// queue a job of its own — as long as no write has been acknowledged
     /// since, because a write moves mtime and the batch must land after it.
-    attr_batch: Mutex<Option<(u64, Arc<Mutex<AttrOverride>>)>>,
+    attr_batch: Mutex<Option<AttrBatch>>,
     last_write_seq: AtomicU64,
 }
 
@@ -172,16 +178,22 @@ pub struct PendingMeta {
     pub mtime: (i64, i64),
 }
 
+/// A setattr job's batch, open to merges until the job takes it: the job's
+/// sequence number once it has one, and the values it will apply.
+type AttrBatch = (Option<u64>, Arc<Mutex<AttrOverride>>);
+
 /// A snapshot of an inode's promises; see [`Inode::overlay`].
 #[derive(Clone, Copy, Default)]
 pub struct Overlay {
     pub size: Option<u64>,
     pub attrs: Option<AttrOverride>,
+    /// Links promised and not yet made.
+    pub links: u32,
 }
 
 impl Overlay {
     pub fn is_empty(&self) -> bool {
-        self.size.is_none() && self.attrs.is_none()
+        self.size.is_none() && self.attrs.is_none() && self.links == 0
     }
 }
 
@@ -286,6 +298,8 @@ impl Inode {
             gone_count: AtomicUsize::new(0),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
+            id: AtomicU64::new(0),
+            extra_links: AtomicU32::new(0),
             attr_pending: AtomicU32::new(0),
             attr_override: Mutex::new(AttrOverride::default()),
             attr_batch: Mutex::new(None),
@@ -321,6 +335,8 @@ impl Inode {
             gone_count: AtomicUsize::new(0),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
+            id: AtomicU64::new(0),
+            extra_links: AtomicU32::new(0),
             attr_pending: AtomicU32::new(0),
             attr_override: Mutex::new(AttrOverride::default()),
             attr_batch: Mutex::new(None),
@@ -487,7 +503,10 @@ impl Inode {
         let Some((seq, values)) = batch.as_ref() else {
             return false;
         };
-        if *seq <= self.last_write_seq.load(Ordering::Relaxed) {
+        // A batch queued before a write must not absorb a change meant to
+        // land after it — the write would clobber the time. A batch not yet
+        // stamped is newer than any write acknowledged so far.
+        if seq.is_some_and(|seq| seq <= self.last_write_seq.load(Ordering::Relaxed)) {
             return false;
         }
         let mut values = values.lock().expect("attr batch poisoned");
@@ -503,17 +522,36 @@ impl Inode {
         true
     }
 
-    /// Opens the batch a freshly queued setattr job will read.
-    pub fn open_attr_batch(&self, seq: u64, values: Arc<Mutex<AttrOverride>>) {
-        *self.attr_batch.lock().expect("attr batch poisoned") = Some((seq, values));
+    /// Opens the batch a setattr job about to be queued will read.
+    ///
+    /// Opened BEFORE the job is pushed, and identified by the batch itself
+    /// rather than by the job's sequence number, because the number does
+    /// not exist until the push returns — and on an empty queue the job can
+    /// run before it does. Opened after, the job had already come and gone,
+    /// the batch stayed open with nothing behind it, and the next chmod
+    /// merged into it and was never applied: mode 600 after a chmod to 755,
+    /// once in six boots.
+    pub fn open_attr_batch(&self, values: Arc<Mutex<AttrOverride>>) {
+        *self.attr_batch.lock().expect("attr batch poisoned") = Some((None, values));
     }
 
-    /// The job with this sequence number is about to run: its batch is
-    /// closed to merges from here on, and its contents are what to apply.
-    pub fn take_attr_batch(&self, seq: u64) -> Option<AttrOverride> {
+    /// The job for `values` has its sequence number now.
+    pub fn stamp_attr_batch(&self, seq: u64, values: &Arc<Mutex<AttrOverride>>) {
+        let mut batch = self.attr_batch.lock().expect("attr batch poisoned");
+        if let Some((open_seq, open)) = batch.as_mut()
+            && Arc::ptr_eq(open, values)
+        {
+            *open_seq = Some(seq);
+        }
+    }
+
+    /// The job for `values` is about to run: its batch is closed to merges
+    /// from here on, and its contents are what to apply. `None` when a newer
+    /// batch has replaced it, in which case the job applies its own copy.
+    pub fn take_attr_batch(&self, values: &Arc<Mutex<AttrOverride>>) -> Option<AttrOverride> {
         let mut batch = self.attr_batch.lock().expect("attr batch poisoned");
         match batch.as_ref() {
-            Some((open_seq, values)) if *open_seq == seq => {
+            Some((_, open)) if Arc::ptr_eq(open, values) => {
                 let taken = *values.lock().expect("attr batch poisoned");
                 *batch = None;
                 Some(taken)
@@ -587,6 +625,7 @@ impl Inode {
         Overlay {
             size,
             attrs: self.attr_override(),
+            links: self.extra_links(),
         }
     }
 
@@ -607,6 +646,25 @@ impl Inode {
     }
 
     /// The sequence a barrier on this inode must wait to.
+    /// A link to this inode has been acknowledged and is queued.
+    pub fn link_acked(&self) {
+        self.extra_links.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A queued link landed, or failed; either way the host answers now.
+    pub fn link_applied(&self) {
+        self.extra_links.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn extra_links(&self) -> u32 {
+        self.extra_links.load(Ordering::Relaxed)
+    }
+
+    /// The nodeid the registry issued for this inode; see [`Registry`].
+    pub fn id(&self) -> u64 {
+        self.id.load(Ordering::Relaxed)
+    }
+
     pub fn settle_seq(&self) -> u64 {
         self.settle_seq.load(Ordering::Relaxed)
     }
@@ -1066,6 +1124,7 @@ impl Registry {
         ));
         let by_id: [Mutex<HashMap<u64, Arc<Inode>>>; SHARDS] =
             std::array::from_fn(|_| Mutex::new(HashMap::new()));
+        root.id.store(ROOT_ID, Ordering::Relaxed);
         by_id[shard(ROOT_ID)]
             .lock()
             .expect("inode table poisoned")
@@ -1211,6 +1270,7 @@ impl Registry {
             1,
             self.census.clone(),
         ));
+        inode.id.store(id, Ordering::Relaxed);
         // Admission control, and the difference between degrading and
         // seizing. A full share used to admit the newcomer and lean on the
         // sweep to evict something — but the sweep finds the few thousand
@@ -1257,11 +1317,39 @@ impl Registry {
             meta,
             self.census.clone(),
         ));
+        inode.id.store(id, Ordering::Relaxed);
         self.by_id[shard(id)]
             .lock()
             .expect("inode table poisoned")
             .insert(id, inode.clone());
         (id, inode)
+    }
+
+    /// A file the host has and the guest has not yet named, registered
+    /// parked: no descriptor, found by identity when the guest looks it up.
+    /// Zero lookups until then, as any file the guest has not named.
+    pub fn insert_parked(&self, dev: i64, ino: u64, birthtime: (i64, i64)) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let meta = PendingMeta {
+            mode: libc::S_IFREG as u32 | 0o644,
+            born: (0, 0),
+            atime: (0, 0),
+            mtime: (0, 0),
+        };
+        let inode = Arc::new(Inode::new_pending(
+            dev,
+            PROVISIONAL_INO | id,
+            meta,
+            self.census.clone(),
+        ));
+        inode.id.store(id, Ordering::Relaxed);
+        inode.bind_parked(dev, ino, birthtime);
+        self.by_id[shard(id)]
+            .lock()
+            .expect("inode table poisoned")
+            .insert(id, inode);
+        self.claim_identity(id, dev, ino);
+        id
     }
 
     /// The apply queue performed a pending create: bind the real identity.
