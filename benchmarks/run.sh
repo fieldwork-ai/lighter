@@ -327,6 +327,23 @@ run_case_container() {
 		"$IMAGE" node $script
 }
 
+# The guest's memory, matched to OrbStack's on this machine when it is
+# installed: a copy of a tree that fits under one guest's writeback threshold
+# and not the other's is a comparison of memory sizes, not of runtimes.
+# `BENCH_MEMORY_MIB` overrides; without OrbStack the default is 8 GiB.
+bench_memory_mib() {
+	if [ -n "${BENCH_MEMORY_MIB:-}" ]; then echo "$BENCH_MEMORY_MIB"; return; fi
+	local kb
+	kb="$(docker --context orbstack run --rm alpine:3.21 sh -c 'grep MemTotal /proc/meminfo' 2>/dev/null | awk '{print $2}')"
+	if [ -n "$kb" ] && [ "$kb" -gt 0 ] 2>/dev/null; then
+		# Round up to the 256 MiB the VMM was given, since /proc/meminfo
+		# reports what the kernel kept after its own reservations.
+		echo $(( (kb / 1024 + 255) / 256 * 256 ))
+	else
+		echo 8192
+	fi
+}
+
 setup_lighter() {
 	KERNEL="guest/out/Image"
 	GVPROXY="${GVPROXY:-vendor/gvproxy}"
@@ -369,7 +386,7 @@ setup_lighter() {
 		--vsock "$SOCKET:2375" \
 		--vsock "$RUN_DIR/control.sock:2376" \
 		--share "bench:$WORK" \
-		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "${BENCH_MEMORY_MIB:-8192}" \
+		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
 		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
