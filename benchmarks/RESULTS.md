@@ -46,6 +46,18 @@ division by noise — read it from the table above in milliseconds.
 | copy-tree | 326% | 154% |
 | rm-rf | 163% | 131% |
 
+### On the runtime's own disk (a named volume), milliseconds
+
+| case | lighter | orbstack |
+|---|---|---|
+| npm-install | 7487 | 7027 |
+| pnpm-install | 1017 | 2032 |
+| yarn-install | 5946 | 5024 |
+| ripgrep | 110 | 105 |
+| find-walk | 114 | 124 |
+| copy-tree | 1286 | 1062 |
+| rm-rf | 312 | 487 |
+
 ## What each case does
 
 - **npm-install** — npm ci of a pinned tree (lower is better)

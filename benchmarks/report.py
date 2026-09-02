@@ -191,6 +191,30 @@ def render(results, description, _primary):
             lines.append(f"| {case} | " + " | ".join(cells) + " |")
         lines.append("")
 
+    # The same cases on the runtime's own disk — a named volume, no host
+    # filesystem underneath — which is where a container's writable layer
+    # and its data volumes live, and the more common path than the bind
+    # mount. `run.sh --where guest --label <runtime>-guest`. No native column:
+    # the Mac's own disk is the reference for the share, not for this.
+    on_disk = [t for t in RUNTIMES if (results / f"{t}-guest.csv").exists()]
+    if on_disk:
+        volumes = {t: load(f"{t}-guest", results) for t in on_disk}
+        lines += [
+            "### On the runtime's own disk (a named volume), milliseconds",
+            "",
+            "| case | " + " | ".join(on_disk) + " |",
+            "|" + "---|" * (len(on_disk) + 1),
+        ]
+        for case, _, _ in CASES:
+            if not any(case in volumes[t] for t in on_disk):
+                continue
+            cells = []
+            for t in on_disk:
+                value = volumes[t].get(case)
+                cells.append("—" if value is None else f"{int(value)}")
+            lines.append(f"| {case} | " + " | ".join(cells) + " |")
+        lines.append("")
+
     return lines
 
 
