@@ -333,15 +333,13 @@ run_case_container() {
 # `BENCH_MEMORY_MIB` overrides; without OrbStack the default is 8 GiB.
 bench_memory_mib() {
 	if [ -n "${BENCH_MEMORY_MIB:-}" ]; then echo "$BENCH_MEMORY_MIB"; return; fi
-	local kb
-	kb="$(docker --context orbstack run --rm alpine:3.21 sh -c 'grep MemTotal /proc/meminfo' 2>/dev/null | awk '{print $2}')"
-	if [ -n "$kb" ] && [ "$kb" -gt 0 ] 2>/dev/null; then
-		# Round up to the 256 MiB the VMM was given, since /proc/meminfo
-		# reports what the kernel kept after its own reservations.
-		echo $(( (kb / 1024 + 255) / 256 * 256 ))
-	else
-		echo 8192
-	fi
+	# OrbStack's configured limit, which is what its guest boots with. Read
+	# from its config rather than its running guest: the comparator is
+	# stopped while we measure, and a probe that needs it running silently
+	# fell back to 8 GiB against its 16 for a whole set of results.
+	local mib
+	mib="$(orb config show 2>/dev/null | awk '/^memory_mib:/ { print $2 }')"
+	if [ -n "$mib" ] && [ "$mib" -gt 0 ] 2>/dev/null; then echo "$mib"; else echo 8192; fi
 }
 
 setup_lighter() {
