@@ -273,6 +273,15 @@ pub fn open_root(path: &Path) -> Result<OwnedFd> {
 ///
 /// APFS metadata operation: the clone shares extents with the source and
 /// costs less than half a hardlink. The destination must not exist.
+/// Clones an open file to a name: the source is the descriptor, so no path
+/// is resolved for it — a `/.vol` identity path costs the kernel a synthetic
+/// lookup on every clone, and pnpm clones every file it installs.
+pub fn fclonefile_at(source: RawFd, parent: RawFd, name: &CStr) -> Result<()> {
+    // SAFETY: a live source descriptor, a live directory descriptor and a
+    // valid NUL-terminated name.
+    check(unsafe { libc::fclonefileat(source, parent, name.as_ptr(), 0) }).map(|_| ())
+}
+
 pub fn clonefile_at(source: &CStr, parent: RawFd, name: &CStr) -> Result<()> {
     // SAFETY: valid NUL-terminated paths and a live directory descriptor. An
     // absolute source makes the source dirfd irrelevant.

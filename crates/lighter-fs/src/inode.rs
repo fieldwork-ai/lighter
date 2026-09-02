@@ -172,6 +172,19 @@ pub struct PendingMeta {
     pub mtime: (i64, i64),
 }
 
+/// A snapshot of an inode's promises; see [`Inode::overlay`].
+#[derive(Clone, Copy, Default)]
+pub struct Overlay {
+    pub size: Option<u64>,
+    pub attrs: Option<AttrOverride>,
+}
+
+impl Overlay {
+    pub fn is_empty(&self) -> bool {
+        self.size.is_none() && self.attrs.is_none()
+    }
+}
+
 /// Attributes a bound inode has been promised by setattrs still on the
 /// queue. Reads must show them; the host stat lags until the jobs land.
 #[derive(Clone, Copy, Default)]
@@ -361,6 +374,25 @@ impl Inode {
         self.pending.store(false, Ordering::Relaxed);
     }
 
+    /// Binds a real identity with no descriptor: the inode is born parked,
+    /// at its identity path, and opens itself on first use.
+    ///
+    /// For a file the guest will most likely never touch again — pnpm's
+    /// sixty thousand imports an install — the descriptor the bound path
+    /// opens is one the sweep closes moments later, at a full share
+    /// immediately: an open, a stat, a path query and a close, all for
+    /// nothing. Parked from birth, the file costs the clone and one stat.
+    fn bind_parked(&self, dev: i64, ino: u64, birthtime: (i64, i64)) {
+        self.dev.store(dev, Ordering::Relaxed);
+        self.ino.store(ino, Ordering::Relaxed);
+        *self.parked_at.lock().expect("parked path poisoned") = Some(Parked {
+            path: PathBuf::from(format!("/.vol/{dev}/{ino}")),
+            birthtime,
+        });
+        *self.pending_meta.lock().expect("pending meta poisoned") = None;
+        self.pending.store(false, Ordering::Relaxed);
+    }
+
     /// The create itself failed; the file will never exist. The errno parks
     /// where the next operation on this inode reports it.
     pub fn bind_failed(&self, errno: i32) {
@@ -539,6 +571,25 @@ impl Inode {
     }
 
     /// What a reader must lay over the host stat, if anything.
+    /// What the guest has been promised about this file that the host may
+    /// not show yet — the size its queued writes reach, the mode and times
+    /// its queued setattrs set. Taken BEFORE the host is consulted, never
+    /// after: `Server::attr_of` says why.
+    pub fn overlay(&self) -> Overlay {
+        // The dirty count first, the size second: a write applying between
+        // the two clears both, and a `Some(0)` laid over the host's size is
+        // the host's size — which is then the truth.
+        let size = if self.is_dirty() {
+            Some(self.pending_size.load(Ordering::Relaxed))
+        } else {
+            None
+        };
+        Overlay {
+            size,
+            attrs: self.attr_override(),
+        }
+    }
+
     pub fn attr_override(&self) -> Option<AttrOverride> {
         if self.attr_pending.load(Ordering::Relaxed) == 0 {
             return None;
@@ -571,6 +622,30 @@ impl Inode {
 
     pub fn meta_shadowed(&self) -> bool {
         self.meta_shadow.load(Ordering::Relaxed) != 0
+    }
+
+    /// The names promised into this directory, with their inodes.
+    pub fn pending_children_snapshot(&self) -> Vec<(Vec<u8>, u64)> {
+        if self.pending_count.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        self.pending_children
+            .lock()
+            .expect("pending children poisoned")
+            .iter()
+            .map(|(name, id)| (name.clone(), *id))
+            .collect()
+    }
+
+    /// The names promised away from this directory.
+    pub fn pending_gone_snapshot(&self) -> std::collections::HashSet<Vec<u8>> {
+        if self.gone_count.load(Ordering::Relaxed) == 0 {
+            return std::collections::HashSet::new();
+        }
+        self.pending_gone
+            .lock()
+            .expect("pending gone poisoned")
+            .clone()
     }
 
     /// Whether any queued operation still shadows this directory's listing.
@@ -1203,6 +1278,24 @@ impl Registry {
         if self.census.descriptors() > self.budget {
             let _ = inode.park();
         }
+        self.claim_identity(id, dev, ino);
+    }
+
+    /// [`Registry::bind_pending`] without a descriptor: see
+    /// [`Inode::bind_parked`].
+    pub fn bind_pending_parked(
+        &self,
+        id: u64,
+        inode: &Arc<Inode>,
+        dev: i64,
+        ino: u64,
+        birthtime: (i64, i64),
+    ) {
+        inode.bind_parked(dev, ino, birthtime);
+        self.claim_identity(id, dev, ino);
+    }
+
+    fn claim_identity(&self, id: u64, dev: i64, ino: u64) {
         let still_known = self.by_id[shard(id)]
             .lock()
             .expect("inode table poisoned")

@@ -339,6 +339,28 @@ fn an_open_file_survives_being_unlinked() {
     );
 }
 
+/// The guest kernel revalidates size before a read. A write acknowledged
+/// after an unlink must show in the next GETATTR, or the kernel truncates
+/// its own view of the file to the old size and the read stops short.
+#[test]
+fn a_write_after_an_unlink_is_what_getattr_and_read_report() {
+    let mut guest = Guest::new("unlink-write-getattr");
+    let (nodeid, fh) = guest.create(1, "doomed", CREATE_RDWR).unwrap();
+    guest.write(nodeid, fh, 0, b"before").unwrap();
+    guest.call(op::UNLINK, 1, &name_body("doomed")).unwrap();
+    assert!(matches!(guest.lookup(1, "doomed"), Err(2) | Ok(0)));
+    assert_eq!(guest.write(nodeid, fh, 6, b" and after").unwrap(), 10);
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    let size = u64::from_le_bytes(ga[16 + 8..16 + 16].try_into().unwrap());
+    assert_eq!(size, 16, "getattr reports the acknowledged size");
+    assert_eq!(
+        guest.read(nodeid, fh, 0, 4096).unwrap(),
+        b"before and after"
+    );
+}
+
 /// Two names for one file are one inode. A guest that saw two would disagree
 /// with its own `stat`, and every hard-link-based cache would break.
 #[test]
@@ -1135,4 +1157,26 @@ fn a_time_set_after_a_write_outlives_the_write() {
         1_000_000_002,
         "the last time set, after the write, is what the Mac has"
     );
+}
+
+/// A listing shows what the guest was promised, before the queue has
+/// applied it: a created name is there, an unlinked one is not.
+#[test]
+fn listings_show_promises_without_waiting() {
+    let mut guest = Guest::new("readdir-overlay");
+    std::fs::write(guest.host("old"), b"x").unwrap();
+    let (_n, _fh) = guest.create(1, "new", 0x8241).expect("create");
+    guest
+        .call(op::UNLINK, 1, &name_body("old"))
+        .expect("unlink");
+    let mut body = vec![0u8; 24];
+    body[16..20].copy_from_slice(&(1u32 << 16).to_le_bytes());
+    let reply = guest.call(op::READDIR, 1, &body).expect("readdir");
+    // Names appear NUL-free inside dirents; a substring search is enough.
+    let text = String::from_utf8_lossy(&reply).to_string();
+    assert!(text.contains("new"), "a promised file is listed");
+    assert!(!text.contains("old"), "a file promised away is not");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert!(guest.host("new").exists());
+    assert!(!guest.host("old").exists());
 }

@@ -456,6 +456,9 @@ impl Server {
             for line in self.stats.report().lines() {
                 tracing::info!("{line}");
             }
+            for line in self.apply.report().lines() {
+                tracing::info!("{line}");
+            }
             self.stats.reset();
         }
     }
@@ -762,13 +765,22 @@ impl Server {
     /// Looks a name up under `parent` and registers it, producing the reply
     /// body that LOOKUP, CREATE, MKDIR and friends all end with.
     fn entry(&self, parent: &Inode, name: &CString) -> Result<EntryOut, i32> {
+        let mark = self.apply.applied();
         let st = sys::stat_at(parent.reference()?.raw_fd(), name)?;
-        self.entry_from(parent, name, st)
+        self.entry_from(parent, name, st, mark)
     }
 
     /// [`Server::entry`], for a caller that already has the `stat`.
-    fn entry_from(&self, parent: &Inode, name: &CString, st: libc::stat) -> Result<EntryOut, i32> {
-        self.entry_with_reference(parent, st, || {
+    /// `mark` is the queue's applied count from before `st` was taken; see
+    /// the overlay step in [`Server::entry_with_reference`].
+    fn entry_from(
+        &self,
+        parent: &Inode,
+        name: &CString,
+        st: libc::stat,
+        mark: u64,
+    ) -> Result<EntryOut, i32> {
+        self.entry_with_reference(parent, st, mark, || {
             let is_symlink = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
             sys::open_reference(parent.reference()?.raw_fd(), name, is_symlink)
         })
@@ -783,6 +795,7 @@ impl Server {
         &self,
         parent: &Inode,
         st: libc::stat,
+        mark: u64,
         reference: impl FnOnce() -> Result<std::os::fd::OwnedFd, i32>,
     ) -> Result<EntryOut, i32> {
         let mode = st.st_mode as u32;
@@ -812,11 +825,19 @@ impl Server {
         let mut attr = self.attr(&st);
         // While writes or setattrs for this file sit on the apply queue, the
         // host stat lags what the guest was promised; the overlay is the truth.
-        if !is_dir
-            && self.apply.busy()
-            && let Some(inode) = self.registry.get(nodeid)
-        {
-            self.overlay_attr(&inode, &mut attr);
+        //
+        // The inode was not known until the stat named it, so the promise
+        // could not be read first (`attr_of`). If it is empty now but a job
+        // for this file was outstanding at `mark`, that job may have applied
+        // while the stat was in flight and the stat be of the moment before:
+        // the file is stat'd again, with nothing left to race.
+        if !is_dir && let Some(inode) = self.registry.get(nodeid) {
+            let overlay = inode.overlay();
+            if !overlay.is_empty() {
+                self.overlay_attr(&overlay, &mut attr);
+            } else if inode.settle_seq() > mark {
+                attr = self.attr(&self.stat_inode(nodeid, &inode)?);
+            }
         }
         Ok(EntryOut {
             nodeid,
@@ -992,11 +1013,17 @@ impl Server {
             entry.attr.encode(&mut out);
             return Ok(out);
         }
-        if let Ok(inode) = self.inode(nodeid) {
+        let inode = self.inode(nodeid).ok();
+        if let Some(inode) = &inode {
             // A queued unlink will change this inode's link count; a stat
             // now would answer with the past.
-            self.settle_while(&inode, |inode| inode.meta_shadowed());
+            self.settle_while(inode, |inode| inode.meta_shadowed());
         }
+        // The promise before the stat: `attr_of` says why.
+        let overlay = inode
+            .as_ref()
+            .map(|inode| inode.overlay())
+            .unwrap_or_default();
         let flags = get_u32(body, 0).unwrap_or(0);
         let st = if flags & fuse::GETATTR_FH != 0
             && let Some(fh) = get_u64(body, 8)
@@ -1009,11 +1036,9 @@ impl Server {
             self.stat_inode(nodeid, &inode)?
         };
         let mut out = self.attr_reply(&st);
-        if let Ok(inode) = self.inode(nodeid)
-            && (inode.is_dirty() || inode.has_pending_attrs())
-        {
+        if !overlay.is_empty() {
             let mut attr = self.attr(&st);
-            self.overlay_attr(&inode, &mut attr);
+            self.overlay_attr(&overlay, &mut attr);
             out.truncate(16);
             attr.encode(&mut out);
         }
@@ -1067,10 +1092,7 @@ impl Server {
         let attr = if inode.is_pending() {
             self.pending_entry(inode, inode, nodeid).attr
         } else {
-            let st = self.stat_inode(nodeid, inode)?;
-            let mut attr = self.attr(&st);
-            self.overlay_attr(inode, &mut attr);
-            attr
+            self.attr_of(nodeid, inode)?
         };
         let valid_for = self.policy.attr_validity(inode.dev(), inode.ino());
         let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
@@ -1167,12 +1189,13 @@ impl Server {
             // here was the ESTALE that turned every pnpm import into a
             // hardlink: libuv's copyfile chmods the destination it has just
             // created, to the mode it already has.)
-            let mut attr = if inode.is_pending() {
-                self.pending_entry(inode, inode, nodeid).attr
+            let attr = if inode.is_pending() {
+                let mut attr = self.pending_entry(inode, inode, nodeid).attr;
+                self.overlay_attr(&inode.overlay(), &mut attr);
+                attr
             } else {
-                self.attr(&self.stat_inode(nodeid, inode)?)
+                self.attr_of(nodeid, inode)?
             };
-            self.overlay_attr(inode, &mut attr);
             let valid_for = self.policy.attr_validity(inode.dev(), inode.ino());
             let mut out = Vec::with_capacity(fuse::ATTR_LEN + 16);
             out.extend_from_slice(&valid_for.as_secs().to_le_bytes());
@@ -1232,7 +1255,9 @@ impl Server {
                 )
             };
             let (job, seq_out) = job;
-            let seq = self.apply.push(crate::apply::Job::new(0, job));
+            let seq = self
+                .apply
+                .push(crate::apply::Job::of(crate::apply::Kind::Setattr, 0, job));
             seq_out.store(seq, std::sync::atomic::Ordering::Relaxed);
             inode.open_attr_batch(seq, batch);
             inode.settled_by(seq);
@@ -1245,9 +1270,7 @@ impl Server {
         let entry = if inode.is_pending() {
             self.pending_entry(inode, inode, nodeid)
         } else {
-            let st = self.stat_inode(nodeid, inode)?;
-            let mut attr = self.attr(&st);
-            self.overlay_attr(inode, &mut attr);
+            let attr = self.attr_of(nodeid, inode)?;
             EntryOut {
                 nodeid,
                 generation: 0,
@@ -1488,7 +1511,9 @@ impl Server {
                     }
                 }
             };
-            let seq = self.apply.push(crate::apply::Job::new(0, job));
+            let seq = self
+                .apply
+                .push(crate::apply::Job::of(crate::apply::Kind::Unlink, 0, job));
             parent.settled_by(seq);
             if let Some(target) = &target_out {
                 target.settled_by(seq);
@@ -1557,6 +1582,11 @@ impl Server {
             // file keeps reading it after the rename, so it must exist.
             displaced.shadow_meta();
         }
+        // A promise moves with its name: the old name stops promising the
+        // inode the instant the new one starts, or a listing in between
+        // shows the file twice — and a rename chain leaves every step of
+        // it behind until the queue catches up.
+        old_parent.remove_pending_child(old.to_bytes(), nodeid);
         old_parent.add_pending_gone(old.to_bytes());
         new_parent.add_pending_child(new.to_bytes(), nodeid);
         let job = {
@@ -1589,7 +1619,9 @@ impl Server {
                 }
             }
         };
-        let seq = self.apply.push(crate::apply::Job::new(0, job));
+        let seq = self
+            .apply
+            .push(crate::apply::Job::of(crate::apply::Kind::Rename, 0, job));
         old_parent.settled_by(seq);
         new_parent.settled_by(seq);
         inode.settled_by(seq);
@@ -1750,7 +1782,25 @@ impl Server {
         // them and lands after they do.
         self.settle_while(&source, |source| source.is_pending());
         let source_path = self.path(&source)?;
-        let st = self.stat_inode(nodeid_in, &source)?;
+        // The source by descriptor: the one a recent write left in the open
+        // cache, else the inode's own. The clone then names no path for it.
+        enum Source {
+            Cached(std::sync::Arc<OpenFile>),
+            Held(crate::inode::Reference),
+        }
+        impl Source {
+            fn raw_fd(&self) -> std::os::fd::RawFd {
+                match self {
+                    Source::Cached(file) => file.fd.as_raw_fd(),
+                    Source::Held(reference) => reference.raw_fd(),
+                }
+            }
+        }
+        let source_fd = match self.open_cache.file(nodeid_in, false) {
+            Some(file) => Source::Cached(file),
+            None => Source::Held(source.reference()?),
+        };
+        let st = sys::stat_fd(source_fd.raw_fd())?;
         let size = source.overlay_size(st.st_size as u64);
         let mode = st.st_mode as u32;
         if !self.apply.accepting() {
@@ -1819,13 +1869,23 @@ impl Server {
                     // per import, fifty thousand imports an install. Only
                     // a name that is taken goes through a temporary, so the
                     // replacement stays atomic.
-                    match sys::clonefile_at(&source_path, parent_ref.raw_fd(), &name) {
+                    let clone = |name: &CString| {
+                        match sys::fclonefile_at(source_fd.raw_fd(), parent_ref.raw_fd(), name) {
+                            // A descriptor the kernel will not clone from
+                            // (an event-only reference, say): by path, as
+                            // before.
+                            Err(e) if e == linux::EBADF || e == linux::EACCES => {
+                                sys::clonefile_at(&source_path, parent_ref.raw_fd(), name)
+                            }
+                            other => other,
+                        }
+                    };
+                    match clone(&name) {
                         Ok(()) => {}
                         Err(e)
                             if e == linux::EEXIST
                                 && sys::unlink_at(parent_ref.raw_fd(), &name, false).is_ok()
-                                && sys::clonefile_at(&source_path, parent_ref.raw_fd(), &name)
-                                    .is_ok() => {}
+                                && clone(&name).is_ok() => {}
                         Err(e) if e == linux::EEXIST => {
                             // Unlink-then-clone was refused; the atomic route.
                             // Unique per job: one source is cloned to many
@@ -1836,7 +1896,7 @@ impl Server {
                                 std::process::id(),
                                 nodeid
                             )))?;
-                            sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
+                            clone(&tmp)?;
                             if let Err(e) = sys::rename_at(
                                 parent_ref.raw_fd(),
                                 &tmp,
@@ -1850,13 +1910,20 @@ impl Server {
                         }
                         Err(e) => return Err(e),
                     }
-                    let fd = sys::open_reference(parent_ref.raw_fd(), &name, false)?;
-                    let st = sys::stat_fd(fd.as_raw_fd())?;
-                    Ok((fd, st))
+                    // One stat for the identity; no descriptor. The clone
+                    // is bound parked (see `Inode::bind_parked`), and the
+                    // first operation that needs it open opens it.
+                    sys::stat_at(parent_ref.raw_fd(), &name)
                 })();
                 match result {
-                    Ok((fd, st)) => {
-                        registry.bind_pending(nodeid, &dest, fd, st.st_dev as i64, st.st_ino);
+                    Ok(st) => {
+                        registry.bind_pending_parked(
+                            nodeid,
+                            &dest,
+                            st.st_dev as i64,
+                            st.st_ino,
+                            (st.st_birthtime, st.st_birthtime_nsec),
+                        );
                     }
                     Err(errno) => {
                         tracing::warn!(
@@ -1871,7 +1938,9 @@ impl Server {
                 parent.remove_pending_child(name.to_bytes(), nodeid);
             }
         };
-        let seq = self.apply.push(crate::apply::Job::new(0, job));
+        let seq = self
+            .apply
+            .push(crate::apply::Job::of(crate::apply::Kind::Clone, 0, job));
         parent.settled_by(seq);
         dest.settled_by(seq);
         let mut out = Vec::with_capacity(8);
@@ -2014,7 +2083,9 @@ impl Server {
                 parent.remove_pending_child(name.to_bytes(), nodeid);
             }
         };
-        let seq = self.apply.push(crate::apply::Job::new(0, job));
+        let seq = self
+            .apply
+            .push(crate::apply::Job::of(crate::apply::Kind::Create, 0, job));
         parent.settled_by(seq);
         inode.settled_by(seq);
         let entry = self.pending_entry(parent, &inode, nodeid);
@@ -2057,12 +2128,29 @@ impl Server {
 
     /// Lays what a bound inode was promised by queued setattrs over the
     /// attributes the host stat produced.
-    fn overlay_attr(&self, inode: &Inode, attr: &mut Attr) {
-        if inode.is_dirty() {
-            attr.size = inode.overlay_size(attr.size);
+    /// The attributes of a bound inode: the host's, with what the guest has
+    /// been promised laid over them.
+    ///
+    /// The overlay is read BEFORE the stat, and that order is the whole
+    /// correctness of it. A queued write is a promise the host does not show
+    /// yet. Read the host first and the promise second, and a job applying
+    /// in between has withdrawn the promise while the stat is of the moment
+    /// before: a file the guest had written nineteen bytes to, reported
+    /// empty, once in a dozen boots. Read first, the promise is either still
+    /// there and laid over, or already kept and the stat shows it.
+    fn attr_of(&self, nodeid: u64, inode: &Inode) -> Result<Attr, i32> {
+        let overlay = inode.overlay();
+        let mut attr = self.attr(&self.stat_inode(nodeid, inode)?);
+        self.overlay_attr(&overlay, &mut attr);
+        Ok(attr)
+    }
+
+    fn overlay_attr(&self, overlay: &crate::inode::Overlay, attr: &mut Attr) {
+        if let Some(size) = overlay.size {
+            attr.size = attr.size.max(size);
             attr.blocks = attr.size.div_ceil(512);
         }
-        if let Some(over) = inode.attr_override() {
+        if let Some(over) = overlay.attrs {
             if let Some(mode) = over.mode {
                 attr.mode = (attr.mode & !0o7777) | (mode & 0o7777);
             }
@@ -2086,9 +2174,7 @@ impl Server {
         inode: &std::sync::Arc<Inode>,
         nodeid: u64,
     ) -> Result<EntryOut, i32> {
-        let st = self.stat_inode(nodeid, inode)?;
-        let mut attr = self.attr(&st);
-        self.overlay_attr(inode, &mut attr);
+        let attr = self.attr_of(nodeid, inode)?;
         self.registry.count_lookup(nodeid);
         let entry_valid = self
             .policy
@@ -2217,7 +2303,8 @@ impl Server {
         if st.st_mode & 0o170000 == 0o040000 {
             return Err(linux::EISDIR);
         }
-        let entry = self.entry_with_reference(&parent, st, || sys::dup(&fd))?;
+        let entry =
+            self.entry_with_reference(&parent, st, self.apply.applied(), || sys::dup(&fd))?;
         let fh = self.registry.add_handle(Handle::File(Arc::new(OpenFile {
             fd,
             readable: true,
@@ -2416,20 +2503,58 @@ impl Server {
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
         let budget = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
 
-        if let Ok(inode) = self.inode(nodeid) {
-            // The host listing cannot show a file that is still a promise,
-            // nor keep showing one that is promised away.
-            self.settle_while(&inode, |inode| inode.listing_shadowed());
-        }
         let open = self.dir_for(nodeid)?;
         let mut entries = open.entries.lock().expect("directory listing poisoned");
+        let parent = self.directory(nodeid)?;
         // A caller starting from the beginning is asking for a fresh view;
         // anyone resuming gets the list the first page came from, so the
         // offsets they were given still mean what they meant.
         if offset == 0 || entries.is_empty() {
-            *entries = self.list(nodeid)?;
+            // The host listing cannot show a file that is still a promise,
+            // nor stop showing one promised away — so the overlay is merged
+            // in rather than waited for. Waiting was a hundred and forty
+            // microseconds per listing, sixteen thousand times a pnpm
+            // install, on a queue that was busy precisely because of it.
+            //
+            // The overlay is read BEFORE the host is listed. A job applies
+            // its host change first and withdraws its promise second, so a
+            // promise read first is in one view or the other, and a
+            // promise read second can be in neither: two files of two
+            // thousand went missing from a listing that way.
+            let gone = parent.pending_gone_snapshot();
+            let promised = parent.pending_children_snapshot();
+            let mut listed = self.list(nodeid)?;
+            if !gone.is_empty() || !promised.is_empty() {
+                listed.retain(|entry| !gone.contains(&entry.name));
+                for (name, id) in promised {
+                    let Some(inode) = self.registry.get(id) else {
+                        continue;
+                    };
+                    let kind = if inode.is_dir {
+                        4
+                    } else if inode.is_symlink {
+                        10
+                    } else {
+                        8
+                    };
+                    match listed.iter_mut().find(|entry| entry.name == name) {
+                        // A name the host already has, promised to a new
+                        // inode (a clone or rename over it): the promise wins.
+                        Some(entry) => {
+                            entry.ino = inode.ino();
+                            entry.kind = kind;
+                        }
+                        None => listed.push(sys::DirEntry {
+                            ino: inode.ino(),
+                            kind,
+                            name,
+                            next_offset: 0,
+                        }),
+                    }
+                }
+            }
+            *entries = listed;
         }
-        let parent = self.directory(nodeid)?;
 
         let mut out = Vec::new();
         for (index, entry) in entries.iter().enumerate().skip(offset) {
@@ -2447,6 +2572,17 @@ impl Server {
                 // and nothing would ever forget them.
                 let looked_up = if entry.name == b"." || entry.name == b".." {
                     None
+                } else if let Some(id) = parent.pending_child(&entry.name)
+                    && let Some(inode) = self.registry.get(id)
+                {
+                    // Promised here: answered from the promise, and counted
+                    // as the lookup the kernel takes it for.
+                    if inode.is_pending() {
+                        self.registry.count_lookup(id);
+                        Some(self.pending_entry(&parent, &inode, id))
+                    } else {
+                        self.promised_entry(&parent, &inode, id).ok()
+                    }
                 } else {
                     self.checked_name(&entry.name)
                         .and_then(|name| self.entry(&parent, &name))

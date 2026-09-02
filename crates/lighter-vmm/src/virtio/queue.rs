@@ -625,6 +625,19 @@ impl Virtqueue {
     /// interrupt storm that ignoring it produces.
     pub fn needs_interrupt(&mut self, mem: &GuestMemory) -> bool {
         const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+        // The barrier the specification demands between publishing the used
+        // index and reading what the driver asked for, and it has to be a
+        // full one: with only the release fence that precedes the index
+        // write, a weakly-ordered core may perform the read of `used_event`
+        // (or the packed flags) *before* its own store of the index becomes
+        // visible — and then the value read is the one the driver wrote
+        // before it looked, saw the old index, decided to sleep, and asked to
+        // be woken at exactly the index we just published. No interrupt is
+        // sent; the driver sleeps on a reply that is sitting in the ring.
+        // (Suspected first for a night of hangs that turned out to be the
+        // missing re-check in `VirtioMmio::notify_queue`; it stays because
+        // the specification requires it, not because it was the culprit.)
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         if self.packed {
             return self.needs_interrupt_packed(mem);
         }

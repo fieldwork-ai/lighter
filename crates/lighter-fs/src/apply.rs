@@ -56,13 +56,34 @@ pub struct Job {
     run: Box<dyn FnOnce() + Send>,
     /// Payload bytes held in memory until applied, for backpressure.
     bytes: usize,
+    /// What kind of work, for the drainer's own histogram.
+    kind: Kind,
 }
+
+/// The kinds of job the queue applies, for accounting: when the drainer is
+/// the bottleneck, which syscalls it spends its time in is the question.
+#[derive(Clone, Copy)]
+pub enum Kind {
+    Create,
+    Write,
+    Unlink,
+    Rename,
+    Clone,
+    Setattr,
+}
+
+const KINDS: usize = 6;
 
 impl Job {
     pub fn new(bytes: usize, run: impl FnOnce() + Send + 'static) -> Job {
+        Job::of(Kind::Write, bytes, run)
+    }
+
+    pub fn of(kind: Kind, bytes: usize, run: impl FnOnce() + Send + 'static) -> Job {
         Job {
             run: Box::new(run),
             bytes,
+            kind,
         }
     }
 }
@@ -130,6 +151,9 @@ struct Shared {
     free: AtomicU64,
     /// The depth cap; see [`jobs_cap`].
     window: usize,
+    /// Per-kind job counts and nanoseconds, the drainer's histogram.
+    kind_count: [AtomicU64; KINDS],
+    kind_nanos: [AtomicU64; KINDS],
     jobs_done: AtomicU64,
 }
 
@@ -148,6 +172,8 @@ impl Apply {
             bytes: AtomicUsize::new(0),
             free: AtomicU64::new(u64::MAX),
             window: jobs_cap(),
+            kind_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            kind_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             jobs_done: AtomicU64::new(0),
         });
         shared.refresh_free(&root);
@@ -237,6 +263,24 @@ impl Apply {
         }
     }
 
+    /// The drainer's histogram since the last call, one line per kind.
+    pub fn report(&self) -> String {
+        const NAMES: [&str; KINDS] = ["create", "write", "unlink", "rename", "clone", "setattr"];
+        let mut out = String::new();
+        for (i, name) in NAMES.iter().enumerate() {
+            let n = self.shared.kind_count[i].swap(0, Ordering::Relaxed);
+            let ns = self.shared.kind_nanos[i].swap(0, Ordering::Relaxed);
+            if n > 0 {
+                out.push_str(&format!(
+                    "APPLY {name:8} n={n:<8} total_ms={:<7} mean_us={:.1}\n",
+                    ns / 1_000_000,
+                    ns as f64 / n as f64 / 1000.0
+                ));
+            }
+        }
+        out
+    }
+
     /// Jobs queued and not yet applied, for diagnostics.
     pub fn depth(&self) -> usize {
         self.shared.depth.load(Ordering::Relaxed)
@@ -288,10 +332,14 @@ impl Shared {
             // A job that panics must not take the drainer with it: with no
             // drainer every barrier waits forever, which is a hung guest.
             let bytes = job.bytes;
+            let kind = job.kind as usize;
+            let started = std::time::Instant::now();
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || (job.run)())).is_err()
             {
                 tracing::error!("an apply job panicked; the queue continues");
             }
+            self.kind_count[kind].fetch_add(1, Ordering::Relaxed);
+            self.kind_nanos[kind].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             self.bytes.fetch_sub(bytes, Ordering::Relaxed);
             self.depth.fetch_sub(1, Ordering::Relaxed);
             let done = self.jobs_done.fetch_add(1, Ordering::Relaxed) + 1;

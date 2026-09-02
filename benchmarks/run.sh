@@ -472,9 +472,14 @@ for name in $CASES; do
 	cap=$(( ${CASE_TIMEOUT_S:-300} * REPS + 60 ))
 	run_case "$name" >"$CASE_OUT" 2>&1 &
 	case_pid=$!
-	( sleep "$cap"; kill "$case_pid" 2>/dev/null && echo "TIME_MS TIMEOUT host-watchdog ${cap}s" >>"$CASE_OUT" ) &
+	# The watchdog detaches from our stdout before it sleeps. Killing the
+	# subshell orphans its `sleep`, and an orphan that still holds the
+	# pipe keeps whoever is reading us waiting out the whole cap — which
+	# is how a one-minute quick gate came to take eleven.
+	( exec </dev/null >/dev/null 2>&1; sleep "$cap"; kill "$case_pid" 2>/dev/null && echo "TIME_MS TIMEOUT host-watchdog ${cap}s" >>"$CASE_OUT" ) &
 	watchdog_pid=$!
 	wait "$case_pid" 2>/dev/null || true
+	pkill -P "$watchdog_pid" 2>/dev/null || true
 	kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null || true
 	while read -r ms; do
 		rep=$((rep + 1))
