@@ -74,13 +74,34 @@ if [ -b "$DATA_DEV" ]; then
 	# A blank disk has no filesystem; making one on first boot is what turns a
 	# freshly created sparse file into usable storage with no setup step.
 	if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
-		echo "INIT formatting=$DATA_DEV"
-		mke2fs -q -t ext4 -L lighter-data "$DATA_DEV"
+		# `lighter.data_mkfs=` on the kernel command line adds options to
+		# the format — a journal left out, say — for the same reason as the
+		# mount options below: to be measured, not guessed at.
+		DATA_MKFS=""
+		for arg in $(cat /proc/cmdline); do
+			case "$arg" in
+			lighter.data_mkfs=*) DATA_MKFS="${arg#lighter.data_mkfs=}" ;;
+			esac
+		done
+		echo "INIT formatting=$DATA_DEV mkfs=$DATA_MKFS"
+		# shellcheck disable=SC2086
+		mke2fs -q -t ext4 -L lighter-data $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
 	fi
 	# Discard is what makes deleting an image give space back to macOS: it
 	# reaches virtio-blk as a discard request and becomes a hole punch in the
 	# host file. Without it the disk only ever grows.
-	if mount -o discard,noatime "$DATA_DEV" /mnt/data; then
+	#
+	# `lighter.data_opts=` on the kernel command line replaces the mount
+	# options outright, so a different journaling or barrier setting can be
+	# measured without a rebuild of this image.
+	DATA_OPTS=discard,noatime
+	for arg in $(cat /proc/cmdline); do
+		case "$arg" in
+		lighter.data_opts=*) DATA_OPTS="${arg#lighter.data_opts=}" ;;
+		esac
+	done
+	echo "INIT data_opts=$DATA_OPTS"
+	if mount -o "$DATA_OPTS" "$DATA_DEV" /mnt/data; then
 		echo "INIT data=mounted"
 		mkdir -p /mnt/data/docker
 		mount --bind /mnt/data/docker /var/lib/docker
