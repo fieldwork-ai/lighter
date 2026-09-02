@@ -339,6 +339,11 @@ setup_lighter() {
 	cargo build --release --example lighter-bench -p lighter-vmm
 	./scripts/sign.sh "$BIN" >/dev/null
 
+	# Let fseventsd finish with any VMM that died on this share moments
+	# ago — the previous run's, typically — before a new stream opens on
+	# it. Its final writes otherwise arrive in the new boot as host changes,
+	# withdrawing entries the guest was just given, for the first seconds.
+	sleep "${LIGHTER_BENCH_SETTLE_S:-2}"
 	RUN_DIR="$(mktemp -d -t lighter-bench)"
 	SOCKET="$RUN_DIR/docker.sock"
 	# Kept outside the run directory so it survives the cleanup: it carries the

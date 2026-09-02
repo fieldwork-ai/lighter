@@ -81,6 +81,12 @@ measure_once() {
 	kill -9 "$vmm" 2>/dev/null || true
 	wait "$vmm" 2>/dev/null || true
 	rm -rf "$run_dir"
+	# Let fseventsd finish with the dead VMM's writes before the next boot
+	# opens a stream on the same directory: the tail of a killed run — the
+	# rmdir of its last tree — arrived in the following boot as host
+	# changes, withdrawing entries the new guest had just been given.
+	# LIGHTER_LATENCY_SETTLE_S=0 reproduces that on purpose.
+	sleep "${LIGHTER_LATENCY_SETTLE_S:-2}"
 }
 
 native=""

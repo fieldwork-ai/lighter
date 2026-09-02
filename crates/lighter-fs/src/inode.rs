@@ -517,6 +517,17 @@ impl Inode {
     }
 
     /// The pending inode `name` resolves to, if it is promised here.
+    /// Whether names under this directory are still promises — children
+    /// whose creation is queued, or names whose removal is. A directory
+    /// holding promises outlives the guest's memory of it: a host change
+    /// that withdraws its entry has the guest forget the nodeid and look the
+    /// name up again, and it must find the same inode, or the promises are
+    /// lost to whatever the second inode resolves.
+    pub fn has_promises(&self) -> bool {
+        self.pending_count.load(Ordering::Relaxed) != 0
+            || !self.pending_gone.lock().expect("pending gone poisoned").is_empty()
+    }
+
     pub fn pending_child(&self, name: &[u8]) -> Option<u64> {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return None;
@@ -1081,12 +1092,25 @@ impl Inode {
     /// opened on, so if that file has been unlinked its link count is zero, and
     /// if the number now belongs to something else the numbers no longer match.
     fn still_is(&self, dev: i64, ino: u64) -> bool {
-        let Ok(reference) = self.reference() else {
-            return false;
+        let reference = match self.reference() {
+            Ok(reference) => reference,
+            Err(errno) => {
+                tracing::debug!(id = self.id(), errno, pending = self.is_pending(), dev, ino, "no reference; identity retired");
+                return false;
+            }
         };
         match crate::sys::stat_fd(reference.raw_fd()) {
-            Ok(st) => st.st_nlink > 0 && st.st_ino == ino && st.st_dev as i64 == dev,
-            Err(_) => false,
+            Ok(st) => {
+                let same = st.st_nlink > 0 && st.st_ino == ino && st.st_dev as i64 == dev;
+                if !same {
+                    tracing::debug!(id = self.id(), nlink = st.st_nlink, have_ino = st.st_ino, ino, "numbers moved; identity retired");
+                }
+                same
+            }
+            Err(errno) => {
+                tracing::debug!(id = self.id(), errno, "stat failed; identity retired");
+                false
+            }
         }
     }
 }
@@ -1337,6 +1361,32 @@ impl Registry {
         Some(id)
     }
 
+    /// The inode these numbers name, if it is still the one they name.
+    ///
+    /// For the server's own use, so it counts no lookup. `nodeid_for` would
+    /// answer with whatever the identity map holds, and APFS reuses inode
+    /// numbers briskly: a directory removed and made again under the same
+    /// name got its predecessor's inode object back — one whose promised
+    /// removals were somebody else's — and `rm -rf` of a tree the guest had
+    /// just made was refused ENOTEMPTY, on a host slow enough for the reuse
+    /// to land inside the window.
+    pub fn identified(&self, dev: i64, ino: u64) -> Option<Arc<Inode>> {
+        let id = *self.by_identity[identity_shard(ino)]
+            .read()
+            .expect("identity table poisoned")
+            .get(&(dev, ino))?;
+        let inode = self.by_id[shard(id)]
+            .lock()
+            .expect("inode table poisoned")
+            .get(&id)
+            .cloned()?;
+        if !inode.still_is(dev, ino) {
+            self.retire_identity(id, dev, ino);
+            return None;
+        }
+        Some(inode)
+    }
+
     /// A reply named this nodeid outside the usual paths: count it, so the
     /// kernel's FORGET total and ours agree.
     pub fn count_lookup(&self, id: u64) {
@@ -1538,6 +1588,9 @@ impl Registry {
             let _ = inode.park();
         }
         self.claim_identity(id, dev, ino);
+        // After, not inside: `claim_identity` holds the identity table's
+        // lock, which `forget` needs.
+        self.release_if_unwanted(id);
     }
 
     /// [`Registry::bind_pending`] without a descriptor: see
@@ -1552,6 +1605,25 @@ impl Registry {
     ) {
         inode.bind_parked(dev, ino, birthtime);
         self.claim_identity(id, dev, ino);
+        self.release_if_unwanted(id);
+    }
+
+    /// Drops an inode the guest has forgotten, once it is no longer a
+    /// promise: the other half of `forget`'s exception for pending inodes.
+    pub fn release_if_unwanted(&self, id: u64) {
+        let unwanted = self
+            .by_id[shard(id)]
+            .lock()
+            .expect("inode table poisoned")
+            .get(&id)
+            .is_some_and(|inode| {
+                !inode.is_pending()
+                    && !inode.has_promises()
+                    && *inode.lookups.lock().expect("lookup count poisoned") == 0
+            });
+        if unwanted {
+            self.forget(id, 0);
+        }
     }
 
     fn claim_identity(&self, id: u64, dev: i64, ino: u64) {
@@ -1565,7 +1637,18 @@ impl Registry {
         let mut identity = self.by_identity[identity_shard(ino)]
             .write()
             .expect("identity table poisoned");
-        identity.entry((dev, ino)).or_insert(id);
+        match identity.entry((dev, ino)) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(slot) if *slot.get() != id => {
+                // Two inodes for one file: the guest was told this id, the
+                // server will resolve the other. Loud, because every path
+                // that let it happen was a bug (`Server::entry_from`).
+                tracing::warn!(id, other = *slot.get(), dev, ino, "a pending inode's identity was already claimed");
+            }
+            _ => {}
+        }
         // Enrolled in the sweep's rotation, and the reclaim given its turn,
         // exactly as `insert` does. Every inode born pending — a create, a
         // clone, a directory — skipped both, so a tree made through the
@@ -1594,6 +1677,18 @@ impl Registry {
             *lookups
         };
         if remaining > 0 {
+            return;
+        }
+        // A promise outlives the guest's memory of it. The kernel may drop
+        // a nodeid it was just given — a dentry re-validated and replaced
+        // before its mkdir job has run — and the parent still lists the name
+        // as a pending child under this id. Dropping the inode here made the
+        // next lookup of that name find a promise it could not resolve, fall
+        // through to the host, and answer ENOENT for a directory whose mkdir
+        // had been acknowledged: `mkdir d && touch d/f` failed on an M1 in
+        // four runs of four. The job that binds it releases it if nothing
+        // has looked it up again by then (`release_if_unwanted`).
+        if inode.is_pending() || inode.has_promises() {
             return;
         }
         let identity = (inode.dev(), inode.ino());

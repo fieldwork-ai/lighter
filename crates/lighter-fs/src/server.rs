@@ -221,10 +221,12 @@ fn create_job(
         if inode.is_cancelled() {
             // Replaced before it existed; nothing to make.
             inode.bind_failed(linux::ENOENT);
+            registry.release_if_unwanted(inode.id());
             for _ in &writes {
                 inode.write_applied(Err(linux::ENOENT));
             }
             parent.remove_pending_child(name.to_bytes(), nodeid);
+            registry.release_if_unwanted(parent.id());
             return;
         }
         // A write-only open is made read-write on the host: the guest's
@@ -315,6 +317,7 @@ fn create_job(
                     "an acknowledged create failed to apply"
                 );
                 inode.bind_failed(errno);
+                registry.release_if_unwanted(inode.id());
                 for _ in &writes {
                     inode.write_applied(Err(errno));
                 }
@@ -323,6 +326,7 @@ fn create_job(
         // Settled either way: the host directory answers for this name now
         // — with the file, or honestly without it.
         parent.remove_pending_child(name.to_bytes(), nodeid);
+        registry.release_if_unwanted(parent.id());
     };
     crate::apply::Job::of(crate::apply::Kind::Create, keys, 0, job)
 }
@@ -350,6 +354,7 @@ fn materialize_held(
     let Some(inode) = inode else {
         // Forgotten before it was made: nothing to make.
         parent.remove_pending_child(held.name.to_bytes(), nodeid);
+        registry.release_if_unwanted(parent.id());
         return true;
     };
     let seq = apply.push(create_job(
@@ -445,6 +450,8 @@ pub struct Server {
     /// Read once: `env::var` takes the process environment lock, and a
     /// negative lookup — most of what module resolution does — is hot.
     debug_enoent: bool,
+    /// One name to narrate every step for (`LIGHTER_FS_DEBUG_NAME`).
+    debug_name: Option<Vec<u8>>,
     /// Whether extended attributes are served at all (`LIGHTER_FS_XATTR=0`
     /// disclaims them, see `dispatch`).
     xattrs: bool,
@@ -633,6 +640,7 @@ impl Server {
             copy_max: copy_instead_of_clone_max(),
             debug_listing: std::env::var("LIGHTER_FS_DEBUG_LISTING").as_deref() == Ok("1"),
             debug_enoent: std::env::var("LIGHTER_FS_DEBUG_ENOENT").as_deref() == Ok("1"),
+            debug_name: std::env::var("LIGHTER_FS_DEBUG_NAME").ok().map(|n| n.into_bytes()),
             xattrs: std::env::var("LIGHTER_FS_XATTR").as_deref() != Ok("0"),
             settler_stop,
             settler: std::sync::Mutex::new(Some(settler)),
@@ -708,12 +716,15 @@ impl Server {
             _ => {}
         }
 
-        self.trace(&header);
+        let traced = self.trace_take();
         let started = self.stats.enabled().then(|| {
             self.stats.enter();
             std::time::Instant::now()
         });
         let outcome = self.handle(&header, body, sink.capacity());
+        if traced {
+            self.trace(&header, body, &outcome);
+        }
         if let Err(errno) = &outcome
             && *errno == linux::ESTALE
             && self.stats.enabled()
@@ -851,21 +862,39 @@ impl Server {
     /// file; only the sequence says whether they come before the create, after
     /// the close, or from something else entirely — and that is the difference
     /// between a guest patch that removes them and one that does nothing.
-    fn trace(&self, header: &fuse::InHeader) {
+    fn trace_take(&self) -> bool {
         let left = self.trace_left.load(Ordering::Relaxed);
-        if left == 0 {
-            return;
-        }
-        if self
-            .trace_left
-            .compare_exchange(left, left - 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
+        left != 0
+            && self
+                .trace_left
+                .compare_exchange(left, left - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+
+    fn trace(&self, header: &fuse::InHeader, body: &[u8], outcome: &Result<Vec<u8>, i32>) {
+        // The name, for the operations that carry one, at the offset each
+        // request format keeps it.
+        let name_at = |skip: usize| {
+            body.get(skip..)
+                .and_then(|rest| get_name(rest))
+                .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+                .unwrap_or_default()
+        };
+        let name = match header.opcode {
+            op::LOOKUP | op::UNLINK | op::RMDIR => name_at(0),
+            op::MKDIR | op::SYMLINK | op::RENAME | op::LINK => name_at(8),
+            op::CREATE => name_at(16),
+            _ => String::new(),
+        };
+        let errno = match outcome {
+            Ok(_) => 0,
+            Err(errno) => *errno,
+        };
         tracing::info!(
             op = crate::stats::name(header.opcode),
             nodeid = header.nodeid,
+            name = %name,
+            errno,
             "FSTRACE"
         );
     }
@@ -1342,6 +1371,24 @@ impl Server {
         st: libc::stat,
         mark: u64,
     ) -> Result<EntryOut, i32> {
+        // A name promised to a pending inode is that inode, whatever the host
+        // says. The host can say plenty: an asynchronous mkdir's job has made
+        // the directory before it has claimed the identity, and a listing of
+        // the parent in that window — readdirplus stats every entry — found
+        // the numbers unclaimed and registered a second inode for them. The
+        // guest went on using the first; the server resolved the second; a
+        // removal promised on one was invisible to the other, and `rm -rf`
+        // failed ENOTEMPTY on an M1 in every run.
+        if let Some(nodeid) = parent.pending_child(name.to_bytes())
+            && let Some(inode) = self.registry.get(nodeid)
+        {
+            self.registry.count_lookup(nodeid);
+            return Ok(if inode.is_pending() {
+                self.pending_entry(parent, &inode, nodeid)
+            } else {
+                self.promised_entry(parent, &inode, nodeid)?
+            });
+        }
         let entry = self.entry_with_reference(parent, st, mark, || {
             let is_symlink = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
             // A regular file the guest names into a full share is registered
@@ -1560,6 +1607,17 @@ impl Server {
         // A name promised to a pending create resolves to its pending inode:
         // the host directory does not know it yet, and ENOENT — worse, a
         // cached ENOENT — would be a lie.
+        if self.debug_name.as_deref() == Some(name.to_bytes()) {
+            tracing::warn!(
+                parent = parent.id(),
+                pending_child = ?parent.pending_child(name.to_bytes()),
+                gone = parent.name_pending_gone(name.to_bytes()),
+                parent_pending = parent.is_pending(),
+                host = ?parent.reference().ok().map(|r| sys::stat_at(r.raw_fd(), &name).map(|st| st.st_ino)),
+                queued = self.apply.depth(),
+                "NAME-DEBUG lookup"
+            );
+        }
         if let Some(nodeid) = parent.pending_child(name.to_bytes())
             && let Some(inode) = self.registry.get(nodeid)
         {
@@ -1575,6 +1633,16 @@ impl Server {
         }
         if parent.name_pending_gone(name.to_bytes()) {
             // The host still lists it; the guest was promised it is gone.
+            if self.debug_enoent {
+                tracing::warn!(
+                    parent = parent.id(),
+                    name = %name.to_string_lossy(),
+                    promised = ?parent.pending_children_snapshot().iter().map(|(n, id)| format!("{}#{id}", String::from_utf8_lossy(n))).collect::<Vec<_>>(),
+                    gone = ?parent.pending_gone_snapshot().iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>(),
+                    queued = self.apply.depth(),
+                    "ENOENT-DEBUG lookup of a name promised gone"
+                );
+            }
             return self.missing(&parent);
         }
         if parent.is_pending() {
@@ -2108,6 +2176,10 @@ impl Server {
         self.settle_while(&parent, |parent| parent.is_pending());
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
+        let narrate = self.debug_name.as_deref() == Some(name.to_bytes());
+        if narrate {
+            tracing::warn!(parent = parent.id(), dir, pending_child = ?parent.pending_child(name.to_bytes()), gone = parent.name_pending_gone(name.to_bytes()), queued = self.apply.depth(), accepting = self.apply.accepting(), "NAME-DEBUG unlink arrived");
+        }
         // A promised name has no host file yet, and its create cannot be
         // withdrawn: the guest may hold it open, and an unlinked file keeps
         // its bytes for whoever does — the server never learns about opens,
@@ -2115,16 +2187,16 @@ impl Server {
         self.settle_while(&parent, |parent| {
             parent.pending_child(name.to_bytes()).is_some()
         });
+        if narrate {
+            tracing::warn!(parent = parent.id(), host = ?parent.reference().ok().map(|r| sys::stat_at(r.raw_fd(), &name).map(|st| st.st_ino)), queued = self.apply.depth(), accepting = self.apply.accepting(), "NAME-DEBUG unlink settled");
+        }
         if dir && parent.name_pending_gone(name.to_bytes()) {
             return Err(linux::ENOENT);
         }
         if dir
             && self.apply.accepting()
             && let Ok(st) = sys::stat_at(parent.reference()?.raw_fd(), &name)
-            && let Some(child) = self
-                .registry
-                .nodeid_for(st.st_dev as i64, st.st_ino)
-                .and_then(|id| self.registry.get(id))
+            && let Some(child) = self.registry.identified(st.st_dev as i64, st.st_ino)
         {
             // RMDIR, acknowledged: the guest removes a directory it has
             // emptied, and its unlinks are queued ahead of this by the
@@ -2134,8 +2206,17 @@ impl Server {
             // that no queued unlink accounts for is ENOTEMPTY now, not a
             // removal that quietly comes back — and the check is one
             // listing, against the four hundred microseconds the wait was.
-            if child.pending_children_snapshot().is_empty() {
-                let gone = child.pending_gone_snapshot();
+            // A child whose create is still queued but whose removal is
+            // queued after it is not an occupant: the two land in order and
+            // the directory is empty by the time the rmdir runs. Counting it
+            // refused `rm -rf` of a tree a slow host had not finished making
+            // — reproduced on an M1 in two runs of three.
+            let gone = child.pending_gone_snapshot();
+            let occupied = child
+                .pending_children_snapshot()
+                .iter()
+                .any(|(name, _)| !gone.contains(name));
+            if !occupied {
                 if child.is_pending() {
                     // Nothing on the host yet; nothing promised inside.
                 } else if let Ok(listing) = self.list(child.id())
@@ -2151,8 +2232,7 @@ impl Server {
                         &CString::new(entry.name.clone()).map_err(|_| linux::EINVAL)?,
                     )
                     .ok()
-                    .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
-                    .and_then(|id| self.registry.get(id).map(|i| (id, i)));
+                    .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino).map(|i| (i.id(), i)));
                     tracing::warn!(
                         dir = %name.to_string_lossy(),
                         entry = %String::from_utf8_lossy(&entry.name),
@@ -2163,6 +2243,7 @@ impl Server {
                         entry_promised_inside = known.as_ref().map(|(_, i)| i.pending_children_snapshot().len()).unwrap_or(0),
                         promised_gone = ?gone.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>(),
                         listed = listing.len(),
+                        child = child.id(),
                         queued = self.apply.depth(),
                         held = self.deferred.map.lock().expect("held creates poisoned").len(),
                         "rmdir refused: an entry no queued removal accounts for"
@@ -2170,10 +2251,32 @@ impl Server {
                     return Err(linux::ENOTEMPTY);
                 }
             } else {
+                let promised = child.pending_children_snapshot();
+                tracing::warn!(
+                    dir = %name.to_string_lossy(),
+                    promised = ?promised
+                        .iter()
+                        .map(|(n, id)| {
+                            let state = self.registry.get(*id).map(|i| {
+                                format!(
+                                    "{}{}{}",
+                                    if i.is_pending() { "pending" } else { "bound" },
+                                    if i.is_cancelled() { ",cancelled" } else { "" },
+                                    if i.is_dir { ",dir" } else { "" }
+                                )
+                            });
+                            format!("{}#{id}:{}", String::from_utf8_lossy(n), state.unwrap_or_else(|| "forgotten".into()))
+                        })
+                        .collect::<Vec<_>>(),
+                    promised_gone = ?gone.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>(),
+                    queued = self.apply.depth(),
+                    "rmdir refused: a promised child no queued removal accounts for"
+                );
                 return Err(linux::ENOTEMPTY);
             }
             parent.add_pending_gone(name.to_bytes());
             let job = {
+                let registry = self.registry.clone();
                 let parent = parent.clone();
                 let name = name.clone();
                 move || {
@@ -2187,6 +2290,7 @@ impl Server {
                         );
                     }
                     parent.remove_pending_gone(name.to_bytes());
+                    registry.release_if_unwanted(parent.id());
                 }
             };
             let seq = self.apply.push(crate::apply::Job::of(
@@ -2222,12 +2326,15 @@ impl Server {
             // nothing left it was allowed to park.
             let target_out = sys::stat_at(parent.reference()?.raw_fd(), &name)
                 .ok()
-                .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
-                .and_then(|id| self.registry.get(id));
+                .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino));
             if let Some(target) = &target_out {
                 target.shadow_meta();
             }
+            if narrate {
+                tracing::warn!(parent = parent.id(), target = ?target_out.as_ref().map(|t| t.id()), "NAME-DEBUG unlink queued async, gone marked");
+            }
             let job = {
+                let registry = self.registry.clone();
                 let parent = parent.clone();
                 let name = name.clone();
                 let target = target_out.clone();
@@ -2242,6 +2349,7 @@ impl Server {
                         );
                     }
                     parent.remove_pending_gone(name.to_bytes());
+                    registry.release_if_unwanted(parent.id());
                     if let Some(target) = &target {
                         target.unshadow_meta();
                     }
@@ -2271,7 +2379,43 @@ impl Server {
             // queued lands first; this path is rare enough to afford it.
             self.apply.drain();
         }
-        sys::unlink_at(parent.reference()?.raw_fd(), &name, dir)?;
+        if narrate {
+            tracing::warn!(parent = parent.id(), dir, "NAME-DEBUG unlink taking the synchronous path");
+        }
+        let result = sys::unlink_at(parent.reference()?.raw_fd(), &name, dir);
+        if dir && result == Err(linux::ENOTEMPTY) && self.stats.enabled() {
+            // What the host still holds, and what this server knows of each
+            // name: the diagnostic for an `rm -rf` the guest believed had
+            // emptied the directory.
+            let left: Vec<String> = sys::openat_path(parent.reference()?.raw_fd(), &name, 0o200000, 0)
+                .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|e| e.name != b"." && e.name != b"..")
+                        .take(12)
+                        .map(|e| {
+                            let known = self.registry.identified(parent.dev(), e.ino);
+                            format!(
+                                "{}:{}",
+                                String::from_utf8_lossy(&e.name),
+                                known
+                                    .map(|i| format!("known#{}{}", i.id(), if i.is_pending() { ",pending" } else { "" }))
+                                    .unwrap_or_else(|| "unknown".into())
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            tracing::warn!(
+                dir = %name.to_string_lossy(),
+                left = ?left,
+                queued = self.apply.depth(),
+                held = self.deferred.map.lock().expect("held creates poisoned").len(),
+                "rmdir failed on the host after a drain: entries the guest never removed"
+            );
+        }
+        result?;
         Ok(Vec::new())
     }
 
@@ -2320,6 +2464,7 @@ impl Server {
                 };
                 if retargeted {
                     old_parent.remove_pending_child(old.to_bytes(), nodeid);
+                    self.registry.release_if_unwanted(old_parent.id());
                     new_parent.add_pending_child(new.to_bytes(), nodeid);
                     if let Some(inode) = self.registry.get(nodeid) {
                         inode.set_place(new_parent, new);
@@ -2337,8 +2482,8 @@ impl Server {
                 if st.st_mode & 0o170000 != 0o100000 {
                     return Ok(None);
                 }
-                match self.registry.nodeid_for(st.st_dev as i64, st.st_ino) {
-                    Some(nodeid) => nodeid,
+                match self.registry.identified(st.st_dev as i64, st.st_ino) {
+                    Some(inode) => inode.id(),
                     None => return Ok(None),
                 }
             }
@@ -2360,8 +2505,7 @@ impl Server {
         } else {
             sys::stat_at(new_parent.reference()?.raw_fd(), new)
                 .ok()
-                .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
-                .and_then(|id| self.registry.get(id))
+                .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
         };
         if let Some(displaced) = &displaced {
             if displaced.is_dir {
@@ -2376,9 +2520,11 @@ impl Server {
         // shows the file twice — and a rename chain leaves every step of
         // it behind until the queue catches up.
         old_parent.remove_pending_child(old.to_bytes(), nodeid);
+        self.registry.release_if_unwanted(old_parent.id());
         old_parent.add_pending_gone(old.to_bytes());
         new_parent.add_pending_child(new.to_bytes(), nodeid);
         let job = {
+            let registry = self.registry.clone();
             let old_parent = old_parent.clone();
             let new_parent = new_parent.clone();
             let old = old.clone();
@@ -2402,7 +2548,9 @@ impl Server {
                     );
                 }
                 old_parent.remove_pending_gone(old.to_bytes());
+                registry.release_if_unwanted(old_parent.id());
                 new_parent.remove_pending_child(new.to_bytes(), nodeid);
+                registry.release_if_unwanted(new_parent.id());
                 if let Some(displaced) = &displaced {
                     displaced.unshadow_meta();
                 }
@@ -2522,7 +2670,12 @@ impl Server {
         if !parent.is_pending() && !parent.name_pending_gone(name.to_bytes()) {
             match sys::stat_at(parent.reference()?.raw_fd(), name) {
                 Err(errno) if errno == linux::ENOENT => {}
-                _ => return Ok(None),
+                other => {
+                    if self.debug_name.as_deref() == Some(name.to_bytes()) {
+                        tracing::warn!(parent = parent.id(), host = ?other.map(|st| st.st_ino), "NAME-DEBUG mkdir declined the async path: the host has the name");
+                    }
+                    return Ok(None);
+                }
             }
         }
         let now = std::time::SystemTime::now()
@@ -2543,12 +2696,16 @@ impl Server {
             inode.write_acked(target.as_bytes().len() as u64);
         }
         parent.add_pending_child(name.to_bytes(), nodeid);
+        if self.debug_name.as_deref() == Some(name.to_bytes()) {
+            tracing::warn!(parent = parent.id(), nodeid, queued = self.apply.depth(), "NAME-DEBUG mkdir acknowledged, pending child added");
+        }
         // The reply before the push: the promise is complete now, and a
         // job that runs before the reply is built would have bound the
         // inode out from under it. The pending inode was born with the one
         // lookup this reply is.
         let reply = self.entry_reply(&self.pending_entry(parent, &inode, nodeid));
         let job = {
+            let debug = self.debug_name.as_deref() == Some(name.to_bytes());
             let registry = self.registry.clone();
             let parent = parent.clone();
             let inode = inode.clone();
@@ -2570,6 +2727,9 @@ impl Server {
                 })();
                 match result {
                     Ok((fd, st)) => {
+                        if debug {
+                            tracing::warn!(nodeid, ino = st.st_ino, "NAME-DEBUG mkdir job applied, binding");
+                        }
                         registry.bind_pending(nodeid, &inode, fd, st.st_dev as i64, st.st_ino);
                     }
                     Err(errno) => {
@@ -2579,12 +2739,14 @@ impl Server {
                             "an acknowledged mkdir or symlink failed to apply"
                         );
                         inode.bind_failed(errno);
+                        registry.release_if_unwanted(inode.id());
                     }
                 }
                 if target.is_some() {
                     inode.write_applied(Ok(()));
                 }
                 parent.remove_pending_child(name.to_bytes(), nodeid);
+                registry.release_if_unwanted(parent.id());
             }
         };
         let seq = self.apply.push(crate::apply::Job::of(
@@ -2638,6 +2800,7 @@ impl Server {
         target.link_acked();
         parent.add_pending_child(name.to_bytes(), nodeid);
         let job = {
+            let registry = self.registry.clone();
             let parent = parent.clone();
             let target = target.clone();
             let name = name.clone();
@@ -2665,6 +2828,7 @@ impl Server {
                 }
                 target.link_applied();
                 parent.remove_pending_child(name.to_bytes(), nodeid);
+                registry.release_if_unwanted(parent.id());
             }
         };
         let seq = self.apply.push(crate::apply::Job::of(
@@ -2856,8 +3020,7 @@ impl Server {
         } else {
             sys::stat_at(parent.reference()?.raw_fd(), &name)
                 .ok()
-                .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
-                .and_then(|id| self.registry.get(id))
+                .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
         };
         let (nodeid, dest) =
             self.registry
@@ -2873,7 +3036,9 @@ impl Server {
             // cancelled, and skips itself if it has not run.
             if old.is_pending() && self.withdraw(old.id()) {
                 old.bind_failed(linux::ENOENT);
+                self.registry.release_if_unwanted(old.id());
                 parent.remove_pending_child(name.to_bytes(), old.id());
+                self.registry.release_if_unwanted(parent.id());
             }
             old.cancel_pending();
             old.forward_to(nodeid);
@@ -3005,10 +3170,12 @@ impl Server {
                             "an acknowledged clone failed to apply"
                         );
                         dest.bind_failed(errno);
+                        registry.release_if_unwanted(dest.id());
                     }
                 }
                 dest.write_applied(Ok(()));
                 parent.remove_pending_child(name.to_bytes(), nodeid);
+                registry.release_if_unwanted(parent.id());
             }
         };
         let seq = self.apply.push(crate::apply::Job::of(

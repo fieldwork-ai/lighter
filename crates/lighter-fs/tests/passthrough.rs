@@ -1595,3 +1595,150 @@ fn a_parked_file_is_reached_through_its_parent() {
     unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
 }
 
+
+/// `rm -rf` of a directory the guest has just filled: every create is still
+/// queued when the removals arrive, and the removals are queued behind them.
+/// The rmdir must not count a child whose removal is already promised.
+#[test]
+fn a_directory_emptied_before_its_creates_landed_can_be_removed() {
+    let mut guest = Guest::new("rmdir-race");
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("dir"));
+    guest.call(op::MKDIR, 1, &body).unwrap();
+    let dir = guest.lookup(1, "dir").unwrap();
+    for round in 0..20 {
+        let mut names = Vec::new();
+        for n in 0..50 {
+            let name = format!("f{round}-{n}");
+            let (nodeid, fh) = guest.create(dir, &name, 0x8241).unwrap();
+            guest.write(nodeid, fh, 0, b"x").unwrap();
+            names.push(name);
+        }
+        for name in &names {
+            guest.call(op::UNLINK, dir, &name_body(name)).unwrap();
+        }
+        assert_eq!(guest.call(op::RMDIR, 1, &name_body("dir")), Ok(Vec::new()), "round {round}");
+        guest.call(op::MKDIR, 1, &body).unwrap();
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert!(guest.host("dir").is_dir());
+    assert_eq!(std::fs::read_dir(guest.host("dir")).unwrap().count(), 0);
+}
+
+/// `rm -rf dir && mkdir dir && touch dir/f`, as fast as a shell can issue
+/// it. The rmdir is a queued promise that the name is gone; the mkdir that
+/// follows is a promise that it is back, and must win every lookup from the
+/// moment it is acknowledged — including after its own job has landed and
+/// the rmdir's gone-mark has not yet been withdrawn.
+#[test]
+fn a_directory_removed_and_remade_is_found_at_once() {
+    let mut guest = Guest::new("remade");
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("dir"));
+    for round in 0..200 {
+        guest.call(op::MKDIR, 1, &body).unwrap();
+        let dir = guest.lookup(1, "dir").unwrap_or_else(|e| panic!("round {round}: lookup after mkdir failed with {e}"));
+        let (nodeid, fh) = guest.create(dir, "f", 0x8241).unwrap_or_else(|e| panic!("round {round}: create failed with {e}"));
+        guest.write(nodeid, fh, 0, b"x").unwrap();
+        guest.call(op::UNLINK, dir, &name_body("f")).unwrap();
+        assert_eq!(guest.call(op::RMDIR, 1, &name_body("dir")), Ok(Vec::new()), "round {round}");
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert!(!guest.host("dir").exists());
+}
+
+/// The guest forgets a nodeid it was just given for a directory whose mkdir
+/// is still queued, then looks the name up again and creates under it. The
+/// promise must survive the forget: the parent still lists the name, and a
+/// lookup that found the promise but not its inode fell through to a host
+/// that did not have the directory yet.
+#[test]
+fn a_promised_directory_survives_being_forgotten() {
+    let mut guest = Guest::new("forgotten-promise");
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("dir"));
+    let reply = guest.call(op::MKDIR, 1, &body).unwrap();
+    let nodeid = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    // FORGET carries the lookup count to give back.
+    guest.call(op::FORGET, nodeid, &1u64.to_le_bytes());
+    let again = guest.lookup(1, "dir").expect("the directory is promised, forgotten or not");
+    let (file, fh) = guest.create(again, "f", 0x8241).expect("a create under the promise");
+    guest.write(file, fh, 0, b"x").unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert_eq!(std::fs::read(guest.host("dir/f")).unwrap(), b"x");
+}
+
+/// A directory made asynchronously, and the parent listed with READDIRPLUS
+/// straight after: the listing stats every entry and must hand back the
+/// nodeid the mkdir reply named, never a second inode for the same host
+/// directory. Two inodes for one directory meant a removal promised on one
+/// was invisible to the other.
+#[test]
+fn a_listing_names_a_promised_directory_by_its_own_nodeid() {
+    let mut guest = Guest::new("one-identity");
+    for round in 0..100 {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let name = format!("d{round}");
+        body.extend_from_slice(&name_body(&name));
+        let reply = guest.call(op::MKDIR, 1, &body).unwrap();
+        let promised = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+        // READDIRPLUS resolves each entry; read the nodeid it carries.
+        let fh = guest.opendir(1).unwrap();
+        let mut req = Vec::new();
+        req.extend_from_slice(&fh.to_le_bytes());
+        req.extend_from_slice(&0u64.to_le_bytes());
+        req.extend_from_slice(&65536u32.to_le_bytes());
+        req.resize(40, 0);
+        let out = guest.call(op::READDIRPLUS, 1, &req).unwrap();
+        let mut cursor = 0;
+        let mut seen = None;
+        while cursor < out.len() {
+            let nodeid = u64::from_le_bytes(out[cursor..cursor + 8].try_into().unwrap());
+            let dirent = cursor + fuse::ENTRY_OUT_LEN;
+            let namelen = u32::from_le_bytes(out[dirent + 16..dirent + 20].try_into().unwrap()) as usize;
+            let entry_name = &out[dirent + fuse::DIRENT_HEADER_LEN..dirent + fuse::DIRENT_HEADER_LEN + namelen];
+            if entry_name == name.as_bytes() {
+                seen = Some(nodeid);
+            }
+            cursor = dirent + fuse::dirent_len(namelen);
+        }
+        assert_eq!(seen, Some(promised), "round {round}: the listing named a different inode for {name}");
+        assert_eq!(guest.lookup(1, &name).unwrap(), promised, "round {round}");
+    }
+}
+
+/// A directory whose names are still promises is forgotten by the guest —
+/// a host change withdrew its entry — and looked up again a moment later.
+/// It must come back as the same inode: the promises (a queued create, a
+/// queued removal) live on it, and a second inode for the same directory
+/// would refuse the rmdir that follows for children it never heard of.
+#[test]
+fn a_forgotten_directory_with_promises_is_found_again_as_itself() {
+    let mut guest = Guest::new("promises-outlive-forget");
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("dir"));
+    for round in 0..50 {
+        let reply = guest.call(op::MKDIR, 1, &body).unwrap();
+        let dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+        let mut lookups = 1u64;
+        for n in 0..20 {
+            let (file, fh) = guest.create(dir, &format!("f{n}"), 0x8241).unwrap();
+            guest.write(file, fh, 0, b"x").unwrap();
+            guest.call(op::UNLINK, dir, &name_body(&format!("f{n}"))).unwrap();
+        }
+        // The guest drops the directory entirely, promises and all.
+        guest.call(op::FORGET, dir, &lookups.to_le_bytes());
+        let again = guest.lookup(1, "dir").unwrap();
+        assert_eq!(again, dir, "round {round}: the directory came back as a different inode");
+        lookups = 1;
+        assert_eq!(guest.call(op::RMDIR, 1, &name_body("dir")), Ok(Vec::new()), "round {round}");
+        guest.call(op::FORGET, again, &lookups.to_le_bytes());
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert!(!guest.host("dir").exists());
+}
