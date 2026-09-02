@@ -140,6 +140,12 @@ pub mod init2 {
     /// would change nothing — same mode, same owner, same size — from the
     /// attributes it still trusts, without a request. Overall bit 58.
     pub const LIGHTER_NOOP_SETATTR: u32 = 1 << 26;
+    /// Ours, matched by guest patch 0008: a positive dentry within its
+    /// lifetime is trusted for an exclusive create, a mkdir and a rename
+    /// target, because this server withdraws entries it learns have
+    /// changed. Overall bit 57. Offered only with the notification channel
+    /// live, since that is the whole basis for it.
+    pub const LIGHTER_TRUST_DENTRIES: u32 = 1 << 25;
 }
 
 /// `fuse_open_out.open_flags`.

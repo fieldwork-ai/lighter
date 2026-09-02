@@ -1036,11 +1036,20 @@ impl Server {
         } else {
             0
         };
+        // Dentries are trusted for O_EXCL and rename targets only when the
+        // guest can be told to forget one; a polled share keeps the kernel's
+        // own caution.
+        let trust = if self.policy.timings().caching() {
+            fuse::init2::LIGHTER_TRUST_DENTRIES
+        } else {
+            0
+        };
         let flags2 = if flags & fuse::init::INIT_EXT != 0 {
             (fuse::init2::LIGHTER_CREATE
                 | clone
                 | no_security
-                | fuse::init2::LIGHTER_NOOP_SETATTR)
+                | fuse::init2::LIGHTER_NOOP_SETATTR
+                | trust)
                 & offered2
         } else {
             0
