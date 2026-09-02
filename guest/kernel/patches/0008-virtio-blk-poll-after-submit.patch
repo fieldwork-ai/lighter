@@ -29,7 +29,7 @@ diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
 index f061420df..e4874a6dc 100644
 --- a/drivers/block/virtio_blk.c
 +++ b/drivers/block/virtio_blk.c
-@@ -41,6 +41,11 @@ static unsigned int poll_queues;
+@@ -41,6 +41,16 @@ static unsigned int poll_queues;
  module_param(poll_queues, uint, 0644);
  MODULE_PARM_DESC(poll_queues, "The number of dedicated virtqueues for polling I/O");
  
@@ -37,6 +37,11 @@ index f061420df..e4874a6dc 100644
 +module_param(poll_usecs, uint, 0644);
 +MODULE_PARM_DESC(poll_usecs, "After submitting, spin this long for the device to complete "
 +		 "the request before relying on its interrupt (0 disables)");
++
++static bool poll_async = true;
++module_param(poll_async, bool, 0644);
++MODULE_PARM_DESC(poll_async, "Spin for asynchronous requests (writeback) too, not only "
++		 "synchronous ones");
 +
  static int major;
  static DEFINE_IDA(vd_index_ida);
@@ -71,7 +76,7 @@ index f061420df..e4874a6dc 100644
 +	 * every time for nothing — a third of a CPU under a tree copy. For
 +	 * those, one look re-arms callbacks and takes whatever is already done.
 +	 */
-+	end = ktime_add_us(ktime_get(), sync ? poll_usecs : 0);
++	end = ktime_add_us(ktime_get(), (sync || poll_async) ? poll_usecs : 0);
 +
 +	spin_lock_irqsave(&vq->lock, flags);
 +	do {
