@@ -127,7 +127,17 @@ if [ -b "$DATA_DEV" ]; then
 		fstrim /mnt/data >/dev/null 2>&1
 		T1=$(cut -d' ' -f1 /proc/uptime)
 		echo "INIT fstrim=$(echo "$T1 $T0" | awk '{printf "%dms", ($1-$2)*1000}')"
-		(while sleep 300; do fstrim /mnt/data >/dev/null 2>&1; done) &
+		# `lighter.fstrim_period=` (seconds; 0 disables the loop) is for
+		# measuring the loop's cost against a run.
+		FSTRIM_PERIOD=300
+		for arg in $(cat /proc/cmdline); do
+			case "$arg" in
+			lighter.fstrim_period=*) FSTRIM_PERIOD="${arg#lighter.fstrim_period=}" ;;
+			esac
+		done
+		if [ "$FSTRIM_PERIOD" -gt 0 ]; then
+			(while sleep "$FSTRIM_PERIOD"; do fstrim /mnt/data >/dev/null 2>&1; done) &
+		fi
 	else
 		echo "INIT data=mount-failed"
 	fi
