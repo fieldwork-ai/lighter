@@ -61,4 +61,30 @@ for (let rep = 0; rep < reps; rep++) {
   }
   const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
   console.log(`TIME_MS ${Math.round(elapsed)}`);
+  // What the children spent, not just how long they took: the same install
+  // on two runtimes with equal CPU time but different wall time was waiting,
+  // and with different CPU time was running slower. Linux only — the fields
+  // are /proc's, and only the guest targets have a kernel worth asking.
+  const cpu = childCpuMs();
+  if (cpu) console.log(`CPU_MS user=${cpu.user} sys=${cpu.sys}`);
+}
+
+function childCpuMs() {
+  let stat;
+  try {
+    stat = fs.readFileSync("/proc/self/stat", "utf8");
+  } catch {
+    return null;
+  }
+  // Fields after the parenthesised command name; cutime and cstime are the
+  // 16th and 17th of the whole line, in clock ticks (100 Hz on every
+  // architecture that matters here).
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  const cutime = Number(fields[13]);
+  const cstime = Number(fields[14]);
+  const user = cutime * 10 - (childCpuMs.user || 0);
+  const sys = cstime * 10 - (childCpuMs.sys || 0);
+  childCpuMs.user = cutime * 10;
+  childCpuMs.sys = cstime * 10;
+  return { user, sys };
 }

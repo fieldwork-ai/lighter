@@ -521,6 +521,10 @@ for name in $CASES; do
 		# says so.
 		echo "$name,$rep,$ms" >> "$RESULTS"
 	done < <(sed -n 's/^TIME_MS //p' "$CASE_OUT" | sed 's/^TIMEOUT .*/timeout/')
+	# The children's CPU time beside their wall time, where the runner can
+	# report it. Not a column: a diagnostic for reading a gap, not a result.
+	cpu="$(sed -n 's/^CPU_MS //p' "$CASE_OUT" | tr '\n' ' ')"
+	[ -z "$cpu" ] || printf '  (cpu ms: %s)' "${cpu% }"
 	if [ "$rep" -eq 0 ]; then
 		printf ' no measurement:'
 		printf '\n'
