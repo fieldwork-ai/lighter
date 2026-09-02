@@ -1448,6 +1448,18 @@ impl Registry {
             .write()
             .expect("identity table poisoned");
         identity.entry((dev, ino)).or_insert(id);
+        // Enrolled in the sweep's rotation, and the reclaim given its turn,
+        // exactly as `insert` does. Every inode born pending — a create, a
+        // clone, a directory — skipped both, so a tree made through the
+        // queue was invisible to the sweep: it examined its few thousand
+        // enrolled inodes, parked nothing, and the share sat over budget
+        // with every directory revived by path on every operation. The
+        // removal of a tree after a copy ran at a third of its speed.
+        self.hands[shard(id)]
+            .lock()
+            .expect("reclaim hand poisoned")
+            .push_back(id);
+        self.reclaim_if_over_budget();
     }
 
     pub fn forget(&self, id: u64, count: u64) {
