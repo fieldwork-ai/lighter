@@ -164,9 +164,20 @@ fn copy_instead_of_clone_max() -> u64 {
         .unwrap_or(256 << 10)
 }
 
+/// How many creates may be held at once. Past this the oldest are queued,
+/// and queuing is where the window's backpressure lives: a held create
+/// occupies no slot, so without a cap a `cp -a` of sixty thousand files
+/// returned in three seconds with six seconds of creates still to come —
+/// paid by whatever ran next, and a visibility window of seconds rather
+/// than milliseconds. pnpm holds each store file for about a millisecond
+/// across four threads; a few hundred is room to spare.
+const HELD_MAX: usize = 256;
+
 #[derive(Default)]
 struct Holding {
     map: std::sync::Mutex<std::collections::HashMap<u64, Held>>,
+    /// Held nodeids, oldest first: what the cap and the settler walk.
+    order: std::sync::Mutex<std::collections::VecDeque<u64>>,
     bytes: AtomicUsize,
 }
 
@@ -361,15 +372,28 @@ fn materialize_stale(
     open_cache: &Arc<OpenCache>,
     park_creates: bool,
 ) {
-    let stale: Vec<u64> = holding
-        .map
-        .lock()
-        .expect("held creates poisoned")
-        .iter()
-        .filter(|(_, held)| held.since.elapsed() > HOLD_GRACE)
-        .map(|(nodeid, _)| *nodeid)
-        .collect();
-    for nodeid in stale {
+    loop {
+        let oldest = {
+            let map = holding.map.lock().expect("held creates poisoned");
+            let mut order = holding.order.lock().expect("held order poisoned");
+            // Entries already queued or withdrawn have left the map; they
+            // are dropped from the front as they are met.
+            while let Some(&front) = order.front()
+                && !map.contains_key(&front)
+            {
+                order.pop_front();
+            }
+            match order.front() {
+                Some(&front) if map[&front].since.elapsed() > HOLD_GRACE => {
+                    order.pop_front();
+                    Some(front)
+                }
+                _ => None,
+            }
+        };
+        let Some(nodeid) = oldest else {
+            break;
+        };
         materialize_held(holding, apply, registry, open_cache, park_creates, nodeid);
     }
 }
@@ -2869,6 +2893,29 @@ impl Server {
                 .lock()
                 .expect("held creates poisoned")
                 .insert(nodeid, held);
+            let over = {
+                let mut order = self.deferred.order.lock().expect("held order poisoned");
+                order.push_back(nodeid);
+                order.len().saturating_sub(HELD_MAX)
+            };
+            // The oldest past the cap are queued now, on this thread, which
+            // is where the window's backpressure reaches the guest.
+            for _ in 0..over {
+                let oldest = {
+                    let map = self.deferred.map.lock().expect("held creates poisoned");
+                    let mut order = self.deferred.order.lock().expect("held order poisoned");
+                    while let Some(&front) = order.front()
+                        && !map.contains_key(&front)
+                    {
+                        order.pop_front();
+                    }
+                    order.pop_front()
+                };
+                match oldest {
+                    Some(old) if old != nodeid => self.materialize_why(old, 9),
+                    _ => break,
+                }
+            }
         } else {
             let seq = self.apply.push(create_job(
                 self.registry.clone(),
