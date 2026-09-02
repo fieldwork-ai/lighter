@@ -1,0 +1,101 @@
+btrfs: no preemptive metadata reclaim, and lend half the free device to a reservation
+
+Preemptive reclaim flushes delayed allocation before any metadata shortage,
+so that no reservation has to wait for a flush. Its trigger is the size of
+the reservations dirty data holds, and a package tree of 75,000 small files
+holds a reservation per file while it is being copied — well over the 128 MB
+that arms it, on a filesystem with tens of gigabytes unallocated. Every copy
+of such a tree was written back while it was still being written, one bio
+per file, with the flush's workers waking each other across every idle CPU:
+2.9 s of system time for a 1 GB copy that costs 1.4 s with the writeback
+left to the dirty flusher, and a copy OrbStack's guest finishes in 1.1 s.
+
+`btrfs.preemptive_reclaim` (default off) is the switch. The on-demand
+reclaim that runs when a reservation actually fails is untouched, so nothing
+waits longer for space than it would have; it only stops being flushed early.
+
+`btrfs.overcommit_shift` (default 1, half the unallocated device; upstream's
+3 is an eighth) is how much a flushing reservation may borrow against. The
+same tree of small files that arms preemptive reclaim also outruns that
+eighth, and each reservation past it is a ticket, a flush of the data being
+written, and the writer blocked behind it.
+
+Measured on the 1 GB tree copy in a live guest, 64 GiB disk: reclaim on,
+1.9–2.3 s and 2.9 s of system time; reclaim off, 1.9 s and 2.4; with half
+the device lent as well, 1.5–1.7 s and the flush coalesces from 47,000
+writes to 8,600. With the guest at 16 GB, the size OrbStack's is on that
+machine, 1.1–1.2 s — theirs is 1.05–1.3.
+
+--- a/fs/btrfs/space-info.c
++++ b/fs/btrfs/space-info.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <linux/spinlock.h>
++#include <linux/moduleparam.h>
+ #include <linux/minmax.h>
+ #include "misc.h"
+ #include "ctree.h"
+@@ -207,6 +208,11 @@
+ /*
+  * Calculate chunk size depending on volume type (regular or zoned).
+  */
++static unsigned int overcommit_shift = 1;
++module_param(overcommit_shift, uint, 0644);
++MODULE_PARM_DESC(overcommit_shift,
++		 "Lend 1/2^n of the unallocated device to a flushing metadata reservation (default 1; upstream 3)");
++
+ static u64 calc_chunk_size(const struct btrfs_fs_info *fs_info, u64 flags)
+ {
+ 	if (btrfs_is_zoned(fs_info))
+@@ -475,8 +481,17 @@
+ 	 * 1/2th of the space. If we can flush, don't let us overcommit
+ 	 * too much, let it overcommit up to 1/8 of the space.
+ 	 */
++	/*
++	 * How much of the unallocated device a reservation may borrow against.
++	 * Upstream lends an eighth to a flushing reservation and half to one
++	 * that cannot flush; a tree of small files holds a worst-case
++	 * reservation per file while it is being written, so 75,000 files ask
++	 * for 19 GB and an eighth of a 60 GB device is 7 — every one past
++	 * that is a ticket, a flush of the data being written, and the writer
++	 * blocked behind it. `btrfs.overcommit_shift` is measured, not chosen.
++	 */
+ 	if (flush == BTRFS_RESERVE_FLUSH_ALL)
+-		avail >>= 3;
++		avail >>= overcommit_shift;
+ 	else
+ 		avail >>= 1;
+ 
+@@ -928,6 +943,21 @@
+ 	return to_reclaim;
+ }
+ 
++/*
++ * Preemptive reclaim flushes delayed allocation ahead of any shortage, so
++ * that a reservation never has to wait for a flush. Its trigger is the
++ * amount of metadata reserved by dirty data, and a tree of small files
++ * reserves gigabytes while it is being written — so on a filesystem with
++ * most of its device unallocated, it still flushes the whole tree while the
++ * copy is in progress, one bio per file, and its workers wake each other
++ * across every idle CPU. The reservations were never going to fail. The
++ * on-demand reclaim, which runs when one actually does, is untouched.
++ */
++static bool preemptive_reclaim;
++module_param(preemptive_reclaim, bool, 0644);
++MODULE_PARM_DESC(preemptive_reclaim,
++		 "Flush delayed allocation ahead of a metadata shortage (default off; upstream on)");
++
+ static bool need_preemptive_reclaim(struct btrfs_fs_info *fs_info,
+ 				    const struct btrfs_space_info *space_info)
+ {
+@@ -936,6 +966,9 @@
+ 	u64 thresh;
+ 	u64 used;
+ 
++	if (!preemptive_reclaim)
++		return false;
++
+ 	thresh = mult_perc(space_info->total_bytes, 90);
+ 
+ 	lockdep_assert_held(&space_info->lock);
