@@ -226,7 +226,6 @@ impl Machine {
         let mut net_slot = None;
         let net_inbox = Net::new_inbox();
 
-        let mut block_slots = Vec::with_capacity(config.disks.len());
         for path in &config.disks {
             let disk = Arc::new(Disk::open_or_create(path, config.disk_size_bytes, false)?);
             tracing::info!(
@@ -236,7 +235,6 @@ impl Machine {
                 "attached disk"
             );
             disks.push(disk.clone());
-            block_slots.push(virtio.len());
             virtio.push(Box::new(Block::new(disk)));
         }
         if let Some(network) = &network {
@@ -351,33 +349,6 @@ impl Machine {
                     .expect("fs transport poisoned")
                     .service_queue(virtio::fs::notify_queue());
             }));
-        }
-
-        // A disk is served on whichever thread takes its request off the ring,
-        // and under load that must not be a vCPU: a package manager's writers
-        // on four cores kicking one queue convoy on the transport lock behind
-        // the vCPU inside doing the `pwritev`. The same watcher the shares use
-        // drains the ring from a host thread and suppresses the doorbell while
-        // it does, so the guest neither traps nor waits.
-        for slot in block_slots {
-            let transport = virtio_devices[slot].clone();
-            let kicks = virtio::poll::Kicks::new();
-            {
-                let mut held = transport.lock().expect("block transport poisoned");
-                let signal = kicks.clone();
-                held.set_kick_observer(Arc::new(move |queue| {
-                    if queue == 0 {
-                        signal.kicked();
-                    }
-                }));
-            }
-            let poller = virtio::poll::spawn(
-                &format!("blk{slot}"),
-                transport.clone(),
-                vec![0],
-                kicks.clone(),
-            )?;
-            pollers.push((kicks, poller));
         }
 
         // The pump that moves frames off the network and into the guest. It runs
