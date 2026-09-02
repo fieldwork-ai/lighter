@@ -1676,6 +1676,12 @@ impl Registry {
 
     /// How many metadata descriptors are open, and the ceiling. Diagnostics
     /// only.
+    /// Whether a new descriptor would be over the budget — and so parked
+    /// the moment it was bound.
+    pub fn at_budget(&self) -> bool {
+        self.budget > 0 && self.census.descriptors() >= self.budget
+    }
+
     pub fn descriptor_usage(&self) -> (usize, usize) {
         (self.census.descriptors(), self.budget)
     }

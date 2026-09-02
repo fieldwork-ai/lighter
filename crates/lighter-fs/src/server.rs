@@ -108,6 +108,23 @@ static MATERIALIZE_N: [std::sync::atomic::AtomicU64; 10] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// A stat of nothing, typed like `inode`: what a bound inode answers with
+/// when it cannot be stat'd at all (its create failed), so the kind at
+/// least is right and the guest sees an empty file rather than EIO.
+fn libc_stat_default(inode: &Inode) -> libc::stat {
+    // SAFETY: `libc::stat` is plain data; all-zero is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    st.st_mode = if inode.is_dir {
+        libc::S_IFDIR | 0o755
+    } else if inode.is_symlink {
+        libc::S_IFLNK | 0o777
+    } else {
+        libc::S_IFREG | 0o644
+    };
+    st.st_nlink = 1;
+    st
+}
+
 /// A shared directory.
 pub struct Server {
     root: PathBuf,
@@ -1917,6 +1934,11 @@ impl Server {
             inode.write_acked(target.as_bytes().len() as u64);
         }
         parent.add_pending_child(name.to_bytes(), nodeid);
+        // The reply before the push: the promise is complete now, and a
+        // job that runs before the reply is built would have bound the
+        // inode out from under it. The pending inode was born with the one
+        // lookup this reply is.
+        let reply = self.entry_reply(&self.pending_entry(parent, &inode, nodeid));
         let job = {
             let registry = self.registry.clone();
             let parent = parent.clone();
@@ -1968,9 +1990,7 @@ impl Server {
         ));
         parent.settled_by(seq);
         inode.settled_by(seq);
-        // The pending inode was born with the one lookup this reply is.
-        let entry = self.pending_entry(parent, &inode, nodeid);
-        Ok(Some(self.entry_reply(&entry)))
+        Ok(Some(reply))
     }
 
     /// The asynchronous half of LINK: acknowledged with the target's own
@@ -2120,6 +2140,12 @@ impl Server {
     /// Reads a directory in full, from wherever it now lives.
     fn list(&self, nodeid: u64) -> Result<Vec<sys::DirEntry>, i32> {
         let inode = self.directory(nodeid)?;
+        // A fresh descriptor per listing, and that is not waste: a dup of
+        // the reference shares its offset with every other dup, and two
+        // threads listing one directory — ripgrep, pnpm's workers — then
+        // advance one offset between them and each gets half the entries.
+        // Measured as ripgrep at 87% of native instead of 97%, and a pnpm
+        // install that failed its second repetition.
         // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
         let fd = sys::reopen(inode.reference()?.raw_fd(), 0o200000, 0)?;
         sys::Dir::from_fd(fd)?.read_all()
@@ -2443,39 +2469,45 @@ impl Server {
                         // file itself in the open cache — which is what lets
                         // the guest keep reading and writing after an unlink,
                         // exactly as a real file handle would.
-                        match sys::dup(&fd) {
-                            Ok(meta) => {
-                                // Cache first, bind second: a reader that
-                                // settles the instant `pending` clears must
-                                // find the descriptor already there, or it
-                                // reopens by path — which an unlinked file
-                                // no longer has.
-                                open_cache.put_file(
-                                    nodeid,
-                                    std::sync::Arc::new(OpenFile {
-                                        fd,
-                                        readable: flags & 0o3 != 1,
-                                        append: false,
-                                        writable: flags & 0o3 != 0,
-                                    }),
-                                );
-                                registry.bind_pending(
-                                    nodeid,
-                                    &inode,
-                                    meta,
-                                    st.st_dev as i64,
-                                    st.st_ino,
-                                );
-                            }
-                            Err(_) => {
-                                registry.bind_pending(
-                                    nodeid,
-                                    &inode,
-                                    fd,
-                                    st.st_dev as i64,
-                                    st.st_ino,
-                                );
-                            }
+                        // At a full share the metadata reference would be
+                        // parked the instant it was bound — a dup, a stat,
+                        // a path query and a close, for nothing, fifty
+                        // thousand times an install. Bound parked instead,
+                        // with the open file itself still in the cache for
+                        // the writes that follow.
+                        let meta = if registry.at_budget() {
+                            None
+                        } else {
+                            sys::dup(&fd).ok()
+                        };
+                        // Cache first, bind second: a reader that settles
+                        // the instant `pending` clears must find the
+                        // descriptor already there, or it reopens by path —
+                        // which an unlinked file no longer has.
+                        open_cache.put_file(
+                            nodeid,
+                            std::sync::Arc::new(OpenFile {
+                                fd,
+                                readable: flags & 0o3 != 1,
+                                append: false,
+                                writable: flags & 0o3 != 0,
+                            }),
+                        );
+                        match meta {
+                            Some(meta) => registry.bind_pending(
+                                nodeid,
+                                &inode,
+                                meta,
+                                st.st_dev as i64,
+                                st.st_ino,
+                            ),
+                            None => registry.bind_pending_parked(
+                                nodeid,
+                                &inode,
+                                st.st_dev as i64,
+                                st.st_ino,
+                                (st.st_birthtime, st.st_birthtime_nsec),
+                            ),
                         }
                     }
                     Err(errno) => {
@@ -2613,13 +2645,6 @@ impl Server {
 
     /// The entry a pending inode answers with, from what the guest was told.
     fn pending_entry(&self, parent: &Inode, inode: &Inode, nodeid: u64) -> EntryOut {
-        let meta = inode.pending_meta().unwrap_or(crate::inode::PendingMeta {
-            mode: libc::S_IFREG as u32 | 0o644,
-            born: (0, 0),
-            atime: (0, 0),
-            mtime: (0, 0),
-        });
-        let size = inode.overlay_size(0);
         let answer = if inode.is_dir {
             Answer::Directory
         } else {
@@ -2627,6 +2652,25 @@ impl Server {
         };
         let entry_valid = self.policy.validity(parent.dev(), parent.ino(), answer);
         let attr_valid = self.policy.attr_validity(inode.dev(), inode.ino());
+        let Some(meta) = inode.pending_meta() else {
+            // Bound since the caller looked — its job ran in the gap — and
+            // the host answers now. Answering from a default promise here
+            // told the guest a directory it had just made was a file, which
+            // its kernel reports as EIO on the mkdir: one install in three.
+            let attr = self
+                .attr_of(nodeid, inode)
+                .unwrap_or_else(|_| self.attr(&libc_stat_default(inode)));
+            return EntryOut {
+                nodeid,
+                generation: 0,
+                entry_valid: entry_valid.as_secs(),
+                attr_valid: attr_valid.as_secs(),
+                entry_valid_nsec: entry_valid.subsec_nanos(),
+                attr_valid_nsec: attr_valid.subsec_nanos(),
+                attr,
+            };
+        };
+        let size = inode.overlay_size(0);
         EntryOut {
             nodeid,
             generation: 0,

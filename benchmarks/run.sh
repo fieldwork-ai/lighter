@@ -509,6 +509,9 @@ for name in $CASES; do
 			printf '  <- implausible; the fixture was probably missing'
 		fi
 	fi
+	# The case's whole output, for a run that produced fewer measurements
+	# than repetitions: a repetition that failed is otherwise invisible.
+	[ -z "${LIGHTER_BENCH_KEEP_OUTPUT:-}" ] || cp "$CASE_OUT" ".logs/case-$TARGET-$name.out" 2>/dev/null || true
 	rm -f "$CASE_OUT"
 	printf '\n'
 	if [ -n "$HELPER_PID" ]; then kill "$HELPER_PID" 2>/dev/null || true; HELPER_PID=""; fi
