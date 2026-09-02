@@ -38,3 +38,6 @@ One row per experiment, appended as they happen, so nobody reruns one by acciden
 | 2026-09-02 | virtio-blk | poll only for synchronous requests (writeback's async writes get one look) | wall time unchanged; a third of a CPU no longer burned under a tree copy | kept |
 | 2026-09-02 | VMM | exit counting (`LIGHTER_EXIT_STATS=1`) | yarn is 3k–10k exits/s, all virtio kicks; not the gap | kept (diagnostic) |
 | 2026-09-02 | share | pnpm on the share, guest profiles | ours 68% idle with a kick per request; OrbStack spins in `virtio_fs_request_complete` and is answered in time — fs-server latency | open (share milestone) |
+| 2026-09-02 | own disk | copy-tree in a persistent VM (`.logs/loop.sh`), counters per copy | our copy writes the full 1 GB to disk while `cp` runs (66k writes, 2.9 s system); OrbStack's writes 80 MB and 1 s system — writeback is forced mid-copy on our side | open (cause being found) |
+| 2026-09-02 | memory | guest 16 GB instead of 8 GB on the M5 (OrbStack's guest is 16 GB) | copy unchanged: still 1 GB written during the copy | ruled out (not the dirty threshold) |
+| 2026-09-02 | scheduling | vCPU count 4 vs 8 on the M1 | yarn −4%, npm −7% (see above); QoS is not why | open |
