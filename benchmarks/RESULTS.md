@@ -20,14 +20,14 @@ compared with another from the same machine and the same session.
 
 | case | native | lighter | orbstack |
 |---|---|---|---|
-| npm-install | 6574 | 8617 | 9001 |
-| pnpm-install | 4705 | 4327 | 5362 |
-| yarn-install | 5923 | 6036 | 9323 |
-| ripgrep | 904 | 99 | 1021 |
-| find-walk | 370 | 109 | 480 |
-| copy-tree | 14186 | 4352 | 9196 |
-| rm-rf | 4450 | 2738 | 3388 |
-| watch-latency | 2 | 2 | 2 |
+| npm-install | 6639 | 9465 | 8839 |
+| pnpm-install | 4614 | 4567 | 5444 |
+| yarn-install | 5670 | 6634 | 8153 |
+| ripgrep | 909 | 110 | 1005 |
+| find-walk | 386 | 131 | 466 |
+| copy-tree | 14553 | 4164 | 9230 |
+| rm-rf | 4186 | 2914 | 3528 |
+| watch-latency | 2 | 2 | 11 |
 
 ### As a fraction of `native`
 
@@ -38,25 +38,25 @@ division by noise — read it from the table above in milliseconds.
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 76% | 73% |
-| pnpm-install | 109% | 88% |
-| yarn-install | 98% | 64% |
-| ripgrep | 913% | 89% |
-| find-walk | 339% | 77% |
-| copy-tree | 326% | 154% |
-| rm-rf | 163% | 131% |
+| npm-install | 70% | 75% |
+| pnpm-install | 101% | 85% |
+| yarn-install | 85% | 70% |
+| ripgrep | 826% | 90% |
+| find-walk | 295% | 83% |
+| copy-tree | 349% | 158% |
+| rm-rf | 144% | 119% |
 
 ### On the runtime's own disk (a named volume), milliseconds
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 7485 | 7027 |
-| pnpm-install | 918 | 2032 |
-| yarn-install | 6713 | 5024 |
-| ripgrep | 98 | 105 |
-| find-walk | 112 | 124 |
-| copy-tree | 1985 | 1062 |
-| rm-rf | 335 | 487 |
+| npm-install | 8349 | 6943 |
+| pnpm-install | 2325 | 2128 |
+| yarn-install | 6018 | 5156 |
+| ripgrep | 133 | 106 |
+| find-walk | 128 | 127 |
+| copy-tree | 2398 | 1106 |
+| rm-rf | 523 | 475 |
 
 ## MacBook Pro (MacBookPro17,1), Apple M1, 8 cores (4P+4E), 8 GB, macOS 26.6.2
 
@@ -64,14 +64,14 @@ division by noise — read it from the table above in milliseconds.
 
 | case | native | lighter | orbstack |
 |---|---|---|---|
-| npm-install | 8082 | 13945 | 10669 |
-| pnpm-install | 4597 | 9297 | 5834 |
-| yarn-install | 9664 | 12448 | 10054 |
-| ripgrep | 1315 | 204 | 1701 |
-| find-walk | 502 | 161 | 519 |
-| copy-tree | 22066 | 6178 | 11802 |
-| rm-rf | 5287 | 3751 | 3952 |
-| watch-latency | 2 | 3 | 3 |
+| npm-install | 7846 | 12837 | 11110 |
+| pnpm-install | 4654 | 9116 | 5884 |
+| yarn-install | 10619 | 11420 | 10061 |
+| ripgrep | 1330 | 156 | 1135 |
+| find-walk | 503 | 164 | 533 |
+| copy-tree | 24755 | 6167 | 13717 |
+| rm-rf | 5432 | 3870 | 3888 |
+| watch-latency | 2 | 2 | 3 |
 
 ### As a fraction of `native`
 
@@ -82,25 +82,25 @@ division by noise — read it from the table above in milliseconds.
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 58% | 76% |
-| pnpm-install | 49% | 79% |
-| yarn-install | 78% | 96% |
-| ripgrep | 645% | 77% |
-| find-walk | 312% | 97% |
-| copy-tree | 357% | 187% |
-| rm-rf | 141% | 134% |
+| npm-install | 61% | 71% |
+| pnpm-install | 51% | 79% |
+| yarn-install | 93% | 106% |
+| ripgrep | 853% | 117% |
+| find-walk | 307% | 94% |
+| copy-tree | 401% | 180% |
+| rm-rf | 140% | 140% |
 
 ### On the runtime's own disk (a named volume), milliseconds
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 11892 | 10307 |
-| pnpm-install | 1683 | 2285 |
-| yarn-install | 10296 | 7673 |
-| ripgrep | 156 | 177 |
-| find-walk | 135 | 133 |
-| copy-tree | 3832 | 2616 |
-| rm-rf | 577 | 659 |
+| npm-install | 10762 | 10879 |
+| pnpm-install | 3080 | 2418 |
+| yarn-install | 8319 | 7785 |
+| ripgrep | 161 | 155 |
+| find-walk | 134 | 131 |
+| copy-tree | 2940 | 3067 |
+| rm-rf | 638 | 684 |
 
 ## What each case does
 
