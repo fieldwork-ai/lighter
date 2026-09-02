@@ -52,7 +52,7 @@ Two things about the transport are not obvious from the specification. The inter
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and nine patches, on the 6.18 longterm line; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and ten patches, on the 6.18 longterm line; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
 The kernel patches are the interesting part:
 
@@ -68,7 +68,9 @@ The kernel patches are the interesting part:
 
 - **Completing a checksum-free read where it finished.** btrfs hands every data read to a workqueue before its completion runs, so checksums can be verified and a bad sector repaired from another copy. On a `nodatacow` volume there are no checksums, and the worker wakeup was most of a cached read: fio at queue depth 1 read at 39k a second on btrfs against 464k on ext4 on the same kernel. A clean read from an inode with no checksums now completes on the CPU that found it, as ext4's do — 437k, with writes at 144k against OrbStack's 123k, which is btrfs's ordered-extent bookkeeping on both.
 
-The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All nine are in `guest/kernel/patches/`.
+- **Not flushing a copy while it is still being written.** btrfs reserves metadata for every file with dirty data, at a worst case of a quarter megabyte each, and a package tree is seventy-five thousand small files. Two upstream mechanisms take that sum as a shortage: preemptive reclaim, which starts flushing delayed allocation once the reservations dirty data holds pass 128 MB, and the ticketed reclaim behind it, which lets a reservation borrow only an eighth of the unallocated device before it queues a flush and blocks the writer. Both were writing the copy back one bio per file while `cp` was still producing it, with the flush's workers waking each other across every idle CPU: 2.9 s of system time for a 1 GB copy. Preemptive reclaim is off (`btrfs.preemptive_reclaim`) and a flushing reservation may borrow half the device (`btrfs.overcommit_shift`, 1), so the dirty flusher writes the copy in bulk after the fact — 47,000 writes become 8,600, and the copy takes 1.1 s where OrbStack's takes 1.05–1.3. On-demand reclaim when a reservation really fails is untouched.
+
+The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All ten are in `guest/kernel/patches/`.
 
 ## The guest decides how much the host remembers
 
