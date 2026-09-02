@@ -26,6 +26,7 @@
 //! ```
 
 pub mod bus;
+pub mod exitstats;
 pub mod console;
 pub mod devices;
 pub mod fdt;

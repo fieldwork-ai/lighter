@@ -226,6 +226,7 @@ impl Machine {
         let mut net_slot = None;
         let net_inbox = Net::new_inbox();
 
+        crate::exitstats::spawn_reporter_if_enabled();
         let mut block_slots = Vec::with_capacity(config.disks.len());
         for path in &config.disks {
             let disk = Arc::new(Disk::open_or_create(path, config.disk_size_bytes, false)?);

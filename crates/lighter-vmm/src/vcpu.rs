@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use lighter_hv::{Exception, Exit, Reg, SysReg, Vcpu, VcpuHandle};
 
 use crate::bus::{FaultError, MmioBus, MmioFault};
+use crate::exitstats;
 use crate::psci::{AffinityState, PSCI_VERSION, PsciCall, PsciReturn};
 use crate::smp::{CpuPark, StartRequest};
 use crate::sysreg::{self, SysRegAccess, SysRegAction};
@@ -180,19 +181,29 @@ impl VcpuRunner {
 
             match exit {
                 Exit::Canceled => {
+                    exitstats::bump(exitstats::Kind::Canceled);
                     if self.ctx.shutdown.load(Ordering::Relaxed) {
                         return Ok(StopReason::Shutdown);
                     }
                     // A cancellation we did not ask for is a spurious wakeup;
                     // re-entering the guest is always safe.
                 }
-                Exit::VTimerActivated => self.handle_vtimer()?,
+                Exit::VTimerActivated => {
+                    exitstats::bump(exitstats::Kind::VTimer);
+                    self.handle_vtimer()?
+                }
                 Exit::Unknown => {
                     return Err(RunError::UnknownExit {
                         vcpu: self.vcpu.id(),
                     });
                 }
                 Exit::Exception(exception) => {
+                    exitstats::bump(match exception.class() {
+                        Exception::EC_DATA_ABORT_LOWER_EL => exitstats::Kind::Mmio,
+                        Exception::EC_HVC64 => exitstats::Kind::Hvc,
+                        Exception::EC_SYSREG_TRAP => exitstats::Kind::SysReg,
+                        _ => exitstats::Kind::Other,
+                    });
                     if let Some(stop) = self.handle_exception(exception)? {
                         return Ok(stop);
                     }
