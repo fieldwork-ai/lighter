@@ -28,6 +28,7 @@
 
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -1240,6 +1241,19 @@ impl Server {
         // Path-based operations (access, xattr, link, setattr) need a file
         // that exists; settle it once, here, for all of them.
         self.settle_while(inode, |inode| inode.is_pending());
+        // A parked file's path is its parent's path and its name — no
+        // descriptor of its own is opened for it. The parent's identity path
+        // takes child components, so this stays immune to the stale-name
+        // problem below; what the name resolves to is checked against the
+        // inode's own identity, since the Mac may have moved it since.
+        if let Ok(Located::At(parent, name)) = inode.locate()
+            && let Ok(st) = sys::stat_at(parent.raw_fd(), &name)
+            && st.st_ino == inode.ino()
+            && st.st_dev as i64 == inode.dev()
+        {
+            let base = sys::identity_path(parent.raw_fd()).or_else(|_| sys::path_of(parent.raw_fd()))?;
+            return sys::c_path(&base.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
+        }
         let fd = match inode.reference() {
             Ok(fd) => fd,
             Err(errno) => {

@@ -836,6 +836,15 @@ impl Inode {
     /// silent work on the wrong one.
     /// Records the name the guest just reached this inode by.
     pub fn set_place(&self, parent: &Arc<Inode>, name: &std::ffi::CStr) {
+        // A lookup of `..` names the parent under its child, and `.` names
+        // an inode under itself. Either would make revival a cycle: the
+        // parent reviving through the child that revives through the
+        // parent, on one thread, into a lock it already holds — which is a
+        // request thread that never answers, and a `cp -a` that timed out.
+        let name_bytes = name.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." || parent.id() == self.id() {
+            return;
+        }
         let parent_id = parent.id();
         let mut place = self.place.lock().expect("place poisoned");
         match place.as_ref() {

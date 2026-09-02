@@ -490,9 +490,22 @@ for name in $CASES; do
 	# is how a one-minute quick gate came to take eleven.
 	( exec </dev/null >/dev/null 2>&1; sleep "$cap"; kill "$case_pid" 2>/dev/null && echo "TIME_MS TIMEOUT host-watchdog ${cap}s" >>"$CASE_OUT" ) &
 	watchdog_pid=$!
+	# A case still running well past what it should take is sampled where
+	# it stands, so a stall that happens once in a session leaves a profile
+	# behind rather than a timeout and nothing to look at. Only our own VMM
+	# is ours to sample; the other targets are left alone.
+	sampler_pid=""
+	if [ -n "$VMM_PID" ] && [ "${LIGHTER_BENCH_SAMPLE_AFTER_S:-150}" -gt 0 ]; then
+		( exec </dev/null >/dev/null 2>&1; sleep "${LIGHTER_BENCH_SAMPLE_AFTER_S:-150}"; kill -0 "$case_pid" 2>/dev/null && { mkdir -p .logs; sample "$VMM_PID" 8 -mayDie -file ".logs/stall-$TARGET-$name.txt"; } ) &
+		sampler_pid=$!
+	fi
 	wait "$case_pid" 2>/dev/null || true
 	pkill -P "$watchdog_pid" 2>/dev/null || true
 	kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null || true
+	if [ -n "$sampler_pid" ]; then
+		pkill -P "$sampler_pid" 2>/dev/null || true
+		kill "$sampler_pid" 2>/dev/null; wait "$sampler_pid" 2>/dev/null || true
+	fi
 	while read -r ms; do
 		rep=$((rep + 1))
 		printf ' %s' "$ms"
