@@ -50,13 +50,57 @@ division by noise — read it from the table above in milliseconds.
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 7487 | 7027 |
-| pnpm-install | 1017 | 2032 |
-| yarn-install | 5946 | 5024 |
-| ripgrep | 110 | 105 |
-| find-walk | 114 | 124 |
-| copy-tree | 1286 | 1062 |
-| rm-rf | 312 | 487 |
+| npm-install | 7485 | 7027 |
+| pnpm-install | 918 | 2032 |
+| yarn-install | 6713 | 5024 |
+| ripgrep | 98 | 105 |
+| find-walk | 112 | 124 |
+| copy-tree | 1985 | 1062 |
+| rm-rf | 335 | 487 |
+
+## MacBook Pro (MacBookPro17,1), Apple M1, 8 cores (4P+4E), 8 GB, macOS 26.6.2
+
+### Wall time, milliseconds
+
+| case | native | lighter | orbstack |
+|---|---|---|---|
+| npm-install | 8082 | 13945 | 10669 |
+| pnpm-install | 4597 | 9297 | 5834 |
+| yarn-install | 9664 | 12448 | 10054 |
+| ripgrep | 1315 | 204 | 1701 |
+| find-walk | 502 | 161 | 519 |
+| copy-tree | 22066 | — | 11802 |
+| rm-rf | 5287 | — | 3952 |
+| watch-latency | 2 | — | 3 |
+
+### As a fraction of `native`
+
+100% would mean the shared filesystem costs nothing at all next to the
+Mac's own disk. Higher is better. `watch-latency` is left out: it is a
+latency against a reference of about a millisecond, so the ratio is a
+division by noise — read it from the table above in milliseconds.
+
+| case | lighter | orbstack |
+|---|---|---|
+| npm-install | 58% | 76% |
+| pnpm-install | 49% | 79% |
+| yarn-install | 78% | 96% |
+| ripgrep | 645% | 77% |
+| find-walk | 312% | 97% |
+| copy-tree | — | 187% |
+| rm-rf | — | 134% |
+
+### On the runtime's own disk (a named volume), milliseconds
+
+| case | lighter | orbstack |
+|---|---|---|
+| npm-install | 11892 | 10307 |
+| pnpm-install | 1683 | 2285 |
+| yarn-install | 10296 | 7673 |
+| ripgrep | 156 | 177 |
+| find-walk | 135 | 133 |
+| copy-tree | 3832 | 2616 |
+| rm-rf | 577 | 659 |
 
 ## What each case does
 
