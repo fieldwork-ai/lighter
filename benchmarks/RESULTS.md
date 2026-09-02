@@ -69,9 +69,9 @@ division by noise — read it from the table above in milliseconds.
 | yarn-install | 9664 | 12448 | 10054 |
 | ripgrep | 1315 | 204 | 1701 |
 | find-walk | 502 | 161 | 519 |
-| copy-tree | 22066 | — | 11802 |
-| rm-rf | 5287 | — | 3952 |
-| watch-latency | 2 | — | 3 |
+| copy-tree | 22066 | 6178 | 11802 |
+| rm-rf | 5287 | 3751 | 3952 |
+| watch-latency | 2 | 3 | 3 |
 
 ### As a fraction of `native`
 
@@ -87,8 +87,8 @@ division by noise — read it from the table above in milliseconds.
 | yarn-install | 78% | 96% |
 | ripgrep | 645% | 77% |
 | find-walk | 312% | 97% |
-| copy-tree | — | 187% |
-| rm-rf | — | 134% |
+| copy-tree | 357% | 187% |
+| rm-rf | 141% | 134% |
 
 ### On the runtime's own disk (a named volume), milliseconds
 

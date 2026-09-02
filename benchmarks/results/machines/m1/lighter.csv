@@ -14,3 +14,12 @@ ripgrep,3,162
 find-walk,1,1066
 find-walk,2,161
 find-walk,3,131
+copy-tree,1,16199
+copy-tree,2,6178
+copy-tree,3,5614
+rm-rf,1,3756
+rm-rf,2,3751
+rm-rf,3,3640
+watch-latency,1,158
+watch-latency,2,3
+watch-latency,3,2
