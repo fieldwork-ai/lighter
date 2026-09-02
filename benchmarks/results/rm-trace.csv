@@ -1,0 +1,17 @@
+case,rep,ms
+copy-tree,1,7267
+copy-tree,2,6149
+copy-tree,3,5737
+copy-tree,4,5644
+copy-tree,5,5699
+copy-tree,6,5529
+copy-tree,7,5287
+copy-tree,8,5357
+rm-rf,1,2584
+rm-rf,2,2507
+rm-rf,3,2697
+rm-rf,4,2571
+rm-rf,5,2749
+rm-rf,6,2446
+rm-rf,7,2578
+rm-rf,8,2658

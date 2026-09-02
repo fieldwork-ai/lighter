@@ -1415,3 +1415,103 @@ fn every_pnpm_shape_releases_when_forgotten_by_its_count() {
         "every shape released by its own count: {counts:?}"
     );
 }
+
+/// A tree removed and made again at once, as a benchmark's setup does, and
+/// removed again: the second removal must not be answered from the first
+/// one's promises.
+#[test]
+fn a_tree_removed_recreated_and_removed_again_is_gone() {
+    let mut guest = Guest::new("rm-cp-rm");
+    let mkdir = |guest: &mut Guest, name: &str| -> u64 {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(name));
+        let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+        u64::from_le_bytes(reply[0..8].try_into().unwrap())
+    };
+    for round in 0..3 {
+        let d = mkdir(&mut guest, "d");
+        let (f, fh) = guest.create(d, "f", 0x8241).unwrap();
+        guest.write(f, fh, 0, b"x").unwrap();
+        guest.call(op::RELEASE, f, &[0u8; 24]).expect("release");
+        guest
+            .call(op::UNLINK, d, &name_body("f"))
+            .unwrap_or_else(|e| panic!("round {round}: unlink f: errno {e}"));
+        guest
+            .call(op::RMDIR, 1, &name_body("d"))
+            .unwrap_or_else(|e| panic!("round {round}: rmdir d: errno {e}"));
+        assert!(
+            matches!(guest.lookup(1, "d"), Err(2) | Ok(0)),
+            "round {round}: d is gone"
+        );
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert!(
+        !guest.host("d").exists(),
+        "the directory is gone from the Mac"
+    );
+}
+
+/// A listing being paged must survive any number of other listings in
+/// between: `rm -rf` reads an ancestor a page at a time while it visits
+/// every directory below it.
+#[test]
+fn a_listing_in_progress_survives_a_thousand_other_listings() {
+    let mut guest = Guest::new("listing-pinned");
+    let mkdir = |guest: &mut Guest, parent: u64, name: &str| -> u64 {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(name));
+        let reply = guest.call(op::MKDIR, parent, &body).expect("mkdir");
+        u64::from_le_bytes(reply[0..8].try_into().unwrap())
+    };
+    let big = mkdir(&mut guest, 1, "big");
+    for i in 0..200 {
+        guest.create(big, &format!("entry-{i:03}"), 0x8241).unwrap();
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    // Page through `big` with a small buffer, listing many other directories
+    // between pages, and unlinking what was already seen — as rm does.
+    let mut seen = std::collections::HashSet::new();
+    let mut offset = 0u64;
+    let mut others = 0;
+    loop {
+        let mut body = vec![0u8; 40];
+        body[8..16].copy_from_slice(&offset.to_le_bytes());
+        body[16..20].copy_from_slice(&1024u32.to_le_bytes());
+        let page = guest.call(op::READDIR, big, &body).expect("readdir");
+        if page.is_empty() {
+            break;
+        }
+        let mut at = 0;
+        let mut names = Vec::new();
+        while at + 24 <= page.len() {
+            let off = u64::from_le_bytes(page[at + 8..at + 16].try_into().unwrap());
+            let len = u32::from_le_bytes(page[at + 16..at + 20].try_into().unwrap()) as usize;
+            let name = String::from_utf8_lossy(&page[at + 24..at + 24 + len]).into_owned();
+            offset = off;
+            at += (24 + len + 7) & !7;
+            if name != "." && name != ".." {
+                names.push(name);
+            }
+        }
+        for name in &names {
+            assert!(seen.insert(name.clone()), "{name} listed twice");
+            guest
+                .call(op::UNLINK, big, &name_body(name))
+                .expect("unlink");
+        }
+        for _ in 0..40 {
+            let d = mkdir(&mut guest, 1, &format!("other-{others}"));
+            others += 1;
+            let mut body = vec![0u8; 40];
+            body[16..20].copy_from_slice(&4096u32.to_le_bytes());
+            guest.call(op::READDIR, d, &body).expect("readdir other");
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        200,
+        "every entry listed exactly once across {others} other listings"
+    );
+}

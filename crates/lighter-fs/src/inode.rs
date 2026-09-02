@@ -1004,6 +1004,15 @@ pub struct OpenDir {
     /// Refilled whenever a caller starts again from the beginning, which is
     /// what makes a listing see changes at all.
     pub entries: Mutex<Vec<crate::sys::DirEntry>>,
+    /// Whether the guest has read this listing to its end. Until it has,
+    /// the listing is a snapshot the guest is paging through by index and
+    /// must not be evicted: rebuilt at a non-zero offset, after the guest's
+    /// own unlinks have removed names from the front, it is a shorter list
+    /// resumed at the old index — and the entries that fall in the gap are
+    /// never shown. `rm -rf` on a large tree visits thousands of directories
+    /// while an ancestor's listing is still open, which is how a bounded
+    /// cache came to evict exactly the one that mattered.
+    pub complete: std::sync::atomic::AtomicBool,
 }
 
 /// An open regular file.

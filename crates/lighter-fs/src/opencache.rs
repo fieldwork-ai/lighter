@@ -79,7 +79,21 @@ impl OpenCache {
     pub fn put_directory(&self, nodeid: u64, dir: Arc<OpenDir>) {
         let mut dirs = self.dirs.lock().expect("open cache poisoned");
         dirs.insert(nodeid, dir);
-        trim(&mut dirs, DIR_LIMIT);
+        // Only listings the guest has finished reading are evictable; see
+        // `OpenDir::complete`. A cache full of open listings simply grows —
+        // a walk that deep is bounded by the tree's depth, not its size.
+        if dirs.len() > DIR_LIMIT {
+            let excess = dirs.len() - DIR_LIMIT + DIR_LIMIT / 4;
+            let doomed: Vec<u64> = dirs
+                .iter()
+                .filter(|(_, dir)| dir.complete.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(key, _)| *key)
+                .take(excess)
+                .collect();
+            for key in doomed {
+                dirs.remove(&key);
+            }
+        }
     }
 
     /// Drops whatever is held for an inode.

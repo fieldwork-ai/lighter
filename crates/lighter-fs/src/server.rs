@@ -439,6 +439,8 @@ pub struct Server {
     defer_creates: bool,
     park_creates: bool,
     copy_max: u64,
+    /// `LIGHTER_FS_DEBUG_LISTING=1`: log every listing an overlay changed.
+    debug_listing: bool,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -566,6 +568,7 @@ impl Server {
             defer_creates: std::env::var("LIGHTER_FS_DEFER_CREATE").as_deref() != Ok("0"),
             park_creates,
             copy_max: copy_instead_of_clone_max(),
+            debug_listing: std::env::var("LIGHTER_FS_DEBUG_LISTING").as_deref() == Ok("1"),
             settler_stop,
             settler: std::sync::Mutex::new(Some(settler)),
             _watcher: watcher,
@@ -1982,11 +1985,25 @@ impl Server {
                     // Said aloud: the guest believes this directory empty,
                     // and an entry the queue does not account for is either
                     // the Mac's doing or a promise this server lost.
+                    let known = sys::stat_at(
+                        child.reference()?.raw_fd(),
+                        &CString::new(entry.name.clone()).map_err(|_| linux::EINVAL)?,
+                    )
+                    .ok()
+                    .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
+                    .and_then(|id| self.registry.get(id).map(|i| (id, i)));
                     tracing::warn!(
                         dir = %name.to_string_lossy(),
                         entry = %String::from_utf8_lossy(&entry.name),
-                        promised_gone = gone.len(),
-                        pending = child.is_pending(),
+                        entry_kind = entry.kind,
+                        entry_nodeid = known.as_ref().map(|(id, _)| *id).unwrap_or(0),
+                        entry_pending = known.as_ref().map(|(_, i)| i.is_pending()).unwrap_or(false),
+                        entry_gone_inside = known.as_ref().map(|(_, i)| i.pending_gone_snapshot().len()).unwrap_or(0),
+                        entry_promised_inside = known.as_ref().map(|(_, i)| i.pending_children_snapshot().len()).unwrap_or(0),
+                        promised_gone = ?gone.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>(),
+                        listed = listing.len(),
+                        queued = self.apply.depth(),
+                        held = self.deferred.map.lock().expect("held creates poisoned").len(),
                         "rmdir refused: an entry no queued removal accounts for"
                     );
                     return Err(linux::ENOTEMPTY);
@@ -2555,6 +2572,7 @@ impl Server {
         let dir = Arc::new(OpenDir {
             nodeid,
             entries: std::sync::Mutex::new(Vec::new()),
+            complete: std::sync::atomic::AtomicBool::new(false),
         });
         self.open_cache.put_directory(nodeid, dir.clone());
         Ok(dir)
@@ -3455,6 +3473,22 @@ impl Server {
                 self.list(nodeid)?
             };
             if !gone.is_empty() || !promised.is_empty() {
+                if self.debug_listing {
+                    let dropped: Vec<String> = listed
+                        .iter()
+                        .filter(|entry| gone.contains(&entry.name))
+                        .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
+                        .collect();
+                    tracing::warn!(
+                        nodeid,
+                        host = listed.len(),
+                        promised = promised.len(),
+                        gone = gone.len(),
+                        dropped = ?dropped,
+                        queued = self.apply.depth(),
+                        "LISTING with an overlay"
+                    );
+                }
                 listed.retain(|entry| !gone.contains(&entry.name));
                 for (name, id) in promised {
                     let Some(inode) = self.registry.get(id) else {
@@ -3484,9 +3518,11 @@ impl Server {
                 }
             }
             *entries = listed;
+            open.complete.store(false, Ordering::Relaxed);
         }
 
         let mut out = Vec::new();
+        let mut reached_end = true;
         for (index, entry) in entries.iter().enumerate().skip(offset) {
             let next = index as u64 + 1;
             if plus {
@@ -3494,6 +3530,7 @@ impl Server {
                 // the entry has to be built before its size is known, so the
                 // budget is checked against the pair up front.
                 if out.len() + fuse::ENTRY_OUT_LEN + fuse::dirent_len(entry.name.len()) > budget {
+                    reached_end = false;
                     break;
                 }
                 // "." and ".." carry nodeid 0, which the kernel reads as "no
@@ -3529,8 +3566,12 @@ impl Server {
             if !fuse::push_dirent(&mut out, budget, entry.ino, next, entry.kind, &entry.name) {
                 // Only reachable in the plain READDIR case; the READDIRPLUS
                 // path checked the whole record above.
+                reached_end = false;
                 break;
             }
+        }
+        if reached_end {
+            open.complete.store(true, Ordering::Relaxed);
         }
         Ok(out)
     }
