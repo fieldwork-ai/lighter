@@ -105,16 +105,8 @@ if [ -b "$DATA_DEV" ]; then
 			# shellcheck disable=SC2086
 			mkfs.xfs -q -f -L lighter-data $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
 		else
-			# No metadata checksums. They guard against a disk returning the
-			# wrong bytes, and this disk is a file in the Mac's page cache and
-			# on its SSD, both of which already answer for that. What they cost
-			# is measured: every directory change recomputes the checksum of
-			# each block it touched, and creating and removing a directory took
-			# 40% longer with them on, unlinking a file 35% — the two operations
-			# an install of a package tree is made of. The instructions are the
-			# hardware ones already; it is the number of blocks, not the CRC.
 			# shellcheck disable=SC2086
-			mke2fs -q -t ext4 -L lighter-data -O ^metadata_csum $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
+			mke2fs -q -t ext4 -L lighter-data $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
 		fi
 	fi
 	# Journaling on Docker's disk is metadata-only, with no write barriers
