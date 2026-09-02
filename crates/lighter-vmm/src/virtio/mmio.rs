@@ -62,7 +62,6 @@ pub struct VirtioMmio {
     device: Box<dyn VirtioDevice>,
     queues: Vec<Virtqueue>,
     memory: Arc<GuestMemory>,
-    irq: Arc<dyn IrqLine>,
 
     /// Which 32-bit half of the 64-bit feature word the driver is reading.
     device_features_sel: u32,
@@ -77,6 +76,7 @@ pub struct VirtioMmio {
     /// submitting the next request, and a stream of 4 KiB writes spent as
     /// long waiting for that lock as running the guest.
     interrupt_status: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    line: std::sync::Arc<crate::bus::InterruptLine>,
     config_generation: u32,
     /// Set once `DRIVER_OK` has been seen, so activation happens exactly once.
     activated: bool,
@@ -178,17 +178,22 @@ impl VirtioMmio {
         let queues = (0..device.queue_count())
             .map(|_| Virtqueue::new(max))
             .collect();
+        let interrupt_status = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let line = std::sync::Arc::new(crate::bus::InterruptLine::new(
+            interrupt_status.clone(),
+            irq.clone(),
+        ));
         VirtioMmio {
             device,
             queues,
             memory,
-            irq,
             device_features_sel: 0,
             driver_features_sel: 0,
             acked_features: 0,
             queue_sel: 0,
             device_status: 0,
-            interrupt_status: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            interrupt_status,
+            line,
             config_generation: 0,
             activated: false,
             kick_observer: None,
@@ -212,11 +217,9 @@ impl VirtioMmio {
         self.device.reset();
         self.device_status = 0;
         self.acked_features = 0;
-        self.interrupt_status
-            .store(0, std::sync::atomic::Ordering::Release);
+        self.line.acknowledge(u32::MAX);
         self.queue_sel = 0;
         self.activated = false;
-        self.irq.set_level(false);
     }
 
     /// Handles the driver writing device status.
@@ -234,6 +237,17 @@ impl VirtioMmio {
         // device has its queues before any I/O can arrive.
         if value & status::DRIVER_OK != 0 && !self.activated {
             self.activated = true;
+            for (i, q) in self.queues.iter().enumerate() {
+                tracing::debug!(
+                    device = self.device.name(),
+                    queue = i,
+                    desc = format_args!("{:#x}", q.desc_addr),
+                    driver = format_args!("{:#x}", q.avail_addr),
+                    device_area = format_args!("{:#x}", q.used_addr),
+                    packed = q.is_packed(),
+                    "queue activated"
+                );
+            }
             self.device.activate(self.memory.clone());
             tracing::debug!(device = self.device.name(), "driver ready");
         }
@@ -319,12 +333,8 @@ impl VirtioMmio {
             }
         }
         if wants_interrupt {
-            self.interrupt_status
-                .fetch_or(INT_VRING, std::sync::atomic::Ordering::AcqRel);
-            // The device tree declares these lines edge-triggered, matching
-            // what every aarch64 guest expects from virtio-mmio, so a pulse is
-            // what delivers the interrupt.
-            self.irq.pulse();
+            // Level-triggered, following the status word (see `InterruptLine`).
+            self.line.raise(INT_VRING);
         }
     }
 
@@ -437,10 +447,7 @@ impl VirtioMmio {
                 }
                 self.notify_queue(value as u16)
             }
-            INTERRUPT_ACK => {
-                self.interrupt_status
-                    .fetch_and(!value, std::sync::atomic::Ordering::AcqRel);
-            }
+            INTERRUPT_ACK => self.line.acknowledge(value),
             STATUS => self.set_status(value),
             QUEUE_DESC_LOW => self.set_queue_addr(|q| &mut q.desc_addr, value, false),
             QUEUE_DESC_HIGH => self.set_queue_addr(|q| &mut q.desc_addr, value, true),
@@ -476,9 +483,7 @@ impl VirtioMmio {
     /// balloon's target size is the case that matters here.
     pub fn notify_config_change(&mut self) {
         self.config_generation = self.config_generation.wrapping_add(1);
-        self.interrupt_status
-            .fetch_or(INT_CONFIG, std::sync::atomic::Ordering::AcqRel);
-        self.irq.pulse();
+        self.line.raise(INT_CONFIG);
     }
 
     /// Lets a device with a host-side source of work (a network backend, a
@@ -575,6 +580,7 @@ impl MmioDevice for VirtioMmio {
             status: self.interrupt_status.clone(),
             status_offset: INTERRUPT_STATUS,
             ack_offset: INTERRUPT_ACK,
+            line: self.line.clone(),
         })
     }
 

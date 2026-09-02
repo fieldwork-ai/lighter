@@ -206,6 +206,13 @@ impl Gic {
         unsafe { check(sys::hv_gic_set_spi(intid, level)) }
     }
 
+    /// Reads a distributor register by its GICv3 offset.
+    pub fn distributor_reg(&self, offset: u16) -> Result<u64> {
+        let mut value = 0u64;
+        unsafe { check(sys::hv_gic_get_distributor_reg(offset, &mut value))? };
+        Ok(value)
+    }
+
     /// Translates a device's SPI index into an absolute INTID.
     pub fn spi_intid(&self, spi: u32) -> Result<u32> {
         if spi >= self.params.spi_count {

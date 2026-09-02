@@ -120,6 +120,50 @@ fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
         (Some("ping"), _) => "pong\n".into(),
+        // Diagnostics that touch no disk: procfs, sysfs and the kernel log
+        // stay readable when a block device has wedged.
+        (Some("read"), Some(path)) => match std::fs::read(path) {
+            Ok(bytes) => {
+                let mut out = String::from_utf8_lossy(&bytes[..bytes.len().min(1 << 16)]).into_owned();
+                out.push_str("\n--end--\n");
+                out
+            }
+            Err(e) => format!("error {e}\n--end--\n"),
+        },
+        // Diagnostics only: a shell command, output and exit status back.
+        (Some("sh"), Some(_)) => {
+            let command = line.trim_start_matches("sh").trim();
+            match std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .output()
+            {
+                Ok(out) => format!(
+                    "{}{}\nexit={}\n--end--\n",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                    out.status.code().unwrap_or(-1)
+                ),
+                Err(e) => format!("error {e}\n--end--\n"),
+            }
+        }
+        // Diagnostics only: bytes of guest-physical memory, through the
+        // direct map that /proc/kcore exposes.
+        (Some("peek"), Some(addr)) => {
+            let len = words.next().and_then(|w| w.parse().ok()).unwrap_or(16usize);
+            let addr = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap_or(0);
+            match peek_physical(addr, len.min(4096)) {
+                Ok(bytes) => {
+                    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    format!("{}\n--end--\n", hex.join(" "))
+                }
+                Err(e) => format!("error {e}\n--end--\n"),
+            }
+        }
+        (Some("kmsg"), _) => match read_kmsg() {
+            Ok(text) => format!("{text}\n--end--\n"),
+            Err(e) => format!("error {e}\n--end--\n"),
+        },
         (Some("time"), Some(seconds)) => match seconds.parse::<i64>() {
             Ok(epoch) => match set_clock(epoch) {
                 Ok(()) => "ok\n".into(),
@@ -129,6 +173,88 @@ fn handle_control(line: &str) -> String {
         },
         _ => "error unknown\n".into(),
     }
+}
+
+/// Reads guest-physical memory through `/proc/kcore`, whose largest LOAD
+/// segment is the kernel's direct map of System RAM, laid out from the
+/// first RAM address in `/proc/iomem`.
+fn peek_physical(pa: u64, len: usize) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::{Seek, SeekFrom};
+    let iomem = std::fs::read_to_string("/proc/iomem")?;
+    let ram_start = iomem
+        .lines()
+        .find(|l| l.contains("System RAM"))
+        .and_then(|l| l.trim().split('-').next())
+        .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
+        .ok_or_else(|| std::io::Error::other("no System RAM in /proc/iomem"))?;
+    let mut kcore = std::fs::File::open("/proc/kcore")?;
+    let mut ehdr = [0u8; 64];
+    kcore.read_exact(&mut ehdr)?;
+    let phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+    let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as u64;
+    let phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as u64;
+    // The direct map of System RAM: the LOAD segment whose physical address
+    // is the start of RAM, and the largest such (the kernel image is a
+    // smaller one at the same physical address).
+    let mut best: Option<(u64, u64, u64)> = None; // (offset, vaddr, memsz)
+    for i in 0..phnum {
+        kcore.seek(SeekFrom::Start(phoff + i * phentsize))?;
+        let mut ph = [0u8; 56];
+        kcore.read_exact(&mut ph)?;
+        let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
+        if p_type != 1 {
+            continue;
+        }
+        let offset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
+        let vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
+        let paddr = u64::from_le_bytes(ph[24..32].try_into().unwrap());
+        let memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
+        if paddr != ram_start {
+            continue;
+        }
+        if best.map_or(true, |(_, _, m)| memsz > m) {
+            best = Some((offset, vaddr, memsz));
+        }
+    }
+    let (offset, _vaddr, memsz) = best.ok_or_else(|| std::io::Error::other("no LOAD segment"))?;
+    if pa < ram_start || pa - ram_start + len as u64 > memsz {
+        return Err(std::io::Error::other("address outside System RAM"));
+    }
+    kcore.seek(SeekFrom::Start(offset + (pa - ram_start)))?;
+    let mut buf = vec![0u8; len];
+    kcore.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// The kernel log, read record by record from `/dev/kmsg` until it has no
+/// more, without blocking.
+fn read_kmsg() -> Result<String, std::io::Error> {
+    use std::os::fd::FromRawFd;
+    let path = std::ffi::CString::new("/dev/kmsg").expect("static path");
+    // SAFETY: a valid C string; the descriptor is owned below.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: just opened, owned by nothing else.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut out = String::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if out.len() > (1 << 18) {
+                    out.drain(..out.len() - (1 << 17));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
 }
 
 /// Sets the guest's wall clock.

@@ -146,6 +146,11 @@ pub struct Virtqueue {
     /// one" — so the device has to remember where it last told the driver it
     /// had got to.
     signalled_used: u16,
+    /// Slots completed on a packed ring, free-running: the position wraps at
+    /// the ring size, and a batch of exactly one ring looks like nothing
+    /// happened to it. See `needs_interrupt_packed`.
+    used_total: u16,
+    signalled_total: u16,
     /// How many ring slots each buffer id occupied when it was taken.
     ///
     /// Only the packed layout needs it, and it is not optional there: the
@@ -183,6 +188,8 @@ impl Virtqueue {
             suppressed: false,
             published_event: None,
             signalled_used: 0,
+            used_total: 0,
+            signalled_total: 0,
             chain_len: Vec::new(),
             outstanding: Vec::new(),
         }
@@ -340,6 +347,9 @@ impl Virtqueue {
         if avail_idx == self.next_avail {
             return None;
         }
+        // The driver writes the entry, a write barrier, then the index; the
+        // loads below must not be reordered ahead of the load of the index.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
         // The ring holds `size` entries and wraps; `idx` itself wraps at 2^16.
         let slot = u64::from(self.next_avail % self.size);
@@ -557,6 +567,7 @@ impl Virtqueue {
             self.used_wrap = !self.used_wrap;
         }
         self.next_used = (next % self.size as u32) as u16;
+        self.used_total = self.used_total.wrapping_add(slots);
     }
 
     /// How many chains the driver has made available that we have not taken.
@@ -655,11 +666,9 @@ impl Virtqueue {
         let Ok(wanted) = mem.read_u16(self.used_event_addr()) else {
             return true;
         };
-        let owed = need_event(wanted, self.next_used, self.signalled_used);
-        if owed {
-            self.signalled_used = self.next_used;
-        }
-        owed
+        let old = self.signalled_used;
+        self.signalled_used = self.next_used;
+        need_event(wanted, self.next_used, old)
     }
 
     /// The packed layout's version of the same question.
@@ -671,10 +680,28 @@ impl Virtqueue {
     /// time, with the event position pulled back a full ring when the driver's
     /// lap counter and ours disagree.
     fn needs_interrupt_packed(&mut self, mem: &GuestMemory) -> bool {
-        let Ok(off_wrap) = mem.read_u16(self.avail_addr) else {
+        // The interval test needs counters that do not wrap at the ring: a
+        // packed ring's positions do, so a batch of exactly one ring (a
+        // driver that parked, a guest that filled the ring behind it, and
+        // one pass that completed all of it) leaves `next_used` where it
+        // was and reads as "nothing new". The driver had polled before the
+        // batch and sleeps on the first entry of it, forever. So the device
+        // keeps a free-running count of slots completed, and the driver's
+        // position is turned into the same domain: how far behind the cursor
+        // it is, in its lap or the one before. `old` is the count at the
+        // previous check, whatever that check decided.
+        let old = self.signalled_total;
+        let new = self.used_total;
+        self.signalled_total = new;
+        // Flags first, then the position, with a load barrier between: the
+        // driver writes the position, a write barrier, then the flags that
+        // make it current, and two plain loads may complete in either order
+        // on aarch64.
+        let Ok(flags) = mem.read_u16(self.avail_addr + 2) else {
             return true;
         };
-        let Ok(flags) = mem.read_u16(self.avail_addr + 2) else {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let Ok(off_wrap) = mem.read_u16(self.avail_addr) else {
             return true;
         };
         match flags {
@@ -684,17 +711,16 @@ impl Virtqueue {
             // often than it asked is wasteful, telling it less is a hang.
             _ => return true,
         }
-
-        let old = self.signalled_used;
-        let new = self.next_used;
-        self.signalled_used = new;
-
+        // How far behind our cursor the driver's position is: the modular
+        // distance, which already spans a lap boundary — and exactly one
+        // ring when the distance is zero but the laps differ.
         let wrap = off_wrap >> event::WRAP_SHIFT != 0;
-        let mut wanted = off_wrap & !(1 << event::WRAP_SHIFT);
-        if wrap != self.used_wrap {
-            wanted = wanted.wrapping_sub(self.size);
+        let pos = off_wrap & !(1 << event::WRAP_SHIFT);
+        let mut behind = self.next_used.wrapping_sub(pos) % self.size;
+        if behind == 0 && wrap != self.used_wrap {
+            behind = self.size;
         }
-        need_event(wanted, new, old)
+        need_event(new.wrapping_sub(behind), new, old)
     }
 
     /// Tells the driver we want to hear about the next thing it publishes.
@@ -1353,6 +1379,135 @@ mod tests {
                 .read_u16(DESC + u64::from(index) * 16 + 14)
                 .unwrap()
         }
+    }
+
+    /// A packed ring's positions wrap at its size, so "where we last
+    /// signalled" goes stale within a lap: the driver spends most of a busy
+    /// stretch with interrupts disabled, every check in that stretch must
+    /// still move the cursor, and one that does not leaves a number from the
+    /// previous lap that can sit inside the interval the next check tests —
+    /// reading as "already told" for a completion the driver is asleep on.
+    #[test]
+    #[ignore]
+    fn a_packed_check_moves_the_cursor_even_when_interrupts_are_disabled() {
+        with_vm(|vm| {
+            let mut h = Harness::packed(vm, 8);
+            h.queue.set_event_idx(true);
+            let lap1 = VIRTQ_DESC_F_AVAIL;
+            let lap2 = VIRTQ_DESC_F_USED;
+            let complete = |h: &mut Harness, pos: u16, lap: u16| {
+                h.write_packed(pos, DATA, 16, pos, lap);
+                let chain = h.queue.pop(&h.mem).expect("published chain");
+                let id = chain.head();
+                drop(chain);
+                h.queue.push_used(&h.mem, id, 0);
+            };
+            let driver = |h: &Harness, off_wrap: u16, flags: u16| {
+                h.mem.write_u16(AVAIL, off_wrap).unwrap();
+                h.mem.write_u16(AVAIL + 2, flags).unwrap();
+            };
+
+            // The driver waits at the start of lap one; three completions
+            // cross it, and the interrupt is owed.
+            driver(&h, 1 << event::WRAP_SHIFT, event::DESC);
+            for pos in 0..3 {
+                complete(&mut h, pos, lap1);
+            }
+            assert!(h.queue.needs_interrupt(&h.mem));
+
+            // It disables interrupts to process, and stays that way through
+            // the rest of lap one and into lap two: no interrupt is owed for
+            // any of these, but every check is a check.
+            driver(&h, 1 << event::WRAP_SHIFT, event::DISABLE);
+            for pos in 3..8 {
+                complete(&mut h, pos, lap1);
+                assert!(!h.queue.needs_interrupt(&h.mem));
+            }
+            for pos in 0..2 {
+                complete(&mut h, pos, lap2);
+                assert!(!h.queue.needs_interrupt(&h.mem));
+            }
+
+            // It re-arms at lap two, position 2, polls, sees nothing, and
+            // sleeps. The completion that lands there is owed an interrupt —
+            // and a cursor left at lap one's position 3 says otherwise.
+            driver(&h, 2, event::DESC);
+            complete(&mut h, 2, lap2);
+            assert!(
+                h.queue.needs_interrupt(&h.mem),
+                "the driver is asleep on this completion"
+            );
+        });
+    }
+
+    /// A packed ring's positions wrap at its size. A driver that re-arms at
+    /// position p and sleeps, a guest that then fills the whole ring behind
+    /// it, and one device pass that completes all of it leaves the device's
+    /// position at p again — and an interval test on positions reads that
+    /// as nothing new. The completion the driver sleeps on is the first of
+    /// the batch. This is the hang the block poller found: it drains a full
+    /// ring in one pass where a vCPU serviced a kick at a time.
+    #[test]
+    #[ignore]
+    fn a_batch_of_exactly_one_ring_still_owes_the_interrupt() {
+        with_vm(|vm| {
+            let mut h = Harness::packed(vm, 8);
+            h.queue.set_event_idx(true);
+            let lap1 = VIRTQ_DESC_F_AVAIL;
+            let lap2 = VIRTQ_DESC_F_USED;
+            let complete = |h: &mut Harness, pos: u16, lap: u16| {
+                h.write_packed(pos, DATA, 16, pos, lap);
+                let chain = h.queue.pop(&h.mem).expect("published chain");
+                let id = chain.head();
+                drop(chain);
+                h.queue.push_used(&h.mem, id, 0);
+            };
+            let driver = |h: &Harness, off_wrap: u16, flags: u16| {
+                h.mem.write_u16(AVAIL, off_wrap).unwrap();
+                h.mem.write_u16(AVAIL + 2, flags).unwrap();
+            };
+
+            // Three completions in lap one; the driver consumes them and
+            // re-arms at position 3, still lap one.
+            driver(&h, 1 << event::WRAP_SHIFT, event::DESC);
+            for pos in 0..3 {
+                complete(&mut h, pos, lap1);
+            }
+            assert!(h.queue.needs_interrupt(&h.mem));
+            driver(&h, 3 | 1 << event::WRAP_SHIFT, event::DESC);
+
+            // The guest fills the whole ring behind it — positions 3..7 of
+            // lap one and 0..2 of lap two — and one pass completes all eight.
+            for pos in 3..8 {
+                complete(&mut h, pos, lap1);
+            }
+            for pos in 0..3 {
+                complete(&mut h, pos, lap2);
+            }
+            assert_eq!(h.queue.next_used, 3, "back where it started");
+            assert!(
+                h.queue.needs_interrupt(&h.mem),
+                "the driver sleeps on position 3 of lap one, the first of the batch"
+            );
+
+            // And having been told, nothing more is owed until it re-arms.
+            assert!(!h.queue.needs_interrupt(&h.mem));
+
+            // The lap boundary: the driver parks on the last slot of lap
+            // two; completing it moves the device to slot 0 of lap three,
+            // one slot on — not one ring and one slot.
+            for pos in 3..7 {
+                complete(&mut h, pos, lap2);
+            }
+            assert!(h.queue.needs_interrupt(&h.mem));
+            driver(&h, 7, event::DESC);
+            complete(&mut h, 7, lap2);
+            assert_eq!(h.queue.next_used, 0);
+            assert!(
+                h.queue.needs_interrupt(&h.mem),
+                "the driver sleeps on the last slot of the lap just completed"
+            );
+        });
     }
 
     /// The driver marks a descriptor as its turn by setting the availability

@@ -18,8 +18,6 @@ const GIC_SPI: u32 = 0;
 const GIC_PPI: u32 = 1;
 /// `IRQ_TYPE_LEVEL_HIGH`.
 const IRQ_LEVEL_HIGH: u32 = 4;
-/// `IRQ_TYPE_EDGE_RISING`.
-const IRQ_EDGE_RISING: u32 = 1;
 
 /// PPI numbers for the ARM generic timer.
 ///
@@ -206,7 +204,7 @@ pub fn build(params: &FdtParams<'_>) -> Result<Vec<u8>, FdtError> {
         fdt.property_array_u64("reg", &[window.base, window.size])?;
         fdt.property_array_u32(
             "interrupts",
-            &[GIC_SPI, layout.virtio_spi(index), IRQ_EDGE_RISING],
+            &[GIC_SPI, layout.virtio_spi(index), IRQ_LEVEL_HIGH],
         )?;
         fdt.end_node(node)?;
     }

@@ -152,6 +152,7 @@ unsafe extern "C" {
     pub fn hv_gic_create(config: hv_gic_config_t) -> hv_return_t;
     pub fn hv_gic_reset() -> hv_return_t;
     pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
+    pub fn hv_gic_get_distributor_reg(reg: u16, value: *mut u64) -> hv_return_t;
     pub fn hv_gic_send_msi(address: hv_ipa_t, intid: u32) -> hv_return_t;
 
     pub fn hv_gic_get_distributor_size(size: *mut usize) -> hv_return_t;

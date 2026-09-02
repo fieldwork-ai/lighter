@@ -100,10 +100,8 @@ impl Kicks {
     }
 }
 
-/// How long the poller watches after the last request, from the environment.
-///
-/// The default is zero, which is off. Setting it enables an experiment that
-/// currently hangs the guest; see the note at the top of the file.
+/// How long the poller watches after the last request, from the environment;
+/// zero turns the watcher off.
 fn idle_window() -> std::time::Duration {
     match std::env::var("LIGHTER_HOST_POLL_US")
         .ok()

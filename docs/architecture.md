@@ -48,6 +48,8 @@ virtio-mmio rather than PCI: no host bridge to model, no enumeration, and a devi
 - **balloon** — with free page reporting, which is how memory comes back.
 - **rng**, **console**.
 
+Two things about the transport are not obvious from the specification. The interrupt line is level-triggered and follows the status word: raising sets a bit and acknowledging clears one, and whichever side changed the status re-derives the line under one lock (`bus::InterruptLine`), so the two can interleave any way they like without leaving the status set and the line low. And the event-index decision on a packed ring runs on free-running counters, not ring positions: a driver that re-arms and sleeps, a guest that fills the whole ring behind it, and one host pass that completes all of it puts the device's position back where it started, which an interval test on positions reads as nothing new — the completion the driver sleeps on is the first of the batch. Block queues are drained by the same host watcher the shares use, so under load no vCPU services a disk request or waits on the transport lock behind one that is; that watcher is what makes a full-ring batch routine.
+
 ## The guest
 
 Built from source, not borrowed. `guest/kernel/` holds a configuration and four patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.

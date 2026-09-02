@@ -363,6 +363,7 @@ setup_lighter() {
 		--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
 		--net "$GVPROXY" --run-dir "$RUN_DIR" \
 		--vsock "$SOCKET:2375" \
+		--vsock "$RUN_DIR/control.sock:2376" \
 		--share "bench:$WORK" \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "${BENCH_MEMORY_MIB:-8192}" \
 		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \

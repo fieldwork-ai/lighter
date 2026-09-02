@@ -53,6 +53,64 @@ pub struct LockfreeInterrupt {
     pub status: Arc<std::sync::atomic::AtomicU32>,
     pub status_offset: u64,
     pub ack_offset: u64,
+    pub line: Arc<InterruptLine>,
+}
+
+/// A level-triggered line that follows a status word.
+///
+/// The line is high exactly while the status is non-zero. Raising (a device
+/// thread sets a bit) and acknowledging (the guest clears bits) each change
+/// the status and then re-derive the line under one lock, so the two can
+/// interleave any way they like and the line still ends up matching the
+/// status. Driving the line as two independent two-step sequences does not:
+/// a raise that set the bit and lifted the line, followed by an
+/// acknowledgement of an *earlier* interrupt that dropped the line, left the
+/// status set with the line low — a completion the guest was never told
+/// about, and a data disk wedged one lap behind its driver.
+pub struct InterruptLine {
+    status: Arc<std::sync::atomic::AtomicU32>,
+    irq: Arc<dyn crate::irq::IrqLine>,
+    level: std::sync::Mutex<bool>,
+}
+
+impl InterruptLine {
+    pub fn new(
+        status: Arc<std::sync::atomic::AtomicU32>,
+        irq: Arc<dyn crate::irq::IrqLine>,
+    ) -> InterruptLine {
+        InterruptLine {
+            status,
+            irq,
+            level: std::sync::Mutex::new(false),
+        }
+    }
+
+    /// Sets `bits` in the status and lifts the line.
+    pub fn raise(&self, bits: u32) {
+        self.status
+            .fetch_or(bits, std::sync::atomic::Ordering::AcqRel);
+        self.sync();
+    }
+
+    /// Clears `bits` from the status and drops the line if nothing is left.
+    pub fn acknowledge(&self, bits: u32) {
+        self.status
+            .fetch_and(!bits, std::sync::atomic::Ordering::AcqRel);
+        self.sync();
+    }
+
+    /// Makes the line match the status.
+    ///
+    /// The status is re-read under the lock, so the last of two racing
+    /// callers decides with the latest value, whichever changed it.
+    fn sync(&self) {
+        let mut level = self.level.lock().expect("interrupt line poisoned");
+        let want = self.status.load(std::sync::atomic::Ordering::Acquire) != 0;
+        if *level != want {
+            self.irq.set_level(want);
+            *level = want;
+        }
+    }
 }
 
 /// A decoded MMIO access.
@@ -255,9 +313,7 @@ impl MmioBus {
                     && data.len() == 4
                 {
                     let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    interrupt
-                        .status
-                        .fetch_and(!value, std::sync::atomic::Ordering::AcqRel);
+                    interrupt.line.acknowledge(value);
                     return true;
                 }
                 entry
