@@ -71,7 +71,12 @@ pub struct VirtioMmio {
 
     queue_sel: u32,
     device_status: u32,
-    interrupt_status: u32,
+    /// Shared with the bus, which serves INTERRUPT_STATUS reads and
+    /// INTERRUPT_ACK writes from it without taking this device's lock: the
+    /// vCPU acknowledging a completion otherwise queued behind the vCPU
+    /// submitting the next request, and a stream of 4 KiB writes spent as
+    /// long waiting for that lock as running the guest.
+    interrupt_status: std::sync::Arc<std::sync::atomic::AtomicU32>,
     config_generation: u32,
     /// Set once `DRIVER_OK` has been seen, so activation happens exactly once.
     activated: bool,
@@ -183,7 +188,7 @@ impl VirtioMmio {
             acked_features: 0,
             queue_sel: 0,
             device_status: 0,
-            interrupt_status: 0,
+            interrupt_status: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             config_generation: 0,
             activated: false,
             kick_observer: None,
@@ -207,7 +212,8 @@ impl VirtioMmio {
         self.device.reset();
         self.device_status = 0;
         self.acked_features = 0;
-        self.interrupt_status = 0;
+        self.interrupt_status
+            .store(0, std::sync::atomic::Ordering::Release);
         self.queue_sel = 0;
         self.activated = false;
         self.irq.set_level(false);
@@ -313,7 +319,8 @@ impl VirtioMmio {
             }
         }
         if wants_interrupt {
-            self.interrupt_status |= INT_VRING;
+            self.interrupt_status
+                .fetch_or(INT_VRING, std::sync::atomic::Ordering::AcqRel);
             // The device tree declares these lines edge-triggered, matching
             // what every aarch64 guest expects from virtio-mmio, so a pulse is
             // what delivers the interrupt.
@@ -351,7 +358,9 @@ impl VirtioMmio {
                 .queues
                 .get(self.queue_sel as usize)
                 .map_or(0, |q| u32::from(q.is_ready())),
-            INTERRUPT_STATUS => self.interrupt_status,
+            INTERRUPT_STATUS => self
+                .interrupt_status
+                .load(std::sync::atomic::Ordering::Acquire),
             STATUS => self.device_status,
             CONFIG_GENERATION => self.config_generation,
             SHM_LEN_LOW | SHM_LEN_HIGH => {
@@ -429,7 +438,8 @@ impl VirtioMmio {
                 self.notify_queue(value as u16)
             }
             INTERRUPT_ACK => {
-                self.interrupt_status &= !value;
+                self.interrupt_status
+                    .fetch_and(!value, std::sync::atomic::Ordering::AcqRel);
             }
             STATUS => self.set_status(value),
             QUEUE_DESC_LOW => self.set_queue_addr(|q| &mut q.desc_addr, value, false),
@@ -466,7 +476,8 @@ impl VirtioMmio {
     /// balloon's target size is the case that matters here.
     pub fn notify_config_change(&mut self) {
         self.config_generation = self.config_generation.wrapping_add(1);
-        self.interrupt_status |= INT_CONFIG;
+        self.interrupt_status
+            .fetch_or(INT_CONFIG, std::sync::atomic::Ordering::AcqRel);
         self.irq.pulse();
     }
 
@@ -559,6 +570,14 @@ impl VirtioMmio {
 }
 
 impl MmioDevice for VirtioMmio {
+    fn lockfree_interrupt(&self) -> Option<crate::bus::LockfreeInterrupt> {
+        Some(crate::bus::LockfreeInterrupt {
+            status: self.interrupt_status.clone(),
+            status_offset: INTERRUPT_STATUS,
+            ack_offset: INTERRUPT_ACK,
+        })
+    }
+
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         // Configuration space is byte-addressable; the register file is not.
         if offset >= CONFIG_SPACE {
@@ -755,7 +774,8 @@ mod tests {
     #[test]
     fn interrupt_status_is_write_one_to_clear() {
         let mut t = transport();
-        t.interrupt_status = INT_VRING | INT_CONFIG;
+        t.interrupt_status
+            .store(INT_VRING | INT_CONFIG, std::sync::atomic::Ordering::Release);
         write32(&mut t, INTERRUPT_ACK, INT_VRING);
         assert_eq!(read32(&mut t, INTERRUPT_STATUS), INT_CONFIG);
     }

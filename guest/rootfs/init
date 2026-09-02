@@ -113,6 +113,11 @@ if [ -b "$DATA_DEV" ]; then
 		esac
 	done
 	echo "INIT data_opts=$DATA_OPTS"
+	# No I/O scheduler on a virtual disk: the host's page cache is behind it
+	# and there is nothing to reorder for. mq-deadline, the kernel's default
+	# for a single-queue virtio-blk, cost a sync of twenty thousand fresh
+	# files twice its time (330 ms to 160).
+	echo none > "/sys/block/${DATA_DEV#/dev/}/queue/scheduler" 2>/dev/null
 	if mount -o "$DATA_OPTS" "$DATA_DEV" /mnt/data; then
 		echo "INIT data=mounted"
 		mkdir -p /mnt/data/docker

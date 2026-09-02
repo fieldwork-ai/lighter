@@ -143,55 +143,52 @@ impl Block {
         }
     }
 
-    fn read(&self, sector: u64, body: &[Descriptor], mem: &GuestMemory) -> (u8, u32) {
-        let mut offset = sector * SECTOR_SIZE;
-        let mut written = 0u32;
+    /// The data descriptors of a request as iovecs over the guest's own
+    /// pages, so the disk reads into or writes from them directly. `None`
+    /// when a descriptor points outside guest memory, is too long, or runs
+    /// the wrong way for the request — a read whose data region the device
+    /// may not write is malformed, and serving it would write nowhere useful.
+    fn spans(body: &[Descriptor], mem: &GuestMemory, writable: bool) -> Option<Vec<libc::iovec>> {
+        let mut iovs = Vec::with_capacity(body.len());
         for desc in body {
-            if !desc.is_write_only() {
-                // A read request whose data region the device may not write is
-                // malformed; serving it would write nowhere useful.
-                return (S_IOERR, written);
+            if desc.is_write_only() != writable {
+                return None;
             }
             let len = desc.len as usize;
             if len > MAX_TRANSFER {
-                return (S_IOERR, written);
+                return None;
             }
-            let mut buf = vec![0u8; len];
-            if self.disk.read_at(offset, &mut buf).is_err() {
-                return (S_IOERR, written);
-            }
-            if mem.write(desc.addr, &buf).is_err() {
-                return (S_IOERR, written);
-            }
-            offset += len as u64;
-            written += desc.len;
+            let base = mem.host_span(desc.addr, len).ok()?;
+            iovs.push(libc::iovec {
+                iov_base: base.cast(),
+                iov_len: len,
+            });
         }
-        (S_OK, written)
+        Some(iovs)
+    }
+
+    fn read(&self, sector: u64, body: &[Descriptor], mem: &GuestMemory) -> (u8, u32) {
+        let Some(mut iovs) = Self::spans(body, mem, true) else {
+            return (S_IOERR, 0);
+        };
+        let total: usize = iovs.iter().map(|iov| iov.iov_len).sum();
+        match self.disk.read_vectored_at(sector * SECTOR_SIZE, &mut iovs) {
+            Ok(()) => (S_OK, total as u32),
+            Err(_) => (S_IOERR, 0),
+        }
     }
 
     fn write(&self, sector: u64, body: &[Descriptor], mem: &GuestMemory) -> u8 {
         if self.read_only {
             return S_IOERR;
         }
-        let mut offset = sector * SECTOR_SIZE;
-        for desc in body {
-            if desc.is_write_only() {
-                return S_IOERR;
-            }
-            let len = desc.len as usize;
-            if len > MAX_TRANSFER {
-                return S_IOERR;
-            }
-            let mut buf = vec![0u8; len];
-            if mem.read(desc.addr, &mut buf).is_err() {
-                return S_IOERR;
-            }
-            if self.disk.write_at(offset, &buf).is_err() {
-                return S_IOERR;
-            }
-            offset += len as u64;
+        let Some(mut iovs) = Self::spans(body, mem, false) else {
+            return S_IOERR;
+        };
+        match self.disk.write_vectored_at(sector * SECTOR_SIZE, &mut iovs) {
+            Ok(()) => S_OK,
+            Err(_) => S_IOERR,
         }
-        S_OK
     }
 
     fn get_id(&self, body: &[Descriptor], mem: &GuestMemory) -> (u8, u32) {

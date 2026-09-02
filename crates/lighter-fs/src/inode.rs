@@ -525,7 +525,11 @@ impl Inode {
     /// lost to whatever the second inode resolves.
     pub fn has_promises(&self) -> bool {
         self.pending_count.load(Ordering::Relaxed) != 0
-            || !self.pending_gone.lock().expect("pending gone poisoned").is_empty()
+            || !self
+                .pending_gone
+                .lock()
+                .expect("pending gone poisoned")
+                .is_empty()
     }
 
     pub fn pending_child(&self, name: &[u8]) -> Option<u64> {
@@ -928,10 +932,7 @@ impl Inode {
         // sweep finds it cold, and the chain above a working directory is
         // resident the next time.
         let budget = self.census.budget.load(Ordering::Relaxed);
-        if budget > 0
-            && !self.is_dir
-            && self.census.descriptors.load(Ordering::Relaxed) >= budget
-        {
+        if budget > 0 && !self.is_dir && self.census.descriptors.load(Ordering::Relaxed) >= budget {
             return Ok(Reference(fd));
         }
         self.held.store(true, Ordering::Relaxed);
@@ -1095,7 +1096,14 @@ impl Inode {
         let reference = match self.reference() {
             Ok(reference) => reference,
             Err(errno) => {
-                tracing::debug!(id = self.id(), errno, pending = self.is_pending(), dev, ino, "no reference; identity retired");
+                tracing::debug!(
+                    id = self.id(),
+                    errno,
+                    pending = self.is_pending(),
+                    dev,
+                    ino,
+                    "no reference; identity retired"
+                );
                 return false;
             }
         };
@@ -1103,7 +1111,13 @@ impl Inode {
             Ok(st) => {
                 let same = st.st_nlink > 0 && st.st_ino == ino && st.st_dev as i64 == dev;
                 if !same {
-                    tracing::debug!(id = self.id(), nlink = st.st_nlink, have_ino = st.st_ino, ino, "numbers moved; identity retired");
+                    tracing::debug!(
+                        id = self.id(),
+                        nlink = st.st_nlink,
+                        have_ino = st.st_ino,
+                        ino,
+                        "numbers moved; identity retired"
+                    );
                 }
                 same
             }
@@ -1611,8 +1625,7 @@ impl Registry {
     /// Drops an inode the guest has forgotten, once it is no longer a
     /// promise: the other half of `forget`'s exception for pending inodes.
     pub fn release_if_unwanted(&self, id: u64) {
-        let unwanted = self
-            .by_id[shard(id)]
+        let unwanted = self.by_id[shard(id)]
             .lock()
             .expect("inode table poisoned")
             .get(&id)
@@ -1645,7 +1658,13 @@ impl Registry {
                 // Two inodes for one file: the guest was told this id, the
                 // server will resolve the other. Loud, because every path
                 // that let it happen was a bug (`Server::entry_from`).
-                tracing::warn!(id, other = *slot.get(), dev, ino, "a pending inode's identity was already claimed");
+                tracing::warn!(
+                    id,
+                    other = *slot.get(),
+                    dev,
+                    ino,
+                    "a pending inode's identity was already claimed"
+                );
             }
             _ => {}
         }

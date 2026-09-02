@@ -301,10 +301,21 @@ else
 			else
 				fail "the container read: ${out:-nothing}"
 			fi
-			if [ "$(cat "$SHARE/from-container" 2>/dev/null)" = " and by a container" ]; then
+			# Promptly, not instantly: the write is acknowledged to the
+			# container and lands on the Mac a few milliseconds later, and
+			# on a loaded host that can be after `docker run` has returned.
+			seen=0
+			for _ in $(seq 1 40); do
+				if [ "$(cat "$SHARE/from-container" 2>/dev/null)" = " and by a container" ]; then
+					seen=1
+					break
+				fi
+				sleep 0.05
+			done
+			if [ "$seen" -eq 1 ]; then
 				pass "macOS sees a file the container wrote"
 			else
-				fail "the container's write did not reach macOS"
+				fail "the container's write did not reach macOS within two seconds"
 			fi
 		else
 			fail "docker run with a bind mount failed"

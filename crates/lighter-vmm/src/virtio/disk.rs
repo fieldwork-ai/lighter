@@ -38,11 +38,36 @@ struct FPunchhole {
 
 /// A disk image backed by a sparse host file.
 #[derive(Debug)]
+///
+/// Every request is one `preadv`/`pwritev` over the guest's own pages. The
+/// obvious faster path, the image mapped whole and requests served with a
+/// `memcpy`, was measured and rejected: a read through the mapping faults per
+/// page with no read-ahead (npm 13% slower), and a write faults on the first
+/// touch of every page, which a journal's scattered blocks pay in full — on
+/// an 8 GB M1, mapped writes made every case slower than the syscalls, npm by
+/// 20% and `rm -rf` by 35%, and were a wash on an M5 Pro.
 pub struct Disk {
     file: File,
     /// Logical size in bytes; the guest sees this as the disk's capacity.
     len: u64,
     read_only: bool,
+}
+
+/// Moves the start of `iovs` past the first `n` bytes, and says how many
+/// whole entries that consumed.
+fn advance(iovs: &mut [libc::iovec], mut n: usize) -> usize {
+    let mut done = 0;
+    for iov in iovs.iter_mut() {
+        if n < iov.iov_len {
+            // SAFETY: still inside the span the entry described.
+            iov.iov_base = unsafe { iov.iov_base.cast::<u8>().add(n) }.cast();
+            iov.iov_len -= n;
+            break;
+        }
+        n -= iov.iov_len;
+        done += 1;
+    }
+    done
 }
 
 impl Disk {
@@ -81,6 +106,90 @@ impl Disk {
             len,
             read_only,
         })
+    }
+
+    /// Reads `iovs` worth of bytes at `offset`, scattered straight into the
+    /// spans they name — the guest's own pages, for a block request — with
+    /// no host buffer in between.
+    pub fn read_vectored_at(&self, offset: u64, iovs: &mut [libc::iovec]) -> io::Result<()> {
+        let total: usize = iovs.iter().map(|iov| iov.iov_len).sum();
+        self.check_range(offset, total as u64)?;
+        let mut at = 0;
+        let mut offset = offset;
+        let mut left = total;
+        while left > 0 {
+            let rest = &mut iovs[at..];
+            let count = rest.len().min(libc::IOV_MAX as usize) as libc::c_int;
+            // SAFETY: every span was produced by the caller for this call and
+            // outlives it; the descriptor is ours.
+            let n = unsafe {
+                libc::preadv(
+                    self.file.as_raw_fd(),
+                    rest.as_ptr(),
+                    count,
+                    offset as libc::off_t,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let n = n as usize;
+            at += advance(rest, n);
+            offset += n as u64;
+            left -= n;
+        }
+        Ok(())
+    }
+
+    /// Writes `iovs` worth of bytes at `offset`, gathered straight from the
+    /// spans they name, in one `pwritev`.
+    pub fn write_vectored_at(&self, offset: u64, iovs: &mut [libc::iovec]) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "disk is read-only",
+            ));
+        }
+        let total: usize = iovs.iter().map(|iov| iov.iov_len).sum();
+        self.check_range(offset, total as u64)?;
+        let mut at = 0;
+        let mut offset = offset;
+        let mut left = total;
+        while left > 0 {
+            let rest = &mut iovs[at..];
+            let count = rest.len().min(libc::IOV_MAX as usize) as libc::c_int;
+            // SAFETY: as for reads.
+            let n = unsafe {
+                libc::pwritev(
+                    self.file.as_raw_fd(),
+                    rest.as_ptr(),
+                    count,
+                    offset as libc::off_t,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            let n = n as usize;
+            at += advance(rest, n);
+            offset += n as u64;
+            left -= n;
+        }
+        Ok(())
     }
 
     /// Capacity in 512-byte sectors, which is what the guest's config space

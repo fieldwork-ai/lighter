@@ -29,6 +29,30 @@ pub trait MmioDevice: Send {
 
     /// A short name for diagnostics.
     fn name(&self) -> &'static str;
+
+    /// An interrupt status word the bus may serve without this device's
+    /// lock, if the device keeps one. See [`LockfreeInterrupt`].
+    fn lockfree_interrupt(&self) -> Option<LockfreeInterrupt> {
+        None
+    }
+}
+
+/// An interrupt status register served from an atomic, outside the device
+/// lock.
+///
+/// Every device lives behind one mutex, and the two registers a guest
+/// touches on every interrupt — read the status, write the acknowledgement
+/// — took it too. A completion interrupt lands on whichever vCPU the GIC
+/// chooses, and its acknowledgement then queued behind the vCPU submitting
+/// the next request, which holds the lock for the whole of the request's
+/// service. A stream of 4 KiB writes spent as long in that wait as in the
+/// guest. Reads of `status_offset` and writes of `ack_offset` (write-one-
+/// to-clear) go to `status` directly.
+#[derive(Clone)]
+pub struct LockfreeInterrupt {
+    pub status: Arc<std::sync::atomic::AtomicU32>,
+    pub status_offset: u64,
+    pub ack_offset: u64,
 }
 
 /// A decoded MMIO access.
@@ -139,6 +163,7 @@ pub struct MmioBus {
 struct Entry {
     window: Window,
     device: Arc<Mutex<dyn MmioDevice>>,
+    interrupt: Option<LockfreeInterrupt>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -168,7 +193,15 @@ impl MmioBus {
                 end: window.end(),
             });
         }
-        self.entries.push(Entry { window, device });
+        let interrupt = device
+            .lock()
+            .expect("device mutex poisoned")
+            .lockfree_interrupt();
+        self.entries.push(Entry {
+            window,
+            device,
+            interrupt,
+        });
         self.entries.sort_by_key(|e| e.window.base);
         Ok(())
     }
@@ -189,6 +222,14 @@ impl MmioBus {
         match self.find(address) {
             Some(entry) => {
                 let offset = address - entry.window.base;
+                if let Some(interrupt) = &entry.interrupt
+                    && offset == interrupt.status_offset
+                    && data.len() == 4
+                {
+                    let status = interrupt.status.load(std::sync::atomic::Ordering::Acquire);
+                    data.copy_from_slice(&status.to_le_bytes());
+                    return true;
+                }
                 entry
                     .device
                     .lock()
@@ -209,6 +250,16 @@ impl MmioBus {
         match self.find(address) {
             Some(entry) => {
                 let offset = address - entry.window.base;
+                if let Some(interrupt) = &entry.interrupt
+                    && offset == interrupt.ack_offset
+                    && data.len() == 4
+                {
+                    let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    interrupt
+                        .status
+                        .fetch_and(!value, std::sync::atomic::Ordering::AcqRel);
+                    return true;
+                }
                 entry
                     .device
                     .lock()

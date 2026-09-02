@@ -41,7 +41,7 @@ There is no firmware. The device tree is the only description the kernel gets of
 
 virtio-mmio rather than PCI: no host bridge to model, no enumeration, and a device set fixed at boot by the device tree.
 
-- **block** — a sparse file, with discard becoming `F_PUNCHHOLE`, which is what makes deleting an image give space back.
+- **block** — a sparse file, with discard becoming `F_PUNCHHOLE`, which is what makes deleting an image give space back. Every request is one `preadv`/`pwritev` straight over the guest's pages; mapping the image was measured and lost (see `Disk`).
 - **net** — frames to `gvproxy`, a userspace network stack running as a sidecar. It is the one component we did not write, consumed over a documented socket protocol so it can be replaced by a native stack without anything else moving.
 - **vsock** — the Docker socket and the control channel, independent of the guest's routing table.
 - **fs** — one device per shared directory. The requests leave the vCPU thread immediately, because a syscall on a vCPU stops that core and a package install makes hundreds of thousands of them.

@@ -28,10 +28,11 @@
 //! reference-counted and an operation in flight holds a strong reference to it.
 
 use std::collections::VecDeque;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use lighter_fs::{Server, Sink, SinkFull};
+use lighter_fs::{FillError, Server, Sink, SinkFull};
 
 use crate::memory::GuestMemory;
 use crate::virtio::mmio::COMMON_FEATURES;
@@ -227,6 +228,77 @@ impl Sink for ChainSink {
             self.offset += take as u32;
             self.remaining -= take;
             data = &data[take..];
+        }
+        Ok(())
+    }
+
+    fn fill(&mut self, fd: RawFd, offset: u64, len: usize) -> Result<usize, FillError> {
+        if len > self.remaining {
+            return Err(FillError::Full);
+        }
+        // The chain from here, as iovecs over the host side of the guest's
+        // pages, for one scattered read.
+        let mut iovs: Vec<libc::iovec> = Vec::new();
+        let mut want = len;
+        let mut at = self.at;
+        let mut skip = self.offset;
+        while want > 0 {
+            let Some(&(addr, seg_len)) = self.segments.get(at) else {
+                return Err(FillError::Full);
+            };
+            let room = (seg_len - skip) as usize;
+            if room > 0 {
+                let take = room.min(want);
+                let base = self
+                    .memory
+                    .host_span(addr + u64::from(skip), take)
+                    .map_err(|_| FillError::Full)?;
+                iovs.push(libc::iovec {
+                    iov_base: base.cast(),
+                    iov_len: take,
+                });
+                want -= take;
+            }
+            at += 1;
+            skip = 0;
+        }
+        let read = lighter_fs::sys::read_vectored_at(fd, &iovs, offset).map_err(FillError::Read)?;
+        // Advance past what arrived, segment by segment.
+        let mut left = read;
+        while left > 0 {
+            let (_, seg_len) = self.segments[self.at];
+            let room = (seg_len - self.offset) as usize;
+            let take = room.min(left);
+            self.offset += take as u32;
+            left -= take;
+            if self.offset == seg_len {
+                self.at += 1;
+                self.offset = 0;
+            }
+        }
+        self.remaining -= read;
+        Ok(read)
+    }
+
+    fn rewrite_head(&mut self, mut head: &[u8]) -> Result<(), SinkFull> {
+        let written: usize = self
+            .segments
+            .iter()
+            .map(|(_, len)| *len as usize)
+            .sum::<usize>()
+            - self.remaining;
+        if head.len() > written {
+            return Err(SinkFull);
+        }
+        for &(addr, len) in &self.segments {
+            let take = (len as usize).min(head.len());
+            if self.memory.write(addr, &head[..take]).is_err() {
+                return Err(SinkFull);
+            }
+            head = &head[take..];
+            if head.is_empty() {
+                break;
+            }
         }
         Ok(())
     }
@@ -621,8 +693,10 @@ impl VirtioDevice for Fs {
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(every));
                         server.log_stats();
-                        let notifies = crate::virtio::mmio::NOTIFIES.load(std::sync::atomic::Ordering::Relaxed);
-                        let polled = crate::virtio::mmio::POLLED.load(std::sync::atomic::Ordering::Relaxed);
+                        let notifies = crate::virtio::mmio::NOTIFIES
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let polled =
+                            crate::virtio::mmio::POLLED.load(std::sync::atomic::Ordering::Relaxed);
                         tracing::info!(
                             notifies = notifies - last_notifies,
                             polled = polled - last_polled,

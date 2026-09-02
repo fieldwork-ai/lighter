@@ -36,4 +36,4 @@ pub mod server;
 pub mod stats;
 pub mod sys;
 
-pub use server::{MAX_WRITE, Server, Sink, SinkFull};
+pub use server::{FillError, MAX_WRITE, Server, Sink, SinkFull};

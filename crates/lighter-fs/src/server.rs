@@ -27,7 +27,7 @@
 //! through unchanged so that a genuinely foreign uid still looks foreign.
 
 use std::ffi::CString;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,11 +65,29 @@ pub trait Sink {
     /// [`Sink::capacity`], because a short reply is read by the guest as a
     /// well-formed reply about something else.
     fn write(&mut self, data: &[u8]) -> Result<(), SinkFull>;
+    /// Appends up to `len` bytes of `fd` from `offset`, read straight into
+    /// wherever the sink's bytes live, and says how many arrived. A READ
+    /// reply is most of the bytes the guest ever receives, and this is what
+    /// lets it cross from the file to the guest's pages in one copy.
+    fn fill(&mut self, fd: RawFd, offset: u64, len: usize) -> Result<usize, FillError>;
+    /// Overwrites the first `head.len()` bytes already written. A reply's
+    /// length is in its header, and a filled reply's length is only known
+    /// once the body is in place.
+    fn rewrite_head(&mut self, head: &[u8]) -> Result<(), SinkFull>;
 }
 
 /// The reply did not fit the buffers the guest supplied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinkFull;
+
+/// Why a [`Sink::fill`] delivered nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillError {
+    /// More was asked for than the sink can hold.
+    Full,
+    /// The read itself failed, with the Linux errno the guest should see.
+    Read(i32),
+}
 
 impl Sink for Vec<u8> {
     fn capacity(&self) -> usize {
@@ -80,6 +98,38 @@ impl Sink for Vec<u8> {
         self.extend_from_slice(data);
         Ok(())
     }
+
+    fn fill(&mut self, fd: RawFd, offset: u64, len: usize) -> Result<usize, FillError> {
+        let start = self.len();
+        self.resize(start + len, 0);
+        match sys::read_at(fd, &mut self[start..], offset) {
+            Ok(read) => {
+                self.truncate(start + read);
+                Ok(read)
+            }
+            Err(errno) => {
+                self.truncate(start);
+                Err(FillError::Read(errno))
+            }
+        }
+    }
+
+    fn rewrite_head(&mut self, head: &[u8]) -> Result<(), SinkFull> {
+        let slot = self.get_mut(..head.len()).ok_or(SinkFull)?;
+        slot.copy_from_slice(head);
+        Ok(())
+    }
+}
+
+/// What a handled request answers with.
+enum Reply {
+    Bytes(Vec<u8>),
+    /// Up to `len` bytes of an open file, to be read into the reply itself.
+    File {
+        file: Arc<OpenFile>,
+        offset: u64,
+        len: usize,
+    },
 }
 
 /// Why held-back creates were queued, by trigger: diagnostics, under
@@ -502,15 +552,20 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
         Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
         Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0),
         Located::At(parent, name) => {
-            let opened = sys::openat_path(parent.raw_fd(), &name, linux_flags | sys::LINUX_O_NOFOLLOW, 0)
-                .and_then(|fd| {
-                    let st = sys::stat_fd(fd.as_raw_fd())?;
-                    if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
-                        Ok(fd)
-                    } else {
-                        Err(linux::ESTALE)
-                    }
-                });
+            let opened = sys::openat_path(
+                parent.raw_fd(),
+                &name,
+                linux_flags | sys::LINUX_O_NOFOLLOW,
+                0,
+            )
+            .and_then(|fd| {
+                let st = sys::stat_fd(fd.as_raw_fd())?;
+                if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
+                    Ok(fd)
+                } else {
+                    Err(linux::ESTALE)
+                }
+            });
             match opened {
                 Ok(fd) => Ok(fd),
                 // The name has moved on; the file may not have.
@@ -640,7 +695,9 @@ impl Server {
             copy_max: copy_instead_of_clone_max(),
             debug_listing: std::env::var("LIGHTER_FS_DEBUG_LISTING").as_deref() == Ok("1"),
             debug_enoent: std::env::var("LIGHTER_FS_DEBUG_ENOENT").as_deref() == Ok("1"),
-            debug_name: std::env::var("LIGHTER_FS_DEBUG_NAME").ok().map(|n| n.into_bytes()),
+            debug_name: std::env::var("LIGHTER_FS_DEBUG_NAME")
+                .ok()
+                .map(|n| n.into_bytes()),
             xattrs: std::env::var("LIGHTER_FS_XATTR").as_deref() != Ok("0"),
             settler_stop,
             settler: std::sync::Mutex::new(Some(settler)),
@@ -745,12 +802,8 @@ impl Server {
             // never silent.
             tracing::warn!(errno, nodeid = header.nodeid, "LIGHTER_CLONE refused");
         }
-        if let Some(started) = started {
-            self.stats.record(header.opcode, started.elapsed());
-            self.stats.exit();
-        }
-        match outcome {
-            Ok(payload) => {
+        let written = match outcome {
+            Ok(Reply::Bytes(payload)) => {
                 let len = fuse::OUT_HEADER_LEN + payload.len();
                 if len > sink.capacity() {
                     // The guest sized the reply buffer, so this can only happen
@@ -762,24 +815,77 @@ impl Server {
                         capacity = sink.capacity(),
                         "reply does not fit the buffer the guest supplied"
                     );
-                    return write_error(sink, header.unique, linux::EIO);
+                    write_error(sink, header.unique, linux::EIO)
+                } else if sink.write(&out_header(len, 0, header.unique)).is_err()
+                    || sink.write(&payload).is_err()
+                {
+                    0
+                } else {
+                    len
                 }
-                let mut out = Vec::with_capacity(fuse::OUT_HEADER_LEN);
-                out.extend_from_slice(&(len as u32).to_le_bytes());
-                out.extend_from_slice(&0i32.to_le_bytes());
-                out.extend_from_slice(&header.unique.to_le_bytes());
-                if sink.write(&out).is_err() || sink.write(&payload).is_err() {
-                    return 0;
+            }
+            Ok(Reply::File { file, offset, len }) => {
+                // The body first, then the header it is measured by: the
+                // guest's driver takes the reply's length from the header
+                // and nothing else, and reads neither until the chain is
+                // returned.
+                if sink
+                    .write(&out_header(fuse::OUT_HEADER_LEN, 0, header.unique))
+                    .is_err()
+                {
+                    0
+                } else {
+                    match sink.fill(file.fd.as_raw_fd(), offset, len) {
+                        Ok(read) => {
+                            let len = fuse::OUT_HEADER_LEN + read;
+                            if sink
+                                .rewrite_head(&out_header(len, 0, header.unique))
+                                .is_err()
+                            {
+                                0
+                            } else {
+                                len
+                            }
+                        }
+                        Err(FillError::Full) => {
+                            tracing::error!(
+                                len,
+                                capacity = sink.capacity(),
+                                "read reply does not fit the buffer the guest supplied"
+                            );
+                            rewrite_error(sink, header.unique, linux::EIO)
+                        }
+                        Err(FillError::Read(errno)) => rewrite_error(sink, header.unique, errno),
+                    }
                 }
-                len
             }
             Err(code) => write_error(sink, header.unique, code),
+        };
+        if let Some(started) = started {
+            self.stats.record(header.opcode, started.elapsed());
+            self.stats.exit();
         }
+        written
     }
 
     /// Everything with a reply.
-    fn handle(&self, header: &InHeader, body: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
+    fn handle(&self, header: &InHeader, body: &[u8], capacity: usize) -> Result<Reply, i32> {
         let nodeid = self.resolve(header.nodeid);
+        if header.opcode == op::READ {
+            return self.read(nodeid, body, capacity);
+        }
+        self.handle_bytes(nodeid, header, body, capacity)
+            .map(Reply::Bytes)
+    }
+
+    /// Everything with a reply that is assembled on the host.
+    fn handle_bytes(
+        &self,
+        nodeid: u64,
+        header: &InHeader,
+        body: &[u8],
+        capacity: usize,
+    ) -> Result<Vec<u8>, i32> {
         match header.opcode {
             op::INIT => self.init(body),
             op::SYNCFS => {
@@ -820,7 +926,6 @@ impl Server {
 
             op::CREATE => self.create(nodeid, body),
             op::LIGHTER_CLONE => self.clone_over(body),
-            op::READ => self.read(nodeid, body, capacity),
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
             op::RELEASE | op::RELEASEDIR => {
@@ -871,7 +976,7 @@ impl Server {
                 .is_ok()
     }
 
-    fn trace(&self, header: &fuse::InHeader, body: &[u8], outcome: &Result<Vec<u8>, i32>) {
+    fn trace(&self, header: &fuse::InHeader, body: &[u8], outcome: &Result<Reply, i32>) {
         // The name, for the operations that carry one, at the offset each
         // request format keeps it.
         let name_at = |skip: usize| {
@@ -1314,7 +1419,8 @@ impl Server {
             && st.st_ino == inode.ino()
             && st.st_dev as i64 == inode.dev()
         {
-            let base = sys::identity_path(parent.raw_fd()).or_else(|_| sys::path_of(parent.raw_fd()))?;
+            let base =
+                sys::identity_path(parent.raw_fd()).or_else(|_| sys::path_of(parent.raw_fd()))?;
             return sys::c_path(&base.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
         }
         let fd = match inode.reference() {
@@ -1931,7 +2037,9 @@ impl Server {
                             match &via {
                                 Via::Raw(raw) => sys::chmod_fd(*raw, mode)?,
                                 Via::Fd(fd) => sys::chmod_fd(fd.raw_fd(), mode)?,
-                                Via::At(parent, name) => sys::chmod_at(parent.raw_fd(), name, mode)?,
+                                Via::At(parent, name) => {
+                                    sys::chmod_at(parent.raw_fd(), name, mode)?
+                                }
                             }
                         }
                         if change.atime.is_some() || change.mtime.is_some() {
@@ -2232,7 +2340,11 @@ impl Server {
                         &CString::new(entry.name.clone()).map_err(|_| linux::EINVAL)?,
                     )
                     .ok()
-                    .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino).map(|i| (i.id(), i)));
+                    .and_then(|st| {
+                        self.registry
+                            .identified(st.st_dev as i64, st.st_ino)
+                            .map(|i| (i.id(), i))
+                    });
                     tracing::warn!(
                         dir = %name.to_string_lossy(),
                         entry = %String::from_utf8_lossy(&entry.name),
@@ -2380,33 +2492,42 @@ impl Server {
             self.apply.drain();
         }
         if narrate {
-            tracing::warn!(parent = parent.id(), dir, "NAME-DEBUG unlink taking the synchronous path");
+            tracing::warn!(
+                parent = parent.id(),
+                dir,
+                "NAME-DEBUG unlink taking the synchronous path"
+            );
         }
         let result = sys::unlink_at(parent.reference()?.raw_fd(), &name, dir);
         if dir && result == Err(linux::ENOTEMPTY) && self.stats.enabled() {
             // What the host still holds, and what this server knows of each
             // name: the diagnostic for an `rm -rf` the guest believed had
             // emptied the directory.
-            let left: Vec<String> = sys::openat_path(parent.reference()?.raw_fd(), &name, 0o200000, 0)
-                .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter(|e| e.name != b"." && e.name != b"..")
-                        .take(12)
-                        .map(|e| {
-                            let known = self.registry.identified(parent.dev(), e.ino);
-                            format!(
-                                "{}:{}",
-                                String::from_utf8_lossy(&e.name),
-                                known
-                                    .map(|i| format!("known#{}{}", i.id(), if i.is_pending() { ",pending" } else { "" }))
-                                    .unwrap_or_else(|| "unknown".into())
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let left: Vec<String> =
+                sys::openat_path(parent.reference()?.raw_fd(), &name, 0o200000, 0)
+                    .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|e| e.name != b"." && e.name != b"..")
+                            .take(12)
+                            .map(|e| {
+                                let known = self.registry.identified(parent.dev(), e.ino);
+                                format!(
+                                    "{}:{}",
+                                    String::from_utf8_lossy(&e.name),
+                                    known
+                                        .map(|i| format!(
+                                            "known#{}{}",
+                                            i.id(),
+                                            if i.is_pending() { ",pending" } else { "" }
+                                        ))
+                                        .unwrap_or_else(|| "unknown".into())
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
             tracing::warn!(
                 dir = %name.to_string_lossy(),
                 left = ?left,
@@ -2697,7 +2818,12 @@ impl Server {
         }
         parent.add_pending_child(name.to_bytes(), nodeid);
         if self.debug_name.as_deref() == Some(name.to_bytes()) {
-            tracing::warn!(parent = parent.id(), nodeid, queued = self.apply.depth(), "NAME-DEBUG mkdir acknowledged, pending child added");
+            tracing::warn!(
+                parent = parent.id(),
+                nodeid,
+                queued = self.apply.depth(),
+                "NAME-DEBUG mkdir acknowledged, pending child added"
+            );
         }
         // The reply before the push: the promise is complete now, and a
         // job that runs before the reply is built would have bound the
@@ -2728,7 +2854,11 @@ impl Server {
                 match result {
                     Ok((fd, st)) => {
                         if debug {
-                            tracing::warn!(nodeid, ino = st.st_ino, "NAME-DEBUG mkdir job applied, binding");
+                            tracing::warn!(
+                                nodeid,
+                                ino = st.st_ino,
+                                "NAME-DEBUG mkdir job applied, binding"
+                            );
                         }
                         registry.bind_pending(nodeid, &inode, fd, st.st_dev as i64, st.st_ino);
                     }
@@ -3567,7 +3697,7 @@ impl Server {
         Ok(out)
     }
 
-    fn read(&self, nodeid: u64, body: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
+    fn read(&self, nodeid: u64, body: &[u8], capacity: usize) -> Result<Reply, i32> {
         let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
@@ -3580,11 +3710,8 @@ impl Server {
         }
         let file = self.file_for(nodeid, fh, false)?;
         // The guest sized the reply chain; never promise more than it can hold.
-        let size = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
-        let mut buf = vec![0u8; size];
-        let read = sys::read_at(file.fd.as_raw_fd(), &mut buf, offset)?;
-        buf.truncate(read);
-        Ok(buf)
+        let len = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
+        Ok(Reply::File { file, offset, len })
     }
 
     fn write(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
@@ -4053,15 +4180,30 @@ fn size_reply(len: usize) -> Vec<u8> {
     out
 }
 
+fn out_header(len: usize, error: i32, unique: u64) -> [u8; fuse::OUT_HEADER_LEN] {
+    let mut out = [0u8; fuse::OUT_HEADER_LEN];
+    out[..4].copy_from_slice(&(len as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&error.to_le_bytes());
+    out[8..].copy_from_slice(&unique.to_le_bytes());
+    out
+}
+
+/// An error in place of a reply whose header is already written.
+fn rewrite_error(sink: &mut dyn Sink, unique: u64, code: i32) -> usize {
+    match sink.rewrite_head(&out_header(fuse::OUT_HEADER_LEN, -code, unique)) {
+        Ok(()) => fuse::OUT_HEADER_LEN,
+        Err(SinkFull) => 0,
+    }
+}
+
 fn write_error(sink: &mut dyn Sink, unique: u64, code: i32) -> usize {
     if sink.capacity() < fuse::OUT_HEADER_LEN {
         return 0;
     }
-    let mut out = Vec::with_capacity(fuse::OUT_HEADER_LEN);
-    out.extend_from_slice(&(fuse::OUT_HEADER_LEN as u32).to_le_bytes());
-    out.extend_from_slice(&(-code).to_le_bytes());
-    out.extend_from_slice(&unique.to_le_bytes());
-    if sink.write(&out).is_err() {
+    if sink
+        .write(&out_header(fuse::OUT_HEADER_LEN, -code, unique))
+        .is_err()
+    {
         return 0;
     }
     fuse::OUT_HEADER_LEN

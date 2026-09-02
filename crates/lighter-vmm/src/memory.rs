@@ -207,6 +207,17 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// The host address of `len` bytes of guest memory, for a kernel call
+    /// that fills guest pages directly (`preadv` into a reply chain).
+    ///
+    /// A raw pointer, deliberately: no reference to guest memory may exist,
+    /// because the guest may be writing the same bytes. The span is only
+    /// valid while `self` lives, and the caller must not read or write it
+    /// through anything but a syscall or a volatile copy.
+    pub fn host_span(&self, gpa: u64, len: usize) -> Result<*mut u8> {
+        Ok(self.region_for(gpa, len)?.host_addr(gpa))
+    }
+
     /// Copies `buf` into guest memory.
     pub fn write(&self, gpa: u64, buf: &[u8]) -> Result<()> {
         let region = self.region_for(gpa, buf.len())?;

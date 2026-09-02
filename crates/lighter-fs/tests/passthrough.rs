@@ -6,10 +6,11 @@
 //! found through a booted guest cost an afternoon of reading kernel traces to
 //! discover that a structure was two fields long.
 
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 use lighter_fs::fuse::{self, op};
-use lighter_fs::{Server, Sink, SinkFull};
+use lighter_fs::{FillError, Server, Sink, SinkFull};
 
 /// A reply buffer of a fixed size, so the capacity logic is exercised rather
 /// than assumed away.
@@ -37,6 +38,30 @@ impl Sink for Buffer {
             return Err(SinkFull);
         }
         self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn fill(&mut self, fd: RawFd, offset: u64, len: usize) -> Result<usize, FillError> {
+        if len > self.capacity() {
+            return Err(FillError::Full);
+        }
+        let start = self.bytes.len();
+        self.bytes.resize(start + len, 0);
+        match lighter_fs::sys::read_at(fd, &mut self.bytes[start..], offset) {
+            Ok(read) => {
+                self.bytes.truncate(start + read);
+                Ok(read)
+            }
+            Err(errno) => {
+                self.bytes.truncate(start);
+                Err(FillError::Read(errno))
+            }
+        }
+    }
+
+    fn rewrite_head(&mut self, head: &[u8]) -> Result<(), SinkFull> {
+        let slot = self.bytes.get_mut(..head.len()).ok_or(SinkFull)?;
+        slot.copy_from_slice(head);
         Ok(())
     }
 }
@@ -1558,10 +1583,18 @@ fn a_parked_file_is_reached_through_its_parent() {
     for n in 0..FILES {
         let name = format!("f{n}");
         let nodeid = guest.lookup(dir, &name).unwrap();
-        assert_eq!(size_of(&mut guest, nodeid), 1, "{name}: getattr through the parent");
+        assert_eq!(
+            size_of(&mut guest, nodeid),
+            1,
+            "{name}: getattr through the parent"
+        );
         chmod(&mut guest, nodeid, 0o640);
         let fh = guest.open(nodeid, 0).unwrap();
-        assert_eq!(guest.read(nodeid, fh, 0, 8).unwrap(), b"1", "{name}: read through the parent");
+        assert_eq!(
+            guest.read(nodeid, fh, 0, 8).unwrap(),
+            b"1",
+            "{name}: read through the parent"
+        );
         ids.push(nodeid);
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
@@ -1571,7 +1604,10 @@ fn a_parked_file_is_reached_through_its_parent() {
             .permissions()
             .mode()
             & 0o7777;
-        assert_eq!(mode, 0o640, "f{n}: the chmod through the parent reached the Mac");
+        assert_eq!(
+            mode, 0o640,
+            "f{n}: the chmod through the parent reached the Mac"
+        );
     }
     let (open, budget) = guest.server.descriptor_usage();
     assert!(
@@ -1584,17 +1620,24 @@ fn a_parked_file_is_reached_through_its_parent() {
     // itself.
     std::fs::rename(guest.host("d/f7"), guest.host("d/moved")).unwrap();
     std::fs::write(guest.host("d/f7"), b"impostor").unwrap();
-    assert_eq!(size_of(&mut guest, ids[7]), 1, "a renamed file answers by identity");
+    assert_eq!(
+        size_of(&mut guest, ids[7]),
+        1,
+        "a renamed file answers by identity"
+    );
     assert_eq!(size_of(&mut guest, ids[8]), 1);
 
     // The Mac renames the whole directory: every name under it moved.
     std::fs::rename(guest.host("d"), guest.host("e")).unwrap();
-    assert_eq!(size_of(&mut guest, ids[100]), 1, "a file whose parent moved still answers");
+    assert_eq!(
+        size_of(&mut guest, ids[100]),
+        1,
+        "a file whose parent moved still answers"
+    );
     let fh = guest.open(ids[200], 0).unwrap();
     assert_eq!(guest.read(ids[200], fh, 0, 8).unwrap(), b"1");
     unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
 }
-
 
 /// `rm -rf` of a directory the guest has just filled: every create is still
 /// queued when the removals arrive, and the removals are queued behind them.
@@ -1618,7 +1661,11 @@ fn a_directory_emptied_before_its_creates_landed_can_be_removed() {
         for name in &names {
             guest.call(op::UNLINK, dir, &name_body(name)).unwrap();
         }
-        assert_eq!(guest.call(op::RMDIR, 1, &name_body("dir")), Ok(Vec::new()), "round {round}");
+        assert_eq!(
+            guest.call(op::RMDIR, 1, &name_body("dir")),
+            Ok(Vec::new()),
+            "round {round}"
+        );
         guest.call(op::MKDIR, 1, &body).unwrap();
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
@@ -1639,11 +1686,19 @@ fn a_directory_removed_and_remade_is_found_at_once() {
     body.extend_from_slice(&name_body("dir"));
     for round in 0..200 {
         guest.call(op::MKDIR, 1, &body).unwrap();
-        let dir = guest.lookup(1, "dir").unwrap_or_else(|e| panic!("round {round}: lookup after mkdir failed with {e}"));
-        let (nodeid, fh) = guest.create(dir, "f", 0x8241).unwrap_or_else(|e| panic!("round {round}: create failed with {e}"));
+        let dir = guest
+            .lookup(1, "dir")
+            .unwrap_or_else(|e| panic!("round {round}: lookup after mkdir failed with {e}"));
+        let (nodeid, fh) = guest
+            .create(dir, "f", 0x8241)
+            .unwrap_or_else(|e| panic!("round {round}: create failed with {e}"));
         guest.write(nodeid, fh, 0, b"x").unwrap();
         guest.call(op::UNLINK, dir, &name_body("f")).unwrap();
-        assert_eq!(guest.call(op::RMDIR, 1, &name_body("dir")), Ok(Vec::new()), "round {round}");
+        assert_eq!(
+            guest.call(op::RMDIR, 1, &name_body("dir")),
+            Ok(Vec::new()),
+            "round {round}"
+        );
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
     assert!(!guest.host("dir").exists());
@@ -1663,9 +1718,13 @@ fn a_promised_directory_survives_being_forgotten() {
     let reply = guest.call(op::MKDIR, 1, &body).unwrap();
     let nodeid = u64::from_le_bytes(reply[0..8].try_into().unwrap());
     // FORGET carries the lookup count to give back.
-    guest.call(op::FORGET, nodeid, &1u64.to_le_bytes());
-    let again = guest.lookup(1, "dir").expect("the directory is promised, forgotten or not");
-    let (file, fh) = guest.create(again, "f", 0x8241).expect("a create under the promise");
+    guest.call(op::FORGET, nodeid, &1u64.to_le_bytes()).ok();
+    let again = guest
+        .lookup(1, "dir")
+        .expect("the directory is promised, forgotten or not");
+    let (file, fh) = guest
+        .create(again, "f", 0x8241)
+        .expect("a create under the promise");
     guest.write(file, fh, 0, b"x").unwrap();
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
     assert_eq!(std::fs::read(guest.host("dir/f")).unwrap(), b"x");
@@ -1699,14 +1758,20 @@ fn a_listing_names_a_promised_directory_by_its_own_nodeid() {
         while cursor < out.len() {
             let nodeid = u64::from_le_bytes(out[cursor..cursor + 8].try_into().unwrap());
             let dirent = cursor + fuse::ENTRY_OUT_LEN;
-            let namelen = u32::from_le_bytes(out[dirent + 16..dirent + 20].try_into().unwrap()) as usize;
-            let entry_name = &out[dirent + fuse::DIRENT_HEADER_LEN..dirent + fuse::DIRENT_HEADER_LEN + namelen];
+            let namelen =
+                u32::from_le_bytes(out[dirent + 16..dirent + 20].try_into().unwrap()) as usize;
+            let entry_name =
+                &out[dirent + fuse::DIRENT_HEADER_LEN..dirent + fuse::DIRENT_HEADER_LEN + namelen];
             if entry_name == name.as_bytes() {
                 seen = Some(nodeid);
             }
             cursor = dirent + fuse::dirent_len(namelen);
         }
-        assert_eq!(seen, Some(promised), "round {round}: the listing named a different inode for {name}");
+        assert_eq!(
+            seen,
+            Some(promised),
+            "round {round}: the listing named a different inode for {name}"
+        );
         assert_eq!(guest.lookup(1, &name).unwrap(), promised, "round {round}");
     }
 }
@@ -1729,15 +1794,24 @@ fn a_forgotten_directory_with_promises_is_found_again_as_itself() {
         for n in 0..20 {
             let (file, fh) = guest.create(dir, &format!("f{n}"), 0x8241).unwrap();
             guest.write(file, fh, 0, b"x").unwrap();
-            guest.call(op::UNLINK, dir, &name_body(&format!("f{n}"))).unwrap();
+            guest
+                .call(op::UNLINK, dir, &name_body(&format!("f{n}")))
+                .unwrap();
         }
         // The guest drops the directory entirely, promises and all.
-        guest.call(op::FORGET, dir, &lookups.to_le_bytes());
+        guest.call(op::FORGET, dir, &lookups.to_le_bytes()).ok();
         let again = guest.lookup(1, "dir").unwrap();
-        assert_eq!(again, dir, "round {round}: the directory came back as a different inode");
+        assert_eq!(
+            again, dir,
+            "round {round}: the directory came back as a different inode"
+        );
         lookups = 1;
-        assert_eq!(guest.call(op::RMDIR, 1, &name_body("dir")), Ok(Vec::new()), "round {round}");
-        guest.call(op::FORGET, again, &lookups.to_le_bytes());
+        assert_eq!(
+            guest.call(op::RMDIR, 1, &name_body("dir")),
+            Ok(Vec::new()),
+            "round {round}"
+        );
+        guest.call(op::FORGET, again, &lookups.to_le_bytes()).ok();
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
     assert!(!guest.host("dir").exists());

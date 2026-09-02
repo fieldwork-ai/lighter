@@ -609,6 +609,22 @@ pub fn read_at(fd: RawFd, buf: &mut [u8], offset: u64) -> Result<usize> {
     })
 }
 
+/// `preadv`: one read scattered over `iovs`, which may point anywhere the
+/// caller may write — into guest memory, for a reply that never touches a
+/// host buffer.
+pub fn read_vectored_at(fd: RawFd, iovs: &[libc::iovec], offset: u64) -> Result<usize> {
+    // SAFETY: the caller vouches for every iovec (a live descriptor, and
+    // spans it may write); the count is bounded by IOV_MAX below.
+    check_size(unsafe {
+        libc::preadv(
+            fd,
+            iovs.as_ptr(),
+            iovs.len().min(libc::IOV_MAX as usize) as libc::c_int,
+            offset as libc::off_t,
+        )
+    })
+}
+
 pub fn write_at(fd: RawFd, buf: &[u8], offset: u64) -> Result<usize> {
     // SAFETY: a buffer we own of the length we pass, and a live descriptor.
     check_size(unsafe {
