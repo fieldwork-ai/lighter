@@ -87,14 +87,26 @@ if [ -b "$DATA_DEV" ]; then
 		# shellcheck disable=SC2086
 		mke2fs -q -t ext4 -L lighter-data $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
 	fi
-	# Discard is what makes deleting an image give space back to macOS: it
-	# reaches virtio-blk as a discard request and becomes a hole punch in the
-	# host file. Without it the disk only ever grows.
+	# Journaling on Docker's disk is metadata-only, with no write barriers
+	# and a thirty-second commit — the same crash semantics as OrbStack's
+	# nodatacow btrfs, chosen to match it: after a VMM crash a file written
+	# in the last moments may hold stale blocks rather than be short. The
+	# barrier costs nothing here (the guest's flush is a host fsync into the
+	# Mac's page cache either way) and ordered data cost yarn twelve percent
+	# on its own disk. Anything that must survive a crash fsyncs, and fsync
+	# is honored.
 	#
-	# `lighter.data_opts=` on the kernel command line replaces the mount
-	# options outright, so a different journaling or barrier setting can be
-	# measured without a rebuild of this image.
-	DATA_OPTS=discard,noatime
+	# Discard is deliberately not a mount option. Online discard is issued
+	# from the journal commit, and in writeback mode that turned deleting a
+	# package tree from a third of a second into three: the trim is batched
+	# instead, by the fstrim loop below, which is what makes deleting an
+	# image give space back to macOS at all — each trimmed range reaches
+	# virtio-blk as a discard and becomes a hole punch in the host file.
+	#
+	# `lighter.data_opts=` on the kernel command line replaces these
+	# outright, so a different setting can be measured without a rebuild of
+	# this image.
+	DATA_OPTS=noatime,nobarrier,commit=30,data=writeback
 	for arg in $(cat /proc/cmdline); do
 		case "$arg" in
 		lighter.data_opts=*) DATA_OPTS="${arg#lighter.data_opts=}" ;;
@@ -105,6 +117,17 @@ if [ -b "$DATA_DEV" ]; then
 		echo "INIT data=mounted"
 		mkdir -p /mnt/data/docker
 		mount --bind /mnt/data/docker /var/lib/docker
+		# The first trim after a mount covers every free block group, so
+		# it is done here, before Docker has anything in flight, and timed
+		# into the boot log. Trimmed ranges are cheap to re-trim (ext4
+		# remembers which groups it has done), so the short period after
+		# that costs nothing on an idle machine and a deleted image is back
+		# with macOS within minutes rather than at the next reboot.
+		T0=$(cut -d' ' -f1 /proc/uptime)
+		fstrim /mnt/data >/dev/null 2>&1
+		T1=$(cut -d' ' -f1 /proc/uptime)
+		echo "INIT fstrim=$(echo "$T1 $T0" | awk '{printf "%dms", ($1-$2)*1000}')"
+		(while sleep 300; do fstrim /mnt/data >/dev/null 2>&1; done) &
 	else
 		echo "INIT data=mount-failed"
 	fi
