@@ -128,8 +128,14 @@ if [ -b "$DATA_DEV" ]; then
 	# `lighter.data_opts=` on the kernel command line replaces these
 	# outright, so a different setting can be measured without a rebuild of
 	# this image.
+	# The options follow the filesystem the disk actually carries, not the
+	# one a blank disk would be given: a disk formatted before the default
+	# changed is still ext4, and mounting it with btrfs's options fails —
+	# after which dockerd starts on the root filesystem and dies there.
+	DATA_TYPE="$(blkid -o value -s TYPE "$DATA_DEV" 2>/dev/null || echo "$DATA_FS")"
+	echo "INIT data_fs=${DATA_TYPE:-unknown}"
 	DATA_OPTS=noatime,nobarrier,commit=30,data=writeback
-	case "$DATA_FS" in
+	case "$DATA_TYPE" in
 	# nodatacow, as OrbStack mounts it: data is written in place and not
 	# checksummed, which keeps a database's file from fragmenting into a
 	# thousand extents and gives the crash semantics described above.
