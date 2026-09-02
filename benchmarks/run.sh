@@ -92,6 +92,10 @@ WORK="${LIGHTER_BENCH_WORK:-$HOME/.lighter-bench/$TARGET}"
 # the second run overwriting the first — which is how the speed gate compares
 # caching on against caching off.
 RESULTS="benchmarks/results/${LABEL:-$TARGET}.csv"
+# A run on the runtime's own disk is its own result set, not a rerun of the
+# share: the report reads `<target>-guest.csv` for that section, and an
+# unlabelled guest run used to overwrite the share's numbers.
+[ "$WHERE" != guest ] || [ -n "$LABEL" ] || RESULTS="benchmarks/results/$TARGET-guest.csv"
 # The fixture is part of what a number means, so a run on the small one does
 # not overwrite the published CSV unless it was asked to by name.
 [ "$FIXTURE" = npm ] || [ -n "$LABEL" ] || RESULTS="benchmarks/results/$TARGET-$FIXTURE.csv"
