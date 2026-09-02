@@ -1037,7 +1037,11 @@ impl Server {
             0
         };
         let flags2 = if flags & fuse::init::INIT_EXT != 0 {
-            (fuse::init2::LIGHTER_CREATE | clone | no_security) & offered2
+            (fuse::init2::LIGHTER_CREATE
+                | clone
+                | no_security
+                | fuse::init2::LIGHTER_NOOP_SETATTR)
+                & offered2
         } else {
             0
         };
@@ -1568,7 +1572,15 @@ impl Server {
             // A directory that is still a promise holds only promises.
             return self.missing(&parent);
         }
-        match self.entry(&parent, &name) {
+        let looked = self.entry(&parent, &name);
+        if self.stats.enabled() {
+            self.stats.count(match &looked {
+                Ok(_) => "lookup=found",
+                Err(errno) if *errno == linux::ENOENT => "lookup=enoent",
+                Err(_) => "lookup=error",
+            });
+        }
+        match looked {
             Ok(entry) => Ok(self.entry_reply(&entry)),
             Err(linux::ENOENT) => {
                 if self.debug_enoent {
@@ -1910,6 +1922,7 @@ impl Server {
         let valid = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let inode = self.inode(nodeid)?;
         if self.stats.enabled() {
+            self.stats.count(&format!("setattr-mask={valid:#x}"));
             // Which shapes of setattr a workload sends, once each: the async
             // path only takes some of them, and which ones arrive decides
             // whether it is taking any.

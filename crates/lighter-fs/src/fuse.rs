@@ -136,6 +136,10 @@ pub mod init2 {
     /// asking before every chmod, chown and truncate whether there are
     /// capabilities to strip. Overall bit 59.
     pub const LIGHTER_NO_SECURITY_XATTR: u32 = 1 << 27;
+    /// Ours, matched by guest patch 0007: the driver answers a setattr that
+    /// would change nothing — same mode, same owner, same size — from the
+    /// attributes it still trusts, without a request. Overall bit 58.
+    pub const LIGHTER_NOOP_SETATTR: u32 = 1 << 26;
 }
 
 /// `fuse_open_out.open_flags`.

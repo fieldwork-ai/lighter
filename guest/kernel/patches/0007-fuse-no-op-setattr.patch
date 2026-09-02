@@ -1,0 +1,137 @@
+fuse: answer a setattr that changes nothing from the cached attributes
+
+A package install does a chmod, a chown and often a truncate on every file it
+makes, and on a shared directory owned by whoever mounted it most of those ask
+for what the file already has: root to root, the mode it was created with,
+zero bytes on an empty file. The server has answered those without work for
+some time, but each was still a request through the virtqueue, an interrupt
+and two context switches — a quarter of a million per install on the request
+profile that decides how fast a small host goes.
+
+When the server has set FUSE_LIGHTER_NOOP_SETATTR the driver judges mode,
+owner and size against attributes it still trusts and answers itself. A time
+set is never a no-op; a chown that must also strip set-id bits is only a no-op
+when there are none. What is lost is the ctime bump a no-op chmod or chown
+would have made.
+
+Gated on the flag, so a stock server sees no change.
+
+diff -ruN k-b/fs/fuse/dir.c k-c/fs/fuse/dir.c
+--- a/fs/fuse/dir.c	2026-09-02 10:05:01
++++ b/fs/fuse/dir.c	2026-09-02 10:16:10
+@@ -2139,6 +2139,55 @@
+ 	return err;
+ }
+ 
++/*
++ * lighter: whether this setattr would change nothing the driver can see.
++ *
++ * A package install does a chmod, a chown and often a truncate on every file
++ * it makes, and on a shared directory owned by whoever mounted it most of
++ * those are requests for what the file already has: root to root, the mode
++ * it was created with, zero bytes on an empty file. Each was still a round
++ * trip. When the cached attributes are current they are answered here.
++ *
++ * Only the shapes that can be judged from the cache: mode, owner and size.
++ * A time set is never a no-op. A chown that must also strip set-id bits is
++ * only a no-op when there are none to strip. What is lost is the ctime bump
++ * a no-op chmod or chown would have made, which nothing that matters reads.
++ */
++static bool fuse_lighter_setattr_is_noop(struct inode *inode,
++					 const struct iattr *attr)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	unsigned int ia_valid = attr->ia_valid;
++	unsigned int judged = ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID | ATTR_SIZE);
++	unsigned int allowed = ATTR_MODE | ATTR_UID | ATTR_GID | ATTR_SIZE |
++			       ATTR_FILE | ATTR_FORCE | ATTR_OPEN | ATTR_CTIME |
++			       ATTR_KILL_PRIV;
++
++	if (!judged)
++		return false;
++	/* A truncate carries mtime/ctime, which an unchanged size does not
++	 * owe (POSIX marks the times only if the size changes). */
++	if (ia_valid & ATTR_SIZE)
++		allowed |= ATTR_MTIME;
++	if (ia_valid & ~allowed)
++		return false;
++	if (time_before64(fi->i_time, get_jiffies_64()))
++		return false;
++	if ((ia_valid & ATTR_MODE) && attr->ia_mode != inode->i_mode)
++		return false;
++	if ((ia_valid & ATTR_UID) && !uid_eq(attr->ia_uid, inode->i_uid))
++		return false;
++	if ((ia_valid & ATTR_GID) && !gid_eq(attr->ia_gid, inode->i_gid))
++		return false;
++	if ((ia_valid & ATTR_SIZE) &&
++	    (!S_ISREG(inode->i_mode) || attr->ia_size != i_size_read(inode)))
++		return false;
++	if ((ia_valid & (ATTR_UID | ATTR_GID | ATTR_KILL_PRIV)) &&
++	    (inode->i_mode & (S_ISUID | S_ISGID)))
++		return false;
++	return true;
++}
++
+ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
+ 			struct iattr *attr)
+ {
+@@ -2184,6 +2233,10 @@
+ 		}
+ 	}
+ 	if (!attr->ia_valid)
++		return 0;
++
++	if (fc->lighter_noop_setattr &&
++	    fuse_lighter_setattr_is_noop(inode, attr))
+ 		return 0;
+ 
+ 	ret = fuse_do_setattr(idmap, entry, attr, file);
+diff -ruN k-b/fs/fuse/fuse_i.h k-c/fs/fuse/fuse_i.h
+--- a/fs/fuse/fuse_i.h	2026-09-02 10:05:01
++++ b/fs/fuse/fuse_i.h	2026-09-02 10:16:10
+@@ -736,6 +736,10 @@
+ 	 * the kernel answers those itself instead of asking. */
+ 	unsigned lighter_no_security_xattr:1;
+ 
++	/* lighter: a setattr that would change nothing is answered from the
++	 * cached attributes instead of being sent. */
++	unsigned lighter_noop_setattr:1;
++
+ 	/*
+ 	 * The following bitfields are only for optimization purposes
+ 	 * and hence races in setting them will not cause malfunction
+diff -ruN k-b/fs/fuse/inode.c k-c/fs/fuse/inode.c
+--- a/fs/fuse/inode.c	2026-09-02 10:05:01
++++ b/fs/fuse/inode.c	2026-09-02 10:16:10
+@@ -1321,6 +1321,8 @@
+ 				fc->lighter_clone = 1;
+ 			if (flags & FUSE_LIGHTER_NO_SECURITY_XATTR)
+ 				fc->lighter_no_security_xattr = 1;
++			if (flags & FUSE_LIGHTER_NOOP_SETATTR)
++				fc->lighter_noop_setattr = 1;
+ 			if (flags & FUSE_SETXATTR_EXT)
+ 				fc->setxattr_ext = 1;
+ 			if (flags & FUSE_SECURITY_CTX)
+@@ -1409,7 +1411,7 @@
+ 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
+ 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
+ 		FUSE_LIGHTER_CREATE | FUSE_LIGHTER_CLONE_SUPPORT |
+-		FUSE_LIGHTER_NO_SECURITY_XATTR;
++		FUSE_LIGHTER_NO_SECURITY_XATTR | FUSE_LIGHTER_NOOP_SETATTR;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm->fc->dax)
+ 		flags |= FUSE_MAP_ALIGNMENT;
+diff -ruN k-b/include/uapi/linux/fuse.h k-c/include/uapi/linux/fuse.h
+--- a/include/uapi/linux/fuse.h	2026-09-02 10:05:01
++++ b/include/uapi/linux/fuse.h	2026-09-02 10:16:10
+@@ -488,6 +488,10 @@
+ /* lighter: no security.* or system.posix_acl_* attribute exists on the
+  * server, ever; getxattr for one is ENODATA without a request. */
+ #define FUSE_LIGHTER_NO_SECURITY_XATTR	(1ULL << 59)
++/* lighter: the driver may answer a setattr that changes nothing — a chmod
++ * to the mode a file has, a chown to its owner, a truncate to its size —
++ * from attributes it still trusts, without a request. */
++#define FUSE_LIGHTER_NOOP_SETATTR	(1ULL << 58)
+ 
+ /**
+  * CUSE INIT request/reply flags

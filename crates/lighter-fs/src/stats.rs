@@ -91,6 +91,9 @@ struct Gauge {
 
 /// One counter per named opcode, plus a catch-all.
 pub struct Stats {
+    /// Ad hoc counters by name — which setattr masks arrive, how lookups
+    /// resolve — for deciding which requests a workload need not make.
+    keyed: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     on: AtomicBool,
     lanes: [Lane; LANES],
     inflight: Gauge,
@@ -119,6 +122,7 @@ impl Default for Stats {
 impl Stats {
     pub fn new() -> Stats {
         Stats {
+            keyed: std::sync::Mutex::new(std::collections::HashMap::new()),
             on: AtomicBool::new(std::env::var_os("LIGHTER_FS_STATS").is_some()),
             lanes: std::array::from_fn(|_| Lane::new()),
             inflight: Gauge {
@@ -170,6 +174,16 @@ impl Stats {
         lane.nanos[slot].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
     }
 
+    pub fn count(&self, key: &str) {
+        let mut keyed = self.keyed.lock().expect("keyed counters poisoned");
+        match keyed.get_mut(key) {
+            Some(n) => *n += 1,
+            None => {
+                keyed.insert(key.to_owned(), 1);
+            }
+        }
+    }
+
     fn total(&self, slot: usize) -> (u64, u64) {
         self.lanes.iter().fold((0, 0), |(count, nanos), lane| {
             (
@@ -213,6 +227,13 @@ impl Stats {
                 nanos / 1_000_000,
                 nanos as f64 / count as f64 / 1000.0
             ));
+        }
+        // Per window, like the counts above: drained, not read.
+        let keyed = std::mem::take(&mut *self.keyed.lock().expect("keyed counters poisoned"));
+        let mut keyed: Vec<(String, u64)> = keyed.into_iter().collect();
+        keyed.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (key, n) in keyed {
+            out.push_str(&format!("FSSTATS {key} n={n}\n"));
         }
         out
     }
