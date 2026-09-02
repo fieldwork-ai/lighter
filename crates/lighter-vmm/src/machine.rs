@@ -237,7 +237,7 @@ impl Machine {
             );
             disks.push(disk.clone());
             block_slots.push(virtio.len());
-            virtio.push(Box::new(Block::new(disk)));
+            virtio.push(Box::new(Block::new(disk, config.vcpus as usize)));
         }
         if let Some(network) = &network {
             net_slot = Some(virtio.len());
@@ -362,19 +362,16 @@ impl Machine {
         for slot in block_slots {
             let transport = virtio_devices[slot].clone();
             let kicks = virtio::poll::Kicks::new();
+            let watched: Vec<u16> = (0..config.vcpus as u16).collect();
             {
                 let mut held = transport.lock().expect("block transport poisoned");
                 let signal = kicks.clone();
-                held.set_kick_observer(Arc::new(move |queue| {
-                    if queue == 0 {
-                        signal.kicked();
-                    }
-                }));
+                held.set_kick_observer(Arc::new(move |_queue| signal.kicked()));
             }
             let poller = virtio::poll::spawn(
                 &format!("blk{slot}"),
                 transport.clone(),
-                vec![0],
+                watched,
                 kicks.clone(),
             )?;
             pollers.push((kicks, poller));

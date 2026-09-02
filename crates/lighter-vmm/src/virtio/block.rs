@@ -35,6 +35,7 @@ const F_BLK_SIZE: u64 = 1 << 6;
 const F_FLUSH: u64 = 1 << 9;
 const F_DISCARD: u64 = 1 << 13;
 const F_WRITE_ZEROES: u64 = 1 << 14;
+const F_MQ: u64 = 1 << 12;
 
 /// Bytes of request header: type, reserved, sector.
 const HEADER_LEN: usize = 16;
@@ -57,15 +58,22 @@ pub struct Block {
     /// Features the driver accepted, which decides whether discard requests are
     /// legal at all.
     acked: u64,
+    /// Request queues offered. One per vCPU, so that the driver maps each
+    /// hardware queue to exactly one CPU: a completion found by that CPU's
+    /// own poll then runs inline, where a shared queue's would be handed to
+    /// the block softirq and a ksoftirqd wakeup — two to four microseconds on
+    /// a request the host finished in under two.
+    queues: usize,
 }
 
 impl Block {
-    pub fn new(disk: Arc<Disk>) -> Block {
+    pub fn new(disk: Arc<Disk>, queues: usize) -> Block {
         let read_only = disk.is_read_only();
         Block {
             disk,
             read_only,
             acked: 0,
+            queues: queues.clamp(1, 32),
         }
     }
 
@@ -276,6 +284,9 @@ impl VirtioDevice for Block {
         if self.read_only {
             features |= F_RO;
         }
+        if self.queues > 1 {
+            features |= F_MQ;
+        }
         features
     }
 
@@ -284,7 +295,7 @@ impl VirtioDevice for Block {
     }
 
     fn queue_count(&self) -> usize {
-        1
+        self.queues
     }
 
     /// Configuration space, laid out as `struct virtio_blk_config`.
@@ -301,7 +312,7 @@ impl VirtioDevice for Block {
         // blk_size: 512, matching the sector size we report capacity in.
         config[20..24].copy_from_slice(&512u32.to_le_bytes());
         // num_queues
-        config[34..36].copy_from_slice(&1u16.to_le_bytes());
+        config[34..36].copy_from_slice(&(self.queues as u16).to_le_bytes());
         // max_discard_sectors / max_discard_seg / discard_sector_alignment
         config[36..40].copy_from_slice(&MAX_DISCARD_SECTORS.to_le_bytes());
         config[40..44].copy_from_slice(&1u32.to_le_bytes());
@@ -317,12 +328,12 @@ impl VirtioDevice for Block {
         }
     }
 
-    fn notify(&mut self, _queue: u16, queues: &mut [Virtqueue], mem: &GuestMemory) -> Serviced {
-        let used_any = match queues.first_mut() {
-            Some(queue) => self.process_queue(queue, mem),
+    fn notify(&mut self, queue: u16, queues: &mut [Virtqueue], mem: &GuestMemory) -> Serviced {
+        let used_any = match queues.get_mut(queue as usize) {
+            Some(ring) => self.process_queue(ring, mem),
             None => false,
         };
-        Serviced::queue_if(0, used_any)
+        Serviced::queue_if(queue, used_any)
     }
 
     fn reset(&mut self) {
@@ -348,7 +359,7 @@ mod tests {
 
     #[test]
     fn reports_capacity_in_sectors() {
-        let block = Block::new(disk());
+        let block = Block::new(disk(), 1);
         let mut config = [0u8; 8];
         block.config_read(0, &mut config);
         assert_eq!(u64::from_le_bytes(config), (16 << 20) / 512);
@@ -356,7 +367,7 @@ mod tests {
 
     #[test]
     fn offers_discard_so_the_disk_can_shrink() {
-        let block = Block::new(disk());
+        let block = Block::new(disk(), 1);
         assert_ne!(block.features() & F_DISCARD, 0);
         assert_ne!(block.features() & F_WRITE_ZEROES, 0);
         assert_ne!(block.features() & F_FLUSH, 0);
@@ -369,16 +380,34 @@ mod tests {
         let path = std::env::temp_dir().join(format!("lighter-ro-{}.img", std::process::id()));
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
         let disk = Arc::new(Disk::open_or_create(&path, 0, true).unwrap());
-        let block = Block::new(disk);
+        let block = Block::new(disk, 1);
         assert_ne!(block.features() & F_RO, 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// One queue per vCPU is only meaningful if the driver is told: the MQ
+    /// feature and `num_queues` travel together, and a single queue offers
+    /// neither.
+    #[test]
+    fn several_queues_are_advertised_with_mq() {
+        let block = Block::new(disk(), 8);
+        assert_eq!(block.queue_count(), 8);
+        assert_ne!(block.features() & F_MQ, 0);
+        let mut num_queues = [0u8; 2];
+        block.config_read(34, &mut num_queues);
+        assert_eq!(u16::from_le_bytes(num_queues), 8);
+
+        let single = Block::new(disk(), 1);
+        assert_eq!(single.features() & F_MQ, 0);
+        single.config_read(34, &mut num_queues);
+        assert_eq!(u16::from_le_bytes(num_queues), 1);
     }
 
     /// Discard before the driver negotiated it must be refused rather than
     /// silently punching holes a driver did not ask for.
     #[test]
     fn discard_requires_negotiation() {
-        let mut block = Block::new(disk());
+        let mut block = Block::new(disk(), 1);
         assert_eq!(block.discard(&[], &GuestMemory::detached(), true), S_UNSUPP);
         block.ack_features(F_DISCARD);
         // With no descriptors there is nothing to do, but it is now permitted.
@@ -387,7 +416,7 @@ mod tests {
 
     #[test]
     fn config_reads_past_the_end_are_zero_filled() {
-        let block = Block::new(disk());
+        let block = Block::new(disk(), 1);
         let mut data = [0xffu8; 16];
         block.config_read(200, &mut data);
         assert!(data.iter().all(|&b| b == 0));
