@@ -240,17 +240,52 @@ impl VirtioMmio {
             return;
         }
 
-        let serviced = self.device.notify(index, &mut self.queues, &self.memory);
-        self.publish_signals();
-        // Re-arm before deciding about the interrupt: the driver stops kicking
-        // a queue whose event index it has overtaken, and it overtakes one
-        // that is never written. A device that negotiates the feature owes
-        // this on every pass — but only where the cursor has actually moved,
-        // because the write carries a fence and paying for one per queue per
-        // request costs more than the notification it saves.
         let memory = self.memory.clone();
-        for queue in &mut self.queues {
-            queue.arm_notifications(&memory);
+        let mut serviced = self.device.notify(index, &mut self.queues, &memory);
+        loop {
+            self.publish_signals();
+            // Re-arm before deciding about the interrupt: the driver stops
+            // kicking a queue whose event index it has overtaken, and it
+            // overtakes one that is never written. A device that negotiates
+            // the feature owes this on every pass — but only where the cursor
+            // has actually moved, because the write carries a fence and
+            // paying for one per queue per request costs more than the
+            // notification it saves.
+            for queue in &mut self.queues {
+                queue.arm_notifications(&memory);
+            }
+            // Then the ring is read once more, and this is not optional. The
+            // driver decides whether to kick by comparing against the event
+            // index it can see, and a chain it published between our last
+            // look at the ring and the arming above compared against the OLD
+            // one — an index it had long since passed — and was not kicked
+            // for. Nothing in the driver looks again: the chain sits in the
+            // ring until its next unrelated submission crosses the new index.
+            // For an ext4 journal commit blocked on that very chain there is
+            // no next submission, and the guest's data disk is dead. That was
+            // the hang: a container that had exited, `jbd2/vdb-8` in D state
+            // in `__wait_on_buffer`, the host entirely idle, three times in
+            // one night under exactly the load that makes the window widest.
+            // The specification's own double check; the driver does the
+            // mirror image of it when it re-enables interrupts.
+            let mut moved = false;
+            for i in 0..self.queues.len() {
+                if !self.queues[i].has_work(&memory) {
+                    continue;
+                }
+                let before = self.queues[i].next_avail();
+                let more = self.device.notify(i as u16, &mut self.queues, &memory);
+                serviced = serviced.and(more);
+                // A queue that offers buffers rather than requests (a
+                // receive ring) always "has work" and never moves; only a
+                // cursor that advanced means there was something to take.
+                if self.queues[i].next_avail() != before {
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
         }
         if !serviced.any() {
             return;
