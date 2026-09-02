@@ -1975,10 +1975,20 @@ impl Server {
                 if child.is_pending() {
                     // Nothing on the host yet; nothing promised inside.
                 } else if let Ok(listing) = self.list(child.id())
-                    && listing.iter().any(|entry| {
+                    && let Some(entry) = listing.iter().find(|entry| {
                         entry.name != b"." && entry.name != b".." && !gone.contains(&entry.name)
                     })
                 {
+                    // Said aloud: the guest believes this directory empty,
+                    // and an entry the queue does not account for is either
+                    // the Mac's doing or a promise this server lost.
+                    tracing::warn!(
+                        dir = %name.to_string_lossy(),
+                        entry = %String::from_utf8_lossy(&entry.name),
+                        promised_gone = gone.len(),
+                        pending = child.is_pending(),
+                        "rmdir refused: an entry no queued removal accounts for"
+                    );
                     return Err(linux::ENOTEMPTY);
                 }
             } else {
@@ -2073,6 +2083,15 @@ impl Server {
                 target.settled_by(seq);
             }
             return Ok(Vec::new());
+        }
+        if dir {
+            // The synchronous fallback for a directory the queue could not
+            // take — not known to the registry, or the queue refusing work.
+            // Its files' removals may still be queued, keyed by an inode
+            // this path does not have, and a host rmdir ahead of them is
+            // ENOTEMPTY for a directory the guest has emptied. Everything
+            // queued lands first; this path is rare enough to afford it.
+            self.apply.drain();
         }
         sys::unlink_at(parent.reference()?.raw_fd(), &name, dir)?;
         Ok(Vec::new())
