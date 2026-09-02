@@ -63,11 +63,17 @@ pub const REQUEST_QUEUE: u16 = 1;
 /// advertised count (patch 0001 removes mainline's nr_cpu_ids clamp so the
 /// two sides cannot disagree).
 pub fn request_queues() -> u16 {
-    std::env::var("LIGHTER_FS_QUEUES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| (1..=8).contains(n))
-        .unwrap_or(4)
+    // Read once. This is asked on every queue notification, on the vCPU
+    // thread, and `env::var` takes the process-wide environment lock — it
+    // showed in a profile of an install as contention between vCPUs.
+    static QUEUES: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *QUEUES.get_or_init(|| {
+        std::env::var("LIGHTER_FS_QUEUES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=8).contains(n))
+            .unwrap_or(4)
+    })
 }
 
 /// The queue *we* write to, carrying invalidations into the guest.

@@ -1515,3 +1515,82 @@ fn a_listing_in_progress_survives_a_thousand_other_listings() {
         "every entry listed exactly once across {others} other listings"
     );
 }
+
+/// A file past the descriptor budget is reached through its parent's
+/// descriptor and its name, never by reopening it — and when that name no
+/// longer means it, by its identity.
+///
+/// The budget is forced low so that a few hundred files park; on a stock Mac
+/// the real budget parks most of a package tree, which is where this path
+/// carries every getattr, chmod and open of an install.
+#[test]
+fn a_parked_file_is_reached_through_its_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: set before the server is built, and the value is read once.
+    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "64") };
+    let mut guest = Guest::new("placed");
+    std::fs::create_dir(guest.host("d")).unwrap();
+    let dir = guest.lookup(1, "d").unwrap();
+
+    const FILES: usize = 300;
+    for n in 0..FILES {
+        let (nodeid, fh) = guest.create(dir, &format!("f{n}"), 0x8241).unwrap();
+        guest.write(nodeid, fh, 0, b"1").unwrap();
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let (open, budget) = guest.server.descriptor_usage();
+    assert!(
+        open <= budget * 2,
+        "nothing parked: {open} descriptors against a budget of {budget}"
+    );
+
+    let size_of = |guest: &mut Guest, nodeid: u64| -> u64 {
+        let reply = guest.call(op::GETATTR, nodeid, &[0u8; 16]).unwrap();
+        u64::from_le_bytes(reply[24..32].try_into().unwrap())
+    };
+    let chmod = |guest: &mut Guest, nodeid: u64, mode: u32| {
+        let mut body = vec![0u8; 88];
+        body[0..4].copy_from_slice(&fuse::fattr::MODE.to_le_bytes());
+        body[68..72].copy_from_slice(&mode.to_le_bytes());
+        guest.call(op::SETATTR, nodeid, &body).unwrap();
+    };
+    let mut ids = Vec::new();
+    for n in 0..FILES {
+        let name = format!("f{n}");
+        let nodeid = guest.lookup(dir, &name).unwrap();
+        assert_eq!(size_of(&mut guest, nodeid), 1, "{name}: getattr through the parent");
+        chmod(&mut guest, nodeid, 0o640);
+        let fh = guest.open(nodeid, 0).unwrap();
+        assert_eq!(guest.read(nodeid, fh, 0, 8).unwrap(), b"1", "{name}: read through the parent");
+        ids.push(nodeid);
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    for n in 0..FILES {
+        let mode = std::fs::metadata(guest.host(&format!("d/f{n}")))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o640, "f{n}: the chmod through the parent reached the Mac");
+    }
+    let (open, budget) = guest.server.descriptor_usage();
+    assert!(
+        open <= budget * 2,
+        "operating on parked files revived them: {open} against {budget}"
+    );
+
+    // The Mac renames a file, and puts a different file under the old name:
+    // the name is no longer the inode, and the inode must still answer for
+    // itself.
+    std::fs::rename(guest.host("d/f7"), guest.host("d/moved")).unwrap();
+    std::fs::write(guest.host("d/f7"), b"impostor").unwrap();
+    assert_eq!(size_of(&mut guest, ids[7]), 1, "a renamed file answers by identity");
+    assert_eq!(size_of(&mut guest, ids[8]), 1);
+
+    // The Mac renames the whole directory: every name under it moved.
+    std::fs::rename(guest.host("d"), guest.host("e")).unwrap();
+    assert_eq!(size_of(&mut guest, ids[100]), 1, "a file whose parent moved still answers");
+    let fh = guest.open(ids[200], 0).unwrap();
+    assert_eq!(guest.read(ids[200], fh, 0, 8).unwrap(), b"1");
+    unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+}

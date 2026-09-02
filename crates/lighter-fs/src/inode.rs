@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// The `nodeid` of a mount's root. Fixed by the protocol.
 pub const ROOT_ID: u64 = 1;
@@ -40,6 +40,39 @@ struct Parked {
     path: PathBuf,
     /// `(st_birthtime, st_birthtime_nsec)` at the moment of parking.
     birthtime: (i64, i64),
+}
+
+/// The name the guest last reached an inode by: its parent and the entry
+/// under it.
+///
+/// This is what lets a parked inode be operated on without reviving it.
+/// Every operation a regular file needs has an `*at` form that takes a
+/// directory descriptor and a name, and the parent's descriptor is the one
+/// the share keeps resident by preference. A parked file then costs the same
+/// one syscall as a resident one, where reviving it by absolute path cost an
+/// `open`, a `stat` and a `close` per operation — the whole of the difference
+/// between an install on a stock Mac, whose ten-thousand-descriptor ceiling
+/// parks most of a package tree, and one on a machine whose limit was raised.
+///
+/// A hint, never an identity: whether `name` under `parent` is still this
+/// file is checked against `(dev, ino)` on every use, and a mismatch falls
+/// back to the reopen by identity that parking always relied on.
+struct Place {
+    parent: Weak<Inode>,
+    /// The parent's nodeid, so an unchanged place is recognized without
+    /// touching the parent's reference counts — on the hottest path in the
+    /// server, under every thread of an install at once.
+    parent_id: u64,
+    name: std::ffi::CString,
+}
+
+/// Where an operation on an inode should be directed.
+pub enum Located {
+    /// A resident descriptor: use the `f*` form.
+    Fd(Reference),
+    /// The parent's descriptor and the name under it: use the `*at` form,
+    /// and check the identity of what answers.
+    At(Reference, std::ffi::CString),
 }
 
 /// The bit that marks an inode number as provisional: handed out for a
@@ -61,6 +94,8 @@ pub struct Inode {
     /// whether it still names this file is settled by `(dev, ino)` after the
     /// reopen, never assumed.
     parked_at: Mutex<Option<Parked>>,
+    /// The name the guest last reached this inode by; see [`Place`].
+    place: Mutex<Option<Place>>,
     /// The reference bit of a clock: set on use, cleared as the reclaimer
     /// passes. An inode found with it clear is one nothing has touched since
     /// the last sweep.
@@ -285,6 +320,7 @@ impl Inode {
         Inode {
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
+            place: Mutex::new(None),
             used: AtomicBool::new(true),
             held: AtomicBool::new(true),
             census,
@@ -328,6 +364,7 @@ impl Inode {
         Inode {
             fd: RwLock::new(None),
             parked_at: Mutex::new(None),
+            place: Mutex::new(None),
             used: AtomicBool::new(true),
             held: AtomicBool::new(false),
             census,
@@ -797,6 +834,50 @@ impl Inode {
     /// path is reopened and the result checked against `(dev, ino)`, so a name
     /// that now belongs to a different file produces `ESTALE` rather than
     /// silent work on the wrong one.
+    /// Records the name the guest just reached this inode by.
+    pub fn set_place(&self, parent: &Arc<Inode>, name: &std::ffi::CStr) {
+        let parent_id = parent.id();
+        let mut place = self.place.lock().expect("place poisoned");
+        match place.as_ref() {
+            Some(current) if current.parent_id == parent_id && current.name.as_c_str() == name => {}
+            _ => {
+                *place = Some(Place {
+                    parent: Arc::downgrade(parent),
+                    parent_id,
+                    name: name.to_owned(),
+                });
+            }
+        }
+    }
+
+    /// The parent and name this inode was last reached by, while the parent
+    /// is still registered.
+    pub fn place(&self) -> Option<(Arc<Inode>, std::ffi::CString)> {
+        let place = self.place.lock().expect("place poisoned");
+        let place = place.as_ref()?;
+        Some((place.parent.upgrade()?, place.name.clone()))
+    }
+
+    /// Where to direct an operation: the resident descriptor when there is
+    /// one, otherwise the parent's descriptor and this inode's name, and
+    /// only when neither is to hand a revival by identity.
+    ///
+    /// The middle case is the point. A parked file — every file past the
+    /// descriptor budget, which on a stock Mac is most of a package tree —
+    /// is operated on through its parent without ever opening it, where
+    /// [`Inode::reference`] would open it by absolute path for the one call
+    /// and close it again.
+    pub fn locate(&self) -> Result<Located, i32> {
+        self.used.store(true, Ordering::Relaxed);
+        if let Some(fd) = self.fd.read().expect("inode slot poisoned").as_ref() {
+            return Ok(Located::Fd(Reference(fd.clone())));
+        }
+        if let Some((parent, name)) = self.place() {
+            return Ok(Located::At(parent.reference()?, name));
+        }
+        Ok(Located::Fd(self.reference()?))
+    }
+
     pub fn reference(&self) -> Result<Reference, i32> {
         self.used.store(true, Ordering::Relaxed);
         if let Some(fd) = self.fd.read().expect("inode slot poisoned").as_ref() {
@@ -814,16 +895,22 @@ impl Inode {
             .clone()
             .ok_or(crate::errno::linux::ESTALE)?;
         let fd = Arc::new(self.reopen(&parked)?);
-        // Reviving into a full share is how a working set larger than the
-        // budget turns into thrash: every revival forces the sweep to park
-        // something else, which the next operation revives in turn — cache
-        // churn plus sweep scanning, on every request. With no room, the
-        // descriptor serves this one operation and is dropped with it; the
-        // inode stays parked and nothing else is evicted to make space.
+        // A file revived into a full share serves this one operation and is
+        // dropped with it: it needs no descriptor of its own — its parent's
+        // and its name do everything (`locate`) — and installing one only
+        // makes the sweep park something else, which the next operation
+        // revives in turn. A directory is the opposite case and is always
+        // installed. It is what every name inside it is reached through, and
+        // reviving it transiently meant reviving its parent transiently too,
+        // and that one's parent: profiled at the stock budget, one `openat`
+        // per level of the tree on every lookup and every queued job, which
+        // was most of what the server did. Installed, it stays until the
+        // sweep finds it cold, and the chain above a working directory is
+        // resident the next time.
         let budget = self.census.budget.load(Ordering::Relaxed);
         if budget > 0
+            && !self.is_dir
             && self.census.descriptors.load(Ordering::Relaxed) >= budget
-            && self.parkable()
         {
             return Ok(Reference(fd));
         }
@@ -850,6 +937,19 @@ impl Inode {
     /// same numbers with the same birth time is the same file, and anything
     /// else is `ESTALE`.
     fn reopen(&self, parked: &Parked) -> Result<std::os::fd::OwnedFd, i32> {
+        // Through the parent first: one `openat` on a descriptor the share
+        // keeps resident, against a walk of the whole absolute path. A
+        // directory revived this way revives its own parent the same way,
+        // so a cold subtree costs one open per level and no more.
+        if let Some((parent, name)) = self.place()
+            && let Ok(parent) = parent.reference()
+            && let Ok(fd) = crate::sys::open_reference(parent.raw_fd(), &name, self.is_symlink)
+            && let Ok(st) = crate::sys::stat_fd(fd.as_raw_fd())
+            && st.st_ino == self.ino()
+            && st.st_dev as i64 == self.dev()
+        {
+            return Ok(fd);
+        }
         if let Ok(fd) = crate::sys::open_reference_path(&parked.path, self.is_symlink) {
             match crate::sys::stat_fd(fd.as_raw_fd()) {
                 Ok(st) if st.st_ino == self.ino() && st.st_dev as i64 == self.dev() => {

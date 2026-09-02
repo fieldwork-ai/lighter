@@ -336,6 +336,18 @@ pub fn open_path(path: &Path, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
     Ok(fd)
 }
 
+/// A fresh descriptor on a directory the caller already holds, for a listing:
+/// `openat(fd, ".")`. Each listing needs its own offset (see the server's
+/// `list`), and this costs one name lookup where a reopen by path walked the
+/// whole path from the root.
+pub fn open_directory_self(dir: RawFd) -> Result<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: a live directory descriptor and a constant path.
+    let raw = check(unsafe { libc::openat(dir, c".".as_ptr(), flags) })?;
+    // SAFETY: fresh descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
 /// Opens a name under a directory for real I/O.
 pub fn openat_path(parent: RawFd, name: &CStr, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
     let flags = translate_open_flags(linux_flags) | libc::O_CLOEXEC;
@@ -356,7 +368,7 @@ const LINUX_O_NONBLOCK: u32 = 0o4000;
 const LINUX_O_DSYNC: u32 = 0o10000;
 const LINUX_O_DIRECT: u32 = 0o40000;
 const LINUX_O_DIRECTORY: u32 = 0o200000;
-const LINUX_O_NOFOLLOW: u32 = 0o400000;
+pub const LINUX_O_NOFOLLOW: u32 = 0o400000;
 const LINUX_O_SYNC: u32 = 0o4010000;
 
 /// Rewrites guest open flags into host ones.

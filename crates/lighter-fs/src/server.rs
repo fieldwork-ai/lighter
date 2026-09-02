@@ -36,7 +36,7 @@ use crate::cache::{Answer, Invalidator, Policy, Timings};
 use crate::errno::linux;
 use crate::fsevents::Watcher;
 use crate::fuse::{self, Attr, EntryOut, InHeader, get_name, get_u32, get_u64, op};
-use crate::inode::{Handle, Inode, OpenDir, OpenFile, Registry};
+use crate::inode::{Handle, Inode, Located, OpenDir, OpenFile, Reference, Registry};
 use crate::opencache::OpenCache;
 use crate::stats::Stats;
 use crate::sys::{self, TimeSpec};
@@ -441,6 +441,9 @@ pub struct Server {
     copy_max: u64,
     /// `LIGHTER_FS_DEBUG_LISTING=1`: log every listing an overlay changed.
     debug_listing: bool,
+    /// Read once: `env::var` takes the process environment lock, and a
+    /// negative lookup — most of what module resolution does — is hot.
+    debug_enoent: bool,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -448,6 +451,62 @@ pub struct Server {
     /// `None` means FSEvents refused to start, and the server falls back to
     /// exact coherence rather than to a timeout it cannot invalidate.
     _watcher: Option<Watcher>,
+}
+
+/// A sentinel errno inside `entry_from`: the reference closure declining to
+/// open a descriptor because the share is at its budget and the file will be
+/// registered parked instead. Never reaches the guest.
+const PARK_ON_ENTRY: i32 = -1;
+
+/// A handle for one operation on an inode, verified: the `At` form has been
+/// checked to still name this inode, so a `chmod` through it cannot land on
+/// a file the Mac has since given the name to.
+enum Via {
+    /// A descriptor the caller already held, typically from the open cache.
+    Raw(std::os::fd::RawFd),
+    Fd(Reference),
+    At(Reference, CString),
+}
+
+fn via(inode: &Inode) -> Result<Via, i32> {
+    match inode.locate()? {
+        Located::Fd(fd) => Ok(Via::Fd(fd)),
+        Located::At(parent, name) => match sys::stat_at(parent.raw_fd(), &name) {
+            Ok(st) if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() => {
+                Ok(Via::At(parent, name))
+            }
+            _ => Ok(Via::Fd(inode.reference()?)),
+        },
+    }
+}
+
+/// Opens an inode for I/O with flags in the guest's numbering.
+///
+/// Through its parent and name where it has no descriptor of its own, and
+/// through the descriptor's own directory for a listing; the reopen by
+/// identity path — a walk of `/.vol/dev/ino` — is what every other case
+/// used to cost, resident or not.
+fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i32> {
+    match inode.locate()? {
+        Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
+        Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0),
+        Located::At(parent, name) => {
+            let opened = sys::openat_path(parent.raw_fd(), &name, linux_flags | sys::LINUX_O_NOFOLLOW, 0)
+                .and_then(|fd| {
+                    let st = sys::stat_fd(fd.as_raw_fd())?;
+                    if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
+                        Ok(fd)
+                    } else {
+                        Err(linux::ESTALE)
+                    }
+                });
+            match opened {
+                Ok(fd) => Ok(fd),
+                // The name has moved on; the file may not have.
+                Err(_) => sys::reopen(inode.reference()?.raw_fd(), linux_flags, 0),
+            }
+        }
+    }
 }
 
 impl Server {
@@ -569,6 +628,7 @@ impl Server {
             park_creates,
             copy_max: copy_instead_of_clone_max(),
             debug_listing: std::env::var("LIGHTER_FS_DEBUG_LISTING").as_deref() == Ok("1"),
+            debug_enoent: std::env::var("LIGHTER_FS_DEBUG_ENOENT").as_deref() == Ok("1"),
             settler_stop,
             settler: std::sync::Mutex::new(Some(settler)),
             _watcher: watcher,
@@ -1218,7 +1278,7 @@ impl Server {
 
     /// Looks a name up under `parent` and registers it, producing the reply
     /// body that LOOKUP, CREATE, MKDIR and friends all end with.
-    fn entry(&self, parent: &Inode, name: &CString) -> Result<EntryOut, i32> {
+    fn entry(&self, parent: &Arc<Inode>, name: &CString) -> Result<EntryOut, i32> {
         let mark = self.apply.applied();
         let st = sys::stat_at(parent.reference()?.raw_fd(), name)?;
         self.entry_from(parent, name, st, mark)
@@ -1229,15 +1289,52 @@ impl Server {
     /// the overlay step in [`Server::entry_with_reference`].
     fn entry_from(
         &self,
-        parent: &Inode,
+        parent: &Arc<Inode>,
         name: &CString,
         st: libc::stat,
         mark: u64,
     ) -> Result<EntryOut, i32> {
-        self.entry_with_reference(parent, st, mark, || {
+        let entry = self.entry_with_reference(parent, st, mark, || {
             let is_symlink = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
+            // A regular file the guest names into a full share is registered
+            // parked, with no descriptor at all: it is operated on through
+            // this parent's descriptor from here on (`Inode::locate`), and
+            // opening one only to have the sweep close it again was an
+            // `open` and a `close` per file of a package tree.
+            if !is_symlink
+                && st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFREG as u32
+                && self.registry.at_budget()
+            {
+                return Err(PARK_ON_ENTRY);
+            }
             sys::open_reference(parent.reference()?.raw_fd(), name, is_symlink)
-        })
+        });
+        let entry = match entry {
+            Err(PARK_ON_ENTRY) => {
+                let (dev, ino) = (st.st_dev as i64, st.st_ino);
+                let nodeid = match self.registry.relookup(dev, ino) {
+                    Some(existing) => existing,
+                    None => {
+                        let id = self.registry.insert_parked(
+                            dev,
+                            ino,
+                            (st.st_birthtime, st.st_birthtime_nsec),
+                        );
+                        self.registry.count_lookup(id);
+                        id
+                    }
+                };
+                if let Some(inode) = self.registry.get(nodeid) {
+                    inode.set_place(parent, name);
+                }
+                return self.entry_with_reference(parent, st, mark, || Err(linux::EIO));
+            }
+            other => other?,
+        };
+        if let Some(inode) = self.registry.get(entry.nodeid) {
+            inode.set_place(parent, name);
+        }
+        Ok(entry)
     }
 
     /// The common tail of every reply that names an inode.
@@ -1439,7 +1536,7 @@ impl Server {
         match self.entry(&parent, &name) {
             Ok(entry) => Ok(self.entry_reply(&entry)),
             Err(linux::ENOENT) => {
-                if std::env::var("LIGHTER_FS_DEBUG_ENOENT").as_deref() == Ok("1") {
+                if self.debug_enoent {
                     let held = sys::path_of(parent.reference()?.raw_fd())
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|e| format!("<no path: {e}>"));
@@ -1702,23 +1799,30 @@ impl Server {
                         .unwrap_or_else(|| *batch.lock().expect("attr batch poisoned"));
                     let result = (|| {
                         let cached = open_cache.file(nodeid, false);
-                        let held;
-                        let raw = match &cached {
-                            Some(file) => file.fd.as_raw_fd(),
-                            None => {
-                                held = inode.reference()?;
-                                held.raw_fd()
-                            }
+                        let via = match &cached {
+                            Some(file) => Via::Raw(file.fd.as_raw_fd()),
+                            None => via(&inode)?,
                         };
                         if let Some(mode) = change.mode {
-                            sys::chmod_fd(raw, mode)?;
+                            match &via {
+                                Via::Raw(raw) => sys::chmod_fd(*raw, mode)?,
+                                Via::Fd(fd) => sys::chmod_fd(fd.raw_fd(), mode)?,
+                                Via::At(parent, name) => sys::chmod_at(parent.raw_fd(), name, mode)?,
+                            }
                         }
                         if change.atime.is_some() || change.mtime.is_some() {
                             let at = |t: Option<(i64, i64)>| match t {
                                 Some((s, ns)) => TimeSpec::At(s, ns as u32),
                                 None => TimeSpec::Omit,
                             };
-                            sys::utimes_fd(raw, at(change.atime), at(change.mtime))?;
+                            let (atime, mtime) = (at(change.atime), at(change.mtime));
+                            match &via {
+                                Via::Raw(raw) => sys::utimes_fd(*raw, atime, mtime)?,
+                                Via::Fd(fd) => sys::utimes_fd(fd.raw_fd(), atime, mtime)?,
+                                Via::At(parent, name) => {
+                                    sys::utimes_at(parent.raw_fd(), name, atime, mtime)?
+                                }
+                            }
                         }
                         Ok(())
                     })();
@@ -1870,7 +1974,7 @@ impl Server {
             sys::truncate_fd(file.fd.as_raw_fd(), size)?;
         }
 
-        let st = sys::stat_fd(inode.reference()?.raw_fd())?;
+        let st = self.stat_of(&inode)?;
         Ok(self.attr_reply(&st))
     }
 
@@ -2160,6 +2264,9 @@ impl Server {
                 if retargeted {
                     old_parent.remove_pending_child(old.to_bytes(), nodeid);
                     new_parent.add_pending_child(new.to_bytes(), nodeid);
+                    if let Some(inode) = self.registry.get(nodeid) {
+                        inode.set_place(new_parent, new);
+                    }
                     return Ok(Some(Vec::new()));
                 }
                 self.materialize_why(nodeid, 5);
@@ -2185,6 +2292,10 @@ impl Server {
         if inode.is_dir {
             return Ok(None);
         }
+        // Reached by its new name from here on, whichever path performs the
+        // rename; a name that turns out not to be it yet fails its identity
+        // check and falls back to a reopen by identity.
+        inode.set_place(new_parent, new);
         // Whatever the new name held loses it; if the guest knows that
         // inode, its link count is about to change.
         let displaced = if let Some(id) = new_parent.pending_child(new.to_bytes()) {
@@ -2368,6 +2479,7 @@ impl Server {
             mtime: born,
         };
         let (nodeid, inode) = self.registry.insert_pending(parent.dev(), meta, kind);
+        inode.set_place(parent, name);
         if let Some(target) = &target {
             // A symlink's size is its target's length; the overlay says so
             // until the host does.
@@ -2553,7 +2665,7 @@ impl Server {
         // are only ever read, and asking for write access to a read-only file
         // fails outright rather than degrading.
         let flags = if need_write { 2 } else { 0 };
-        let fd = sys::reopen(inode.reference()?.raw_fd(), flags, 0)?;
+        let fd = open_inode(&inode, flags)?;
         let file = Arc::new(OpenFile {
             fd,
             readable: true,
@@ -2588,7 +2700,7 @@ impl Server {
         // Measured as ripgrep at 87% of native instead of 97%, and a pnpm
         // install that failed its second repetition.
         // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
-        let fd = sys::reopen(inode.reference()?.raw_fd(), 0o200000, 0)?;
+        let fd = open_inode(&inode, 0o200000)?;
         sys::Dir::from_fd(fd)?.read_all()
     }
 
@@ -2693,6 +2805,7 @@ impl Server {
         let (nodeid, dest) =
             self.registry
                 .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
+        dest.set_place(&parent, &name);
         // The reply is a size, not an entry: see `Registry::unname`.
         self.registry.unname(nodeid);
         if let Some(old) = &displaced {
@@ -2914,6 +3027,7 @@ impl Server {
         let (nodeid, inode) =
             self.registry
                 .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
+        inode.set_place(parent, name);
         parent.add_pending_child(name.to_bytes(), nodeid);
         let held = Held {
             parent: parent.clone(),
@@ -2972,6 +3086,21 @@ impl Server {
         Ok(Some(out))
     }
 
+    /// A stat of the inode by whatever names it now: a resident descriptor,
+    /// else its parent's descriptor and its name, and only as a last resort
+    /// a revival by identity. What the name answers is checked against the
+    /// inode's own identity, so a name the Mac has since given to another
+    /// file cannot be mistaken for ours.
+    fn stat_of(&self, inode: &Inode) -> Result<libc::stat, i32> {
+        match inode.locate()? {
+            Located::Fd(fd) => sys::stat_fd(fd.raw_fd()),
+            Located::At(parent, name) => match sys::stat_at(parent.raw_fd(), &name) {
+                Ok(st) if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() => Ok(st),
+                _ => sys::stat_fd(inode.reference()?.raw_fd()),
+            },
+        }
+    }
+
     /// A stat of the inode by the cheapest descriptor to hand.
     ///
     /// The open cache holds the descriptor a recent create or write left,
@@ -2983,8 +3112,8 @@ impl Server {
         if let Some(file) = self.open_cache.file(nodeid, false) {
             return sys::stat_fd(file.fd.as_raw_fd());
         }
-        match inode.reference() {
-            Ok(fd) => sys::stat_fd(fd.raw_fd()),
+        match self.stat_of(inode) {
+            Ok(st) => Ok(st),
             Err(errno) => {
                 if self.stats.enabled() {
                     tracing::warn!(
@@ -3294,9 +3423,8 @@ impl Server {
                             fd = cached;
                             fd.fd.as_raw_fd()
                         } else {
-                            let reference = inode.reference()?;
                             fd = std::sync::Arc::new(OpenFile {
-                                fd: sys::reopen(reference.raw_fd(), 2, 0)?,
+                                fd: open_inode(&inode, 2)?,
                                 readable: true,
                                 append: false,
                                 writable: true,
