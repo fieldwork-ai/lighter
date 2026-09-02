@@ -70,10 +70,12 @@ echo "INIT filesystems=ok"
 # root image can be replaced on upgrade without touching anyone's images, and so
 # that the thing that grows is the thing that gets punched back to nothing.
 DATA_DEV=/dev/vdb
-# `lighter.data_fs=xfs` formats a blank data disk as XFS instead of ext4, to
-# be measured: its reflinks make a copy_file_range a clone, which is how
-# yarn links a package tree and how cp copies one.
-DATA_FS=ext4
+# The data disk is btrfs, as OrbStack's is: its reflinks make a
+# copy_file_range a clone, which is how yarn links a package tree and how cp
+# copies one — on ext4 that was a real copy, 1.4 GB per install and its
+# writeback, and half of yarn's system time. `lighter.data_fs=ext4|xfs`
+# formats a blank disk otherwise, so the alternatives stay measurable.
+DATA_FS=btrfs
 for arg in $(cat /proc/cmdline); do
 	case "$arg" in
 	lighter.data_fs=*) DATA_FS="${arg#lighter.data_fs=}" ;;
@@ -93,7 +95,13 @@ if [ -b "$DATA_DEV" ]; then
 			esac
 		done
 		echo "INIT formatting=$DATA_DEV fs=$DATA_FS mkfs=$DATA_MKFS"
-		if [ "$DATA_FS" = xfs ]; then
+		if [ "$DATA_FS" = btrfs ]; then
+			# Single metadata: the default duplicates it against a bad
+			# sector, and this disk is a file whose sectors are the
+			# Mac's to lose or keep.
+			# shellcheck disable=SC2086
+			mkfs.btrfs -q -f -L lighter-data -m single $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
+		elif [ "$DATA_FS" = xfs ]; then
 			# shellcheck disable=SC2086
 			mkfs.xfs -q -f -L lighter-data $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
 		else
@@ -129,7 +137,14 @@ if [ -b "$DATA_DEV" ]; then
 	# outright, so a different setting can be measured without a rebuild of
 	# this image.
 	DATA_OPTS=noatime,nobarrier,commit=30,data=writeback
-	[ "$DATA_FS" != xfs ] || DATA_OPTS=noatime
+	case "$DATA_FS" in
+	# nodatacow, as OrbStack mounts it: data is written in place and not
+	# checksummed, which keeps a database's file from fragmenting into a
+	# thousand extents and gives the crash semantics described above.
+	# Clones still share extents; the first write to a shared one copies.
+	btrfs) DATA_OPTS=noatime,nodatacow,commit=30 ;;
+	xfs) DATA_OPTS=noatime ;;
+	esac
 	for arg in $(cat /proc/cmdline); do
 		case "$arg" in
 		lighter.data_opts=*) DATA_OPTS="${arg#lighter.data_opts=}" ;;

@@ -41,7 +41,7 @@ There is no firmware. The device tree is the only description the kernel gets of
 
 virtio-mmio rather than PCI: no host bridge to model, no enumeration, and a device set fixed at boot by the device tree.
 
-- **block** — a sparse file, with discard becoming `F_PUNCHHOLE`, which is what makes deleting an image give space back. Every request is one `preadv`/`pwritev` straight over the guest's pages; mapping the image was measured and lost (see `Disk`).
+- **block** — a sparse file, with discard becoming `F_PUNCHHOLE`, which is what makes deleting an image give space back. Every request is one `preadv`/`pwritev` straight over the guest's pages; mapping the image was measured and lost (see `Disk`). The guest formats it as btrfs, mounted `nodatacow` as OrbStack's is, for its reflinks: yarn links a package tree by copying every file out of its cache and `cp` copies one the same way, and a clone moves no data where ext4 moved 1.4 GB per install and wrote it back — half of yarn's system time. A clone wins at every file size on btrfs, one-kilobyte files included, so there is no threshold below which the copy is taken (a version with one was measured and dropped). `nodatacow` writes data in place, which is what keeps a database's file from fragmenting into a thousand extents and gives the crash semantics the init describes (a file written in the last moments may hold stale blocks rather than be short); clones still share extents, and the first write to a shared one copies.
 - **net** — frames to `gvproxy`, a userspace network stack running as a sidecar. It is the one component we did not write, consumed over a documented socket protocol so it can be replaced by a native stack without anything else moving.
 - **vsock** — the Docker socket and the control channel, independent of the guest's routing table.
 - **fs** — one device per shared directory. The requests leave the vCPU thread immediately, because a syscall on a vCPU stops that core and a package install makes hundreds of thousands of them.
@@ -52,7 +52,7 @@ Two things about the transport are not obvious from the specification. The inter
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and nine patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and ten patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
 The kernel patches are the interesting part:
 
@@ -66,7 +66,9 @@ The kernel patches are the interesting part:
 
 - **Looking for the disk's answer before sleeping for it.** The block device finishes a request inside the kick exit, and when the host watcher has the ring the guest need not kick at all; the stock driver then paid an interrupt, two exits to read and acknowledge it, and an IPI to hand the completion to the CPU that asked. So the driver disables callbacks before publishing a request and spins on the used ring for a bounded time afterwards, completing what it finds on the submitting CPU; what the device did not finish in time still arrives by interrupt. With both sides polling a request costs no exit. The device also offers one queue per vCPU, and not for parallelism: a queue shared by every CPU makes the block layer hand a completion found from process context to the block softirq and a ksoftirqd wakeup, two to four microseconds of task switching on a request the host finished in under two, and it was reads that paid it (a write's completion was reaped inside `io_submit`, a read's four microseconds later). With a queue per CPU the driver completes in place. fio, 4 KiB random, direct, queue depth 1 then 8: reads 40k → 438k and 239k → 462k a second, writes 35k → 310k and 158k → 319k, against 1.6 million interrupts becoming a few thousand. OrbStack's guest takes no block interrupts at all under fio and advertises the same multi-queue shape; on the same machine it reads at 392k and 395k and writes at 123k and 122k.
 
-The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All nine are in `guest/kernel/patches/`.
+- **Completing a checksum-free read where it finished.** btrfs hands every data read to a workqueue before its completion runs, so checksums can be verified and a bad sector repaired from another copy. On a `nodatacow` volume there are no checksums, and the worker wakeup was most of a cached read: fio at queue depth 1 read at 39k a second on btrfs against 464k on ext4 on the same kernel. A clean read from an inode with no checksums now completes on the CPU that found it, as ext4's do — 437k, with writes at 144k against OrbStack's 123k, which is btrfs's ordered-extent bookkeeping on both.
+
+The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All ten are in `guest/kernel/patches/`.
 
 ## The guest decides how much the host remembers
 

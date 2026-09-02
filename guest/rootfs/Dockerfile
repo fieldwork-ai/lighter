@@ -24,6 +24,7 @@ RUN apk add --no-cache \
 	e2fsprogs \
 	e2fsprogs-extra \
 	xfsprogs \
+	btrfs-progs \
 	util-linux \
 	blkid \
 	ca-certificates \
