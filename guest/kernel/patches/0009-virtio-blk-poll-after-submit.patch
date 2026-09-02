@@ -1,4 +1,4 @@
-virtio-blk: poll for the completion after kicking, before relying on the interrupt
+virtio-blk: poll for the completion after submitting, before relying on the interrupt
 
 A virtio-blk request on this machine costs three vCPU exits and an
 inter-CPU wake: the kick, then the interrupt the device raises when it is
@@ -7,10 +7,13 @@ acknowledgement — and then the completion redirected to the submitting CPU
 by IPI. The device, meanwhile, finished the request inside the kick exit:
 the used entry is in the ring before the vCPU is back in the guest.
 
-So after kicking, look. Callbacks are disabled before the kick, so the
-device raises nothing for what it completes synchronously; the submitting
-CPU then spins on the used ring for a bounded time, completes what it finds
-in its own context (no IPI, no interrupt, no acknowledge), and re-arms.
+So after submitting, look — whether or not a kick was needed, because a
+device that is watching the ring suppresses the kick and answers moments
+after the descriptor is published. Callbacks are disabled before the
+submission, so the device raises nothing for what it completes now; the
+submitting CPU spins on the used ring for a bounded time, completes what it
+finds in its own context (no IPI, no interrupt, no acknowledge), and
+re-arms. With the device polling too, a request costs no exit at all.
 Requests the device did not finish in time — a write that had to wait for a
 flush, a read from a cold image — still arrive by interrupt as before.
 
@@ -18,31 +21,33 @@ flush, a read from a cold image — still arrive by interrupt as before.
 
 --- a/drivers/block/virtio_blk.c
 +++ b/drivers/block/virtio_blk.c
-@@ -41,6 +41,11 @@
- static unsigned int poll_queues;
+@@ -42,6 +42,11 @@
  module_param(poll_queues, uint, 0644);
  MODULE_PARM_DESC(poll_queues, "The number of dedicated virtqueues for polling I/O");
-+
+ 
 +static unsigned int poll_usecs = 30;
 +module_param(poll_usecs, uint, 0644);
-+MODULE_PARM_DESC(poll_usecs, "After kicking, spin this long for the device to complete "
++MODULE_PARM_DESC(poll_usecs, "After submitting, spin this long for the device to complete "
 +		 "the request before relying on its interrupt (0 disables)");
- 
++
  static int major;
  static DEFINE_IDA(vd_index_ida);
-@@ -373,6 +378,48 @@
+ 
+@@ -373,6 +378,50 @@
  	if (req_done)
  		blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
  	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
 +}
 +
 +/*
-+ * The device may have finished the request inside the kick itself. Look for
-+ * that before sleeping for an interrupt: callbacks were disabled ahead of the
-+ * kick, so nothing the device completed synchronously raised one, and what is
-+ * found here completes on the CPU that submitted it.
++ * The device may finish the request while we are still here: inside the kick
++ * itself, or — when it is watching the ring and we did not need to kick —
++ * moments after it saw the descriptor. Look for that before sleeping for an
++ * interrupt: callbacks were disabled before the submission was published, so
++ * nothing the device completes now raises one, and what is found here
++ * completes on the CPU that submitted it.
 + */
-+static void virtblk_poll_after_kick(struct virtio_blk_vq *vq)
++static void virtblk_poll_after_submit(struct virtio_blk_vq *vq)
 +{
 +	struct request_queue *q = NULL;
 +	struct virtblk_req *vbr;
@@ -79,39 +84,39 @@ flush, a read from a cold image — still arrive by interrupt as before.
  }
  
  static void virtio_commit_rqs(struct blk_mq_hw_ctx *hctx)
-@@ -454,12 +501,17 @@
+@@ -454,12 +503,18 @@
  		return virtblk_fail_to_queue(req, err);
  	}
  
 -	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq))
-+	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq)) {
- 		notify = true;
+-		notify = true;
++	if (bd->last) {
 +		if (poll_usecs)
 +			virtqueue_disable_cb(vblk->vqs[qid].vq);
++		if (virtqueue_kick_prepare(vblk->vqs[qid].vq))
++			notify = true;
 +	}
  	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
  
--	if (notify)
-+	if (notify) {
+ 	if (notify)
  		virtqueue_notify(vblk->vqs[qid].vq);
-+		virtblk_poll_after_kick(&vblk->vqs[qid]);
-+	}
++	if (bd->last)
++		virtblk_poll_after_submit(&vblk->vqs[qid]);
  	return BLK_STS_OK;
  }
  
-@@ -493,10 +545,14 @@
+@@ -492,11 +547,14 @@
+ 		}
  	}
  
- 	kick = virtqueue_kick_prepare(vq->vq);
-+	if (kick && poll_usecs)
++	if (poll_usecs)
 +		virtqueue_disable_cb(vq->vq);
+ 	kick = virtqueue_kick_prepare(vq->vq);
  	spin_unlock_irqrestore(&vq->lock, flags);
  
--	if (kick)
-+	if (kick) {
+ 	if (kick)
  		virtqueue_notify(vq->vq);
-+		virtblk_poll_after_kick(vq);
-+	}
++	virtblk_poll_after_submit(vq);
  }
  
  static void virtio_queue_rqs(struct rq_list *rqlist)
