@@ -40,8 +40,8 @@ UNRATIOED = {"watch-latency"}
 REFERENCE = "native"
 
 
-def load(target):
-    path = RESULTS / f"{target}.csv"
+def load(target, results=RESULTS):
+    path = results / f"{target}.csv"
     if not path.exists():
         return {}
     runs = {}
@@ -64,23 +64,37 @@ def tool_version(*command):
         return "not installed"
 
 
-# The runtimes the report is a comparison *of*. Everything else in
-# `results/` is a sweep — one target measured twice under different settings,
-# recorded so a tuning decision can be re-checked — and belongs in its own
-# section rather than as thirty more columns nobody can read across.
+# The runtimes the report is a comparison *of*.
 RUNTIMES = ("native", "lighter", "orbstack", "colima", "docker-desktop")
 
 
-def main():
-    found = sorted(p.stem for p in RESULTS.glob("*.csv"))
-    targets = [t for t in RUNTIMES if t in found]
-    sweeps = [t for t in found if t not in RUNTIMES]
-    if not targets:
-        print("no results yet; run benchmarks/run.sh --target <t>", file=sys.stderr)
-        return 1
-    measured = {target: load(target) for target in found}
-    reference = measured.get(REFERENCE, {})
+def describe_this_machine():
+    """What `scripts/describe-machine.sh` says about the machine running this."""
+    try:
+        out = subprocess.run(
+            [str(HERE.parent / "scripts" / "describe-machine.sh")],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return out.stdout.strip() or f"{platform.machine()}, macOS {platform.mac_ver()[0]}"
+    except Exception:
+        return f"{platform.machine()}, macOS {platform.mac_ver()[0]}"
 
+
+def machines():
+    """Every result set: this machine's in `results/`, and one directory per
+    other machine under `results/machines/`, each with the `machine.txt` its
+    own `scripts/describe-machine.sh` wrote."""
+    sets = [(RESULTS, describe_this_machine(), True)]
+    for entry in sorted((RESULTS / "machines").glob("*/")):
+        note = entry / "machine.txt"
+        if note.exists() and any(entry.glob("*.csv")):
+            sets.append((entry, note.read_text().strip(), False))
+    return sets
+
+
+def main():
     lines = [
         "# Benchmark results",
         "",
@@ -89,16 +103,53 @@ def main():
         "",
         "Every target ran the same case scripts against the same fixture on the same",
         "machine, with caches warmed by an untimed run first. The figure is the median",
-        "of the repetitions.",
+        "of the repetitions. Each machine is its own section; a number is only ever",
+        "compared with another from the same machine and the same session.",
         "",
-        f"- Machine: {platform.machine()}, macOS {platform.mac_ver()[0]}",
         f"- Node: {tool_version('node', '--version')}",
         f"- npm: {tool_version('npm', '--version')}",
         f"- ripgrep: {tool_version('rg', '--version')}",
         f"- pnpm: {tool_version('pnpm', '--version')}",
         f"- yarn: {tool_version('yarn', '--version')}",
         "",
-        "## Wall time, milliseconds",
+    ]
+    rendered = 0
+    for results, description, primary in machines():
+        section = render(results, description, primary)
+        if section:
+            lines += section
+            rendered += 1
+    if not rendered:
+        print("no results yet; run benchmarks/run.sh --target <t>", file=sys.stderr)
+        return 1
+
+    lines += ["## What each case does", ""]
+    for case, description, direction in CASES:
+        lines.append(f"- **{case}** — {description} ({direction})")
+    lines.append("")
+
+    (HERE / "RESULTS.md").write_text("\n".join(lines))
+    print(f"wrote {HERE / 'RESULTS.md'}")
+    return 0
+
+
+def render(results, description, _primary):
+    """One machine's tables."""
+    # Only the runtimes are reported. Everything else in the directory is a
+    # labelled run — a sweep, a diagnosis, a repetition kept for the record —
+    # and stays as a CSV anyone can read; a hundred such columns in one table
+    # was a table nobody could.
+    found = sorted(p.stem for p in results.glob("*.csv"))
+    targets = [t for t in RUNTIMES if t in found]
+    if not targets:
+        return []
+    measured = {target: load(target, results) for target in targets}
+    reference = measured.get(REFERENCE, {})
+
+    lines = [
+        f"## {description}",
+        "",
+        "### Wall time, milliseconds",
         "",
     ]
 
@@ -117,7 +168,7 @@ def main():
 
     if reference:
         lines += [
-            f"## As a fraction of `{REFERENCE}`",
+            f"### As a fraction of `{REFERENCE}`",
             "",
             f"100% would mean the shared filesystem costs nothing at all next to the",
             f"Mac's own disk. Higher is better. `watch-latency` is left out: it is a",
@@ -140,35 +191,7 @@ def main():
             lines.append(f"| {case} | " + " | ".join(cells) + " |")
         lines.append("")
 
-    if sweeps:
-        lines += [
-            "## Sweeps",
-            "",
-            "One runtime measured twice under different settings, so a tuning",
-            "decision can be re-checked without taking anyone's word for it.",
-            "The names are the settings; the code that reads them says which.",
-            "",
-            "| case | " + " | ".join(sweeps) + " |",
-            "|" + "---|" * (len(sweeps) + 1),
-        ]
-        for case, _, _ in CASES:
-            if not any(case in measured[t] for t in sweeps):
-                continue
-            cells = [
-                "—" if measured[t].get(case) is None else f"{int(measured[t][case])}"
-                for t in sweeps
-            ]
-            lines.append(f"| {case} | " + " | ".join(cells) + " |")
-        lines.append("")
-
-    lines += ["## What each case does", ""]
-    for case, description, direction in CASES:
-        lines.append(f"- **{case}** — {description} ({direction})")
-    lines.append("")
-
-    (HERE / "RESULTS.md").write_text("\n".join(lines))
-    print(f"wrote {HERE / 'RESULTS.md'}")
-    return 0
+    return lines
 
 
 if __name__ == "__main__":

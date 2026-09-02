@@ -5,29 +5,31 @@ Do not edit: regenerate it.
 
 Every target ran the same case scripts against the same fixture on the same
 machine, with caches warmed by an untimed run first. The figure is the median
-of the repetitions.
+of the repetitions. Each machine is its own section; a number is only ever
+compared with another from the same machine and the same session.
 
-- Machine: arm64, macOS 26.6.2
-- Node: v26.8.1
-- npm: 11.19.0
-- ripgrep: ripgrep 15.2.0
-- pnpm: 10.28.0
+- Node: v24.18.0
+- npm: 11.16.0
+- ripgrep: ripgrep 15.1.0
+- pnpm: 11.23.0
 - yarn: 1.22.22
 
-## Wall time, milliseconds
+## MacBook Pro (Mac17,8), Apple M5 Pro, 18 cores (6P+12E), 48 GB, macOS 26.6.2
+
+### Wall time, milliseconds
 
 | case | native | lighter | orbstack |
 |---|---|---|---|
-| npm-install | 7817 | 14250 | 10713 |
-| pnpm-install | 4437 | 30002 | 5868 |
-| yarn-install | 9448 | 16260 | 10010 |
-| ripgrep | 1317 | 159 | 1125 |
-| find-walk | 498 | 125 | 513 |
-| copy-tree | 22119 | 14219 | 11910 |
-| rm-rf | 5278 | 5839 | 3831 |
-| watch-latency | 2 | 2 | 33 |
+| npm-install | 6574 | 8617 | 9001 |
+| pnpm-install | 4705 | 4327 | 5362 |
+| yarn-install | 5923 | 6036 | 9323 |
+| ripgrep | 904 | 99 | 1021 |
+| find-walk | 370 | 109 | 480 |
+| copy-tree | 14186 | 4352 | 9196 |
+| rm-rf | 4450 | 2738 | 3388 |
+| watch-latency | 2 | 2 | 2 |
 
-## As a fraction of `native`
+### As a fraction of `native`
 
 100% would mean the shared filesystem costs nothing at all next to the
 Mac's own disk. Higher is better. `watch-latency` is left out: it is a
@@ -36,13 +38,13 @@ division by noise — read it from the table above in milliseconds.
 
 | case | lighter | orbstack |
 |---|---|---|
-| npm-install | 55% | 73% |
-| pnpm-install | 15% | 76% |
-| yarn-install | 58% | 94% |
-| ripgrep | 828% | 117% |
-| find-walk | 398% | 97% |
-| copy-tree | 156% | 186% |
-| rm-rf | 90% | 138% |
+| npm-install | 76% | 73% |
+| pnpm-install | 109% | 88% |
+| yarn-install | 98% | 64% |
+| ripgrep | 913% | 89% |
+| find-walk | 339% | 77% |
+| copy-tree | 326% | 154% |
+| rm-rf | 163% | 131% |
 
 ## What each case does
 
