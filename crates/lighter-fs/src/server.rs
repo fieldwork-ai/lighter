@@ -215,12 +215,23 @@ fn create_job(
             parent.remove_pending_child(name.to_bytes(), nodeid);
             return;
         }
+        // A write-only open is made read-write on the host: the guest's
+        // own access check has passed, the creating open ignores the mode
+        // it sets, and the cached descriptor then serves the read a clone
+        // or a copy of this file will make of it — pnpm imports every store
+        // file it has just written, and a write-only descriptor cannot be
+        // read from or cloned from.
+        let host_flags = if flags & 0o3 == 1 {
+            (flags & !0o3) | 2
+        } else {
+            flags
+        };
         let result = (|| {
             let parent_fd = parent.reference()?;
             let fd = sys::openat_path(
                 parent_fd.raw_fd(),
                 &name,
-                flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
+                host_flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
                 mode,
             )?;
             let st = sys::stat_fd(fd.as_raw_fd())?;
@@ -267,7 +278,7 @@ fn create_job(
                     nodeid,
                     std::sync::Arc::new(OpenFile {
                         fd,
-                        readable: flags & 0o3 != 1,
+                        readable: true,
                         append: false,
                         writable: flags & 0o3 != 0,
                     }),
@@ -2661,11 +2672,21 @@ impl Server {
                     // file is cloned, and shares its blocks as FICLONE
                     // promises.
                     let bytes = if size <= COPY_INSTEAD_OF_CLONE_MAX {
+                        // The reference is event-only and cannot be read;
+                        // reopened read-only by identity when that is what
+                        // there is.
+                        let readable;
+                        let raw = match &source_fd {
+                            Source::Cached(file) if file.readable => file.fd.as_raw_fd(),
+                            _ => {
+                                readable = sys::reopen(source_fd.raw_fd(), 0, 0)?;
+                                readable.as_raw_fd()
+                            }
+                        };
                         let mut bytes = Vec::with_capacity(size as usize);
                         let mut chunk = vec![0u8; 64 << 10];
                         loop {
-                            let n =
-                                sys::read_at(source_fd.raw_fd(), &mut chunk, bytes.len() as u64)?;
+                            let n = sys::read_at(raw, &mut chunk, bytes.len() as u64)?;
                             if n == 0 {
                                 break;
                             }

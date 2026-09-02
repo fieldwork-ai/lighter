@@ -339,6 +339,24 @@ fn an_open_file_survives_being_unlinked() {
     );
 }
 
+/// pnpm's import: a store file it wrote write-only, cloned to its place.
+/// The clone (a copy, at this size) reads a source the guest never opened
+/// for reading.
+#[test]
+fn a_write_only_source_can_be_cloned() {
+    let mut guest = Guest::new("clone-wronly");
+    let (src, fh) = guest.create(1, "store", 0x8241).unwrap();
+    guest.write(src, fh, 0, b"payload").unwrap();
+    guest.call(op::RELEASE, src, &[0u8; 24]).expect("release");
+    let mut body = Vec::new();
+    body.extend_from_slice(&src.to_le_bytes());
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(b"imported\0");
+    guest.call(op::LIGHTER_CLONE, 1, &body).expect("clone");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::read(guest.host("imported")).unwrap(), b"payload");
+}
+
 /// pnpm's store write: a temporary name, the bytes, a close, a rename into
 /// place. Held, that is one create under the final name with the bytes in
 /// it — and the temporary name never exists on the Mac at all.
