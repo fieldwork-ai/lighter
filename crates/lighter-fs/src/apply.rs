@@ -117,9 +117,22 @@ pub enum Kind {
     Link,
     Mkdir,
     Symlink,
+    Rmdir,
 }
 
-const KINDS: usize = 9;
+const KINDS: usize = 10;
+
+impl Kind {
+    /// Whether jobs of this kind may run beside the serial lane.
+    ///
+    /// Clones, whose cost is inside the file; and unlinks and rmdirs,
+    /// which are keyed by their directory and so only ever overlap across
+    /// directories — the one parallelism APFS rewards, and the one `rm -rf`
+    /// offers as it moves on while a directory's removals are still queued.
+    const fn concurrent(self) -> bool {
+        matches!(self, Kind::Clone | Kind::Unlink | Kind::Rmdir)
+    }
+}
 
 const fn kind_of(index: usize) -> Kind {
     match index {
@@ -131,7 +144,8 @@ const fn kind_of(index: usize) -> Kind {
         5 => Kind::Setattr,
         6 => Kind::Link,
         7 => Kind::Mkdir,
-        _ => Kind::Symlink,
+        8 => Kind::Symlink,
+        _ => Kind::Rmdir,
     }
 }
 
@@ -216,8 +230,12 @@ struct State {
     /// per-file latency of one — and the one job a pnpm install is made of.
     serial_running: bool,
     slots: HashMap<u64, Slot>,
-    /// Ready to run, oldest first.
+    /// Ready to run, oldest first: the serial lane, and the clones that
+    /// may run beside it. Two queues so that a worker's pick is one pop
+    /// and not a scan — with a thousand jobs ready, three workers scanning
+    /// the lot on every completion cost an npm install three seconds.
     ready: VecDeque<u64>,
+    ready_clones: VecDeque<u64>,
     /// The most recent job queued on each key, while it is still held.
     tails: HashMap<u64, u64>,
     /// Sequence numbers queued and not yet applied.
@@ -268,6 +286,7 @@ impl Apply {
                 serial_running: false,
                 slots: HashMap::new(),
                 ready: VecDeque::new(),
+                ready_clones: VecDeque::new(),
                 tails: HashMap::new(),
                 incomplete: BTreeSet::new(),
             }),
@@ -335,6 +354,7 @@ impl Apply {
         shared.depth.fetch_add(1, Ordering::Relaxed);
         shared.bytes.fetch_add(job.bytes, Ordering::Relaxed);
         let seq = shared.pushed.fetch_add(1, Ordering::Relaxed) + 1;
+        let concurrent = job.kind.concurrent();
         // Ordered behind the most recent job on each of its keys, if that
         // job is still held. One that has finished has left the table, and
         // took its tail entries with it.
@@ -366,7 +386,11 @@ impl Apply {
             },
         );
         if waiting == 0 {
-            state.ready.push_back(seq);
+            if concurrent {
+                state.ready_clones.push_back(seq);
+            } else {
+                state.ready.push_back(seq);
+            }
         }
         drop(state);
         shared.arrived.notify_one();
@@ -429,6 +453,7 @@ impl Apply {
     pub fn report(&self) -> String {
         const NAMES: [&str; KINDS] = [
             "create", "write", "unlink", "rename", "clone", "setattr", "link", "mkdir", "symlink",
+            "rmdir",
         ];
         let mut out = String::new();
         for (i, name) in NAMES.iter().enumerate() {
@@ -489,27 +514,20 @@ impl Shared {
                     if state.retired {
                         return;
                     }
-                    // The oldest ready job this worker may take: any clone,
-                    // or the oldest of the rest when none is running.
-                    let pick = state.ready.iter().position(|seq| {
-                        let concurrent = state
-                            .slots
-                            .get(seq)
-                            .and_then(|slot| slot.job.as_ref())
-                            .is_some_and(|job| matches!(job.kind, Kind::Clone));
-                        concurrent || !state.serial_running
-                    });
-                    if let Some(index) = pick {
-                        let seq = state
-                            .ready
-                            .remove(index)
-                            .expect("a position in the ready queue");
+                    // The oldest job of the serial lane when nothing in it
+                    // is running, else the oldest clone.
+                    let pick = if !state.serial_running && !state.ready.is_empty() {
+                        state.ready.pop_front()
+                    } else {
+                        state.ready_clones.pop_front()
+                    };
+                    if let Some(seq) = pick {
                         let job = state
                             .slots
                             .get_mut(&seq)
                             .and_then(|slot| slot.job.take())
                             .expect("a ready job is held and untaken");
-                        if !matches!(job.kind, Kind::Clone) {
+                        if !job.kind.concurrent() {
                             state.serial_running = true;
                         }
                         break (seq, job);
@@ -536,11 +554,12 @@ impl Shared {
             }
             {
                 let mut state = self.state.lock().expect("apply queue poisoned");
-                if !matches!(kind_of(kind), Kind::Clone) {
+                if !kind_of(kind).concurrent() {
                     state.serial_running = false;
                 }
                 let slot = state.slots.remove(&seq).expect("a running job is held");
                 debug_assert!(!slot.done);
+                let mut clones_ready = 0;
                 for next in slot.successors {
                     let successor = state
                         .slots
@@ -548,7 +567,16 @@ impl Shared {
                         .expect("a successor is held until it runs");
                     successor.waiting -= 1;
                     if successor.waiting == 0 {
-                        state.ready.push_back(next);
+                        let concurrent = successor
+                            .job
+                            .as_ref()
+                            .is_some_and(|job| job.kind.concurrent());
+                        if concurrent {
+                            state.ready_clones.push_back(next);
+                            clones_ready += 1;
+                        } else {
+                            state.ready.push_back(next);
+                        }
                     }
                 }
                 // A key still pointing here has no later job on it; with this
@@ -571,8 +599,18 @@ impl Shared {
                 // the gap before it sleeps — a lost wake-up, and a barrier
                 // that sleeps forever on a queue that is already empty.
                 self.depth.fetch_sub(1, Ordering::Relaxed);
+                // Wake another worker only for a clone this completion made
+                // ready: the serial lane's next job is this worker's own to
+                // take when it loops. Waking one on every completion had a
+                // second worker racing this one for a job it would lose,
+                // four hundred thousand times an npm install; waking them
+                // all was worse.
+                match clones_ready {
+                    0 => {}
+                    1 => self.arrived.notify_one(),
+                    _ => self.arrived.notify_all(),
+                }
             }
-            self.arrived.notify_all();
             self.settled.notify_all();
         }
     }

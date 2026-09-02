@@ -1,0 +1,17 @@
+case,rep,ms
+npm-install,1,8700
+npm-install,2,8660
+pnpm-install,1,5752
+pnpm-install,2,5782
+yarn-install,1,8417
+yarn-install,2,8532
+ripgrep,1,1055
+ripgrep,2,960
+find-walk,1,769
+find-walk,2,505
+copy-tree,1,10320
+copy-tree,2,10102
+rm-rf,1,3542
+rm-rf,2,3587
+watch-latency,1,12
+watch-latency,2,98

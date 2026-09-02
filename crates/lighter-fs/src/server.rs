@@ -157,6 +157,12 @@ pub struct Server {
     deferred: std::sync::Mutex<
         std::collections::HashMap<u64, (std::sync::Arc<Inode>, crate::apply::Job)>,
     >,
+    /// `LIGHTER_FS_DEFER_CREATE=0` queues creates at once, as before they
+    /// were held back; `LIGHTER_FS_PARK_CREATES=0` binds them with a
+    /// metadata descriptor even at a full share. Kill switches for
+    /// bisecting a regression by environment rather than by rebuild.
+    defer_creates: bool,
+    park_creates: bool,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -252,6 +258,8 @@ impl Server {
             stats: Stats::new(),
             apply: crate::apply::Apply::start(root.to_path_buf()),
             deferred: std::sync::Mutex::new(std::collections::HashMap::new()),
+            defer_creates: std::env::var("LIGHTER_FS_DEFER_CREATE").as_deref() != Ok("0"),
+            park_creates: std::env::var("LIGHTER_FS_PARK_CREATES").as_deref() != Ok("0"),
             _watcher: watcher,
         })
     }
@@ -1625,15 +1633,65 @@ impl Server {
         self.settle_while(&parent, |parent| {
             parent.pending_child(name.to_bytes()).is_some()
         });
+        if dir && parent.name_pending_gone(name.to_bytes()) {
+            return Err(linux::ENOENT);
+        }
         if dir
-            && self.apply.busy()
+            && self.apply.accepting()
             && let Ok(st) = sys::stat_at(parent.reference()?.raw_fd(), &name)
             && let Some(child) = self
                 .registry
                 .nodeid_for(st.st_dev as i64, st.st_ino)
                 .and_then(|id| self.registry.get(id))
         {
-            self.settle_while(&child, |child| child.listing_shadowed());
+            // RMDIR, acknowledged: the guest removes a directory it has
+            // emptied, and its unlinks are queued ahead of this by the
+            // child's key. Waiting for them made `rm -rf` synchronous at
+            // the cost of every unlink: twice OrbStack. Emptiness is
+            // checked here rather than trusted — a name the host holds
+            // that no queued unlink accounts for is ENOTEMPTY now, not a
+            // removal that quietly comes back — and the check is one
+            // listing, against the four hundred microseconds the wait was.
+            if child.pending_children_snapshot().is_empty() {
+                let gone = child.pending_gone_snapshot();
+                if child.is_pending() {
+                    // Nothing on the host yet; nothing promised inside.
+                } else if let Ok(listing) = self.list(child.id())
+                    && listing.iter().any(|entry| {
+                        entry.name != b"." && entry.name != b".." && !gone.contains(&entry.name)
+                    })
+                {
+                    return Err(linux::ENOTEMPTY);
+                }
+            } else {
+                return Err(linux::ENOTEMPTY);
+            }
+            parent.add_pending_gone(name.to_bytes());
+            let job = {
+                let parent = parent.clone();
+                let name = name.clone();
+                move || {
+                    if let Err(errno) =
+                        (|| sys::unlink_at(parent.reference()?.raw_fd(), &name, true))()
+                    {
+                        tracing::warn!(
+                            errno,
+                            name = %name.to_string_lossy(),
+                            "an acknowledged rmdir failed to apply"
+                        );
+                    }
+                    parent.remove_pending_gone(name.to_bytes());
+                }
+            };
+            let seq = self.apply.push(crate::apply::Job::of(
+                crate::apply::Kind::Rmdir,
+                crate::apply::Keys::of(&[parent.id(), child.id()]),
+                0,
+                job,
+            ));
+            parent.settled_by(seq);
+            child.settled_by(seq);
+            return Ok(Vec::new());
         }
         if !dir && parent.name_pending_gone(name.to_bytes()) {
             // Already promised away; the guest's own dentry cache should have
@@ -2428,6 +2486,7 @@ impl Server {
             let parent = parent.clone();
             let inode = inode.clone();
             let name = name.clone();
+            let park_creates = self.park_creates;
             move || {
                 const LINUX_O_CREAT: u32 = 0o100;
                 const LINUX_O_NOFOLLOW: u32 = 0o400000;
@@ -2475,7 +2534,7 @@ impl Server {
                         // thousand times an install. Bound parked instead,
                         // with the open file itself still in the cache for
                         // the writes that follow.
-                        let meta = if registry.at_budget() {
+                        let meta = if park_creates && registry.at_budget() {
                             None
                         } else {
                             sys::dup(&fd).ok()
@@ -2524,21 +2583,22 @@ impl Server {
                 parent.remove_pending_child(name.to_bytes(), nodeid);
             }
         };
-        self.deferred
-            .lock()
-            .expect("deferred creates poisoned")
-            .insert(
-                nodeid,
-                (
-                    parent.clone(),
-                    crate::apply::Job::of(
-                        crate::apply::Kind::Create,
-                        crate::apply::Keys::of(&[parent.id(), nodeid]),
-                        0,
-                        job,
-                    ),
-                ),
-            );
+        let job = crate::apply::Job::of(
+            crate::apply::Kind::Create,
+            crate::apply::Keys::of(&[parent.id(), nodeid]),
+            0,
+            job,
+        );
+        if self.defer_creates {
+            self.deferred
+                .lock()
+                .expect("deferred creates poisoned")
+                .insert(nodeid, (parent.clone(), job));
+        } else {
+            let seq = self.apply.push(job);
+            parent.settled_by(seq);
+            inode.settled_by(seq);
+        }
         let entry = self.pending_entry(parent, &inode, nodeid);
         let mut out = self.entry_reply(&entry);
         let open_flags = self.created_file_flags() | fuse::fopen::LIGHTER_CREATED;
