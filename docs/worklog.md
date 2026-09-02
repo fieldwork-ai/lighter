@@ -43,3 +43,4 @@ One row per experiment, appended as they happen, so nobody reruns one by acciden
 | 2026-09-02 | scheduling | vCPU count 4 vs 8 on the M1 | yarn −4%, npm −7% (see above); QoS is not why | open |
 | 2026-09-02 | filesystem | btrfs default mounted an existing ext4 disk with btrfs options (`nodatacow`) | mount failed, dockerd started on the 2 GB root and died — the daily driver lost Docker; fixed by mounting by the type blkid reports, formatting by the default | fixed (trap) |
 | 2026-09-02 | own disk | per-device counters around a copy on both guests | OrbStack writes the full 1 GB during the copy too (55k writes, 20 KB each) — the gap is per-write cost: 3.0 s system vs 1.6 for the same writes | open (completion path) |
+| 2026-09-02 | virtio-blk | poll for asynchronous (writeback) requests too (`virtio_blk.poll_async`, runtime switch) | copy 2.0–2.1 s vs 2.2–2.7 without; system time 2.9 s either way | kept on by default (small wall gain), not the cost |
