@@ -617,9 +617,18 @@ impl VirtioDevice for Fs {
                         .and_then(|v| v.parse().ok())
                         .filter(|seconds| *seconds > 0)
                         .unwrap_or(5);
+                    let (mut last_notifies, mut last_polled) = (0u64, 0u64);
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(every));
                         server.log_stats();
+                        let notifies = crate::virtio::mmio::NOTIFIES.load(std::sync::atomic::Ordering::Relaxed);
+                        let polled = crate::virtio::mmio::POLLED.load(std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(
+                            notifies = notifies - last_notifies,
+                            polled = polled - last_polled,
+                            "VMMSTATS"
+                        );
+                        (last_notifies, last_polled) = (notifies, polled);
                     }
                 })
                 .expect("failed to spawn the filesystem stats thread");

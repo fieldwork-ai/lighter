@@ -154,6 +154,12 @@ impl QueueSignal {
     }
 }
 
+/// Doorbell exits taken (every queue notification the guest made), and
+/// queue pickups the host poller made without one. Diagnostics: the ratio
+/// says whether the poller is sparing the guest its exits.
+pub static NOTIFIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POLLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl VirtioMmio {
     pub fn new(
         device: Box<dyn VirtioDevice>,
@@ -229,6 +235,7 @@ impl VirtioMmio {
 
     /// Handles a queue notification.
     fn notify_queue(&mut self, index: u16) {
+        NOTIFIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.activated {
             // A notification before DRIVER_OK is a driver bug, not something to
             // service: the device has no memory to work against yet.
@@ -491,6 +498,9 @@ impl VirtioMmio {
         if !queue.has_work(&self.memory) {
             return false;
         }
+        // Counted here and again inside notify_queue: doorbell exits are
+        // NOTIFIES minus POLLED.
+        POLLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.notify_queue(index);
         true
     }
