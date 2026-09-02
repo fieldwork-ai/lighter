@@ -140,7 +140,7 @@ if [ -b "$DATA_DEV" ]; then
 	# checksummed, which keeps a database's file from fragmenting into a
 	# thousand extents and gives the crash semantics described above.
 	# Clones still share extents; the first write to a shared one copies.
-	btrfs) DATA_OPTS=noatime,nodatacow,commit=30 ;;
+	btrfs) DATA_OPTS=noatime,nodatacow,commit=30,thread_pool=1 ;;
 	xfs) DATA_OPTS=noatime ;;
 	esac
 	for arg in $(cat /proc/cmdline); do
