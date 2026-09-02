@@ -52,7 +52,7 @@ Two things about the transport are not obvious from the specification. The inter
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and four patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and nine patches; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
 The kernel patches are the interesting part:
 
@@ -64,7 +64,9 @@ The kernel patches are the interesting part:
 - **Not asking for `security.capability` the server has promised to clear.** `FUSE_HANDLE_KILLPRIV_V2` is a connection-wide undertaking that the server strips setuid, setgid and file capabilities on write. The kernel sends `FUSE_WRITE_KILL_SUIDGID` to say so, and then reads the attribute itself anyway — two round trips per written file, ten percent of all requests on an install, every one answered ENODATA.
 - **Not asking questions CREATE already answers.** Creating a file invalidates the parent directory's attributes — which the driver itself just changed, so the next walk through that directory pays a GETATTR to learn what it already knew. With the server's create dialect negotiated, the driver advances the parent's times in place (4,721 GETATTRs on the small npm fixture become 24), and skips the pre-create LOOKUP where the dentry is still unhashed. The skip needs one honesty guarantee in return: `FMODE_CREATED` suppresses the guest-side permission check, so the server creates with `O_EXCL` first and reports whether it really created, refuses a directory with the EISDIR that `open(2)` would give anyway, and answers a trailing symlink with ELOOP — on which the driver falls back to the ordinary lookup path so the VFS can walk it.
 
-All four are in `guest/kernel/patches/`, each with the reasoning in its header.
+- **Looking for the disk's answer before sleeping for it.** The block device finishes a request inside the kick exit — the used entry is in the ring before the vCPU is back in the guest — and the stock driver then pays an interrupt, two more exits to read and acknowledge it, and an IPI to hand the completion to the CPU that asked. So the driver disables callbacks ahead of the kick and spins on the used ring for a bounded time afterwards, completing what it finds on the submitting CPU; what the device did not finish in time still arrives by interrupt. 4 KiB random reads at queue depth 1 went from 38k to 117k a second and writes from 34k to 206k, with one interrupt in the whole run. This is the same shape as OrbStack's guest, whose block device takes no interrupts at all under fio.
+
+The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All nine are in `guest/kernel/patches/`.
 
 ## The guest decides how much the host remembers
 

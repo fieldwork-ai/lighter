@@ -1,0 +1,117 @@
+virtio-blk: poll for the completion after kicking, before relying on the interrupt
+
+A virtio-blk request on this machine costs three vCPU exits and an
+inter-CPU wake: the kick, then the interrupt the device raises when it is
+done — which the driver answers with two more exits, a status read and an
+acknowledgement — and then the completion redirected to the submitting CPU
+by IPI. The device, meanwhile, finished the request inside the kick exit:
+the used entry is in the ring before the vCPU is back in the guest.
+
+So after kicking, look. Callbacks are disabled before the kick, so the
+device raises nothing for what it completes synchronously; the submitting
+CPU then spins on the used ring for a bounded time, completes what it finds
+in its own context (no IPI, no interrupt, no acknowledge), and re-arms.
+Requests the device did not finish in time — a write that had to wait for a
+flush, a read from a cold image — still arrive by interrupt as before.
+
+`virtio_blk.poll_usecs=0` restores the interrupt-only path.
+
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -41,6 +41,11 @@
+ static unsigned int poll_queues;
+ module_param(poll_queues, uint, 0644);
+ MODULE_PARM_DESC(poll_queues, "The number of dedicated virtqueues for polling I/O");
++
++static unsigned int poll_usecs = 30;
++module_param(poll_usecs, uint, 0644);
++MODULE_PARM_DESC(poll_usecs, "After kicking, spin this long for the device to complete "
++		 "the request before relying on its interrupt (0 disables)");
+ 
+ static int major;
+ static DEFINE_IDA(vd_index_ida);
+@@ -373,6 +378,48 @@
+ 	if (req_done)
+ 		blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
+ 	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
++}
++
++/*
++ * The device may have finished the request inside the kick itself. Look for
++ * that before sleeping for an interrupt: callbacks were disabled ahead of the
++ * kick, so nothing the device completed synchronously raised one, and what is
++ * found here completes on the CPU that submitted it.
++ */
++static void virtblk_poll_after_kick(struct virtio_blk_vq *vq)
++{
++	struct request_queue *q = NULL;
++	struct virtblk_req *vbr;
++	unsigned long flags;
++	unsigned int len;
++	bool done = false;
++	ktime_t end;
++
++	if (!poll_usecs)
++		return;
++	end = ktime_add_us(ktime_get(), poll_usecs);
++
++	spin_lock_irqsave(&vq->lock, flags);
++	do {
++		virtqueue_disable_cb(vq->vq);
++		for (;;) {
++			while ((vbr = virtqueue_get_buf(vq->vq, &len)) != NULL) {
++				struct request *req = blk_mq_rq_from_pdu(vbr);
++
++				q = req->q;
++				if (likely(!blk_should_fake_timeout(req->q)))
++					blk_mq_complete_request(req);
++				done = true;
++			}
++			if (done || ktime_after(ktime_get(), end))
++				break;
++			cpu_relax();
++		}
++	} while (!virtqueue_enable_cb(vq->vq));
++
++	if (done)
++		blk_mq_start_stopped_hw_queues(q, true);
++	spin_unlock_irqrestore(&vq->lock, flags);
+ }
+ 
+ static void virtio_commit_rqs(struct blk_mq_hw_ctx *hctx)
+@@ -454,12 +501,17 @@
+ 		return virtblk_fail_to_queue(req, err);
+ 	}
+ 
+-	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq))
++	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq)) {
+ 		notify = true;
++		if (poll_usecs)
++			virtqueue_disable_cb(vblk->vqs[qid].vq);
++	}
+ 	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+ 
+-	if (notify)
++	if (notify) {
+ 		virtqueue_notify(vblk->vqs[qid].vq);
++		virtblk_poll_after_kick(&vblk->vqs[qid]);
++	}
+ 	return BLK_STS_OK;
+ }
+ 
+@@ -493,10 +545,14 @@
+ 	}
+ 
+ 	kick = virtqueue_kick_prepare(vq->vq);
++	if (kick && poll_usecs)
++		virtqueue_disable_cb(vq->vq);
+ 	spin_unlock_irqrestore(&vq->lock, flags);
+ 
+-	if (kick)
++	if (kick) {
+ 		virtqueue_notify(vq->vq);
++		virtblk_poll_after_kick(vq);
++	}
+ }
+ 
+ static void virtio_queue_rqs(struct rq_list *rqlist)
