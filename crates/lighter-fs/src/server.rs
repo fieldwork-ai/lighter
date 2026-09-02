@@ -1086,6 +1086,10 @@ impl Server {
             // The host still lists it; the guest was promised it is gone.
             return self.missing(&parent);
         }
+        if parent.is_pending() {
+            // A directory that is still a promise holds only promises.
+            return self.missing(&parent);
+        }
         match self.entry(&parent, &name) {
             Ok(entry) => Ok(self.entry_reply(&entry)),
             Err(linux::ENOENT) => {
@@ -1529,6 +1533,7 @@ impl Server {
         if !inode.is_symlink {
             return Err(linux::EINVAL);
         }
+        self.settle_while(&inode, |inode| inode.is_pending());
         let path = self.path(&inode)?;
         // The reply carries no terminator: the kernel takes the length from the
         // header, and a trailing NUL becomes part of the target.
@@ -1541,6 +1546,16 @@ impl Server {
         let (target, _) = get_name(rest).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let target = CString::new(target).map_err(|_| linux::EINVAL)?;
+        if let Some(reply) = self.name_pending(
+            &parent,
+            &name,
+            crate::inode::PendingKind::Symlink,
+            libc::S_IFLNK as u32 | 0o777,
+            Some(target.clone()),
+        )? {
+            return Ok(reply);
+        }
+        self.settle_while(&parent, |parent| parent.is_pending());
         sys::symlink_at(&target, parent.reference()?.raw_fd(), &name)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
@@ -1548,6 +1563,7 @@ impl Server {
 
     fn mknod(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
+        self.settle_while(&parent, |parent| parent.is_pending());
         let mode = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let rdev = get_u32(body, 4).ok_or(linux::EINVAL)?;
         let umask = get_u32(body, 8).unwrap_or(0);
@@ -1564,13 +1580,25 @@ impl Server {
         let umask = get_u32(body, 4).unwrap_or(0);
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        sys::mkdir_at(parent.reference()?.raw_fd(), &name, mode & 0o7777 & !umask)?;
+        let mode = mode & 0o7777 & !umask;
+        if let Some(reply) = self.name_pending(
+            &parent,
+            &name,
+            crate::inode::PendingKind::Directory,
+            libc::S_IFDIR as u32 | mode,
+            None,
+        )? {
+            return Ok(reply);
+        }
+        self.settle_while(&parent, |parent| parent.is_pending());
+        sys::mkdir_at(parent.reference()?.raw_fd(), &name, mode)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
 
     fn unlink(&self, parent: u64, body: &[u8], dir: bool) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
+        self.settle_while(&parent, |parent| parent.is_pending());
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         // A promised name has no host file yet, and its create cannot be
@@ -1791,6 +1819,8 @@ impl Server {
         let (new, _) = get_name(rest).ok_or(linux::EINVAL)?;
         let old = self.checked_name(old)?;
         let new = self.checked_name(new)?;
+        self.settle_while(&old_parent, |parent| parent.is_pending());
+        self.settle_while(&new_parent, |parent| parent.is_pending());
         if flags == 0
             && let Some(reply) = self.rename_pending(&old_parent, &old, &new_parent, &new)?
         {
@@ -1816,6 +1846,7 @@ impl Server {
 
     fn link(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
+        self.settle_while(&parent, |parent| parent.is_pending());
         let oldnodeid = self.resolve(get_u64(body, 0).ok_or(linux::EINVAL)?);
         let target = self.inode(oldnodeid)?;
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
@@ -1835,6 +1866,111 @@ impl Server {
         sys::link_at(libc::AT_FDCWD, &source, parent.reference()?.raw_fd(), &name)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
+    }
+
+    /// The asynchronous half of MKDIR and SYMLINK: a fresh name acknowledged
+    /// with a pending inode of the right kind, the syscall queued behind the
+    /// parent's own making by key.
+    ///
+    /// A pnpm install makes twelve thousand directories and five thousand
+    /// symlinks, each one synchronously a hundred microseconds of APFS on
+    /// the request thread — in the same directories the clone workers were
+    /// filling, so every one was also contention. A directory that is still
+    /// a promise holds nothing but promises: lookups and listings under it
+    /// are answered from its overlay, and anything that needs its
+    /// descriptor settles it first.
+    fn name_pending(
+        &self,
+        parent: &std::sync::Arc<Inode>,
+        name: &CString,
+        kind: crate::inode::PendingKind,
+        mode: u32,
+        target: Option<CString>,
+    ) -> Result<Option<Vec<u8>>, i32> {
+        if !self.apply.accepting() {
+            return Ok(None);
+        }
+        if parent.pending_child(name.to_bytes()).is_some() {
+            return Err(linux::EEXIST);
+        }
+        // A pending parent has nothing in it the overlay does not know.
+        if !parent.is_pending() && !parent.name_pending_gone(name.to_bytes()) {
+            match sys::stat_at(parent.reference()?.raw_fd(), name) {
+                Err(errno) if errno == linux::ENOENT => {}
+                _ => return Ok(None),
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let born = (now.as_secs() as i64, now.subsec_nanos() as i64);
+        let meta = crate::inode::PendingMeta {
+            mode,
+            born,
+            atime: born,
+            mtime: born,
+        };
+        let (nodeid, inode) = self.registry.insert_pending(parent.dev(), meta, kind);
+        if let Some(target) = &target {
+            // A symlink's size is its target's length; the overlay says so
+            // until the host does.
+            inode.write_acked(target.as_bytes().len() as u64);
+        }
+        parent.add_pending_child(name.to_bytes(), nodeid);
+        let job = {
+            let registry = self.registry.clone();
+            let parent = parent.clone();
+            let inode = inode.clone();
+            let name = name.clone();
+            let is_symlink = matches!(kind, crate::inode::PendingKind::Symlink);
+            move || {
+                let result = (|| {
+                    let parent_ref = parent.reference()?;
+                    match &target {
+                        Some(target) => sys::symlink_at(target, parent_ref.raw_fd(), &name)?,
+                        None => {
+                            let mode = inode.pending_meta().map(|m| m.mode).unwrap_or(mode);
+                            sys::mkdir_at(parent_ref.raw_fd(), &name, mode & 0o7777)?;
+                        }
+                    }
+                    let fd = sys::open_reference(parent_ref.raw_fd(), &name, is_symlink)?;
+                    let st = sys::stat_fd(fd.as_raw_fd())?;
+                    Ok((fd, st))
+                })();
+                match result {
+                    Ok((fd, st)) => {
+                        registry.bind_pending(nodeid, &inode, fd, st.st_dev as i64, st.st_ino);
+                    }
+                    Err(errno) => {
+                        tracing::warn!(
+                            errno,
+                            name = %name.to_string_lossy(),
+                            "an acknowledged mkdir or symlink failed to apply"
+                        );
+                        inode.bind_failed(errno);
+                    }
+                }
+                if target.is_some() {
+                    inode.write_applied(Ok(()));
+                }
+                parent.remove_pending_child(name.to_bytes(), nodeid);
+            }
+        };
+        let seq = self.apply.push(crate::apply::Job::of(
+            if matches!(kind, crate::inode::PendingKind::Symlink) {
+                crate::apply::Kind::Symlink
+            } else {
+                crate::apply::Kind::Mkdir
+            },
+            crate::apply::Keys::of(&[parent.id(), nodeid]),
+            0,
+            job,
+        ));
+        parent.settled_by(seq);
+        inode.settled_by(seq);
+        // The pending inode was born with the one lookup this reply is.
+        let entry = self.pending_entry(parent, &inode, nodeid);
+        Ok(Some(self.entry_reply(&entry)))
     }
 
     /// The asynchronous half of LINK: acknowledged with the target's own
@@ -2077,13 +2213,17 @@ impl Server {
         // operations pnpm's open-then-FICLONE import used to cost.
         let displaced = if let Some(old) = parent.pending_child(name.to_bytes()) {
             self.registry.get(old)
+        } else if parent.is_pending() {
+            None
         } else {
             sys::stat_at(parent.reference()?.raw_fd(), &name)
                 .ok()
                 .and_then(|st| self.registry.nodeid_for(st.st_dev as i64, st.st_ino))
                 .and_then(|id| self.registry.get(id))
         };
-        let (nodeid, dest) = self.registry.insert_pending(parent.dev(), meta);
+        let (nodeid, dest) =
+            self.registry
+                .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
         if let Some(old) = &displaced {
             // The guest's descriptor on the old file keeps working, and sees
             // the clone — as FICLONE promises — because the old inode now
@@ -2234,8 +2374,9 @@ impl Server {
         }
         // A name promised away is fresh — the unlink is queued ahead of the
         // create this acknowledges, so the order the guest asked for is the
-        // order the host applies. Otherwise the host answers freshness.
-        if !parent.name_pending_gone(name.to_bytes()) {
+        // order the host applies. So is any name in a directory that is
+        // itself still a promise. Otherwise the host answers freshness.
+        if !parent.is_pending() && !parent.name_pending_gone(name.to_bytes()) {
             match sys::stat_at(parent.reference()?.raw_fd(), name) {
                 Err(errno) if errno == linux::ENOENT => {}
                 _ => return Ok(None),
@@ -2251,7 +2392,9 @@ impl Server {
             atime: born,
             mtime: born,
         };
-        let (nodeid, inode) = self.registry.insert_pending(parent.dev(), meta);
+        let (nodeid, inode) =
+            self.registry
+                .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
         parent.add_pending_child(name.to_bytes(), nodeid);
         let job = {
             let registry = self.registry.clone();
@@ -2477,9 +2620,12 @@ impl Server {
             mtime: (0, 0),
         });
         let size = inode.overlay_size(0);
-        let entry_valid = self
-            .policy
-            .validity(parent.dev(), parent.ino(), Answer::File);
+        let answer = if inode.is_dir {
+            Answer::Directory
+        } else {
+            Answer::File
+        };
+        let entry_valid = self.policy.validity(parent.dev(), parent.ino(), answer);
         let attr_valid = self.policy.attr_validity(inode.dev(), inode.ino());
         EntryOut {
             nodeid,
@@ -2499,7 +2645,7 @@ impl Server {
                 mtimensec: meta.mtime.1 as u32,
                 ctimensec: meta.born.1 as u32,
                 mode: meta.mode,
-                nlink: 1 + inode.extra_links(),
+                nlink: if inode.is_dir { 2 } else { 1 } + inode.extra_links(),
                 uid: 0,
                 gid: 0,
                 rdev: 0,
@@ -2535,6 +2681,7 @@ impl Server {
         {
             return Ok(reply);
         }
+        self.settle_while(&parent, |parent| parent.is_pending());
         // The synchronous path is about to consult the host about a name
         // whose truth may still be in the queue.
         self.settle_while(&parent, |parent| parent.name_pending_gone(name.to_bytes()));
@@ -2811,7 +2958,20 @@ impl Server {
             // thousand went missing from a listing that way.
             let gone = parent.pending_gone_snapshot();
             let promised = parent.pending_children_snapshot();
-            let mut listed = self.list(nodeid)?;
+            let mut listed = if parent.is_pending() {
+                // Nothing on the host yet: the dots, and the promises below.
+                [b".".as_slice(), b"..".as_slice()]
+                    .into_iter()
+                    .map(|name| sys::DirEntry {
+                        ino: parent.ino(),
+                        kind: 4,
+                        name: name.to_vec(),
+                        next_offset: 0,
+                    })
+                    .collect()
+            } else {
+                self.list(nodeid)?
+            };
             if !gone.is_empty() || !promised.is_empty() {
                 listed.retain(|entry| !gone.contains(&entry.name));
                 for (name, id) in promised {

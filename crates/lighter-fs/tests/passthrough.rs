@@ -620,6 +620,7 @@ fn removing_a_non_empty_directory_reports_enotempty() {
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(&name_body("dir"));
     guest.call(op::MKDIR, 1, &body).unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
     std::fs::write(guest.host("dir").join("occupant"), b"").unwrap();
 
     assert_eq!(

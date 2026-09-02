@@ -115,9 +115,11 @@ pub enum Kind {
     Clone,
     Setattr,
     Link,
+    Mkdir,
+    Symlink,
 }
 
-const KINDS: usize = 7;
+const KINDS: usize = 9;
 
 const fn kind_of(index: usize) -> Kind {
     match index {
@@ -127,7 +129,9 @@ const fn kind_of(index: usize) -> Kind {
         3 => Kind::Rename,
         4 => Kind::Clone,
         5 => Kind::Setattr,
-        _ => Kind::Link,
+        6 => Kind::Link,
+        7 => Kind::Mkdir,
+        _ => Kind::Symlink,
     }
 }
 
@@ -424,7 +428,7 @@ impl Apply {
     /// The drainer's histogram since the last call, one line per kind.
     pub fn report(&self) -> String {
         const NAMES: [&str; KINDS] = [
-            "create", "write", "unlink", "rename", "clone", "setattr", "link",
+            "create", "write", "unlink", "rename", "clone", "setattr", "link", "mkdir", "symlink",
         ];
         let mut out = String::new();
         for (i, name) in NAMES.iter().enumerate() {

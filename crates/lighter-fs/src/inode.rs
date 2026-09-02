@@ -167,6 +167,14 @@ pub struct Inode {
     last_write_seq: AtomicU64,
 }
 
+/// What a pending inode will be once its job lands.
+#[derive(Clone, Copy)]
+pub enum PendingKind {
+    File,
+    Directory,
+    Symlink,
+}
+
 /// The attributes a pending file was promised at creation, and any it has
 /// been promised since by a queued setattr.
 #[derive(Clone, Copy)]
@@ -309,7 +317,13 @@ impl Inode {
 
     /// An inode acknowledged before it exists: no descriptor, provisional
     /// identity, attributes served from `meta` until [`Registry::bind_pending`].
-    fn new_pending(dev: i64, ino: u64, meta: PendingMeta, census: Arc<Census>) -> Inode {
+    fn new_pending(
+        dev: i64,
+        ino: u64,
+        meta: PendingMeta,
+        kind: PendingKind,
+        census: Arc<Census>,
+    ) -> Inode {
         census.inodes.fetch_add(1, Ordering::Relaxed);
         Inode {
             fd: RwLock::new(None),
@@ -319,8 +333,8 @@ impl Inode {
             census,
             dev: std::sync::atomic::AtomicI64::new(dev),
             ino: AtomicU64::new(ino),
-            is_dir: false,
-            is_symlink: false,
+            is_dir: matches!(kind, PendingKind::Directory),
+            is_symlink: matches!(kind, PendingKind::Symlink),
             lookups: Mutex::new(1),
             dirty: AtomicU32::new(0),
             pending_size: AtomicU64::new(0),
@@ -385,6 +399,9 @@ impl Inode {
         self.ino.store(ino, Ordering::Relaxed);
         *self.fd.write().expect("inode slot poisoned") = Some(Arc::new(fd));
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
+        }
         self.held.store(true, Ordering::Relaxed);
         *self.pending_meta.lock().expect("pending meta poisoned") = None;
         self.pending.store(false, Ordering::Relaxed);
@@ -1309,12 +1326,18 @@ impl Registry {
     /// The identity is provisional — a number from a range no real device
     /// uses — and the entry deliberately stays out of the identity map: there
     /// is no host identity to claim until [`Registry::bind_pending`].
-    pub fn insert_pending(&self, dev: i64, meta: PendingMeta) -> (u64, Arc<Inode>) {
+    pub fn insert_pending(
+        &self,
+        dev: i64,
+        meta: PendingMeta,
+        kind: PendingKind,
+    ) -> (u64, Arc<Inode>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let inode = Arc::new(Inode::new_pending(
             dev,
             PROVISIONAL_INO | id,
             meta,
+            kind,
             self.census.clone(),
         ));
         inode.id.store(id, Ordering::Relaxed);
@@ -1340,6 +1363,7 @@ impl Registry {
             dev,
             PROVISIONAL_INO | id,
             meta,
+            PendingKind::File,
             self.census.clone(),
         ));
         inode.id.store(id, Ordering::Relaxed);
@@ -1362,8 +1386,9 @@ impl Registry {
         inode.bind(fd, dev, ino);
         // The same admission control as `insert`: a bind must not push the
         // descriptor count past the budget, or a create storm larger than the
-        // budget outruns the sweep and climbs to the kernel's ceiling.
-        if self.census.descriptors() > self.budget {
+        // budget outruns the sweep and climbs to the kernel's ceiling. A
+        // directory keeps its residency privilege (`parkable`).
+        if self.census.descriptors() > self.budget && inode.parkable() {
             let _ = inode.park();
         }
         self.claim_identity(id, dev, ino);
