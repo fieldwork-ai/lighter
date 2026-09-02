@@ -714,6 +714,7 @@ impl Server {
             // file without telling us. See `crate::opencache` for what that
             // buys and what it costs.
             op::OPEN | op::OPENDIR => Err(linux::ENOSYS),
+
             op::CREATE => self.create(nodeid, body),
             op::LIGHTER_CLONE => self.clone_over(body),
             op::READ => self.read(nodeid, body, capacity),
@@ -2631,6 +2632,8 @@ impl Server {
         let (nodeid, dest) =
             self.registry
                 .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
+        // The reply is a size, not an entry: see `Registry::unname`.
+        self.registry.unname(nodeid);
         if let Some(old) = &displaced {
             // The guest's descriptor on the old file keeps working, and sees
             // the clone — as FICLONE promises — because the old inode now

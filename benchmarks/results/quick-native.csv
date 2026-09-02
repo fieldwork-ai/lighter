@@ -1,7 +1,7 @@
 case,rep,ms
-npm-install,1,668
-npm-install,2,657
-ripgrep,1,95
-ripgrep,2,82
-copy-tree,1,1196
-copy-tree,2,1214
+npm-install,1,717
+npm-install,2,708
+ripgrep,1,103
+ripgrep,2,83
+copy-tree,1,1212
+copy-tree,2,1216

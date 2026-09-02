@@ -1391,6 +1391,19 @@ impl Registry {
         id
     }
 
+    /// The reply a pending inode was born for names no nodeid — a clone's
+    /// reply is a size — so the lookup it was born with is not owed. The
+    /// guest's own lookup of the name is what will count, and what its
+    /// FORGET will pay back; born with one too many, every file pnpm
+    /// imported stayed in the registry forever: sixty thousand an install,
+    /// and a server that got slower with each one.
+    pub fn unname(&self, id: u64) {
+        if let Some(inode) = self.get(id) {
+            let mut lookups = inode.lookups.lock().expect("lookup count poisoned");
+            *lookups = lookups.saturating_sub(1);
+        }
+    }
+
     /// The apply queue performed a pending create: bind the real identity.
     ///
     /// The identity map only gains the entry if the guest still knows the

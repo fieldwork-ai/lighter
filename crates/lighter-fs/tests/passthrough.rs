@@ -1305,3 +1305,113 @@ fn listings_show_promises_without_waiting() {
     assert!(guest.host("new").exists());
     assert!(!guest.host("old").exists());
 }
+
+/// Every reply that names a nodeid is a lookup the guest kernel will one day
+/// FORGET, exactly. The pnpm shapes — a store file written and renamed, a
+/// copy of it into place, a directory made and removed — must all release
+/// when forgotten by that count, or the registry grows by a tree an install.
+#[test]
+fn every_pnpm_shape_releases_when_forgotten_by_its_count() {
+    use std::collections::HashMap;
+    let mut guest = Guest::new("forget-pnpm-shapes");
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    let note = |reply: &[u8], counts: &mut HashMap<u64, u64>| {
+        let nodeid = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+        if nodeid != 0 {
+            *counts.entry(nodeid).or_default() += 1;
+        }
+        nodeid
+    };
+    let before = guest.server.live_inodes();
+
+    // The store file: created write-only, written, released, renamed.
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x8241u32.to_le_bytes());
+    body.extend_from_slice(&0o644u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(b"tmp-store\0");
+    let reply = guest.call(op::CREATE, 1, &body).expect("create");
+    let store = note(&reply, &mut counts);
+    guest.write(store, 0, 0, b"content").expect("write");
+    guest.call(op::RELEASE, store, &[0u8; 24]).expect("release");
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(b"tmp-store\0store\0");
+    guest.call(op::RENAME, 1, &body).expect("rename");
+    let reply = guest
+        .call(op::LOOKUP, 1, &name_body("store"))
+        .expect("lookup");
+    assert_eq!(note(&reply, &mut counts), store);
+
+    // The directory it is imported into, and the import (a copy).
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("pkg"));
+    let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+    let pkg = note(&reply, &mut counts);
+    let mut body = Vec::new();
+    body.extend_from_slice(&store.to_le_bytes());
+    body.extend_from_slice(&pkg.to_le_bytes());
+    body.extend_from_slice(b"index.js\0");
+    guest.call(op::LIGHTER_CLONE, 1, &body).expect("clone");
+    let reply = guest
+        .call(op::LOOKUP, pkg, &name_body("index.js"))
+        .expect("lookup");
+    let imported = note(&reply, &mut counts);
+    // A chmod, as libuv sends after the clone.
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&fuse::fattr::MODE.to_le_bytes());
+    body[68..72].copy_from_slice(&0o644u32.to_le_bytes());
+    guest.call(op::SETATTR, imported, &body).expect("setattr");
+    // A symlink beside it.
+    let mut body = Vec::new();
+    body.extend_from_slice(b"link\0index.js\0");
+    let reply = guest.call(op::SYMLINK, pkg, &body).expect("symlink");
+    note(&reply, &mut counts);
+    // A listing, which counts every entry it names.
+    let mut body = vec![0u8; 40];
+    body[16..20].copy_from_slice(&4096u32.to_le_bytes());
+    let listing = guest
+        .call(op::READDIRPLUS, pkg, &body)
+        .expect("readdirplus");
+    let mut at = 0;
+    while at + fuse::ENTRY_OUT_LEN + 24 <= listing.len() {
+        let nodeid = u64::from_le_bytes(listing[at..at + 8].try_into().unwrap());
+        let name_len = u32::from_le_bytes(
+            listing[at + fuse::ENTRY_OUT_LEN + 16..at + fuse::ENTRY_OUT_LEN + 20]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if nodeid != 0 {
+            *counts.entry(nodeid).or_default() += 1;
+        }
+        let record = fuse::ENTRY_OUT_LEN + 24 + name_len;
+        at += (record + 7) & !7;
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+
+    // Then the tree is removed, as the next repetition's setup does.
+    guest
+        .call(op::UNLINK, pkg, &name_body("index.js"))
+        .expect("unlink");
+    guest
+        .call(op::UNLINK, pkg, &name_body("link"))
+        .expect("unlink");
+    guest.call(op::RMDIR, 1, &name_body("pkg")).expect("rmdir");
+    guest
+        .call(op::UNLINK, 1, &name_body("store"))
+        .expect("unlink");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+
+    for (nodeid, count) in &counts {
+        let mut forget = Vec::new();
+        forget.extend_from_slice(&count.to_le_bytes());
+        guest.call(op::FORGET, *nodeid, &forget).ok();
+    }
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "every shape released by its own count: {counts:?}"
+    );
+}
