@@ -98,17 +98,29 @@ RESULTS="benchmarks/results/${LABEL:-$TARGET}.csv"
 [ "$WHERE" = share ] || [ "$WHERE" = guest ] || { echo "--where wants share or guest, got $WHERE" >&2; exit 2; }
 VMM_PID=""
 HELPER_PID=""
+ROOTFS=""
+RUN_DIR=""
+CASE_OUT=""
 
 # Milliseconds since the epoch, from a runtime every target already needs.
 # macOS `date` has no %N, and the shell has no sub-second clock at all.
 now_ms() { node -e 'process.stdout.write(String(Date.now()))'; }
 
+# Everything the run made under $TMPDIR goes too: the rootfs clone and the
+# run directory, whose data disk is a sparse file that has grown to whatever
+# the guest wrote. A run that was killed leaves them otherwise, and nine
+# hundred such leftovers once filled the disk of an unsupervised machine.
 cleanup() {
 	[ -n "$HELPER_PID" ] && kill "$HELPER_PID" 2>/dev/null || true
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	[ "$KEEP" -eq 1 ] || rm -rf "$WORK"
+	[ -z "$RUN_DIR" ] || rm -rf "$RUN_DIR"
+	[ -z "$ROOTFS" ] || rm -f "$ROOTFS"
+	[ -z "$CASE_OUT" ] || rm -f "$CASE_OUT"
 }
 trap cleanup EXIT
+# An EXIT trap does not run for a fatal signal; the cap kills with TERM.
+trap 'exit 143' INT TERM
 
 # --------------------------------------------------------------- exclusivity --
 

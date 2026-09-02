@@ -75,8 +75,11 @@ VMM_PID=""
 cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	rm -rf "$SHARE"
+	rm -rf "${RUN_DIR:-}"
+	rm -f "${ROOTFS:-}"
 }
 trap cleanup EXIT
+trap 'exit 143' INT TERM
 
 # Boots the guest with the share attached, in one of the prober's modes.
 boot() {

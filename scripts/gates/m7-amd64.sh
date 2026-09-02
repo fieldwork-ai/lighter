@@ -51,8 +51,10 @@ VMM_PID=""
 cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	rm -rf "$RUN_DIR"
+	rm -f "${ROOTFS:-}"
 }
 trap cleanup EXIT
+trap 'exit 143' INT TERM
 
 echo
 echo "==> Booting"

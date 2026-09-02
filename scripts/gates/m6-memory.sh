@@ -63,8 +63,10 @@ VMM_PID=""
 cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	rm -rf "$RUN_DIR"
+	rm -f "${ROOTFS:-}"
 }
 trap cleanup EXIT
+trap 'exit 143' INT TERM
 
 # The VMM reports its own footprint on an interval, because nothing outside the
 # process can see the number that matters.
