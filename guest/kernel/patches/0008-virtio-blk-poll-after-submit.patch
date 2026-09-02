@@ -19,9 +19,17 @@ flush, a read from a cold image — still arrive by interrupt as before.
 
 `virtio_blk.poll_usecs=0` restores the interrupt-only path.
 
+Only a synchronous request is waited for. Writeback submits large
+asynchronous writes that take the device longer than the window, and a
+kworker spinning on each of them burned the whole window for nothing — a
+third of a CPU under a tree copy. Those get one look, which re-arms
+callbacks and takes whatever is already done, and then the interrupt.
+
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index f061420df..e4874a6dc 100644
 --- a/drivers/block/virtio_blk.c
 +++ b/drivers/block/virtio_blk.c
-@@ -42,6 +42,11 @@
+@@ -41,6 +41,11 @@ static unsigned int poll_queues;
  module_param(poll_queues, uint, 0644);
  MODULE_PARM_DESC(poll_queues, "The number of dedicated virtqueues for polling I/O");
  
@@ -33,12 +41,10 @@ flush, a read from a cold image — still arrive by interrupt as before.
  static int major;
  static DEFINE_IDA(vd_index_ida);
  
-@@ -373,6 +378,50 @@
- 	if (req_done)
- 		blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
+@@ -374,6 +379,57 @@ static void virtblk_done(struct virtqueue *vq)
  	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
-+}
-+
+ }
+ 
 +/*
 + * The device may finish the request while we are still here: inside the kick
 + * itself, or — when it is watching the ring and we did not need to kick —
@@ -47,7 +53,7 @@ flush, a read from a cold image — still arrive by interrupt as before.
 + * nothing the device completes now raises one, and what is found here
 + * completes on the CPU that submitted it.
 + */
-+static void virtblk_poll_after_submit(struct virtio_blk_vq *vq)
++static void virtblk_poll_after_submit(struct virtio_blk_vq *vq, bool sync)
 +{
 +	struct request_queue *q = NULL;
 +	struct virtblk_req *vbr;
@@ -58,7 +64,14 @@ flush, a read from a cold image — still arrive by interrupt as before.
 +
 +	if (!poll_usecs)
 +		return;
-+	end = ktime_add_us(ktime_get(), poll_usecs);
++	/*
++	 * Only a synchronous request has someone waiting for it. Writeback
++	 * submits large asynchronous writes that take the device longer than
++	 * the window, so a kworker spinning on them burned the whole window
++	 * every time for nothing — a third of a CPU under a tree copy. For
++	 * those, one look re-arms callbacks and takes whatever is already done.
++	 */
++	end = ktime_add_us(ktime_get(), sync ? poll_usecs : 0);
 +
 +	spin_lock_irqsave(&vq->lock, flags);
 +	do {
@@ -81,10 +94,12 @@ flush, a read from a cold image — still arrive by interrupt as before.
 +	if (done)
 +		blk_mq_start_stopped_hw_queues(q, true);
 +	spin_unlock_irqrestore(&vq->lock, flags);
- }
- 
++}
++
  static void virtio_commit_rqs(struct blk_mq_hw_ctx *hctx)
-@@ -454,12 +503,18 @@
+ {
+ 	struct virtio_blk *vblk = hctx->queue->queuedata;
+@@ -453,12 +509,18 @@ static blk_status_t virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
  		return virtblk_fail_to_queue(req, err);
  	}
  
@@ -101,11 +116,27 @@ flush, a read from a cold image — still arrive by interrupt as before.
  	if (notify)
  		virtqueue_notify(vblk->vqs[qid].vq);
 +	if (bd->last)
-+		virtblk_poll_after_submit(&vblk->vqs[qid]);
++		virtblk_poll_after_submit(&vblk->vqs[qid], op_is_sync(req->cmd_flags));
  	return BLK_STS_OK;
  }
  
-@@ -492,11 +547,14 @@
+@@ -475,6 +537,7 @@ static void virtblk_add_req_batch(struct virtio_blk_vq *vq,
+ {
+ 	struct request *req;
+ 	unsigned long flags;
++	bool sync = false;
+ 	bool kick;
+ 
+ 	spin_lock_irqsave(&vq->lock, flags);
+@@ -483,6 +546,7 @@ static void virtblk_add_req_batch(struct virtio_blk_vq *vq,
+ 		struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
+ 		int err;
+ 
++		sync |= op_is_sync(req->cmd_flags);
+ 		err = virtblk_add_req(vq->vq, vbr);
+ 		if (err) {
+ 			virtblk_unmap_data(req, vbr);
+@@ -491,11 +555,14 @@ static void virtblk_add_req_batch(struct virtio_blk_vq *vq,
  		}
  	}
  
@@ -116,7 +147,7 @@ flush, a read from a cold image — still arrive by interrupt as before.
  
  	if (kick)
  		virtqueue_notify(vq->vq);
-+	virtblk_poll_after_submit(vq);
++	virtblk_poll_after_submit(vq, sync);
  }
  
  static void virtio_queue_rqs(struct rq_list *rqlist)

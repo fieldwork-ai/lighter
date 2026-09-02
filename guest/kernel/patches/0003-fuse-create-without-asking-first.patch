@@ -22,9 +22,11 @@ advances mtime and ctime in place instead.
 Gated on FUSE_LIGHTER_CREATE, an init flag no other server sets, so an
 unpatched server keeps the stock behavior bit for bit.
 
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index a013fad84..2c4471c01 100644
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
-@@ -131,6 +131,24 @@
+@@ -131,6 +131,24 @@ void fuse_invalidate_attr(struct inode *inode)
  
  static void fuse_dir_changed(struct inode *dir)
  {
@@ -49,7 +51,7 @@ unpatched server keeps the stock behavior bit for bit.
  	fuse_invalidate_attr(dir);
  	inode_maybe_inc_iversion(dir, false);
  }
-@@ -687,6 +705,16 @@
+@@ -699,6 +717,16 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
  	    fuse_invalid_attr(&outentry.attr))
  		goto out_free_ff;
  
@@ -66,7 +68,7 @@ unpatched server keeps the stock behavior bit for bit.
  	ff->fh = outopenp->fh;
  	ff->nodeid = outentry.nodeid;
  	ff->open_flags = outopenp->open_flags;
-@@ -700,7 +728,15 @@
+@@ -712,7 +740,15 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
  		goto out_err;
  	}
  	kfree(forget);
@@ -80,13 +82,16 @@ unpatched server keeps the stock behavior bit for bit.
 +		d_add(entry, inode);
 +	else
 +		d_instantiate(entry, inode);
+ 	entry->d_time = epoch;
  	fuse_change_entry_timeout(entry, &outentry);
  	fuse_dir_changed(dir);
- 	err = generic_file_open(inode, file);
-@@ -742,6 +778,16 @@
+@@ -754,7 +790,19 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
  		return -EIO;
  
  	if (d_in_lookup(entry)) {
+-		struct dentry *res = fuse_lookup(dir, entry, 0);
++		struct dentry *res;
++
 +		/*
 +		 * lighter: for O_CREAT the CREATE reply carries everything a
 +		 * LOOKUP would have said, so asking first is a wasted round
@@ -97,18 +102,19 @@ unpatched server keeps the stock behavior bit for bit.
 +		 */
 +		if (fc->lighter_create && (flags & O_CREAT) && !fc->no_create)
 +			goto create;
- 		res = fuse_lookup(dir, entry, 0);
- 		if (IS_ERR(res))
- 			return PTR_ERR(res);
-@@ -753,6 +799,7 @@
- 	if (!(flags & O_CREAT) || d_really_is_positive(entry))
- 		goto no_open;
++		res = fuse_lookup(dir, entry, 0);
+ 		if (res || d_really_is_positive(entry))
+ 			return finish_no_open(file, res);
+ 	}
+@@ -762,6 +810,7 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
+ 	if (!(flags & O_CREAT))
+ 		return finish_no_open(file, NULL);
  
 +create:
  	/* Only creates */
  	file->f_mode |= FMODE_CREATED;
  
-@@ -763,8 +810,17 @@
+@@ -772,8 +821,17 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
  	if (err == -ENOSYS) {
  		fc->no_create = 1;
  		goto mknod;
@@ -116,20 +122,39 @@ unpatched server keeps the stock behavior bit for bit.
 +	} else if (err == -EEXIST) {
  		fuse_invalidate_entry(entry);
 +	} else if (err == -ELOOP && d_in_lookup(entry)) {
++		struct dentry *res;
++
 +		file->f_mode &= ~FMODE_CREATED;
 +		res = fuse_lookup(dir, entry, 0);
 +		if (IS_ERR(res))
 +			return PTR_ERR(res);
-+		if (res)
-+			entry = res;
-+		goto no_open;
++		return finish_no_open(file, res);
 +	}
- out_dput:
- 	dput(res);
  	return err;
+ 
+ mknod:
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index c288f28f6..34d615741 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -759,6 +759,12 @@ struct fuse_conn {
+ 	 */
+ 	unsigned handle_killpriv_v2:1;
+ 
++	/*
++	 * lighter: FUSE_CREATE may be sent without a prior LOOKUP, and the
++	 * reply says whether the file was created (FOPEN_LIGHTER_CREATED).
++	 */
++	unsigned lighter_create:1;
++
+ 	/*
+ 	 * The following bitfields are only for optimization purposes
+ 	 * and hence races in setting them will not cause malfunction
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index e9ed693fc..9b9bd6ee8 100644
 --- a/fs/fuse/inode.c
 +++ b/fs/fuse/inode.c
-@@ -1315,6 +1315,8 @@
+@@ -1409,6 +1409,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
  				fc->handle_killpriv_v2 = 1;
  				fm->sb->s_flags |= SB_NOSEC;
  			}
@@ -138,34 +163,20 @@ unpatched server keeps the stock behavior bit for bit.
  			if (flags & FUSE_SETXATTR_EXT)
  				fc->setxattr_ext = 1;
  			if (flags & FUSE_SECURITY_CTX)
-@@ -1401,7 +1403,8 @@
- 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
+@@ -1503,7 +1505,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
  		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
  		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
--		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP;
-+		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
-+		FUSE_LIGHTER_CREATE;
+ 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
+-		FUSE_REQUEST_TIMEOUT;
++		FUSE_REQUEST_TIMEOUT | FUSE_LIGHTER_CREATE;
  #ifdef CONFIG_FUSE_DAX
  	if (fm->fc->dax)
  		flags |= FUSE_MAP_ALIGNMENT;
---- a/fs/fuse/fuse_i.h
-+++ b/fs/fuse/fuse_i.h
-@@ -722,6 +722,12 @@
- 	 * file has group execute permission.
- 	 */
- 	unsigned handle_killpriv_v2:1;
-+
-+	/*
-+	 * lighter: FUSE_CREATE may be sent without a prior LOOKUP, and the
-+	 * reply says whether the file was created (FOPEN_LIGHTER_CREATED).
-+	 */
-+	unsigned lighter_create:1;
- 
- 	/*
- 	 * The following bitfields are only for optimization purposes
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index c13e1f9a2..4ea757b1f 100644
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
-@@ -372,6 +372,10 @@
+@@ -392,6 +392,10 @@ struct fuse_file_lock {
  #define FOPEN_NOFLUSH		(1 << 5)
  #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
  #define FOPEN_PASSTHROUGH	(1 << 7)
@@ -176,10 +187,10 @@ unpatched server keeps the stock behavior bit for bit.
  
  /**
   * INIT request/reply flags
-@@ -471,6 +475,11 @@
- /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
- #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
+@@ -495,6 +499,11 @@ struct fuse_file_lock {
  #define FUSE_ALLOW_IDMAP	(1ULL << 40)
+ #define FUSE_OVER_IO_URING	(1ULL << 41)
+ #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
 +/* lighter: the server speaks lighter's create dialect. FUSE_CREATE without a
 + * prior LOOKUP is handled for existing files too, FOPEN_LIGHTER_CREATED is
 + * truthful, and the server pushes invalidations for whatever it changes

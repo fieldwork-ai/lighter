@@ -1,0 +1,55 @@
+btrfs: complete a checksum-free read or write where it finished
+
+Every data read on btrfs is handed to the end-io workqueue before its
+completion runs, so that checksums can be verified and a bad sector
+repaired from another copy. A read from an inode with no checksums — every
+file on a nodatacow volume — has neither to do, and the worker wakeup it
+still pays is most of the cost of a cached 4 KiB read: fio at queue depth 1
+read at 39k a second on btrfs and 464k on ext4 on the same kernel, with the
+device completing inside the submit in both cases.
+
+So a clean data read with no checksums to check completes on the CPU that
+found it, as ext4's do. Reads with checksums, reads that failed, and repair
+bios keep the workqueue; metadata reads keep it too, for now, since their
+completion validates the tree block.
+
+6.18 sends every completion, writes included, through the workqueue,
+and asserts task context in the completion itself — a checksum computed
+alongside a write is waited for there. A read or write found by the
+submitter's own poll is in task context and, without checksums, has
+nothing to wait for; it completes in place. One delivered by interrupt
+keeps the worker. fio direct writes at queue depth 1 on 6.18: 32k a second
+through the worker.
+
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -351,6 +351,29 @@
+ 	if (bio->bi_status)
+ 		btrfs_log_dev_io_error(bio, dev);
+ 
++	/*
++	 * The workqueue exists to verify checksums, to wait for a checksum
++	 * being computed alongside a write, and to repair. A data read that
++	 * returned cleanly from an inode with no checksums has none of those
++	 * to do, and neither has a clean write with no checksum in flight.
++	 * Completing them here saves the worker wakeup, which was most of
++	 * the cost of a cached 4 KiB read and of a small direct write.
++	 * Completion must run in task context, which a request found by the
++	 * submitter's own poll is; one delivered by interrupt keeps the
++	 * worker. Repair bios keep their path (the repair code checks them,
++	 * not their inode), and so do zone appends, which record their
++	 * physical address first.
++	 */
++	if (!bio->bi_status && in_task() &&
++	    bio->bi_pool != &btrfs_repair_bioset &&
++	    ((bio_op(bio) == REQ_OP_READ && is_data_bbio(bbio) &&
++	      !bbio->csum) ||
++	     (bio_op(bio) == REQ_OP_WRITE && !bbio->async_csum &&
++	      !bio_is_zone_append(bio)))) {
++		btrfs_bio_end_io(bbio, BLK_STS_OK);
++		return;
++	}
++
+ 	INIT_WORK(&bbio->end_io_work, simple_end_io_work);
+ 	queue_work(btrfs_end_io_wq(fs_info, bio), &bbio->end_io_work);
+ }

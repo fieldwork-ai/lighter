@@ -14,14 +14,14 @@ attributes are dropped and the dentry invalidated, and the next path
 access finds the clone. That matches how the callers that matter use
 the result: probe, clone, close, read back by path.
 
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index c581cd1df..66a1f9e63 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3336,6 +3336,75 @@
- 	fuse_flush_time_update(inode_out);
- 
+@@ -3108,6 +3108,75 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  	return err;
-+}
-+
+ }
+ 
 +/*
 + * lighter: FICLONE, answered by the server with a clonefile on the host.
 + *
@@ -89,10 +89,12 @@ the result: probe, clone, close, read back by path.
 +	if (err)
 +		return err;
 +	return outarg.size ? outarg.size : len;
- }
- 
++}
++
  static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
-@@ -3372,6 +3441,7 @@
+ 				    struct file *dst_file, loff_t dst_off,
+ 				    size_t len, unsigned int flags)
+@@ -3142,6 +3211,7 @@ static const struct file_operations fuse_file_operations = {
  	.poll		= fuse_file_poll,
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
@@ -100,29 +102,11 @@ the result: probe, clone, close, read back by path.
  };
  
  static const struct address_space_operations fuse_file_aops  = {
---- a/fs/fuse/inode.c
-+++ b/fs/fuse/inode.c
-@@ -1317,6 +1317,8 @@
- 			}
- 			if (flags & FUSE_LIGHTER_CREATE)
- 				fc->lighter_create = 1;
-+			if (flags & FUSE_LIGHTER_CLONE_SUPPORT)
-+				fc->lighter_clone = 1;
- 			if (flags & FUSE_SETXATTR_EXT)
- 				fc->setxattr_ext = 1;
- 			if (flags & FUSE_SECURITY_CTX)
-@@ -1404,7 +1406,7 @@
- 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
- 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
- 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
--		FUSE_LIGHTER_CREATE;
-+		FUSE_LIGHTER_CREATE | FUSE_LIGHTER_CLONE_SUPPORT;
- #ifdef CONFIG_FUSE_DAX
- 	if (fm->fc->dax)
- 		flags |= FUSE_MAP_ALIGNMENT;
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 34d615741..1bc4f44ed 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
-@@ -729,6 +729,9 @@
+@@ -765,6 +765,9 @@ struct fuse_conn {
  	 */
  	unsigned lighter_create:1;
  
@@ -132,9 +116,34 @@ the result: probe, clone, close, read back by path.
  	/*
  	 * The following bitfields are only for optimization purposes
  	 * and hence races in setting them will not cause malfunction
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 9b9bd6ee8..6bbde0977 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1411,6 +1411,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 			}
+ 			if (flags & FUSE_LIGHTER_CREATE)
+ 				fc->lighter_create = 1;
++			if (flags & FUSE_LIGHTER_CLONE_SUPPORT)
++				fc->lighter_clone = 1;
+ 			if (flags & FUSE_SETXATTR_EXT)
+ 				fc->setxattr_ext = 1;
+ 			if (flags & FUSE_SECURITY_CTX)
+@@ -1505,7 +1507,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+ 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
+ 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
+ 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
+-		FUSE_REQUEST_TIMEOUT | FUSE_LIGHTER_CREATE;
++		FUSE_REQUEST_TIMEOUT | FUSE_LIGHTER_CREATE |
++		FUSE_LIGHTER_CLONE_SUPPORT;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm->fc->dax)
+ 		flags |= FUSE_MAP_ALIGNMENT;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 4ea757b1f..ad5e68c0c 100644
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
-@@ -480,6 +480,11 @@
+@@ -504,6 +504,11 @@ struct fuse_file_lock {
   * truthful, and the server pushes invalidations for whatever it changes
   * underneath the driver. */
  #define FUSE_LIGHTER_CREATE	(1ULL << 60)
@@ -146,7 +155,7 @@ the result: probe, clone, close, read back by path.
  
  /**
   * CUSE INIT request/reply flags
-@@ -642,6 +647,8 @@
+@@ -666,6 +671,8 @@ enum fuse_opcode {
  	FUSE_RENAME2		= 45,
  	FUSE_LSEEK		= 46,
  	FUSE_COPY_FILE_RANGE	= 47,
@@ -155,17 +164,15 @@ the result: probe, clone, close, read back by path.
  	FUSE_SETUPMAPPING	= 48,
  	FUSE_REMOVEMAPPING	= 49,
  	FUSE_SYNCFS		= 50,
-@@ -1124,8 +1131,17 @@
- 
- struct fuse_lseek_out {
+@@ -1160,6 +1167,15 @@ struct fuse_lseek_out {
  	uint64_t	offset;
-+};
-+
+ };
+ 
 +struct fuse_lighter_clone_in {
 +	uint64_t	nodeid_in;
 +	uint64_t	parent_out;
- };
- 
++};
++
 +struct fuse_lighter_clone_out {
 +	uint64_t	size;
 +};
