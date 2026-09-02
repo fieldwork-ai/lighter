@@ -388,6 +388,21 @@ impl Inode {
         }
     }
 
+    /// A held write moved the promised modification time to now.
+    pub fn note_write_time(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        if let Some(meta) = self
+            .pending_meta
+            .lock()
+            .expect("pending meta poisoned")
+            .as_mut()
+        {
+            meta.mtime = (now.as_secs() as i64, now.subsec_nanos() as i64);
+        }
+    }
+
     pub fn pending_meta(&self) -> Option<PendingMeta> {
         *self.pending_meta.lock().expect("pending meta poisoned")
     }

@@ -339,6 +339,38 @@ fn an_open_file_survives_being_unlinked() {
     );
 }
 
+/// pnpm's store write: a temporary name, the bytes, a close, a rename into
+/// place. Held, that is one create under the final name with the bytes in
+/// it — and the temporary name never exists on the Mac at all.
+#[test]
+fn a_temporary_written_and_renamed_is_made_under_its_final_name() {
+    let mut guest = Guest::new("held-rename");
+    let (nodeid, fh) = guest.create(1, "tmp-1", CREATE_RDWR).unwrap();
+    guest.write(nodeid, fh, 0, b"store bytes").unwrap();
+    guest
+        .call(op::RELEASE, nodeid, &[0u8; 24])
+        .expect("release");
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(b"tmp-1\0final\0");
+    guest.call(op::RENAME, 1, &body).expect("rename");
+    assert_eq!(
+        guest.lookup(1, "final").unwrap(),
+        nodeid,
+        "promised under the new name"
+    );
+    assert!(
+        matches!(guest.lookup(1, "tmp-1"), Err(2) | Ok(0)),
+        "and not the old"
+    );
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::read(guest.host("final")).unwrap(), b"store bytes");
+    assert!(
+        !guest.host("tmp-1").exists(),
+        "the temporary name was never made"
+    );
+}
+
 /// A create is a promise the host has not been asked to keep yet. It is
 /// kept at the next barrier, and by the guest's release, with nothing
 /// written in between.

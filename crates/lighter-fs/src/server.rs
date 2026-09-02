@@ -125,6 +125,244 @@ fn libc_stat_default(inode: &Inode) -> libc::stat {
     st
 }
 
+/// A create acknowledged and not yet queued, with everything the guest has
+/// promised about it since: the name it will be made under (a rename of a
+/// held file just moves this), the bytes written into it, the flags and
+/// mode of the open. See [`Server::materialize_why`].
+///
+/// pnpm writes every store file under a temporary name, closes it and
+/// renames it into place — a create, a write and a rename queued for each
+/// of fifty thousand files an install. Held, the three become one job that
+/// creates the final name and writes the bytes into it.
+struct Held {
+    parent: std::sync::Arc<Inode>,
+    name: CString,
+    flags: u32,
+    mode: u32,
+    writes: Vec<(u64, Vec<u8>)>,
+    bytes: usize,
+    since: std::time::Instant,
+}
+
+/// Bytes one held file may accumulate before its create is queued, and all
+/// held files together. Small on purpose: a held file is one the Mac cannot
+/// see yet.
+const HELD_FILE_CAP: usize = 4 << 20;
+const HELD_TOTAL_CAP: usize = 64 << 20;
+
+/// How long a create may stay held with nothing forcing it. pnpm writes,
+/// closes and renames a store file within a millisecond; a file a container
+/// wrote and forgot about is on the Mac within this.
+const HOLD_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Files up to this size are copied rather than cloned; see `clone_over`.
+/// `LIGHTER_FS_COPY_MAX` overrides it (0 clones everything).
+fn copy_instead_of_clone_max() -> u64 {
+    std::env::var("LIGHTER_FS_COPY_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256 << 10)
+}
+
+#[derive(Default)]
+struct Holding {
+    map: std::sync::Mutex<std::collections::HashMap<u64, Held>>,
+    bytes: AtomicUsize,
+}
+
+/// Writes all of `data` at `offset`.
+fn write_fully(fd: std::os::fd::RawFd, data: &[u8], offset: u64) -> Result<(), i32> {
+    let mut at = 0usize;
+    while at < data.len() {
+        match sys::write_at(fd, &data[at..], offset + at as u64) {
+            Ok(0) => return Err(linux::EIO),
+            Ok(n) => at += n,
+            Err(errno) => return Err(errno),
+        }
+    }
+    Ok(())
+}
+
+/// The job a held create becomes: the open, the attributes promised
+/// meanwhile, the bytes written meanwhile, and the binding.
+fn create_job(
+    registry: std::sync::Arc<Registry>,
+    open_cache: Arc<OpenCache>,
+    park_creates: bool,
+    nodeid: u64,
+    inode: std::sync::Arc<Inode>,
+    held: Held,
+) -> crate::apply::Job {
+    let Held {
+        parent,
+        name,
+        flags,
+        mode,
+        writes,
+        ..
+    } = held;
+    let keys = crate::apply::Keys::of(&[parent.id(), nodeid]);
+    let job = move || {
+        const LINUX_O_CREAT: u32 = 0o100;
+        const LINUX_O_EXCL: u32 = 0o200;
+        const LINUX_O_NOFOLLOW: u32 = 0o400000;
+        if inode.is_cancelled() {
+            // Replaced before it existed; nothing to make.
+            inode.bind_failed(linux::ENOENT);
+            for _ in &writes {
+                inode.write_applied(Err(linux::ENOENT));
+            }
+            parent.remove_pending_child(name.to_bytes(), nodeid);
+            return;
+        }
+        let result = (|| {
+            let parent_fd = parent.reference()?;
+            let fd = sys::openat_path(
+                parent_fd.raw_fd(),
+                &name,
+                flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
+                mode,
+            )?;
+            let st = sys::stat_fd(fd.as_raw_fd())?;
+            Ok((fd, st))
+        })();
+        match result {
+            Ok((fd, st)) => {
+                // The bytes promised while the create was held back are the
+                // create's to keep — and then the attributes, since a write
+                // moves the time and the last promise made wins.
+                for (offset, data) in &writes {
+                    inode.write_applied(write_fully(fd.as_raw_fd(), data, *offset));
+                }
+                if let Some(meta) = inode.pending_meta() {
+                    if meta.mode & 0o7777 != mode & 0o7777 {
+                        let _ = sys::chmod_fd(fd.as_raw_fd(), meta.mode & 0o7777);
+                    }
+                    if meta.atime != meta.born || meta.mtime != meta.born {
+                        let _ = sys::utimes_fd(
+                            fd.as_raw_fd(),
+                            TimeSpec::At(meta.atime.0, meta.atime.1 as u32),
+                            TimeSpec::At(meta.mtime.0, meta.mtime.1 as u32),
+                        );
+                    }
+                }
+                // Two descriptors, as the synchronous path keeps two: a
+                // metadata reference for the inode, and the open file itself
+                // in the open cache — which is what lets the guest keep
+                // reading and writing after an unlink, exactly as a real
+                // file handle would. At a full share the reference would be
+                // parked the instant it was bound — a dup, a stat, a path
+                // query and a close for nothing, fifty thousand times an
+                // install — so there it is bound parked, the open file still
+                // cached for the writes that follow.
+                let meta = if park_creates && registry.at_budget() {
+                    None
+                } else {
+                    sys::dup(&fd).ok()
+                };
+                // Cache first, bind second: a reader that settles the instant
+                // `pending` clears must find the descriptor already there, or
+                // it reopens by path — which an unlinked file no longer has.
+                open_cache.put_file(
+                    nodeid,
+                    std::sync::Arc::new(OpenFile {
+                        fd,
+                        readable: flags & 0o3 != 1,
+                        append: false,
+                        writable: flags & 0o3 != 0,
+                    }),
+                );
+                match meta {
+                    Some(meta) => {
+                        registry.bind_pending(nodeid, &inode, meta, st.st_dev as i64, st.st_ino)
+                    }
+                    None => registry.bind_pending_parked(
+                        nodeid,
+                        &inode,
+                        st.st_dev as i64,
+                        st.st_ino,
+                        (st.st_birthtime, st.st_birthtime_nsec),
+                    ),
+                }
+            }
+            Err(errno) => {
+                tracing::warn!(
+                    errno,
+                    name = %name.to_string_lossy(),
+                    "an acknowledged create failed to apply"
+                );
+                inode.bind_failed(errno);
+                for _ in &writes {
+                    inode.write_applied(Err(errno));
+                }
+            }
+        }
+        // Settled either way: the host directory answers for this name now
+        // — with the file, or honestly without it.
+        parent.remove_pending_child(name.to_bytes(), nodeid);
+    };
+    crate::apply::Job::of(crate::apply::Kind::Create, keys, 0, job)
+}
+
+/// Queues the held create for `nodeid`, if it is still held.
+fn materialize_held(
+    holding: &Holding,
+    apply: &crate::apply::Apply,
+    registry: &std::sync::Arc<Registry>,
+    open_cache: &Arc<OpenCache>,
+    park_creates: bool,
+    nodeid: u64,
+) -> bool {
+    let held = holding
+        .map
+        .lock()
+        .expect("held creates poisoned")
+        .remove(&nodeid);
+    let Some(held) = held else {
+        return false;
+    };
+    holding.bytes.fetch_sub(held.bytes, Ordering::Relaxed);
+    let parent = held.parent.clone();
+    let inode = registry.get(nodeid);
+    let Some(inode) = inode else {
+        // Forgotten before it was made: nothing to make.
+        parent.remove_pending_child(held.name.to_bytes(), nodeid);
+        return true;
+    };
+    let seq = apply.push(create_job(
+        registry.clone(),
+        open_cache.clone(),
+        park_creates,
+        nodeid,
+        inode.clone(),
+        held,
+    ));
+    parent.settled_by(seq);
+    inode.settled_by(seq);
+    true
+}
+
+/// Queues every held create older than the grace period.
+fn materialize_stale(
+    holding: &Holding,
+    apply: &crate::apply::Apply,
+    registry: &std::sync::Arc<Registry>,
+    open_cache: &Arc<OpenCache>,
+    park_creates: bool,
+) {
+    let stale: Vec<u64> = holding
+        .map
+        .lock()
+        .expect("held creates poisoned")
+        .iter()
+        .filter(|(_, held)| held.since.elapsed() > HOLD_GRACE)
+        .map(|(nodeid, _)| *nodeid)
+        .collect();
+    for nodeid in stale {
+        materialize_held(holding, apply, registry, open_cache, park_creates, nodeid);
+    }
+}
+
 /// A shared directory.
 pub struct Server {
     root: PathBuf,
@@ -151,18 +389,21 @@ pub struct Server {
     stats: Stats,
     /// The ordered queue that applies acknowledged mutations. See
     /// [`crate::apply`] for the promises it keeps.
-    apply: crate::apply::Apply,
+    apply: std::sync::Arc<crate::apply::Apply>,
     /// Creates acknowledged and not yet queued — the job and the directory
     /// it changes, by the nodeid promised. See [`Server::materialize`].
-    deferred: std::sync::Mutex<
-        std::collections::HashMap<u64, (std::sync::Arc<Inode>, crate::apply::Job)>,
-    >,
+    deferred: std::sync::Arc<Holding>,
+    /// The thread that keeps the grace period: a held create nothing has
+    /// forced is queued by it once it is older than [`HOLD_GRACE`].
+    settler_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    settler: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// `LIGHTER_FS_DEFER_CREATE=0` queues creates at once, as before they
     /// were held back; `LIGHTER_FS_PARK_CREATES=0` binds them with a
     /// metadata descriptor even at a full share. Kill switches for
     /// bisecting a regression by environment rather than by rebuild.
     defer_creates: bool,
     park_creates: bool,
+    copy_max: u64,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -238,6 +479,35 @@ impl Server {
             descriptors,
             "share opened"
         );
+        let open_cache = Arc::new(OpenCache::new());
+        let apply = std::sync::Arc::new(crate::apply::Apply::start(root.to_path_buf()));
+        let deferred = std::sync::Arc::new(Holding::default());
+        let park_creates = std::env::var("LIGHTER_FS_PARK_CREATES").as_deref() != Ok("0");
+        let settler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settler = {
+            let holding = deferred.clone();
+            let apply = apply.clone();
+            let registry = registry.clone();
+            let open_cache = open_cache.clone();
+            let stop = settler_stop.clone();
+            std::thread::Builder::new()
+                .name("fs-settler".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(HOLD_GRACE / 2);
+                        if holding
+                            .map
+                            .lock()
+                            .expect("held creates poisoned")
+                            .is_empty()
+                        {
+                            continue;
+                        }
+                        materialize_stale(&holding, &apply, &registry, &open_cache, park_creates);
+                    }
+                })
+                .expect("failed to spawn the filesystem settler thread")
+        };
         Ok(Server {
             root: root.to_path_buf(),
             root_dev: dev,
@@ -254,12 +524,15 @@ impl Server {
             ),
             policy,
             notifications: sink,
-            open_cache: Arc::new(OpenCache::new()),
+            open_cache,
             stats: Stats::new(),
-            apply: crate::apply::Apply::start(root.to_path_buf()),
-            deferred: std::sync::Mutex::new(std::collections::HashMap::new()),
+            apply,
+            deferred,
             defer_creates: std::env::var("LIGHTER_FS_DEFER_CREATE").as_deref() != Ok("0"),
-            park_creates: std::env::var("LIGHTER_FS_PARK_CREATES").as_deref() != Ok("0"),
+            park_creates,
+            copy_max: copy_instead_of_clone_max(),
+            settler_stop,
+            settler: std::sync::Mutex::new(Some(settler)),
             _watcher: watcher,
         })
     }
@@ -436,9 +709,6 @@ impl Server {
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
             op::RELEASE | op::RELEASEDIR => {
-                // The guest is done with it: a create still held back is
-                // made now, not at the next barrier.
-                self.materialize_why(nodeid, 7);
                 if let Some(fh) = get_u64(body, 0) {
                     self.registry.release_handle(fh);
                 }
@@ -779,19 +1049,15 @@ impl Server {
     /// clone arrived, and every import paid a create, an unlink and a clone.
     /// Held back, the clone withdraws it and pays for the clone alone.
     fn materialize_why(&self, nodeid: u64, why: usize) {
-        let held = self
-            .deferred
-            .lock()
-            .expect("deferred creates poisoned")
-            .remove(&nodeid);
-        let Some((parent, job)) = held else {
-            return;
-        };
-        MATERIALIZE_N[why].fetch_add(1, Ordering::Relaxed);
-        let seq = self.apply.push(job);
-        parent.settled_by(seq);
-        if let Some(inode) = self.registry.get(nodeid) {
-            inode.settled_by(seq);
+        if materialize_held(
+            &self.deferred,
+            &self.apply,
+            &self.registry,
+            &self.open_cache,
+            self.park_creates,
+            nodeid,
+        ) {
+            MATERIALIZE_N[why].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -804,8 +1070,9 @@ impl Server {
     fn materialize_all(&self) {
         let all: Vec<u64> = self
             .deferred
+            .map
             .lock()
-            .expect("deferred creates poisoned")
+            .expect("held creates poisoned")
             .keys()
             .copied()
             .collect();
@@ -817,11 +1084,26 @@ impl Server {
     /// Withdraws a held-back create: the file it promised is never made.
     /// `true` if it was still held.
     fn withdraw(&self, nodeid: u64) -> bool {
-        self.deferred
+        let held = self
+            .deferred
+            .map
             .lock()
-            .expect("deferred creates poisoned")
-            .remove(&nodeid)
-            .is_some()
+            .expect("held creates poisoned")
+            .remove(&nodeid);
+        match held {
+            Some(held) => {
+                self.deferred.bytes.fetch_sub(held.bytes, Ordering::Relaxed);
+                // Writes acknowledged into a file that will never exist:
+                // their promise ends with it.
+                if let Some(inode) = self.registry.get(nodeid) {
+                    for _ in &held.writes {
+                        inode.write_applied(Ok(()));
+                    }
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     fn inode(&self, nodeid: u64) -> Result<std::sync::Arc<Inode>, i32> {
@@ -1349,7 +1631,7 @@ impl Server {
         // so a change cannot fall between the job reading its promise and
         // keeping it.
         let kept_by_create = {
-            let held = self.deferred.lock().expect("deferred creates poisoned");
+            let held = self.deferred.map.lock().expect("held creates poisoned");
             if held.contains_key(&nodeid) {
                 inode.attr_acked(change);
                 inode.attr_merged();
@@ -1780,6 +2062,34 @@ impl Server {
         }
         let nodeid = match old_parent.pending_child(old.to_bytes()) {
             Some(nodeid) => {
+                // A held create is simply made under the new name: no
+                // temporary file, no rename. The new name must be free —
+                // a rename over something is a replacement, and that is the
+                // queue's job to order — and the check holds the lock the
+                // create is taken with.
+                let retargeted = {
+                    let mut held = self.deferred.map.lock().expect("held creates poisoned");
+                    let free = new_parent.pending_child(new.to_bytes()).is_none()
+                        && !new_parent.name_pending_gone(new.to_bytes())
+                        && (new_parent.is_pending()
+                            || matches!(
+                                sys::stat_at(new_parent.reference()?.raw_fd(), new),
+                                Err(errno) if errno == linux::ENOENT
+                            ));
+                    match held.get_mut(&nodeid) {
+                        Some(held) if free => {
+                            held.parent = new_parent.clone();
+                            held.name = new.clone();
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if retargeted {
+                    old_parent.remove_pending_child(old.to_bytes(), nodeid);
+                    new_parent.add_pending_child(new.to_bytes(), nodeid);
+                    return Ok(Some(Vec::new()));
+                }
                 self.materialize_why(nodeid, 5);
                 nodeid
             }
@@ -2278,6 +2588,8 @@ impl Server {
             out.extend_from_slice(&size.to_le_bytes());
             return Ok(out);
         }
+        #[allow(non_snake_case)]
+        let COPY_INSTEAD_OF_CLONE_MAX = self.copy_max;
         // Acknowledged: the destination is a pending inode with the source's
         // size and mode, and the guest's re-lookup of the name (patch 0005
         // invalidates the dentry) resolves to it until the clone lands.
@@ -2337,7 +2649,45 @@ impl Server {
                     // per import, fifty thousand imports an install. Only
                     // a name that is taken goes through a temporary, so the
                     // replacement stays atomic.
+                    // A small file is copied rather than cloned. An APFS
+                    // clone costs sixty to a hundred microseconds whatever
+                    // is done around it, and — measured, three workers,
+                    // seventy-six thousand imports — the volume serves no
+                    // more of them per second for being asked in parallel.
+                    // A create with the bytes written into it costs about
+                    // the same alone and does scale across directories,
+                    // which is how pnpm's four import threads arrive. The
+                    // space a copy costs is bounded by the size cap; a large
+                    // file is cloned, and shares its blocks as FICLONE
+                    // promises.
+                    let bytes = if size <= COPY_INSTEAD_OF_CLONE_MAX {
+                        let mut bytes = Vec::with_capacity(size as usize);
+                        let mut chunk = vec![0u8; 64 << 10];
+                        loop {
+                            let n =
+                                sys::read_at(source_fd.raw_fd(), &mut chunk, bytes.len() as u64)?;
+                            if n == 0 {
+                                break;
+                            }
+                            bytes.extend_from_slice(&chunk[..n]);
+                        }
+                        Some(bytes)
+                    } else {
+                        None
+                    };
                     let clone = |name: &CString| {
+                        if let Some(bytes) = &bytes {
+                            const LINUX_O_WRONLY: u32 = 1;
+                            const LINUX_O_CREAT: u32 = 0o100;
+                            const LINUX_O_EXCL: u32 = 0o200;
+                            let fd = sys::openat_path(
+                                parent_ref.raw_fd(),
+                                name,
+                                LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_EXCL,
+                                mode & 0o7777,
+                            )?;
+                            return write_fully(fd.as_raw_fd(), bytes, 0);
+                        }
                         match sys::fclonefile_at(source_fd.raw_fd(), parent_ref.raw_fd(), name) {
                             // A descriptor the kernel will not clone from
                             // (an event-only reference, say): by path, as
@@ -2480,122 +2830,30 @@ impl Server {
             self.registry
                 .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
         parent.add_pending_child(name.to_bytes(), nodeid);
-        let job = {
-            let registry = self.registry.clone();
-            let open_cache = self.open_cache.clone();
-            let parent = parent.clone();
-            let inode = inode.clone();
-            let name = name.clone();
-            let park_creates = self.park_creates;
-            move || {
-                const LINUX_O_CREAT: u32 = 0o100;
-                const LINUX_O_NOFOLLOW: u32 = 0o400000;
-                if inode.is_cancelled() {
-                    // Replaced before it existed; nothing to make.
-                    inode.bind_failed(linux::ENOENT);
-                    parent.remove_pending_child(name.to_bytes(), nodeid);
-                    return;
-                }
-                let result = (|| {
-                    let parent_fd = parent.reference()?;
-                    let fd = sys::openat_path(
-                        parent_fd.raw_fd(),
-                        &name,
-                        flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
-                        mode,
-                    )?;
-                    let st = sys::stat_fd(fd.as_raw_fd())?;
-                    Ok((fd, st))
-                })();
-                match result {
-                    Ok((fd, st)) => {
-                        // Attributes promised while the create was held back
-                        // are the create's to keep.
-                        if let Some(meta) = inode.pending_meta() {
-                            if meta.mode & 0o7777 != mode & 0o7777 {
-                                let _ = sys::chmod_fd(fd.as_raw_fd(), meta.mode & 0o7777);
-                            }
-                            if meta.atime != meta.born || meta.mtime != meta.born {
-                                let _ = sys::utimes_fd(
-                                    fd.as_raw_fd(),
-                                    TimeSpec::At(meta.atime.0, meta.atime.1 as u32),
-                                    TimeSpec::At(meta.mtime.0, meta.mtime.1 as u32),
-                                );
-                            }
-                        }
-                        // Two descriptors, as the synchronous path keeps two:
-                        // a metadata reference for the inode, and the open
-                        // file itself in the open cache — which is what lets
-                        // the guest keep reading and writing after an unlink,
-                        // exactly as a real file handle would.
-                        // At a full share the metadata reference would be
-                        // parked the instant it was bound — a dup, a stat,
-                        // a path query and a close, for nothing, fifty
-                        // thousand times an install. Bound parked instead,
-                        // with the open file itself still in the cache for
-                        // the writes that follow.
-                        let meta = if park_creates && registry.at_budget() {
-                            None
-                        } else {
-                            sys::dup(&fd).ok()
-                        };
-                        // Cache first, bind second: a reader that settles
-                        // the instant `pending` clears must find the
-                        // descriptor already there, or it reopens by path —
-                        // which an unlinked file no longer has.
-                        open_cache.put_file(
-                            nodeid,
-                            std::sync::Arc::new(OpenFile {
-                                fd,
-                                readable: flags & 0o3 != 1,
-                                append: false,
-                                writable: flags & 0o3 != 0,
-                            }),
-                        );
-                        match meta {
-                            Some(meta) => registry.bind_pending(
-                                nodeid,
-                                &inode,
-                                meta,
-                                st.st_dev as i64,
-                                st.st_ino,
-                            ),
-                            None => registry.bind_pending_parked(
-                                nodeid,
-                                &inode,
-                                st.st_dev as i64,
-                                st.st_ino,
-                                (st.st_birthtime, st.st_birthtime_nsec),
-                            ),
-                        }
-                    }
-                    Err(errno) => {
-                        tracing::warn!(
-                            errno,
-                            name = %name.to_string_lossy(),
-                            "an acknowledged create failed to apply"
-                        );
-                        inode.bind_failed(errno);
-                    }
-                }
-                // Settled either way: the host directory answers for this
-                // name now — with the file, or honestly without it.
-                parent.remove_pending_child(name.to_bytes(), nodeid);
-            }
+        let held = Held {
+            parent: parent.clone(),
+            name: name.clone(),
+            flags,
+            mode,
+            writes: Vec::new(),
+            bytes: 0,
+            since: std::time::Instant::now(),
         };
-        let job = crate::apply::Job::of(
-            crate::apply::Kind::Create,
-            crate::apply::Keys::of(&[parent.id(), nodeid]),
-            0,
-            job,
-        );
         if self.defer_creates {
             self.deferred
+                .map
                 .lock()
-                .expect("deferred creates poisoned")
-                .insert(nodeid, (parent.clone(), job));
+                .expect("held creates poisoned")
+                .insert(nodeid, held);
         } else {
-            let seq = self.apply.push(job);
+            let seq = self.apply.push(create_job(
+                self.registry.clone(),
+                self.open_cache.clone(),
+                self.park_creates,
+                nodeid,
+                inode.clone(),
+                held,
+            ));
             parent.settled_by(seq);
             inode.settled_by(seq);
         }
@@ -2882,6 +3140,36 @@ impl Server {
         // A write to a pending file cannot open a descriptor yet; the job
         // resolves one at apply time, after the create it is ordered behind.
         if inode.is_pending() && self.apply.accepting() {
+            // A write to a file whose create is still held is held with
+            // it, within the caps: one job makes the file with its bytes
+            // in it, under whatever name it has by then.
+            let absorbed = {
+                let mut held = self.deferred.map.lock().expect("held creates poisoned");
+                match held.get_mut(&nodeid) {
+                    Some(held)
+                        if held.bytes + size <= HELD_FILE_CAP
+                            && self.deferred.bytes.load(Ordering::Relaxed) + size
+                                <= HELD_TOTAL_CAP =>
+                    {
+                        held.writes.push((offset, data.to_vec()));
+                        held.bytes += size;
+                        self.deferred.bytes.fetch_add(size, Ordering::Relaxed);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if absorbed {
+                inode.write_acked(offset + size as u64);
+                // A write moves the modification time, as it will on the
+                // Mac: a time promised before this write is void, one
+                // promised after it stands.
+                inode.note_write_time();
+                let mut out = Vec::with_capacity(8);
+                out.extend_from_slice(&(size as u32).to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                return Ok(out);
+            }
             self.materialize_why(nodeid, 3);
             inode.write_acked(offset + size as u64);
             let data = data.to_vec();
@@ -3298,6 +3586,10 @@ fn write_error(sink: &mut dyn Sink, unique: u64, code: i32) -> usize {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        self.settler_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.settler.lock().expect("settler poisoned").take() {
+            let _ = handle.join();
+        }
         // Every promise is kept before the queue behind it is drained.
         self.materialize_all();
     }
