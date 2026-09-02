@@ -23,6 +23,7 @@ RUN apk add --no-cache \
 	ip6tables \
 	e2fsprogs \
 	e2fsprogs-extra \
+	xfsprogs \
 	util-linux \
 	blkid \
 	ca-certificates \

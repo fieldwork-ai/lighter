@@ -70,6 +70,15 @@ echo "INIT filesystems=ok"
 # root image can be replaced on upgrade without touching anyone's images, and so
 # that the thing that grows is the thing that gets punched back to nothing.
 DATA_DEV=/dev/vdb
+# `lighter.data_fs=xfs` formats a blank data disk as XFS instead of ext4, to
+# be measured: its reflinks make a copy_file_range a clone, which is how
+# yarn links a package tree and how cp copies one.
+DATA_FS=ext4
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	lighter.data_fs=*) DATA_FS="${arg#lighter.data_fs=}" ;;
+	esac
+done
 if [ -b "$DATA_DEV" ]; then
 	# A blank disk has no filesystem; making one on first boot is what turns a
 	# freshly created sparse file into usable storage with no setup step.
@@ -83,17 +92,22 @@ if [ -b "$DATA_DEV" ]; then
 			lighter.data_mkfs=*) DATA_MKFS="${arg#lighter.data_mkfs=}" ;;
 			esac
 		done
-		echo "INIT formatting=$DATA_DEV mkfs=$DATA_MKFS"
-		# No metadata checksums. They guard against a disk returning the
-		# wrong bytes, and this disk is a file in the Mac's page cache and
-		# on its SSD, both of which already answer for that. What they cost
-		# is measured: every directory change recomputes the checksum of
-		# each block it touched, and creating and removing a directory took
-		# 40% longer with them on, unlinking a file 35% — the two operations
-		# an install of a package tree is made of. The instructions are the
-		# hardware ones already; it is the number of blocks, not the CRC.
-		# shellcheck disable=SC2086
-		mke2fs -q -t ext4 -L lighter-data -O ^metadata_csum $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
+		echo "INIT formatting=$DATA_DEV fs=$DATA_FS mkfs=$DATA_MKFS"
+		if [ "$DATA_FS" = xfs ]; then
+			# shellcheck disable=SC2086
+			mkfs.xfs -q -f -L lighter-data $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
+		else
+			# No metadata checksums. They guard against a disk returning the
+			# wrong bytes, and this disk is a file in the Mac's page cache and
+			# on its SSD, both of which already answer for that. What they cost
+			# is measured: every directory change recomputes the checksum of
+			# each block it touched, and creating and removing a directory took
+			# 40% longer with them on, unlinking a file 35% — the two operations
+			# an install of a package tree is made of. The instructions are the
+			# hardware ones already; it is the number of blocks, not the CRC.
+			# shellcheck disable=SC2086
+			mke2fs -q -t ext4 -L lighter-data -O ^metadata_csum $(echo "$DATA_MKFS" | tr ',' ' ') "$DATA_DEV"
+		fi
 	fi
 	# Journaling on Docker's disk is metadata-only, with no write barriers
 	# and a thirty-second commit — the same crash semantics as OrbStack's
@@ -115,6 +129,7 @@ if [ -b "$DATA_DEV" ]; then
 	# outright, so a different setting can be measured without a rebuild of
 	# this image.
 	DATA_OPTS=noatime,nobarrier,commit=30,data=writeback
+	[ "$DATA_FS" != xfs ] || DATA_OPTS=noatime
 	for arg in $(cat /proc/cmdline); do
 		case "$arg" in
 		lighter.data_opts=*) DATA_OPTS="${arg#lighter.data_opts=}" ;;
