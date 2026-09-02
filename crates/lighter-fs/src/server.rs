@@ -445,6 +445,9 @@ pub struct Server {
     /// Read once: `env::var` takes the process environment lock, and a
     /// negative lookup — most of what module resolution does — is hot.
     debug_enoent: bool,
+    /// Whether extended attributes are served at all (`LIGHTER_FS_XATTR=0`
+    /// disclaims them, see `dispatch`).
+    xattrs: bool,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -630,6 +633,7 @@ impl Server {
             copy_max: copy_instead_of_clone_max(),
             debug_listing: std::env::var("LIGHTER_FS_DEBUG_LISTING").as_deref() == Ok("1"),
             debug_enoent: std::env::var("LIGHTER_FS_DEBUG_ENOENT").as_deref() == Ok("1"),
+            xattrs: std::env::var("LIGHTER_FS_XATTR").as_deref() != Ok("0"),
             settler_stop,
             settler: std::sync::Mutex::new(Some(settler)),
             _watcher: watcher,
@@ -820,6 +824,15 @@ impl Server {
             op::ACCESS => self.access(nodeid, body),
             op::LSEEK => self.lseek(nodeid, body),
             op::FALLOCATE => self.fallocate(nodeid, body),
+            // ENOSYS to any of these is a negotiation, not an error: the
+            // kernel remembers it and answers every later call of that kind
+            // itself, EOPNOTSUPP, with no request made. Measured on pnpm:
+            // a quarter of a million getxattr requests per install, nearly
+            // all of them the kernel asking for security.capability before
+            // a chmod, chown or truncate so it can strip privileges.
+            op::GETXATTR | op::SETXATTR | op::LISTXATTR | op::REMOVEXATTR if !self.xattrs => {
+                Err(linux::ENOSYS)
+            }
             op::GETXATTR => self.getxattr(nodeid, body),
             op::SETXATTR => self.setxattr(nodeid, body),
             op::LISTXATTR => self.listxattr(nodeid, body),
@@ -1015,8 +1028,16 @@ impl Server {
         } else {
             fuse::init2::LIGHTER_CLONE
         };
+        // No security or ACL attribute can exist on a Mac, so the driver
+        // is told so and stops asking (guest patch 0006). `LIGHTER_FS_XATTR=0`
+        // disclaims every attribute instead, the blunt version for measuring.
+        let no_security = if self.xattrs {
+            fuse::init2::LIGHTER_NO_SECURITY_XATTR
+        } else {
+            0
+        };
         let flags2 = if flags & fuse::init::INIT_EXT != 0 {
-            (fuse::init2::LIGHTER_CREATE | clone) & offered2
+            (fuse::init2::LIGHTER_CREATE | clone | no_security) & offered2
         } else {
             0
         };

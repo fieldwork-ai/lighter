@@ -130,6 +130,12 @@ pub mod init2 {
     /// Ours, matched by guest patch 0005: `op::LIGHTER_CLONE` is answered
     /// with a clonefile. Overall bit 61.
     pub const LIGHTER_CLONE: u32 = 1 << 29;
+    /// Ours, matched by guest patch 0006: no `security.*` or POSIX ACL
+    /// attribute exists here, ever, so the driver answers those reads itself
+    /// — a quarter of a million requests per package install, the kernel
+    /// asking before every chmod, chown and truncate whether there are
+    /// capabilities to strip. Overall bit 59.
+    pub const LIGHTER_NO_SECURITY_XATTR: u32 = 1 << 27;
 }
 
 /// `fuse_open_out.open_flags`.
