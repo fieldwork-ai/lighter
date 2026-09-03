@@ -146,72 +146,68 @@ def render(results, description, _primary):
     measured = {target: load(target, results) for target in targets}
     reference = measured.get(REFERENCE, {})
 
+    # Two places a container's files can live, side by side: the host share
+    # (a bind mount of the Mac's filesystem) and the runtime's own disk (a
+    # named volume, where a container's writable layer and its data volumes
+    # live). `native` is the same command on the Mac's own disk, and is the
+    # one reference for both: the share is asked how close it comes to the
+    # Mac's disk from inside a VM, the own disk how a Linux filesystem in a
+    # VM compares with the Mac's.
+    columns = []
+    if REFERENCE in targets:
+        columns.append((REFERENCE, reference))
+    for t in targets:
+        if t != REFERENCE:
+            columns.append((f"{t} (share)", measured[t]))
+    for t in RUNTIMES:
+        if (results / f"{t}-guest.csv").exists():
+            columns.append((f"{t} (own disk)", load(f"{t}-guest", results)))
+
     lines = [
         f"## {description}",
         "",
         "### Wall time, milliseconds",
         "",
+        "`native` is the command on the Mac's own disk. `share` is a bind mount of",
+        "the same tree into the container; `own disk` is a named volume, the",
+        "runtime's own filesystem inside the VM, where a container's writable layer",
+        "and its data volumes live.",
+        "",
+        "| case | " + " | ".join(name for name, _ in columns) + " |",
+        "|" + "---|" * (len(columns) + 1),
     ]
-
-    header = "| case | " + " | ".join(targets) + " |"
-    lines.append(header)
-    lines.append("|" + "---|" * (len(targets) + 1))
-    for case, description, _ in CASES:
-        if not any(case in measured[t] for t in targets):
+    for case, _, _ in CASES:
+        if not any(case in values for _, values in columns):
             continue
         cells = []
-        for target in targets:
-            value = measured[target].get(case)
+        for _, values in columns:
+            value = values.get(case)
             cells.append("—" if value is None else f"{int(value)}")
         lines.append(f"| {case} | " + " | ".join(cells) + " |")
     lines.append("")
 
     if reference:
+        ratioed = [(name, values) for name, values in columns if name != REFERENCE]
         lines += [
             f"### As a fraction of `{REFERENCE}`",
             "",
-            f"100% would mean the shared filesystem costs nothing at all next to the",
-            f"Mac's own disk. Higher is better. `watch-latency` is left out: it is a",
-            f"latency against a reference of about a millisecond, so the ratio is a",
-            f"division by noise — read it from the table above in milliseconds.",
+            "100% is the Mac's own disk. For the share, higher is the boundary costing",
+            "less; for the own disk, more than 100% is a filesystem inside the VM",
+            "outrunning the Mac's. `watch-latency` is left out: it is a latency against",
+            "a reference of about a millisecond, so the ratio is a division by noise —",
+            "read it from the table above in milliseconds.",
             "",
-            "| case | " + " | ".join(t for t in targets if t != REFERENCE) + " |",
-            "|" + "---|" * len([t for t in targets if t != REFERENCE] + [1]),
+            "| case | " + " | ".join(name for name, _ in ratioed) + " |",
+            "|" + "---|" * (len(ratioed) + 1),
         ]
         for case, _, _ in CASES:
             base = reference.get(case)
             if not base or case in UNRATIOED:
                 continue
             cells = []
-            for target in targets:
-                if target == REFERENCE:
-                    continue
-                value = measured[target].get(case)
+            for _, values in ratioed:
+                value = values.get(case)
                 cells.append("—" if not value else f"{base / value * 100:.0f}%")
-            lines.append(f"| {case} | " + " | ".join(cells) + " |")
-        lines.append("")
-
-    # The same cases on the runtime's own disk — a named volume, no host
-    # filesystem underneath — which is where a container's writable layer
-    # and its data volumes live, and the more common path than the bind
-    # mount. `run.sh --where guest --label <runtime>-guest`. No native column:
-    # the Mac's own disk is the reference for the share, not for this.
-    on_disk = [t for t in RUNTIMES if (results / f"{t}-guest.csv").exists()]
-    if on_disk:
-        volumes = {t: load(f"{t}-guest", results) for t in on_disk}
-        lines += [
-            "### On the runtime's own disk (a named volume), milliseconds",
-            "",
-            "| case | " + " | ".join(on_disk) + " |",
-            "|" + "---|" * (len(on_disk) + 1),
-        ]
-        for case, _, _ in CASES:
-            if not any(case in volumes[t] for t in on_disk):
-                continue
-            cells = []
-            for t in on_disk:
-                value = volumes[t].get(case)
-                cells.append("—" if value is None else f"{int(value)}")
             lines.append(f"| {case} | " + " | ".join(cells) + " |")
         lines.append("")
 

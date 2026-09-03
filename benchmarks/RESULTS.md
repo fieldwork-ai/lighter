@@ -18,89 +18,77 @@ compared with another from the same machine and the same session.
 
 ### Wall time, milliseconds
 
-| case | native | lighter | orbstack |
-|---|---|---|---|
-| npm-install | 6639 | 6315 | 9093 |
-| pnpm-install | 4614 | 4725 | 5538 |
-| yarn-install | 5670 | 5383 | 8384 |
-| ripgrep | 909 | 84 | 1047 |
-| find-walk | 386 | 96 | 519 |
-| copy-tree | 14553 | 3312 | 9404 |
-| rm-rf | 4186 | 2585 | 3382 |
-| watch-latency | 2 | 3 | 11 |
+`native` is the command on the Mac's own disk. `share` is a bind mount of
+the same tree into the container; `own disk` is a named volume, the
+runtime's own filesystem inside the VM, where a container's writable layer
+and its data volumes live.
+
+| case | native | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
+|---|---|---|---|---|---|
+| npm-install | 6639 | 6315 | 9093 | 4777 | 7068 |
+| pnpm-install | 4614 | 4725 | 5538 | 1210 | 2040 |
+| yarn-install | 5670 | 5383 | 8384 | 4267 | 5266 |
+| ripgrep | 909 | 84 | 1047 | 91 | 112 |
+| find-walk | 386 | 96 | 519 | 97 | 128 |
+| copy-tree | 14553 | 3312 | 9404 | 955 | 1150 |
+| rm-rf | 4186 | 2585 | 3382 | 386 | 479 |
+| watch-latency | 2 | 3 | 11 | — | — |
 
 ### As a fraction of `native`
 
-100% would mean the shared filesystem costs nothing at all next to the
-Mac's own disk. Higher is better. `watch-latency` is left out: it is a
-latency against a reference of about a millisecond, so the ratio is a
-division by noise — read it from the table above in milliseconds.
+100% is the Mac's own disk. For the share, higher is the boundary costing
+less; for the own disk, more than 100% is a filesystem inside the VM
+outrunning the Mac's. `watch-latency` is left out: it is a latency against
+a reference of about a millisecond, so the ratio is a division by noise —
+read it from the table above in milliseconds.
 
-| case | lighter | orbstack |
-|---|---|---|
-| npm-install | 105% | 73% |
-| pnpm-install | 98% | 83% |
-| yarn-install | 105% | 68% |
-| ripgrep | 1082% | 87% |
-| find-walk | 402% | 74% |
-| copy-tree | 439% | 155% |
-| rm-rf | 162% | 124% |
-
-### On the runtime's own disk (a named volume), milliseconds
-
-| case | lighter | orbstack |
-|---|---|---|
-| npm-install | 4777 | 7068 |
-| pnpm-install | 1210 | 2040 |
-| yarn-install | 4267 | 5266 |
-| ripgrep | 91 | 112 |
-| find-walk | 97 | 128 |
-| copy-tree | 955 | 1150 |
-| rm-rf | 386 | 479 |
+| case | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
+|---|---|---|---|---|
+| npm-install | 105% | 73% | 139% | 94% |
+| pnpm-install | 98% | 83% | 381% | 226% |
+| yarn-install | 105% | 68% | 133% | 108% |
+| ripgrep | 1082% | 87% | 999% | 812% |
+| find-walk | 402% | 74% | 398% | 302% |
+| copy-tree | 439% | 155% | 1524% | 1265% |
+| rm-rf | 162% | 124% | 1084% | 874% |
 
 ## MacBook Pro (MacBookPro17,1), Apple M1, 8 cores (4P+4E), 8 GB, macOS 26.6.2
 
 ### Wall time, milliseconds
 
-| case | native | lighter | orbstack |
-|---|---|---|---|
-| npm-install | 7846 | 12475 | 11175 |
-| pnpm-install | 4654 | 7768 | 5950 |
-| yarn-install | 10619 | 12155 | 10029 |
-| ripgrep | 1330 | 159 | 1131 |
-| find-walk | 503 | 122 | 522 |
-| copy-tree | 24755 | 5551 | 15129 |
-| rm-rf | 5432 | 2922 | 3914 |
-| watch-latency | 2 | 3 | 2 |
+`native` is the command on the Mac's own disk. `share` is a bind mount of
+the same tree into the container; `own disk` is a named volume, the
+runtime's own filesystem inside the VM, where a container's writable layer
+and its data volumes live.
+
+| case | native | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
+|---|---|---|---|---|---|
+| npm-install | 7846 | 12475 | 11175 | 7599 | 9756 |
+| pnpm-install | 4654 | 7768 | 5950 | 1745 | 2442 |
+| yarn-install | 10619 | 12155 | 10029 | 7928 | 7850 |
+| ripgrep | 1330 | 159 | 1131 | 123 | 149 |
+| find-walk | 503 | 122 | 522 | 127 | 146 |
+| copy-tree | 24755 | 5551 | 15129 | 3034 | 2441 |
+| rm-rf | 5432 | 2922 | 3914 | 651 | 700 |
+| watch-latency | 2 | 3 | 2 | — | — |
 
 ### As a fraction of `native`
 
-100% would mean the shared filesystem costs nothing at all next to the
-Mac's own disk. Higher is better. `watch-latency` is left out: it is a
-latency against a reference of about a millisecond, so the ratio is a
-division by noise — read it from the table above in milliseconds.
+100% is the Mac's own disk. For the share, higher is the boundary costing
+less; for the own disk, more than 100% is a filesystem inside the VM
+outrunning the Mac's. `watch-latency` is left out: it is a latency against
+a reference of about a millisecond, so the ratio is a division by noise —
+read it from the table above in milliseconds.
 
-| case | lighter | orbstack |
-|---|---|---|
-| npm-install | 63% | 70% |
-| pnpm-install | 60% | 78% |
-| yarn-install | 87% | 106% |
-| ripgrep | 836% | 118% |
-| find-walk | 412% | 96% |
-| copy-tree | 446% | 164% |
-| rm-rf | 186% | 139% |
-
-### On the runtime's own disk (a named volume), milliseconds
-
-| case | lighter | orbstack |
-|---|---|---|
-| npm-install | 7599 | 9756 |
-| pnpm-install | 1745 | 2442 |
-| yarn-install | 7928 | 7850 |
-| ripgrep | 123 | 149 |
-| find-walk | 127 | 146 |
-| copy-tree | 3034 | 2441 |
-| rm-rf | 651 | 700 |
+| case | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
+|---|---|---|---|---|
+| npm-install | 63% | 70% | 103% | 80% |
+| pnpm-install | 60% | 78% | 267% | 191% |
+| yarn-install | 87% | 106% | 134% | 135% |
+| ripgrep | 836% | 118% | 1081% | 893% |
+| find-walk | 412% | 96% | 396% | 345% |
+| copy-tree | 446% | 164% | 816% | 1014% |
+| rm-rf | 186% | 139% | 834% | 776% |
 
 ## What each case does
 

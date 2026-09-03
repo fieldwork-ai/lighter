@@ -372,7 +372,7 @@ bench_memory_mib() {
 }
 
 setup_lighter() {
-	KERNEL="guest/out/Image"
+	KERNEL="${LIGHTER_BENCH_KERNEL:-guest/out/Image}"
 	GVPROXY="${GVPROXY:-vendor/gvproxy}"
 	BIN="target/release/examples/lighter-bench"
 	[ -f "$KERNEL" ] || ./guest/kernel/build.sh
