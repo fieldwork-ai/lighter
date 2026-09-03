@@ -11,8 +11,14 @@ HERE="$ROOT/guest/rootfs"
 
 mkdir -p "$OUT"
 
-# The agent is built by its own toolchain; this image only packages it.
-[ -f "$OUT/lighter-agent" ] || "$ROOT/guest/agent/build.sh"
+# The agent is built by its own toolchain; this image only packages it. It
+# is rebuilt when any of its source is newer than the binary: a stale agent
+# packaged into a fresh rootfs answered "error unknown" to a verb the source
+# had held for an hour.
+if [ ! -f "$OUT/lighter-agent" ] \
+	|| [ -n "$(find "$ROOT/guest/agent/src" "$ROOT/guest/agent/Cargo.toml" "$ROOT/guest/agent/Cargo.lock" -newer "$OUT/lighter-agent" -print -quit)" ]; then
+	"$ROOT/guest/agent/build.sh"
+fi
 cp "$OUT/lighter-agent" "$HERE/lighter-agent"
 trap 'rm -f "$HERE/lighter-agent"' EXIT
 
