@@ -13,7 +13,7 @@ class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
   url "https://github.com/fieldwork-ai/lighter/releases/download/v0.1.0/lighter-0.1.0-arm64.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "e2675fad38f46e478a16e47ce0314c9614e63a001e4cefc910fc64047e498082"
   license "MIT"
   version "0.1.0"
 
