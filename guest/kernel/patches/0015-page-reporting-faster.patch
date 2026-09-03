@@ -1,0 +1,46 @@
+lighter: free page reporting at the rate the host can take it
+
+Free page reporting is how a guest's freed memory reaches the host, and
+upstream paces it for a host that might be slow to take it: thirty-two
+blocks of two megabytes per pass, two seconds between passes, sixty-four
+megabytes a second at best. Measured on a 4 GiB guest that had just
+trimmed its cache: 1.9 GB freed inside, 644 MB back on the host after
+fifteen seconds and 1.45 GB after sixty, exactly that slope. The host
+here releases a run with one madvise and is never the slow side, so a
+pass is the whole ring the device offers, 256 blocks, a quarter second
+apart.
+
+--- a/mm/page_reporting.h
++++ b/mm/page_reporting.h
+@@ -10,7 +10,7 @@
+ #include <linux/scatterlist.h>
+ 
+ #define PAGE_REPORTING_MIN_ORDER	pageblock_order
+-#define PAGE_REPORTING_CAPACITY		32
++#define PAGE_REPORTING_CAPACITY		256
+ 
+ #ifdef CONFIG_PAGE_REPORTING
+ DECLARE_STATIC_KEY_FALSE(page_reporting_enabled);
+--- a/mm/page_reporting.c
++++ b/mm/page_reporting.c
+@@ -24,7 +24,7 @@ static int page_order_update_notify(const char *val, const struct kernel_param *
+ 
+ static const struct kernel_param_ops page_reporting_param_ops = {
+ 	.set = &page_order_update_notify,
+ 	/*
+ 	 * For the get op, use param_get_int instead of param_get_uint.
+ 	 * This is to make sure that when unset the initialized value of
+ 	 * -1 is shown correctly
+ 	 */
+ 	.get = &param_get_int,
+ };
+ 
+ module_param_cb(page_reporting_order, &page_reporting_param_ops,
+ 			&page_reporting_order, 0644);
+ MODULE_PARM_DESC(page_reporting_order, "Set page reporting order");
+ 
+-#define PAGE_REPORTING_DELAY	(2 * HZ)
++#define PAGE_REPORTING_DELAY	(HZ / 4)
+ static struct page_reporting_dev_info __rcu *pr_dev_info __read_mostly;
+ 
+ enum {
