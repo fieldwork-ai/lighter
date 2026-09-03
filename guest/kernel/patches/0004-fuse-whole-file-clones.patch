@@ -18,7 +18,7 @@ diff --git a/fs/fuse/file.c b/fs/fuse/file.c
 index c581cd1df..66a1f9e63 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3108,6 +3108,93 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
+@@ -3108,6 +3108,95 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  	return err;
  }
  
@@ -68,6 +68,8 @@ index c581cd1df..66a1f9e63 100644
 +	memset(&inarg, 0, sizeof(inarg));
 +	inarg.nodeid_in = ff_in->nodeid;
 +	inarg.parent_out = get_fuse_inode(d_inode(parent))->nodeid;
++	inarg.size = i_size_read(inode_in);
++	inarg.mode = inode_in->i_mode;
 +	args.opcode = FUSE_LIGHTER_CLONE;
 +	args.nodeid = ff_out->nodeid;
 +	args.in_numargs = 2;
@@ -182,13 +184,18 @@ index 4ea757b1f..ad5e68c0c 100644
  	FUSE_SETUPMAPPING	= 48,
  	FUSE_REMOVEMAPPING	= 49,
  	FUSE_SYNCFS		= 50,
-@@ -1160,6 +1167,19 @@ struct fuse_lseek_out {
+@@ -1160,6 +1167,24 @@ struct fuse_lseek_out {
  	uint64_t	offset;
  };
  
 +struct fuse_lighter_clone_in {
 +	uint64_t	nodeid_in;
 +	uint64_t	parent_out;
++	/* The source's size and mode as the guest knows them, so the server
++	 * need not stat a file it may have parked. */
++	uint64_t	size;
++	uint32_t	mode;
++	uint32_t	padding;
 +};
 +
 +struct fuse_lighter_clone_out {

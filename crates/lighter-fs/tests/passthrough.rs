@@ -376,6 +376,9 @@ fn a_write_only_source_can_be_cloned() {
     let mut body = Vec::new();
     body.extend_from_slice(&src.to_le_bytes());
     body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes()); // size: unknown, the server stats
+    body.extend_from_slice(&0u32.to_le_bytes()); // mode: unknown
+    body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(b"imported\0");
     guest.call(op::LIGHTER_CLONE, 1, &body).expect("clone");
     guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
@@ -968,6 +971,9 @@ fn a_clone_replaces_the_destination_name() {
     let mut body = Vec::new();
     body.extend_from_slice(&src.to_le_bytes());
     body.extend_from_slice(&1u64.to_le_bytes()); // parent: the root
+    body.extend_from_slice(&0u64.to_le_bytes()); // size: unknown, the server stats
+    body.extend_from_slice(&0u32.to_le_bytes()); // mode: unknown
+    body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(b"dest\0");
     let reply = guest
         .call(op::LIGHTER_CLONE, 1, &body)
@@ -1378,6 +1384,9 @@ fn every_pnpm_shape_releases_when_forgotten_by_its_count() {
     let mut body = Vec::new();
     body.extend_from_slice(&store.to_le_bytes());
     body.extend_from_slice(&pkg.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes()); // size: unknown, the server stats
+    body.extend_from_slice(&0u32.to_le_bytes()); // mode: unknown
+    body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(b"index.js\0");
     guest.call(op::LIGHTER_CLONE, 1, &body).expect("clone");
     let reply = guest
@@ -1832,6 +1841,9 @@ fn a_clone_is_read_through_the_nodeid_the_caller_holds() {
     let mut body = Vec::new();
     body.extend_from_slice(&store.to_le_bytes());
     body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes()); // size: unknown, the server stats
+    body.extend_from_slice(&0u32.to_le_bytes()); // mode: unknown
+    body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(b"index.js\0");
     let reply = guest.call(op::LIGHTER_CLONE, dest, &body).expect("clone");
     assert_eq!(reply.len(), 8 + 8 + 4 + 4 + 88, "size, validity and an attr");

@@ -129,8 +129,22 @@ impl Kind {
     /// which are keyed by their directory and so only ever overlap across
     /// directories — the one parallelism APFS rewards, and the one `rm -rf`
     /// offers as it moves on while a directory's removals are still queued.
-    const fn concurrent(self) -> bool {
-        matches!(self, Kind::Clone | Kind::Unlink | Kind::Rmdir)
+    fn concurrent(self) -> bool {
+        if matches!(self, Kind::Clone | Kind::Unlink | Kind::Rmdir) {
+            return true;
+        }
+        // Creates, writes, mkdirs and symlinks are keyed by their directory
+        // and file too, so they only ever overlap across directories, and
+        // an install is thousands of directories. On the serial lane alone
+        // they were npm's whole bound: 122,000 creates at a hundred
+        // microseconds, one at a time, while the clone lane ran five wide.
+        // Beside it, npm on the M5 share 8.3–9.0 s → 6.2–6.9 and yarn
+        // 6.1–6.4 → 5.5–5.8; the M1, whose eight cores the vCPUs already
+        // fill, neither gains nor loses. `LIGHTER_FS_APPLY_WIDE=0` keeps
+        // them serial, for measurement.
+        static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wide = *WIDE.get_or_init(|| std::env::var("LIGHTER_FS_APPLY_WIDE").ok().is_none_or(|v| v != "0"));
+        wide && matches!(self, Kind::Create | Kind::Write | Kind::Mkdir | Kind::Symlink)
     }
 }
 

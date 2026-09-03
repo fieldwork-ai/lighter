@@ -3157,7 +3157,12 @@ impl Server {
         // descriptor on a file a clone has since replaced.
         let nodeid_in = self.resolve(get_u64(body, 0).ok_or(linux::EINVAL)?);
         let parent_out = self.resolve(get_u64(body, 8).ok_or(linux::EINVAL)?);
-        let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
+        // The source's size and mode, as the guest knows them: a file the
+        // guest wrote through this server has exactly the size it says, and
+        // saying so spares a stat of a source that may be parked.
+        let told_size = get_u64(body, 16).ok_or(linux::EINVAL)?;
+        let told_mode = get_u32(body, 24).ok_or(linux::EINVAL)?;
+        let (name, _) = get_name(body.get(32..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let source = self.inode(nodeid_in)?;
         let parent = self.directory(parent_out)?;
@@ -3189,10 +3194,15 @@ impl Server {
                 crate::inode::Located::At(parent_ref, name) => Source::At(parent_ref, name),
             },
         };
-        let st = match &source_fd {
-            Source::Cached(file) => sys::stat_fd(file.fd.as_raw_fd())?,
-            Source::Held(reference) => sys::stat_fd(reference.raw_fd())?,
-            Source::At(parent_ref, name) => sys::stat_at(parent_ref.raw_fd(), name)?,
+        let (size, mode) = if told_mode & 0o170000 == 0o100000 {
+            (source.overlay_size(told_size), told_mode)
+        } else {
+            let st = match &source_fd {
+                Source::Cached(file) => sys::stat_fd(file.fd.as_raw_fd())?,
+                Source::Held(reference) => sys::stat_fd(reference.raw_fd())?,
+                Source::At(parent_ref, name) => sys::stat_at(parent_ref.raw_fd(), name)?,
+            };
+            (source.overlay_size(st.st_size as u64), st.st_mode as u32)
         };
         // The path is only for cloning from a descriptor the kernel refuses
         // (an event-only reference), and only that case pays for it.
@@ -3200,8 +3210,6 @@ impl Server {
             Source::Held(_) => Some(self.path(&source)?),
             _ => None,
         };
-        let size = source.overlay_size(st.st_size as u64);
-        let mode = st.st_mode as u32;
         phase("clone-us-2-fd-stat", t1);
         let t2 = std::time::Instant::now();
         if !self.apply.accepting() {
