@@ -81,10 +81,10 @@ what a runtime gives back on its own after the work ends.
 
 | reading | lighter (share) | orbstack (share) | colima (share) |
 |---|---|---|---|
-| settled, before an install | 1141 | 1088 | 4329 |
-| peak through an npm install | 3904 | 4311 | 4338 |
-| 15 s after it ends | 1680 | 2150 | 4337 |
-| 60 s after it ends | 1244 | 1021 | 4337 |
+| settled, before an install | 1254 | 1088 | 4329 |
+| peak through an npm install | 4047 | 4311 | 4338 |
+| 15 s after it ends | 2126 | 2150 | 4337 |
+| 60 s after it ends | 1456 | 1021 | 4337 |
 
 ### As a fraction of `native`
 

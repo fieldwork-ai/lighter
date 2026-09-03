@@ -101,12 +101,12 @@ The physical footprint of the runtime's own processes, which is the "Memory" col
 
 | Reading | lighter | OrbStack | Colima |
 |---|---|---|---|
-| Settled, before the install | 1141 MiB | **1088 MiB** | 4329 MiB |
-| Peak during the install | **3904 MiB** | 4311 MiB | 4338 MiB |
-| 15 s after it ends | **1680 MiB** | 2150 MiB | 4337 MiB |
-| 60 s after it ends | 1244 MiB | **1021 MiB** | 4337 MiB |
+| Settled, before the install | 1254 MiB | **1088 MiB** | 4329 MiB |
+| Peak during the install | **4047 MiB** | 4311 MiB | 4338 MiB |
+| 15 s after it ends | **2126 MiB** | 2150 MiB | 4337 MiB |
+| 60 s after it ends | 1456 MiB | **1021 MiB** | 4337 MiB |
 
-lighter gives memory back through free page reporting in 128 KiB blocks and a trim of the guest's cache once its containers have been idle for ten seconds; the balloon, in host-page units, is steered off the Mac's compressor. Colima's guest is handed its 4 GiB by Virtualization.framework and keeps it.
+lighter gives memory back through free page reporting: once its containers have been idle for ten seconds the guest trims its cache to a sixteenth of RAM and compacts what it freed into runs the host can take; the balloon, in host-page units, is steered off the Mac's compressor. Colima's guest is handed its 4 GiB by Virtualization.framework and keeps it.
 
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 
