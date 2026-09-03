@@ -197,10 +197,14 @@ def render(results, description, _primary):
         lines.append(f"| {case} | " + " | ".join(cells) + " |")
     lines.append("")
 
+    # The share columns only: the reading is of the runtime, and the own-disk
+    # leg of the same runtime measures the same processes again.
     memory_columns = [
         (name, values)
         for name, values in columns
-        if name != REFERENCE and any(case in values for case, _ in MEMORY_CASES)
+        if name != REFERENCE
+        and not name.endswith("(own disk)")
+        and any(case in values for case, _ in MEMORY_CASES)
     ]
     if memory_columns:
         lines += [

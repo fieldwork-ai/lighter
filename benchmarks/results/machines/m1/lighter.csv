@@ -23,3 +23,7 @@ rm-rf,3,3831
 watch-latency,1,252
 watch-latency,2,2
 watch-latency,3,2
+memory-settled,1,1141
+memory-peak,1,3904
+memory-after-15s,1,1680
+memory-after-60s,1,1244

@@ -70,18 +70,43 @@ OrbStack was measured on the same machines in the same sessions, not quoted from
 
 ### Apple M1 (8 cores, 8 GB RAM)
 
-On an 8 GB machine under memory pressure, lighter matches OrbStack on package manager wall times while running traversal, search, and bulk operations substantially faster:
+On an 8 GB machine under memory pressure, lighter matches OrbStack on package manager wall times while running traversal, search, and bulk operations substantially faster. Colima (0.10, Virtualization.framework with virtiofs, the fast configuration) was measured in the same session at the same 4 GiB and 8 CPUs:
 
-| Workload | native APFS | lighter (share) | OrbStack (share) | lighter (own disk) | OrbStack (own disk) |
-|---|---|---|---|---|---|
-| `pnpm install` | 4.65 s | **6.02 s** (77%) | 6.06 s (77%) | **1.76 s** (264%) | 2.38 s (196%) |
-| `npm ci` | 7.85 s | 11.66 s (67%) | **11.09 s** (71%) | **7.87 s** (100%) | 10.21 s (77%) |
-| `yarn install` | 10.62 s | 12.19 s (87%) | **10.23 s** (104%) | **8.02 s** (132%) | 7.82 s (136%) |
-| `ripgrep` (file read) | 1330 ms | **151 ms** (881%) | 1121 ms (119%) | **129 ms** (1031%) | 184 ms (723%) |
-| `find` (metadata walk) | 503 ms | **122 ms** (412%) | 518 ms (97%) | **125 ms** (402%) | 130 ms (387%) |
-| `cp -a node_modules` | 24.76 s | **4.96 s** (499%) | 16.57 s (149%) | **2.48 s** (999%) | 3.62 s (683%) |
-| `rm -rf node_modules` | 5.43 s | **3.53 s** (154%) | 4.02 s (135%) | **590 ms** (921%) | 695 ms (782%) |
-| Host file edit -> container | 2 ms | **2 ms** | 2 ms | n/a | n/a |
+| Workload | native APFS | lighter (share) | OrbStack (share) | Colima (share) |
+|---|---|---|---|---|
+| `pnpm install` | 4.65 s | **6.02 s** (77%) | 6.06 s (77%) | failed |
+| `npm ci` | 7.85 s | 11.66 s (67%) | **11.09 s** (71%) | 23.01 s (34%) |
+| `yarn install` | 10.62 s | 12.19 s (87%) | **10.23 s** (104%) | 28.13 s (38%) |
+| `ripgrep` (file read) | 1330 ms | **151 ms** (881%) | 1121 ms (119%) | 15019 ms (9%) |
+| `find` (metadata walk) | 503 ms | **122 ms** (412%) | 518 ms (97%) | 3813 ms (13%) |
+| `cp -a node_modules` | 24.76 s | **4.96 s** (499%) | 16.57 s (149%) | 60.40 s (41%) |
+| `rm -rf node_modules` | 5.43 s | **3.53 s** (154%) | 4.02 s (135%) | 12.41 s (44%) |
+| Host file edit -> container | 2 ms | **2 ms** | 2 ms | 3 ms |
+
+| Workload (own disk) | lighter | OrbStack | Colima |
+|---|---|---|---|
+| `pnpm install` | 1.76 s | 2.38 s | **1.58 s** |
+| `npm ci` | **7.87 s** | 10.21 s | 10.74 s |
+| `yarn install` | 8.02 s | **7.82 s** | 11.23 s |
+| `ripgrep` (file read) | **129 ms** | 184 ms | 188 ms |
+| `find` (metadata walk) | **125 ms** | 130 ms | 218 ms |
+| `cp -a node_modules` | **2.48 s** | 3.62 s | 2.56 s |
+| `rm -rf node_modules` | **590 ms** | 695 ms | 726 ms |
+
+Colima's `pnpm install` on the share failed inside the container and records no measurement.
+
+#### What the runtime costs the Mac
+
+The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: settled before an `npm ci`, at its peak during one, and 15 and 60 seconds after it ends with nothing running. The last two are what a runtime gives back on its own. Each guest has 4 GiB.
+
+| Reading | lighter | OrbStack | Colima |
+|---|---|---|---|
+| Settled, before the install | 1141 MiB | **1088 MiB** | 4329 MiB |
+| Peak during the install | **3904 MiB** | 4311 MiB | 4338 MiB |
+| 15 s after it ends | **1680 MiB** | 2150 MiB | 4337 MiB |
+| 60 s after it ends | 1244 MiB | **1021 MiB** | 4337 MiB |
+
+lighter gives memory back through free page reporting in 128 KiB blocks and a trim of the guest's cache once its containers have been idle for ten seconds; the balloon, in host-page units, is steered off the Mac's compressor. Colima's guest is handed its 4 GiB by Virtualization.framework and keeps it.
 
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 

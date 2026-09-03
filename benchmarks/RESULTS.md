@@ -79,12 +79,12 @@ accounts it — which reads high for any Hypervisor.framework guest, and the
 same way for every runtime here. Lower is better; the last two columns are
 what a runtime gives back on its own after the work ends.
 
-| reading | colima (share) | colima (own disk) |
-|---|---|---|
-| settled, before an install | 4329 | 4346 |
-| peak through an npm install | 4338 | 4346 |
-| 15 s after it ends | 4337 | 4346 |
-| 60 s after it ends | 4337 | 4346 |
+| reading | lighter (share) | orbstack (share) | colima (share) |
+|---|---|---|---|
+| settled, before an install | 1141 | 1088 | 4329 |
+| peak through an npm install | 3904 | 4311 | 4338 |
+| 15 s after it ends | 1680 | 2150 | 4337 |
+| 60 s after it ends | 1244 | 1021 | 4337 |
 
 ### As a fraction of `native`
 
