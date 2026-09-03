@@ -141,6 +141,7 @@ pub fn spawn(
             if window.is_zero() {
                 return;
             }
+            crate::virtio::fs::raise_server_qos();
             while kicks.wait() {
                 // The kick that woke us has already been serviced by the vCPU
                 // that made it; from here the guest is told to stop bothering.

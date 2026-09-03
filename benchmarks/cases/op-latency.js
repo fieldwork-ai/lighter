@@ -35,7 +35,7 @@ const PARALLEL = Number(process.env.PARALLEL || 16);
 
 // The share, and a directory on whatever the guest boots from.
 const places = [
-  ["", path.join(process.env.DIR, "op-latency")],
+  ["", path.join(process.env.DIR || process.env.WORK, "op-latency")],
   ["@local", "/tmp/op-latency"],
 ];
 

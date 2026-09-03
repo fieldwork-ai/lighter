@@ -123,6 +123,34 @@ fn workers() -> usize {
 
 const WORKERS: usize = 16;
 
+/// Raises the calling thread to the user-interactive QoS class, when
+/// `LIGHTER_SERVER_QOS` asks for it.
+///
+/// A guest waiting on the share is waiting on these threads: the poller that
+/// takes its request off the ring and the worker that answers it. On a Mac
+/// whose every core is a vCPU — eight on an M1, with eight vCPUs — they
+/// compete with the idle polling of the guest they serve, and lose often
+/// enough that the poller misses most requests and the guest traps for
+/// them. macOS schedules by QoS class before anything else.
+pub fn raise_server_qos() {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let wanted = *WANTED.get_or_init(|| {
+        std::env::var("LIGHTER_SERVER_QOS").is_ok_and(|v| v != "0")
+    });
+    if !wanted {
+        return;
+    }
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    // SAFETY: a plain call on the current thread with constant arguments.
+    let rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    if rc != 0 {
+        tracing::debug!(rc, "could not raise the server thread's QoS");
+    }
+}
+
 /// The callback a worker uses to poke the transport once a reply is ready.
 ///
 /// Shared, optional and behind a lock because it is installed after the device
@@ -424,6 +452,7 @@ impl Pool {
             let handle = std::thread::Builder::new()
                 .name(format!("fs-{tag}-{index}"))
                 .spawn(move || {
+                    raise_server_qos();
                     while let Some(job) = queue.pop() {
                         let mut sink = ChainSink::new(memory.clone(), job.reply);
                         let written = server.dispatch(&job.request, &mut sink);
