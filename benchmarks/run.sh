@@ -333,13 +333,22 @@ run_case_container() {
 # `BENCH_MEMORY_MIB` overrides; without OrbStack the default is 8 GiB.
 bench_memory_mib() {
 	if [ -n "${BENCH_MEMORY_MIB:-}" ]; then echo "$BENCH_MEMORY_MIB"; return; fi
-	# OrbStack's configured limit, which is what its guest boots with. Read
-	# from its config rather than its running guest: the comparator is
-	# stopped while we measure, and a probe that needs it running silently
-	# fell back to 8 GiB against its 16 for a whole set of results.
-	local mib
-	mib="$(orb config show 2>/dev/null | awk '/^memory_mib:/ { print $2 }')"
-	if [ -n "$mib" ] && [ "$mib" -gt 0 ] 2>/dev/null; then echo "$mib"; else echo 8192; fi
+	# OrbStack's configured limit, which is what its guest boots with. Asking
+	# it (`orb config show`) starts it when it is not running — a second VM
+	# under our measurement — so ask only when it is up, and otherwise apply
+	# its default, which it stores nowhere: half the machine, capped at
+	# 16 GiB (4 GiB on an 8 GB M1, 16 on a 48 GB M5). A probe that needed
+	# its guest running silently fell back to 8 GiB against its 16 for a
+	# whole set of results.
+	local mib=""
+	if pgrep -q -f "OrbStack Helper" 2>/dev/null; then
+		mib="$(orb config show 2>/dev/null | awk '/^memory_mib:/ { print $2 }')"
+	fi
+	if [ -z "$mib" ] || ! [ "$mib" -gt 0 ] 2>/dev/null; then
+		mib=$(( $(sysctl -n hw.memsize) / 1048576 / 2 ))
+		[ "$mib" -le 16384 ] || mib=16384
+	fi
+	echo "$mib"
 }
 
 setup_lighter() {
