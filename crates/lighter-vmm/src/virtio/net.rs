@@ -54,8 +54,17 @@ const STATUS_LINK_UP: u16 = 1;
 /// carries nothing but malformed packets.
 pub const NET_HDR_LEN: usize = 12;
 
-/// The Ethernet MTU on a link with nothing to negotiate it: the wire's own.
-pub const DEFAULT_MTU: u16 = 1500;
+/// The MTU the guest is told the link carries.
+///
+/// The largest a virtio-net frame can be, not Ethernet's 1500: the far end
+/// of this link is a userspace stack that terminates every flow onto a host
+/// socket, so no frame on it is ever forwarded anywhere with a smaller MTU,
+/// and the only thing the number decides is how many frames a byte costs.
+/// With the bridge following it (the rootfs init reads eth0's MTU into
+/// dockerd's `--mtu`) a container's stream moves in 64 KiB frames instead of
+/// 1500-byte ones, and the sidecar path went from 3.8 to 6.3 Gbit/s on the
+/// M5 for it. `LIGHTER_NET_MTU` overrides it for an A/B.
+pub const DEFAULT_MTU: u16 = 65_520;
 
 /// Largest frame we will move in either direction.
 const MAX_FRAME: usize = 65_550;
@@ -428,7 +437,10 @@ mod tests {
             u16::from_le_bytes(config[6..8].try_into().unwrap()),
             STATUS_LINK_UP
         );
-        assert_eq!(u16::from_le_bytes(config[10..12].try_into().unwrap()), 1500);
+        assert_eq!(
+            u16::from_le_bytes(config[10..12].try_into().unwrap()),
+            DEFAULT_MTU
+        );
     }
 
     /// The header is 12 bytes under VERSION_1 even without MRG_RXBUF. A
