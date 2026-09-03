@@ -63,14 +63,14 @@ and its data volumes live.
 
 | case | native | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
 |---|---|---|---|---|---|
-| npm-install | 7846 | 12895 | 11240 | 7600 | 10102 |
-| pnpm-install | 4654 | 6592 | 6034 | 1744 | 2390 |
-| yarn-install | 10619 | 11109 | 10237 | 7881 | 7843 |
-| ripgrep | 1330 | 140 | 1175 | 125 | 151 |
-| find-walk | 503 | 126 | 520 | 128 | 130 |
-| copy-tree | 24755 | 5042 | 14034 | 2799 | 2378 |
-| rm-rf | 5432 | 2683 | 3886 | 596 | 745 |
-| watch-latency | 2 | 2 | 3 | — | — |
+| npm-install | 7846 | 11333 | 11072 | 8015 | 9800 |
+| pnpm-install | 4654 | 7126 | 6149 | 1727 | 2428 |
+| yarn-install | 10619 | 10877 | 10379 | 7918 | 7908 |
+| ripgrep | 1330 | 152 | 1146 | 132 | 155 |
+| find-walk | 503 | 124 | 519 | 124 | 130 |
+| copy-tree | 24755 | 5271 | 20210 | 3235 | 3870 |
+| rm-rf | 5432 | 2523 | 3869 | 584 | 722 |
+| watch-latency | 2 | 2 | 2 | — | — |
 
 ### As a fraction of `native`
 
@@ -82,13 +82,13 @@ read it from the table above in milliseconds.
 
 | case | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
 |---|---|---|---|---|
-| npm-install | 61% | 70% | 103% | 78% |
-| pnpm-install | 71% | 77% | 267% | 195% |
-| yarn-install | 96% | 104% | 135% | 135% |
-| ripgrep | 950% | 113% | 1064% | 881% |
-| find-walk | 399% | 97% | 393% | 387% |
-| copy-tree | 491% | 176% | 884% | 1041% |
-| rm-rf | 202% | 140% | 911% | 729% |
+| npm-install | 69% | 71% | 98% | 80% |
+| pnpm-install | 65% | 76% | 269% | 192% |
+| yarn-install | 98% | 102% | 134% | 134% |
+| ripgrep | 875% | 116% | 1008% | 858% |
+| find-walk | 406% | 97% | 406% | 387% |
+| copy-tree | 470% | 122% | 765% | 640% |
+| rm-rf | 215% | 140% | 930% | 752% |
 
 ## What each case does
 
