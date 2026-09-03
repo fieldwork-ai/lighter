@@ -1,0 +1,8 @@
+case,rep,ms
+net-tcp-egress,1,112613
+net-tcp-egress-r,1,128697
+net-udp,1,21018
+net-connect-rate,1,26356
+net-http-p99,1,74
+net-http-latency,1,40
+net-dns,1,7710
