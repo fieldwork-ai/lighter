@@ -220,7 +220,11 @@ impl Machine {
         // receive pump needs the transport, which does not exist until every
         // device has been placed.
         let network = match &config.gvproxy {
-            Some(path) => Some(Arc::new(Network::start(path, &config.run_dir)?)),
+            Some(path) => Some(Arc::new(Network::start(
+                path,
+                &config.run_dir,
+                net::link_mtu(),
+            )?)),
             None => None,
         };
         let mut net_slot = None;
@@ -246,6 +250,7 @@ impl Machine {
                 network.outbox(),
                 net::GUEST_MAC,
                 net_inbox.clone(),
+                network.mtu(),
             )));
         }
 
@@ -405,6 +410,30 @@ impl Machine {
                     .expect("net transport poisoned")
                     .service_queue(virtio::net::TX_QUEUE);
             })?;
+            // The transmit ring gets the watcher the disks have. A single TCP
+            // stream hands the driver one frame at a time, and the driver
+            // kicks for each unless the device has said not to: at 1500 bytes
+            // a frame that is a trap every three microseconds, which was the
+            // whole of the 3.8 Gbit/s. Watched, the guest publishes and moves
+            // on, and the copy into the outbox happens on this thread.
+            let transport = virtio_devices[slot].clone();
+            let kicks = virtio::poll::Kicks::new();
+            {
+                let mut held = transport.lock().expect("net transport poisoned");
+                let signal = kicks.clone();
+                held.set_kick_observer(Arc::new(move |queue| {
+                    if queue == virtio::net::TX_QUEUE {
+                        signal.kicked();
+                    }
+                }));
+            }
+            let poller = virtio::poll::spawn(
+                "net-tx",
+                transport.clone(),
+                vec![virtio::net::TX_QUEUE],
+                kicks.clone(),
+            )?;
+            pollers.push((kicks, poller));
         }
 
         // The balloon only matters when the Mac itself is short, so it is

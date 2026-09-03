@@ -258,12 +258,19 @@ fi
 # enabled, but userland-proxy-path is not set"). Turning it off is the right
 # answer regardless: publishing a port then rests on netfilter DNAT alone, and
 # the host side of the journey is gvproxy's job, not a hairpin process here.
+#
+# --mtu is the link's own, read back from eth0: the host terminates every
+# flow on its side of the link, so the only thing the number decides is how
+# many frames a byte costs between here and there, and a bridge left at 1500
+# would have every container segment at 1460 whatever the link could carry.
 mkdir -p /var/log
+link_mtu=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1500)
 dockerd \
 	--host=unix:///run/docker.sock \
 	--data-root=/var/lib/docker \
 	--storage-driver=overlay2 \
 	--userland-proxy=false \
+	--mtu="$link_mtu" \
 	>/var/log/dockerd.log 2>&1 &
 DOCKERD_PID=$!
 

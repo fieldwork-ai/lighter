@@ -28,6 +28,9 @@ cd "$ROOT"
 SECONDS_PER_PATH=2
 ONLY_PATH=""
 SOAK=0
+# --host-net runs the container client in the guest's own network namespace,
+# which takes Docker's bridge (and its MTU) out of the egress paths.
+NETMODE=""
 LIGHTER_BIN="${LIGHTER_BIN:-target/release/lighter}"
 IMAGE=networkstatic/iperf3
 IMAGE_TAR=".logs/iperf3.tar"
@@ -38,6 +41,7 @@ while [ $# -gt 0 ]; do
 	--seconds) SECONDS_PER_PATH="$2"; shift 2 ;;
 	--path) ONLY_PATH="$2"; shift 2 ;;
 	--soak) SOAK="$2"; shift 2 ;;
+	--host-net) NETMODE="--net=host"; shift ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -80,26 +84,36 @@ else
 	$DOCKER pull -q "$IMAGE" >/dev/null 2>&1
 fi
 
+echo "guest_mtu=$($DOCKER run --rm --net=host --entrypoint cat "$IMAGE" /sys/class/net/eth0/mtu 2>/dev/null | tr -d '[:space:]') docker0_mtu=$($DOCKER run --rm --net=host --entrypoint cat "$IMAGE" /sys/class/net/docker0/mtu 2>/dev/null | tr -d '[:space:]') lan_ip=$LAN_IP net_mtu_env=${LIGHTER_NET_MTU:-unset}"
 iperf3 -s -D -p "$HOST_PORT" --logfile "$LIGHTER_HOME/iperf-host.log"
 $DOCKER run -d --rm --name iperf-port -p "$PUBLISHED_PORT:5201" "$IMAGE" -s >/dev/null 2>&1
 sleep 1
 
 # The receiver's figure, in Gbit/s; "0" when iperf3 printed nothing (a stalled
 # guest prints nothing, and the checks below say why).
+# eth0's counters in the guest, for the average frame size a path moved: the
+# number that says whether a bigger MTU reached the wire.
+guest_counters() { $DOCKER run --rm --net=host --entrypoint sh "$IMAGE" -c 'cd /sys/class/net/eth0/statistics && echo $(cat tx_packets) $(cat tx_bytes) $(cat rx_packets) $(cat rx_bytes)' 2>/dev/null; }
+frame_sizes() {
+	# $1/$2: before/after "tx_packets tx_bytes rx_packets rx_bytes"
+	echo "$1 $2" | awk '{ tp=$5-$1; tb=$6-$2; rp=$7-$3; rb=$8-$4; printf "tx_avg=%d rx_avg=%d", (tp>0?tb/tp:0), (rp>0?rb/rp:0) }'
+}
 receiver_gbits() { grep receiver | awk '{ if ($8 == "Mbits/sec") printf "%.2f\n", $7 / 1000; else if ($8 == "Gbits/sec") printf "%.2f\n", $7; else print "0" }' | head -1; }
 measure() {
-	local path="$1" secs="$2" out
+	local path="$1" secs="$2" out before after
+	before="$(guest_counters)"
 	# Each measurement under its own cap: a guest that stalls mid-transfer
 	# hangs the client, and the point is to record that as a zero and go on
 	# to the checks that name it, not to hang the loop with it.
 	local cap=$(( secs + 25 ))
 	case "$path" in
-	egress)   out="$(scripts/capped.sh "$cap" $DOCKER run --rm "$IMAGE" -c "$LAN_IP" -p "$HOST_PORT" -t "$secs" 2>&1)" ;;
-	egress-r) out="$(scripts/capped.sh "$cap" $DOCKER run --rm "$IMAGE" -c "$LAN_IP" -p "$HOST_PORT" -t "$secs" -R 2>&1)" ;;
+	egress)   out="$(scripts/capped.sh "$cap" $DOCKER run --rm $NETMODE "$IMAGE" -c "$LAN_IP" -p "$HOST_PORT" -t "$secs" 2>&1)" ;;
+	egress-r) out="$(scripts/capped.sh "$cap" $DOCKER run --rm $NETMODE "$IMAGE" -c "$LAN_IP" -p "$HOST_PORT" -t "$secs" -R 2>&1)" ;;
 	port)     out="$(scripts/capped.sh "$cap" iperf3 -c 127.0.0.1 -p "$PUBLISHED_PORT" -t "$secs" 2>&1)" ;;
 	port-r)   out="$(scripts/capped.sh "$cap" iperf3 -c 127.0.0.1 -p "$PUBLISHED_PORT" -t "$secs" -R 2>&1)" ;;
 	esac
-	echo "path=$path gbits=$(echo "$out" | receiver_gbits | grep . || echo 0)"
+	after="$(guest_counters)"
+	echo "path=$path gbits=$(echo "$out" | receiver_gbits | grep . || echo 0) $(frame_sizes "$before" "$after")"
 }
 
 if [ "$SOAK" -gt 0 ]; then

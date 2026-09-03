@@ -93,11 +93,26 @@ pub struct Network {
     stream: Arc<Mutex<UnixStream>>,
     /// Frames the device has taken off the guest's ring for the wire.
     outbox: Arc<Outbox>,
+    /// The link's MTU, agreed with gvproxy at spawn.
+    mtu: u16,
+}
+
+/// The MTU for the link to gvproxy.
+///
+/// gvproxy terminates every flow onto a host socket, so nothing past it sees
+/// this number; it only decides how many frames a byte costs on the way
+/// there. `LIGHTER_NET_MTU` overrides it for an A/B.
+pub fn link_mtu() -> u16 {
+    std::env::var("LIGHTER_NET_MTU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|m| (68..=65_520).contains(m))
+        .unwrap_or(crate::virtio::net::DEFAULT_MTU)
 }
 
 impl Network {
     /// Starts gvproxy and connects to it.
-    pub fn start(gvproxy: &Path, run_dir: &Path) -> Result<Network, NetError> {
+    pub fn start(gvproxy: &Path, run_dir: &Path, mtu: u16) -> Result<Network, NetError> {
         if !gvproxy.exists() {
             return Err(NetError::NotFound(gvproxy.to_path_buf()));
         }
@@ -118,7 +133,7 @@ impl Network {
             .arg("--listen-qemu")
             .arg(format!("unix://{}", socket_path.display()))
             .arg("--mtu")
-            .arg("1500")
+            .arg(mtu.to_string())
             // gvproxy's built-in SSH forward binds 127.0.0.1:2222 by default,
             // which we never use and which makes every second machine on the
             // Mac die at boot — the benchmark harness beside the daily
@@ -144,6 +159,7 @@ impl Network {
             control = %control_path.display(),
             gateway = GATEWAY_IP,
             guest = GUEST_IP,
+            mtu,
             "network started"
         );
 
@@ -153,6 +169,7 @@ impl Network {
             control_path,
             stream: Arc::new(Mutex::new(stream)),
             outbox: Outbox::new(),
+            mtu,
         })
     }
 
@@ -220,6 +237,11 @@ impl Network {
         Ok(payload.to_string())
     }
 
+    /// The link's MTU, for the device to advertise.
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
     /// Where the device puts frames for the wire.
     pub fn outbox(&self) -> Arc<Outbox> {
         self.outbox.clone()
@@ -271,29 +293,45 @@ impl Network {
         std::thread::Builder::new()
             .name("net-rx".into())
             .spawn(move || {
-                let mut header = [0u8; 4];
+                // One read takes whatever the socket holds, up to a megabyte,
+                // and the frames are cut out of that: two syscalls per frame
+                // was a third of a frame's cost at 1500 bytes. A frame split
+                // across two reads is carried over in `buf`.
+                let mut buf = vec![0u8; 1 << 20];
+                let mut filled = 0usize;
                 let mut pending = 0usize;
                 loop {
-                    if reader.read_exact(&mut header).is_err() {
-                        break;
+                    let n = match reader.read(&mut buf[filled..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    filled += n;
+                    let mut at = 0usize;
+                    while filled - at >= 4 {
+                        let len = u32::from_be_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+                        if len == 0 || len > 65_550 {
+                            // A length we cannot honour means the stream is
+                            // out of sync, and there is no way to
+                            // resynchronize a framed protocol other than to
+                            // stop.
+                            tracing::error!(len, "network stream framing lost");
+                            return;
+                        }
+                        if filled - at - 4 < len {
+                            break;
+                        }
+                        let frame = buf[at + 4..at + 4 + len].to_vec();
+                        at += 4 + len;
+                        if Net::enqueue_received(&inbox, frame) {
+                            pending += 1;
+                        } else {
+                            tracing::trace!("receive backlog full; frame dropped");
+                        }
                     }
-                    let len = u32::from_be_bytes(header) as usize;
-                    if len == 0 || len > 65_550 {
-                        // A length we cannot honour means the stream is out of
-                        // sync, and there is no way to resynchronize a framed
-                        // protocol other than to stop.
-                        tracing::error!(len, "network stream framing lost");
-                        break;
-                    }
-                    let mut frame = vec![0u8; len];
-                    if reader.read_exact(&mut frame).is_err() {
-                        break;
-                    }
-                    if Net::enqueue_received(&inbox, frame) {
-                        pending += 1;
-                    } else {
-                        tracing::trace!("receive backlog full; frame dropped");
-                    }
+                    // What is left is the start of a frame the next read
+                    // completes.
+                    buf.copy_within(at..filled, 0);
+                    filled -= at;
                     // Keep reading while the socket has more: a burst is moved
                     // into the guest as one batch. A burst longer than the
                     // backlog is flushed part way so nothing is dropped for

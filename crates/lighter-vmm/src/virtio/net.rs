@@ -54,8 +54,8 @@ const STATUS_LINK_UP: u16 = 1;
 /// carries nothing but malformed packets.
 pub const NET_HDR_LEN: usize = 12;
 
-/// Ethernet MTU we advertise.
-const MTU: u16 = 1500;
+/// The Ethernet MTU on a link with nothing to negotiate it: the wire's own.
+pub const DEFAULT_MTU: u16 = 1500;
 
 /// Largest frame we will move in either direction.
 const MAX_FRAME: usize = 65_550;
@@ -170,16 +170,21 @@ pub struct Net {
     outbox: Arc<Outbox>,
     inbox: Inbox,
     mac: [u8; 6],
+    /// What the guest is told the link carries. The backend terminates every
+    /// flow itself, so this is a private agreement between the two ends of a
+    /// socket, and a larger one means fewer frames per byte.
+    mtu: u16,
     /// Frames dropped because the guest had no receive buffers posted.
     dropped: u64,
 }
 
 impl Net {
-    pub fn new(outbox: Arc<Outbox>, mac: [u8; 6], inbox: Inbox) -> Net {
+    pub fn new(outbox: Arc<Outbox>, mac: [u8; 6], inbox: Inbox, mtu: u16) -> Net {
         Net {
             outbox,
             inbox,
             mac,
+            mtu,
             dropped: 0,
         }
     }
@@ -370,7 +375,7 @@ impl VirtioDevice for Net {
         config[6..8].copy_from_slice(&STATUS_LINK_UP.to_le_bytes());
         // max_virtqueue_pairs: one rx/tx pair.
         config[8..10].copy_from_slice(&1u16.to_le_bytes());
-        config[10..12].copy_from_slice(&MTU.to_le_bytes());
+        config[10..12].copy_from_slice(&self.mtu.to_le_bytes());
 
         let start = offset as usize;
         for (i, byte) in data.iter_mut().enumerate() {
@@ -408,6 +413,7 @@ mod tests {
             outbox.clone(),
             [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee],
             inbox.clone(),
+            DEFAULT_MTU,
         );
         (net, outbox, inbox)
     }
