@@ -192,6 +192,44 @@ fn serve_control(stream: OwnedFd) {
         while let Some(end) = buffer.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buffer.drain(..=end).collect();
             let line = String::from_utf8_lossy(&line[..end]).trim().to_string();
+            // The two verbs that move bytes rather than words, for measuring
+            // the channel itself: `blast N` writes N bytes as fast as the
+            // socket takes them, `sink N` reads N bytes and then says so.
+            // Raw bytes on the line protocol's own connection, so what is
+            // measured is exactly what a stream over this device costs.
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next().and_then(|n| n.parse::<u64>().ok())) {
+                (Some("blast"), Some(mut left)) => {
+                    let chunk = vec![0x5au8; 256 * 1024];
+                    while left > 0 {
+                        let take = (chunk.len() as u64).min(left) as usize;
+                        if writer.write_all(&chunk[..take]).is_err() {
+                            return;
+                        }
+                        left -= take as u64;
+                    }
+                    continue;
+                }
+                (Some("sink"), Some(mut left)) => {
+                    // Whatever followed the line in the same read is data.
+                    let have = buffer.len().min(left as usize);
+                    buffer.drain(..have);
+                    left -= have as u64;
+                    let mut big = vec![0u8; 256 * 1024];
+                    while left > 0 {
+                        let want = big.len().min(left as usize);
+                        match reader.read(&mut big[..want]) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => left -= n as u64,
+                        }
+                    }
+                    if writer.write_all(b"sunk\n").is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let reply = handle_control(&line);
             if writer.write_all(reply.as_bytes()).is_err() {
                 return;
