@@ -12,7 +12,28 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The opcodes worth naming in a report. Everything else lands in `other`.
-const NAMED: [(u32, &str); 24] = [
+const NAMED: [(u32, &str); 45] = [
+    (7, "mknod"),
+    (21, "setxattr"),
+    (23, "listxattr"),
+    (24, "removexattr"),
+    (30, "fsyncdir"),
+    (31, "getlk"),
+    (32, "setlk"),
+    (33, "setlkw"),
+    (36, "interrupt"),
+    (40, "poll"),
+    (48, "setupmapping"),
+    (50, "syncfs"),
+    (51, "tmpfile"),
+    (52, "statx"),
+    (39, "ioctl"),
+    (42, "batch_forget"),
+    (43, "fallocate"),
+    (44, "readdirplus"),
+    (45, "rename2"),
+    (46, "lseek"),
+    (47, "copy_file_range"),
     (1, "lookup"),
     (2, "forget"),
     (3, "getattr"),
@@ -172,6 +193,15 @@ impl Stats {
         let lane = &self.lanes[lane()];
         lane.counts[slot].fetch_add(1, Ordering::Relaxed);
         lane.nanos[slot].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Adds `n` to a keyed counter — microseconds, usually.
+    pub fn add(&self, key: &str, n: u64) {
+        if !self.on.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut keyed = self.keyed.lock().expect("keyed counters poisoned");
+        *keyed.entry(key.to_owned()).or_insert(0) += n;
     }
 
     pub fn count(&self, key: &str) {

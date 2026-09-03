@@ -242,6 +242,12 @@ struct State {
     incomplete: BTreeSet<u64>,
 }
 
+/// Diagnostics for the acknowledgement path: time spent taking the queue's
+/// lock, and time spent waiting for it to drain below its caps.
+pub static PUSH_LOCK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PUSH_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PUSH_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Apply {
     shared: Arc<Shared>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -311,7 +317,10 @@ impl Apply {
                 handles.push(
                     std::thread::Builder::new()
                         .name(format!("fs-apply-{index}"))
-                        .spawn(move || shared.run(&root))
+                        .spawn(move || {
+                            crate::sys::raise_server_qos();
+                            shared.run(&root)
+                        })
                         .expect("failed to spawn a filesystem apply thread"),
                 );
             }
@@ -339,11 +348,20 @@ impl Apply {
     /// more jobs than the window.
     pub fn push(&self, job: Job) -> u64 {
         let shared = &self.shared;
+        let t_lock = std::time::Instant::now();
         let mut state = shared.state.lock().expect("apply queue poisoned");
+        PUSH_LOCK_NS.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t_wait = std::time::Instant::now();
+        let mut waited = false;
         while shared.bytes.load(Ordering::Relaxed) > BYTES_CAP
             || shared.depth.load(Ordering::Relaxed) > shared.window
         {
+            waited = true;
             state = shared.settled.wait(state).expect("apply queue poisoned");
+        }
+        if waited {
+            PUSH_WAITS.fetch_add(1, Ordering::Relaxed);
+            PUSH_WAIT_NS.fetch_add(t_wait.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if state.retired {
             // Retired mid-flight; nothing will drain, so do it here.
@@ -451,6 +469,7 @@ impl Apply {
 
     /// The drainer's histogram since the last call, one line per kind.
     pub fn report(&self) -> String {
+        let _ = (PUSH_LOCK_NS.load(Ordering::Relaxed), PUSH_WAITS.load(Ordering::Relaxed), PUSH_WAIT_NS.load(Ordering::Relaxed));
         const NAMES: [&str; KINDS] = [
             "create", "write", "unlink", "rename", "clone", "setattr", "link", "mkdir", "symlink",
             "rmdir",

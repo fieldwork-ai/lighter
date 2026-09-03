@@ -3070,6 +3070,8 @@ impl Server {
     /// every other Docker, cost a hundred and sixty-six each on APFS — twice
     /// a clone — and took seventeen.
     fn clone_over(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+        let t0 = std::time::Instant::now();
+        let phase = |k: &str, t: std::time::Instant| self.stats.add(k, t.elapsed().as_micros() as u64);
         // Both name nodeids in the body, not the header, so the dispatch-time
         // resolution has not seen them: the source may be the guest's open
         // descriptor on a file a clone has since replaced.
@@ -3084,6 +3086,8 @@ impl Server {
         // them and lands after they do.
         self.settle_while(&source, |source| source.is_pending());
         let source_path = self.path(&source)?;
+        phase("clone-us-1-resolve-settle-path", t0);
+        let t1 = std::time::Instant::now();
         // The source by descriptor: the one a recent write left in the open
         // cache, else the inode's own. The clone then names no path for it.
         enum Source {
@@ -3107,6 +3111,8 @@ impl Server {
         let st = sys::stat_fd(source_fd.raw_fd())?;
         let size = source.overlay_size(st.st_size as u64);
         let mode = st.st_mode as u32;
+        phase("clone-us-2-fd-stat", t1);
+        let t2 = std::time::Instant::now();
         if !self.apply.accepting() {
             self.settle_while(&source, |source| source.is_dirty());
             let parent_ref = parent.reference()?;
@@ -3155,6 +3161,8 @@ impl Server {
         let (nodeid, dest) =
             self.registry
                 .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
+        phase("clone-us-3-displaced", t2);
+        let t3 = std::time::Instant::now();
         dest.set_place(&parent, &name);
         // The reply is a size, not an entry: see `Registry::unname`.
         self.registry.unname(nodeid);
@@ -3175,6 +3183,8 @@ impl Server {
         }
         dest.write_acked(size);
         parent.add_pending_child(name.to_bytes(), nodeid);
+        phase("clone-us-4-pending", t3);
+        let t4 = std::time::Instant::now();
         let job = {
             let registry = self.registry.clone();
             let parent = parent.clone();
@@ -3319,6 +3329,11 @@ impl Server {
             0,
             job,
         ));
+        phase("clone-us-5-push", t4);
+        self.stats.add("apply-push-lock-us", crate::apply::PUSH_LOCK_NS.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000);
+        self.stats.add("apply-push-waits", crate::apply::PUSH_WAITS.swap(0, std::sync::atomic::Ordering::Relaxed));
+        self.stats.add("apply-push-wait-us", crate::apply::PUSH_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000);
+        phase("clone-us-total", t0);
         parent.settled_by(seq);
         dest.settled_by(seq);
         let mut out = Vec::with_capacity(8);
