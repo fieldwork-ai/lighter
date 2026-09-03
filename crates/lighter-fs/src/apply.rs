@@ -167,7 +167,20 @@ impl Job {
 /// becomes an unbounded copy of the workload's output. Sixty-four megabytes
 /// rides out any burst a package manager produces while capping what a crash
 /// of the VMM could lose to roughly one second of disk work.
-const BYTES_CAP: usize = 64 << 20;
+const BYTES_CAP_DEFAULT: usize = 64 << 20;
+
+/// The byte cap, overridable for measurement (`LIGHTER_FS_APPLY_BYTES_MIB`).
+fn bytes_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("LIGHTER_FS_APPLY_BYTES_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .map(|mib| mib << 20)
+            .unwrap_or(BYTES_CAP_DEFAULT)
+    })
+}
 
 /// Jobs the queue may hold before acknowledgement starts waiting.
 ///
@@ -344,7 +357,7 @@ impl Apply {
 
     /// Queues a job whose outcome has already been described to the guest,
     /// returning its sequence number — the mark a scoped barrier waits to.
-    /// Blocks only when the queue holds more payload than [`BYTES_CAP`] or
+    /// Blocks only when the queue holds more payload than its byte cap or
     /// more jobs than the window.
     pub fn push(&self, job: Job) -> u64 {
         let shared = &self.shared;
@@ -353,7 +366,7 @@ impl Apply {
         PUSH_LOCK_NS.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let t_wait = std::time::Instant::now();
         let mut waited = false;
-        while shared.bytes.load(Ordering::Relaxed) > BYTES_CAP
+        while shared.bytes.load(Ordering::Relaxed) > bytes_cap()
             || shared.depth.load(Ordering::Relaxed) > shared.window
         {
             waited = true;
