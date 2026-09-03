@@ -1,0 +1,13 @@
+case,rep,ms
+npm-install,1,7690
+npm-install,2,7414
+npm-install,3,7511
+yarn-install,1,6530
+yarn-install,2,6027
+yarn-install,3,5839
+copy-tree,1,2431
+copy-tree,2,2891
+copy-tree,3,2377
+rm-rf,1,322
+rm-rf,2,324
+rm-rf,3,341

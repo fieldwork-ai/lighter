@@ -1,0 +1,7 @@
+case,rep,ms
+npm-install,1,8895
+npm-install,2,8723
+pnpm-install,1,7254
+pnpm-install,2,5641
+yarn-install,1,6706
+yarn-install,2,6498

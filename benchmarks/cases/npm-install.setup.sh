@@ -5,3 +5,7 @@
 set -eu
 cp "$WORK"/fixture/* "$WORK/npm/"
 rm -rf "$WORK/npm/node_modules"
+
+# The setup is not the measurement: whatever it queued lands before the
+# clock starts, on every runtime alike.
+sync

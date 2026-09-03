@@ -4,3 +4,7 @@
 set -eu
 rm -rf "$WORK/npm/doomed"
 cp -a "$WORK/npm/node_modules" "$WORK/npm/doomed"
+
+# The setup is not the measurement: whatever it queued lands before the
+# clock starts, on every runtime alike.
+sync
