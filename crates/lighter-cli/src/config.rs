@@ -65,7 +65,22 @@ impl Config {
     }
 }
 
-fn num_cpus() -> u32 {
+/// How long an idle vCPU may spin for a wakeup before it sleeps, in
+/// nanoseconds (guest patch 0011's `idle.poll_ns`).
+///
+/// The spin is what makes a cross-vCPU wakeup a cache line instead of an
+/// interrupt and a host scheduler round trip — most of an install's wall
+/// time on the guest's own disk. It costs a host core while it lasts, and
+/// on a Mac whose every core is a vCPU that core is the one the share's
+/// server needed: on an eight-core M1 with eight vCPUs a pnpm install
+/// through the share took 6.4–7.1 s at 200 µs and 5.3–6.4 at 50, with the
+/// own-disk installs unchanged. Where the vCPUs leave cores free the longer
+/// window is free too.
+pub fn idle_poll_ns(cpus: u32) -> u32 {
+    if cpus >= num_cpus() { 50_000 } else { 200_000 }
+}
+
+pub fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(4)

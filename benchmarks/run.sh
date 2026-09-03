@@ -342,6 +342,15 @@ bench_disk_gib() {
 	[ -n "$gib" ] && [ "$gib" -gt 64 ] 2>/dev/null && echo "$gib" || echo 64
 }
 
+# The guest's idle poll window, as the product sets it (`config::idle_poll_ns`):
+# 50 µs where the vCPUs fill the Mac's cores, 200 where cores are left for
+# the share's server. Last on the command line wins, so LIGHTER_CMDLINE_EXTRA
+# can still override it.
+bench_idle_poll_ns() {
+	local cores; cores="$(sysctl -n hw.ncpu)"
+	if [ "${BENCH_CPUS:-8}" -ge "$cores" ]; then echo 50000; else echo 200000; fi
+}
+
 bench_memory_mib() {
 	if [ -n "${BENCH_MEMORY_MIB:-}" ]; then echo "$BENCH_MEMORY_MIB"; return; fi
 	# OrbStack's configured limit, which is what its guest boots with. Asking
@@ -405,7 +414,7 @@ setup_lighter() {
 		--vsock "$RUN_DIR/control.sock:2376" \
 		--share "bench:$WORK" \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
