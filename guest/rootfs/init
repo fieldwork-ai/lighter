@@ -165,7 +165,7 @@ if [ -b "$DATA_DEV" ]; then
 		# that costs nothing on an idle machine and a deleted image is back
 		# with macOS within minutes rather than at the next reboot.
 		T0=$(cut -d' ' -f1 /proc/uptime)
-		fstrim /mnt/data >/dev/null 2>&1
+		fstrim /mnt/data >/dev/null 2>&1 || true
 		T1=$(cut -d' ' -f1 /proc/uptime)
 		echo "INIT fstrim=$(echo "$T1 $T0" | awk '{printf "%dms", ($1-$2)*1000}')"
 		# `lighter.fstrim_period=` (seconds; 0 disables the loop) is for

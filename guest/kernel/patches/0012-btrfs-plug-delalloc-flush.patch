@@ -1,0 +1,43 @@
+btrfs: plug the delalloc flush
+
+A reclaim flush (`btrfs_start_delalloc_roots`, run when a metadata
+reservation tickets) writes each dirty inode in turn with
+`filemap_fdatawrite_wbc`, and nothing plugs the loop, so every small file
+of a tree being copied is submitted as its own request the moment its
+pages are written: a 1 GB copy of 75,000 files flushed this way costs
+65,000 block requests where the background flusher, which plugs, writes
+the same bytes in 8,000. The files of a copy sit next to each other on
+disk, so plugged, consecutive inodes merge.
+
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8814,12 +8814,21 @@
+ 				 bool in_reclaim_context)
+ {
+ 	struct btrfs_delalloc_work *work, *next;
++	struct blk_plug plug;
+ 	LIST_HEAD(works);
+ 	LIST_HEAD(splice);
+ 	int ret = 0;
+ 	bool full_flush = wbc->nr_to_write == LONG_MAX;
+ 
+ 	mutex_lock(&root->delalloc_mutex);
++	/*
++	 * A reclaim flush writes one small file per inode here, and the files
++	 * of a tree being copied sit next to each other on disk. Plugged, the
++	 * bios of consecutive inodes merge into requests the size the
++	 * background flusher submits; unplugged, every file is its own
++	 * request and its own completion.
++	 */
++	blk_start_plug(&plug);
+ 	spin_lock(&root->delalloc_lock);
+ 	list_splice_init(&root->delalloc_inodes, &splice);
+ 	while (!list_empty(&splice)) {
+@@ -8876,6 +8885,7 @@
+ 		list_splice_tail(&splice, &root->delalloc_inodes);
+ 		spin_unlock(&root->delalloc_lock);
+ 	}
++	blk_finish_plug(&plug);
+ 	mutex_unlock(&root->delalloc_mutex);
+ 	return ret;
+ }

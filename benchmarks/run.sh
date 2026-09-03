@@ -331,6 +331,17 @@ run_case_container() {
 # installed: a copy of a tree that fits under one guest's writeback threshold
 # and not the other's is a comparison of memory sizes, not of runtimes.
 # `BENCH_MEMORY_MIB` overrides; without OrbStack the default is 8 GiB.
+# The guest's disk is sized as the product sizes it: what the Mac has free,
+# never under 64 GiB. It is sparse, so the number is a ceiling, but btrfs
+# reads it: with 32 GiB a copy of a package tree ticketed its metadata
+# reservations and was flushed file by file mid-copy, 1.6 s where 64 GiB
+# copied in 1.1 and OrbStack's 320 GB guest disk in 1.05.
+bench_disk_gib() {
+	if [ -n "${BENCH_DISK_GIB:-}" ]; then echo "$BENCH_DISK_GIB"; return; fi
+	local gib; gib="$(df -g "$HOME" | awk 'NR == 2 { print $4 }')"
+	[ -n "$gib" ] && [ "$gib" -gt 64 ] 2>/dev/null && echo "$gib" || echo 64
+}
+
 bench_memory_mib() {
 	if [ -n "${BENCH_MEMORY_MIB:-}" ]; then echo "$BENCH_MEMORY_MIB"; return; fi
 	# OrbStack's configured limit, which is what its guest boots with. Asking
@@ -388,7 +399,7 @@ setup_lighter() {
 	"$BIN" \
 		--kernel "$KERNEL" \
 		--disk "$ROOTFS" \
-		--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
+		--disk "$RUN_DIR/data.img" --disk-size-gib "$(bench_disk_gib)" \
 		--net "$GVPROXY" --run-dir "$RUN_DIR" \
 		--vsock "$SOCKET:2375" \
 		--vsock "$RUN_DIR/control.sock:2376" \

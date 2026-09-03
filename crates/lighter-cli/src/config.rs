@@ -13,7 +13,10 @@ pub struct Config {
     pub cpus: u32,
     pub memory_mib: u64,
     /// Logical size of the disk Docker's images and volumes live on. Sparse, so
-    /// this is a ceiling rather than a cost.
+    /// this is a ceiling rather than a cost — and the ceiling matters to the
+    /// filesystem inside it: btrfs lends a writer metadata against the space
+    /// it has not allocated yet, and a small disk makes it flush a large copy
+    /// mid-copy, file by file (see `Disk` in the architecture doc).
     pub disk_gib: u64,
     /// Directories from the Mac the guest can see, at the same paths.
     pub shares: Vec<String>,
@@ -31,7 +34,11 @@ impl Default for Config {
             // not use — see the balloon — so this is a ceiling and not a
             // reservation, and being generous costs nothing when idle.
             memory_mib: (physical_memory_mib() / 4).clamp(2048, 16384),
-            disk_gib: 64,
+            // What the Mac has free when the machine is made, which is what
+            // a sparse image could ever hold anyway, and is what OrbStack
+            // gives its guest. Never less than 64 GiB: the image is sparse,
+            // and a low ceiling is the only way to make btrfs slow.
+            disk_gib: free_disk_gib().max(64),
             shares: vec![home_directory()],
         }
     }
@@ -82,6 +89,20 @@ fn physical_memory_mib() -> u64 {
     } else {
         8192
     }
+}
+
+/// Free space on the volume the machine's image lives on, in GiB.
+fn free_disk_gib() -> u64 {
+    let home = home_directory();
+    let Ok(path) = std::ffi::CString::new(home) else {
+        return 0;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and an out-parameter of the right type.
+    if unsafe { libc::statfs(path.as_ptr(), &mut st) } != 0 {
+        return 0;
+    }
+    (st.f_bavail as u64).saturating_mul(st.f_bsize as u64) >> 30
 }
 
 fn home_directory() -> String {

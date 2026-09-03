@@ -287,15 +287,23 @@ impl Disk {
             ));
         }
         self.check_range(offset, len)?;
-        if len == 0 {
+        // APFS punches whole filesystem blocks and refuses anything else with
+        // EINVAL, and the guest's discards are in sectors: fstrim on a large
+        // device sends one of 2 GiB less a sector. A discard is advice, so
+        // the unaligned edges are simply kept and the aligned interior is
+        // what gets punched.
+        const BLOCK: u64 = 4096;
+        let start = offset.div_ceil(BLOCK) * BLOCK;
+        let end = (offset + len) / BLOCK * BLOCK;
+        if end <= start {
             return Ok(());
         }
 
         let arg = FPunchhole {
             fp_flags: 0,
             reserved: 0,
-            fp_offset: offset as libc::off_t,
-            fp_length: len as libc::off_t,
+            fp_offset: start as libc::off_t,
+            fp_length: (end - start) as libc::off_t,
         };
         // SAFETY: a valid descriptor and a correctly-shaped fpunchhole_t that
         // outlives the call.
