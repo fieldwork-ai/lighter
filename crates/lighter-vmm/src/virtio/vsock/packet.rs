@@ -143,6 +143,22 @@ impl Packet {
         })
     }
 
+    /// The header alone, for a writer that places the payload itself.
+    pub fn header_bytes(&self) -> [u8; HDR_LEN] {
+        let mut out = [0u8; HDR_LEN];
+        out[0..8].copy_from_slice(&self.src_cid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.dst_cid.to_le_bytes());
+        out[16..20].copy_from_slice(&self.src_port.to_le_bytes());
+        out[20..24].copy_from_slice(&self.dst_port.to_le_bytes());
+        out[24..28].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        out[28..30].copy_from_slice(&TYPE_STREAM.to_le_bytes());
+        out[30..32].copy_from_slice(&(self.op as u16).to_le_bytes());
+        out[32..36].copy_from_slice(&self.flags.to_le_bytes());
+        out[36..40].copy_from_slice(&self.buf_alloc.to_le_bytes());
+        out[40..44].copy_from_slice(&self.fwd_cnt.to_le_bytes());
+        out
+    }
+
     /// Serializes the packet for the guest's receive queue.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = vec![0u8; HDR_LEN + self.payload.len()];

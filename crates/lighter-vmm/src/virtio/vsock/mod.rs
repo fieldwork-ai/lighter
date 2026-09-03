@@ -578,17 +578,38 @@ impl Vsock {
                 inner.outbox.push_front(rest);
             }
 
-            let bytes = packet.to_bytes();
+            // Header, then payload, straight from where they are into the
+            // guest's buffers: assembling them into one Vec first was a
+            // second copy of every byte that reached the guest.
+            let header = packet.header_bytes();
+            let total = HDR_LEN + packet.payload.len();
             let mut offset = 0usize;
             for desc in writable {
-                if offset >= bytes.len() {
+                if offset >= total {
                     break;
                 }
-                let take = (desc.len as usize).min(bytes.len() - offset);
-                if mem.write(desc.addr, &bytes[offset..offset + take]).is_err() {
-                    break;
+                let mut at = desc.addr;
+                let mut room = desc.len as usize;
+                if offset < HDR_LEN {
+                    let take = room.min(HDR_LEN - offset);
+                    if mem.write(at, &header[offset..offset + take]).is_err() {
+                        break;
+                    }
+                    offset += take;
+                    at += take as u64;
+                    room -= take;
                 }
-                offset += take;
+                if room > 0 && offset >= HDR_LEN && offset < total {
+                    let start = offset - HDR_LEN;
+                    let take = room.min(total - offset);
+                    if mem
+                        .write(at, &packet.payload[start..start + take])
+                        .is_err()
+                    {
+                        break;
+                    }
+                    offset += take;
+                }
             }
 
             queue.push_used(mem, head, offset as u32);
