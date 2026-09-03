@@ -107,7 +107,7 @@ fn main() -> std::process::ExitCode {
 ///
 /// What remains is what OrbStack's footprint shows: back at two gigabytes
 /// within a quarter minute of an install ending. Once the containers have
-/// been idle for half a minute the cache is trimmed to a quarter of RAM,
+/// been idle ten seconds the cache is trimmed to a sixteenth of RAM,
 /// coldest pages first (`memory.reclaim`), and free page reporting hands
 /// the freed memory back. Idle is the containers' own CPU from their
 /// cgroup, not the guest's — a guest installing against the share is three
@@ -126,7 +126,7 @@ fn bound_container_cache() {
         })
         .map(|kb| kb * 1024);
     let Some(total) = total else { return };
-    let resting = total / 4;
+    let resting = total / 16;
     let cgroup = "/sys/fs/cgroup/docker";
     let mut idle_for = 0u32;
     let mut last = container_cpu_usec(cgroup);
