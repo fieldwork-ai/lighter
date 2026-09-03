@@ -100,6 +100,11 @@ pub fn gvproxy() -> anyhow::Result<PathBuf> {
     {
         return Ok(beside);
     }
+    if let Some(libexec) = exe.parent().map(|dir| dir.join("../libexec/gvproxy"))
+        && libexec.exists()
+    {
+        return Ok(libexec);
+    }
     let repo = exe
         .ancestors()
         .find(|dir| dir.join("vendor/gvproxy").exists())

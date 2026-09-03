@@ -23,6 +23,9 @@ initramfs*.cpio*
 # The gvproxy sidecar, fetched by scripts/fetch-gvproxy.sh rather than vendored.
 vendor/
 
+# Release archives
+/dist/
+
 # Gate and build logs. Every gate writes here, so this is a directory rule
 # rather than a list of filenames that the next gate would immediately outgrow.
 .logs/

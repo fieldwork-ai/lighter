@@ -32,12 +32,13 @@ class Lighter < Formula
   end
 
   def post_install
-    # Ad-hoc, with the entitlement. Homebrew installs files unsigned, and a
-    # binary without this cannot ask for a hypervisor at all.
-    system "/usr/bin/codesign", "--force", "--sign", "-",
-           "--entitlements", share/"lighter/entitlements.plist",
-           "--options", "runtime",
-           bin/"lighter"
+    # Verify the signature; if unsigned or stripped, sign ad-hoc with the hypervisor entitlement.
+    unless quiet_system("/usr/bin/codesign", "--verify", bin/"lighter")
+      system "/usr/bin/codesign", "--force", "--sign", "-",
+             "--entitlements", share/"lighter/entitlements.plist",
+             "--options", "runtime",
+             bin/"lighter"
+    end
   end
 
   def caveats
