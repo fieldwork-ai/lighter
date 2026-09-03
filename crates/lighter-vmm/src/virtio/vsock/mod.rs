@@ -83,7 +83,12 @@ struct Conn {
     /// It needs no size limit of its own: the guest may only send what our
     /// advertised credit allows, and credit advances only as the writer thread
     /// drains this. The protocol is the bound.
-    outbound: VecDeque<u8>,
+    ///
+    /// Payloads are kept whole, moved in and moved out. The first version
+    /// was a deque of bytes and pushed each packet's payload into it one
+    /// byte at a time, on the vCPU thread, under both locks: 64 KiB of
+    /// `push_back` per packet, which was the whole of a 7 Gbit/s ceiling.
+    outbound: VecDeque<Vec<u8>>,
     /// The guest has half-closed: it will send nothing further, but it is still
     /// willing to receive. The host is owed an EOF once `outbound` drains.
     guest_done: bool,
@@ -318,7 +323,7 @@ impl VsockShared {
     ///
     /// Returns `None` once the connection is gone. Blocks while the connection
     /// is alive and has nothing pending, so the writer thread does not spin.
-    fn take_outbound(&self, host_port: u32) -> Option<Vec<u8>> {
+    fn take_outbound(&self, host_port: u32) -> Option<Vec<Vec<u8>>> {
         let mut inner = self.lock();
         loop {
             let conn = inner.conns.get_mut(&host_port)?;
@@ -448,7 +453,7 @@ impl Vsock {
                 // advanced here — the bytes are not with the host application
                 // yet, and claiming they are would invite the guest to send
                 // more than we can hold.
-                conn.outbound.extend(packet.payload.iter().copied());
+                conn.outbound.push_back(packet.payload);
             }
 
             Op::CreditRequest => {
@@ -682,13 +687,14 @@ pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
         std::thread::Builder::new()
             .name("vsock-write".into())
             .spawn(move || {
-                while let Some(data) = shared.take_outbound(host_port) {
-                    if socket.write_all(&data).is_err() {
+                while let Some(chunks) = shared.take_outbound(host_port) {
+                    if write_all_chunks(&mut socket, &chunks).is_err() {
                         break;
                     }
                     // Only now are the bytes the host application's, so only
                     // now may the guest be told it has room for more.
-                    shared.acknowledge(host_port, data.len() as u32);
+                    let bytes: usize = chunks.iter().map(Vec::len).sum();
+                    shared.acknowledge(host_port, bytes as u32);
                 }
                 let _ = socket.flush();
                 // The guest will send no more, so the host peer is owed an
@@ -736,9 +742,29 @@ pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
     }
 }
 
+/// One vectored write per batch, completed across partial writes.
+fn write_all_chunks(socket: &mut UnixStream, chunks: &[Vec<u8>]) -> std::io::Result<()> {
+    let mut slices: Vec<std::io::IoSlice<'_>> =
+        chunks.iter().map(|c| std::io::IoSlice::new(c)).collect();
+    let mut slices: &mut [std::io::IoSlice<'_>] = &mut slices;
+    while !slices.is_empty() {
+        match socket.write_vectored(slices) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => std::io::IoSlice::advance_slices(&mut slices, n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flat(chunks: Option<Vec<Vec<u8>>>) -> Option<Vec<u8>> {
+        chunks.map(|c| c.concat())
+    }
 
     fn shared_with_connection() -> (Arc<VsockShared>, u32, UnixStream) {
         let shared = Arc::new(VsockShared::new());
@@ -834,7 +860,7 @@ mod tests {
         drop(inner);
 
         // Buffered data first — a half-close must not discard it.
-        assert_eq!(shared.take_outbound(port).as_deref(), Some(&b"tail"[..]));
+        assert_eq!(flat(shared.take_outbound(port)).as_deref(), Some(&b"tail"[..]));
         assert_eq!(shared.take_outbound(port), None, "then end of stream");
     }
 
@@ -861,7 +887,7 @@ mod tests {
         Vsock::handle(&mut inner, data);
 
         assert_eq!(
-            inner.conns[&port].outbound.len(),
+            inner.conns[&port].outbound.iter().map(Vec::len).sum::<usize>(),
             5,
             "the payload should be queued for the writer thread"
         );
@@ -905,7 +931,7 @@ mod tests {
         Vsock::handle(&mut inner, data);
         drop(inner);
 
-        assert_eq!(shared.take_outbound(port).as_deref(), Some(&b"hello"[..]));
+        assert_eq!(flat(shared.take_outbound(port)).as_deref(), Some(&b"hello"[..]));
     }
 
     #[test]
