@@ -52,7 +52,7 @@ Two things about the transport are not obvious from the specification. The inter
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and ten patches, on the 6.18 longterm line; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and eleven patches, on the 6.18 longterm line; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
 The kernel patches are the interesting part:
 
@@ -70,7 +70,9 @@ The kernel patches are the interesting part:
 
 - **Not flushing a copy while it is still being written.** btrfs reserves metadata for every file with dirty data, at a worst case of a quarter megabyte each, and a package tree is seventy-five thousand small files. Two upstream mechanisms take that sum as a shortage: preemptive reclaim, which starts flushing delayed allocation once the reservations dirty data holds pass 128 MB, and the ticketed reclaim behind it, which lets a reservation borrow only an eighth of the unallocated device before it queues a flush and blocks the writer. Both were writing the copy back one bio per file while `cp` was still producing it, with the flush's workers waking each other across every idle CPU: 2.9 s of system time for a 1 GB copy. Preemptive reclaim is off (`btrfs.preemptive_reclaim`) and a flushing reservation may borrow half the device (`btrfs.overcommit_shift`, 1), so the dirty flusher writes the copy in bulk after the fact — 47,000 writes become 8,600, and the copy takes 1.1 s where OrbStack's takes 1.05–1.3. On-demand reclaim when a reservation really fails is untouched.
 
-The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All ten are in `guest/kernel/patches/`.
+- **Polling before WFI.** On hardware WFI is free to leave and an IPI wakes a core in under a microsecond; under a hypervisor WFI parks the host thread, and waking it costs the sender a trap and the receiver a scheduler round trip on the host. `perf bench sched pipe` between two vCPUs measured it: 19 µs a round trip in this guest against 1.4 with both ends on one vCPU, and 1.2 in OrbStack's guest across any two — a package installer's thread pool pays that on every handoff, which is how an install could match OrbStack's CPU time and lose on wall time. An idle core now spins for a bounded window first, with `TIF_POLLING_NRFLAG` defined for arm64 so a waker writes `TIF_NEED_RESCHED` and sends no interrupt; the window adapts per CPU as the haltpoll governor's does, so a guest that is really idle stops spinning within a few rounds and costs the host nothing (its VMM is charged 6 ms a second). Two vCPUs: 2.9 µs. On the M5's own disk: npm 8.3 s → 5.1 (OrbStack 7.2), pnpm 2.4 → 1.45 (2.1), yarn 5.8 → 4.5 (5.1). Upstream has no arm64 haltpoll in 6.18 or 7.0; this is the part of that series that matters here, in the arch idle entry, because the guest has no cpuidle driver and needs none.
+
+The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All eleven are in `guest/kernel/patches/`.
 
 ## The guest decides how much the host remembers
 

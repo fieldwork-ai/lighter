@@ -1,0 +1,151 @@
+arm64: poll before WFI in a guest
+
+On hardware WFI is free to leave and an IPI wakes a core in under a
+microsecond. Under a hypervisor WFI parks the host thread, and waking it
+again costs the sender a trap to inject the interrupt and the receiver a
+scheduler round trip on the host. Measured with `perf bench sched pipe`
+pinned to two vCPUs in this guest: 19 µs a round trip, against 1.4 µs
+with both ends on one vCPU — and OrbStack's guest does the two-vCPU trip
+in 1.2 µs, with its host idle. Every cross-CPU wakeup of an installer's
+thread pool paid that, which is where a package install's wall time went
+while its CPU time matched.
+
+So an idle core first spins for a bounded time with TIF_POLLING_NRFLAG
+set, which arm64 did not define: the scheduler's `set_nr_if_polling` then
+wakes it by writing TIF_NEED_RESCHED and sends no IPI at all. The window
+adapts per CPU as the haltpoll governor's does (grow when a wakeup follows
+soon after giving up, halve after a long sleep), capped at
+`idle.poll_ns` (200 µs, 0 disables), so a really idle guest stops
+spinning within a few rounds. The upstream arm64 haltpoll series is not in
+6.18 or 7.0; this is the part of it that matters here, in the arch idle
+entry rather than a cpuidle driver, because the guest has no cpuidle
+driver and needs none.
+
+--- a/arch/arm64/include/asm/thread_info.h
++++ b/arch/arm64/include/asm/thread_info.h
+@@ -71,6 +71,7 @@
+ #define TIF_SECCOMP		11	/* syscall secure computing */
+ #define TIF_SYSCALL_EMU		12	/* syscall emulation active */
+ #define TIF_PATCH_PENDING	13	/* pending live patching update */
++#define TIF_POLLING_NRFLAG	14	/* idle is polling for TIF_NEED_RESCHED */
+ #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
+ #define TIF_FREEZE		19
+ #define TIF_RESTORE_SIGMASK	20
+@@ -98,6 +99,7 @@
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+ #define _TIF_SYSCALL_EMU	(1 << TIF_SYSCALL_EMU)
+ #define _TIF_PATCH_PENDING	(1 << TIF_PATCH_PENDING)
++#define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_UPROBE		(1 << TIF_UPROBE)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
+ #define _TIF_32BIT		(1 << TIF_32BIT)
+--- a/arch/arm64/kernel/idle.c
++++ b/arch/arm64/kernel/idle.c
+@@ -5,6 +5,11 @@
+ 
+ #include <linux/cpu.h>
+ #include <linux/irqflags.h>
++#include <linux/minmax.h>
++#include <linux/moduleparam.h>
++#include <linux/percpu.h>
++#include <linux/sched/clock.h>
++#include <linux/sched/idle.h>
+ 
+ #include <asm/barrier.h>
+ #include <asm/cpuidle.h>
+@@ -33,13 +38,95 @@
+ }
+ 
+ /*
++ * Polling before WFI, for a guest.
++ *
++ * On hardware WFI is free to leave and an IPI wakes a core in under a
++ * microsecond. Under a hypervisor WFI parks the host thread, and waking it
++ * again costs the sender a trap to inject the interrupt and the receiver a
++ * scheduler round trip on the host: fifteen to twenty microseconds a wakeup,
++ * paid on every cross-CPU wakeup of a thread pool. So a core that goes idle
++ * first spins for a bounded time with TIF_POLLING_NRFLAG set, in which case
++ * a waker only writes TIF_NEED_RESCHED and sends nothing, and the wakeup is a
++ * cache line rather than a trap.
++ *
++ * How long to spin adapts per CPU the way the haltpoll governor does: a
++ * wakeup that arrives soon after the CPU gave up polling doubles the window,
++ * a long sleep halves it, so a machine that is really idle stops spinning
++ * within a few rounds and costs the host nothing.
++ */
++static unsigned int idle_poll_ns = 200000;
++module_param_named(poll_ns, idle_poll_ns, uint, 0644);
++static unsigned int idle_poll_grow_start_ns = 50000;
++module_param_named(poll_grow_start_ns, idle_poll_grow_start_ns, uint, 0644);
++
++static DEFINE_PER_CPU(u32, idle_poll_limit_ns);
++
++static void __cpuidle idle_poll_adjust(u64 block_ns)
++{
++	u32 limit = __this_cpu_read(idle_poll_limit_ns);
++
++	if (block_ns <= idle_poll_ns) {
++		if (limit < idle_poll_grow_start_ns)
++			limit = idle_poll_grow_start_ns;
++		else
++			limit = min_t(u64, (u64)limit * 2, idle_poll_ns);
++	} else {
++		limit /= 2;
++	}
++	__this_cpu_write(idle_poll_limit_ns, limit);
++}
++
++/* Returns true if a wakeup arrived while polling, so WFI is not needed. */
++static bool __cpuidle idle_poll(u64 *start)
++{
++	u32 limit = __this_cpu_read(idle_poll_limit_ns);
++	bool woke = false;
++
++	*start = local_clock_noinstr();
++	if (!limit)
++		return false;
++
++	raw_local_irq_enable();
++	if (!current_set_polling_and_test()) {
++		unsigned int count = 0;
++
++		while (!need_resched()) {
++			cpu_relax();
++			if (count++ < 200)
++				continue;
++			count = 0;
++			if (local_clock_noinstr() - *start > limit)
++				goto out;
++		}
++		woke = true;
++	}
++out:
++	current_clr_polling();
++	raw_local_irq_disable();
++	return woke;
++}
++
++/*
+  * This is our default idle handler.
+  */
+ void __cpuidle arch_cpu_idle(void)
+ {
++	u64 start;
++
++	if (!idle_poll_ns) {
++		cpu_do_idle();
++		return;
++	}
++
++	if (idle_poll(&start)) {
++		idle_poll_adjust(local_clock_noinstr() - start);
++		return;
++	}
++
+ 	/*
+ 	 * This should do all the clock switching and wait for interrupt
+ 	 * tricks
+ 	 */
+ 	cpu_do_idle();
++	idle_poll_adjust(local_clock_noinstr() - start);
+ }
