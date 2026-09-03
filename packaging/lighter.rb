@@ -13,7 +13,7 @@ class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
   url "https://github.com/fieldwork-ai/lighter/releases/download/v0.1.0/lighter-0.1.0-arm64.tar.gz"
-  sha256 "063d3b39d28bf97778984cdd4c63280d6fc81faa3e35c071fccdc2173285a761"
+  sha256 "79505ffeeb3c41ee4f56a7bb9f4094d5db896150730f310d0ace0cbb1325429e"
   license "MIT"
 
   # Apple Silicon only, and not by omission: there is no Intel path and there
