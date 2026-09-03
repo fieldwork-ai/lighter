@@ -31,7 +31,7 @@ cd "$ROOT"
 TARGET=""
 LABEL=""
 REPS=3
-CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency"
+CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency memory"
 # Cases that read a package tree rather than making one. They run after the
 # installs, on a tree materialized once by npm — which installer produced it
 # changes what they see, and pnpm in particular builds a farm of symlinks.
@@ -505,8 +505,60 @@ case " $CASES " in
 	;;
 esac
 
+# What the runtime costs the Mac, as Activity Monitor accounts it: the
+# physical footprint of the runtime's own processes, in MiB, summed. Four
+# readings: settled before an install, the peak through one (sampled every
+# second), and fifteen and sixty seconds after it ends with nothing running
+# — the last two being what a runtime gives back on its own. The footprint
+# of a Hypervisor.framework guest reads high (a 2 GiB guest that had touched
+# all its memory read 3.5 GB), and the same accounting applies to every
+# runtime here, so the figures compare with each other and with what a
+# user sees, not with the guest's size.
+runtime_footprint_mib() {
+	local pids=""
+	case "$TARGET" in
+	lighter)        pids="$VMM_PID" ;;
+	orbstack)       pids="$(pgrep -f 'OrbStack' | tr '\n' ' ')" ;;
+	colima)         pids="$(pgrep -f 'limactl|lima-driver|com.apple.Virtualization.VirtualMachine|virtiofsd' | tr '\n' ' ')" ;;
+	docker-desktop) pids="$(pgrep -f 'com.docker' | tr '\n' ' ')" ;;
+	esac
+	local total=0 pid mb
+	for pid in $pids; do
+		mb="$(footprint "$pid" 2>/dev/null | sed -n 's/.*phys_footprint: *\([0-9]*\) MB.*/\1/p' | head -1)"
+		total=$(( total + ${mb:-0} ))
+	done
+	echo "$total"
+}
+
+run_memory_case() {
+	[ "$TARGET" != native ] || return 0
+	printf '==> %s: memory' "$TARGET"
+	sleep 5
+	local settled peak after15 after60 now
+	settled="$(runtime_footprint_mib)"
+	REPS=1 run_case npm-install >/dev/null 2>&1 &
+	local install=$!
+	peak="$settled"
+	while kill -0 "$install" 2>/dev/null; do
+		now="$(runtime_footprint_mib)"
+		[ "$now" -le "$peak" ] || peak="$now"
+		sleep 1
+	done
+	sleep 15; after15="$(runtime_footprint_mib)"
+	sleep 45; after60="$(runtime_footprint_mib)"
+	printf ' settled=%s peak=%s after15s=%s after60s=%s (MiB)\n' "$settled" "$peak" "$after15" "$after60"
+	echo "memory-settled,1,$settled" >> "$RESULTS"
+	echo "memory-peak,1,$peak" >> "$RESULTS"
+	echo "memory-after-15s,1,$after15" >> "$RESULTS"
+	echo "memory-after-60s,1,$after60" >> "$RESULTS"
+}
+
 materialized=0
 for name in $CASES; do
+	if [ "$name" = memory ]; then
+		run_memory_case
+		continue
+	fi
 	# A tree the previous case deleted is a case that measures nothing and
 	# says so in milliseconds. This is not timed.
 	case "$TREE_CASES" in

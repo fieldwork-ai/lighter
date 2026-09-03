@@ -29,6 +29,17 @@ CASES = [
     ("watch-latency", "host change to guest visibility, round trip", "lower is better"),
 ]
 
+# The runtime's cost to the Mac, in MiB rather than milliseconds: the
+# physical footprint of its processes as Activity Monitor accounts it, settled
+# before an install, at the peak through one, and fifteen and sixty seconds
+# after it ends. Reported in their own table; `native` has no runtime.
+MEMORY_CASES = [
+    ("memory-settled", "settled, before an install"),
+    ("memory-peak", "peak through an npm install"),
+    ("memory-after-15s", "15 s after it ends"),
+    ("memory-after-60s", "60 s after it ends"),
+]
+
 # Cases the native ratio says nothing useful about. `watch-latency` is the
 # only one: on the Mac a file is visible the moment it is written, so the
 # reference is nearly zero and every ratio against it is a division by noise —
@@ -185,6 +196,31 @@ def render(results, description, _primary):
             cells.append("—" if value is None else f"{int(value)}")
         lines.append(f"| {case} | " + " | ".join(cells) + " |")
     lines.append("")
+
+    memory_columns = [
+        (name, values)
+        for name, values in columns
+        if name != REFERENCE and any(case in values for case, _ in MEMORY_CASES)
+    ]
+    if memory_columns:
+        lines += [
+            "### What the runtime costs the Mac, MiB",
+            "",
+            "The physical footprint of the runtime's own processes, as Activity Monitor",
+            "accounts it — which reads high for any Hypervisor.framework guest, and the",
+            "same way for every runtime here. Lower is better; the last two columns are",
+            "what a runtime gives back on its own after the work ends.",
+            "",
+            "| reading | " + " | ".join(name for name, _ in memory_columns) + " |",
+            "|" + "---|" * (len(memory_columns) + 1),
+        ]
+        for case, label in MEMORY_CASES:
+            cells = []
+            for _, values in memory_columns:
+                value = values.get(case)
+                cells.append("—" if value is None else f"{int(value)}")
+            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append("")
 
     if reference:
         ratioed = [(name, values) for name, values in columns if name != REFERENCE]

@@ -23,16 +23,16 @@ the same tree into the container; `own disk` is a named volume, the
 runtime's own filesystem inside the VM, where a container's writable layer
 and its data volumes live.
 
-| case | native | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
-|---|---|---|---|---|---|
-| npm-install | 6639 | 6315 | 9093 | 4777 | 7068 |
-| pnpm-install | 4614 | 4725 | 5538 | 1210 | 2040 |
-| yarn-install | 5670 | 5383 | 8384 | 4267 | 5266 |
-| ripgrep | 909 | 84 | 1047 | 91 | 112 |
-| find-walk | 386 | 96 | 519 | 97 | 128 |
-| copy-tree | 14553 | 3312 | 9404 | 955 | 1150 |
-| rm-rf | 4186 | 2585 | 3382 | 386 | 479 |
-| watch-latency | 2 | 3 | 11 | — | — |
+| case | native | lighter (share) | orbstack (share) | colima (share) | lighter (own disk) | orbstack (own disk) |
+|---|---|---|---|---|---|---|
+| npm-install | 6639 | 6315 | 9093 | — | 4777 | 7068 |
+| pnpm-install | 4614 | 4725 | 5538 | — | 1210 | 2040 |
+| yarn-install | 5670 | 5383 | 8384 | — | 4267 | 5266 |
+| ripgrep | 909 | 84 | 1047 | — | 91 | 112 |
+| find-walk | 386 | 96 | 519 | — | 97 | 128 |
+| copy-tree | 14553 | 3312 | 9404 | — | 955 | 1150 |
+| rm-rf | 4186 | 2585 | 3382 | — | 386 | 479 |
+| watch-latency | 2 | 3 | 11 | — | — | — |
 
 ### As a fraction of `native`
 
@@ -42,15 +42,15 @@ outrunning the Mac's. `watch-latency` is left out: it is a latency against
 a reference of about a millisecond, so the ratio is a division by noise —
 read it from the table above in milliseconds.
 
-| case | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
-|---|---|---|---|---|
-| npm-install | 105% | 73% | 139% | 94% |
-| pnpm-install | 98% | 83% | 381% | 226% |
-| yarn-install | 105% | 68% | 133% | 108% |
-| ripgrep | 1082% | 87% | 999% | 812% |
-| find-walk | 402% | 74% | 398% | 302% |
-| copy-tree | 439% | 155% | 1524% | 1265% |
-| rm-rf | 162% | 124% | 1084% | 874% |
+| case | lighter (share) | orbstack (share) | colima (share) | lighter (own disk) | orbstack (own disk) |
+|---|---|---|---|---|---|
+| npm-install | 105% | 73% | — | 139% | 94% |
+| pnpm-install | 98% | 83% | — | 381% | 226% |
+| yarn-install | 105% | 68% | — | 133% | 108% |
+| ripgrep | 1082% | 87% | — | 999% | 812% |
+| find-walk | 402% | 74% | — | 398% | 302% |
+| copy-tree | 439% | 155% | — | 1524% | 1265% |
+| rm-rf | 162% | 124% | — | 1084% | 874% |
 
 ## MacBook Pro (MacBookPro17,1), Apple M1, 8 cores (4P+4E), 8 GB, macOS 26.6.2
 

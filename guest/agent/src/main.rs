@@ -136,7 +136,7 @@ fn bound_container_cache() {
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < 50_000 { idle_for + 1 } else { 0 };
-        if idle_for < 30 {
+        if idle_for < 10 {
             continue;
         }
         let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
