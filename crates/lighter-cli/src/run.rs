@@ -122,14 +122,6 @@ pub fn machine() -> anyhow::Result<()> {
     // with a complaint about a certificate.
     let mut cmdline =
         String::from("console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t");
-    // Free page reporting in 128 KiB blocks rather than the default 2 MiB. A
-    // guest that has churned its cache has its free memory in small pieces,
-    // and at 2 MiB most of it was never reported: a 4 GiB guest with 2.2 GB
-    // free inside still cost the Mac 4.4 GB, and at 128 KiB the same guest
-    // cost 3.1 with 2.7 in use — the host's number within 15% of the
-    // guest's. The host releases a run with one madvise, so the smaller
-    // blocks cost it nothing it notices.
-    cmdline.push_str(" page_reporting.page_reporting_order=5");
     cmdline.push_str(&format!(
         " idle.poll_ns={}",
         crate::config::idle_poll_ns(config.cpus)
