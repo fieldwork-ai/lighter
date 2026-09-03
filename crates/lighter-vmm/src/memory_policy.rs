@@ -71,8 +71,6 @@ const DEFLATE_STEP_BYTES: u64 = 32 << 20;
 /// The steering never asks for more than this share of guest RAM; the
 /// pressure levels may.
 const STEER_CAP_FRACTION: u64 = 8;
-const FLOOR_FRACTION_OF_HOST: u64 = 16;
-const FLOOR_MIN_BYTES: u64 = 512 << 20;
 const POLL: Duration = Duration::from_secs(1);
 
 /// The guest port the agent's control channel listens on.
@@ -122,12 +120,14 @@ impl MemoryPolicy {
                 .name("memory-policy".into())
                 .spawn(move || {
                     let mut last = host.sample();
+                    let mut quiet_for = 0u32;
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(POLL);
                         let Some(now) = host.sample() else { continue };
                         if let Some(then) = last {
                             let compressed = now.compressed.saturating_sub(then.compressed);
-                            steering.steer(compressed, now.free, host.floor_bytes());
+                            quiet_for = if compressed == 0 { quiet_for + 1 } else { 0 };
+                            steering.steer(compressed, quiet_for);
                         }
                         last = Some(now);
                     }
@@ -177,9 +177,9 @@ impl Steering {
         (self.ram_bytes / STEER_CAP_FRACTION / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX)) as u32
     }
 
-    fn steer(&self, compressed: u64, free: u64, floor: u64) {
+    fn steer(&self, compressed: u64, quiet_for: u32) {
         let before = self.steer_pages.load(Ordering::Relaxed);
-        let after = steer(before, compressed, free, floor, self.cap_pages());
+        let after = steer(before, compressed, quiet_for, self.cap_pages());
         if after != before {
             self.steer_pages.store(after, Ordering::Relaxed);
             self.apply();
@@ -215,14 +215,19 @@ impl Steering {
 }
 
 /// The steering rule, as arithmetic: a step up while the host compresses,
-/// a smaller step down once it has stopped and has free memory above the
-/// floor, and nothing in between.
-fn steer(pages: u32, compressed: u64, free: u64, floor: u64, cap: u32) -> u32 {
+/// a smaller step down once it has been quiet for a few seconds, and
+/// nothing in between. Quiet, not free: an 8 GB Mac shows a few hundred
+/// megabytes free at the best of times, and a deflate that waited for more
+/// left the balloon inflated through the install after the big one, which
+/// then paid for the cache it did not have.
+const QUIET_POLLS_BEFORE_DEFLATE: u32 = 5;
+
+fn steer(pages: u32, compressed: u64, quiet_for: u32, cap: u32) -> u32 {
     if compressed >= COMPRESSING_BYTES_PER_POLL {
         pages
             .saturating_add((INFLATE_STEP_BYTES / BALLOON_PAGE_SIZE) as u32)
             .min(cap)
-    } else if compressed == 0 && free > floor {
+    } else if quiet_for >= QUIET_POLLS_BEFORE_DEFLATE {
         pages.saturating_sub((DEFLATE_STEP_BYTES / BALLOON_PAGE_SIZE) as u32)
     } else {
         pages
@@ -254,11 +259,9 @@ impl Observer for Levels {
     }
 }
 
-/// What the host has compressed and what it can hand out, read the way
-/// `vm_stat` reads them.
+/// What the host has compressed, read the way `vm_stat` reads it.
 struct HostMemory {
     page: u64,
-    ram: u64,
 }
 
 #[repr(C)]
@@ -299,25 +302,9 @@ unsafe extern "C" {
 
 impl HostMemory {
     fn new() -> HostMemory {
-        // SAFETY: plain queries with no pointers of ours involved.
+        // SAFETY: a plain query with no pointers of ours involved.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
-        let mut ram: u64 = 0;
-        let mut len = std::mem::size_of::<u64>();
-        // SAFETY: `hw.memsize` is a u64 and the buffer is one.
-        unsafe {
-            libc::sysctlbyname(
-                c"hw.memsize".as_ptr(),
-                (&mut ram as *mut u64).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            );
-        }
-        HostMemory { page, ram }
-    }
-
-    fn floor_bytes(&self) -> u64 {
-        (self.ram / FLOOR_FRACTION_OF_HOST).max(FLOOR_MIN_BYTES)
+        HostMemory { page }
     }
 
     fn sample(&self) -> Option<HostSample> {
@@ -338,20 +325,14 @@ impl HostMemory {
         }
         Some(HostSample {
             compressed: stats.compressions * self.page,
-            free: (u64::from(stats.free_count)
-                + u64::from(stats.speculative_count)
-                + u64::from(stats.purgeable_count))
-                * self.page,
         })
     }
 }
 
-/// One reading: how much the host has compressed since boot, and what it
-/// can hand out without evicting anything.
+/// One reading: how much the host has compressed since boot.
 #[derive(Clone, Copy)]
 struct HostSample {
     compressed: u64,
-    free: u64,
 }
 
 #[cfg(test)]
@@ -381,40 +362,29 @@ mod tests {
     }
 
     /// The steering rule: a step up while compressing, a smaller step down
-    /// when idle with room, and a hold in between; never past the cap or
-    /// below zero.
+    /// once quiet for long enough, and a hold in between; never past the
+    /// cap or below zero.
     #[test]
-    fn steering_steps_up_while_compressing_and_eases_when_idle() {
-        let floor = 512u64 << 20;
-        let cap = ((2u64 << 30) / BALLOON_PAGE_SIZE) as u32;
-        let up = steer(0, 64 << 20, 0, floor, cap);
+    fn steering_steps_up_while_compressing_and_eases_when_quiet() {
+        let cap = ((512u64 << 20) / BALLOON_PAGE_SIZE) as u32;
+        let up = steer(0, 64 << 20, 0, cap);
         assert_eq!(u64::from(up) * BALLOON_PAGE_SIZE, INFLATE_STEP_BYTES);
+        assert_eq!(steer(up, 0, 2, cap), up, "quiet but not for long: held");
         assert_eq!(
-            steer(up, 0, floor / 2, floor, cap),
+            steer(up, 1 << 20, 0, cap),
             up,
-            "idle but no room: held"
+            "a trickle, so no quiet yet: held"
         );
-        assert_eq!(
-            steer(up, 1 << 20, floor * 4, floor, cap),
-            up,
-            "a trickle: held"
-        );
-        let down = steer(up, 0, floor * 4, floor, cap);
+        let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, cap);
         assert_eq!(u64::from(up - down) * BALLOON_PAGE_SIZE, DEFLATE_STEP_BYTES);
-        assert_eq!(
-            steer(cap, 1 << 30, 0, floor, cap),
-            cap,
-            "never past the cap"
-        );
-        assert_eq!(steer(1, 0, floor * 4, floor, cap), 0, "never below zero");
+        assert_eq!(steer(cap, 1 << 30, 0, cap), cap, "never past the cap");
+        assert_eq!(steer(1, 0, 30, cap), 0, "never below zero");
     }
 
     /// The statistics struct is the kernel's, integer for integer.
     #[test]
     fn the_statistics_struct_is_the_kernels_size() {
         assert_eq!(std::mem::size_of::<VmStatistics64>() / 4, 38);
-        let host = HostMemory::new();
-        assert!(host.ram > 0);
-        assert!(host.sample().is_some());
+        assert!(HostMemory::new().sample().is_some());
     }
 }
