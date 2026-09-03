@@ -1397,9 +1397,7 @@ mod tests {
             let lap2 = VIRTQ_DESC_F_USED;
             let complete = |h: &mut Harness, pos: u16, lap: u16| {
                 h.write_packed(pos, DATA, 16, pos, lap);
-                let chain = h.queue.pop(&h.mem).expect("published chain");
-                let id = chain.head();
-                drop(chain);
+                let id = h.queue.pop(&h.mem).expect("published chain").head();
                 h.queue.push_used(&h.mem, id, 0);
             };
             let driver = |h: &Harness, off_wrap: u16, flags: u16| {
@@ -1457,9 +1455,7 @@ mod tests {
             let lap2 = VIRTQ_DESC_F_USED;
             let complete = |h: &mut Harness, pos: u16, lap: u16| {
                 h.write_packed(pos, DATA, 16, pos, lap);
-                let chain = h.queue.pop(&h.mem).expect("published chain");
-                let id = chain.head();
-                drop(chain);
+                let id = h.queue.pop(&h.mem).expect("published chain").head();
                 h.queue.push_used(&h.mem, id, 0);
             };
             let driver = |h: &Harness, off_wrap: u16, flags: u16| {
