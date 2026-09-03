@@ -52,7 +52,7 @@ Two things about the transport are not obvious from the specification. The inter
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and thirteen patches, on the 6.18 longterm line; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and thirteen patches, on the 6.18 longterm line — and the configuration is measured, not inherited: the arm64 defconfig ships full preemption, kernel pointer authentication, a zeroed stack frame on every call, IRQ time accounting and audit, and against OrbStack's kernel in the same container they cost a tenth of every syscall and every tmpfs create; without them the guest is a fifth faster on those and a quarter faster copying a tree on its own disk, ahead of OrbStack on each; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
 The kernel patches are the interesting part:
 
