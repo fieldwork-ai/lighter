@@ -202,14 +202,19 @@ fn jobs_cap() -> usize {
 
 /// How many workers apply jobs: one applies everything in order; the rest
 /// let clones run beside it (see `State::serial_running`). Three, four and
-/// five measured the same on a pnpm install — clone throughput on APFS
-/// stops improving past about three — so three it is.
+/// five once measured the same on a pnpm install, when the guest was the
+/// slower side. With the guest's serial track cut down the queue became
+/// the bound on both machines, and the count was measured again: on the
+/// M5 five beats three (4.0 s against 4.3) and eight loses (5.2); on the
+/// M1 five beats three and four (best rep 5.7 s against 6.6 and 6.1).
+/// Each job takes longer with company — a clone 154 → 240 µs on the M5,
+/// APFS contending — but more of them finish per second.
 fn workers() -> usize {
     std::env::var("LIGHTER_FS_APPLY_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(3)
+        .unwrap_or(5)
 }
 
 /// Below this much free space, acknowledgement stops and service goes back to

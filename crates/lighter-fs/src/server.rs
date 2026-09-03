@@ -361,9 +361,31 @@ fn create_job(
                 }
             }
             Err(errno) => {
+                // Who holds the name on the host, and whether it is one of
+                // ours: the race this reports is between two of the guest's
+                // own writers, and the loser's identity says which path let
+                // it through.
+                let holder = parent
+                    .reference()
+                    .ok()
+                    .and_then(|r| sys::stat_at(r.raw_fd(), &name).ok())
+                    .map(|st| {
+                        let known = registry.identified(st.st_dev as i64, st.st_ino);
+                        format!(
+                            "ino={} size={} nodeid={:?} pending={:?}",
+                            st.st_ino,
+                            st.st_size,
+                            known.as_ref().map(|i| i.id()),
+                            known.as_ref().map(|i| i.is_pending())
+                        )
+                    });
                 tracing::warn!(
                     errno,
                     name = %name.to_string_lossy(),
+                    nodeid,
+                    holder,
+                    gone = parent.name_pending_gone(name.to_bytes()),
+                    promised = ?parent.pending_child(name.to_bytes()),
                     "an acknowledged create failed to apply"
                 );
                 inode.bind_failed(errno);
@@ -1610,7 +1632,13 @@ impl Server {
     /// absence is worth as much as caching the presence. A `nodeid` of zero is
     /// how the protocol spells it; with no validity it is just ENOENT, which
     /// is what an unwatched share falls back to.
-    fn missing(&self, parent: &Inode) -> Result<Vec<u8>, i32> {
+    fn missing(&self, parent: &Inode, name: &std::ffi::CStr) -> Result<Vec<u8>, i32> {
+        if self.stats.enabled() {
+            static SAMPLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAMPLED.fetch_add(1, Ordering::Relaxed) % 4000 == 0 {
+                tracing::warn!(parent = ?self.path(parent).ok(), name = ?name, "ENOENT-SAMPLE");
+            }
+        }
         let valid = self
             .policy
             .validity(parent.dev(), parent.ino(), Answer::Missing);
@@ -1749,11 +1777,11 @@ impl Server {
                     "ENOENT-DEBUG lookup of a name promised gone"
                 );
             }
-            return self.missing(&parent);
+            return self.missing(&parent, &name);
         }
         if parent.is_pending() {
             // A directory that is still a promise holds only promises.
-            return self.missing(&parent);
+            return self.missing(&parent, &name);
         }
         let looked = self.entry(&parent, &name);
         if self.stats.enabled() {
@@ -1778,7 +1806,7 @@ impl Server {
                         "ENOENT-DEBUG lookup miss"
                     );
                 }
-                self.missing(&parent)
+                self.missing(&parent, &name)
             }
             Err(other) => Err(other),
         }
@@ -1964,6 +1992,7 @@ impl Server {
             mode: (valid & fuse::fattr::MODE != 0).then(|| get_u32(body, 68).unwrap_or(0) & 0o7777),
             atime: time(fuse::fattr::ATIME, fuse::fattr::ATIME_NOW, 32, 56),
             mtime: time(fuse::fattr::MTIME, fuse::fattr::MTIME_NOW, 40, 60),
+            landed: false,
         };
         // A chmod to the mode the file already has is a request for nothing,
         // and a package manager makes a great many of them; the syscall it
@@ -2046,6 +2075,9 @@ impl Server {
                         .take_attr_batch(&batch)
                         .unwrap_or_else(|| *batch.lock().expect("attr batch poisoned"));
                     let result = (|| {
+                        if change.landed {
+                            return Ok(());
+                        }
                         let cached = open_cache.file(nodeid, false);
                         let via = match &cached {
                             Some(file) => Via::Raw(file.fd.as_raw_fd()),
@@ -2574,7 +2606,7 @@ impl Server {
         new: &CString,
     ) -> Result<Option<Vec<u8>>, i32> {
         if !self.apply.accepting() || old_parent.name_pending_gone(old.to_bytes()) {
-            return Ok(None);
+            { self.stats.count("rename-none=0"); return Ok(None) };
         }
         let nodeid = match old_parent.pending_child(old.to_bytes()) {
             Some(nodeid) => {
@@ -2610,29 +2642,45 @@ impl Server {
                     }
                     return Ok(Some(Vec::new()));
                 }
+                // Not free: this rename replaces whatever holds the new
+                // name, and the queue orders that — but only among jobs it
+                // holds. A held create of the new name is not in the queue
+                // yet, and materialized later it would land on the file
+                // this rename put there: "an acknowledged create failed to
+                // apply", from two pnpm threads writing the same content
+                // to the same content-hash name. So the holder goes into
+                // the queue first, and the replacement lands after it, as
+                // on any filesystem.
+                if let Some(holder) = new_parent.pending_child(new.to_bytes()) {
+                    self.materialize_why(holder, 7);
+                }
                 self.materialize_why(nodeid, 5);
                 nodeid
             }
             None => {
                 let st = match sys::stat_at(old_parent.reference()?.raw_fd(), old) {
                     Ok(st) => st,
-                    Err(_) => return Ok(None),
+                    Err(_) => { self.stats.count("rename-none=1"); return Ok(None) },
                 };
-                if st.st_mode & 0o170000 != 0o100000 {
-                    return Ok(None);
+                // Files and directories are promised; anything else (a
+                // symlink, a device) takes the synchronous path.
+                if st.st_mode & 0o170000 != 0o100000 && st.st_mode & 0o170000 != 0o040000 {
+                    { self.stats.count("rename-none=2"); return Ok(None) };
                 }
                 match self.registry.identified(st.st_dev as i64, st.st_ino) {
                     Some(inode) => inode.id(),
-                    None => return Ok(None),
+                    None => { self.stats.count("rename-none=3"); return Ok(None) },
                 }
             }
         };
         let Some(inode) = self.registry.get(nodeid) else {
-            return Ok(None);
+            { self.stats.count("rename-none=4"); return Ok(None) };
         };
-        if inode.is_dir {
-            return Ok(None);
-        }
+        // A directory is promised like a file: its children reach it by its
+        // descriptor, which a rename does not disturb, and its held creates
+        // by its inode. Made synchronous, a directory rename settled the
+        // whole backlog first — pnpm renames every package it imports into
+        // place, 1.7 ms each, a second an install.
         // Reached by its new name from here on, whichever path performs the
         // rename; a name that turns out not to be it yet fails its identity
         // check and falls back to a reopen by identity.
@@ -2648,7 +2696,7 @@ impl Server {
         };
         if let Some(displaced) = &displaced {
             if displaced.is_dir {
-                return Ok(None);
+                { self.stats.count("rename-none=6"); return Ok(None) };
             }
             // Not withdrawn: a descriptor the guest holds on the displaced
             // file keeps reading it after the rename, so it must exist.
@@ -2716,6 +2764,8 @@ impl Server {
     }
 
     fn rename(&self, parent: u64, body: &[u8], two: bool) -> Result<Vec<u8>, i32> {
+        let t0 = std::time::Instant::now();
+        let phase = |k: &str, t: std::time::Instant| self.stats.add(k, t.elapsed().as_micros() as u64);
         let old_parent = self.directory(parent)?;
         let newdir = self.resolve(get_u64(body, 0).ok_or(linux::EINVAL)?);
         let (flags, names) = if two {
@@ -2733,11 +2783,19 @@ impl Server {
         let new = self.checked_name(new)?;
         self.settle_while(&old_parent, |parent| parent.is_pending());
         self.settle_while(&new_parent, |parent| parent.is_pending());
+        phase("rename-us-1-parents", t0);
+        let t1 = std::time::Instant::now();
         if flags == 0
             && let Some(reply) = self.rename_pending(&old_parent, &old, &new_parent, &new)?
         {
+            phase("rename-us-2-promised", t1);
+            phase("rename-us-total", t0);
+            self.stats.count("rename=promised");
             return Ok(reply);
         }
+        phase("rename-us-2-nopromise", t1);
+        let t2 = std::time::Instant::now();
+        self.stats.count("rename=sync");
         self.settle_while(&old_parent, |parent| {
             parent.pending_child(old.to_bytes()).is_some()
                 || parent.name_pending_gone(old.to_bytes())
@@ -2746,6 +2804,8 @@ impl Server {
             parent.pending_child(new.to_bytes()).is_some()
                 || parent.name_pending_gone(new.to_bytes())
         });
+        phase("rename-us-3-settle-names", t2);
+        let t3 = std::time::Instant::now();
         sys::rename_at(
             old_parent.reference()?.raw_fd(),
             &old,
@@ -2753,6 +2813,8 @@ impl Server {
             &new,
             flags,
         )?;
+        phase("rename-us-4-host", t3);
+        phase("rename-us-total", t0);
         Ok(Vec::new())
     }
 
@@ -3103,30 +3165,41 @@ impl Server {
         // need no waiting for, because the clone joins the same queue behind
         // them and lands after they do.
         self.settle_while(&source, |source| source.is_pending());
-        let source_path = self.path(&source)?;
         phase("clone-us-1-resolve-settle-path", t0);
         let t1 = std::time::Instant::now();
         // The source by descriptor: the one a recent write left in the open
         // cache, else the inode's own. The clone then names no path for it.
+        // The source by descriptor when one is to hand — a recent write's in
+        // the open cache, else the inode's own — and otherwise by its
+        // parent's descriptor and its name. The third is the stock-Mac case:
+        // past the descriptor budget the store is parked, and reviving a
+        // parked file just to fstat it was a reopen by path on the serial
+        // track, four seconds of a seven-second install on an M1. By name
+        // the stat is one syscall, and the job opens the source itself, on
+        // a worker.
         enum Source {
             Cached(std::sync::Arc<OpenFile>),
             Held(crate::inode::Reference),
+            At(crate::inode::Reference, CString),
         }
-        impl Source {
-            fn raw_fd(&self) -> std::os::fd::RawFd {
-                match self {
-                    Source::Cached(file) => file.fd.as_raw_fd(),
-                    Source::Held(reference) => reference.raw_fd(),
-                }
-            }
-        }
-        // A write-only descriptor cannot be cloned from (EBADF); the
-        // event-only reference can, and costs no open.
         let source_fd = match self.open_cache.file(nodeid_in, false) {
             Some(file) if file.readable => Source::Cached(file),
-            _ => Source::Held(source.reference()?),
+            _ => match source.locate()? {
+                crate::inode::Located::Fd(reference) => Source::Held(reference),
+                crate::inode::Located::At(parent_ref, name) => Source::At(parent_ref, name),
+            },
         };
-        let st = sys::stat_fd(source_fd.raw_fd())?;
+        let st = match &source_fd {
+            Source::Cached(file) => sys::stat_fd(file.fd.as_raw_fd())?,
+            Source::Held(reference) => sys::stat_fd(reference.raw_fd())?,
+            Source::At(parent_ref, name) => sys::stat_at(parent_ref.raw_fd(), name)?,
+        };
+        // The path is only for cloning from a descriptor the kernel refuses
+        // (an event-only reference), and only that case pays for it.
+        let source_path = match &source_fd {
+            Source::Held(_) => Some(self.path(&source)?),
+            _ => None,
+        };
         let size = source.overlay_size(st.st_size as u64);
         let mode = st.st_mode as u32;
         phase("clone-us-2-fd-stat", t1);
@@ -3138,6 +3211,10 @@ impl Server {
                 ".lighter-clone-{}",
                 std::process::id() as u64 ^ nodeid_in
             )))?;
+            let source_path = match &source_path {
+                Some(path) => path.clone(),
+                None => self.path(&source)?,
+            };
             sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
             if let Err(e) = sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &name, 0)
             {
@@ -3243,18 +3320,29 @@ impl Server {
                     // space a copy costs is bounded by the size cap; a large
                     // file is cloned, and shares its blocks as FICLONE
                     // promises.
+                    // A descriptor to read or clone from. The cached one
+                    // serves as it is; a parked source is opened read-only
+                    // by its name, here on the worker; the event-only
+                    // reference cannot be read and is reopened by identity
+                    // when that is what there is.
+                    let opened;
+                    let raw = match &source_fd {
+                        Source::Cached(file) if file.readable => file.fd.as_raw_fd(),
+                        Source::At(parent_ref, name) => {
+                            const LINUX_O_NOFOLLOW: u32 = 0o400000;
+                            opened = sys::openat_path(parent_ref.raw_fd(), name, LINUX_O_NOFOLLOW, 0)?;
+                            opened.as_raw_fd()
+                        }
+                        Source::Held(reference) => {
+                            opened = sys::reopen(reference.raw_fd(), 0, 0)?;
+                            opened.as_raw_fd()
+                        }
+                        Source::Cached(file) => {
+                            opened = sys::reopen(file.fd.as_raw_fd(), 0, 0)?;
+                            opened.as_raw_fd()
+                        }
+                    };
                     let bytes = if size <= COPY_INSTEAD_OF_CLONE_MAX {
-                        // The reference is event-only and cannot be read;
-                        // reopened read-only by identity when that is what
-                        // there is.
-                        let readable;
-                        let raw = match &source_fd {
-                            Source::Cached(file) if file.readable => file.fd.as_raw_fd(),
-                            _ => {
-                                readable = sys::reopen(source_fd.raw_fd(), 0, 0)?;
-                                readable.as_raw_fd()
-                            }
-                        };
                         let mut bytes = Vec::with_capacity(size as usize);
                         let mut chunk = vec![0u8; 64 << 10];
                         loop {
@@ -3268,6 +3356,12 @@ impl Server {
                     } else {
                         None
                     };
+                    // A copy keeps the descriptor it wrote through: the
+                    // chmod, the utimes and the identity stat that follow
+                    // go through it rather than through three more path
+                    // lookups, a quarter of the job on an M1.
+                    let made: std::cell::Cell<Option<std::os::fd::OwnedFd>> =
+                        std::cell::Cell::new(None);
                     let clone = |name: &CString| {
                         if let Some(bytes) = &bytes {
                             const LINUX_O_WRONLY: u32 = 1;
@@ -3279,14 +3373,17 @@ impl Server {
                                 LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_EXCL,
                                 mode & 0o7777,
                             )?;
-                            return write_fully(fd.as_raw_fd(), bytes, 0);
+                            write_fully(fd.as_raw_fd(), bytes, 0)?;
+                            made.set(Some(fd));
+                            return Ok(());
                         }
-                        match sys::fclonefile_at(source_fd.raw_fd(), parent_ref.raw_fd(), name) {
+                        match sys::fclonefile_at(raw, parent_ref.raw_fd(), name) {
                             // A descriptor the kernel will not clone from
                             // (an event-only reference, say): by path, as
                             // before.
                             Err(e) if e == linux::EBADF || e == linux::EACCES => {
-                                sys::clonefile_at(&source_path, parent_ref.raw_fd(), name)
+                                let path = source_path.as_ref().ok_or(e)?;
+                                sys::clonefile_at(path, parent_ref.raw_fd(), name)
                             }
                             other => other,
                         }
@@ -3321,10 +3418,50 @@ impl Server {
                         }
                         Err(e) => return Err(e),
                     }
-                    // One stat for the identity; no descriptor. The clone
-                    // is bound parked (see `Inode::bind_parked`), and the
-                    // first operation that needs it open opens it.
-                    sys::stat_at(parent_ref.raw_fd(), &name)
+                    // A chmod or utimes acknowledged while the clone was
+                    // queued lands here, by name, in the same pass — libuv
+                    // utimes every file it copies — and its own job then has
+                    // only bookkeeping to do. Ordered behind this job by the
+                    // inode's key, so it cannot run first.
+                    let made = made.take();
+                    if let Some(values) = dest.open_attr_batch_values() {
+                        let mut change = values.lock().expect("attr batch poisoned");
+                        if !change.landed {
+                            if let Some(mode) = change.mode {
+                                match &made {
+                                    Some(fd) => sys::chmod_fd(fd.as_raw_fd(), mode)?,
+                                    None => sys::chmod_at(parent_ref.raw_fd(), &name, mode)?,
+                                }
+                            }
+                            if change.atime.is_some() || change.mtime.is_some() {
+                                let at = |t: Option<(i64, i64)>| match t {
+                                    Some((s, ns)) => TimeSpec::At(s, ns as u32),
+                                    None => TimeSpec::Omit,
+                                };
+                                match &made {
+                                    Some(fd) => sys::utimes_fd(
+                                        fd.as_raw_fd(),
+                                        at(change.atime),
+                                        at(change.mtime),
+                                    )?,
+                                    None => sys::utimes_at(
+                                        parent_ref.raw_fd(),
+                                        &name,
+                                        at(change.atime),
+                                        at(change.mtime),
+                                    )?,
+                                }
+                            }
+                            change.landed = true;
+                        }
+                    }
+                    // One stat for the identity; no descriptor kept. The
+                    // clone is bound parked (see `Inode::bind_parked`), and
+                    // the first operation that needs it open opens it.
+                    match &made {
+                        Some(fd) => sys::stat_fd(fd.as_raw_fd()),
+                        None => sys::stat_at(parent_ref.raw_fd(), &name),
+                    }
                 })();
                 match result {
                     Ok(st) => {
@@ -3692,8 +3829,17 @@ impl Server {
         }
         self.settle_while(&parent, |parent| parent.is_pending());
         // The synchronous path is about to consult the host about a name
-        // whose truth may still be in the queue.
-        self.settle_while(&parent, |parent| parent.name_pending_gone(name.to_bytes()));
+        // whose truth may still be in the queue: a removal of it, or a
+        // creation of it. The second matters when two writers race to make
+        // the same name — pnpm's store, keyed by content hash, does exactly
+        // that from its import threads. Consulting the host past a queued
+        // create made the host file first, and the promise then landed on
+        // EEXIST, with its acknowledged bytes lost: "an acknowledged create
+        // failed to apply", a few times every install on an M1.
+        self.settle_while(&parent, |parent| {
+            parent.name_pending_gone(name.to_bytes())
+                || parent.pending_child(name.to_bytes()).is_some()
+        });
         let parent_fd = parent.reference()?;
         let mut created = true;
         let mut attempt = 0;

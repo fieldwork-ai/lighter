@@ -1855,3 +1855,55 @@ fn a_clone_is_read_through_the_nodeid_the_caller_holds() {
     }
     assert_eq!(guest.server.live_inodes(), before, "the replacement went with its holder");
 }
+
+/// Two writers racing to make the same name — pnpm's content-addressed store
+/// does exactly this from its import threads. The first create is promised;
+/// the second, exclusive, must see the promise as the file it is, not reach
+/// the host ahead of it and leave the promise to land on EEXIST.
+#[test]
+fn a_second_exclusive_create_of_a_promised_name_is_eexist() {
+    let mut guest = Guest::new("create-race");
+    // O_WRONLY|O_CREAT|O_EXCL
+    let (first, fh) = guest.create(1, "hash", 0x8241 | 0o200).expect("first create");
+    guest.write(first, fh, 0, b"first writer's bytes").expect("write");
+    let second = guest.create(1, "hash", 0x8241 | 0o200);
+    assert_eq!(second, Err(17), "the promised name already exists");
+    guest.call(op::RELEASE, first, &[0u8; 24]).expect("release");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(
+        std::fs::read(guest.host("hash")).unwrap(),
+        b"first writer's bytes",
+        "the promise landed, and kept its bytes"
+    );
+    // And a non-exclusive create of a promised name opens the promise.
+    let (third, _) = guest.create(1, "hash", 0x8241).expect("open existing");
+    assert_eq!(third, first, "the same file, under the nodeid the guest holds");
+}
+
+/// Two writers making the same content-addressed file: each writes its own
+/// temporary name and renames it onto the same final name. Both creates are
+/// held; the second rename replaces the first's promise. The final file is
+/// the second writer's, and neither create is left to land on EEXIST.
+#[test]
+fn two_renames_onto_one_promised_name_land_in_order() {
+    let mut guest = Guest::new("rename-race");
+    let (a, fh_a) = guest.create(1, "tmp-a", 0x8241).expect("create a");
+    guest.write(a, fh_a, 0, b"first").expect("write a");
+    guest.call(op::RELEASE, a, &[0u8; 24]).expect("release a");
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(b"tmp-a\0final\0");
+    guest.call(op::RENAME, 1, &body).expect("rename a");
+    let (b, fh_b) = guest.create(1, "tmp-b", 0x8241).expect("create b");
+    guest.write(b, fh_b, 0, b"second").expect("write b");
+    guest.call(op::RELEASE, b, &[0u8; 24]).expect("release b");
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(b"tmp-b\0final\0");
+    guest.call(op::RENAME, 1, &body).expect("rename b");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::read(guest.host("final")).unwrap(), b"second");
+    assert!(!guest.host("tmp-a").exists() && !guest.host("tmp-b").exists());
+    let found = guest.lookup(1, "final").expect("lookup");
+    assert_eq!(found, b, "the name resolves to the second writer's file");
+}

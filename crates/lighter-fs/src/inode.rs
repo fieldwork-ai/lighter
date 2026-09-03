@@ -247,6 +247,9 @@ pub struct AttrOverride {
     pub mode: Option<u32>,
     pub atime: Option<(i64, i64)>,
     pub mtime: Option<(i64, i64)>,
+    /// Applied already by the job that bound the inode, so the batch's own
+    /// job has only bookkeeping left.
+    pub landed: bool,
 }
 
 /// What a share is holding, counted where it changes.
@@ -617,6 +620,17 @@ impl Inode {
     /// once in six boots.
     pub fn open_attr_batch(&self, values: Arc<Mutex<AttrOverride>>) {
         *self.attr_batch.lock().expect("attr batch poisoned") = Some((None, values));
+    }
+
+    /// The open batch, if any, for a job that can land it in passing —
+    /// the clone that binds this inode chmods and utimes the file it just
+    /// made, which spares the serial lane a job per imported file.
+    pub fn open_attr_batch_values(&self) -> Option<Arc<Mutex<AttrOverride>>> {
+        self.attr_batch
+            .lock()
+            .expect("attr batch poisoned")
+            .as_ref()
+            .map(|(_, values)| values.clone())
     }
 
     /// The job for `values` has its sequence number now.
