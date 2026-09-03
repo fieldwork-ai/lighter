@@ -32,9 +32,11 @@ URL="${LIGHTER_TARBALL_URL:-}"
 
 if [ -z "$URL" ]; then
 	if [ -z "$VERSION" ]; then
+		# Expanded as `${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"}` below: macOS ships
+		# bash 3.2, where an empty array is unbound under `set -u`.
 		AUTH_HEADER=()
 		[ -n "${GITHUB_TOKEN:-}" ] && AUTH_HEADER=(-H "Authorization: Bearer $GITHUB_TOKEN")
-		LATEST_JSON="$(curl -fsSL "${AUTH_HEADER[@]}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)"
+		LATEST_JSON="$(curl -fsSL ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)"
 		TAG="$(printf '%s\n' "$LATEST_JSON" | grep '"tag_name":' | head -1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' || true)"
 		if [ -z "$TAG" ]; then
 			err "could not find the latest release on GitHub. Set LIGHTER_VERSION=<version> to specify manually."
@@ -64,7 +66,7 @@ TARBALL="$WORK/lighter.tar.gz"
 log "Downloading $URL"
 DOWNLOAD_HEADERS=()
 [ -n "${GITHUB_TOKEN:-}" ] && DOWNLOAD_HEADERS=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream")
-curl -fL --progress-bar "${DOWNLOAD_HEADERS[@]}" "$URL" -o "$TARBALL" || err "failed to download release archive from $URL"
+curl -fL --progress-bar ${DOWNLOAD_HEADERS[@]+"${DOWNLOAD_HEADERS[@]}"} "$URL" -o "$TARBALL" || err "failed to download release archive from $URL"
 
 INSTALL_DIR="${LIGHTER_INSTALL_DIR:-$HOME/.lighter}"
 mkdir -p "$INSTALL_DIR"

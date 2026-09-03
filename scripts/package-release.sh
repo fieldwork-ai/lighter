@@ -121,6 +121,14 @@ cp vendor/gvproxy "$STAGE/bin/gvproxy"
 cp guest/out/Image guest/out/rootfs.ext4 "$STAGE/share/lighter/"
 cp LICENSE README.md "$STAGE/"
 cp entitlements.plist "$STAGE/share/lighter/"
+# The bundle `lighter start` runs the machine from, shipped rather than
+# built on the user's Mac: Gatekeeper assesses an app bundle at first launch,
+# and only a notarized one passes without putting a verdict to the user.
+APP="$STAGE/share/lighter/lighter.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp target/release/lighter "$APP/Contents/MacOS/lighter"
+cp assets/Info.plist "$APP/Contents/Info.plist"
+cp assets/lighter.icns "$APP/Contents/Resources/lighter.icns"
 
 # --- sign --------------------------------------------------------------------
 echo "==> Signing binaries with Developer ID and hardened runtime"
@@ -137,22 +145,32 @@ codesign --sign "$IDENTITY" \
 	--timestamp \
 	"$STAGE/bin/gvproxy"
 
+codesign --sign "$IDENTITY" \
+	--entitlements entitlements.plist \
+	--force \
+	--options runtime \
+	--timestamp \
+	"$APP"
+
 echo "==> Verifying signatures"
 codesign --verify --verbose=2 "$STAGE/bin/lighter"
 codesign --verify --verbose=2 "$STAGE/bin/gvproxy"
+codesign --verify --verbose=2 --deep "$APP"
 
 # --- notarize ----------------------------------------------------------------
 if [ -z "$SKIP_NOTARIZE" ] && [ -f "$WORK/AuthKey.p8" ] && [ -n "${APPLE_API_KEY_ID:-}" ]; then
 	echo "==> Submitting binaries to Apple Notary Service"
 	ZIP="$WORK/notarize.zip"
-	ditto -c -k --keepParent "$STAGE/bin" "$ZIP"
+	mkdir -p "$WORK/notarize"
+	cp -R "$STAGE/bin" "$APP" "$WORK/notarize/"
+	ditto -c -k --keepParent "$WORK/notarize" "$ZIP"
 	xcrun notarytool submit "$ZIP" \
 		--key "$WORK/AuthKey.p8" \
 		--key-id "$APPLE_API_KEY_ID" \
 		--issuer "$APPLE_API_ISSUER" \
 		--wait
 	echo "==> Notarization accepted by Apple"
-	spctl --assess --type execute --verbose=4 "$STAGE/bin/lighter" || true
+	spctl --assess --type execute --verbose=4 "$APP" || true
 else
 	echo "==> Skipping notarization (--skip-notarize or missing API keys)"
 fi
