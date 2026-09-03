@@ -1093,7 +1093,7 @@ impl Inode {
                 std::backtrace::Backtrace::force_capture()
             );
         }
-        if nth % 20_000 == 0 && std::env::var_os("LIGHTER_FS_STATS").is_some() {
+        if nth.is_multiple_of(20_000) && std::env::var_os("LIGHTER_FS_STATS").is_some() {
             tracing::warn!(
                 id = self.id(),
                 dir = self.is_dir,
@@ -2285,6 +2285,19 @@ fn descriptor_budget() -> usize {
     ((ceiling.saturating_sub(reserve) / 4) * 3).max(1024) as usize
 }
 
+/// `prefix/name`, or `name` alone under a resident directory.
+pub fn join(prefix: &Option<std::ffi::CString>, name: &std::ffi::CStr) -> std::ffi::CString {
+    match prefix {
+        None => name.to_owned(),
+        Some(prefix) => {
+            let mut joined = prefix.as_bytes().to_vec();
+            joined.push(b'/');
+            joined.extend_from_slice(name.to_bytes());
+            std::ffi::CString::new(joined).expect("no interior NUL in a joined path")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2763,18 +2776,5 @@ mod tests {
             writable: true,
         })));
         assert_ne!(first, second);
-    }
-}
-
-/// `prefix/name`, or `name` alone under a resident directory.
-pub fn join(prefix: &Option<std::ffi::CString>, name: &std::ffi::CStr) -> std::ffi::CString {
-    match prefix {
-        None => name.to_owned(),
-        Some(prefix) => {
-            let mut joined = prefix.as_bytes().to_vec();
-            joined.push(b'/');
-            joined.extend_from_slice(name.to_bytes());
-            std::ffi::CString::new(joined).expect("no interior NUL in a joined path")
-        }
     }
 }

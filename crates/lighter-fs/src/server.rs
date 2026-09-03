@@ -1500,7 +1500,7 @@ impl Server {
     /// body that LOOKUP, CREATE, MKDIR and friends all end with.
     fn entry(&self, parent: &Arc<Inode>, name: &CString) -> Result<EntryOut, i32> {
         let mark = self.apply.applied();
-        let st = parent.under_name(name, |dir, at| sys::stat_at(dir, at))?;
+        let st = parent.under_name(name, sys::stat_at)?;
         self.entry_from(parent, name, st, mark)
     }
 
@@ -1650,7 +1650,7 @@ impl Server {
     fn missing(&self, parent: &Inode, name: &std::ffi::CStr) -> Result<Vec<u8>, i32> {
         if self.stats.enabled() {
             static SAMPLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SAMPLED.fetch_add(1, Ordering::Relaxed) % 4000 == 0 {
+            if SAMPLED.fetch_add(1, Ordering::Relaxed).is_multiple_of(4000) {
                 tracing::warn!(parent = ?self.path(parent).ok(), name = ?name, "ENOENT-SAMPLE");
             }
         }
@@ -2372,7 +2372,7 @@ impl Server {
         }
         if dir
             && self.apply.accepting()
-            && let Ok(st) = parent.under_name(&name, |dir, at| sys::stat_at(dir, at))
+            && let Ok(st) = parent.under_name(&name, sys::stat_at)
             && let Some(child) = self.registry.identified(st.st_dev as i64, st.st_ino)
         {
             // RMDIR, acknowledged: the guest removes a directory it has
@@ -2462,7 +2462,7 @@ impl Server {
                 let name = name.clone();
                 move || {
                     if let Err(errno) =
-                        (|| parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, true)))()
+                        parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, true))
                     {
                         tracing::warn!(
                             errno,
@@ -2506,7 +2506,7 @@ impl Server {
             // pinned in the table with its descriptor, until the sweep had
             // nothing left it was allowed to park.
             let target_out = parent
-                .under_name(&name, |dir, at| sys::stat_at(dir, at))
+                .under_name(&name, sys::stat_at)
                 .ok()
                 .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino));
             if let Some(target) = &target_out {
@@ -2522,7 +2522,7 @@ impl Server {
                 let target = target_out.clone();
                 move || {
                     if let Err(errno) =
-                        (|| parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, false)))()
+                        parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, false))
                     {
                         tracing::warn!(
                             errno,
@@ -2644,7 +2644,7 @@ impl Server {
                         && !new_parent.name_pending_gone(new.to_bytes())
                         && (new_parent.is_pending()
                             || matches!(
-                                new_parent.under_name(new, |dir, at| sys::stat_at(dir, at)),
+                                new_parent.under_name(new, sys::stat_at),
                                 Err(errno) if errno == linux::ENOENT
                             ));
                     match held.get_mut(&nodeid) {
@@ -2681,7 +2681,7 @@ impl Server {
                 nodeid
             }
             None => {
-                let st = match old_parent.under_name(old, |dir, at| sys::stat_at(dir, at)) {
+                let st = match old_parent.under_name(old, sys::stat_at) {
                     Ok(st) => st,
                     Err(_) => {
                         self.stats.count("rename-none=1");
@@ -2726,7 +2726,7 @@ impl Server {
             self.registry.get(id)
         } else {
             new_parent
-                .under_name(new, |dir, at| sys::stat_at(dir, at))
+                .under_name(new, sys::stat_at)
                 .ok()
                 .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
         };
@@ -2757,13 +2757,11 @@ impl Server {
             let new = new.clone();
             let displaced = displaced.clone();
             move || {
-                if let Err(errno) = (|| {
-                    old_parent.under_name(&old, |old_dir, old_at| {
-                        new_parent.under_name(&new, |new_dir, new_at| {
-                            sys::rename_at(old_dir, old_at, new_dir, new_at, 0)
-                        })
+                if let Err(errno) = old_parent.under_name(&old, |old_dir, old_at| {
+                    new_parent.under_name(&new, |new_dir, new_at| {
+                        sys::rename_at(old_dir, old_at, new_dir, new_at, 0)
                     })
-                })() {
+                }) {
                     tracing::warn!(
                         errno,
                         from = %old.to_string_lossy(),
@@ -2907,7 +2905,7 @@ impl Server {
         }
         // A pending parent has nothing in it the overlay does not know.
         if !parent.is_pending() && !parent.name_pending_gone(name.to_bytes()) {
-            match parent.under_name(name, |dir, at| sys::stat_at(dir, at)) {
+            match parent.under_name(name, sys::stat_at) {
                 Err(errno) if errno == linux::ENOENT => {}
                 other => {
                     if self.debug_name.as_deref() == Some(name.to_bytes()) {
@@ -3040,7 +3038,7 @@ impl Server {
             return Err(linux::EEXIST);
         }
         if !parent.name_pending_gone(name.to_bytes()) {
-            match parent.under_name(name, |dir, at| sys::stat_at(dir, at)) {
+            match parent.under_name(name, sys::stat_at) {
                 Err(errno) if errno == linux::ENOENT => {}
                 _ => return Ok(None),
             }
@@ -3304,7 +3302,7 @@ impl Server {
             None
         } else {
             parent
-                .under_name(&name, |dir, at| sys::stat_at(dir, at))
+                .under_name(&name, sys::stat_at)
                 .ok()
                 .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
         };
@@ -3622,7 +3620,7 @@ impl Server {
         // order the host applies. So is any name in a directory that is
         // itself still a promise. Otherwise the host answers freshness.
         if !parent.is_pending() && !parent.name_pending_gone(name.to_bytes()) {
-            match parent.under_name(name, |dir, at| sys::stat_at(dir, at)) {
+            match parent.under_name(name, sys::stat_at) {
                 Err(errno) if errno == linux::ENOENT => {}
                 _ => return Ok(None),
             }

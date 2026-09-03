@@ -59,6 +59,9 @@ unsafe extern "C" {
     fn mach_port_deallocate(task: u32, name: u32) -> i32;
 }
 
+// Every backing measured stays runnable — add one to `cases` to measure it
+// again — though only the two that won are in the list.
+#[allow(dead_code)]
 enum Backing {
     Mmap(i32),
     MachAllocate(i32),

@@ -40,8 +40,8 @@ fn private_rootfs() -> anyhow::Result<std::path::PathBuf> {
         let meta = std::fs::metadata(&master)?;
         format!("{:?} {}", meta.modified()?, meta.len())
     };
-    let stale = !private.exists()
-        || std::fs::read_to_string(&stamp).map_or(true, |from| from != current);
+    let stale =
+        !private.exists() || std::fs::read_to_string(&stamp).map_or(true, |from| from != current);
     if stale {
         let staging = paths::home()?.join(".rootfs.next");
         let _ = std::fs::remove_file(&staging);

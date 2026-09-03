@@ -927,6 +927,33 @@ impl Drop for Dir {
     }
 }
 
+/// Raises the calling thread to the user-interactive QoS class, when
+/// `LIGHTER_SERVER_QOS` asks for it.
+///
+/// A guest waiting on the share is waiting on these threads: the poller that
+/// takes its request off the ring, the worker that answers it, and the apply
+/// queue that lands the outcome on the Mac. On a Mac whose every core is a
+/// vCPU — eight on an M1, with eight vCPUs — they compete with the idle
+/// polling of the guest they serve. macOS schedules by QoS class before
+/// anything else.
+pub fn raise_server_qos() {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let wanted =
+        *WANTED.get_or_init(|| std::env::var("LIGHTER_SERVER_QOS").is_ok_and(|v| v != "0"));
+    if !wanted {
+        return;
+    }
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    // SAFETY: a plain call on the current thread with constant arguments.
+    let rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    if rc != 0 {
+        tracing::debug!(rc, "could not raise the server thread's QoS");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,32 +1033,5 @@ mod tests {
             reported.starts_with("/"),
             "F_GETPATH must give an absolute path, got {reported:?}"
         );
-    }
-}
-
-/// Raises the calling thread to the user-interactive QoS class, when
-/// `LIGHTER_SERVER_QOS` asks for it.
-///
-/// A guest waiting on the share is waiting on these threads: the poller that
-/// takes its request off the ring, the worker that answers it, and the apply
-/// queue that lands the outcome on the Mac. On a Mac whose every core is a
-/// vCPU — eight on an M1, with eight vCPUs — they compete with the idle
-/// polling of the guest they serve. macOS schedules by QoS class before
-/// anything else.
-pub fn raise_server_qos() {
-    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let wanted =
-        *WANTED.get_or_init(|| std::env::var("LIGHTER_SERVER_QOS").is_ok_and(|v| v != "0"));
-    if !wanted {
-        return;
-    }
-    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-    // SAFETY: a plain call on the current thread with constant arguments.
-    let rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
-    if rc != 0 {
-        tracing::debug!(rc, "could not raise the server thread's QoS");
     }
 }

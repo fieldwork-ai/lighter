@@ -202,10 +202,10 @@ impl Steering {
             .lock()
             .expect("balloon transport poisoned")
             .notify_config_change();
-        let mib = u64::from(pages) * BALLOON_PAGE_SIZE >> 20;
+        let mib = (u64::from(pages) * BALLOON_PAGE_SIZE) >> 20;
         // A step is routine; a crossing of a quarter gigabyte is worth a line.
-        if (u64::from(before) * BALLOON_PAGE_SIZE >> 28)
-            != (u64::from(pages) * BALLOON_PAGE_SIZE >> 28)
+        if ((u64::from(before) * BALLOON_PAGE_SIZE) >> 28)
+            != ((u64::from(pages) * BALLOON_PAGE_SIZE) >> 28)
         {
             tracing::info!(target_mib = mib, "balloon target");
         } else {
