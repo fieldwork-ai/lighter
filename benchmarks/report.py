@@ -40,6 +40,32 @@ MEMORY_CASES = [
     ("memory-after-60s", "60 s after it ends"),
 ]
 
+# The network, in the unit each path is naturally read in. Throughput cases
+# are Mbit/s and higher is better; the rest are rates and latencies. `native`
+# is the Mac over loopback where that means something, and blank where it
+# does not (there is no "egress" from the Mac to itself).
+NETWORK_CASES = [
+    ("net-tcp-egress", "TCP, container to the Mac", "Mbit/s", "higher"),
+    ("net-tcp-egress-r", "TCP, the Mac to a container", "Mbit/s", "higher"),
+    ("net-tcp-port", "TCP into a published port", "Mbit/s", "higher"),
+    ("net-tcp-port-r", "TCP out of a published port", "Mbit/s", "higher"),
+    ("net-udp", "UDP, container to the Mac", "Mbit/s", "higher"),
+    ("net-connect-rate", "connects to a published port", "per second", "higher"),
+    ("net-http-latency", "GET on a published port, median", "µs", "lower"),
+    ("net-http-p99", "GET on a published port, p99", "µs", "lower"),
+    ("net-dns", "DNS lookup from a container, median", "µs", "lower"),
+]
+
+# What an idle runtime costs, sampled by `top` over a quiet minute: CPU as
+# milliseconds per second, idle wakeups per second, and top's energy-impact
+# figure (stored times ten, shown with one decimal). Lower is better for all.
+POWER_CASES = [
+    ("power-cpu-ms-per-s", "CPU, ms per second", 1),
+    ("power-wakeups-per-s", "wakeups per second", 1),
+    ("power-pkg-idle-wakeups-per-s", "package-idle wakeups per second", 1),
+    ("power-energy-x10", "energy impact (top)", 10),
+]
+
 # Cases the native ratio says nothing useful about. `watch-latency` is the
 # only one: on the Mac a file is visible the moment it is written, so the
 # reference is nearly zero and every ratio against it is a division by noise —
@@ -223,6 +249,70 @@ def render(results, description, _primary):
             for _, values in memory_columns:
                 value = values.get(case)
                 cells.append("—" if value is None else f"{int(value)}")
+            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    # The share columns plus native: the network does not care where the
+    # fixture lives, and the own-disk leg measures the same link again.
+    network_columns = [
+        (name, values)
+        for name, values in columns
+        if not name.endswith("(own disk)")
+        and any(case in values for case, _, _, _ in NETWORK_CASES)
+    ]
+    if network_columns:
+        lines += [
+            "### The network",
+            "",
+            "iperf3 between a container and the Mac in both directions, on the",
+            "path a container sees (its egress to the Mac's LAN address) and on the",
+            "path the Mac sees (a published port on localhost); then connection",
+            "setup, request latency on a kept-alive connection, and DNS from inside",
+            "a container. `native` is the Mac over loopback where that means anything.",
+            "",
+            "| case | unit | " + " | ".join(name for name, _ in network_columns) + " |",
+            "|" + "---|" * (len(network_columns) + 2),
+        ]
+        for case, label, unit, _ in NETWORK_CASES:
+            if not any(case in values for _, values in network_columns):
+                continue
+            cells = []
+            for _, values in network_columns:
+                value = values.get(case)
+                cells.append("—" if value is None else f"{int(value)}")
+            lines.append(f"| {label} | {unit} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    power_columns = [
+        (name, values)
+        for name, values in columns
+        if name != REFERENCE
+        and not name.endswith("(own disk)")
+        and any(case in values for case, _, _ in POWER_CASES)
+    ]
+    if power_columns:
+        lines += [
+            "### What an idle runtime costs",
+            "",
+            "After a quiet minute, a minute of powermetrics samples over the",
+            "runtime's processes (top's columns where powermetrics is not allowed):",
+            "CPU as milliseconds of core per second, wakeups per second, and the",
+            "wakeups that pull the package out of idle, which are the battery's.",
+            "Lower is better throughout.",
+            "",
+            "| reading | " + " | ".join(name for name, _ in power_columns) + " |",
+            "|" + "---|" * (len(power_columns) + 1),
+        ]
+        for case, label, scale in POWER_CASES:
+            cells = []
+            for _, values in power_columns:
+                value = values.get(case)
+                if value is None:
+                    cells.append("—")
+                elif scale == 1:
+                    cells.append(f"{int(value)}")
+                else:
+                    cells.append(f"{value / scale:.1f}")
             lines.append(f"| {label} | " + " | ".join(cells) + " |")
         lines.append("")
 

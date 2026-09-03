@@ -9,7 +9,7 @@
 # our own over it is the point.
 FROM node:24-alpine
 
-RUN apk add --no-cache ripgrep git tar \
+RUN apk add --no-cache ripgrep git tar iperf3 \
 	&& npm install -g --force --no-audit --no-fund pnpm@10.28.0 yarn@1.22.22
 
 WORKDIR /work
