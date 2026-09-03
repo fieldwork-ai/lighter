@@ -61,16 +61,30 @@ the same tree into the container; `own disk` is a named volume, the
 runtime's own filesystem inside the VM, where a container's writable layer
 and its data volumes live.
 
-| case | native | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
-|---|---|---|---|---|---|
-| npm-install | 7846 | 11661 | 11093 | 7869 | 10210 |
-| pnpm-install | 4654 | 6025 | 6061 | 1763 | 2375 |
-| yarn-install | 10619 | 12193 | 10233 | 8018 | 7816 |
-| ripgrep | 1330 | 151 | 1121 | 129 | 184 |
-| find-walk | 503 | 122 | 518 | 125 | 130 |
-| copy-tree | 24755 | 4957 | 16567 | 2477 | 3622 |
-| rm-rf | 5432 | 3527 | 4025 | 590 | 695 |
-| watch-latency | 2 | 2 | 2 | — | — |
+| case | native | lighter (share) | orbstack (share) | colima (share) | lighter (own disk) | orbstack (own disk) | colima (own disk) |
+|---|---|---|---|---|---|---|---|
+| npm-install | 7846 | 11661 | 11093 | 23008 | 7869 | 10210 | 10737 |
+| pnpm-install | 4654 | 6025 | 6061 | — | 1763 | 2375 | 1582 |
+| yarn-install | 10619 | 12193 | 10233 | 28132 | 8018 | 7816 | 11233 |
+| ripgrep | 1330 | 151 | 1121 | 15019 | 129 | 184 | 188 |
+| find-walk | 503 | 122 | 518 | 3813 | 125 | 130 | 218 |
+| copy-tree | 24755 | 4957 | 16567 | 60404 | 2477 | 3622 | 2560 |
+| rm-rf | 5432 | 3527 | 4025 | 12405 | 590 | 695 | 726 |
+| watch-latency | 2 | 2 | 2 | 3 | — | — | — |
+
+### What the runtime costs the Mac, MiB
+
+The physical footprint of the runtime's own processes, as Activity Monitor
+accounts it — which reads high for any Hypervisor.framework guest, and the
+same way for every runtime here. Lower is better; the last two columns are
+what a runtime gives back on its own after the work ends.
+
+| reading | colima (share) | colima (own disk) |
+|---|---|---|
+| settled, before an install | 4329 | 4346 |
+| peak through an npm install | 4338 | 4346 |
+| 15 s after it ends | 4337 | 4346 |
+| 60 s after it ends | 4337 | 4346 |
 
 ### As a fraction of `native`
 
@@ -80,15 +94,15 @@ outrunning the Mac's. `watch-latency` is left out: it is a latency against
 a reference of about a millisecond, so the ratio is a division by noise —
 read it from the table above in milliseconds.
 
-| case | lighter (share) | orbstack (share) | lighter (own disk) | orbstack (own disk) |
-|---|---|---|---|---|
-| npm-install | 67% | 71% | 100% | 77% |
-| pnpm-install | 77% | 77% | 264% | 196% |
-| yarn-install | 87% | 104% | 132% | 136% |
-| ripgrep | 881% | 119% | 1031% | 723% |
-| find-walk | 412% | 97% | 402% | 387% |
-| copy-tree | 499% | 149% | 999% | 683% |
-| rm-rf | 154% | 135% | 921% | 782% |
+| case | lighter (share) | orbstack (share) | colima (share) | lighter (own disk) | orbstack (own disk) | colima (own disk) |
+|---|---|---|---|---|---|---|
+| npm-install | 67% | 71% | 34% | 100% | 77% | 73% |
+| pnpm-install | 77% | 77% | — | 264% | 196% | 294% |
+| yarn-install | 87% | 104% | 38% | 132% | 136% | 95% |
+| ripgrep | 881% | 119% | 9% | 1031% | 723% | 707% |
+| find-walk | 412% | 97% | 13% | 402% | 387% | 231% |
+| copy-tree | 499% | 149% | 41% | 999% | 683% | 967% |
+| rm-rf | 154% | 135% | 44% | 921% | 782% | 748% |
 
 ## What each case does
 
