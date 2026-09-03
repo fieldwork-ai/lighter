@@ -10,34 +10,26 @@ here releases a run with one madvise and is never the slow side, so a
 pass is the whole ring the device offers, 256 blocks, a quarter second
 apart.
 
---- a/mm/page_reporting.h
-+++ b/mm/page_reporting.h
-@@ -10,7 +10,7 @@
+diff --git a/include/linux/page_reporting.h b/include/linux/page_reporting.h
+index fe648df..8da1591 100644
+--- a/include/linux/page_reporting.h
++++ b/include/linux/page_reporting.h
+@@ -6,7 +6,7 @@
  #include <linux/scatterlist.h>
  
- #define PAGE_REPORTING_MIN_ORDER	pageblock_order
+ /* This value should always be a power of 2, see page_reporting_cycle() */
 -#define PAGE_REPORTING_CAPACITY		32
 +#define PAGE_REPORTING_CAPACITY		256
  
- #ifdef CONFIG_PAGE_REPORTING
- DECLARE_STATIC_KEY_FALSE(page_reporting_enabled);
+ struct page_reporting_dev_info {
+ 	/* function that alters pages to make them "reported" */
+diff --git a/mm/page_reporting.c b/mm/page_reporting.c
+index 68c791d..4adfc23 100644
 --- a/mm/page_reporting.c
 +++ b/mm/page_reporting.c
-@@ -24,7 +24,7 @@ static int page_order_update_notify(const char *val, const struct kernel_param *
- 
- static const struct kernel_param_ops page_reporting_param_ops = {
- 	.set = &page_order_update_notify,
- 	/*
- 	 * For the get op, use param_get_int instead of param_get_uint.
- 	 * This is to make sure that when unset the initialized value of
- 	 * -1 is shown correctly
- 	 */
- 	.get = &param_get_int,
- };
- 
- module_param_cb(page_reporting_order, &page_reporting_param_ops,
- 			&page_reporting_order, 0644);
- MODULE_PARM_DESC(page_reporting_order, "Set page reporting order");
+@@ -47,7 +47,7 @@ MODULE_PARM_DESC(page_reporting_order, "Set page reporting order");
+  */
+ EXPORT_SYMBOL_GPL(page_reporting_order);
  
 -#define PAGE_REPORTING_DELAY	(2 * HZ)
 +#define PAGE_REPORTING_DELAY	(HZ / 4)
