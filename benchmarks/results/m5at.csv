@@ -1,3 +1,13 @@
 case,rep,ms
-pnpm-install,1,4394
-pnpm-install,2,4730
+npm-install,1,6743
+npm-install,2,6814
+npm-install,3,6486
+pnpm-install,1,4081
+pnpm-install,2,4000
+pnpm-install,3,3900
+yarn-install,1,5470
+yarn-install,2,5215
+yarn-install,3,6196
+rm-rf,1,2531
+rm-rf,2,3234
+rm-rf,3,2897

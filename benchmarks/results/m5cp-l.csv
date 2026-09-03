@@ -1,0 +1,7 @@
+case,rep,ms
+copy-tree,1,1722
+copy-tree,2,1354
+copy-tree,3,1284
+rm-rf,1,537
+rm-rf,2,545
+rm-rf,3,511
