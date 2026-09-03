@@ -30,15 +30,24 @@ use crate::paths;
 fn private_rootfs() -> anyhow::Result<std::path::PathBuf> {
     let master = paths::rootfs()?;
     let private = paths::home()?.join("rootfs.ext4");
-    let stale = match (std::fs::metadata(&master), std::fs::metadata(&private)) {
-        (Ok(m), Ok(p)) => m.modified()? > p.modified()?,
-        _ => true,
+    // Which master the copy was made from, kept beside it. The copy's own
+    // modification time says nothing: the guest writes to its root disk, so
+    // a running machine keeps its copy newer than any master, and a check
+    // on the two times never refreshed it — a daily driver ran a rootfs
+    // three builds old while every benchmark VM booted the current one.
+    let stamp = paths::home()?.join("rootfs.ext4.from");
+    let current = {
+        let meta = std::fs::metadata(&master)?;
+        format!("{:?} {}", meta.modified()?, meta.len())
     };
+    let stale = !private.exists()
+        || std::fs::read_to_string(&stamp).map_or(true, |from| from != current);
     if stale {
         let staging = paths::home()?.join(".rootfs.next");
         let _ = std::fs::remove_file(&staging);
         clonefile(&master, &staging)?;
         std::fs::rename(&staging, &private)?;
+        std::fs::write(&stamp, &current)?;
     }
     Ok(private)
 }

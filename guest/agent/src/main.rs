@@ -100,8 +100,10 @@ fn main() -> std::process::ExitCode {
 /// same machine holds at two gigabytes. `memory.high` on the cgroup every
 /// container lives in has the kernel keep the cache under the line as it
 /// goes, coldest pages first, and free page reporting hands the rest to the
-/// host. Asked for once dockerd has made the cgroup, which is soon after
-/// boot but not at it.
+/// host. dockerd makes the cgroup when the first container runs, which on
+/// a machine started and left alone can be any time at all, and a daemon
+/// restart makes it afresh with the bound gone — so this keeps watching,
+/// and writes the bound whenever the file is there and does not carry it.
 fn bound_container_cache() {
     let total = std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -113,12 +115,13 @@ fn bound_container_cache() {
         })
         .map(|kb| kb * 1024);
     let Some(total) = total else { return };
-    let high = total / 2;
-    for _ in 0..120 {
-        if std::fs::write("/sys/fs/cgroup/docker/memory.high", high.to_string()).is_ok() {
-            return;
+    let high = (total / 2).to_string();
+    let path = "/sys/fs/cgroup/docker/memory.high";
+    loop {
+        if std::fs::read_to_string(path).is_ok_and(|now| now.trim() != high) {
+            let _ = std::fs::write(path, &high);
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }
 
