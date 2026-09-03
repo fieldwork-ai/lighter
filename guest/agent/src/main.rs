@@ -51,6 +51,10 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
+    if control {
+        std::thread::spawn(bound_container_cache);
+    }
+
     let listener = match VsockListener::bind(port) {
         Ok(l) => l,
         Err(e) => {
@@ -86,6 +90,38 @@ fn main() -> std::process::ExitCode {
 /// anything more would be a serialization format to maintain. Each command
 /// gets one line back so the host can tell "done" from "this build does not
 /// know that word".
+/// Bounds the page cache the containers may hold, to half the guest's RAM.
+///
+/// Without it the cache grows to fill the guest, and on a Mac with little
+/// to spare that is the host compressing the guest's pages: an 8 GB Mac
+/// with a 4 GiB guest sat at sixty megabytes free with its compressor at
+/// two gigabytes through a package install, and the next install paid
+/// fifteen percent faulting its memory back in. OrbStack's footprint on the
+/// same machine holds at two gigabytes. `memory.high` on the cgroup every
+/// container lives in has the kernel keep the cache under the line as it
+/// goes, coldest pages first, and free page reporting hands the rest to the
+/// host. Asked for once dockerd has made the cgroup, which is soon after
+/// boot but not at it.
+fn bound_container_cache() {
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb * 1024);
+    let Some(total) = total else { return };
+    let high = total / 2;
+    for _ in 0..120 {
+        if std::fs::write("/sys/fs/cgroup/docker/memory.high", high.to_string()).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 fn serve_control(stream: OwnedFd) {
     let mut reader = Fd(stream);
     let mut writer = match reader.try_clone() {
@@ -120,6 +156,19 @@ fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
         (Some("ping"), _) => "pong\n".into(),
+        // The host is compressing our pages: give back that much page cache,
+        // coldest first, from the cgroup every container lives in. The
+        // kernel frees it in bulk and free page reporting returns it to the
+        // host in runs it can take, which the balloon's scattered 4 KiB
+        // pages never were.
+        (Some("reclaim"), Some(amount)) => match amount.parse::<u64>() {
+            Err(_) => "error bad amount\n".into(),
+            Ok(mib) => match std::fs::write("/sys/fs/cgroup/docker/memory.reclaim", format!("{mib}M")) {
+                Ok(()) => "ok\n".into(),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => "partial\n".into(),
+                Err(e) => format!("error {e}\n"),
+            },
+        },
         // Diagnostics that touch no disk: procfs, sysfs and the kernel log
         // stay readable when a block device has wedged.
         (Some("read"), Some(path)) => match std::fs::read(path) {

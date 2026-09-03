@@ -139,7 +139,7 @@ pub struct Machine {
     proxies: Vec<VsockProxy>,
     /// Held for the machine's lifetime: dropping it ends the subscription to
     /// host memory pressure and the balloon stops responding.
-    _memory_policy: Option<crate::memory_policy::MemoryPolicy>,
+    memory_policy: Option<crate::memory_policy::MemoryPolicy>,
     /// Queue watchers, and the handles that retire them. Held because a
     /// detached poller would outlive the transport it polls.
     pollers: Vec<(Arc<virtio::poll::Kicks>, JoinHandle<()>)>,
@@ -511,7 +511,7 @@ impl Machine {
             network,
             vsock: vsock_state,
             proxies: Vec::new(),
-            _memory_policy: memory_policy,
+            memory_policy,
             pollers,
         })
     }
@@ -532,6 +532,11 @@ impl Machine {
     /// a path that briefly worked.
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
         let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone())?;
+        if guest_port == crate::memory_policy::AGENT_CONTROL_PORT
+            && let Some(policy) = &self.memory_policy
+        {
+            policy.set_control_socket(path);
+        }
         self.proxies.push(proxy);
         Ok(())
     }
