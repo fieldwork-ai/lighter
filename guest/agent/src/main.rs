@@ -90,20 +90,27 @@ fn main() -> std::process::ExitCode {
 /// anything more would be a serialization format to maintain. Each command
 /// gets one line back so the host can tell "done" from "this build does not
 /// know that word".
-/// Bounds the page cache the containers may hold, to half the guest's RAM.
+/// Keeps the containers' page cache from costing the host its memory.
 ///
-/// Without it the cache grows to fill the guest, and on a Mac with little
-/// to spare that is the host compressing the guest's pages: an 8 GB Mac
-/// with a 4 GiB guest sat at sixty megabytes free with its compressor at
-/// two gigabytes through a package install, and the next install paid
-/// fifteen percent faulting its memory back in. OrbStack's footprint on the
-/// same machine holds at two gigabytes. `memory.high` on the cgroup every
-/// container lives in has the kernel keep the cache under the line as it
-/// goes, coldest pages first, and free page reporting hands the rest to the
-/// host. dockerd makes the cgroup when the first container runs, which on
-/// a machine started and left alone can be any time at all, and a daemon
-/// restart makes it afresh with the bound gone — so this keeps watching,
-/// and writes the bound whenever the file is there and does not carry it.
+/// Two measures, from what an 8 GB Mac with a 4 GiB guest showed. Left
+/// alone, the cache grows to fill the guest and macOS compresses the
+/// guest's pages while reporting no pressure at all: the compressor at two
+/// gigabytes through a package install, and the next install fifteen
+/// percent slower faulting its memory back in. A hard bound at half of RAM
+/// stopped that and cost the big working sets instead — yarn's copy of its
+/// cache into a tree, or a tree copied whole, want more than two gigabytes
+/// of cache at once and were throttled a third slower. OrbStack's footprint
+/// on the same machine grows to four gigabytes during an install and is
+/// back at two within fifteen seconds of it ending.
+///
+/// So: `memory.high` on the cgroup every container lives in at three
+/// quarters of RAM, a ceiling the working sets fit under, and a trim once
+/// the guest has been idle for a few seconds, reclaiming the cache down to
+/// a quarter of RAM (`memory.reclaim`, coldest pages first) so what an
+/// install left behind is not the host's to compress. Free page reporting
+/// hands the freed memory back. dockerd makes the cgroup at the first
+/// container, which can be any time, and afresh on a restart, so the bound
+/// is rewritten whenever it is found missing.
 fn bound_container_cache() {
     let total = std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -115,14 +122,46 @@ fn bound_container_cache() {
         })
         .map(|kb| kb * 1024);
     let Some(total) = total else { return };
-    let high = (total / 2).to_string();
-    let path = "/sys/fs/cgroup/docker/memory.high";
+    let high = (total / 4 * 3).to_string();
+    let resting = total / 4;
+    let cgroup = "/sys/fs/cgroup/docker";
+    let mut idle_for = 0u32;
+    let mut last = cpu_ticks();
+    let mut cooldown = 0u32;
     loop {
-        if std::fs::read_to_string(path).is_ok_and(|now| now.trim() != high) {
-            let _ = std::fs::write(path, &high);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if std::fs::read_to_string(format!("{cgroup}/memory.high")).is_ok_and(|now| now.trim() != high) {
+            let _ = std::fs::write(format!("{cgroup}/memory.high"), &high);
         }
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        let now = cpu_ticks();
+        let (busy, all) = (now.0.saturating_sub(last.0), now.1.saturating_sub(last.1));
+        last = now;
+        idle_for = if all > 0 && busy * 10 < all { idle_for + 1 } else { 0 };
+        cooldown = cooldown.saturating_sub(1);
+        if idle_for >= 3 && cooldown == 0 {
+            let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
+                .ok()
+                .and_then(|c| c.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if current > resting {
+                let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
+                cooldown = 10;
+            }
+        }
     }
+}
+
+/// (busy, total) jiffies across every CPU, from the first line of /proc/stat.
+fn cpu_ticks() -> (u64, u64) {
+    let Ok(stat) = std::fs::read_to_string("/proc/stat") else { return (0, 0) };
+    let Some(line) = stat.lines().next() else { return (0, 0) };
+    let fields: Vec<u64> = line.split_whitespace().skip(1).filter_map(|f| f.parse().ok()).collect();
+    if fields.len() < 5 {
+        return (0, 0);
+    }
+    let total: u64 = fields.iter().sum();
+    let idle = fields[3] + fields[4];
+    (total - idle, total)
 }
 
 fn serve_control(stream: OwnedFd) {
