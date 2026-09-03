@@ -52,7 +52,7 @@ Two things about the transport are not obvious from the specification. The inter
 
 ## The guest
 
-Built from source, not borrowed. `guest/kernel/` holds a configuration and twelve patches, on the 6.18 longterm line; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
+Built from source, not borrowed. `guest/kernel/` holds a configuration and thirteen patches, on the 6.18 longterm line; `guest/rootfs/` an Alpine tree, dockerd, and an init that fits on two screens; `guest/agent/` a small Rust program that bridges vsock to the Docker socket and answers the control channel.
 
 The kernel patches are the interesting part:
 
@@ -74,7 +74,9 @@ The kernel patches are the interesting part:
 
 - **Plugging the reclaim flush.** When a metadata reservation tickets, btrfs writes each dirty inode in turn and nothing plugs the loop, so every small file of a tree being copied became its own block request the moment it was written: 65,000 requests for a 1 GB copy that the background flusher, which plugs, writes in 8,000. The files of a copy sit next to each other on disk, so plugged, consecutive inodes merge. Whether the copy tickets at all is the disk's size, below.
 
-The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All twelve are in `guest/kernel/patches/`.
+- **Answering the stats a package manager makes.** Without the writeback cache — which this share does not use, because the server acknowledges writes early itself — the guest's own rules made the next stat of a file a round trip after every write (size and times invalidated), every rename (ctime), every read (atime), and on a brand-new inode whose lookup overlapped any eviction at all (upstream's guard against a server reusing a nodeid, which this one never does). pnpm writes each store file, renames it into place, hashes it and stats it: sixty thousand GETATTRs a run, one per imported file, on a serial track. For the dialect the guest now keeps what it knows — size it tracks, blocks follow size, mtime and ctime move to now, atime stays — and clears a new inode's mask on the reply. A pnpm run on the M5 share went from 218,000 GETATTRs to none. The clone reply carries the clone's attributes for the same reason: the guest keeps its dentry and inode and reads the clone through the nodeid it holds, which the server forwards, instead of dropping the dentry and looking the name up again.
+
+The four FUSE dialect patches that follow (whole-file clones, no `security.*` lookups, no-op setattr answered from the cache, fresh dentries trusted) each carry their reasoning in their header. All thirteen are in `guest/kernel/patches/`.
 
 ## The guest decides how much the host remembers
 

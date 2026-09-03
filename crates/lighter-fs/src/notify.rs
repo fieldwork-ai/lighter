@@ -100,6 +100,9 @@ impl Notification {
 /// The watcher runs on a dispatch queue owned by Core Services and the device
 /// is driven by vCPU threads; neither may block the other, so they meet here
 /// and nowhere else.
+/// Invalidations pushed since start; diagnostics.
+pub static PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Default)]
 pub struct Sink {
     pending: Mutex<VecDeque<Vec<u8>>>,
@@ -120,6 +123,7 @@ impl Sink {
 
     /// Queues a notification and pokes the transport.
     pub fn push(&self, notification: Notification) {
+        PUSHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut pending = self.pending.lock().expect("notify sink poisoned");
             if pending.len() >= BACKLOG {

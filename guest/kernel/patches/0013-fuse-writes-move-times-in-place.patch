@@ -1,0 +1,110 @@
+fuse: a new inode's first stat, a write, a rename and a read all cost a round trip; not for this server
+
+Without the writeback cache every write invalidates the file's size,
+blocks and times, a rename its ctime and a read its atime, and the next
+stat is a GETATTR round trip; and a brand-new inode whose lookup
+overlapped any eviction keeps its whole mask set (the guard against a
+server reusing a nodeid), so its first stat is a round trip too. pnpm
+writes each store file, renames it into place, hashes it and stats it,
+and every one of those was a round trip per file — sixty thousand a
+run, on a serial track.
+
+The server answers such a stat from what the guest promised anyway (the
+write's own size and time), and never reuses a nodeid, so the guest
+keeps its own: size it already tracks, blocks follow size, mtime and
+ctime move to now, atime stays where it was, and a new inode's mask is
+cleared on the reply. Only when the server speaks the create dialect,
+which is the one that acknowledges writes early.
+
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -141,7 +141,15 @@
+  */
+ void fuse_invalidate_atime(struct inode *inode)
+ {
+-	if (!IS_RDONLY(inode))
++	/*
++	 * lighter: reads leave atime alone. A read served from the page cache
++	 * still invalidated it, and without the writeback cache the file's
++	 * next stat was a round trip: pnpm hashes every store file it imports
++	 * and stats it after, sixty thousand round trips an install for a
++	 * timestamp nothing reads. A mount's noatime does not reach here (it
++	 * is a mount flag, not an inode flag), so the dialect decides.
++	 */
++	if (!IS_RDONLY(inode) && !get_fuse_conn(inode)->lighter_create)
+ 		fuse_invalidate_attr_mask(inode, STATX_ATIME);
+ }
+ 
+@@ -969,7 +977,14 @@
+ 
+ void fuse_update_ctime(struct inode *inode)
+ {
+-	fuse_invalidate_attr_mask(inode, STATX_CTIME);
++	/*
++	 * lighter: the cached ctime just set below is the answer; without the
++	 * writeback cache the invalidation made the next stat of every renamed
++	 * file a round trip, and a package manager renames every file it
++	 * writes into its store.
++	 */
++	if (!get_fuse_conn(inode)->lighter_create)
++		fuse_invalidate_attr_mask(inode, STATX_CTIME);
+ 	fuse_update_ctime_in_cache(inode);
+ }
+ 
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1100,16 +1100,34 @@
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+ 	bool ret = false;
++	/*
++	 * lighter: a write moves the times in place. Without the writeback
++	 * cache every write invalidated size, blocks and both times, and the
++	 * next stat of the file was a round trip — one per file a package
++	 * manager writes, sixty thousand an install. The server answers that
++	 * stat from what the guest promised anyway (the write's own size and
++	 * time), so the guest may keep its own. Only for a server that speaks
++	 * the dialect, which is the one that acknowledges writes this way.
++	 */
++	bool in_place = fc->lighter_create && !fc->writeback_cache && written > 0;
+ 
+ 	spin_lock(&fi->lock);
+ 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+ 	if (written > 0 && pos > inode->i_size) {
+ 		i_size_write(inode, pos);
+ 		ret = true;
++	}
++	if (in_place) {
++		struct timespec64 now = current_time(inode);
++
++		inode_set_mtime_to_ts(inode, now);
++		inode_set_ctime_to_ts(inode, now);
++		inode->i_blocks = DIV_ROUND_UP(i_size_read(inode), 512);
+ 	}
+ 	spin_unlock(&fi->lock);
+ 
+-	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
++	if (!in_place)
++		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
+ 
+ 	return ret;
+ }
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -242,7 +242,15 @@
+ 	 * fi->attr_version != 0 -> this is not a new inode
+ 	 * evict_ctr == fuse_get_evict_ctr() -> no evicts while during request
+ 	 */
+-	if (!evict_ctr || fi->attr_version || evict_ctr == fuse_get_evict_ctr(fc))
++	/*
++	 * lighter: the guard against a racing evict is for a server that could
++	 * answer a lookup with a nodeid it has since reused. Ours never reuses
++	 * one, so the reply is the truth whatever was evicted meanwhile — and
++	 * under a package install something always is, which left every new
++	 * inode's mask set and made its first stat a round trip.
++	 */
++	if (!evict_ctr || fi->attr_version || evict_ctr == fuse_get_evict_ctr(fc) ||
++	    fc->lighter_create)
+ 		set_mask_bits(&fi->inval_mask, STATX_BASIC_STATS, 0);
+ 
+ 	fi->attr_version = atomic64_inc_return(&fc->attr_version);

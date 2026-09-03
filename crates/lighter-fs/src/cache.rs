@@ -86,16 +86,20 @@ impl Timings {
 
     /// What may be promised when the guest *can* be corrected.
     ///
-    /// Thirty seconds is not the staleness — with the notification channel live
+    /// Five minutes is not the staleness — with the notification channel live
     /// that is however long FSEvents takes to notice, which is milliseconds. It
     /// is the backstop: notifications are queued in a bounded buffer, and a
     /// message dropped because the guest was slow has to expire on its own
     /// eventually. Long enough to be worth having, short enough that nothing
-    /// stays wrong for a working day.
+    /// stays wrong for a working day. It was thirty seconds, and a package
+    /// install paid for that: pnpm stats every store file it imports, the
+    /// store was written more than thirty seconds earlier, and each stat was
+    /// a GETATTR — sixty thousand an install, one round trip each. A missing
+    /// name is still only promised for thirty seconds.
     pub const PUSHED: Timings = Timings {
-        attr: Duration::from_secs(30),
-        entry_file: Duration::from_secs(30),
-        entry_dir: Duration::from_secs(30),
+        attr: Duration::from_secs(300),
+        entry_file: Duration::from_secs(300),
+        entry_dir: Duration::from_secs(300),
         negative: Duration::from_secs(30),
         cooldown: Duration::from_millis(2000),
     };

@@ -1816,3 +1816,42 @@ fn a_forgotten_directory_with_promises_is_found_again_as_itself() {
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
     assert!(!guest.host("dir").exists());
 }
+
+/// The shape libuv's copyFile(FICLONE) makes: open the destination for
+/// writing (a promised create), then clone the source over its name. The
+/// guest keeps that inode, so the clone is read back through the nodeid the
+/// create returned, the reply carries the clone's attributes, and forgetting
+/// that one nodeid by its count releases the replacement with it.
+#[test]
+fn a_clone_is_read_through_the_nodeid_the_caller_holds() {
+    let mut guest = Guest::new("clone-forward");
+    let before = guest.server.live_inodes();
+    std::fs::write(guest.host("store"), b"the store's bytes").unwrap();
+    let store = guest.lookup(1, "store").expect("lookup");
+    let (dest, dest_fh) = guest.create(1, "index.js", 0x8241).expect("create");
+    let mut body = Vec::new();
+    body.extend_from_slice(&store.to_le_bytes());
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(b"index.js\0");
+    let reply = guest.call(op::LIGHTER_CLONE, dest, &body).expect("clone");
+    assert_eq!(reply.len(), 8 + 8 + 4 + 4 + 88, "size, validity and an attr");
+    let size = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    assert_eq!(size, 17);
+    let attr_size = u64::from_le_bytes(reply[24 + 8..24 + 16].try_into().unwrap());
+    assert_eq!(attr_size, 17, "the attr in the reply is the clone's");
+    // No new lookup was handed out: the clone answers under `dest`.
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let bytes = guest.read(dest, dest_fh, 0, 64).expect("read");
+    assert_eq!(bytes, b"the store's bytes");
+    assert_eq!(std::fs::read(guest.host("index.js")).unwrap(), b"the store's bytes");
+    guest.call(op::RELEASE, dest, &[0u8; 24]).expect("release");
+    guest.call(op::UNLINK, 1, &name_body("index.js")).expect("unlink");
+    guest.call(op::UNLINK, 1, &name_body("store")).expect("unlink");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    for (nodeid, count) in [(dest, 1u64), (store, 1u64)] {
+        let mut forget = Vec::new();
+        forget.extend_from_slice(&count.to_le_bytes());
+        let _ = guest.call(op::FORGET, nodeid, &forget);
+    }
+    assert_eq!(guest.server.live_inodes(), before, "the replacement went with its holder");
+}

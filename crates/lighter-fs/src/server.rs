@@ -925,7 +925,7 @@ impl Server {
             op::OPEN | op::OPENDIR => Err(linux::ENOSYS),
 
             op::CREATE => self.create(nodeid, body),
-            op::LIGHTER_CLONE => self.clone_over(body),
+            op::LIGHTER_CLONE => self.clone_over(header.nodeid, body),
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
             op::RELEASE | op::RELEASEDIR => {
@@ -1785,6 +1785,24 @@ impl Server {
     }
 
     fn getattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+        if self.stats.enabled() {
+            // Which inodes a workload stats: a pending promise, a directory,
+            // a file it wrote, or a file — and whether by handle. What made
+            // pnpm's sixty thousand stats a run visible as new inodes whose
+            // first stat the guest would not answer itself.
+            let flags = get_u32(body, 0).unwrap_or(0);
+            let kind = match self.inode(nodeid) {
+                Ok(inode) if inode.is_pending() => "pending",
+                Ok(inode) if inode.is_dir => "dir",
+                Ok(inode) if inode.is_dirty() => "dirty-file",
+                Ok(_) => "file",
+                Err(_) => "unknown",
+            };
+            self.stats.count(&format!(
+                "getattr={kind}{}",
+                if flags & fuse::GETATTR_FH != 0 { "+fh" } else { "" }
+            ));
+        }
         if let Ok(inode) = self.inode(nodeid)
             && inode.is_pending()
         {
@@ -3069,7 +3087,7 @@ impl Server {
     /// install took ten seconds against eight. Hardlinks, pnpm's fallback on
     /// every other Docker, cost a hundred and sixty-six each on APFS — twice
     /// a clone — and took seventeen.
-    fn clone_over(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn clone_over(&self, caller: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let t0 = std::time::Instant::now();
         let phase = |k: &str, t: std::time::Instant| self.stats.add(k, t.elapsed().as_micros() as u64);
         // Both name nodeids in the body, not the header, so the dispatch-time
@@ -3158,14 +3176,29 @@ impl Server {
                 .ok()
                 .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
         };
+        // The guest keeps its dentry and inode across the clone and reads
+        // the result through the nodeid it already holds, so whatever it
+        // holds is forwarded: the create this clone displaces, else the
+        // inode the request itself named. The replacement's own lookup count
+        // (one, from `insert_pending`) is held on the old inode's behalf and
+        // released when the guest forgets it (`Registry::forget`).
+        let displaced = displaced.or_else(|| {
+            self.registry
+                .get(self.resolve(caller))
+                .filter(|inode| !inode.is_dir)
+        });
         let (nodeid, dest) =
             self.registry
                 .insert_pending(parent.dev(), meta, crate::inode::PendingKind::File);
         phase("clone-us-3-displaced", t2);
         let t3 = std::time::Instant::now();
         dest.set_place(&parent, &name);
-        // The reply is a size, not an entry: see `Registry::unname`.
-        self.registry.unname(nodeid);
+        if displaced.is_none() {
+            // Nothing holds the old name — a caller that named no file of
+            // its own — so the reply is a size, not an entry, and the count
+            // `insert_pending` took is returned (`Registry::unname`).
+            self.registry.unname(nodeid);
+        }
         if let Some(old) = &displaced {
             // The guest's descriptor on the old file keeps working, and sees
             // the clone — as FICLONE promises — because the old inode now
@@ -3336,8 +3369,16 @@ impl Server {
         phase("clone-us-total", t0);
         parent.settled_by(seq);
         dest.settled_by(seq);
-        let mut out = Vec::with_capacity(8);
+        // The reply carries the clone's attributes, so the guest can install
+        // them on the inode it keeps rather than drop the dentry and look the
+        // name up again.
+        let entry = self.pending_entry(&parent, &dest, nodeid);
+        let mut out = Vec::with_capacity(8 + 8 + 4 + 4 + 88);
         out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&entry.attr_valid.to_le_bytes());
+        out.extend_from_slice(&entry.attr_valid_nsec.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        entry.attr.encode(&mut out);
         Ok(out)
     }
 

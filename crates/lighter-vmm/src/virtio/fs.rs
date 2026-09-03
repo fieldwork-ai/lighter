@@ -715,6 +715,7 @@ impl VirtioDevice for Fs {
                             notifies = notifies - last_notifies,
                             polled = polled - last_polled,
                             by_kind,
+                            invalidations = lighter_fs::notify::PUSHED.load(std::sync::atomic::Ordering::Relaxed),
                             "VMMSTATS"
                         );
                         (last_notifies, last_polled) = (notifies, polled);

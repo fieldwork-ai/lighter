@@ -1711,16 +1711,26 @@ impl Registry {
             return;
         }
         let identity = (inode.dev(), inode.ino());
+        let forwarded = inode.forwarded();
         table.remove(&id);
         drop(table);
 
-        let mut map = self.by_identity[identity_shard(identity.1)]
-            .write()
-            .expect("identity table poisoned");
-        // Only unmap the identity if it still points at us: a file removed and
-        // recreated could have reused the inode number and repointed it.
-        if map.get(&identity) == Some(&id) {
-            map.remove(&identity);
+        {
+            let mut map = self.by_identity[identity_shard(identity.1)]
+                .write()
+                .expect("identity table poisoned");
+            // Only unmap the identity if it still points at us: a file removed
+            // and recreated could have reused the inode number and repointed
+            // it.
+            if map.get(&identity) == Some(&id) {
+                map.remove(&identity);
+            }
+        }
+        // A clone's replacement was kept alive on this inode's behalf — the
+        // guest never looked it up itself. Released once no lock is held,
+        // since the replacement may share this shard.
+        if let Some(next) = forwarded {
+            self.forget(next, 1);
         }
     }
 

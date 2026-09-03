@@ -18,7 +18,7 @@ diff --git a/fs/fuse/file.c b/fs/fuse/file.c
 index c581cd1df..66a1f9e63 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3108,6 +3108,75 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
+@@ -3108,6 +3108,93 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  	return err;
  }
  
@@ -80,9 +80,27 @@ index c581cd1df..66a1f9e63 100644
 +	args.out_args[0].value = &outarg;
 +	err = fuse_simple_request(fm, &args);
 +	if (!err) {
++		/*
++		 * The dentry and inode stay: the server answers the old nodeid
++		 * with the clone from here on, and the reply carries the
++		 * clone's attributes. Dropping the dentry cost a LOOKUP and a
++		 * FORGET per imported file, two of the five requests an import
++		 * made. Size and times are set on the inode directly, since
++		 * with the writeback cache the attribute install trusts the
++		 * inode's own over the reply's.
++		 */
++		struct fuse_inode *fi = get_fuse_inode(inode_out);
++
 +		truncate_inode_pages(inode_out->i_mapping, 0);
-+		fuse_invalidate_attr(inode_out);
-+		d_invalidate(entry);
++		spin_lock(&fi->lock);
++		i_size_write(inode_out, outarg.attr.size);
++		inode_set_atime(inode_out, outarg.attr.atime, outarg.attr.atimensec);
++		inode_set_mtime(inode_out, outarg.attr.mtime, outarg.attr.mtimensec);
++		inode_set_ctime(inode_out, outarg.attr.ctime, outarg.attr.ctimensec);
++		spin_unlock(&fi->lock);
++		fuse_change_attributes(inode_out, &outarg.attr, NULL,
++				       ATTR_TIMEOUT(&outarg),
++				       fuse_get_attr_version(fc));
 +	}
 +	dput(parent);
 +	inode_unlock(inode_out);
@@ -164,7 +182,7 @@ index 4ea757b1f..ad5e68c0c 100644
  	FUSE_SETUPMAPPING	= 48,
  	FUSE_REMOVEMAPPING	= 49,
  	FUSE_SYNCFS		= 50,
-@@ -1160,6 +1167,15 @@ struct fuse_lseek_out {
+@@ -1160,6 +1167,19 @@ struct fuse_lseek_out {
  	uint64_t	offset;
  };
  
@@ -175,6 +193,10 @@ index 4ea757b1f..ad5e68c0c 100644
 +
 +struct fuse_lighter_clone_out {
 +	uint64_t	size;
++	uint64_t	attr_valid;
++	uint32_t	attr_valid_nsec;
++	uint32_t	padding;
++	struct fuse_attr attr;
 +};
 +
  struct fuse_copy_file_range_in {
