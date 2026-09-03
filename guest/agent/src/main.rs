@@ -90,27 +90,31 @@ fn main() -> std::process::ExitCode {
 /// anything more would be a serialization format to maintain. Each command
 /// gets one line back so the host can tell "done" from "this build does not
 /// know that word".
-/// Keeps the containers' page cache from costing the host its memory.
+/// Gives the containers' page cache back once they have been idle a while.
 ///
-/// Two measures, from what an 8 GB Mac with a 4 GiB guest showed. Left
-/// alone, the cache grows to fill the guest and macOS compresses the
-/// guest's pages while reporting no pressure at all: the compressor at two
-/// gigabytes through a package install, and the next install fifteen
-/// percent slower faulting its memory back in. A hard bound at half of RAM
-/// stopped that and cost the big working sets instead — yarn's copy of its
-/// cache into a tree, or a tree copied whole, want more than two gigabytes
-/// of cache at once and were throttled a third slower. OrbStack's footprint
-/// on the same machine grows to four gigabytes during an install and is
-/// back at two within fifteen seconds of it ending.
+/// From what an 8 GB Mac with a 4 GiB guest showed, in order. Left alone,
+/// the cache fills the guest and macOS compresses the guest's pages while
+/// reporting no pressure at all, and the install after a big one paid
+/// fifteen percent faulting its memory back in. A bound on the cache — as
+/// `memory.high`, at half of RAM or three quarters, or kept by reclaiming
+/// above a line every second — cured that and cost more than it cured:
+/// the first of three repetitions of every install took twice as long as
+/// the third, and yarn ran a third slower throughout, because an install's
+/// working set is the cache and any bound the working set crosses is paid
+/// on every page. The host's compressor is left to the host-side policy,
+/// which asks for a reclaim only under real distress; with that alone the
+/// install after a big one paid three percent.
 ///
-/// So: `memory.high` on the cgroup every container lives in at three
-/// quarters of RAM, a ceiling the working sets fit under, and a trim once
-/// the guest has been idle for a few seconds, reclaiming the cache down to
-/// a quarter of RAM (`memory.reclaim`, coldest pages first) so what an
-/// install left behind is not the host's to compress. Free page reporting
-/// hands the freed memory back. dockerd makes the cgroup at the first
-/// container, which can be any time, and afresh on a restart, so the bound
-/// is rewritten whenever it is found missing.
+/// What remains is what OrbStack's footprint shows: back at two gigabytes
+/// within a quarter minute of an install ending. Once the containers have
+/// been idle for half a minute the cache is trimmed to a quarter of RAM,
+/// coldest pages first (`memory.reclaim`), and free page reporting hands
+/// the freed memory back. Idle is the containers' own CPU from their
+/// cgroup, not the guest's — a guest installing against the share is three
+/// quarters idle waiting on the host — and half a minute of it, because
+/// three seconds was the pause between one install and the next and every
+/// one started cold. dockerd makes the cgroup at the first container, which
+/// can be any time, so this simply keeps looking.
 fn bound_container_cache() {
     let total = std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -122,38 +126,28 @@ fn bound_container_cache() {
         })
         .map(|kb| kb * 1024);
     let Some(total) = total else { return };
-    let high = (total / 4 * 3).to_string();
     let resting = total / 4;
     let cgroup = "/sys/fs/cgroup/docker";
-    // Idle is the containers' own CPU, from their cgroup, not the guest's:
-    // a guest running a package install against the share is three
-    // quarters idle, waiting on the host, and a trim keyed on that fired in
-    // the middle of every install and evicted the cache it was using. A
-    // container doing anything at all burns a core; one doing nothing
-    // burns nothing.
     let mut idle_for = 0u32;
     let mut last = container_cpu_usec(cgroup);
-    let mut cooldown = 0u32;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        if std::fs::read_to_string(format!("{cgroup}/memory.high")).is_ok_and(|now| now.trim() != high) {
-            let _ = std::fs::write(format!("{cgroup}/memory.high"), &high);
-        }
         let now = container_cpu_usec(cgroup);
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < 50_000 { idle_for + 1 } else { 0 };
-        cooldown = cooldown.saturating_sub(1);
-        if idle_for >= 3 && cooldown == 0 {
-            let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
-                .ok()
-                .and_then(|c| c.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            if current > resting {
-                let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
-                cooldown = 10;
-            }
+        if idle_for < 30 {
+            continue;
         }
+        let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
+            .ok()
+            .and_then(|c| c.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if current > resting {
+            let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
+        }
+        // Trimmed: not again until the containers have worked and rested.
+        idle_for = 0;
     }
 }
 
