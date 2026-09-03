@@ -145,6 +145,16 @@ fn bound_container_cache() {
             .unwrap_or(0);
         if current > resting {
             let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
+            // What the trim freed is in pieces the size of the files that
+            // held it, and free page reporting hands the host only runs of
+            // two megabytes: reported as it stood, a trimmed guest still
+            // cost the Mac most of its size. Reporting smaller runs was
+            // measured and rejected — the guest reports its free memory as
+            // fast as it churns it, and every reported page it reuses is a
+            // fault on the host; a pnpm install took four times as long.
+            // Compaction instead, once, on a guest that has nothing else to
+            // do: the pieces coalesce, and the runs go back.
+            let _ = std::fs::write("/proc/sys/vm/compact_memory", "1");
         }
         // Trimmed: not again until the containers have worked and rested.
         idle_for = 0;
