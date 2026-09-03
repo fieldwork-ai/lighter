@@ -1819,6 +1819,30 @@ impl Registry {
         if !still_known {
             return;
         }
+        // An occupant that is no longer that identity gives up the slot.
+        // APFS recycles inode numbers briskly: a directory removed and made
+        // again gets its old number back while the registry still holds the
+        // old inode for the promises queued under it, and a claim refused
+        // on its account left the map pointing at a corpse — the next lookup
+        // checked it, retired it, and minted a third inode for the one
+        // directory (`a_forgotten_directory_with_promises_is_found_again_as_itself`,
+        // once in forty rounds on a fast machine). Checked before the write
+        // lock, since `still_is` may take the inode table, which `forget`
+        // takes before this one.
+        let occupant = self.by_identity[identity_shard(ino)]
+            .read()
+            .expect("identity table poisoned")
+            .get(&(dev, ino))
+            .copied()
+            .filter(|other| *other != id);
+        let stale_occupant = occupant.filter(|other| {
+            let inode = self.by_id[shard(*other)]
+                .lock()
+                .expect("inode table poisoned")
+                .get(other)
+                .cloned();
+            inode.is_none_or(|inode| !inode.still_is(dev, ino))
+        });
         let mut identity = self.by_identity[identity_shard(ino)]
             .write()
             .expect("identity table poisoned");
@@ -1826,17 +1850,21 @@ impl Registry {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(id);
             }
-            std::collections::hash_map::Entry::Occupied(slot) if *slot.get() != id => {
-                // Two inodes for one file: the guest was told this id, the
-                // server will resolve the other. Loud, because every path
-                // that let it happen was a bug (`Server::entry_from`).
-                tracing::warn!(
-                    id,
-                    other = *slot.get(),
-                    dev,
-                    ino,
-                    "a pending inode's identity was already claimed"
-                );
+            std::collections::hash_map::Entry::Occupied(mut slot) if *slot.get() != id => {
+                if Some(*slot.get()) == stale_occupant {
+                    slot.insert(id);
+                } else {
+                    // Two inodes for one file: the guest was told this id,
+                    // the server will resolve the other. Loud, because every
+                    // path that let it happen was a bug (`Server::entry_from`).
+                    tracing::warn!(
+                        id,
+                        other = *slot.get(),
+                        dev,
+                        ino,
+                        "a pending inode's identity was already claimed"
+                    );
+                }
             }
             _ => {}
         }
