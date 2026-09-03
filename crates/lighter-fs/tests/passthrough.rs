@@ -1800,20 +1800,40 @@ fn a_forgotten_directory_with_promises_is_found_again_as_itself() {
         let reply = guest.call(op::MKDIR, 1, &body).unwrap();
         let dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
         let mut lookups = 1u64;
+        // The directory itself has landed; the promises made under it —
+        // twenty subdirectories, acknowledged and queued — are held in the
+        // queue, so they are still outstanding at the forget and the
+        // lookup, which is the case this test is about. Left to timing, a
+        // fast runner had them all applied first, the registry released
+        // the directory as it should, and the lookup rightly minted a new
+        // inode. Subdirectories rather than unlinked files because an
+        // unlink settles the create it undoes, which a held queue never
+        // lets land.
+        guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+        guest.server.hold_apply();
+        let mut subs = Vec::new();
         for n in 0..20 {
-            let (file, fh) = guest.create(dir, &format!("f{n}"), 0x8241).unwrap();
-            guest.write(file, fh, 0, b"x").unwrap();
-            guest
-                .call(op::UNLINK, dir, &name_body(&format!("f{n}")))
-                .unwrap();
+            let mut sub = 0o755u32.to_le_bytes().to_vec();
+            sub.extend_from_slice(&0u32.to_le_bytes());
+            sub.extend_from_slice(&name_body(&format!("s{n}")));
+            let reply = guest.call(op::MKDIR, dir, &sub).unwrap();
+            subs.push(u64::from_le_bytes(reply[0..8].try_into().unwrap()));
         }
         // The guest drops the directory entirely, promises and all.
         guest.call(op::FORGET, dir, &lookups.to_le_bytes()).ok();
-        let again = guest.lookup(1, "dir").unwrap();
+        let again = guest.lookup(1, "dir");
+        guest.server.release_apply();
+        let again = again.unwrap();
         assert_eq!(
             again, dir,
             "round {round}: the directory came back as a different inode"
         );
+        for (n, sub) in subs.iter().enumerate() {
+            guest
+                .call(op::RMDIR, dir, &name_body(&format!("s{n}")))
+                .unwrap();
+            guest.call(op::FORGET, *sub, &1u64.to_le_bytes()).ok();
+        }
         lookups = 1;
         assert_eq!(
             guest.call(op::RMDIR, 1, &name_body("dir")),

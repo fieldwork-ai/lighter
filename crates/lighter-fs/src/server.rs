@@ -1048,6 +1048,15 @@ impl Server {
         self.stats.enabled()
     }
 
+    /// Pins every queued job in place, and lets them go. Tests.
+    pub fn hold_apply(&self) {
+        self.apply.hold();
+    }
+
+    pub fn release_apply(&self) {
+        self.apply.release();
+    }
+
     /// How many inodes the registry holds. Diagnostics and tests.
     pub fn live_inodes(&self) -> usize {
         self.registry.inode_count()

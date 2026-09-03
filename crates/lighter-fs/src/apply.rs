@@ -258,6 +258,9 @@ struct Slot {
 
 struct State {
     retired: bool,
+    /// Nothing is picked while held. Tests hold the queue to pin a promise
+    /// in place around the operation that must see it.
+    held: bool,
     /// Whether a job that is not a clone is running. Only clones run beside
     /// one another; everything else keeps to one at a time.
     ///
@@ -328,6 +331,7 @@ impl Apply {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 retired: false,
+                held: false,
                 serial_running: false,
                 slots: HashMap::new(),
                 ready: VecDeque::new(),
@@ -375,6 +379,18 @@ impl Apply {
     ///
     /// The free-space check is what keeps promise 3: close to a full disk,
     /// everything goes back to synchronous and errors land where they belong.
+    /// Keeps every queued job queued until [`Apply::release`]. For tests
+    /// that must see a promise outstanding.
+    pub fn hold(&self) {
+        self.shared.state.lock().expect("apply queue poisoned").held = true;
+    }
+
+    /// Lets the workers pick again.
+    pub fn release(&self) {
+        self.shared.state.lock().expect("apply queue poisoned").held = false;
+        self.shared.arrived.notify_all();
+    }
+
     pub fn accepting(&self) -> bool {
         self.on
             && self.shared.free.load(Ordering::Relaxed)
@@ -575,6 +591,10 @@ impl Shared {
                 loop {
                     if state.retired {
                         return;
+                    }
+                    if state.held {
+                        state = self.arrived.wait(state).expect("apply queue poisoned");
+                        continue;
                     }
                     // The oldest job of the serial lane when nothing in it
                     // is running, else the oldest clone.
