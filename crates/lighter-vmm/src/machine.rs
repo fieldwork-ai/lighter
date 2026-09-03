@@ -243,7 +243,7 @@ impl Machine {
         if let Some(network) = &network {
             net_slot = Some(virtio.len());
             virtio.push(Box::new(Net::new(
-                network.backend(),
+                network.outbox(),
                 net::GUEST_MAC,
                 net_inbox.clone(),
             )));
@@ -393,6 +393,17 @@ impl Machine {
                     .lock()
                     .expect("net transport poisoned")
                     .service_queue(virtio::net::RX_QUEUE);
+            })?;
+            // And the one that moves them the other way. The wire is a socket
+            // that blocks when full, and the only thread allowed to block on
+            // it is this one; when the device has parked on a full outbox it
+            // is this thread that has the ring looked at again.
+            let transport = virtio_devices[slot].clone();
+            network.spawn_transmitter(move || {
+                transport
+                    .lock()
+                    .expect("net transport poisoned")
+                    .service_queue(virtio::net::TX_QUEUE);
             })?;
         }
 

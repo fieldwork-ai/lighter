@@ -5,9 +5,28 @@
 //! userspace network stack in a sidecar process — is hidden behind
 //! [`NetBackend`], because that is a piece we expect to replace: a native
 //! in-process stack would swap the implementation and leave this file alone.
+//!
+//! # Nothing here blocks
+//!
+//! The first version wrote each transmitted frame to the backend from inside
+//! the notification, which is to say on the vCPU thread that kicked, under the
+//! transport lock. A backend that is a socket has a buffer, and a guest sending
+//! faster than the sidecar drains it fills that buffer, at which point the
+//! write blocks — with a vCPU inside it. The guest saw that as a CPU that
+//! stopped answering: an RCU stall on core 0 every minute, a Docker socket
+//! that no longer replied, and 1.5 Gbit/s while it lasted.
+//!
+//! So the device now touches the backend on no thread of the guest's. Frames
+//! are copied out of the ring into an [`Outbox`] and a thread of the backend's
+//! own drains that to the wire; frames from the wire land in an [`Inbox`] and
+//! are moved into the guest's buffers by whoever is holding the transport. The
+//! only thing a vCPU does on a kick is a memcpy. When the outbox is full the
+//! device stops taking chains and leaves them in the ring — backpressure into
+//! the guest's own queue, which is where a slow link belongs — and the drain
+//! thread asks for the queue to be looked at again once there is room.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::memory::GuestMemory;
 use crate::virtio::mmio::COMMON_FEATURES;
@@ -47,20 +66,108 @@ const MAX_FRAME: usize = 65_550;
 /// may be busy: an unbounded queue here is a memory leak driven by whoever is
 /// sending us traffic. Dropping is also what a real NIC does when its ring is
 /// full.
-const RX_BACKLOG: usize = 256;
+const RX_BACKLOG: usize = 1024;
+
+/// How many bytes of transmitted frames to hold for the backend before the
+/// device stops taking chains off the ring.
+///
+/// Large enough that a burst does not park the guest on every write to the
+/// wire, small enough that a stalled backend does not turn into a memory
+/// leak. Eight megabytes is under a millisecond of the link at the speeds we
+/// are after.
+const OUTBOX_BYTES: usize = 8 << 20;
 
 /// Somewhere for frames to go, and come from.
 pub trait NetBackend: Send {
     /// Sends one Ethernet frame.
     fn send(&mut self, frame: &[u8]) -> std::io::Result<()>;
+
+    /// Sends a batch. The default is one call per frame; a backend with a
+    /// cheaper way to move several at once overrides it.
+    fn send_many(&mut self, frames: &[Vec<u8>]) -> std::io::Result<()> {
+        for frame in frames {
+            self.send(frame)?;
+        }
+        Ok(())
+    }
 }
 
 /// Frames received from the backend, waiting for the guest to offer buffers.
 pub type Inbox = Arc<Mutex<VecDeque<Vec<u8>>>>;
 
+struct OutboxState {
+    frames: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// The device stopped taking chains because this was full. Whoever drains
+    /// it owes the queue a look.
+    parked: bool,
+    closed: bool,
+}
+
+/// Frames the guest has transmitted, waiting for the backend's thread.
+pub struct Outbox {
+    state: Mutex<OutboxState>,
+    filled: Condvar,
+}
+
+impl Outbox {
+    pub fn new() -> Arc<Outbox> {
+        Arc::new(Outbox {
+            state: Mutex::new(OutboxState {
+                frames: VecDeque::new(),
+                bytes: 0,
+                parked: false,
+                closed: false,
+            }),
+            filled: Condvar::new(),
+        })
+    }
+
+    /// Whether there is room for another frame.
+    fn has_room(&self) -> bool {
+        self.state.lock().expect("net outbox poisoned").bytes < OUTBOX_BYTES
+    }
+
+    fn push(&self, frame: Vec<u8>) {
+        let mut state = self.state.lock().expect("net outbox poisoned");
+        state.bytes += frame.len();
+        state.frames.push_back(frame);
+        drop(state);
+        self.filled.notify_one();
+    }
+
+    /// Records that the device left chains on the ring for want of room.
+    fn park(&self) {
+        self.state.lock().expect("net outbox poisoned").parked = true;
+    }
+
+    /// Blocks until there are frames, then takes all of them. The flag says
+    /// whether the device had parked on a full outbox, in which case the
+    /// caller owes the transmit queue a look. None means closed.
+    pub fn take(&self) -> Option<(Vec<Vec<u8>>, bool)> {
+        let mut state = self.state.lock().expect("net outbox poisoned");
+        while state.frames.is_empty() {
+            if state.closed {
+                return None;
+            }
+            state = self.filled.wait(state).expect("net outbox poisoned");
+        }
+        let frames: Vec<Vec<u8>> = state.frames.drain(..).collect();
+        state.bytes = 0;
+        let parked = std::mem::take(&mut state.parked);
+        Some((frames, parked))
+    }
+
+    /// Releases a thread blocked in [`Outbox::take`].
+    pub fn close(&self) {
+        self.state.lock().expect("net outbox poisoned").closed = true;
+        self.filled.notify_all();
+    }
+}
+
 /// A virtio network device.
 pub struct Net {
-    backend: Box<dyn NetBackend>,
+    outbox: Arc<Outbox>,
     inbox: Inbox,
     mac: [u8; 6],
     /// Frames dropped because the guest had no receive buffers posted.
@@ -68,9 +175,9 @@ pub struct Net {
 }
 
 impl Net {
-    pub fn new(backend: Box<dyn NetBackend>, mac: [u8; 6], inbox: Inbox) -> Net {
+    pub fn new(outbox: Arc<Outbox>, mac: [u8; 6], inbox: Inbox) -> Net {
         Net {
-            backend,
+            outbox,
             inbox,
             mac,
             dropped: 0,
@@ -93,13 +200,23 @@ impl Net {
         true
     }
 
-    /// Moves frames the guest has queued out to the backend.
+    /// Copies frames the guest has queued into the outbox, without the
+    /// virtio-net header the wire does not want. Stops, leaving the rest on
+    /// the ring, when the outbox is full.
     fn transmit(&mut self, queue: &mut Virtqueue, mem: &GuestMemory) -> bool {
         let mut used_any = false;
 
-        while let Some(chain) = queue.pop(mem) {
+        while queue.more_available(mem) {
+            if !self.outbox.has_room() {
+                self.outbox.park();
+                break;
+            }
+            let Some(chain) = queue.pop(mem) else {
+                break;
+            };
             let head = chain.head();
             let mut frame = Vec::with_capacity(1600);
+            let mut skip = NET_HDR_LEN;
 
             for desc in chain {
                 // Transmit buffers are device-readable; a writable one here is
@@ -107,29 +224,33 @@ impl Net {
                 if desc.is_write_only() {
                     continue;
                 }
-                let len = desc.len as usize;
+                let mut addr = desc.addr;
+                let mut len = desc.len as usize;
+                if skip > 0 {
+                    let drop = skip.min(len);
+                    addr += drop as u64;
+                    len -= drop;
+                    skip -= drop;
+                    if len == 0 {
+                        continue;
+                    }
+                }
                 if frame.len() + len > MAX_FRAME {
                     break;
                 }
                 let start = frame.len();
                 frame.resize(start + len, 0);
-                if mem.read(desc.addr, &mut frame[start..]).is_err() {
+                if mem.read(addr, &mut frame[start..]).is_err() {
                     frame.truncate(start);
                     break;
                 }
             }
 
-            // The guest prefixes every frame with the virtio-net header, which
-            // the wire does not want.
-            if frame.len() > NET_HDR_LEN
-                && let Err(e) = self.backend.send(&frame[NET_HDR_LEN..])
-            {
-                // A send failure is the backend's problem, not the guest's: the
-                // frame is lost, exactly as it would be on a real network, and
-                // the descriptor still has to come back.
-                tracing::debug!(%e, "dropping a transmitted frame");
+            // A frame that was only a header carries nothing; it still has to
+            // come back to the driver.
+            if !frame.is_empty() {
+                self.outbox.push(frame);
             }
-
             queue.push_used(mem, head, 0);
             used_any = true;
         }
@@ -280,26 +401,15 @@ impl VirtioDevice for Net {
 mod tests {
     use super::*;
 
-    struct Sink {
-        sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    }
-
-    impl NetBackend for Sink {
-        fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
-            self.sent.lock().unwrap().push(frame.to_vec());
-            Ok(())
-        }
-    }
-
-    fn net() -> (Net, Arc<Mutex<Vec<Vec<u8>>>>, Inbox) {
-        let sent = Arc::new(Mutex::new(Vec::new()));
+    fn net() -> (Net, Arc<Outbox>, Inbox) {
+        let outbox = Outbox::new();
         let inbox = Net::new_inbox();
         let net = Net::new(
-            Box::new(Sink { sent: sent.clone() }),
+            outbox.clone(),
             [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee],
             inbox.clone(),
         );
-        (net, sent, inbox)
+        (net, outbox, inbox)
     }
 
     #[test]
@@ -347,5 +457,55 @@ mod tests {
             !Net::enqueue_received(&inbox, vec![0u8; 64]),
             "a full backlog must drop rather than grow"
         );
+    }
+
+    /// The outbox hands over everything it holds in one take, and reports
+    /// whether the device had parked on it — which is what tells the drain
+    /// thread to have the ring looked at again.
+    #[test]
+    fn outbox_takes_a_batch_and_reports_a_park() {
+        let outbox = Outbox::new();
+        outbox.push(vec![1, 2, 3]);
+        outbox.push(vec![4]);
+        let (frames, parked) = outbox.take().unwrap();
+        assert_eq!(frames, vec![vec![1, 2, 3], vec![4]]);
+        assert!(!parked);
+
+        outbox.push(vec![5]);
+        outbox.park();
+        let (frames, parked) = outbox.take().unwrap();
+        assert_eq!(frames, vec![vec![5]]);
+        assert!(parked, "a park must be reported with the next batch");
+        assert!(outbox.has_room());
+    }
+
+    /// A full outbox refuses room, and taking from it makes room again: the
+    /// bound is bytes, not frames, because a frame is anything up to 64 KiB.
+    #[test]
+    fn outbox_is_bounded_by_bytes() {
+        let outbox = Outbox::new();
+        let frames = OUTBOX_BYTES / 65_536;
+        for _ in 0..frames {
+            assert!(outbox.has_room());
+            outbox.push(vec![0u8; 65_536]);
+        }
+        assert!(!outbox.has_room(), "at the bound there is no room");
+        let (taken, _) = outbox.take().unwrap();
+        assert_eq!(taken.len(), frames);
+        assert!(outbox.has_room());
+    }
+
+    /// Closing releases a blocked taker with None, so the drain thread exits
+    /// when the machine does.
+    #[test]
+    fn closing_the_outbox_releases_a_taker() {
+        let outbox = Outbox::new();
+        let taker = {
+            let outbox = outbox.clone();
+            std::thread::spawn(move || outbox.take())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        outbox.close();
+        assert!(taker.join().unwrap().is_none());
     }
 }

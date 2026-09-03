@@ -15,12 +15,13 @@
 //! and delete this file, with nothing else moving.
 
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use crate::virtio::net::{Inbox, Net, NetBackend};
+use crate::virtio::net::{Inbox, Net, NetBackend, Outbox};
 
 /// The address gvproxy hands the guest by DHCP, and its own gateway address.
 /// Fixed by gvproxy's defaults; recorded here because the guest's routes and
@@ -87,8 +88,11 @@ pub struct Network {
     child: Child,
     socket_path: PathBuf,
     control_path: PathBuf,
-    /// The write half, shared with the device.
+    /// The socket. Written only by the transmit thread; cloned for the
+    /// receive thread.
     stream: Arc<Mutex<UnixStream>>,
+    /// Frames the device has taken off the guest's ring for the wire.
+    outbox: Arc<Outbox>,
 }
 
 impl Network {
@@ -148,6 +152,7 @@ impl Network {
             socket_path,
             control_path,
             stream: Arc::new(Mutex::new(stream)),
+            outbox: Outbox::new(),
         })
     }
 
@@ -215,17 +220,48 @@ impl Network {
         Ok(payload.to_string())
     }
 
-    /// The device-side handle for transmitting frames.
-    pub fn backend(&self) -> Box<dyn NetBackend> {
-        Box::new(FramedStream {
+    /// Where the device puts frames for the wire.
+    pub fn outbox(&self) -> Arc<Outbox> {
+        self.outbox.clone()
+    }
+
+    /// Spawns the thread that moves transmitted frames from the outbox to
+    /// the wire.
+    ///
+    /// This is the only thread that writes the socket, and the only one that
+    /// may block on it. `wake` is called when the device had parked on a full
+    /// outbox and there is room again, so the transport looks at the ring
+    /// the device left chains on.
+    pub fn spawn_transmitter(&self, wake: impl Fn() + Send + 'static) -> io::Result<()> {
+        let outbox = self.outbox.clone();
+        let mut backend = FramedStream {
             stream: self.stream.clone(),
-        })
+        };
+        std::thread::Builder::new()
+            .name("net-tx".into())
+            .spawn(move || {
+                while let Some((frames, parked)) = outbox.take() {
+                    if let Err(e) = backend.send_many(&frames) {
+                        // The backend's problem, not the guest's: the frames
+                        // are lost, exactly as they would be on a real
+                        // network.
+                        tracing::debug!(%e, dropped = frames.len(), "dropping transmitted frames");
+                    }
+                    if parked {
+                        wake();
+                    }
+                }
+                tracing::debug!("network transmitter stopped");
+            })?;
+        Ok(())
     }
 
     /// Spawns the thread that reads frames from the network into the guest.
     ///
-    /// `wake` is called after each frame so the transport can move it into the
-    /// guest's receive queue; the reader itself touches no virtio state.
+    /// `wake` is called once per burst — after the last frame the socket had
+    /// ready, not after each — so the transport moves a batch into the
+    /// guest's receive queue under one lock and one interrupt. The reader
+    /// itself touches no virtio state.
     pub fn spawn_receiver(&self, inbox: Inbox, wake: impl Fn() + Send + 'static) -> io::Result<()> {
         let mut reader = self
             .stream
@@ -236,27 +272,36 @@ impl Network {
             .name("net-rx".into())
             .spawn(move || {
                 let mut header = [0u8; 4];
-                let mut frame = vec![0u8; 65_550];
+                let mut pending = 0usize;
                 loop {
                     if reader.read_exact(&mut header).is_err() {
                         break;
                     }
                     let len = u32::from_be_bytes(header) as usize;
-                    if len == 0 || len > frame.len() {
+                    if len == 0 || len > 65_550 {
                         // A length we cannot honour means the stream is out of
                         // sync, and there is no way to resynchronize a framed
                         // protocol other than to stop.
                         tracing::error!(len, "network stream framing lost");
                         break;
                     }
-                    if reader.read_exact(&mut frame[..len]).is_err() {
+                    let mut frame = vec![0u8; len];
+                    if reader.read_exact(&mut frame).is_err() {
                         break;
                     }
-                    if !Net::enqueue_received(&inbox, frame[..len].to_vec()) {
+                    if Net::enqueue_received(&inbox, frame) {
+                        pending += 1;
+                    } else {
                         tracing::trace!("receive backlog full; frame dropped");
-                        continue;
                     }
-                    wake();
+                    // Keep reading while the socket has more: a burst is moved
+                    // into the guest as one batch. A burst longer than the
+                    // backlog is flushed part way so nothing is dropped for
+                    // want of a look.
+                    if pending > 0 && (bytes_ready(&reader) == 0 || pending >= 256) {
+                        wake();
+                        pending = 0;
+                    }
                 }
                 tracing::debug!("network receiver stopped");
             })?;
@@ -274,6 +319,7 @@ impl Network {
 
 impl Drop for Network {
     fn drop(&mut self) {
+        self.outbox.close();
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket_path);
@@ -298,6 +344,76 @@ impl NetBackend for FramedStream {
         buf.extend_from_slice(frame);
         stream.write_all(&buf)
     }
+
+    /// A batch goes to the socket as one `writev`: two iovecs per frame, the
+    /// length and the payload, up to the platform's limit per call. One
+    /// syscall per burst instead of one per frame is most of what a stream
+    /// socket costs, and a partial write is completed before the next call
+    /// so the framing stays intact.
+    fn send_many(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        // IOV_MAX on macOS; frames beyond it go in the next call.
+        const IOVS_PER_CALL: usize = 1024;
+        let stream = self.stream.lock().expect("net stream poisoned");
+        let fd = stream.as_raw_fd();
+        let headers: Vec<[u8; 4]> = frames
+            .iter()
+            .map(|f| (f.len() as u32).to_be_bytes())
+            .collect();
+        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(frames.len() * 2);
+        for (header, frame) in headers.iter().zip(frames) {
+            iovs.push(libc::iovec {
+                iov_base: header.as_ptr() as *mut libc::c_void,
+                iov_len: 4,
+            });
+            iovs.push(libc::iovec {
+                iov_base: frame.as_ptr() as *mut libc::c_void,
+                iov_len: frame.len(),
+            });
+        }
+        for chunk in iovs.chunks_mut(IOVS_PER_CALL) {
+            write_all_vectored(fd, chunk)?;
+        }
+        Ok(())
+    }
+}
+
+/// `writev` until every iovec is on the socket, advancing past whatever a
+/// partial write took.
+fn write_all_vectored(fd: libc::c_int, iovs: &mut [libc::iovec]) -> io::Result<()> {
+    let mut first = 0usize;
+    while first < iovs.len() {
+        let rest = &iovs[first..];
+        // SAFETY: every iovec points into a frame or header that outlives
+        // this call, and the count is what the slice holds.
+        let n = unsafe { libc::writev(fd, rest.as_ptr(), rest.len() as libc::c_int) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        let mut n = n as usize;
+        while first < iovs.len() && n >= iovs[first].iov_len {
+            n -= iovs[first].iov_len;
+            first += 1;
+        }
+        if first < iovs.len() && n > 0 {
+            // SAFETY: advancing within the same buffer by fewer bytes than
+            // its length.
+            iovs[first].iov_base = unsafe { iovs[first].iov_base.add(n) };
+            iovs[first].iov_len -= n;
+        }
+    }
+    Ok(())
+}
+
+/// Bytes the kernel holds for this socket that have not been read yet.
+fn bytes_ready(stream: &UnixStream) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int through the pointer given.
+    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut n) };
+    if rc < 0 { 0 } else { n.max(0) as usize }
 }
 
 /// The network as somewhere Docker's published ports can be sent.
