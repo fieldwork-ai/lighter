@@ -43,6 +43,15 @@ if [ -z "$URL" ]; then
 	fi
 	TAG="v$VERSION"
 	URL="https://github.com/$REPO/releases/download/$TAG/lighter-$VERSION-arm64.tar.gz"
+	# A private repository answers the download URL with 404 whatever the
+	# token; its assets are fetched through the API by id. With a token in
+	# hand, resolve the asset that way so an install works before the
+	# repository is public, and for a fork that never will be.
+	if [ -n "${GITHUB_TOKEN:-}" ]; then
+		ASSET_ID="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/releases/tags/$TAG" 2>/dev/null \
+			| tr -d '\n' | grep -oE '"id": *[0-9]+,[^}]*"name": *"lighter-'"$VERSION"'-arm64\.tar\.gz"' | head -1 | grep -oE '[0-9]+' | head -1 || true)"
+		[ -n "$ASSET_ID" ] && URL="https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID"
+	fi
 fi
 
 log "Installing lighter $VERSION"
@@ -53,7 +62,9 @@ trap 'rm -rf "$WORK"' EXIT
 
 TARBALL="$WORK/lighter.tar.gz"
 log "Downloading $URL"
-curl -fL --progress-bar "$URL" -o "$TARBALL" || err "failed to download release archive from $URL"
+DOWNLOAD_HEADERS=()
+[ -n "${GITHUB_TOKEN:-}" ] && DOWNLOAD_HEADERS=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream")
+curl -fL --progress-bar "${DOWNLOAD_HEADERS[@]}" "$URL" -o "$TARBALL" || err "failed to download release archive from $URL"
 
 INSTALL_DIR="${LIGHTER_INSTALL_DIR:-$HOME/.lighter}"
 mkdir -p "$INSTALL_DIR"

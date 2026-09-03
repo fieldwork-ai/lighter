@@ -57,11 +57,21 @@ pub fn config_file() -> anyhow::Result<PathBuf> {
 /// Beside the binary when installed, and in the repository when run from a
 /// checkout — so `cargo run` and an installed copy both work without a flag
 /// or an environment variable to remember.
+/// The binary as it really lives, not as it was invoked. The installer and
+/// Homebrew both reach it through a symlink (`~/.local/bin/lighter`,
+/// `/opt/homebrew/bin/lighter`), and `current_exe` answers with the link:
+/// "beside the executable" then means beside the link, where there is no
+/// gvproxy and no `share`, and a fresh install could not start.
+fn executable() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
 pub fn guest_dir() -> anyhow::Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("LIGHTER_GUEST_DIR") {
         return Ok(PathBuf::from(explicit));
     }
-    let exe = std::env::current_exe()?;
+    let exe = executable()?;
     let beside = exe
         .parent()
         .map(|dir| dir.join("../share/lighter"))
@@ -94,7 +104,7 @@ pub fn gvproxy() -> anyhow::Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("LIGHTER_GVPROXY") {
         return Ok(PathBuf::from(explicit));
     }
-    let exe = std::env::current_exe()?;
+    let exe = executable()?;
     if let Some(beside) = exe.parent().map(|dir| dir.join("gvproxy"))
         && beside.exists()
     {

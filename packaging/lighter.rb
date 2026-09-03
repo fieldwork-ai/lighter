@@ -13,21 +13,20 @@ class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
   url "https://github.com/fieldwork-ai/lighter/releases/download/v0.1.0/lighter-0.1.0-arm64.tar.gz"
-  sha256 "e2675fad38f46e478a16e47ce0314c9614e63a001e4cefc910fc64047e498082"
+  sha256 "d93395cf23cfa0573012c13622ffca85a7b0b7234237d2021ed888b46c17f11f"
   license "MIT"
-  version "0.1.0"
 
   # Apple Silicon only, and not by omission: there is no Intel path and there
   # will not be one.
   depends_on arch: :arm64
-  depends_on macos: :sequoia
   # The client, which lighter is not. lighter is the daemon.
   depends_on "docker"
+  depends_on macos: :sequoia
 
   def install
     bin.install "bin/lighter"
     libexec.install "bin/gvproxy"
-    (share/"lighter").install Dir["share/lighter/*"]
+    pkgshare.install Dir["share/lighter/*"]
     prefix.install "LICENSE", "README.md"
   end
 
@@ -35,7 +34,7 @@ class Lighter < Formula
     # Verify the signature; if unsigned or stripped, sign ad-hoc with the hypervisor entitlement.
     unless quiet_system("/usr/bin/codesign", "--verify", bin/"lighter")
       system "/usr/bin/codesign", "--force", "--sign", "-",
-             "--entitlements", share/"lighter/entitlements.plist",
+             "--entitlements", pkgshare/"entitlements.plist",
              "--options", "runtime",
              bin/"lighter"
     end
