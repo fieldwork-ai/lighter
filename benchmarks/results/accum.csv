@@ -1,0 +1,10 @@
+case,rep,ms
+pnpm-install,1,4840
+pnpm-install,2,4079
+pnpm-install,3,3663
+npm-install,1,6180
+npm-install,2,6073
+npm-install,3,6078
+pnpm-install,1,4685
+pnpm-install,2,3741
+pnpm-install,3,4566
