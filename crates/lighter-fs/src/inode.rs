@@ -910,10 +910,45 @@ impl Inode {
         if let Some(fd) = self.fd.read().expect("inode slot poisoned").as_ref() {
             return Ok(Located::Fd(Reference(fd.clone())));
         }
-        if let Some((parent, name)) = self.place() {
-            return Ok(Located::At(parent.reference()?, name));
+        if let Some((ancestor, path)) = self.nearest_resident() {
+            return Ok(Located::At(ancestor, path));
         }
         Ok(Located::Fd(self.reference()?))
+    }
+
+    /// The nearest ancestor holding a descriptor, and the path from it to
+    /// here — several components when the directories between are parked.
+    ///
+    /// A parked directory need never be opened to reach what is inside it:
+    /// `openat` resolves the components in the kernel for a microsecond or
+    /// two each, where reviving the directory was an open, an fstat and a
+    /// close, and then its parent's if that was parked too. On a stock Mac
+    /// a package tree's directories alone outrun half the budget, so they
+    /// were parked and revived on every create inside them and every lookup
+    /// through them — the last of the revivals an install was made of. The
+    /// names on the way are real directories' (a symlink is never a parent
+    /// here), so nothing is followed that the guest did not walk itself.
+    fn nearest_resident(&self) -> Option<(Reference, std::ffi::CString)> {
+        let mut path: Vec<u8> = Vec::new();
+        let (mut parent, mut name) = self.place()?;
+        for _ in 0..256 {
+            if path.is_empty() {
+                path = name.to_bytes().to_vec();
+            } else {
+                let mut joined = name.to_bytes().to_vec();
+                joined.push(b'/');
+                joined.extend_from_slice(&path);
+                path = joined;
+            }
+            if let Some(fd) = parent.fd.read().expect("inode slot poisoned").as_ref() {
+                parent.used.store(true, Ordering::Relaxed);
+                return Some((Reference(fd.clone()), std::ffi::CString::new(path).ok()?));
+            }
+            let (next, next_name) = parent.place()?;
+            parent = next;
+            name = next_name;
+        }
+        None
     }
 
     pub fn reference(&self) -> Result<Reference, i32> {
@@ -972,14 +1007,24 @@ impl Inode {
     /// same numbers with the same birth time is the same file, and anything
     /// else is `ESTALE`.
     fn reopen(&self, parked: &Parked) -> Result<std::os::fd::OwnedFd, i32> {
-        REOPENS.fetch_add(1, Ordering::Relaxed);
+        // Every twenty-thousandth revival says where it came from, when the
+        // stats are on: the counter alone says how many, not why.
+        if REOPENS.fetch_add(1, Ordering::Relaxed) % 20_000 == 0
+            && std::env::var_os("LIGHTER_FS_STATS").is_some()
+        {
+            tracing::warn!(
+                id = self.id(),
+                dir = self.is_dir,
+                "REOPEN-SAMPLE {}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         // Through the parent first: one `openat` on a descriptor the share
         // keeps resident, against a walk of the whole absolute path. A
         // directory revived this way revives its own parent the same way,
         // so a cold subtree costs one open per level and no more.
-        if let Some((parent, name)) = self.place()
-            && let Ok(parent) = parent.reference()
-            && let Ok(fd) = crate::sys::open_reference(parent.raw_fd(), &name, self.is_symlink)
+        if let Some((ancestor, path)) = self.nearest_resident()
+            && let Ok(fd) = crate::sys::open_reference(ancestor.raw_fd(), &path, self.is_symlink)
             && let Ok(st) = crate::sys::stat_fd(fd.as_raw_fd())
             && st.st_ino == self.ino()
             && st.st_dev as i64 == self.dev()
@@ -1874,8 +1919,16 @@ impl Registry {
                     // under the budget), so the census never grows past the
                     // budget by rotation — the sets swap.
                     if inode.used.swap(false, Ordering::Relaxed) {
-                        let room =
-                            parked_total + self.budget.saturating_sub(self.census.descriptors());
+                        // Into headroom only — never into the room this
+                        // same sweep is making by parking. A working set
+                        // well past the budget made every pass park a
+                        // batch of cold files and revive a batch of warm
+                        // ones to fill their places, each revival an open
+                        // the workload had not asked for: three of five
+                        // sampled revivals on a stock Mac came from here.
+                        // A warm parked file is revived by the operation
+                        // that needs it, when it needs it.
+                        let room = self.budget.saturating_sub(self.census.descriptors());
                         if promoted_total < room && inode.promote() {
                             promoted_total += 1;
                         }
