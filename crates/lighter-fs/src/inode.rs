@@ -972,6 +972,7 @@ impl Inode {
     /// same numbers with the same birth time is the same file, and anything
     /// else is `ESTALE`.
     fn reopen(&self, parked: &Parked) -> Result<std::os::fd::OwnedFd, i32> {
+        REOPENS.fetch_add(1, Ordering::Relaxed);
         // Through the parent first: one `openat` on a descriptor the share
         // keeps resident, against a walk of the whole absolute path. A
         // directory revived this way revives its own parent the same way,
@@ -1107,6 +1108,28 @@ impl Inode {
     /// opened on, so if that file has been unlinked its link count is zero, and
     /// if the number now belongs to something else the numbers no longer match.
     fn still_is(&self, dev: i64, ino: u64) -> bool {
+        // A parked file with a place is checked by its name: one fstatat
+        // against the parent's descriptor, with the birth time recorded at
+        // parking as the tiebreak against a reused inode number. Reviving it
+        // to fstat it was an open, an fstat and a close — and a listing
+        // asks this of every entry, so a readdirplus of a package directory
+        // was reviving every file a clone had just made: two hundred
+        // thousand opens across three installs, on either machine.
+        if self.fd.read().expect("inode slot poisoned").is_none()
+            && let Some((parent, name)) = self.place()
+            && let Some(parked) = self.parked_at.lock().expect("parked path poisoned").clone()
+            && let Ok(parent_ref) = parent.reference()
+        {
+            return match crate::sys::stat_at(parent_ref.raw_fd(), &name) {
+                Ok(st) => {
+                    st.st_nlink > 0
+                        && st.st_ino == ino
+                        && st.st_dev as i64 == dev
+                        && (st.st_birthtime, st.st_birthtime_nsec) == parked.birthtime
+                }
+                Err(_) => false,
+            };
+        }
         let reference = match self.reference() {
             Ok(reference) => reference,
             Err(errno) => {
@@ -1239,6 +1262,10 @@ fn shard(key: u64) -> usize {
 }
 
 /// Every inode and open handle the guest currently holds.
+/// Revivals of parked inodes since start: each is an open the workload did
+/// not ask for. Diagnostics, printed with the share's stats.
+pub static REOPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Registry {
     /// Sharded by `nodeid`.
     by_id: [Mutex<HashMap<u64, Arc<Inode>>>; SHARDS],
@@ -1308,6 +1335,11 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Descriptors the registry holds open right now. Diagnostics.
+    pub fn descriptors(&self) -> usize {
+        self.census.descriptors()
+    }
+
     /// Builds a registry whose root is `root_fd`.
     pub fn new(root_fd: OwnedFd, dev: i64, ino: u64) -> Registry {
         // The root is never forgotten: the kernel does not FORGET nodeid 1, and

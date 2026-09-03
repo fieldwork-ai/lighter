@@ -1919,3 +1919,38 @@ fn two_renames_onto_one_promised_name_land_in_order() {
     let found = guest.lookup(1, "final").expect("lookup");
     assert_eq!(found, b, "the name resolves to the second writer's file");
 }
+
+/// A listing of a directory full of clones — bound parked, every one of
+/// them — checks each entry's identity by its name, not by reviving it. A
+/// readdirplus of a package directory was one open, fstat and close per
+/// file it had just made.
+#[test]
+fn listing_parked_clones_revives_none_of_them() {
+    let mut guest = Guest::new("readdirplus-parked");
+    std::fs::write(guest.host("store"), b"bytes").unwrap();
+    let store = guest.lookup(1, "store").expect("lookup");
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("pkg"));
+    let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+    let pkg = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    for i in 0..40 {
+        let (dest, _fh) = guest.create(pkg, &format!("f{i}"), 0x8241).expect("create");
+        let mut body = Vec::new();
+        body.extend_from_slice(&store.to_le_bytes());
+        body.extend_from_slice(&pkg.to_le_bytes());
+        body.extend_from_slice(&5u64.to_le_bytes());
+        body.extend_from_slice(&0o100644u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(format!("f{i}\0").as_bytes());
+        guest.call(op::LIGHTER_CLONE, dest, &body).expect("clone");
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let before = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut body = vec![0u8; 40];
+    body[16..20].copy_from_slice(&65536u32.to_le_bytes());
+    let listing = guest.call(op::READDIRPLUS, pkg, &body).expect("readdirplus");
+    assert!(listing.len() > 40 * 32, "every entry listed");
+    let revived = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert_eq!(revived, 0, "a listing revives nothing");
+}

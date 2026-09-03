@@ -1046,6 +1046,12 @@ impl Server {
 
     /// Prints the opcode histogram, if one was being kept.
     pub fn log_stats(&self) {
+        tracing::info!(
+            reopens = crate::inode::REOPENS.load(Ordering::Relaxed),
+            descriptors = self.registry.descriptors(),
+            inodes = self.live_inodes(),
+            "FSSTATS parked"
+        );
         if self.stats.enabled() {
             let (open, budget) = self.registry.descriptor_usage();
             tracing::info!(
