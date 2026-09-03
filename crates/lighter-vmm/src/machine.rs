@@ -311,8 +311,12 @@ impl Machine {
             {
                 let mut held = transport.lock().expect("fs transport poisoned");
                 let signal = kicks.clone();
-                let first = virtio::fs::REQUEST_QUEUE;
-                let last = first + virtio::fs::request_queues();
+                // Hiprio too: FORGET rides it, and an install forgets a name
+                // for every one it makes. Unwatched, each batch of forgets was
+                // a doorbell exit while the request queues were quiet — forty
+                // percent of an install's kicks were these.
+                let first = virtio::fs::HIPRIO_QUEUE;
+                let last = virtio::fs::REQUEST_QUEUE + virtio::fs::request_queues();
                 held.set_kick_observer(Arc::new(move |queue| {
                     if (first..last).contains(&queue) {
                         signal.kicked();
@@ -323,7 +327,7 @@ impl Machine {
             // watcher is a thread that spins, and the probe it spins on is a
             // single memory read, so covering four rings costs four reads a
             // turn instead of four threads.
-            let watched: Vec<u16> = (virtio::fs::REQUEST_QUEUE
+            let watched: Vec<u16> = (virtio::fs::HIPRIO_QUEUE
                 ..virtio::fs::REQUEST_QUEUE + virtio::fs::request_queues())
                 .collect();
             let poller = virtio::poll::spawn(

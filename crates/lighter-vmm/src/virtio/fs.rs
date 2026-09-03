@@ -697,9 +697,18 @@ impl VirtioDevice for Fs {
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let polled =
                             crate::virtio::mmio::POLLED.load(std::sync::atomic::Ordering::Relaxed);
+                        let by_kind = crate::virtio::mmio::NOTIFY_KINDS
+                            .iter()
+                            .zip(crate::virtio::mmio::NOTIFIES_BY_KIND.iter())
+                            .map(|(kind, count)| {
+                                format!("{kind}={}", count.load(std::sync::atomic::Ordering::Relaxed))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         tracing::info!(
                             notifies = notifies - last_notifies,
                             polled = polled - last_polled,
+                            by_kind,
                             "VMMSTATS"
                         );
                         (last_notifies, last_polled) = (notifies, polled);

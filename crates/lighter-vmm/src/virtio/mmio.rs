@@ -164,6 +164,20 @@ impl QueueSignal {
 /// says whether the poller is sparing the guest its exits.
 pub static NOTIFIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static POLLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Doorbell exits per device kind: fs, block, vsock, net, other — so a
+/// count of traps says which device the guest is still kicking.
+pub static NOTIFIES_BY_KIND: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub const NOTIFY_KINDS: [&str; 5] = ["fs", "blk", "vsock", "net", "other"];
+fn notify_kind(name: &str) -> usize {
+    match name {
+        "fs" => 0,
+        "virtio-blk" => 1,
+        "virtio-vsock" => 2,
+        "virtio-net" => 3,
+        _ => 4,
+    }
+}
 
 impl VirtioMmio {
     pub fn new(
@@ -256,6 +270,8 @@ impl VirtioMmio {
     /// Handles a queue notification.
     fn notify_queue(&mut self, index: u16) {
         NOTIFIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        NOTIFIES_BY_KIND[notify_kind(self.device.name())]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.activated {
             // A notification before DRIVER_OK is a driver bug, not something to
             // service: the device has no memory to work against yet.
