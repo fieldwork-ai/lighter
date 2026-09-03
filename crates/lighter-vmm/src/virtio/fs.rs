@@ -707,7 +707,10 @@ impl VirtioDevice for Fs {
                             .iter()
                             .zip(crate::virtio::mmio::NOTIFIES_BY_KIND.iter())
                             .map(|(kind, count)| {
-                                format!("{kind}={}", count.load(std::sync::atomic::Ordering::Relaxed))
+                                format!(
+                                    "{kind}={}",
+                                    count.load(std::sync::atomic::Ordering::Relaxed)
+                                )
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
@@ -715,7 +718,8 @@ impl VirtioDevice for Fs {
                             notifies = notifies - last_notifies,
                             polled = polled - last_polled,
                             by_kind,
-                            invalidations = lighter_fs::notify::PUSHED.load(std::sync::atomic::Ordering::Relaxed),
+                            invalidations = lighter_fs::notify::PUSHED
+                                .load(std::sync::atomic::Ordering::Relaxed),
                             "VMMSTATS"
                         );
                         (last_notifies, last_polled) = (notifies, polled);

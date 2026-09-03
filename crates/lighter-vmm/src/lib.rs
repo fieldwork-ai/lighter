@@ -26,9 +26,9 @@
 //! ```
 
 pub mod bus;
-pub mod exitstats;
 pub mod console;
 pub mod devices;
+pub mod exitstats;
 pub mod fdt;
 pub mod footprint;
 pub mod irq;
