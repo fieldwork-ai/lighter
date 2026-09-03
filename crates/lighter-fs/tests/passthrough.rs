@@ -1846,7 +1846,11 @@ fn a_clone_is_read_through_the_nodeid_the_caller_holds() {
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(b"index.js\0");
     let reply = guest.call(op::LIGHTER_CLONE, dest, &body).expect("clone");
-    assert_eq!(reply.len(), 8 + 8 + 4 + 4 + 88, "size, validity and an attr");
+    assert_eq!(
+        reply.len(),
+        8 + 8 + 4 + 4 + 88,
+        "size, validity and an attr"
+    );
     let size = u64::from_le_bytes(reply[0..8].try_into().unwrap());
     assert_eq!(size, 17);
     let attr_size = u64::from_le_bytes(reply[24 + 8..24 + 16].try_into().unwrap());
@@ -1855,17 +1859,28 @@ fn a_clone_is_read_through_the_nodeid_the_caller_holds() {
     guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
     let bytes = guest.read(dest, dest_fh, 0, 64).expect("read");
     assert_eq!(bytes, b"the store's bytes");
-    assert_eq!(std::fs::read(guest.host("index.js")).unwrap(), b"the store's bytes");
+    assert_eq!(
+        std::fs::read(guest.host("index.js")).unwrap(),
+        b"the store's bytes"
+    );
     guest.call(op::RELEASE, dest, &[0u8; 24]).expect("release");
-    guest.call(op::UNLINK, 1, &name_body("index.js")).expect("unlink");
-    guest.call(op::UNLINK, 1, &name_body("store")).expect("unlink");
+    guest
+        .call(op::UNLINK, 1, &name_body("index.js"))
+        .expect("unlink");
+    guest
+        .call(op::UNLINK, 1, &name_body("store"))
+        .expect("unlink");
     guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
     for (nodeid, count) in [(dest, 1u64), (store, 1u64)] {
         let mut forget = Vec::new();
         forget.extend_from_slice(&count.to_le_bytes());
         let _ = guest.call(op::FORGET, nodeid, &forget);
     }
-    assert_eq!(guest.server.live_inodes(), before, "the replacement went with its holder");
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "the replacement went with its holder"
+    );
 }
 
 /// Two writers racing to make the same name — pnpm's content-addressed store
@@ -1876,8 +1891,12 @@ fn a_clone_is_read_through_the_nodeid_the_caller_holds() {
 fn a_second_exclusive_create_of_a_promised_name_is_eexist() {
     let mut guest = Guest::new("create-race");
     // O_WRONLY|O_CREAT|O_EXCL
-    let (first, fh) = guest.create(1, "hash", 0x8241 | 0o200).expect("first create");
-    guest.write(first, fh, 0, b"first writer's bytes").expect("write");
+    let (first, fh) = guest
+        .create(1, "hash", 0x8241 | 0o200)
+        .expect("first create");
+    guest
+        .write(first, fh, 0, b"first writer's bytes")
+        .expect("write");
     let second = guest.create(1, "hash", 0x8241 | 0o200);
     assert_eq!(second, Err(17), "the promised name already exists");
     guest.call(op::RELEASE, first, &[0u8; 24]).expect("release");
@@ -1889,7 +1908,10 @@ fn a_second_exclusive_create_of_a_promised_name_is_eexist() {
     );
     // And a non-exclusive create of a promised name opens the promise.
     let (third, _) = guest.create(1, "hash", 0x8241).expect("open existing");
-    assert_eq!(third, first, "the same file, under the nodeid the guest holds");
+    assert_eq!(
+        third, first,
+        "the same file, under the nodeid the guest holds"
+    );
 }
 
 /// Two writers making the same content-addressed file: each writes its own
@@ -1949,8 +1971,82 @@ fn listing_parked_clones_revives_none_of_them() {
     let before = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed);
     let mut body = vec![0u8; 40];
     body[16..20].copy_from_slice(&65536u32.to_le_bytes());
-    let listing = guest.call(op::READDIRPLUS, pkg, &body).expect("readdirplus");
+    let listing = guest
+        .call(op::READDIRPLUS, pkg, &body)
+        .expect("readdirplus");
     assert!(listing.len() > 40 * 32, "every entry listed");
     let revived = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
     assert_eq!(revived, 0, "a listing revives nothing");
+}
+
+#[test]
+fn a_parked_directory_is_not_revived_by_creating_inside_it() {
+    // SAFETY: set before the server is built, and the value is read once.
+    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "64") };
+    let mut guest = Guest::new("parked-dirs");
+    const DIRS: usize = 200;
+    let mut dirs = Vec::new();
+    for n in 0..DIRS {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(&format!("d{n}")));
+        let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+        dirs.push(u64::from_le_bytes(reply[0..8].try_into().unwrap()));
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let (open, budget) = guest.server.descriptor_usage();
+    assert!(
+        open <= budget * 2,
+        "the directories were not parked: {open} against {budget}"
+    );
+
+    // A create, a lookup, a stat of the name, a mkdir, an unlink and a
+    // rename in each parked directory, none of which opens the directory:
+    // its nearest resident ancestor and a relative path do the work.
+    let before = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed);
+    for (n, dir) in dirs.iter().enumerate() {
+        let (file, fh) = guest.create(*dir, "made", 0x8241).expect("create");
+        guest.write(file, fh, 0, b"x").unwrap();
+        assert_eq!(
+            guest.lookup(*dir, "made").unwrap(),
+            file,
+            "d{n}: looked up by name"
+        );
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body("sub"));
+        guest.call(op::MKDIR, *dir, &body).expect("mkdir inside");
+        let mut body = dir.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(b"made\0moved\0");
+        guest.call(op::RENAME2, *dir, &body).expect("rename inside");
+        // Settled before the unlink: a name whose rename is still queued
+        // is rightly checked by identity, which is a revival.
+        guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+        guest
+            .call(op::UNLINK, *dir, &name_body("moved"))
+            .expect("unlink inside");
+        guest
+            .call(op::RMDIR, *dir, &name_body("sub"))
+            .expect("rmdir inside");
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let revived = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    // The sweep promotes a few directories into headroom as it goes; the
+    // operations themselves revive nothing.
+    assert!(
+        revived <= 16,
+        "working inside parked directories revived {revived} inodes"
+    );
+    for n in 0..DIRS {
+        let left: Vec<_> = std::fs::read_dir(guest.host(&format!("d{n}")))
+            .unwrap()
+            .collect();
+        assert!(
+            left.is_empty(),
+            "d{n}: everything made inside was taken away again"
+        );
+    }
+    unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
 }

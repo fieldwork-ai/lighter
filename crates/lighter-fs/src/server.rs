@@ -291,18 +291,19 @@ fn create_job(
             flags
         };
         let result = (|| {
-            let parent_fd = parent.reference()?;
-            let fd = sys::openat_path(
-                parent_fd.raw_fd(),
-                &name,
-                host_flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
-                mode,
-            )?;
+            let fd = parent.under_name(&name, |dir, at| {
+                sys::openat_path(
+                    dir,
+                    at,
+                    host_flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
+                    mode,
+                )
+            })?;
             let st = sys::stat_fd(fd.as_raw_fd())?;
             Ok((fd, st))
         })();
         match result {
-            Ok((fd, st)) => {
+            Ok((fd, mut st)) => {
                 // The bytes promised while the create was held back are the
                 // create's to keep — and then the attributes, since a write
                 // moves the time and the last promise made wins.
@@ -319,6 +320,14 @@ fn create_job(
                             TimeSpec::At(meta.atime.0, meta.atime.1 as u32),
                             TimeSpec::At(meta.mtime.0, meta.mtime.1 as u32),
                         );
+                        // APFS moves a file's birth time back to a modification
+                        // time set earlier than it — and the promised time is
+                        // earlier, the guest having been answered before the
+                        // host made the file. The identity a parked file is
+                        // checked by later must be the one that resulted.
+                        if let Ok(again) = sys::stat_fd(fd.as_raw_fd()) {
+                            st = again;
+                        }
                     }
                 }
                 // Two descriptors, as the synchronous path keeps two: a
@@ -1491,7 +1500,7 @@ impl Server {
     /// body that LOOKUP, CREATE, MKDIR and friends all end with.
     fn entry(&self, parent: &Arc<Inode>, name: &CString) -> Result<EntryOut, i32> {
         let mark = self.apply.applied();
-        let st = sys::stat_at(parent.reference()?.raw_fd(), name)?;
+        let st = parent.under_name(name, |dir, at| sys::stat_at(dir, at))?;
         self.entry_from(parent, name, st, mark)
     }
 
@@ -1536,7 +1545,7 @@ impl Server {
             {
                 return Err(PARK_ON_ENTRY);
             }
-            sys::open_reference(parent.reference()?.raw_fd(), name, is_symlink)
+            parent.under_name(name, |dir, at| sys::open_reference(dir, at, is_symlink))
         });
         let entry = match entry {
             Err(PARK_ON_ENTRY) => {
@@ -1834,7 +1843,11 @@ impl Server {
             };
             self.stats.count(&format!(
                 "getattr={kind}{}",
-                if flags & fuse::GETATTR_FH != 0 { "+fh" } else { "" }
+                if flags & fuse::GETATTR_FH != 0 {
+                    "+fh"
+                } else {
+                    ""
+                }
             ));
         }
         if let Ok(inode) = self.inode(nodeid)
@@ -2308,7 +2321,7 @@ impl Server {
         let umask = get_u32(body, 8).unwrap_or(0);
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        sys::mknod_at(parent.reference()?.raw_fd(), &name, mode & !umask, rdev)?;
+        parent.under_name(&name, |dir, at| sys::mknod_at(dir, at, mode & !umask, rdev))?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
@@ -2330,7 +2343,7 @@ impl Server {
             return Ok(reply);
         }
         self.settle_while(&parent, |parent| parent.is_pending());
-        sys::mkdir_at(parent.reference()?.raw_fd(), &name, mode)?;
+        parent.under_name(&name, |dir, at| sys::mkdir_at(dir, at, mode))?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
@@ -2359,7 +2372,7 @@ impl Server {
         }
         if dir
             && self.apply.accepting()
-            && let Ok(st) = sys::stat_at(parent.reference()?.raw_fd(), &name)
+            && let Ok(st) = parent.under_name(&name, |dir, at| sys::stat_at(dir, at))
             && let Some(child) = self.registry.identified(st.st_dev as i64, st.st_ino)
         {
             // RMDIR, acknowledged: the guest removes a directory it has
@@ -2449,7 +2462,7 @@ impl Server {
                 let name = name.clone();
                 move || {
                     if let Err(errno) =
-                        (|| sys::unlink_at(parent.reference()?.raw_fd(), &name, true))()
+                        (|| parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, true)))()
                     {
                         tracing::warn!(
                             errno,
@@ -2492,7 +2505,8 @@ impl Server {
             // lookup left every unlinked file one FORGET short of release —
             // pinned in the table with its descriptor, until the sweep had
             // nothing left it was allowed to park.
-            let target_out = sys::stat_at(parent.reference()?.raw_fd(), &name)
+            let target_out = parent
+                .under_name(&name, |dir, at| sys::stat_at(dir, at))
                 .ok()
                 .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino));
             if let Some(target) = &target_out {
@@ -2508,7 +2522,7 @@ impl Server {
                 let target = target_out.clone();
                 move || {
                     if let Err(errno) =
-                        (|| sys::unlink_at(parent.reference()?.raw_fd(), &name, false))()
+                        (|| parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, false)))()
                     {
                         tracing::warn!(
                             errno,
@@ -2554,36 +2568,36 @@ impl Server {
                 "NAME-DEBUG unlink taking the synchronous path"
             );
         }
-        let result = sys::unlink_at(parent.reference()?.raw_fd(), &name, dir);
+        let result = parent.under_name(&name, |under, at| sys::unlink_at(under, at, dir));
         if dir && result == Err(linux::ENOTEMPTY) && self.stats.enabled() {
             // What the host still holds, and what this server knows of each
             // name: the diagnostic for an `rm -rf` the guest believed had
             // emptied the directory.
-            let left: Vec<String> =
-                sys::openat_path(parent.reference()?.raw_fd(), &name, 0o200000, 0)
-                    .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .filter(|e| e.name != b"." && e.name != b"..")
-                            .take(12)
-                            .map(|e| {
-                                let known = self.registry.identified(parent.dev(), e.ino);
-                                format!(
-                                    "{}:{}",
-                                    String::from_utf8_lossy(&e.name),
-                                    known
-                                        .map(|i| format!(
-                                            "known#{}{}",
-                                            i.id(),
-                                            if i.is_pending() { ",pending" } else { "" }
-                                        ))
-                                        .unwrap_or_else(|| "unknown".into())
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+            let left: Vec<String> = parent
+                .under_name(&name, |dir, at| sys::openat_path(dir, at, 0o200000, 0))
+                .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|e| e.name != b"." && e.name != b"..")
+                        .take(12)
+                        .map(|e| {
+                            let known = self.registry.identified(parent.dev(), e.ino);
+                            format!(
+                                "{}:{}",
+                                String::from_utf8_lossy(&e.name),
+                                known
+                                    .map(|i| format!(
+                                        "known#{}{}",
+                                        i.id(),
+                                        if i.is_pending() { ",pending" } else { "" }
+                                    ))
+                                    .unwrap_or_else(|| "unknown".into())
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             tracing::warn!(
                 dir = %name.to_string_lossy(),
                 left = ?left,
@@ -2612,7 +2626,10 @@ impl Server {
         new: &CString,
     ) -> Result<Option<Vec<u8>>, i32> {
         if !self.apply.accepting() || old_parent.name_pending_gone(old.to_bytes()) {
-            { self.stats.count("rename-none=0"); return Ok(None) };
+            {
+                self.stats.count("rename-none=0");
+                return Ok(None);
+            };
         }
         let nodeid = match old_parent.pending_child(old.to_bytes()) {
             Some(nodeid) => {
@@ -2627,7 +2644,7 @@ impl Server {
                         && !new_parent.name_pending_gone(new.to_bytes())
                         && (new_parent.is_pending()
                             || matches!(
-                                sys::stat_at(new_parent.reference()?.raw_fd(), new),
+                                new_parent.under_name(new, |dir, at| sys::stat_at(dir, at)),
                                 Err(errno) if errno == linux::ENOENT
                             ));
                     match held.get_mut(&nodeid) {
@@ -2664,23 +2681,35 @@ impl Server {
                 nodeid
             }
             None => {
-                let st = match sys::stat_at(old_parent.reference()?.raw_fd(), old) {
+                let st = match old_parent.under_name(old, |dir, at| sys::stat_at(dir, at)) {
                     Ok(st) => st,
-                    Err(_) => { self.stats.count("rename-none=1"); return Ok(None) },
+                    Err(_) => {
+                        self.stats.count("rename-none=1");
+                        return Ok(None);
+                    }
                 };
                 // Files and directories are promised; anything else (a
                 // symlink, a device) takes the synchronous path.
                 if st.st_mode & 0o170000 != 0o100000 && st.st_mode & 0o170000 != 0o040000 {
-                    { self.stats.count("rename-none=2"); return Ok(None) };
+                    {
+                        self.stats.count("rename-none=2");
+                        return Ok(None);
+                    };
                 }
                 match self.registry.identified(st.st_dev as i64, st.st_ino) {
                     Some(inode) => inode.id(),
-                    None => { self.stats.count("rename-none=3"); return Ok(None) },
+                    None => {
+                        self.stats.count("rename-none=3");
+                        return Ok(None);
+                    }
                 }
             }
         };
         let Some(inode) = self.registry.get(nodeid) else {
-            { self.stats.count("rename-none=4"); return Ok(None) };
+            {
+                self.stats.count("rename-none=4");
+                return Ok(None);
+            };
         };
         // A directory is promised like a file: its children reach it by its
         // descriptor, which a rename does not disturb, and its held creates
@@ -2696,13 +2725,17 @@ impl Server {
         let displaced = if let Some(id) = new_parent.pending_child(new.to_bytes()) {
             self.registry.get(id)
         } else {
-            sys::stat_at(new_parent.reference()?.raw_fd(), new)
+            new_parent
+                .under_name(new, |dir, at| sys::stat_at(dir, at))
                 .ok()
                 .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
         };
         if let Some(displaced) = &displaced {
             if displaced.is_dir {
-                { self.stats.count("rename-none=6"); return Ok(None) };
+                {
+                    self.stats.count("rename-none=6");
+                    return Ok(None);
+                };
             }
             // Not withdrawn: a descriptor the guest holds on the displaced
             // file keeps reading it after the rename, so it must exist.
@@ -2725,13 +2758,11 @@ impl Server {
             let displaced = displaced.clone();
             move || {
                 if let Err(errno) = (|| {
-                    sys::rename_at(
-                        old_parent.reference()?.raw_fd(),
-                        &old,
-                        new_parent.reference()?.raw_fd(),
-                        &new,
-                        0,
-                    )
+                    old_parent.under_name(&old, |old_dir, old_at| {
+                        new_parent.under_name(&new, |new_dir, new_at| {
+                            sys::rename_at(old_dir, old_at, new_dir, new_at, 0)
+                        })
+                    })
                 })() {
                     tracing::warn!(
                         errno,
@@ -2771,7 +2802,8 @@ impl Server {
 
     fn rename(&self, parent: u64, body: &[u8], two: bool) -> Result<Vec<u8>, i32> {
         let t0 = std::time::Instant::now();
-        let phase = |k: &str, t: std::time::Instant| self.stats.add(k, t.elapsed().as_micros() as u64);
+        let phase =
+            |k: &str, t: std::time::Instant| self.stats.add(k, t.elapsed().as_micros() as u64);
         let old_parent = self.directory(parent)?;
         let newdir = self.resolve(get_u64(body, 0).ok_or(linux::EINVAL)?);
         let (flags, names) = if two {
@@ -2812,13 +2844,11 @@ impl Server {
         });
         phase("rename-us-3-settle-names", t2);
         let t3 = std::time::Instant::now();
-        sys::rename_at(
-            old_parent.reference()?.raw_fd(),
-            &old,
-            new_parent.reference()?.raw_fd(),
-            &new,
-            flags,
-        )?;
+        old_parent.under_name(&old, |old_dir, old_at| {
+            new_parent.under_name(&new, |new_dir, new_at| {
+                sys::rename_at(old_dir, old_at, new_dir, new_at, flags)
+            })
+        })?;
         phase("rename-us-4-host", t3);
         phase("rename-us-total", t0);
         Ok(Vec::new())
@@ -2843,7 +2873,9 @@ impl Server {
         // by its live path — which is correct even if it has been renamed since
         // the guest looked it up.
         let source = self.path(&target)?;
-        sys::link_at(libc::AT_FDCWD, &source, parent.reference()?.raw_fd(), &name)?;
+        parent.under_name(&name, |dir, at| {
+            sys::link_at(libc::AT_FDCWD, &source, dir, at)
+        })?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
@@ -2875,7 +2907,7 @@ impl Server {
         }
         // A pending parent has nothing in it the overlay does not know.
         if !parent.is_pending() && !parent.name_pending_gone(name.to_bytes()) {
-            match sys::stat_at(parent.reference()?.raw_fd(), name) {
+            match parent.under_name(name, |dir, at| sys::stat_at(dir, at)) {
                 Err(errno) if errno == linux::ENOENT => {}
                 other => {
                     if self.debug_name.as_deref() == Some(name.to_bytes()) {
@@ -2925,15 +2957,16 @@ impl Server {
             let is_symlink = matches!(kind, crate::inode::PendingKind::Symlink);
             move || {
                 let result = (|| {
-                    let parent_ref = parent.reference()?;
-                    match &target {
-                        Some(target) => sys::symlink_at(target, parent_ref.raw_fd(), &name)?,
-                        None => {
-                            let mode = inode.pending_meta().map(|m| m.mode).unwrap_or(mode);
-                            sys::mkdir_at(parent_ref.raw_fd(), &name, mode & 0o7777)?;
+                    let fd = parent.under_name(&name, |dir, at| {
+                        match &target {
+                            Some(target) => sys::symlink_at(target, dir, at)?,
+                            None => {
+                                let mode = inode.pending_meta().map(|m| m.mode).unwrap_or(mode);
+                                sys::mkdir_at(dir, at, mode & 0o7777)?;
+                            }
                         }
-                    }
-                    let fd = sys::open_reference(parent_ref.raw_fd(), &name, is_symlink)?;
+                        sys::open_reference(dir, at, is_symlink)
+                    })?;
                     let st = sys::stat_fd(fd.as_raw_fd())?;
                     Ok((fd, st))
                 })();
@@ -3007,7 +3040,7 @@ impl Server {
             return Err(linux::EEXIST);
         }
         if !parent.name_pending_gone(name.to_bytes()) {
-            match sys::stat_at(parent.reference()?.raw_fd(), name) {
+            match parent.under_name(name, |dir, at| sys::stat_at(dir, at)) {
                 Err(errno) if errno == linux::ENOENT => {}
                 _ => return Ok(None),
             }
@@ -3022,7 +3055,6 @@ impl Server {
             let name = name.clone();
             move || {
                 let result = (|| {
-                    let parent_ref = parent.reference()?;
                     // Bound by now, or its create failed — and a provisional
                     // number names nothing on the volume.
                     if target.is_pending() || target.ino() & crate::inode::PROVISIONAL_INO != 0 {
@@ -3033,7 +3065,9 @@ impl Server {
                         target.dev(),
                         target.ino()
                     )))?;
-                    sys::link_at(libc::AT_FDCWD, &source, parent_ref.raw_fd(), &name)
+                    parent.under_name(&name, |dir, at| {
+                        sys::link_at(libc::AT_FDCWD, &source, dir, at)
+                    })
                 })();
                 if let Err(errno) = result {
                     tracing::warn!(
@@ -3157,7 +3191,8 @@ impl Server {
     /// a clone — and took seventeen.
     fn clone_over(&self, caller: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let t0 = std::time::Instant::now();
-        let phase = |k: &str, t: std::time::Instant| self.stats.add(k, t.elapsed().as_micros() as u64);
+        let phase =
+            |k: &str, t: std::time::Instant| self.stats.add(k, t.elapsed().as_micros() as u64);
         // Both name nodeids in the body, not the header, so the dispatch-time
         // resolution has not seen them: the source may be the guest's open
         // descriptor on a file a clone has since replaced.
@@ -3220,7 +3255,6 @@ impl Server {
         let t2 = std::time::Instant::now();
         if !self.apply.accepting() {
             self.settle_while(&source, |source| source.is_dirty());
-            let parent_ref = parent.reference()?;
             let tmp = sys::c_path(&std::path::PathBuf::from(format!(
                 ".lighter-clone-{}",
                 std::process::id() as u64 ^ nodeid_in
@@ -3229,12 +3263,18 @@ impl Server {
                 Some(path) => path.clone(),
                 None => self.path(&source)?,
             };
-            sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
-            if let Err(e) = sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &name, 0)
-            {
-                let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
-                return Err(e);
-            }
+            parent.under(|parent_ref, prefix| {
+                let tmp = crate::inode::join(prefix, &tmp);
+                let at = crate::inode::join(prefix, &name);
+                sys::clonefile_at(&source_path, parent_ref.raw_fd(), &tmp)?;
+                if let Err(e) =
+                    sys::rename_at(parent_ref.raw_fd(), &tmp, parent_ref.raw_fd(), &at, 0)
+                {
+                    let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
+                    return Err(e);
+                }
+                Ok(())
+            })?;
             let mut out = Vec::with_capacity(8);
             out.extend_from_slice(&size.to_le_bytes());
             return Ok(out);
@@ -3263,7 +3303,8 @@ impl Server {
         } else if parent.is_pending() {
             None
         } else {
-            sys::stat_at(parent.reference()?.raw_fd(), &name)
+            parent
+                .under_name(&name, |dir, at| sys::stat_at(dir, at))
                 .ok()
                 .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
         };
@@ -3315,8 +3356,8 @@ impl Server {
             let dest = dest.clone();
             let name = name.clone();
             move || {
-                let result = (|| {
-                    let parent_ref = parent.reference()?;
+                let result = parent.under(|parent_ref, prefix| {
+                    let dest_at = crate::inode::join(prefix, &name);
                     // Straight to the name when nothing holds it — the
                     // common case, pnpm importing into a fresh store — and
                     // the rename is saved: forty-seven microseconds of APFS
@@ -3344,7 +3385,8 @@ impl Server {
                         Source::Cached(file) if file.readable => file.fd.as_raw_fd(),
                         Source::At(parent_ref, name) => {
                             const LINUX_O_NOFOLLOW: u32 = 0o400000;
-                            opened = sys::openat_path(parent_ref.raw_fd(), name, LINUX_O_NOFOLLOW, 0)?;
+                            opened =
+                                sys::openat_path(parent_ref.raw_fd(), name, LINUX_O_NOFOLLOW, 0)?;
                             opened.as_raw_fd()
                         }
                         Source::Held(reference) => {
@@ -3402,12 +3444,12 @@ impl Server {
                             other => other,
                         }
                     };
-                    match clone(&name) {
+                    match clone(&dest_at) {
                         Ok(()) => {}
                         Err(e)
                             if e == linux::EEXIST
-                                && sys::unlink_at(parent_ref.raw_fd(), &name, false).is_ok()
-                                && clone(&name).is_ok() => {}
+                                && sys::unlink_at(parent_ref.raw_fd(), &dest_at, false).is_ok()
+                                && clone(&dest_at).is_ok() => {}
                         Err(e) if e == linux::EEXIST => {
                             // Unlink-then-clone was refused; the atomic route.
                             // Unique per job: one source is cloned to many
@@ -3418,12 +3460,13 @@ impl Server {
                                 std::process::id(),
                                 nodeid
                             )))?;
+                            let tmp = crate::inode::join(prefix, &tmp);
                             clone(&tmp)?;
                             if let Err(e) = sys::rename_at(
                                 parent_ref.raw_fd(),
                                 &tmp,
                                 parent_ref.raw_fd(),
-                                &name,
+                                &dest_at,
                                 0,
                             ) {
                                 let _ = sys::unlink_at(parent_ref.raw_fd(), &tmp, false);
@@ -3444,7 +3487,7 @@ impl Server {
                             if let Some(mode) = change.mode {
                                 match &made {
                                     Some(fd) => sys::chmod_fd(fd.as_raw_fd(), mode)?,
-                                    None => sys::chmod_at(parent_ref.raw_fd(), &name, mode)?,
+                                    None => sys::chmod_at(parent_ref.raw_fd(), &dest_at, mode)?,
                                 }
                             }
                             if change.atime.is_some() || change.mtime.is_some() {
@@ -3460,7 +3503,7 @@ impl Server {
                                     )?,
                                     None => sys::utimes_at(
                                         parent_ref.raw_fd(),
-                                        &name,
+                                        &dest_at,
                                         at(change.atime),
                                         at(change.mtime),
                                     )?,
@@ -3474,9 +3517,9 @@ impl Server {
                     // the first operation that needs it open opens it.
                     match &made {
                         Some(fd) => sys::stat_fd(fd.as_raw_fd()),
-                        None => sys::stat_at(parent_ref.raw_fd(), &name),
+                        None => sys::stat_at(parent_ref.raw_fd(), &dest_at),
                     }
-                })();
+                });
                 match result {
                     Ok(st) => {
                         registry.bind_pending_parked(
@@ -3514,9 +3557,18 @@ impl Server {
             job,
         ));
         phase("clone-us-5-push", t4);
-        self.stats.add("apply-push-lock-us", crate::apply::PUSH_LOCK_NS.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000);
-        self.stats.add("apply-push-waits", crate::apply::PUSH_WAITS.swap(0, std::sync::atomic::Ordering::Relaxed));
-        self.stats.add("apply-push-wait-us", crate::apply::PUSH_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000);
+        self.stats.add(
+            "apply-push-lock-us",
+            crate::apply::PUSH_LOCK_NS.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000,
+        );
+        self.stats.add(
+            "apply-push-waits",
+            crate::apply::PUSH_WAITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        );
+        self.stats.add(
+            "apply-push-wait-us",
+            crate::apply::PUSH_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000,
+        );
         phase("clone-us-total", t0);
         parent.settled_by(seq);
         dest.settled_by(seq);
@@ -3570,7 +3622,7 @@ impl Server {
         // order the host applies. So is any name in a directory that is
         // itself still a promise. Otherwise the host answers freshness.
         if !parent.is_pending() && !parent.name_pending_gone(name.to_bytes()) {
-            match sys::stat_at(parent.reference()?.raw_fd(), name) {
+            match parent.under_name(name, |dir, at| sys::stat_at(dir, at)) {
                 Err(errno) if errno == linux::ENOENT => {}
                 _ => return Ok(None),
             }
@@ -3854,36 +3906,35 @@ impl Server {
             parent.name_pending_gone(name.to_bytes())
                 || parent.pending_child(name.to_bytes()).is_some()
         });
-        let parent_fd = parent.reference()?;
-        let mut created = true;
-        let mut attempt = 0;
-        let fd = loop {
-            match sys::openat_path(
-                parent_fd.raw_fd(),
-                &name,
-                flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
-                mode & 0o7777 & !umask,
-            ) {
-                Ok(fd) => break fd,
-                Err(e) if e == linux::EEXIST && flags & LINUX_O_EXCL == 0 => {}
-                Err(e) => return Err(e),
-            }
-            match sys::openat_path(
-                parent_fd.raw_fd(),
-                &name,
-                (flags & !LINUX_O_CREAT) | LINUX_O_NOFOLLOW,
-                0,
-            ) {
-                Ok(fd) => {
-                    created = false;
-                    break fd;
+        let (fd, created) = parent.under(|dir, prefix| {
+            let dir = dir.raw_fd();
+            let at = &crate::inode::join(prefix, &name);
+            let mut created = true;
+            let mut attempt = 0;
+            let fd = loop {
+                match sys::openat_path(
+                    dir,
+                    at,
+                    flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
+                    mode & 0o7777 & !umask,
+                ) {
+                    Ok(fd) => break fd,
+                    Err(e) if e == linux::EEXIST && flags & LINUX_O_EXCL == 0 => {}
+                    Err(e) => return Err(e),
                 }
-                // Unlinked between the two opens: go create it after all,
-                // once, so a delete storm cannot pin us here.
-                Err(e) if e == linux::ENOENT && attempt == 0 => attempt = 1,
-                Err(e) => return Err(e),
-            }
-        };
+                match sys::openat_path(dir, at, (flags & !LINUX_O_CREAT) | LINUX_O_NOFOLLOW, 0) {
+                    Ok(fd) => {
+                        created = false;
+                        break fd;
+                    }
+                    // Unlinked between the two opens: go create it after all,
+                    // once, so a delete storm cannot pin us here.
+                    Err(e) if e == linux::ENOENT && attempt == 0 => attempt = 1,
+                    Err(e) => return Err(e),
+                }
+            };
+            Ok((fd, created))
+        })?;
         // Everything below avoids re-resolving a path we are already holding
         // open. A package install creates tens of thousands of files, and the
         // naive version costs two `openat`s and a path-based `stat` for each:

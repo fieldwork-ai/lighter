@@ -910,10 +910,85 @@ impl Inode {
         if let Some(fd) = self.fd.read().expect("inode slot poisoned").as_ref() {
             return Ok(Located::Fd(Reference(fd.clone())));
         }
-        if let Some((ancestor, path)) = self.nearest_resident() {
-            return Ok(Located::At(ancestor, path));
+        if let Some((parent, name)) = self.place()
+            && let Ok((dir, at)) = parent.at(&name)
+        {
+            return Ok(Located::At(dir, at));
         }
         Ok(Located::Fd(self.reference()?))
+    }
+
+    /// The descriptor to act under and the path from it to `name` here:
+    /// this directory's own when it is resident, otherwise the nearest
+    /// resident ancestor's and the components between. A parked directory
+    /// is never revived to create, stat, rename or unlink a name inside it.
+    pub fn at(&self, name: &std::ffi::CStr) -> Result<(Reference, std::ffi::CString), i32> {
+        let (dir, prefix) = self.at_dir()?;
+        Ok((dir, join(&prefix, name)))
+    }
+
+    /// Runs `op` under this directory: with its own descriptor when it is
+    /// resident, otherwise the nearest resident ancestor's and the prefix
+    /// from there. The path is checked before `op` runs ([`Inode::at_dir`]),
+    /// but a rename above can land between the check and the operation —
+    /// the queue applies renames on their own lane — so an `ENOENT` through
+    /// a prefix is believed only if the prefix still resolves to this
+    /// directory afterwards. Most are genuine, a create asking whether its
+    /// name is taken, and cost one more fstatat; when the path has gone
+    /// from under it, the directory is opened by identity and `op` runs
+    /// once more, against what the host has now.
+    pub fn under<T>(
+        &self,
+        op: impl Fn(&Reference, &Option<std::ffi::CString>) -> Result<T, i32>,
+    ) -> Result<T, i32> {
+        let (dir, prefix) = self.at_dir()?;
+        match op(&dir, &prefix) {
+            Err(errno) if errno == crate::errno::linux::ENOENT && prefix.is_some() => {
+                let still = crate::sys::stat_at(dir.raw_fd(), prefix.as_ref().expect("checked"))
+                    .is_ok_and(|st| st.st_ino == self.ino() && st.st_dev as i64 == self.dev());
+                if still {
+                    return Err(errno);
+                }
+                let dir = self.reference()?;
+                op(&dir, &None)
+            }
+            other => other,
+        }
+    }
+
+    /// [`Inode::under`] for one name: `op` gets the descriptor and the path
+    /// from it to the name.
+    pub fn under_name<T>(
+        &self,
+        name: &std::ffi::CStr,
+        op: impl Fn(std::os::fd::RawFd, &std::ffi::CStr) -> Result<T, i32>,
+    ) -> Result<T, i32> {
+        self.under(|dir, prefix| op(dir.raw_fd(), &join(prefix, name)))
+    }
+
+    /// [`Inode::at`] for several names under one directory: the descriptor
+    /// and the prefix to put in front of each, `None` when it is resident.
+    ///
+    /// The path is the guest's view of where this directory is, and the
+    /// host can be behind it: a rename the guest was told is done sits in
+    /// the queue until its turn, while a create keyed on this directory
+    /// alone runs in a lane of its own. So the path is checked to resolve
+    /// to this inode before it is trusted — one `fstatat`, a microsecond —
+    /// and when it does not, the directory is opened by identity, which
+    /// answers whatever it is called.
+    pub fn at_dir(&self) -> Result<(Reference, Option<std::ffi::CString>), i32> {
+        self.used.store(true, Ordering::Relaxed);
+        if let Some(fd) = self.fd.read().expect("inode slot poisoned").as_ref() {
+            return Ok((Reference(fd.clone()), None));
+        }
+        if let Some((ancestor, path)) = self.nearest_resident()
+            && let Ok(st) = crate::sys::stat_at(ancestor.raw_fd(), &path)
+            && st.st_ino == self.ino()
+            && st.st_dev as i64 == self.dev()
+        {
+            return Ok((ancestor, Some(path)));
+        }
+        Ok((self.reference()?, None))
     }
 
     /// The nearest ancestor holding a descriptor, and the path from it to
@@ -1009,9 +1084,16 @@ impl Inode {
     fn reopen(&self, parked: &Parked) -> Result<std::os::fd::OwnedFd, i32> {
         // Every twenty-thousandth revival says where it came from, when the
         // stats are on: the counter alone says how many, not why.
-        if REOPENS.fetch_add(1, Ordering::Relaxed) % 20_000 == 0
-            && std::env::var_os("LIGHTER_FS_STATS").is_some()
-        {
+        let nth = REOPENS.fetch_add(1, Ordering::Relaxed);
+        if std::env::var_os("LIGHTER_FS_REOPEN_TRACE").is_some() {
+            eprintln!(
+                "REOPEN-TRACE id={} dir={} {}",
+                self.id(),
+                self.is_dir,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        if nth % 20_000 == 0 && std::env::var_os("LIGHTER_FS_STATS").is_some() {
             tracing::warn!(
                 id = self.id(),
                 dir = self.is_dir,
@@ -1163,18 +1245,17 @@ impl Inode {
         if self.fd.read().expect("inode slot poisoned").is_none()
             && let Some((parent, name)) = self.place()
             && let Some(parked) = self.parked_at.lock().expect("parked path poisoned").clone()
-            && let Ok(parent_ref) = parent.reference()
+            && let Ok((dir, at)) = parent.at(&name)
+            && let Ok(st) = crate::sys::stat_at(dir.raw_fd(), &at)
+            && st.st_nlink > 0
+            && st.st_ino == ino
+            && st.st_dev as i64 == dev
+            && (st.st_birthtime, st.st_birthtime_nsec) == parked.birthtime
         {
-            return match crate::sys::stat_at(parent_ref.raw_fd(), &name) {
-                Ok(st) => {
-                    st.st_nlink > 0
-                        && st.st_ino == ino
-                        && st.st_dev as i64 == dev
-                        && (st.st_birthtime, st.st_birthtime_nsec) == parked.birthtime
-                }
-                Err(_) => false,
-            };
+            return true;
         }
+        // The name did not answer for it — a rename of its own or an
+        // ancestor's still queued, say — and only the inode itself can.
         let reference = match self.reference() {
             Ok(reference) => reference,
             Err(errno) => {
@@ -1926,10 +2007,15 @@ impl Registry {
                         // ones to fill their places, each revival an open
                         // the workload had not asked for: three of five
                         // sampled revivals on a stock Mac came from here.
-                        // A warm parked file is revived by the operation
-                        // that needs it, when it needs it.
+                        // A warm parked file is not revived at all: every
+                        // operation reaches it through its parent and its
+                        // name, and a descriptor of its own serves nothing.
+                        // A directory is what those names are reached
+                        // through, and resident it saves the walk from its
+                        // nearest resident ancestor, and the check that the
+                        // walk arrived, on every operation inside it.
                         let room = self.budget.saturating_sub(self.census.descriptors());
-                        if promoted_total < room && inode.promote() {
+                        if inode.is_dir && promoted_total < room && inode.promote() {
                             promoted_total += 1;
                         }
                     }
@@ -2677,5 +2763,18 @@ mod tests {
             writable: true,
         })));
         assert_ne!(first, second);
+    }
+}
+
+/// `prefix/name`, or `name` alone under a resident directory.
+pub fn join(prefix: &Option<std::ffi::CString>, name: &std::ffi::CStr) -> std::ffi::CString {
+    match prefix {
+        None => name.to_owned(),
+        Some(prefix) => {
+            let mut joined = prefix.as_bytes().to_vec();
+            joined.push(b'/');
+            joined.extend_from_slice(name.to_bytes());
+            std::ffi::CString::new(joined).expect("no interior NUL in a joined path")
+        }
     }
 }

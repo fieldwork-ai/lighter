@@ -143,8 +143,15 @@ impl Kind {
         // fill, neither gains nor loses. `LIGHTER_FS_APPLY_WIDE=0` keeps
         // them serial, for measurement.
         static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let wide = *WIDE.get_or_init(|| std::env::var("LIGHTER_FS_APPLY_WIDE").ok().is_none_or(|v| v != "0"));
-        wide && matches!(self, Kind::Create | Kind::Write | Kind::Mkdir | Kind::Symlink)
+        let wide = *WIDE.get_or_init(|| {
+            std::env::var("LIGHTER_FS_APPLY_WIDE")
+                .ok()
+                .is_none_or(|v| v != "0")
+        });
+        wide && matches!(
+            self,
+            Kind::Create | Kind::Write | Kind::Mkdir | Kind::Symlink
+        )
     }
 }
 
@@ -501,7 +508,11 @@ impl Apply {
 
     /// The drainer's histogram since the last call, one line per kind.
     pub fn report(&self) -> String {
-        let _ = (PUSH_LOCK_NS.load(Ordering::Relaxed), PUSH_WAITS.load(Ordering::Relaxed), PUSH_WAIT_NS.load(Ordering::Relaxed));
+        let _ = (
+            PUSH_LOCK_NS.load(Ordering::Relaxed),
+            PUSH_WAITS.load(Ordering::Relaxed),
+            PUSH_WAIT_NS.load(Ordering::Relaxed),
+        );
         const NAMES: [&str; KINDS] = [
             "create", "write", "unlink", "rename", "clone", "setattr", "link", "mkdir", "symlink",
             "rmdir",

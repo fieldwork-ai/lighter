@@ -1020,7 +1020,8 @@ mod tests {
 /// anything else.
 pub fn raise_server_qos() {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let wanted = *WANTED.get_or_init(|| std::env::var("LIGHTER_SERVER_QOS").is_ok_and(|v| v != "0"));
+    let wanted =
+        *WANTED.get_or_init(|| std::env::var("LIGHTER_SERVER_QOS").is_ok_and(|v| v != "0"));
     if !wanted {
         return;
     }
