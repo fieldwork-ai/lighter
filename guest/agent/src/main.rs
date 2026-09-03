@@ -125,18 +125,24 @@ fn bound_container_cache() {
     let high = (total / 4 * 3).to_string();
     let resting = total / 4;
     let cgroup = "/sys/fs/cgroup/docker";
+    // Idle is the containers' own CPU, from their cgroup, not the guest's:
+    // a guest running a package install against the share is three
+    // quarters idle, waiting on the host, and a trim keyed on that fired in
+    // the middle of every install and evicted the cache it was using. A
+    // container doing anything at all burns a core; one doing nothing
+    // burns nothing.
     let mut idle_for = 0u32;
-    let mut last = cpu_ticks();
+    let mut last = container_cpu_usec(cgroup);
     let mut cooldown = 0u32;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
         if std::fs::read_to_string(format!("{cgroup}/memory.high")).is_ok_and(|now| now.trim() != high) {
             let _ = std::fs::write(format!("{cgroup}/memory.high"), &high);
         }
-        let now = cpu_ticks();
-        let (busy, all) = (now.0.saturating_sub(last.0), now.1.saturating_sub(last.1));
+        let now = container_cpu_usec(cgroup);
+        let used = now.saturating_sub(last);
         last = now;
-        idle_for = if all > 0 && busy * 10 < all { idle_for + 1 } else { 0 };
+        idle_for = if used < 50_000 { idle_for + 1 } else { 0 };
         cooldown = cooldown.saturating_sub(1);
         if idle_for >= 3 && cooldown == 0 {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
@@ -151,17 +157,17 @@ fn bound_container_cache() {
     }
 }
 
-/// (busy, total) jiffies across every CPU, from the first line of /proc/stat.
-fn cpu_ticks() -> (u64, u64) {
-    let Ok(stat) = std::fs::read_to_string("/proc/stat") else { return (0, 0) };
-    let Some(line) = stat.lines().next() else { return (0, 0) };
-    let fields: Vec<u64> = line.split_whitespace().skip(1).filter_map(|f| f.parse().ok()).collect();
-    if fields.len() < 5 {
-        return (0, 0);
-    }
-    let total: u64 = fields.iter().sum();
-    let idle = fields[3] + fields[4];
-    (total - idle, total)
+/// CPU time the containers have used, in microseconds, from their cgroup.
+fn container_cpu_usec(cgroup: &str) -> u64 {
+    std::fs::read_to_string(format!("{cgroup}/cpu.stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.lines()
+                .find(|l| l.starts_with("usage_usec "))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 fn serve_control(stream: OwnedFd) {
