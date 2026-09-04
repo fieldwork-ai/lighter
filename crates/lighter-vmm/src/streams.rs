@@ -46,6 +46,7 @@ pub fn start(shared: Arc<VsockShared>) -> io::Result<()> {
                 let shared = shared.clone();
                 let _ = std::thread::Builder::new()
                     .name("stream".into())
+                    .stack_size(crate::qos::CONNECTION_STACK)
                     .spawn(move || serve(shared, key));
             }
             tracing::debug!("stream listener stopped");
@@ -142,7 +143,10 @@ impl lighter_docker::PortMapper for PortMapper {
                     }
                     let Ok(mac) = accepted else { continue };
                     let shared = shared.clone();
-                    std::thread::spawn(move || carry_inbound(shared, port, mac));
+                    let _ = std::thread::Builder::new()
+                        .name("inbound".into())
+                        .stack_size(crate::qos::CONNECTION_STACK)
+                        .spawn(move || carry_inbound(shared, port, mac));
                 }
             })
             .map_err(|e| e.to_string())?;

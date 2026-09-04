@@ -10,6 +10,12 @@
 //! and off: a request thread that is answered on the vCPU's own core does
 //! not want it, a copy thread that is never on that core does.
 
+/// The stack for a thread that carries one connection. A quarter megabyte
+/// against macOS's half-megabyte default for a spawned thread: a
+/// connection thread holds a few buffers and a stream's life, and the
+/// stack mapping is most of what a spawn costs at thousands a second.
+pub const CONNECTION_STACK: usize = 256 << 10;
+
 /// `QOS_CLASS_USER_INTERACTIVE`.
 const USER_INTERACTIVE: u32 = 0x21;
 

@@ -1153,6 +1153,7 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
         };
         std::thread::Builder::new()
             .name("vsock-write".into())
+            .stack_size(crate::qos::CONNECTION_STACK)
             .spawn(move || {
                 crate::qos::raise_interactive();
                 let memory = shared.memory();

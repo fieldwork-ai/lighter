@@ -59,8 +59,13 @@ impl VsockProxy {
                     }
                     let Ok(stream) = stream else { continue };
                     let shared = accept_shared.clone();
+                    // A small stack: a connection thread holds a few buffers
+                    // and a stream's life, and macOS's default stack is most
+                    // of what a spawn costs at thousands of connections a
+                    // second.
                     if let Err(e) = std::thread::Builder::new()
                         .name("vsock-conn".into())
+                        .stack_size(crate::qos::CONNECTION_STACK)
                         .spawn(move || serve(stream, guest_port, shared))
                     {
                         tracing::warn!(%e, "could not spawn a connection thread");
