@@ -15,13 +15,12 @@
 //! The header is nineteen bytes: a family byte (4 or 6), sixteen bytes of
 //! address with an IPv4 address in the first four, and the port big-endian.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::virtio::vsock::{Accepted, VsockShared, pump};
+use crate::virtio::vsock::{Accepted, ConnKey, VsockShared, pump};
 
 /// The vsock port the agent dials for an outbound stream.
 pub const STREAM_PORT: u32 = 2377;
@@ -43,24 +42,11 @@ pub fn start(shared: Arc<VsockShared>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("streams".into())
         .spawn(move || {
-            for conn in accepted {
+            for Accepted { key } in accepted {
                 let shared = shared.clone();
-                let Accepted {
-                    key,
-                    device_side,
-                    stream,
-                } = conn;
-                // The pump moves bytes between the device and its end of the
-                // pair; this thread moves them between the other end and the
-                // real socket.
-                let pumped = shared.clone();
-                let _ = std::thread::Builder::new()
-                    .name("stream-pump".into())
-                    .spawn(move || pump(pumped, key, device_side));
                 let _ = std::thread::Builder::new()
                     .name("stream".into())
-                    .spawn(move || serve(stream));
-                drop(shared);
+                    .spawn(move || serve(shared, key));
             }
             tracing::debug!("stream listener stopped");
         })?;
@@ -89,62 +75,33 @@ fn destination(header: &[u8; HEADER_LEN]) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-/// One stream: read the header, dial, copy until both directions close.
-fn serve(mut guest: UnixStream) {
-    let mut header = [0u8; HEADER_LEN];
-    if guest.read_exact(&mut header).is_err() {
+/// One stream: read the header out of the connection's queue, dial, and
+/// pump the connection straight onto the socket. No pair, no extra thread:
+/// the bytes go from the device's queue to the TCP socket and back.
+fn serve(shared: Arc<VsockShared>, key: ConnKey) {
+    let Some(header) = shared.read_outbound_exact(key, HEADER_LEN) else {
+        shared.shutdown(key);
         return;
-    }
+    };
+    let header: [u8; HEADER_LEN] = header.try_into().expect("exact length");
     let Some(addr) = destination(&header) else {
+        shared.shutdown(key);
         return;
     };
     let mac = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(s) => s,
         Err(e) => {
-            // Dropping the pair closes the stream, which the agent turns into
-            // a close of the container's connection: the same thing a refused
-            // connect looks like through any userspace stack.
+            // Closing the stream is what the agent turns into a close of the
+            // container's connection: the same thing a refused connect looks
+            // like through any userspace stack.
             tracing::debug!(%addr, %e, "stream: connect failed");
+            shared.shutdown(key);
             return;
         }
     };
     let _ = mac.set_nodelay(true);
     crate::sockbuf::widen(&mac);
-    crate::sockbuf::widen(&guest);
-    let Ok(mut mac_read) = mac.try_clone() else {
-        return;
-    };
-    let mut mac_write = mac;
-    let Ok(mut guest_read) = guest.try_clone() else {
-        return;
-    };
-
-    // guest -> the world
-    let outbound = std::thread::spawn(move || {
-        copy(&mut guest_read, &mut mac_write);
-        let _ = mac_write.shutdown(std::net::Shutdown::Write);
-    });
-    // the world -> guest
-    copy(&mut mac_read, &mut guest);
-    let _ = guest.shutdown(std::net::Shutdown::Write);
-    let _ = outbound.join();
-}
-
-/// A stream copy with a buffer sized for the link rather than for a pipe.
-fn copy(from: &mut impl Read, to: &mut impl Write) {
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match from.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => {
-                if to.write_all(&buf[..n]).is_err() {
-                    return;
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
-        }
-    }
+    pump(shared, key, mac);
 }
 
 /// Published ports, the other way round: a listener on the Mac per port
@@ -211,43 +168,21 @@ impl lighter_docker::PortMapper for PortMapper {
     }
 }
 
-/// One accepted connection on a published port, into the guest.
+/// One accepted connection on a published port, into the guest: the
+/// socket is the connection's from the start, the port goes first.
 fn carry_inbound(shared: Arc<VsockShared>, port: u16, mac: TcpStream) {
     let _ = mac.set_nodelay(true);
     crate::sockbuf::widen(&mac);
-    let Ok((device_side, mut guest)) = UnixStream::pair() else {
-        return;
-    };
-    crate::sockbuf::widen(&device_side);
-    crate::sockbuf::widen(&guest);
-    let key = shared.open(INBOUND_PORT, device_side.try_clone().expect("socket clone"));
+    let Ok(clone) = mac.try_clone() else { return };
+    let key = shared.open(INBOUND_PORT, clone);
     if !shared.await_established(key, Duration::from_secs(4)) {
         tracing::debug!(port, "the agent did not accept an inbound stream");
         return;
     }
-    let pumped = shared.clone();
-    let _ = std::thread::Builder::new()
-        .name("inbound-pump".into())
-        .spawn(move || pump(pumped, key, device_side));
-    if guest.write_all(&port.to_be_bytes()).is_err() {
+    if !shared.send(key, &port.to_be_bytes()) {
         return;
     }
-    let Ok(mut mac_read) = mac.try_clone() else {
-        return;
-    };
-    let mut mac_write = mac;
-    let Ok(mut guest_read) = guest.try_clone() else {
-        return;
-    };
-    // the Mac -> the container
-    let inbound = std::thread::spawn(move || {
-        copy(&mut mac_read, &mut guest);
-        let _ = guest.shutdown(std::net::Shutdown::Write);
-    });
-    // the container -> the Mac
-    copy(&mut guest_read, &mut mac_write);
-    let _ = mac_write.shutdown(std::net::Shutdown::Write);
-    let _ = inbound.join();
+    pump(shared, key, mac);
 }
 
 #[cfg(test)]

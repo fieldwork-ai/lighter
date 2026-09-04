@@ -577,6 +577,9 @@ run_memory_case() {
 # `native` is the Mac talking to itself over loopback for the transfer and
 # request cases, which is the ceiling every runtime's published port is
 # measured against; the egress direction has no native meaning.
+# docker with the target's context, if it has one. bash 3.2 reads an empty
+# array as unbound under `set -u`, and the lighter target's is empty.
+dk() { docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} "$@"; }
 NET_CASES=" net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns "
 NET_HOST_PORT="${NET_HOST_PORT:-5399}"
 NET_PUB_PORT="${NET_PUB_PORT:-5398}"
@@ -594,9 +597,9 @@ net_setup() {
 		node -e 'require("http").createServer((q, r) => r.end("ok")).listen(process.argv[1], "127.0.0.1")' "$NET_HTTP_PORT" &
 		NET_HTTP_PID=$!
 	else
-		docker "${DOCKER_ARGS[@]}" rm -f "lighter-bench-net-$TARGET" "lighter-bench-http-$TARGET" >/dev/null 2>&1 || true
-		docker "${DOCKER_ARGS[@]}" run -d --name "lighter-bench-net-$TARGET" -p "$NET_PUB_PORT:5201" "$IMAGE" iperf3 -s >/dev/null
-		docker "${DOCKER_ARGS[@]}" run -d --name "lighter-bench-http-$TARGET" -p "$NET_HTTP_PORT:8080" "$IMAGE" \
+		dk rm -f "lighter-bench-net-$TARGET" "lighter-bench-http-$TARGET" >/dev/null 2>&1 || true
+		dk run -d --name "lighter-bench-net-$TARGET" -p "$NET_PUB_PORT:5201" "$IMAGE" iperf3 -s >/dev/null
+		dk run -d --name "lighter-bench-http-$TARGET" -p "$NET_HTTP_PORT:8080" "$IMAGE" \
 			node -e 'require("http").createServer((q, r) => r.end("ok")).listen(8080)' >/dev/null
 	fi
 	# The published ports take a moment to be reachable on every runtime.
@@ -610,7 +613,7 @@ net_teardown() {
 	[ "$NET_READY" -eq 1 ] || return 0
 	pkill -f "iperf3 -s -D -p $NET_HOST_PORT" 2>/dev/null || true
 	[ -z "$NET_HTTP_PID" ] || kill "$NET_HTTP_PID" 2>/dev/null || true
-	[ "$TARGET" = native ] || docker "${DOCKER_ARGS[@]}" rm -f "lighter-bench-net-$TARGET" "lighter-bench-http-$TARGET" >/dev/null 2>&1 || true
+	[ "$TARGET" = native ] || dk rm -f "lighter-bench-net-$TARGET" "lighter-bench-http-$TARGET" >/dev/null 2>&1 || true
 	NET_READY=0
 }
 # iperf3's JSON, reduced to the receiver's Mbit/s (the sender's for UDP,
@@ -620,7 +623,7 @@ d=json.load(sys.stdin); e=d["end"]
 bps=(e.get("sum_received") or e.get("sum") or {}).get("bits_per_second", 0)
 print(int(bps/1e6))' 2>/dev/null || echo ""; }
 # A client in the container for the egress paths; on the Mac for the rest.
-net_client() { docker "${DOCKER_ARGS[@]}" run --rm "$IMAGE" "$@"; }
+net_client() { dk run --rm "$IMAGE" "$@"; }
 run_net_case() {
 	local name="$1" rep value out
 	net_setup || return 1

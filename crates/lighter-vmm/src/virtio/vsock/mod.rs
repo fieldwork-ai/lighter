@@ -92,8 +92,52 @@ struct Conn {
     /// The guest has half-closed: it will send nothing further, but it is still
     /// willing to receive. The host is owed an EOF once `outbound` drains.
     guest_done: bool,
-    /// The host end, kept for shutdown. The writer thread holds its own clone.
-    socket: UnixStream,
+    /// The host end, kept for shutdown. The writer thread holds its own
+    /// clone. None until a pump attaches one.
+    socket: Option<Box<dyn Closable>>,
+}
+
+/// What the host end of a connection has to be: readable, writable,
+/// clonable for a writer thread, and closable. A unix socket for the Docker
+/// proxy, a TCP socket for a stream to the network — the pump does not
+/// care which, and it matters that it does not, because a socket pair in
+/// between was a copy and a thread per connection that bought nothing.
+pub trait Socket: Read + Write + Send + 'static {
+    fn try_clone(&self) -> std::io::Result<Self>
+    where
+        Self: Sized;
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()>;
+}
+
+impl Socket for UnixStream {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        UnixStream::shutdown(self, how)
+    }
+}
+
+impl Socket for std::net::TcpStream {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        std::net::TcpStream::try_clone(self)
+    }
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        std::net::TcpStream::shutdown(self, how)
+    }
+}
+
+/// The one thing the connection table does with a socket: close it when
+/// the guest is done. Held type-erased so the table need not know which
+/// kind it is; a guest-opened connection has none until its pump starts.
+trait Closable: Send {
+    fn close(&self);
+}
+
+impl<S: Socket> Closable for S {
+    fn close(&self) {
+        let _ = Socket::shutdown(self, std::net::Shutdown::Both);
+    }
 }
 
 /// A connection: our port and the guest's, which together are what every
@@ -112,13 +156,12 @@ struct Inner {
     listeners: HashMap<u32, std::sync::mpsc::Sender<Accepted>>,
 }
 
-/// A connection the guest opened, as handed to its listener.
+/// A connection the guest opened, as handed to its listener: established,
+/// with whatever the guest sent first waiting in its queue. The listener
+/// reads what it needs with [`VsockShared::read_outbound_exact`] and then
+/// runs [`pump`] on the socket it chose.
 pub struct Accepted {
     pub key: ConnKey,
-    /// The device's end; give it to [`pump`].
-    pub device_side: UnixStream,
-    /// The listener's end.
-    pub stream: UnixStream,
 }
 
 /// State shared between the device and the host threads driving connections.
@@ -191,7 +234,7 @@ impl VsockShared {
     /// life. The REQUEST is only queued here: the guest answers on its own
     /// schedule, and [`VsockShared::await_established`] is where that is waited
     /// for.
-    pub fn open(&self, guest_port: u32, socket: UnixStream) -> ConnKey {
+    pub fn open<S: Socket>(&self, guest_port: u32, socket: S) -> ConnKey {
         let mut inner = self.lock();
         let host_port = inner.next_port;
         inner.next_port = inner.next_port.wrapping_add(1).max(FIRST_EPHEMERAL_PORT);
@@ -204,7 +247,7 @@ impl VsockShared {
                 credit: Credit::new(),
                 outbound: VecDeque::new(),
                 guest_done: false,
-                socket,
+                socket: Some(Box::new(socket)),
             },
         );
         let mut request = Packet::control(Op::Request, host_port, guest_port);
@@ -218,13 +261,56 @@ impl VsockShared {
 
     /// Answers connections the guest opens to `host_port`.
     ///
-    /// Each accepted connection arrives on the returned channel with both
-    /// ends of a socket pair; the listener runs [`pump`] on the device's end
-    /// and does what it likes with the other.
+    /// Each accepted connection arrives on the returned channel already
+    /// established; the listener reads the guest's opening bytes from the
+    /// queue and runs [`pump`] on whatever socket they call for.
     pub fn listen(&self, host_port: u32) -> std::sync::mpsc::Receiver<Accepted> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.lock().listeners.insert(host_port, tx);
         rx
+    }
+
+    /// Gives a connection the socket its pump will use, for closing.
+    fn attach<S: Socket>(&self, key: ConnKey, socket: S) {
+        if let Some(conn) = self.lock().conns.get_mut(&key) {
+            conn.socket = Some(Box::new(socket));
+        }
+    }
+
+    /// Takes exactly `n` bytes from what the guest has sent, blocking for
+    /// them, and credits the guest for them. `None` if the connection ends
+    /// first. For a listener reading the header a stream starts with.
+    pub fn read_outbound_exact(&self, key: ConnKey, n: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(n);
+        let mut inner = self.lock();
+        loop {
+            let conn = inner.conns.get_mut(&key)?;
+            while out.len() < n {
+                let Some(mut chunk) = conn.outbound.pop_front() else {
+                    break;
+                };
+                let take = chunk.len().min(n - out.len());
+                if take < chunk.len() {
+                    let rest = chunk.split_off(take);
+                    conn.outbound.push_front(rest);
+                }
+                out.extend_from_slice(&chunk[..take]);
+            }
+            if out.len() == n {
+                break;
+            }
+            if conn.state == State::Closed || conn.guest_done {
+                return None;
+            }
+            let (guard, _) = self
+                .progress
+                .wait_timeout(inner, std::time::Duration::from_millis(100))
+                .expect("vsock state poisoned");
+            inner = guard;
+        }
+        drop(inner);
+        self.acknowledge(key, n as u32);
+        Some(out)
     }
 
     /// Blocks until the guest accepts or refuses. `false` means refused.
@@ -471,7 +557,9 @@ impl Vsock {
                 }
 
                 conn.state = State::Closed;
-                let _ = conn.socket.shutdown(std::net::Shutdown::Both);
+                if let Some(socket) = &conn.socket {
+                    socket.close();
+                }
                 let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
                 rst.buf_alloc = credit::BUF_ALLOC;
                 inner.outbox.push_back(rst);
@@ -516,29 +604,19 @@ impl Vsock {
                 // one end of a socket pair for the pump and the other for
                 // the listener, which the listener threads together itself;
                 // nothing is spawned under this lock.
-                let accepted = inner.listeners.get(&host_port).and_then(|listener| {
-                    let (device_side, stream) = UnixStream::pair().ok()?;
-                    crate::sockbuf::widen(&device_side);
-                    crate::sockbuf::widen(&stream);
-                    let device_clone = device_side.try_clone().ok()?;
-                    listener
-                        .send(Accepted {
-                            key,
-                            device_side: device_clone,
-                            stream,
-                        })
-                        .ok()?;
-                    Some(device_side)
-                });
+                let accepted = inner
+                    .listeners
+                    .get(&host_port)
+                    .is_some_and(|listener| listener.send(Accepted { key }).is_ok());
                 match accepted {
-                    Some(socket) => {
+                    true => {
                         let mut conn = Conn {
                             guest_port: packet.src_port,
                             state: State::Established,
                             credit: Credit::new(),
                             outbound: VecDeque::new(),
                             guest_done: false,
-                            socket,
+                            socket: None,
                         };
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
                         inner.conns.insert(key, conn);
@@ -547,7 +625,7 @@ impl Vsock {
                         response.buf_alloc = credit::BUF_ALLOC;
                         inner.outbox.push_back(response);
                     }
-                    None => {
+                    false => {
                         let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
                         rst.buf_alloc = credit::BUF_ALLOC;
                         inner.outbox.push_back(rst);
@@ -816,7 +894,10 @@ impl VirtioDevice for Vsock {
 /// Runs on its own thread per connection. That is a real cost at a thousand
 /// connections and no cost at the dozen a Docker client opens, and it buys a
 /// blocking read with no readiness machinery anywhere.
-pub fn pump(shared: Arc<VsockShared>, key: ConnKey, mut socket: UnixStream) {
+pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
+    if let Ok(clone) = socket.try_clone() {
+        shared.attach(key, clone);
+    }
     // Guest to host, on its own thread. The blocking write has to happen
     // somewhere that is not a vCPU thread; this is that somewhere.
     let writer = {
@@ -842,7 +923,7 @@ pub fn pump(shared: Arc<VsockShared>, key: ConnKey, mut socket: UnixStream) {
                 // end-of-stream. Without it a client reading to EOF — which is
                 // most of them — waits forever on a connection with nothing
                 // left to say.
-                let _ = socket.shutdown(std::net::Shutdown::Write);
+                let _ = Socket::shutdown(&socket, std::net::Shutdown::Write);
             })
     };
 
@@ -886,7 +967,7 @@ pub fn pump(shared: Arc<VsockShared>, key: ConnKey, mut socket: UnixStream) {
 }
 
 /// One vectored write per batch, completed across partial writes.
-fn write_all_chunks(socket: &mut UnixStream, chunks: &[Vec<u8>]) -> std::io::Result<()> {
+fn write_all_chunks(socket: &mut impl Write, chunks: &[Vec<u8>]) -> std::io::Result<()> {
     let mut slices: Vec<std::io::IoSlice<'_>> =
         chunks.iter().map(|c| std::io::IoSlice::new(c)).collect();
     let mut slices: &mut [std::io::IoSlice<'_>] = &mut slices;
