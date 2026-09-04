@@ -204,6 +204,9 @@ fn bound_container_cache() {
     // was lifted by hand. The benchmark asks for it on its own command
     // line; a machine that did not ask keeps its cache.
     let trims = cmdline_value("lighter.trim").is_none_or(|v| v != 0);
+    // `lighter.balloonmin=<GiB>` lowers the line below which the balloon is
+    // not offered memory (eight gigabytes), for the A/B on a small guest.
+    let balloon_min = cmdline_value("lighter.balloonmin").map(|g| g << 30).unwrap_or(8 << 30);
     let bound = cmdline_value("lighter.cachebound")
         .map(|mib| mib << 20)
         .unwrap_or(0);
@@ -298,7 +301,7 @@ fn bound_container_cache() {
         // alone: the peak 600 MB better, the minute reading 500 MB worse,
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
-        if total >= 8 << 30 {
+        if total >= balloon_min {
             offer_memory(&mut memory_stream, &mut last_offer, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
         }
         // Two passes, five and ten seconds idle: the containers down to a
