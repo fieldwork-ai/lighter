@@ -539,7 +539,11 @@ runtime_footprint_mib() {
 	local pids; pids="$(runtime_pids)"
 	local total=0 pid mb
 	for pid in $pids; do
-		mb="$(footprint "$pid" 2>/dev/null | sed -n 's/.*phys_footprint: *\([0-9]*\) MB.*/\1/p' | head -1)"
+		local raw; raw="$(footprint "$pid" 2>&1)"
+		[ -z "${LIGHTER_BENCH_DEBUG_FOOTPRINT:-}" ] || echo "FOOTPRINT pid=$pid $(echo "$raw" | grep -E 'phys_footprint|rror|annot|ailed' | head -2 | tr '\n' ' ')" >&2
+		# `footprint` switches to GB at ten gigabytes; a guest that has just
+		# run the storage cases holds its whole RAM as cache and reads there.
+		mb="$(echo "$raw" | sed -n 's/.*phys_footprint: *\([0-9.]*\) \([MG]\)B.*/\1 \2/p' | head -1 | awk '{v=$1; if ($2=="G") v=v*1024; printf "%d", v}')"
 		total=$(( total + ${mb:-0} ))
 	done
 	echo "$total"
