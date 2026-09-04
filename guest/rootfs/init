@@ -335,6 +335,11 @@ fi
 if grep -qw "lighter.streams" /proc/cmdline; then
 	/sbin/lighter-agent --tcp-proxy 15201 &
 	/sbin/lighter-agent --inbound 2378 &
+	# DNS answered by the Mac's resolver over the same channel. On eth0's
+	# address rather than loopback: Docker copies this file into every
+	# container and drops loopback nameservers on the way.
+	/sbin/lighter-agent --dns 192.168.127.2 &
+	printf 'nameserver 192.168.127.2\n' > /etc/resolv.conf
 	# The ruleset goes through a file: busybox's shell does not take a
 	# heredoc on an `if` line the way bash does, and the rule that had
 	# worked by hand failed at every boot.

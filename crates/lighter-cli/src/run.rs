@@ -170,6 +170,7 @@ pub fn machine() -> anyhow::Result<()> {
     }
     if streams {
         lighter_vmm::streams::start(machine.vsock())?;
+        lighter_vmm::dns::start(machine.vsock())?;
     }
 
     // Ports a container publishes appear on the Mac, for as long as the

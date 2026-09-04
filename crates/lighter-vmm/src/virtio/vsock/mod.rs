@@ -421,6 +421,50 @@ impl VsockShared {
         Ok(offset)
     }
 
+    /// Queues an owned buffer as one packet without copying it, when credit
+    /// allows the whole of it and the outbox has room; otherwise queues what
+    /// fits and returns the rest as a new buffer. `Err` when the connection
+    /// is not there to take it.
+    pub fn try_send_owned(&self, key: ConnKey, mut data: Vec<u8>) -> Result<Option<Vec<u8>>, ()> {
+        if data.len() > MAX_PAYLOAD {
+            let rest = data.split_off(MAX_PAYLOAD);
+            return match self.try_send_owned(key, data)? {
+                None => Ok(Some(rest)),
+                Some(mut unsent) => {
+                    unsent.extend_from_slice(&rest);
+                    Ok(Some(unsent))
+                }
+            };
+        }
+        let mut inner = self.lock();
+        let Some(conn) = inner.conns.get(&key) else {
+            return Err(());
+        };
+        if conn.state != State::Established {
+            return if conn.state == State::Connecting { Ok(Some(data)) } else { Err(()) };
+        }
+        let allowed = conn.credit.available() as usize;
+        let room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+        if room == 0 || allowed == 0 {
+            return Ok(Some(data));
+        }
+        let (host_port, guest_port) = key;
+        let fwd_cnt = conn.credit.fwd_cnt();
+        let rest = if data.len() > allowed { Some(data.split_off(allowed)) } else { None };
+        let take = data.len();
+        let mut packet = Packet::control(Op::Rw, host_port, guest_port);
+        packet.payload = data;
+        packet.buf_alloc = credit::BUF_ALLOC;
+        packet.fwd_cnt = fwd_cnt;
+        inner.outbox.push_back(packet);
+        if let Some(conn) = inner.conns.get_mut(&key) {
+            conn.credit.sent(take as u32);
+        }
+        drop(inner);
+        self.wake();
+        Ok(rest)
+    }
+
     /// What the guest has sent, without waiting.
     pub fn try_take_outbound(&self, key: ConnKey) -> Outbound {
         let mut inner = self.lock();
@@ -763,7 +807,7 @@ impl VsockShared {
 
     /// A buffer to read a payload into: one a writer finished with, or a
     /// new one. Capacity is kept; length is zero.
-    fn spare_buffer(&self) -> Vec<u8> {
+    pub fn spare_buffer(&self) -> Vec<u8> {
         let mut inner = self.lock();
         match inner.spare.pop() {
             Some(mut buf) => {

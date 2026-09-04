@@ -28,6 +28,7 @@
 pub mod bus;
 pub mod console;
 pub mod devices;
+pub mod dns;
 pub mod exitstats;
 pub mod fdt;
 pub mod footprint;

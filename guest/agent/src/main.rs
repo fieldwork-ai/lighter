@@ -28,6 +28,7 @@ fn main() -> std::process::ExitCode {
     let mut control = false;
     let mut tcp_proxy: Option<u16> = None;
     let mut inbound: Option<u32> = None;
+    let mut dns: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -49,6 +50,9 @@ fn main() -> std::process::ExitCode {
             // published port arrives as a vsock stream naming the port, and
             // is carried to the guest address Docker publishes on.
             "--inbound" => inbound = args.next().and_then(|v| v.parse().ok()),
+            // Answers DNS on the given address by carrying each query to the
+            // host over one vsock stream; the Mac's own resolver answers.
+            "--dns" => dns = args.next(),
             other => {
                 eprintln!("lighter-agent: unknown argument {other}");
                 return std::process::ExitCode::from(2);
@@ -61,6 +65,9 @@ fn main() -> std::process::ExitCode {
     }
     if let Some(port) = inbound {
         return serve_inbound(port);
+    }
+    if let Some(addr) = dns {
+        return serve_dns(&addr);
     }
     if target.is_none() && !echo && !control {
         eprintln!("lighter-agent: one of --to <path>, --echo, --control or --tcp-proxy <port> is required");
@@ -294,6 +301,88 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     copy(&mut host_read, &mut tcp_write);
     let _ = tcp_write.shutdown(std::net::Shutdown::Write);
     let _ = outbound.join();
+}
+
+/// The host's vsock port for DNS.
+const DNS_PORT: u32 = 2379;
+
+/// DNS for the guest and its containers, answered by the Mac's resolver.
+///
+/// One UDP socket here, one vsock stream to the host, queries multiplexed
+/// on it as `[len u16][client id u16][query]`, replies the same way back.
+/// The client id is ours, not DNS's own, because two clients may use the
+/// same transaction id at once. The host forwards each query to the
+/// resolver macOS is configured with — a VPN's, when one is up — so a
+/// container sees the names the Mac sees.
+fn serve_dns(addr: &str) -> std::process::ExitCode {
+    let socket = match std::net::UdpSocket::bind((addr, 53)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lighter-agent: cannot bind dns on {addr}:53: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let host = match vsock::connect(DNS_PORT) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("lighter-agent: dns stream to host refused: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let mut host_write = Fd(host);
+    let Ok(mut host_read) = host_write.try_clone() else {
+        return std::process::ExitCode::FAILURE;
+    };
+    println!("AGENT dns addr={addr}");
+    // Who asked, by our id, so the reply finds its way back. Bounded and
+    // overwritten in order: a reply for a forgotten query is dropped.
+    let clients: std::sync::Arc<std::sync::Mutex<[Option<(std::net::SocketAddr, u16)>; 4096]>> =
+        std::sync::Arc::new(std::sync::Mutex::new([None; 4096]));
+    let reply_socket = match socket.try_clone() {
+        Ok(s) => s,
+        Err(_) => return std::process::ExitCode::FAILURE,
+    };
+    let reply_clients = clients.clone();
+    std::thread::spawn(move || {
+        let mut header = [0u8; 4];
+        loop {
+            if host_read.read_exact(&mut header).is_err() {
+                return;
+            }
+            let len = u16::from_be_bytes([header[0], header[1]]) as usize;
+            let id = u16::from_be_bytes([header[2], header[3]]) as usize;
+            let mut reply = vec![0u8; len];
+            if host_read.read_exact(&mut reply).is_err() {
+                return;
+            }
+            let client = reply_clients.lock().expect("dns clients poisoned")[id % 4096];
+            if let Some((client, original)) = client {
+                // The reply carries our id; the client expects its own.
+                reply[0..2].copy_from_slice(&original.to_be_bytes());
+                let _ = reply_socket.send_to(&reply, client);
+            }
+        }
+    });
+    let mut buf = [0u8; 4096];
+    let mut next: u16 = 0;
+    loop {
+        let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
+        if n < 12 || n > 4000 {
+            continue;
+        }
+        let id = next;
+        next = next.wrapping_add(1) % 4096;
+        let original = u16::from_be_bytes([buf[0], buf[1]]);
+        clients.lock().expect("dns clients poisoned")[id as usize] = Some((from, original));
+        let mut frame = Vec::with_capacity(4 + n);
+        frame.extend_from_slice(&(n as u16).to_be_bytes());
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.extend_from_slice(&buf[..n]);
+        if host_write.write_all(&frame).is_err() {
+            eprintln!("lighter-agent: dns stream to host closed");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
 }
 
 /// The address Docker publishes ports on inside this guest: eth0's, which

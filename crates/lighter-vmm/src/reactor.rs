@@ -278,7 +278,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         kq,
         streams: HashMap::new(),
         by_fd: HashMap::new(),
-        buf: vec![0u8; READ_CHUNK],
+        buf: Vec::with_capacity(READ_CHUNK),
         memory: None,
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
@@ -451,21 +451,34 @@ impl Loop {
         }
     }
 
-    /// Chunks from the guest, onto the socket as far as it takes them.
+    /// Chunks from the guest, onto the socket as far as it takes them, and
+    /// again while there are more: what arrived during a write that could
+    /// not complete is taken once it has, not on the next wake — the guest
+    /// may be waiting on this very write for the credit to send anything.
     fn pull_from_guest(&mut self, key: ConnKey) {
-        let Some(stream) = self.streams.get_mut(&key) else { return };
-        if stream.from_guest.is_empty() && !stream.guest_eof {
-            match self.shared.try_take_outbound(key) {
-                Outbound::Chunks(chunks) => stream.from_guest.extend(chunks),
-                Outbound::Empty => {}
-                Outbound::Finished => stream.guest_eof = true,
-                Outbound::Gone => {
-                    self.close(key);
-                    return;
+        loop {
+            let Some(stream) = self.streams.get_mut(&key) else { return };
+            if stream.from_guest.is_empty() && !stream.guest_eof {
+                match self.shared.try_take_outbound(key) {
+                    Outbound::Chunks(chunks) => stream.from_guest.extend(chunks),
+                    Outbound::Empty => {}
+                    Outbound::Finished => stream.guest_eof = true,
+                    Outbound::Gone => {
+                        self.close(key);
+                        return;
+                    }
                 }
             }
+            if stream.from_guest.is_empty() {
+                self.flush(key);
+                return;
+            }
+            self.flush(key);
+            let Some(stream) = self.streams.get_mut(&key) else { return };
+            if stream.writing || !stream.from_guest.is_empty() {
+                return;
+            }
         }
-        self.flush(key);
     }
 
     /// Writes what is pending from the guest; arms the write filter if the
@@ -581,8 +594,17 @@ impl Loop {
             return;
         }
         loop {
-            // SAFETY: reading into the loop's buffer on a non-blocking fd.
-            let n = unsafe { libc::read(fd, self.buf.as_mut_ptr().cast(), self.buf.len()) };
+            // Into a payload-sized buffer the packet will own: a read and a
+            // copy into a packet was two copies of every inbound byte on the
+            // one thread that carries them all.
+            if self.buf.capacity() < READ_CHUNK {
+                self.buf = self.shared.spare_buffer();
+                self.buf.reserve(READ_CHUNK);
+            }
+            self.buf.clear();
+            // SAFETY: reading into the buffer's spare capacity on a
+            // non-blocking fd; the length is set from what arrived.
+            let n = unsafe { libc::read(fd, self.buf.as_mut_ptr().cast(), READ_CHUNK) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::WouldBlock {
@@ -605,13 +627,15 @@ impl Loop {
                 return;
             }
             let n = n as usize;
-            match self.shared.try_send(key, &self.buf[..n]) {
-                Ok(sent) if sent == n => {}
-                Ok(sent) => {
+            // SAFETY: `n` bytes were just written into the buffer by read.
+            unsafe { self.buf.set_len(n) };
+            let buf = std::mem::take(&mut self.buf);
+            match self.shared.try_send_owned(key, buf) {
+                Ok(None) => {}
+                Ok(Some(rest)) => {
                     // Out of credit: keep the rest, stop reading until the
                     // waker says the guest has room.
-                    stream.to_guest.clear();
-                    stream.to_guest.extend_from_slice(&self.buf[sent..n]);
+                    stream.to_guest = rest;
                     stream.to_guest_at = 0;
                     stream.reading = false;
                     self.kq.read(fd, false);
@@ -645,7 +669,7 @@ impl Loop {
             }
             return;
         }
-        self.flush(key);
+        self.pull_from_guest(key);
     }
 
     fn close(&mut self, key: ConnKey) {
