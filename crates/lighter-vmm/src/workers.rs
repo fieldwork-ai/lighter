@@ -89,6 +89,7 @@ pub fn idle_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
