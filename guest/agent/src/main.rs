@@ -278,16 +278,16 @@ fn bound_container_cache() {
         // seconds of an install. A sixteenth of RAM kept at the first pass
         // was measured: 0.4 GB back at five seconds, 1.4 at ten, and the
         // fifteen-second reading caught the second pass mid-drain.
+        //
+        // With no container running at all, two and seven seconds instead:
+        // nothing is between commands then, and the cache is the last thing
+        // the host is still holding for a guest that has stopped.
+        let running = running_containers(containers);
+        let (first, second) = if running == 0 { (2, 7) } else { (5, 10) };
         let (floor, engine_floor) = match idle_for {
-            x if x == 5 * TICKS_PER_SEC || x == 10 * TICKS_PER_SEC => (total / 64, 8 << 20),
+            x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
         };
-        // Hurried, and down to 128 KiB runs: what a trim frees merges
-        // upward over twenty seconds as compaction works around the pages
-        // still in use, and the runs it sits in meanwhile are a third of
-        // what was freed. The two-megabyte order is for a guest that is
-        // churning, where a reported page reused is a fault on the host.
-        set_reporting(100, 5);
         for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
@@ -298,18 +298,12 @@ fn bound_container_cache() {
             }
         }
         // What the trim freed is in pieces the size of the files that held
-        // it, and free page reporting hands the host only runs of two
-        // megabytes: reported as it stood, a trimmed guest still cost the
-        // Mac most of its size. Reporting smaller runs was measured and
-        // rejected — the guest reports its free memory as fast as it churns
-        // it, and every reported page it reuses is a fault on the host; a
-        // pnpm install took four times as long. Compaction instead, on a
-        // guest that has nothing else to do: the pieces coalesce, and the
-        // runs go back. Repeatedly: one pass left most of what a trim freed
-        // below the reporting order, and the kernel's own background
-        // compaction then returned it at a hundred megabytes a second — a
-        // trimmed guest took twenty seconds to reach its resting footprint
-        // where a few passes take two.
+        // it; the balloon takes the bulk of it as it is, a host page at a
+        // time, through the offer above. What it leaves — the reserve, an
+        // eighth of RAM — is reporting's: hurried for a while and compacted
+        // into reportable runs, as before the balloon. On a 4 GiB guest the
+        // reserve alone read 600 MB more at a minute without this.
+        set_reporting(100, 5);
         compact_until_reportable();
     }
 }
