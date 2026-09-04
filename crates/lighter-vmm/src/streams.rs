@@ -66,7 +66,9 @@ pub fn start(shared: Arc<VsockShared>) -> io::Result<()> {
         .spawn(move || {
             for Accepted { key } in accepted {
                 let shared = shared.clone();
-                crate::workers::run("stream", crate::qos::CONNECTION_STACK, move || serve(shared, key));
+                crate::workers::run("stream", crate::qos::CONNECTION_STACK, move || {
+                    serve(shared, key)
+                });
             }
             tracing::debug!("stream listener stopped");
         })?;

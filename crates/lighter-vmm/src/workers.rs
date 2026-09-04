@@ -8,8 +8,8 @@
 //! before it goes: connection churn reuses threads, a burst grows the set,
 //! and an idle machine sheds them.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -30,7 +30,11 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 pub fn run(name: &'static str, stack: usize, job: impl FnOnce() + Send + 'static) {
     let mut job: Job = Box::new(job);
     loop {
-        let sender = IDLE_THREADS.lock().expect("worker cache poisoned").parked.pop();
+        let sender = IDLE_THREADS
+            .lock()
+            .expect("worker cache poisoned")
+            .parked
+            .pop();
         match sender {
             Some((_, sender)) => match sender.send(job) {
                 Ok(()) => return,
@@ -83,7 +87,11 @@ fn worker(id: u64, tx: Sender<Job>, rx: Receiver<Job>, first: Job) {
 
 /// For a thread count in diagnostics.
 pub fn idle_count() -> usize {
-    IDLE_THREADS.lock().expect("worker cache poisoned").parked.len()
+    IDLE_THREADS
+        .lock()
+        .expect("worker cache poisoned")
+        .parked
+        .len()
 }
 
 #[cfg(test)]

@@ -418,7 +418,11 @@ impl VsockShared {
             return Err(());
         };
         if conn.state != State::Established {
-            return if conn.state == State::Connecting { Ok(0) } else { Err(()) };
+            return if conn.state == State::Connecting {
+                Ok(0)
+            } else {
+                Err(())
+            };
         }
         let mut allowed = conn.credit.available() as usize;
         let mut room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
@@ -458,7 +462,12 @@ impl VsockShared {
     /// allows the whole of it and the outbox has room; otherwise queues what
     /// fits and returns the rest as a new buffer. `Err` when the connection
     /// is not there to take it.
-    pub fn try_send_owned(&self, key: ConnKey, mut data: Vec<u8>, bulk: bool) -> Result<Option<Vec<u8>>, ()> {
+    pub fn try_send_owned(
+        &self,
+        key: ConnKey,
+        mut data: Vec<u8>,
+        bulk: bool,
+    ) -> Result<Option<Vec<u8>>, ()> {
         if data.len() > MAX_PAYLOAD {
             let rest = data.split_off(MAX_PAYLOAD);
             return match self.try_send_owned(key, data, bulk)? {
@@ -474,7 +483,11 @@ impl VsockShared {
             return Err(());
         };
         if conn.state != State::Established {
-            return if conn.state == State::Connecting { Ok(Some(data)) } else { Err(()) };
+            return if conn.state == State::Connecting {
+                Ok(Some(data))
+            } else {
+                Err(())
+            };
         }
         let allowed = conn.credit.available() as usize;
         let room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
@@ -483,7 +496,11 @@ impl VsockShared {
         }
         let (host_port, guest_port) = key;
         let fwd_cnt = conn.credit.fwd_cnt();
-        let rest = if data.len() > allowed { Some(data.split_off(allowed)) } else { None };
+        let rest = if data.len() > allowed {
+            Some(data.split_off(allowed))
+        } else {
+            None
+        };
         let take = data.len();
         let mut packet = Packet::control(Op::Rw, host_port, guest_port);
         packet.payload = data;
@@ -538,7 +555,9 @@ impl VsockShared {
         let mut out = Vec::with_capacity(n);
         let mut finished: Vec<u16> = Vec::new();
         while out.len() < n {
-            let Some(chunk) = conn.outbound.pop_front() else { break };
+            let Some(chunk) = conn.outbound.pop_front() else {
+                break;
+            };
             let (mut bytes, head) = match chunk {
                 Chunk::Owned(v) => (v, None),
                 Chunk::Guest { head, spans } => {
@@ -1047,7 +1066,7 @@ impl Vsock {
                             outbound: VecDeque::new(),
                             guest_done: false,
                             unreported: 0,
-                received: 0,
+                            received: 0,
                             socket: None,
                         };
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
@@ -1084,7 +1103,12 @@ impl Vsock {
     /// [`Chunk::Guest`] if the connection is there to take it, in which
     /// case the chain is held until the writer is done with it. Returns
     /// whether the chain was held.
-    fn handle_guest_rw(inner: &mut Inner, packet: &Packet, head: u16, spans: Vec<(u64, usize)>) -> bool {
+    fn handle_guest_rw(
+        inner: &mut Inner,
+        packet: &Packet,
+        head: u16,
+        spans: Vec<(u64, usize)>,
+    ) -> bool {
         let key: ConnKey = (packet.dst_port, packet.src_port);
         match inner.conns.get_mut(&key) {
             Some(conn) => {
@@ -1147,9 +1171,9 @@ impl Vsock {
                     addr += take as u64;
                     len -= take;
                     if have == HDR_LEN {
-                        declared = u32::from_le_bytes([
-                            header[24], header[25], header[26], header[27],
-                        ]) as usize;
+                        declared =
+                            u32::from_le_bytes([header[24], header[25], header[26], header[27]])
+                                as usize;
                         if declared > MAX_PAYLOAD {
                             ok = false;
                             break;
@@ -1445,30 +1469,30 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
             return;
         };
         crate::workers::run("vsock-write", crate::qos::CONNECTION_STACK, move || {
-                let _done = done_tx;
-                let memory = shared.memory();
-                while let Some(chunks) = shared.take_outbound(key) {
-                    if write_all_chunks(&mut socket, &chunks, memory.as_deref()).is_err() {
-                        break;
-                    }
-                    // Only now are the bytes the host application's, so only
-                    // now may the guest be told it has room for more — and
-                    // only now may the guest have its buffers back.
-                    let bytes: usize = chunks.iter().map(Chunk::len).sum();
-                    shared.complete(chunks.iter().filter_map(|c| match c {
-                        Chunk::Guest { head, .. } => Some(*head),
-                        Chunk::Owned(_) => None,
-                    }));
-                    shared.acknowledge(key, bytes as u32);
-                    shared.recycle(chunks);
+            let _done = done_tx;
+            let memory = shared.memory();
+            while let Some(chunks) = shared.take_outbound(key) {
+                if write_all_chunks(&mut socket, &chunks, memory.as_deref()).is_err() {
+                    break;
                 }
-                let _ = socket.flush();
-                // The guest will send no more, so the host peer is owed an
-                // end-of-stream. Without it a client reading to EOF — which is
-                // most of them — waits forever on a connection with nothing
-                // left to say.
-                let _ = Socket::shutdown(&socket, std::net::Shutdown::Write);
-            });
+                // Only now are the bytes the host application's, so only
+                // now may the guest be told it has room for more — and
+                // only now may the guest have its buffers back.
+                let bytes: usize = chunks.iter().map(Chunk::len).sum();
+                shared.complete(chunks.iter().filter_map(|c| match c {
+                    Chunk::Guest { head, .. } => Some(*head),
+                    Chunk::Owned(_) => None,
+                }));
+                shared.acknowledge(key, bytes as u32);
+                shared.recycle(chunks);
+            }
+            let _ = socket.flush();
+            // The guest will send no more, so the host peer is owed an
+            // end-of-stream. Without it a client reading to EOF — which is
+            // most of them — waits forever on a connection with nothing
+            // left to say.
+            let _ = Socket::shutdown(&socket, std::net::Shutdown::Write);
+        });
     }
 
     // A megabyte per read: what the socket holds arrives in one call and
@@ -1713,7 +1737,11 @@ mod tests {
         // an interrupt for every few hundred kilobytes.
         shared.acknowledge(port, 5);
         assert!(
-            !shared.lock().outbox.iter().any(|p| p.op == Op::CreditUpdate),
+            !shared
+                .lock()
+                .outbox
+                .iter()
+                .any(|p| p.op == Op::CreditUpdate),
             "a few bytes should not produce a credit update"
         );
 

@@ -45,7 +45,10 @@ fn nameserver() -> SocketAddr {
 
 /// Starts answering the agent's DNS stream: each accepted stream goes to
 /// the reactor, which answers cache hits inline and misses off-thread.
-pub fn start(shared: Arc<VsockShared>, reactor: Arc<crate::reactor::Reactor>) -> std::io::Result<()> {
+pub fn start(
+    shared: Arc<VsockShared>,
+    reactor: Arc<crate::reactor::Reactor>,
+) -> std::io::Result<()> {
     let accepted = shared.listen(DNS_PORT);
     std::thread::Builder::new()
         .name("dns-accept".into())
@@ -98,7 +101,11 @@ fn cache_put(name: &str, want_v6: bool, addrs: &[IpAddr]) {
 /// Docker name, or a type the resolver cannot answer being forwarded
 /// elsewhere returns None too), or None with the answer to come through
 /// `deliver` later.
-pub fn answer(query: Vec<u8>, id: u16, deliver: Arc<dyn Fn(u16, Vec<u8>) + Send + Sync>) -> Option<Vec<u8>> {
+pub fn answer(
+    query: Vec<u8>,
+    id: u16,
+    deliver: Arc<dyn Fn(u16, Vec<u8>) + Send + Sync>,
+) -> Option<Vec<u8>> {
     let q = parse_question(&query)?;
     if q.qclass != CLASS_IN || (q.qtype != TYPE_A && q.qtype != TYPE_AAAA) {
         // Forwarded raw to the Mac's nameserver, answered whenever it does.
@@ -128,10 +135,16 @@ pub fn answer(query: Vec<u8>, id: u16, deliver: Arc<dyn Fn(u16, Vec<u8>) + Send 
 /// The names answered here without a resolver.
 fn resolve_local(name: &str, want_v6: bool) -> Result<Vec<IpAddr>, ()> {
     match name.to_ascii_lowercase().as_str() {
-        "host.docker.internal" | "host.lima.internal" | "host.lighter.internal" => {
-            Ok(if want_v6 { Vec::new() } else { vec![HOST_ALIAS.into()] })
-        }
-        "gateway.docker.internal" => Ok(if want_v6 { Vec::new() } else { vec![GATEWAY.into()] }),
+        "host.docker.internal" | "host.lima.internal" | "host.lighter.internal" => Ok(if want_v6 {
+            Vec::new()
+        } else {
+            vec![HOST_ALIAS.into()]
+        }),
+        "gateway.docker.internal" => Ok(if want_v6 {
+            Vec::new()
+        } else {
+            vec![GATEWAY.into()]
+        }),
         _ => Err(()),
     }
 }
@@ -140,7 +153,9 @@ fn resolve_local(name: &str, want_v6: bool) -> Result<Vec<IpAddr>, ()> {
 /// its own; its reply, if one comes within a few seconds, is delivered.
 fn forward_raw(mut query: Vec<u8>, id: u16, deliver: Arc<dyn Fn(u16, Vec<u8>) + Send + Sync>) {
     crate::workers::run("dns-forward", crate::qos::CONNECTION_STACK, move || {
-        let Ok(udp) = UdpSocket::bind("0.0.0.0:0") else { return };
+        let Ok(udp) = UdpSocket::bind("0.0.0.0:0") else {
+            return;
+        };
         let _ = udp.set_read_timeout(Some(Duration::from_secs(5)));
         let original = [query[0], query[1]];
         query[0..2].copy_from_slice(&id.to_be_bytes());
@@ -286,8 +301,14 @@ mod tests {
 
     #[test]
     fn the_docker_names_are_the_mac() {
-        assert_eq!(resolve("host.docker.internal", false).unwrap(), vec![IpAddr::V4(HOST_ALIAS)]);
-        assert_eq!(resolve("gateway.docker.internal", false).unwrap(), vec![IpAddr::V4(GATEWAY)]);
+        assert_eq!(
+            resolve("host.docker.internal", false).unwrap(),
+            vec![IpAddr::V4(HOST_ALIAS)]
+        );
+        assert_eq!(
+            resolve("gateway.docker.internal", false).unwrap(),
+            vec![IpAddr::V4(GATEWAY)]
+        );
         assert!(resolve("host.docker.internal", true).unwrap().is_empty());
     }
 }

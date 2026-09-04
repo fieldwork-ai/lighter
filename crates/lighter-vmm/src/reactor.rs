@@ -120,24 +120,36 @@ impl Reactor {
 
     /// A stream the guest opened, established, its header on the way.
     pub fn accept_outbound(&self, key: ConnKey) {
-        self.commands.lock().expect("reactor commands poisoned").push(Command::Outbound(key));
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::Outbound(key));
         self.wake();
     }
 
     /// A connection accepted on a published port, to carry into the guest.
     pub fn carry_inbound(&self, port: u16, mac: TcpStream) {
-        self.commands.lock().expect("reactor commands poisoned").push(Command::Inbound(port, mac));
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::Inbound(port, mac));
         self.wake();
     }
 
     /// A DNS stream the guest opened.
     pub fn accept_dns(&self, key: ConnKey) {
-        self.commands.lock().expect("reactor commands poisoned").push(Command::Dns(key));
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::Dns(key));
         self.wake();
     }
 
     fn dns_reply(&self, key: ConnKey, id: u16, reply: Vec<u8>) {
-        self.commands.lock().expect("reactor commands poisoned").push(Command::DnsReply(key, id, reply));
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::DnsReply(key, id, reply));
         self.wake();
     }
 
@@ -189,10 +201,17 @@ fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
             sin.sin_port = a.port().to_be();
             sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
             let bytes = unsafe {
-                std::slice::from_raw_parts(std::ptr::addr_of!(sin).cast::<u8>(), size_of::<libc::sockaddr_in>())
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(sin).cast::<u8>(),
+                    size_of::<libc::sockaddr_in>(),
+                )
             }
             .to_vec();
-            (libc::AF_INET, bytes, size_of::<libc::sockaddr_in>() as libc::socklen_t)
+            (
+                libc::AF_INET,
+                bytes,
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
         }
         SocketAddr::V6(a) => {
             let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
@@ -201,10 +220,17 @@ fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
             sin6.sin6_port = a.port().to_be();
             sin6.sin6_addr.s6_addr = a.ip().octets();
             let bytes = unsafe {
-                std::slice::from_raw_parts(std::ptr::addr_of!(sin6).cast::<u8>(), size_of::<libc::sockaddr_in6>())
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(sin6).cast::<u8>(),
+                    size_of::<libc::sockaddr_in6>(),
+                )
             }
             .to_vec();
-            (libc::AF_INET6, bytes, size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+            (
+                libc::AF_INET6,
+                bytes,
+                size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
         }
     };
     // SAFETY: a plain socket(2) call.
@@ -233,7 +259,15 @@ fn connect_result(fd: RawFd) -> io::Result<()> {
     let mut err: libc::c_int = 0;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: an int for SO_ERROR to fill.
-    let rc = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, std::ptr::addr_of_mut!(err).cast(), &mut len) };
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            std::ptr::addr_of_mut!(err).cast(),
+            &mut len,
+        )
+    };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -269,11 +303,27 @@ impl Kq {
     }
 
     fn read(&self, fd: RawFd, on: bool) {
-        self.set(fd, libc::EVFILT_READ, if on { libc::EV_ADD | libc::EV_ENABLE } else { libc::EV_DISABLE });
+        self.set(
+            fd,
+            libc::EVFILT_READ,
+            if on {
+                libc::EV_ADD | libc::EV_ENABLE
+            } else {
+                libc::EV_DISABLE
+            },
+        );
     }
 
     fn write(&self, fd: RawFd, on: bool) {
-        self.set(fd, libc::EVFILT_WRITE, if on { libc::EV_ADD | libc::EV_ENABLE } else { libc::EV_DISABLE });
+        self.set(
+            fd,
+            libc::EVFILT_WRITE,
+            if on {
+                libc::EV_ADD | libc::EV_ENABLE
+            } else {
+                libc::EV_DISABLE
+            },
+        );
     }
 
     fn forget(&self, fd: RawFd) {
@@ -315,8 +365,13 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
     // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
-    let trace = std::env::var("LIGHTER_STREAM_TRACE").map(|v| v == "1").unwrap_or(false);
-    let tick = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+    let trace = std::env::var("LIGHTER_STREAM_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let tick = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
     let mut last_trace = std::time::Instant::now();
     loop {
         // SAFETY: the events buffer has capacity 64 and no changes are given.
@@ -352,7 +407,9 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
                 woken = true;
                 continue;
             }
-            let Some(&key) = l.by_fd.get(&fd) else { continue };
+            let Some(&key) = l.by_fd.get(&fd) else {
+                continue;
+            };
             if ev.filter == libc::EVFILT_READ {
                 l.readable(key);
             } else if ev.filter == libc::EVFILT_WRITE {
@@ -366,7 +423,13 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             let mut sink = [0u8; 256];
             // SAFETY: reading into a stack buffer on a non-blocking fd.
             while unsafe { libc::read(wake_read, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
-            let commands: Vec<Command> = std::mem::take(&mut *l.reactor.commands.lock().expect("reactor commands poisoned"));
+            let commands: Vec<Command> = std::mem::take(
+                &mut *l
+                    .reactor
+                    .commands
+                    .lock()
+                    .expect("reactor commands poisoned"),
+            );
             for command in commands {
                 l.command(command);
             }
@@ -383,12 +446,16 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
 
 impl Loop {
     fn trace(&self) {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() % 100_000_000).unwrap_or(0);
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() % 100_000_000)
+            .unwrap_or(0);
         for (key, s) in &self.streams {
             if !matches!(s.phase, Phase::Open) {
                 continue;
             }
-            let from_guest: usize = s.from_guest.iter().map(|c| c.len()).sum::<usize>() - s.from_guest_at;
+            let from_guest: usize =
+                s.from_guest.iter().map(|c| c.len()).sum::<usize>() - s.from_guest_at;
             eprintln!(
                 "TRACE t={t} stream {:?} from_guest={} to_guest={} reading={} writing={} tcp_eof={} guest_eof={}",
                 key,
@@ -403,7 +470,14 @@ impl Loop {
         let c = &self.counters;
         eprintln!(
             "TRACE t={t} reactor iters={} wakes={} events={} takes_chunks={} takes_empty={} writev={} eagain={} writable={}",
-            c.iters, c.wakes, c.events, c.takes_chunks, c.takes_empty, c.writev, c.eagain, c.writable
+            c.iters,
+            c.wakes,
+            c.events,
+            c.takes_chunks,
+            c.takes_empty,
+            c.writev,
+            c.eagain,
+            c.writable
         );
         for line in self.shared.trace_lines() {
             if line.contains("outbound=0/0") && line.contains("guest_inflight=0 ") {
@@ -416,34 +490,40 @@ impl Loop {
     fn command(&mut self, command: Command) {
         match command {
             Command::Outbound(key) => {
-                self.streams.insert(key, Stream {
-                    tcp: None,
-                    phase: Phase::AwaitHeader,
-                    to_guest: Vec::new(),
-                    to_guest_at: 0,
-                    from_guest: VecDeque::new(),
-                    from_guest_at: 0,
-                    tcp_eof: false,
-                    guest_eof: false,
-                    reading: false,
-                    writing: false,
-                    partial: Vec::new(),
-                });
+                self.streams.insert(
+                    key,
+                    Stream {
+                        tcp: None,
+                        phase: Phase::AwaitHeader,
+                        to_guest: Vec::new(),
+                        to_guest_at: 0,
+                        from_guest: VecDeque::new(),
+                        from_guest_at: 0,
+                        tcp_eof: false,
+                        guest_eof: false,
+                        reading: false,
+                        writing: false,
+                        partial: Vec::new(),
+                    },
+                );
             }
             Command::Dns(key) => {
-                self.streams.insert(key, Stream {
-                    tcp: None,
-                    phase: Phase::Dns,
-                    to_guest: Vec::new(),
-                    to_guest_at: 0,
-                    from_guest: VecDeque::new(),
-                    from_guest_at: 0,
-                    tcp_eof: false,
-                    guest_eof: false,
-                    reading: false,
-                    writing: false,
-                    partial: Vec::new(),
-                });
+                self.streams.insert(
+                    key,
+                    Stream {
+                        tcp: None,
+                        phase: Phase::Dns,
+                        to_guest: Vec::new(),
+                        to_guest_at: 0,
+                        from_guest: VecDeque::new(),
+                        from_guest_at: 0,
+                        tcp_eof: false,
+                        guest_eof: false,
+                        reading: false,
+                        writing: false,
+                        partial: Vec::new(),
+                    },
+                );
             }
             Command::DnsReply(key, id, reply) => {
                 self.dns_send(key, id, &reply);
@@ -458,19 +538,22 @@ impl Loop {
                 let key = self.shared.open(INBOUND_PORT, clone);
                 let fd = mac.as_raw_fd();
                 self.by_fd.insert(fd, key);
-                self.streams.insert(key, Stream {
-                    tcp: Some(mac),
-                    phase: Phase::AwaitEstablished(port),
-                    to_guest: Vec::new(),
-                    to_guest_at: 0,
-                    from_guest: VecDeque::new(),
-                    from_guest_at: 0,
-                    tcp_eof: false,
-                    guest_eof: false,
-                    reading: false,
-                    writing: false,
-                    partial: Vec::new(),
-                });
+                self.streams.insert(
+                    key,
+                    Stream {
+                        tcp: Some(mac),
+                        phase: Phase::AwaitEstablished(port),
+                        to_guest: Vec::new(),
+                        to_guest_at: 0,
+                        from_guest: VecDeque::new(),
+                        from_guest_at: 0,
+                        tcp_eof: false,
+                        guest_eof: false,
+                        reading: false,
+                        writing: false,
+                        partial: Vec::new(),
+                    },
+                );
             }
         }
     }
@@ -489,7 +572,9 @@ impl Loop {
     /// Queries off a DNS stream: whole frames answered, a partial one kept.
     fn dns_progress(&mut self, key: ConnKey) {
         let memory = self.memory.clone();
-        let Some(stream) = self.streams.get_mut(&key) else { return };
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
         let chunks = match self.shared.try_take_outbound(key) {
             Outbound::Chunks(c) => c,
             Outbound::Empty => return,
@@ -550,7 +635,9 @@ impl Loop {
 
     /// Whatever a stream can do now.
     fn progress(&mut self, key: ConnKey) {
-        let Some(stream) = self.streams.get_mut(&key) else { return };
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
         match stream.phase {
             Phase::Dns => self.dns_progress(key),
             Phase::AwaitHeader => match self.shared.try_read_outbound(key, HEADER_LEN) {
@@ -580,18 +667,16 @@ impl Loop {
             },
             Phase::Connecting => {}
             Phase::AwaitEstablished(port) => match self.shared.status(key) {
-                Status::Established => {
-                    match self.shared.try_send(key, &port.to_be_bytes()) {
-                        Ok(2) => {
-                            let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();
-                            stream.phase = Phase::Open;
-                            stream.reading = true;
-                            self.kq.read(fd, true);
-                        }
-                        Ok(_) => {}
-                        Err(()) => self.close(key),
+                Status::Established => match self.shared.try_send(key, &port.to_be_bytes()) {
+                    Ok(2) => {
+                        let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();
+                        stream.phase = Phase::Open;
+                        stream.reading = true;
+                        self.kq.read(fd, true);
                     }
-                }
+                    Ok(_) => {}
+                    Err(()) => self.close(key),
+                },
                 Status::Connecting => {}
                 Status::Gone => self.close(key),
             },
@@ -604,9 +689,14 @@ impl Loop {
 
     /// Bytes read from the socket that the guest had no credit for, tried again.
     fn push_to_guest(&mut self, key: ConnKey) {
-        let Some(stream) = self.streams.get_mut(&key) else { return };
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
         if stream.to_guest_at < stream.to_guest.len() {
-            match self.shared.try_send(key, &stream.to_guest[stream.to_guest_at..]) {
+            match self
+                .shared
+                .try_send(key, &stream.to_guest[stream.to_guest_at..])
+            {
                 Ok(n) => {
                     stream.to_guest_at += n;
                     if stream.to_guest_at == stream.to_guest.len() {
@@ -630,7 +720,9 @@ impl Loop {
     /// may be waiting on this very write for the credit to send anything.
     fn pull_from_guest(&mut self, key: ConnKey) {
         loop {
-            let Some(stream) = self.streams.get_mut(&key) else { return };
+            let Some(stream) = self.streams.get_mut(&key) else {
+                return;
+            };
             if stream.from_guest.is_empty() && !stream.guest_eof {
                 match self.shared.try_take_outbound(key) {
                     Outbound::Chunks(chunks) => {
@@ -650,7 +742,9 @@ impl Loop {
                 return;
             }
             self.flush(key);
-            let Some(stream) = self.streams.get_mut(&key) else { return };
+            let Some(stream) = self.streams.get_mut(&key) else {
+                return;
+            };
             if stream.writing || !stream.from_guest.is_empty() {
                 return;
             }
@@ -660,8 +754,12 @@ impl Loop {
     /// Writes what is pending from the guest; arms the write filter if the
     /// socket would not take it all.
     fn flush(&mut self, key: ConnKey) {
-        let Some(stream) = self.streams.get_mut(&key) else { return };
-        let Some(tcp) = stream.tcp.as_ref() else { return };
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
+        let Some(tcp) = stream.tcp.as_ref() else {
+            return;
+        };
         let fd = tcp.as_raw_fd();
         while !stream.from_guest.is_empty() {
             // One writev over everything pending, from the offset into the
@@ -674,7 +772,10 @@ impl Loop {
                         let s = skip.min(v.len());
                         skip -= s;
                         if v.len() > s {
-                            iovs.push(libc::iovec { iov_base: v[s..].as_ptr() as *mut libc::c_void, iov_len: v.len() - s });
+                            iovs.push(libc::iovec {
+                                iov_base: v[s..].as_ptr() as *mut libc::c_void,
+                                iov_len: v.len() - s,
+                            });
                         }
                     }
                     Chunk::Guest { spans, .. } => {
@@ -682,8 +783,13 @@ impl Loop {
                         for (gpa, len) in spans {
                             let s = skip.min(*len);
                             skip -= s;
-                            if *len > s && let Ok(ptr) = mem.host_span(gpa + s as u64, len - s) {
-                                iovs.push(libc::iovec { iov_base: ptr.cast(), iov_len: len - s });
+                            if *len > s
+                                && let Ok(ptr) = mem.host_span(gpa + s as u64, len - s)
+                            {
+                                iovs.push(libc::iovec {
+                                    iov_base: ptr.cast(),
+                                    iov_len: len - s,
+                                });
                             }
                         }
                     }
@@ -721,7 +827,9 @@ impl Loop {
             let mut recycled: Vec<Chunk> = Vec::new();
             let mut acked = 0u32;
             while left > 0 {
-                let Some(front) = stream.from_guest.front() else { break };
+                let Some(front) = stream.from_guest.front() else {
+                    break;
+                };
                 let remaining = front.len() - stream.from_guest_at;
                 if left >= remaining {
                     left -= remaining;
@@ -765,8 +873,12 @@ impl Loop {
     }
 
     fn readable(&mut self, key: ConnKey) {
-        let Some(stream) = self.streams.get_mut(&key) else { return };
-        let Some(tcp) = stream.tcp.as_ref() else { return };
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
+        let Some(tcp) = stream.tcp.as_ref() else {
+            return;
+        };
         let fd = tcp.as_raw_fd();
         if !matches!(stream.phase, Phase::Open) {
             return;
@@ -830,7 +942,9 @@ impl Loop {
 
     fn writable(&mut self, key: ConnKey) {
         self.counters.writable += 1;
-        let Some(stream) = self.streams.get_mut(&key) else { return };
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
         if matches!(stream.phase, Phase::Connecting) {
             let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();
             match connect_result(fd) {
@@ -882,7 +996,10 @@ mod tests {
             header[0] = 4;
             header[1..5].copy_from_slice(&ip.octets());
             header[17..19].copy_from_slice(&8080u16.to_be_bytes());
-            assert_eq!(destination(&header), Some("127.0.0.1:8080".parse().unwrap()));
+            assert_eq!(
+                destination(&header),
+                Some("127.0.0.1:8080".parse().unwrap())
+            );
         }
     }
 
@@ -903,7 +1020,11 @@ mod tests {
         let stream = connect_nonblocking(addr).unwrap();
         // Poll until the socket settles.
         let fd = stream.as_raw_fd();
-        let mut fds = [libc::pollfd { fd, events: libc::POLLOUT, revents: 0 }];
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        }];
         unsafe { libc::poll(fds.as_mut_ptr(), 1, 2000) };
         assert!(connect_result(fd).is_err());
     }

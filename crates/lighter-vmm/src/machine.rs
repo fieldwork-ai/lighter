@@ -311,7 +311,8 @@ impl Machine {
                         let (pending, arrived) = &*deliver;
                         loop {
                             let mut go = false;
-                            let spin_until = std::time::Instant::now() + std::time::Duration::from_micros(50);
+                            let spin_until =
+                                std::time::Instant::now() + std::time::Duration::from_micros(50);
                             while std::time::Instant::now() < spin_until {
                                 if std::mem::take(&mut *pending.lock().expect("deliver poisoned")) {
                                     go = true;

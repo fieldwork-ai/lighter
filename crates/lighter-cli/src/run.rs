@@ -151,7 +151,10 @@ pub fn machine() -> anyhow::Result<()> {
     }
     // The kernel join of a stream's two sockets: on unless `LIGHTER_SOCKMAP=0`,
     // which keeps the agent's copying path measurable.
-    if std::env::var("LIGHTER_SOCKMAP").map(|v| v == "0").unwrap_or(false) {
+    if std::env::var("LIGHTER_SOCKMAP")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
         cmdline.push_str(" lighter.nosockmap");
     }
 
