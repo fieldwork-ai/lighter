@@ -140,9 +140,10 @@ pub fn machine() -> anyhow::Result<()> {
             share.path.display()
         ));
     }
-    // TCP as streams over vsock rather than frames through gvproxy, while it
-    // is being measured; the guest's rules are behind the same switch.
-    let streams = std::env::var("LIGHTER_STREAMS").map(|v| v != "0").unwrap_or(false);
+    // TCP as streams over vsock rather than frames through gvproxy: on
+    // unless `LIGHTER_STREAMS=0`, which keeps the frame path measurable.
+    // The guest's rules are behind the same switch.
+    let streams = std::env::var("LIGHTER_STREAMS").map(|v| v != "0").unwrap_or(true);
     if streams {
         cmdline.push_str(" lighter.streams");
     }

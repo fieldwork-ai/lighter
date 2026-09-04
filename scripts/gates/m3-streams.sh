@@ -51,8 +51,15 @@ code="$($D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --m
 t0=$(date +%s); out="$($D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{exitcode}' --max-time 10 "http://$LAN_IP:9/" 2>/dev/null)"; dt=$(( $(date +%s) - t0 ))
 { [ "$out" != 0 ] && [ "$dt" -le 3 ]; } && pass "a closed port is refused in ${dt}s (curl exit $out)" || fail "refused: exit=$out after ${dt}s"
 
-# halfclose: nc sends a request then half-closes; the reply must still arrive
-reply="$($D run --rm alpine:3.21 sh -c 'printf "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n" | nc -w 10 example.com 80 | head -1' 2>/dev/null)"
+# halfclose: a client that sends its request and closes its write side
+# must still get the reply (busybox nc cannot half-close, so node does it)
+$D pull -q node:24-alpine >/dev/null 2>&1
+reply="$($D run --rm node:24-alpine node -e '
+const net = require("net");
+const s = net.connect(80, "example.com", () => { s.write("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"); s.end(); });
+let got = ""; s.on("data", d => { got += d; }); s.on("close", () => { console.log(got.split("\r\n")[0]); });
+s.on("error", e => { console.log("error " + e.message); }); setTimeout(() => { console.log("timeout"); process.exit(1); }, 15000);
+' 2>/dev/null)"
 echo "$reply" | grep -q "HTTP/1.[01] 200" && pass "half-close: the reply arrives after the request side closed" || fail "half-close: got '${reply}'"
 
 # host.docker.internal -> a server on the Mac
