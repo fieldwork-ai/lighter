@@ -317,8 +317,8 @@ fn bound_container_cache() {
 /// The host port that takes the guest's memory offer.
 const MEMORY_PORT: u32 = 2381;
 
-/// Sixteen bytes to the host: what the guest can spare beyond a reserve of
-/// an eighth of RAM (MiB; zero holds the balloon where it is), available
+/// Sixteen bytes to the host: the free memory beyond a reserve of an
+/// eighth of RAM (MiB; zero holds the balloon where it is), available
 /// and free (MiB), and a release flag that asks the whole balloon back.
 /// Reconnects on the next tick if the stream is gone; the host treats a
 /// closed stream as a release.
@@ -368,9 +368,16 @@ fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool) {
     // Not on free memory alone: inflation toward a target computed a tick
     // ago dips free memory under the line for a moment, and a release on
     // that dip alternated with the next offer, every tick.
+    // Free memory, never available memory: MemAvailable counts the page
+    // cache the kernel could reclaim, and a target that counted it had the
+    // balloon driver reclaiming the cache to fill itself — on a 4 GiB
+    // guest every ripgrep repetition ran cold, copy-tree took four times
+    // as long and pnpm twice. The cache is the trims' to give up, when the
+    // containers have been idle; the balloon takes only what is already
+    // free.
     let release = active && free < reserve / 2;
-    let spare = if !release && avail > reserve + reserve / 4 {
-        avail - reserve
+    let spare = if !release && free > reserve + reserve / 4 {
+        free - reserve
     } else {
         0
     };
