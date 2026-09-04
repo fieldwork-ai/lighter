@@ -222,6 +222,7 @@ fn bound_container_cache() {
     let mut idle_for = 0u32;
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
+    let mut last_offer: Option<[u8; 16]> = None;
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
     // Quarter-second ticks: the offer to the host waits for two seconds of
@@ -230,7 +231,14 @@ fn bound_container_cache() {
     // machine five seconds after its work would read.
     const TICKS_PER_SEC: u32 = 4;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(1000 / TICKS_PER_SEC as u64));
+        // A quarter-second tick while anything is happening; one a second
+        // once the guest has been idle ten seconds. Each tick is a timer
+        // wakeup for a vCPU and, above eight gigabytes, a message to the
+        // host: four a second of each on a machine doing nothing. The
+        // counters step by four so the marks they are compared against
+        // (the trims, the reporting rate at 25 s) fall where they did.
+        let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
+        std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
             // The engine's cache (image layers) bounded too, at an eighth of
@@ -241,7 +249,7 @@ fn bound_container_cache() {
         let now = container_cpu_usec(containers);
         let used = now.saturating_sub(last);
         last = now;
-        idle_for = if used < 50_000 / TICKS_PER_SEC as u64 { idle_for + 1 } else { 0 };
+        idle_for = if used < step as u64 * 50_000 / TICKS_PER_SEC as u64 { idle_for + step } else { 0 };
         // Freed memory goes back at reporting's idle rate for a while after
         // a trim, and at its churn rate again once the containers work or
         // the burst is over (guest kernel patch 0019).
@@ -277,7 +285,7 @@ fn bound_container_cache() {
         let running = running_containers(containers);
         let active = idle_for == 0 && running > 0;
         let busy = guest_cpu_busy(&mut cpu_last);
-        quiet_for = if busy < 100_000 / TICKS_PER_SEC as u64 { quiet_for + 1 } else { 0 };
+        quiet_for = if busy < step as u64 * 100_000 / TICKS_PER_SEC as u64 { quiet_for + step } else { 0 };
         // Three seconds of it, not one: a second's pause between two
         // commands is the suite's gap between cases, and an offer made in
         // it had the next case deflating the balloon and faulting on every
@@ -291,7 +299,7 @@ fn bound_container_cache() {
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
         if total >= 8 << 30 {
-            offer_memory(&mut memory_stream, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
+            offer_memory(&mut memory_stream, &mut last_offer, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
         }
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
@@ -310,7 +318,12 @@ fn bound_container_cache() {
         // nothing is between commands then, and the cache is the last thing
         // the host is still holding for a guest that has stopped.
         let running = running_containers(containers);
-        let (first, second) = if running == 0 { (3, 8) } else { (5, 10) };
+        // Three and eight seconds whether or not a container is running:
+        // five was chosen so a trim would not land between two installs
+        // and cost the second its cache, and that cost was measured at
+        // nothing (`lighter.trim=0`, three reps, level). Three is inside the
+        // five seconds after work that a footprint is read at.
+        let (first, second) = (3, 8);
         // `lighter.trim=0` keeps the caches: the A/B for what a trim costs
         // the next command.
         if !trims {
@@ -385,7 +398,17 @@ fn guest_cpu_usec() -> u64 {
     busy * 10_000
 }
 
-fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool, quiet: bool, nothing_runs: bool) {
+/// Sends only what changed: the host keeps the last offer until the next,
+/// so an idle guest repeating itself four times a second was four host
+/// wakeups a second for nothing. A reconnect resends.
+fn offer_memory(
+    stream: &mut Option<OwnedFd>,
+    last: &mut Option<[u8; 16]>,
+    total: u64,
+    active: bool,
+    quiet: bool,
+    nothing_runs: bool,
+) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
         meminfo
@@ -434,16 +457,26 @@ fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool, quiet: b
     };
     if stream.is_none() {
         *stream = vsock::connect(MEMORY_PORT).ok();
+        *last = None;
     }
     let Some(fd) = stream.as_ref() else { return };
     let mut bytes = [0u8; 16];
-    for (i, v) in [spare as u32, avail as u32, free as u32, u32::from(release)].iter().enumerate() {
+    // Available and free are rounded to 16 MiB: they drift by a page or two
+    // on an idle guest and would defeat the comparison.
+    let coarse = |v: u64| (v & !15) as u32;
+    for (i, v) in [spare as u32, coarse(avail), coarse(free), u32::from(release)].iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    if *last == Some(bytes) {
+        return;
     }
     // SAFETY: a plain write of a stack buffer to a descriptor we own.
     let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), 16) };
     if n != 16 {
         *stream = None;
+        *last = None;
+    } else {
+        *last = Some(bytes);
     }
 }
 
