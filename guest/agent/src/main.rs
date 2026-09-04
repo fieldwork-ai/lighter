@@ -27,6 +27,7 @@ fn main() -> std::process::ExitCode {
     let mut echo = false;
     let mut control = false;
     let mut tcp_proxy: Option<u16> = None;
+    let mut inbound: Option<u32> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -44,6 +45,10 @@ fn main() -> std::process::ExitCode {
             // connection from a container or the guest that would have left
             // through eth0 — and carries each to the host as a vsock stream.
             "--tcp-proxy" => tcp_proxy = args.next().and_then(|v| v.parse().ok()),
+            // The other direction: a connection the Mac accepted on a
+            // published port arrives as a vsock stream naming the port, and
+            // is carried to the guest address Docker publishes on.
+            "--inbound" => inbound = args.next().and_then(|v| v.parse().ok()),
             other => {
                 eprintln!("lighter-agent: unknown argument {other}");
                 return std::process::ExitCode::from(2);
@@ -53,6 +58,9 @@ fn main() -> std::process::ExitCode {
 
     if let Some(port) = tcp_proxy {
         return serve_tcp_proxy(port);
+    }
+    if let Some(port) = inbound {
+        return serve_inbound(port);
     }
     if target.is_none() && !echo && !control {
         eprintln!("lighter-agent: one of --to <path>, --echo, --control or --tcp-proxy <port> is required");
@@ -285,6 +293,59 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     copy(&mut host_read, &mut tcp_write);
     let _ = tcp_write.shutdown(std::net::Shutdown::Write);
     let _ = outbound.join();
+}
+
+/// The address Docker publishes ports on inside this guest: eth0's, which
+/// gvproxy leases by DHCP. Loopback would not do — with no userland proxy a
+/// published port is a DNAT rule, and Docker's rule exempts loopback.
+const PUBLISHED_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 2);
+
+/// Answers the host's inbound streams: two bytes of port, then bytes both
+/// ways to whatever Docker has on that port.
+fn serve_inbound(port: u32) -> std::process::ExitCode {
+    let listener = match VsockListener::bind(port) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lighter-agent: cannot bind vsock port {port}: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    println!("AGENT inbound port={port}");
+    loop {
+        let Ok(stream) = listener.accept() else { continue };
+        let _ = vsock::set_buffer(&stream, STREAM_WINDOW);
+        std::thread::spawn(move || forward_inbound(stream));
+    }
+}
+
+fn forward_inbound(host: OwnedFd) {
+    let mut host_read = Fd(host);
+    let Ok(mut host_write) = host_read.try_clone() else { return };
+    let mut header = [0u8; 2];
+    if host_read.read_exact(&mut header).is_err() {
+        return;
+    }
+    let port = u16::from_be_bytes(header);
+    let tcp = match std::net::TcpStream::connect((PUBLISHED_ADDR, port)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("lighter-agent: inbound to {PUBLISHED_ADDR}:{port} refused: {e}");
+            return;
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+    let Ok(mut tcp_read) = tcp.try_clone() else { return };
+    let mut tcp_write = tcp;
+    // host -> container
+    let inbound = std::thread::spawn(move || {
+        copy(&mut host_read, &mut tcp_write);
+        let _ = tcp_write.shutdown(std::net::Shutdown::Write);
+    });
+    // container -> host
+    copy(&mut tcp_read, &mut host_write);
+    // SAFETY: a live descriptor; shutdown of the write half only.
+    unsafe { libc::shutdown(host_write.0.as_raw_fd(), libc::SHUT_WR) };
+    let _ = inbound.join();
 }
 
 fn serve_control(stream: OwnedFd) {

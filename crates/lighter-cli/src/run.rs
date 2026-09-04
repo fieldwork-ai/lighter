@@ -170,8 +170,12 @@ pub fn machine() -> anyhow::Result<()> {
     }
 
     // Ports a container publishes appear on the Mac, for as long as the
-    // container is running and no longer.
-    if let Some(network) = machine.network() {
+    // container is running and no longer: through a stream into the guest
+    // when streams are on, through gvproxy's forwarder otherwise.
+    if streams {
+        let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+        lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
+    } else if let Some(network) = machine.network() {
         lighter_docker::PortWatcher::start(&paths::docker_socket()?, network.clone())?;
     }
 

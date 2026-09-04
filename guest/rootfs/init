@@ -325,6 +325,7 @@ fi
 # left alone without listing subnets that Docker changes at will.
 if grep -qw "lighter.streams" /proc/cmdline; then
 	/sbin/lighter-agent --tcp-proxy 15201 &
+	/sbin/lighter-agent --inbound 2378 &
 	if nft -f - <<'EOF'
 table inet lighter {
 	chain prerouting {
