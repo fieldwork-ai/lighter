@@ -203,6 +203,7 @@ fn bound_container_cache() {
     // health check failing and 782,575 throttle events before the bound
     // was lifted by hand. The benchmark asks for it on its own command
     // line; a machine that did not ask keeps its cache.
+    let trims = cmdline_value("lighter.trim").is_none_or(|v| v != 0);
     let bound = cmdline_value("lighter.cachebound")
         .map(|mib| mib << 20)
         .unwrap_or(0);
@@ -310,6 +311,11 @@ fn bound_container_cache() {
         // the host is still holding for a guest that has stopped.
         let running = running_containers(containers);
         let (first, second) = if running == 0 { (3, 8) } else { (5, 10) };
+        // `lighter.trim=0` keeps the caches: the A/B for what a trim costs
+        // the next command.
+        if !trims {
+            continue;
+        }
         let (floor, engine_floor) = match idle_for {
             x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
