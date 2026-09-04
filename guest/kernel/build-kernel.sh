@@ -115,8 +115,12 @@ log "Building Image"
 make ARCH=arm64 -j"${JOBS}" Image
 
 mkdir -p "$OUT"
-cp arch/arm64/boot/Image "$OUT/Image"
-cp .config "$OUT/kernel.config"
+# Through a temporary name and a rename, so a copy that fails partway (the
+# output directory is the Mac's, through the share) never leaves a truncated
+# Image under the name every machine boots from.
+cat arch/arm64/boot/Image > "$OUT/Image.tmp"
+mv "$OUT/Image.tmp" "$OUT/Image"
+cat .config > "$OUT/kernel.config"
 printf '%s\n' "$KERNEL_VERSION" > "$OUT/kernel.version"
 
 log "Done: $(du -h "$OUT/Image" | cut -f1) Image for Linux ${KERNEL_VERSION}"

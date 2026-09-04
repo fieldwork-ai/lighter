@@ -257,11 +257,12 @@ drains the queue like TCP.
  	default:
  		err = -EINVAL;
  		break;
-@@ -1903,31 +1948,42 @@ int virtio_transport_read_skb(struct vsock_sock *vsk, skb_read_actor_t recv_acto
+@@ -1903,31 +1948,52 @@ int virtio_transport_read_skb(struct vsock_sock *vsk, skb_read_actor_t recv_acto
  	struct sock *sk = sk_vsock(vsk);
  	struct virtio_vsock_hdr *hdr;
  	struct sk_buff *skb;
 +	int copied = 0;
++	u32 consumed;
  	u32 pkt_len;
  	int off = 0;
  	int err;
@@ -300,9 +301,18 @@ drains the queue like TCP.
 -	pkt_len = le32_to_cpu(hdr->len);
 -	virtio_transport_dec_rx_pkt(vvs, pkt_len, pkt_len);
 -	spin_unlock_bh(&vvs->rx_lock);
++		/* A packet recvmsg had started on before a sockmap took the
++		 * socket: what it returned is off the count already and
++		 * must not be read twice.
++		 */
++		consumed = VIRTIO_VSOCK_SKB_CB(skb)->offset;
 +		pkt_len = le32_to_cpu(hdr->len);
-+		virtio_transport_dec_rx_pkt(vvs, pkt_len, pkt_len);
++		virtio_transport_dec_rx_pkt(vvs, pkt_len - consumed, pkt_len);
 +		spin_unlock_bh(&vvs->rx_lock);
++		if (consumed) {
++			skb_pull(skb, consumed);
++			VIRTIO_VSOCK_SKB_CB(skb)->offset = 0;
++		}
  
 -	virtio_transport_send_credit_update(vsk);
 +		virtio_transport_send_credit_update(vsk);

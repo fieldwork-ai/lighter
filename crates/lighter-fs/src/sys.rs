@@ -697,7 +697,28 @@ pub fn fallocate(fd: RawFd, mode: u32, offset: u64, length: u64) -> Result<()> {
             fp_length: length as libc::off_t,
         };
         // SAFETY: live descriptor and a correctly-shaped fpunchhole_t.
-        return check(unsafe { libc::fcntl(fd, F_PUNCHHOLE, &arg) }).map(|_| ());
+        if check(unsafe { libc::fcntl(fd, F_PUNCHHOLE, &arg) }).is_ok() {
+            return Ok(());
+        }
+        // macOS punches holes only on block boundaries and answers EINVAL
+        // otherwise; Linux promises the range reads as zeros whatever the
+        // alignment, and coreutils' cp punches at the source's hole edges
+        // when it copies onto an existing file, aborting the copy on the
+        // error. Zeros written in place keep the promise without the
+        // space.
+        let size = stat_fd(fd)?.st_size as u64;
+        let end = offset.saturating_add(length).min(size);
+        let zeros = [0u8; 64 << 10];
+        let mut at = offset;
+        while at < end {
+            let n = ((end - at) as usize).min(zeros.len());
+            let written = write_at(fd, &zeros[..n], at)?;
+            if written == 0 {
+                return Err(errno::linux::EIO);
+            }
+            at += written as u64;
+        }
+        return Ok(());
     }
     if mode & !FALLOC_FL_KEEP_SIZE != 0 {
         return Err(errno::linux::EOPNOTSUPP);
