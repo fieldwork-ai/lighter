@@ -524,7 +524,10 @@ runtime_pids() {
 	lighter)        echo "$VMM_PID $(pgrep -f "gvproxy.*$RUN_DIR" | tr '\n' ' ')" ;;
 	orbstack)       pgrep -f 'OrbStack' | tr '\n' ' ' ;;
 	colima)         pgrep -f 'limactl|lima-driver|com.apple.Virtualization.VirtualMachine|virtiofsd' | tr '\n' ' ' ;;
-	docker-desktop) pgrep -f 'com.docker' | tr '\n' ' ' ;;
+	# Its VM is Virtualization.framework's own XPC service, not a docker
+	# process: without it the reading was the app's 300 MiB and never the
+	# guest's gigabytes.
+	docker-desktop) pgrep -f 'com.docker|com.apple.Virtualization.VirtualMachine' | tr '\n' ' ' ;;
 	esac
 }
 
