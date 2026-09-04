@@ -30,6 +30,7 @@ pub mod packet;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -88,10 +89,20 @@ struct Conn {
     /// was a deque of bytes and pushed each packet's payload into it one
     /// byte at a time, on the vCPU thread, under both locks: 64 KiB of
     /// `push_back` per packet, which was the whole of a 7 Gbit/s ceiling.
-    outbound: VecDeque<Vec<u8>>,
+    /// A payload the guest sent stays in the guest's own buffers until the
+    /// writer has put it on the socket (`Chunk::Guest`): copying it out
+    /// first was a second memcpy of every outbound byte, on a core of its
+    /// own, and with the writer's own copy into the kernel that was the
+    /// whole of a 62 Gbit/s ceiling.
+    outbound: VecDeque<Chunk>,
     /// The guest has half-closed: it will send nothing further, but it is still
     /// willing to receive. The host is owed an EOF once `outbound` drains.
     guest_done: bool,
+    /// Bytes consumed since the guest was last told. A credit update per
+    /// batch written was a packet, a transport lock and a guest interrupt
+    /// for every few hundred kilobytes; the guest only needs to hear when
+    /// a useful fraction of its window has come back.
+    unreported: u32,
     /// The host end, kept for shutdown. The writer thread holds its own
     /// clone. None until a pump attaches one.
     socket: Option<Box<dyn Closable>>,
@@ -102,7 +113,7 @@ struct Conn {
 /// proxy, a TCP socket for a stream to the network — the pump does not
 /// care which, and it matters that it does not, because a socket pair in
 /// between was a copy and a thread per connection that bought nothing.
-pub trait Socket: Read + Write + Send + 'static {
+pub trait Socket: Read + Write + AsRawFd + Send + 'static {
     fn try_clone(&self) -> std::io::Result<Self>
     where
         Self: Sized;
@@ -140,6 +151,25 @@ impl<S: Socket> Closable for S {
     }
 }
 
+/// Bytes on their way from the guest to the host socket.
+pub enum Chunk {
+    /// Owned by us: a control payload, or a copy made for a reader.
+    Owned(Vec<u8>),
+    /// Still in the guest's transmit buffers. `head` is the chain to return
+    /// once the bytes are on the socket; `spans` are the payload's host
+    /// addresses, valid until then.
+    Guest { head: u16, spans: Vec<(u64, usize)> },
+}
+
+impl Chunk {
+    fn len(&self) -> usize {
+        match self {
+            Chunk::Owned(v) => v.len(),
+            Chunk::Guest { spans, .. } => spans.iter().map(|(_, n)| n).sum(),
+        }
+    }
+}
+
 /// A connection: our port and the guest's, which together are what every
 /// packet carries. Host-opened connections have a unique port of ours and a
 /// well-known one of the guest's; guest-opened ones share the port they
@@ -155,6 +185,9 @@ struct Inner {
     /// zeroed mapping and an unmap on every packet — the host's writer
     /// thread sat at a core in `writev` and the copies never got faster.
     spare: Vec<Vec<u8>>,
+    /// Transmit chains whose bytes are on a socket now, waiting to go back
+    /// on the used ring the next time the transport looks.
+    done: VecDeque<u16>,
     /// Ports the host answers: a REQUEST to one is accepted and the new
     /// connection handed to the listener, one end of a socket pair for the
     /// device's pump and the other for whoever listens.
@@ -172,6 +205,9 @@ pub struct Accepted {
 /// State shared between the device and the host threads driving connections.
 pub struct VsockShared {
     inner: Mutex<Inner>,
+    /// Guest memory, for a writer reading a payload where the guest left
+    /// it. Set when the driver activates the device.
+    memory: std::sync::OnceLock<Arc<GuestMemory>>,
     /// Signalled when credit frees up or a connection changes state, so a
     /// blocked writer wakes without polling.
     progress: Condvar,
@@ -196,11 +232,13 @@ impl Default for VsockShared {
 impl VsockShared {
     pub fn new() -> VsockShared {
         VsockShared {
+            memory: std::sync::OnceLock::new(),
             inner: Mutex::new(Inner {
                 conns: HashMap::new(),
                 outbox: VecDeque::new(),
                 next_port: FIRST_EPHEMERAL_PORT,
                 spare: Vec::new(),
+                done: VecDeque::new(),
                 listeners: HashMap::new(),
             }),
             progress: Condvar::new(),
@@ -253,6 +291,7 @@ impl VsockShared {
                 credit: Credit::new(),
                 outbound: VecDeque::new(),
                 guest_done: false,
+                unreported: 0,
                 socket: Some(Box::new(socket)),
             },
         );
@@ -290,22 +329,46 @@ impl VsockShared {
         let mut out = Vec::with_capacity(n);
         let mut inner = self.lock();
         loop {
+            let memory = self.memory.get().cloned();
             let conn = inner.conns.get_mut(&key)?;
+            let mut finished: Vec<u16> = Vec::new();
             while out.len() < n {
-                let Some(mut chunk) = conn.outbound.pop_front() else {
+                let Some(chunk) = conn.outbound.pop_front() else {
                     break;
                 };
-                let take = chunk.len().min(n - out.len());
-                if take < chunk.len() {
-                    let rest = chunk.split_off(take);
-                    conn.outbound.push_front(rest);
+                // Whole chunk as bytes; a guest chunk is copied out here,
+                // which is fine for the few bytes a header is.
+                let (mut bytes, head) = match chunk {
+                    Chunk::Owned(v) => (v, None),
+                    Chunk::Guest { head, spans } => {
+                        let mut v = Vec::new();
+                        if let Some(mem) = &memory {
+                            for (gpa, len) in &spans {
+                                let start = v.len();
+                                v.resize(start + len, 0);
+                                let _ = mem.read(*gpa, &mut v[start..]);
+                            }
+                        }
+                        (v, Some(head))
+                    }
+                };
+                if let Some(head) = head {
+                    finished.push(head);
                 }
-                out.extend_from_slice(&chunk[..take]);
+                let take = bytes.len().min(n - out.len());
+                if take < bytes.len() {
+                    let rest = bytes.split_off(take);
+                    conn.outbound.push_front(Chunk::Owned(rest));
+                }
+                out.extend_from_slice(&bytes[..take]);
             }
-            if out.len() == n {
+            let done_now = out.len() == n;
+            let ended = conn.state == State::Closed || conn.guest_done;
+            inner.done.extend(finished.iter().copied());
+            if done_now {
                 break;
             }
-            if conn.state == State::Closed || conn.guest_done {
+            if ended {
                 return None;
             }
             let (guard, _) = self
@@ -315,8 +378,27 @@ impl VsockShared {
             inner = guard;
         }
         drop(inner);
+        self.wake();
         self.acknowledge(key, n as u32);
         Some(out)
+    }
+
+    /// Chains whose bytes are on a socket: back to the guest on the next
+    /// look at the ring.
+    fn complete(&self, heads: impl IntoIterator<Item = u16>) {
+        let mut inner = self.lock();
+        let before = inner.done.len();
+        inner.done.extend(heads);
+        let any = inner.done.len() > before;
+        drop(inner);
+        if any {
+            self.wake();
+        }
+    }
+
+    /// Guest memory, once the device is active.
+    fn memory(&self) -> Option<Arc<GuestMemory>> {
+        self.memory.get().cloned()
     }
 
     /// Blocks until the guest accepts or refuses. `false` means refused.
@@ -461,7 +543,7 @@ impl VsockShared {
     ///
     /// Returns `None` once the connection is gone. Blocks while the connection
     /// is alive and has nothing pending, so the writer thread does not spin.
-    fn take_outbound(&self, key: ConnKey) -> Option<Vec<Vec<u8>>> {
+    fn take_outbound(&self, key: ConnKey) -> Option<Vec<Chunk>> {
         let mut inner = self.lock();
         loop {
             let conn = inner.conns.get_mut(&key)?;
@@ -489,6 +571,15 @@ impl VsockShared {
             return;
         };
         conn.credit.consumed(bytes);
+        conn.unreported = conn.unreported.saturating_add(bytes);
+        // A quarter of the window at a time: the guest always has at least
+        // three quarters in hand, and a small transfer that never reaches the
+        // threshold has nothing more to send anyway. A CREDIT_REQUEST is
+        // answered at once regardless.
+        if conn.unreported < credit::BUF_ALLOC / 4 {
+            return;
+        }
+        conn.unreported = 0;
         let fwd_cnt = conn.credit.fwd_cnt();
 
         let (host_port, guest_port) = key;
@@ -518,15 +609,17 @@ impl VsockShared {
 
     /// Hands payload buffers back for the ring reader to fill again. Bounded,
     /// so a burst does not leave a pile of them behind.
-    fn recycle(&self, chunks: Vec<Vec<u8>>) {
+    fn recycle(&self, chunks: Vec<Chunk>) {
         const KEEP: usize = 64;
         let mut inner = self.lock();
         for chunk in chunks {
             if inner.spare.len() >= KEEP {
                 break;
             }
-            if chunk.capacity() >= MAX_PAYLOAD / 4 {
-                inner.spare.push(chunk);
+            if let Chunk::Owned(buf) = chunk
+                && buf.capacity() >= MAX_PAYLOAD / 4
+            {
+                inner.spare.push(buf);
             }
         }
     }
@@ -572,8 +665,10 @@ impl Vsock {
 
             Op::Rst => {
                 // Refused, or torn down. Either way the connection is over, and
-                // dropping the entry closes the host socket with it.
-                if inner.conns.remove(&key).is_some() {
+                // dropping the entry closes the host socket with it. Chains it
+                // still held go back to the guest.
+                if let Some(conn) = inner.conns.remove(&key) {
+                    Vsock::retire(inner, conn);
                     tracing::debug!(host_port, "vsock reset by guest");
                 }
             }
@@ -605,7 +700,9 @@ impl Vsock {
                 let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
                 rst.buf_alloc = credit::BUF_ALLOC;
                 inner.outbox.push_back(rst);
-                inner.conns.remove(&key);
+                if let Some(conn) = inner.conns.remove(&key) {
+                    Vsock::retire(inner, conn);
+                }
             }
 
             Op::Rw => {
@@ -622,11 +719,12 @@ impl Vsock {
                 // advanced here — the bytes are not with the host application
                 // yet, and claiming they are would invite the guest to send
                 // more than we can hold.
-                conn.outbound.push_back(packet.payload);
+                conn.outbound.push_back(Chunk::Owned(packet.payload));
             }
 
             Op::CreditRequest => {
-                if let Some(conn) = inner.conns.get(&key) {
+                if let Some(conn) = inner.conns.get_mut(&key) {
+                    conn.unreported = 0;
                     let guest_port = conn.guest_port;
                     let fwd_cnt = conn.credit.fwd_cnt();
                     let mut update = Packet::control(Op::CreditUpdate, host_port, guest_port);
@@ -658,6 +756,7 @@ impl Vsock {
                             credit: Credit::new(),
                             outbound: VecDeque::new(),
                             guest_done: false,
+                            unreported: 0,
                             socket: None,
                         };
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
@@ -681,20 +780,61 @@ impl Vsock {
         }
     }
 
+    /// Returns to the guest any chains a departing connection still held.
+    fn retire(inner: &mut Inner, conn: Conn) {
+        for chunk in conn.outbound {
+            if let Chunk::Guest { head, .. } = chunk {
+                inner.done.push_back(head);
+            }
+        }
+    }
+
+    /// An RW packet whose payload stays in the guest: queued as a
+    /// [`Chunk::Guest`] if the connection is there to take it, in which
+    /// case the chain is held until the writer is done with it. Returns
+    /// whether the chain was held.
+    fn handle_guest_rw(inner: &mut Inner, packet: &Packet, head: u16, spans: Vec<(u64, usize)>) -> bool {
+        let key: ConnKey = (packet.dst_port, packet.src_port);
+        match inner.conns.get_mut(&key) {
+            Some(conn) => {
+                conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
+                conn.outbound.push_back(Chunk::Guest { head, spans });
+                true
+            }
+            None => {
+                let mut rst = Packet::control(Op::Rst, packet.dst_port, packet.src_port);
+                rst.buf_alloc = credit::BUF_ALLOC;
+                inner.outbox.push_back(rst);
+                false
+            }
+        }
+    }
+
+    /// Returns the chains a writer has finished with to the guest.
+    fn complete_done(inner: &mut Inner, queue: &mut Virtqueue, mem: &GuestMemory) -> bool {
+        let mut any = false;
+        while let Some(head) = inner.done.pop_front() {
+            queue.push_used(mem, head, 0);
+            any = true;
+        }
+        any
+    }
+
     /// Reads packets the guest has queued for us.
     fn drain_tx(&mut self, queue: &mut Virtqueue, mem: &GuestMemory) -> bool {
         let mut used_any = false;
-        let mut packets = Vec::new();
+        // Each entry: the packet, and for an RW one the chain and the
+        // payload's spans in guest memory, which the writer reads in place.
+        let mut packets: Vec<(Packet, Option<(u16, Vec<(u64, usize)>)>)> = Vec::new();
 
         while let Some(chain) = queue.pop(mem) {
             let head = chain.head();
-            // The header into a stack array and the payload into the Vec
-            // that will carry it to the socket: one copy out of the guest.
-            // Reading the chain into one buffer and parsing that copied every
-            // payload byte twice, on the vCPU thread.
+            // The header into a stack array; the payload stays where it is,
+            // as spans of guest memory, unless the packet is not RW.
             let mut header = [0u8; HDR_LEN];
             let mut have = 0usize;
-            let mut payload: Vec<u8> = self.shared.spare_buffer();
+            let mut spans: Vec<(u64, usize)> = Vec::new();
+            let mut declared = 0usize;
             let mut ok = true;
             for desc in chain {
                 if desc.is_write_only() {
@@ -712,64 +852,90 @@ impl Vsock {
                     addr += take as u64;
                     len -= take;
                     if have == HDR_LEN {
-                        let declared =
-                            u32::from_le_bytes([header[24], header[25], header[26], header[27]])
-                                as usize;
+                        declared = u32::from_le_bytes([
+                            header[24], header[25], header[26], header[27],
+                        ]) as usize;
                         if declared > MAX_PAYLOAD {
                             ok = false;
                             break;
                         }
-                        payload.reserve_exact(declared);
                     }
                 }
                 if len == 0 {
                     continue;
                 }
-                if payload.len() + len > MAX_PAYLOAD {
+                let so_far: usize = spans.iter().map(|(_, n)| n).sum();
+                if so_far >= declared {
+                    continue;
+                }
+                let take = len.min(declared - so_far);
+                if mem.host_span(addr, take).is_err() {
                     ok = false;
                     break;
                 }
-                let start = payload.len();
-                payload.resize(start + len, 0);
-                if mem.read(addr, &mut payload[start..]).is_err() {
-                    ok = false;
-                    break;
-                }
+                spans.push((addr, take));
             }
-
-            let parsed = if ok && have == HDR_LEN {
-                // A chain may carry more bytes than the header declares
-                // (the driver posts whole buffers); only the declared part
-                // is payload.
-                let declared =
-                    u32::from_le_bytes([header[24], header[25], header[26], header[27]]) as usize;
-                if payload.len() >= declared {
-                    payload.truncate(declared);
-                    Packet::from_parts(&header, payload)
-                } else {
-                    None
-                }
+            let total: usize = spans.iter().map(|(_, n)| n).sum();
+            let parsed = if ok && have == HDR_LEN && total == declared {
+                Packet::from_parts(&header, Vec::new()).map(|mut p| {
+                    // A payload on a packet that is not RW is small and
+                    // rare (nothing in the protocol has one); copy it so the
+                    // packet can be handled whole.
+                    if p.op != Op::Rw && declared > 0 {
+                        let mut payload = Vec::with_capacity(declared);
+                        for (gpa, len) in &spans {
+                            let start = payload.len();
+                            payload.resize(start + len, 0);
+                            let _ = mem.read(*gpa, &mut payload[start..]);
+                        }
+                        p.payload = payload;
+                        (p, None)
+                    } else if declared > 0 {
+                        (p, Some((head, std::mem::take(&mut spans))))
+                    } else {
+                        (p, None)
+                    }
+                })
             } else {
                 None
             };
             match parsed {
-                Some(packet) => packets.push(packet),
-                None => tracing::debug!("malformed vsock packet from guest"),
+                Some((packet, guest)) => {
+                    let held = guest.is_some();
+                    packets.push((packet, guest));
+                    if !held {
+                        queue.push_used(mem, head, 0);
+                        used_any = true;
+                    }
+                }
+                None => {
+                    tracing::debug!("malformed vsock packet from guest");
+                    queue.push_used(mem, head, 0);
+                    used_any = true;
+                }
             }
-            queue.push_used(mem, head, 0);
-            used_any = true;
         }
 
-        if !packets.is_empty() {
-            let mut inner = self.shared.lock();
-            for packet in packets {
-                Vsock::handle(&mut inner, packet);
+        let mut inner = self.shared.lock();
+        for (packet, guest) in packets {
+            match guest {
+                Some((head, spans)) => {
+                    if !Vsock::handle_guest_rw(&mut inner, &packet, head, spans) {
+                        queue.push_used(mem, head, 0);
+                        used_any = true;
+                    }
+                }
+                None => Vsock::handle(&mut inner, packet),
             }
-            drop(inner);
-            // Credit may have freed up, and a connection may have been
-            // established or torn down; either way somebody may be blocked.
-            self.shared.progress.notify_all();
         }
+        // Chains a writer finished with since the last look.
+        if Vsock::complete_done(&mut inner, queue, mem) {
+            used_any = true;
+        }
+        drop(inner);
+        // Credit may have freed up, and a connection may have been
+        // established or torn down; either way somebody may be blocked.
+        self.shared.progress.notify_all();
 
         used_any
     }
@@ -897,6 +1063,10 @@ impl VirtioDevice for Vsock {
         }
     }
 
+    fn activate(&mut self, mem: Arc<GuestMemory>) {
+        let _ = self.shared.memory.set(mem);
+    }
+
     fn notify(&mut self, queue: u16, queues: &mut [Virtqueue], mem: &GuestMemory) -> Serviced {
         let serviced = match queue {
             TX_QUEUE => match queues.get_mut(TX_QUEUE as usize) {
@@ -964,13 +1134,19 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
             .name("vsock-write".into())
             .spawn(move || {
                 crate::qos::raise_interactive();
+                let memory = shared.memory();
                 while let Some(chunks) = shared.take_outbound(key) {
-                    if write_all_chunks(&mut socket, &chunks).is_err() {
+                    if write_all_chunks(&mut socket, &chunks, memory.as_deref()).is_err() {
                         break;
                     }
                     // Only now are the bytes the host application's, so only
-                    // now may the guest be told it has room for more.
-                    let bytes: usize = chunks.iter().map(Vec::len).sum();
+                    // now may the guest be told it has room for more — and
+                    // only now may the guest have its buffers back.
+                    let bytes: usize = chunks.iter().map(Chunk::len).sum();
+                    shared.complete(chunks.iter().filter_map(|c| match c {
+                        Chunk::Guest { head, .. } => Some(*head),
+                        Chunk::Owned(_) => None,
+                    }));
                     shared.acknowledge(key, bytes as u32);
                     shared.recycle(chunks);
                 }
@@ -1022,18 +1198,39 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
     }
 }
 
-/// One vectored write per batch, completed across partial writes.
-fn write_all_chunks(socket: &mut impl Write, chunks: &[Vec<u8>]) -> std::io::Result<()> {
-    let mut slices: Vec<std::io::IoSlice<'_>> =
-        chunks.iter().map(|c| std::io::IoSlice::new(c)).collect();
-    let mut slices: &mut [std::io::IoSlice<'_>] = &mut slices;
-    while !slices.is_empty() {
-        match socket.write_vectored(slices) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(n) => std::io::IoSlice::advance_slices(&mut slices, n),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+/// One vectored write per batch, completed across partial writes. Guest
+/// chunks are written from where they are: the kernel copies them out of
+/// guest memory itself.
+fn write_all_chunks(
+    socket: &mut impl Socket,
+    chunks: &[Chunk],
+    memory: Option<&GuestMemory>,
+) -> std::io::Result<()> {
+    let mut iovs: Vec<libc::iovec> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        match chunk {
+            Chunk::Owned(v) => iovs.push(libc::iovec {
+                iov_base: v.as_ptr() as *mut libc::c_void,
+                iov_len: v.len(),
+            }),
+            Chunk::Guest { spans, .. } => {
+                let Some(mem) = memory else {
+                    return Err(std::io::Error::other("no guest memory for a guest chunk"));
+                };
+                for (gpa, len) in spans {
+                    let ptr = mem
+                        .host_span(*gpa, *len)
+                        .map_err(|_| std::io::Error::other("guest span out of bounds"))?;
+                    iovs.push(libc::iovec {
+                        iov_base: ptr.cast(),
+                        iov_len: *len,
+                    });
+                }
+            }
         }
+    }
+    for batch in iovs.chunks_mut(1024) {
+        crate::net::write_all_vectored(socket.as_raw_fd(), batch)?;
     }
     Ok(())
 }
@@ -1042,8 +1239,15 @@ fn write_all_chunks(socket: &mut impl Write, chunks: &[Vec<u8>]) -> std::io::Res
 mod tests {
     use super::*;
 
-    fn flat(chunks: Option<Vec<Vec<u8>>>) -> Option<Vec<u8>> {
-        chunks.map(|c| c.concat())
+    fn flat(chunks: Option<Vec<Chunk>>) -> Option<Vec<u8>> {
+        chunks.map(|c| {
+            c.into_iter()
+                .flat_map(|chunk| match chunk {
+                    Chunk::Owned(v) => v,
+                    Chunk::Guest { .. } => panic!("a guest chunk in a unit test"),
+                })
+                .collect()
+        })
     }
 
     fn shared_with_connection() -> (Arc<VsockShared>, ConnKey, UnixStream) {
@@ -1196,15 +1400,25 @@ mod tests {
         inner.outbox.clear();
         drop(inner);
 
+        // A few bytes are consumed silently: the guest has most of its
+        // window in hand and an update per batch was a packet, a lock and
+        // an interrupt for every few hundred kilobytes.
         shared.acknowledge(port, 5);
+        assert!(
+            !shared.lock().outbox.iter().any(|p| p.op == Op::CreditUpdate),
+            "a few bytes should not produce a credit update"
+        );
+
+        // A quarter of the window is when the guest is told.
+        shared.acknowledge(port, credit::BUF_ALLOC / 4);
 
         let inner = shared.lock();
         let update = inner
             .outbox
             .iter()
             .find(|p| p.op == Op::CreditUpdate)
-            .expect("delivery should produce a credit update");
-        assert_eq!(update.fwd_cnt, 5);
+            .expect("delivery of a quarter window should produce a credit update");
+        assert_eq!(update.fwd_cnt, 5 + credit::BUF_ALLOC / 4);
         assert_eq!(update.buf_alloc, credit::BUF_ALLOC);
     }
 

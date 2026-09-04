@@ -420,7 +420,7 @@ impl NetBackend for FramedStream {
 
 /// `writev` until every iovec is on the socket, advancing past whatever a
 /// partial write took.
-fn write_all_vectored(fd: libc::c_int, iovs: &mut [libc::iovec]) -> io::Result<()> {
+pub(crate) fn write_all_vectored(fd: libc::c_int, iovs: &mut [libc::iovec]) -> io::Result<()> {
     let mut first = 0usize;
     while first < iovs.len() {
         let rest = &iovs[first..];
