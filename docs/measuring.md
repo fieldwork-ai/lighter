@@ -99,3 +99,7 @@ to submit).
 Each had been reasoned about rather than measured, and each survived because it
 was plausible. They are corrected in place with a note saying what was wrong,
 because the failure mode is more useful than the fact.
+
+## A machine that has stopped answering
+
+`kill -USR1 <vmm pid>` (the pid in `lighter.pid`, or the `lighter-bench` process under the suite) prints every virtqueue's state and the vsock counters to the VMM's stderr — `machine.log` under a `lighter start`, the stage log under the suite. It is the one probe that works when the control channel is what has stopped: a guest asleep on an interrupt it never received looks, from outside, exactly like an idle one (every vCPU in wait-for-interrupt, the pumps parked on their condvars, the port watcher blocked on the daemon), and the ring indices are what tell the two apart. Read each `DUMP` line against the driver: `next_avail` behind what the guest offered is a request we never took; `next_used` ahead of what the guest consumed with `isr=0x0` is a completion it was never told about; `suppressed=true` with work outstanding is a poller that went to sleep with the kick turned off. Pair it with `sample <pid> 2` for the host side.

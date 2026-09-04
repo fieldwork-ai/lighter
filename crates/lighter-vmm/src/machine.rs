@@ -609,6 +609,8 @@ impl Machine {
             "machine started"
         );
 
+        crate::dump::install(virtio_devices.clone(), vsock_state.clone());
+
         Ok(Machine {
             _vm: vm,
             ctx,

@@ -575,6 +575,44 @@ impl Virtqueue {
     /// Diagnostics, and the one number that matters when a polled queue stops:
     /// a poller that goes to sleep while this is non-zero has lost a wake-up,
     /// and the guest will wait forever for a reply nobody is going to produce.
+    /// One line of the ring's state, for the stall dump (`kill -USR1`).
+    pub fn debug_line(&self, mem: &GuestMemory) -> String {
+        if !self.ready {
+            return "not ready".into();
+        }
+        if self.packed {
+            return format!(
+                "packed size={} next_avail={} next_used={} wrap={}/{} event_idx={} suppressed={} published={:?} work={}",
+                self.size,
+                self.next_avail,
+                self.next_used,
+                self.avail_wrap,
+                self.used_wrap,
+                self.event_idx,
+                self.suppressed,
+                self.published_event,
+                self.has_work(mem)
+            );
+        }
+        let size = u64::from(self.size);
+        format!(
+            "split size={} avail.idx={:?} next_avail={} outstanding={} used.idx={:?} next_used={} avail.flags={:?} used_event={:?} avail_event={:?} event_idx={} suppressed={} published={:?} signalled_used={}",
+            self.size,
+            self.avail_idx(mem),
+            self.next_avail,
+            self.outstanding(mem),
+            mem.read_u16(self.used_addr + 2).ok(),
+            self.next_used,
+            mem.read_u16(self.avail_addr).ok(),
+            mem.read_u16(self.avail_addr + 4 + 2 * size).ok(),
+            mem.read_u16(self.used_addr + 4 + 8 * size).ok(),
+            self.event_idx,
+            self.suppressed,
+            self.published_event,
+            self.signalled_used
+        )
+    }
+
     pub fn outstanding(&self, mem: &GuestMemory) -> u16 {
         // A packed ring has no index to subtract: whether there is anything
         // there is a question about one descriptor, and "some" is all the
