@@ -25,7 +25,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-SECONDS_PER_PATH=2
+SECONDS_PER_PATH=6
 ONLY_PATH=""
 SOAK=0
 # --host-net runs the container client in the guest's own network namespace,

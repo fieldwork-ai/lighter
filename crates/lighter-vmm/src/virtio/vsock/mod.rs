@@ -944,6 +944,11 @@ impl VirtioDevice for Vsock {
 /// connections and no cost at the dozen a Docker client opens, and it buys a
 /// blocking read with no readiness machinery anywhere.
 pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
+    // Both threads of a stream do the work a user is waiting on, and a
+    // thread at default QoS is a thread Apple silicon may put on an
+    // efficiency core: the same transfer read 45 Gbit/s one run and 63 the
+    // next until the pump's threads were raised.
+    crate::qos::raise_interactive();
     if let Ok(clone) = socket.try_clone() {
         shared.attach(key, clone);
     }
@@ -958,6 +963,7 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
         std::thread::Builder::new()
             .name("vsock-write".into())
             .spawn(move || {
+                crate::qos::raise_interactive();
                 while let Some(chunks) = shared.take_outbound(key) {
                     if write_all_chunks(&mut socket, &chunks).is_err() {
                         break;

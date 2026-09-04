@@ -263,6 +263,7 @@ impl Network {
         std::thread::Builder::new()
             .name("net-tx".into())
             .spawn(move || {
+                crate::qos::raise_interactive();
                 while let Some((frames, parked)) = outbox.take() {
                     if let Err(e) = backend.send_many(&frames) {
                         // The backend's problem, not the guest's: the frames
@@ -294,6 +295,7 @@ impl Network {
         std::thread::Builder::new()
             .name("net-rx".into())
             .spawn(move || {
+                crate::qos::raise_interactive();
                 // One read takes whatever the socket holds, up to a megabyte,
                 // and the frames are cut out of that: two syscalls per frame
                 // was a third of a frame's cost at 1500 bytes. A frame split

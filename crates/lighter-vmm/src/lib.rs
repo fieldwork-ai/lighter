@@ -40,6 +40,7 @@ pub mod memory_policy;
 pub mod mempressure;
 pub mod net;
 pub mod psci;
+pub mod qos;
 pub mod smp;
 pub mod sockbuf;
 pub mod streams;
