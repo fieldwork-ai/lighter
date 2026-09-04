@@ -895,7 +895,21 @@ impl VsockShared {
         // three quarters in hand, and a small transfer that never reaches the
         // threshold has nothing more to send anyway. A CREDIT_REQUEST is
         // answered at once regardless.
-        if conn.unreported < credit::BUF_ALLOC / 4 {
+        //
+        // The window is the smaller of ours and the guest's. A guest socket
+        // sends no more than its own buffer's worth ahead of the last credit
+        // it saw, whatever we advertise: a Docker-socket connection (the
+        // guest's default 256 KiB) sent exactly 262,144 bytes and waited for
+        // a credit that a quarter of our 4 MiB was never going to bring —
+        // `docker cp` and every attach stream dead past the first quarter
+        // megabyte, on a daily driver, twice in a day. The agent's own
+        // streams advertise 8 MiB and are credited as before.
+        // `LIGHTER_CREDIT_EAGER=1`: an update on every acknowledgement, for
+        // measuring what the coalescing costs.
+        static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let eager = *EAGER.get_or_init(|| std::env::var("LIGHTER_CREDIT_EAGER").is_ok_and(|v| v == "1"));
+        let window = credit::BUF_ALLOC.min(conn.credit.peer_buf_alloc().max(64 << 10));
+        if !eager && conn.unreported < window / 4 {
             return;
         }
         conn.unreported = 0;

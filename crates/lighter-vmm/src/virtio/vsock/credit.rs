@@ -54,6 +54,11 @@ impl Credit {
     }
 
     /// Records the credit fields carried by every packet from the peer.
+    /// The receive buffer the peer advertised.
+    pub const fn peer_buf_alloc(&self) -> u32 {
+        self.peer_buf_alloc
+    }
+
     /// The counters, for a trace: (peer_buf_alloc, peer_fwd_cnt, tx_cnt, fwd_cnt).
     pub fn counters(&self) -> (u32, u32, u32, u32) {
         (
