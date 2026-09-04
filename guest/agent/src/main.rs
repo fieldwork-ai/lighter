@@ -229,6 +229,19 @@ fn bound_container_cache() {
         if (idle_for == 0 || idle_for == 25) && !always_fast {
             set_reporting(2000, 9);
         }
+        // Two seconds idle: hurry reporting, before any trim. What the
+        // containers freed while they worked — a removed tree, a finished
+        // install's scratch — sits in the guest's free lists in file-sized
+        // pieces the churn setting never reports, and the host holds all of
+        // it: traced through the storage cases, the guest had 13 GB free
+        // with the host at 6.4 GB, and the first trim's hurried window,
+        // not the trim, returned 4.5 GB of it. Hurrying costs nothing on an
+        // idle guest (no reuse to fault on), and the churn setting comes
+        // back the moment the containers do.
+        if idle_for == 2 && !always_fast {
+            set_reporting(100, 5);
+            compact_until_reportable();
+        }
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
