@@ -93,7 +93,7 @@ fn program(peers: RawFd, sockets: RawFd) -> Vec<Insn> {
         insn(MOV64_REG, 2, 10, 0, 0),                   // r2 = r10
         insn(ADD64_IMM, 2, 0, 0, -8),                   // r2 -= 8
         insn(CALL, 0, 0, 0, BPF_FUNC_MAP_LOOKUP_ELEM),  // r0 = lookup
-        insn(JEQ_IMM, 0, 0, 6, 0),                      // if r0 == 0 goto pass
+        insn(JEQ_IMM, 0, 0, 7, 0),                      // if r0 == 0 goto pass
         insn(LDX_MEM_W, 3, 0, 0, 0),                    // r3 = *(u32 *)r0
         insn(MOV64_REG, 1, 6, 0, 0),                    // r1 = r6
         insn(LD_IMM_DW, 2, BPF_PSEUDO_MAP_FD, 0, sockets), // r2 = &sockets
@@ -231,6 +231,63 @@ fn socket_cookie(fd: RawFd) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok(cookie)
+}
+
+/// Loads a program and reports errno and the verifier's words, for the
+/// probe below.
+fn try_load(prog_type: u32, insns: &[Insn], log_level: u32, expected_attach: u32) -> String {
+    let mut log = vec![0u8; 64 * 1024];
+    let mut attr = Attr { zero: [0; 128] };
+    attr.prog = ProgLoad {
+        prog_type,
+        insn_cnt: insns.len() as u32,
+        insns: insns.as_ptr() as u64,
+        license: c"GPL".as_ptr() as u64,
+        log_level,
+        log_size: if log_level > 0 { log.len() as u32 } else { 0 },
+        log_buf: if log_level > 0 { log.as_mut_ptr() as u64 } else { 0 },
+        kern_version: 0,
+        prog_flags: 0,
+    };
+    // expected_attach_type sits after prog_name[16] and prog_ifindex.
+    if expected_attach != 0 {
+        // SAFETY: writing a u32 at the union's byte offset 76 (24 + 16 + 4 + 16 + 4 + ... as laid out by the UAPI).
+        unsafe {
+            let base = std::ptr::addr_of_mut!(attr).cast::<u8>();
+            std::ptr::write_unaligned(base.add(76).cast::<u32>(), expected_attach);
+        }
+    }
+    match bpf(BPF_PROG_LOAD, &mut attr) {
+        Ok(fd) => {
+            // SAFETY: a fresh descriptor, closed here.
+            unsafe { libc::close(fd) };
+            "ok".to_string()
+        }
+        Err(e) => {
+            let text = String::from_utf8_lossy(&log);
+            format!("{e}: {}", text.trim_end_matches('\0').trim())
+        }
+    }
+}
+
+/// Tries the program and its attributes in variants, printing each: the
+/// kernel says only "invalid argument" for a load it refuses before
+/// verifying, and which attribute it disliked is what this finds out.
+pub fn probe() {
+    let trivial = [insn(MOV64_IMM, 0, 0, 0, 1), insn(EXIT, 0, 0, 0, 0)];
+    println!("trivial sk_skb, log 1: {}", try_load(BPF_PROG_TYPE_SK_SKB, &trivial, 1, 0));
+    println!("trivial sk_skb, log 0: {}", try_load(BPF_PROG_TYPE_SK_SKB, &trivial, 0, 0));
+    println!("trivial sk_skb, expected verdict: {}", try_load(BPF_PROG_TYPE_SK_SKB, &trivial, 1, BPF_SK_SKB_VERDICT));
+    println!("trivial sk_msg: {}", try_load(16, &trivial, 1, 0));
+    println!("trivial socket_filter: {}", try_load(1, &trivial, 1, 0));
+    match (map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, 16), map_create(BPF_MAP_TYPE_HASH, 8, 4, 16)) {
+        (Ok(sockets), Ok(peers)) => {
+            let full = program(peers.as_raw_fd(), sockets.as_raw_fd());
+            println!("full sk_skb: {}", try_load(BPF_PROG_TYPE_SK_SKB, &full, 1, 0));
+            println!("full sk_skb, expected verdict: {}", try_load(BPF_PROG_TYPE_SK_SKB, &full, 1, BPF_SK_SKB_VERDICT));
+        }
+        (a, b) => println!("maps: {:?} {:?}", a.err(), b.err()),
+    }
 }
 
 /// The maps and the program, created once.

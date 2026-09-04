@@ -54,6 +54,10 @@ fn main() -> std::process::ExitCode {
             // Answers DNS on the given address by carrying each query to the
             // host over one vsock stream; the Mac's own resolver answers.
             "--dns" => dns = args.next(),
+            "--bpf-probe" => {
+                sockmap::probe();
+                return std::process::ExitCode::SUCCESS;
+            }
             other => {
                 eprintln!("lighter-agent: unknown argument {other}");
                 return std::process::ExitCode::from(2);
