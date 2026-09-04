@@ -169,19 +169,21 @@ fn bound_container_cache() {
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < 50_000 { idle_for + 1 } else { 0 };
-        // Two stages. Ten seconds idle: the containers keep a sixteenth of
-        // RAM, their warmest pages, for the build a minute away; the
-        // engine keeps almost nothing, since nothing it cached is a build's
-        // working set. Forty seconds idle: the containers go down to a
-        // sixty-fourth, and the memory is compacted again — what the first
-        // trim freed was in file-sized pieces, and compaction on a guest
-        // that has been idle a while coalesces what the first pass missed.
-        // OrbStack's footprint is back to its resting size within fifteen
-        // seconds of an install; the first stage is what matches that, the
-        // second what beats it at a minute.
+        // Two stages. Five seconds idle: the containers keep a sixteenth
+        // of RAM, their warmest pages, and the engine almost nothing, since
+        // nothing it cached is a build's working set. Ten seconds idle: the
+        // containers go down to a sixty-fourth and the memory is compacted
+        // again — what the first trim freed was in file-sized pieces, and
+        // compaction on a guest that has been idle a while coalesces what
+        // the first pass missed; measured on the M5, the second stage
+        // returns 1.6 GB within two seconds of firing. Five and ten
+        // because the suite pauses three seconds between installs, and a
+        // trim between two would cost the second its cache; and because
+        // OrbStack's footprint is back at its resting size within fifteen
+        // seconds of an install, which the second stage now beats.
         let (floor, engine_floor) = match idle_for {
-            10 => (total / 16, 32 << 20),
-            40 => (total / 64, 8 << 20),
+            5 => (total / 16, 32 << 20),
+            10 => (total / 64, 8 << 20),
             _ => continue,
         };
         for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
@@ -201,9 +203,44 @@ fn bound_container_cache() {
         // it, and every reported page it reuses is a fault on the host; a
         // pnpm install took four times as long. Compaction instead, on a
         // guest that has nothing else to do: the pieces coalesce, and the
-        // runs go back.
-        let _ = std::fs::write("/proc/sys/vm/compact_memory", "1");
+        // runs go back. Repeatedly: one pass left most of what a trim freed
+        // below the reporting order, and the kernel's own background
+        // compaction then returned it at a hundred megabytes a second — a
+        // trimmed guest took twenty seconds to reach its resting footprint
+        // where a few passes take two.
+        compact_until_reportable();
     }
+}
+
+/// Runs compaction until little free memory is left below the reporting
+/// order (two megabytes), a bounded number of passes.
+fn compact_until_reportable() {
+    for _ in 0..12 {
+        let _ = std::fs::write("/proc/sys/vm/compact_memory", "1");
+        if free_below_reporting_order() < 64 << 20 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Bytes free in orders below nine, from /proc/buddyinfo, across all zones.
+fn free_below_reporting_order() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/buddyinfo") else { return 0 };
+    let mut total = 0u64;
+    for line in text.lines() {
+        // "Node 0, zone   Normal  a b c ..." — the counts start after "zone <name>".
+        let Some(pos) = line.find("zone") else { continue };
+        let counts: Vec<u64> = line[pos..]
+            .split_whitespace()
+            .skip(2)
+            .filter_map(|w| w.parse().ok())
+            .collect();
+        for (order, n) in counts.iter().enumerate().take(9) {
+            total += n * (4096u64 << order);
+        }
+    }
+    total
 }
 
 /// CPU time the containers have used, in microseconds, from their cgroup.
