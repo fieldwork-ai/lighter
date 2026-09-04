@@ -5,6 +5,9 @@
 # in run.sh: a second share, and `lighter.devagent=` on the command line).
 # Usage: scripts/iter-agent.sh <label>   → results in the M1's benchmarks/results/<label>.csv
 set -u; cd ~/git/lighter; label=${1:-iter}
+# Builds go to OrbStack: the lighter context is the daily driver, and a
+# kernel build there is sixteen gcc processes on its owner's machine.
+export DOCKER_CONTEXT=orbstack
 ./guest/agent/build.sh > .logs/agent-build.log 2>&1 || { echo "agent build failed"; tail -5 .logs/agent-build.log; exit 1; }
 ssh admin@192.168.50.21 'mkdir -p ~/.lighter-bench/dev'; rsync -a guest/out/lighter-agent admin@192.168.50.21:.lighter-bench/dev/lighter-agent
 rsync -a -S --exclude target --exclude .logs --exclude 'benchmarks/results/*' --exclude guest/out -e "ssh -o ConnectTimeout=20" ./ admin@192.168.50.21:lighter/ >/dev/null
