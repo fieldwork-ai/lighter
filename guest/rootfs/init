@@ -241,6 +241,11 @@ for arg in $(cat /proc/cmdline); do
 done
 
 # --- Networking -----------------------------------------------------------
+# A socket may ask for a send buffer up to this; the agent asks for 8 MiB
+# on every stream, because a vsock packet's memory stays charged to its
+# socket until the host has taken it off the ring, and the default ceiling
+# is under one packet.
+sysctl -q -w net.core.wmem_max=16777216 net.core.rmem_max=16777216 2>/dev/null || true
 if [ -e /sys/class/net/eth0 ]; then
 	ip link set eth0 up
 	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok" || echo "INIT dhcp=failed"

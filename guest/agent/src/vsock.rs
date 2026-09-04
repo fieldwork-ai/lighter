@@ -52,9 +52,23 @@ pub const VMADDR_CID_HOST: u32 = 2;
 const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
 const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
 
-/// Sets the credit window a socket advertises to its peer.
+/// Sets the credit window a socket advertises to its peer, and its send
+/// buffer: a vsock packet's memory is charged to the socket until the host
+/// has taken it off the ring, and the default 208 KiB is under one packet,
+/// so a sender was one packet deep whatever the window said.
 pub fn set_buffer(fd: &OwnedFd, bytes: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
+    let sndbuf: libc::c_int = (bytes.min(i32::MAX as u64)) as libc::c_int;
+    // SAFETY: an int lives at the pointer for the call's duration.
+    unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::addr_of!(sndbuf).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
     for name in [SO_VM_SOCKETS_BUFFER_MAX_SIZE, SO_VM_SOCKETS_BUFFER_SIZE] {
         // SAFETY: a u64 lives at the pointer for the call's duration, and
         // the length is its size.

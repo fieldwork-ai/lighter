@@ -196,7 +196,7 @@ fn container_cpu_usec(cgroup: &str) -> u64 {
 /// The host's vsock port for outbound streams.
 const STREAM_PORT: u32 = 2377;
 /// The credit window a stream advertises: a millisecond of a fast link.
-const STREAM_WINDOW: u64 = 4 << 20;
+const STREAM_WINDOW: u64 = 8 << 20;
 
 /// Where a redirected connection was really going, from conntrack.
 ///
