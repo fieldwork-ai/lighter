@@ -203,6 +203,10 @@ fn bound_container_cache() {
     // health check failing and 782,575 throttle events before the bound
     // was lifted by hand. The benchmark asks for it on its own command
     // line; a machine that did not ask keeps its cache.
+    // The per-CPU vmstat workers ran every second on eight vCPUs of an
+    // idle guest — half of its kworker wakeups. Ten seconds is plenty for
+    // counters nothing in here reads faster than the agent's own tick.
+    let _ = std::fs::write("/proc/sys/vm/stat_interval", "10");
     let trims = cmdline_value("lighter.trim").is_none_or(|v| v != 0);
     let bound = cmdline_value("lighter.cachebound")
         .map(|mib| mib << 20)
