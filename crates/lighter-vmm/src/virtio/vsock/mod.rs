@@ -181,7 +181,7 @@ pub enum Chunk {
 }
 
 impl Chunk {
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self {
             Chunk::Owned(v) => v.len(),
             Chunk::Guest { spans, .. } => spans.iter().map(|(_, n)| n).sum(),
