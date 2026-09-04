@@ -41,6 +41,7 @@ pub mod mempressure;
 pub mod net;
 pub mod psci;
 pub mod qos;
+pub mod reactor;
 pub mod smp;
 pub mod sockbuf;
 pub mod streams;
@@ -49,6 +50,7 @@ pub mod vcpu;
 pub mod virtio;
 pub mod vsock_proxy;
 pub mod wake;
+pub mod workers;
 
 pub use machine::{Machine, MachineConfig, MachineError};
 pub use vcpu::StopReason;

@@ -151,6 +151,25 @@ impl<S: Socket> Closable for S {
     }
 }
 
+/// A connection as a reactor sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Connecting,
+    Established,
+    Gone,
+}
+
+/// What [`VsockShared::try_take_outbound`] found.
+pub enum Outbound {
+    Chunks(Vec<Chunk>),
+    /// Nothing now; the guest may send more.
+    Empty,
+    /// The guest is done and everything it sent has been taken.
+    Finished,
+    /// No such connection.
+    Gone,
+}
+
 /// Bytes on their way from the guest to the host socket.
 pub enum Chunk {
     /// Owned by us: a control payload, or a copy made for a reader.
@@ -221,6 +240,10 @@ pub struct VsockShared {
     /// caller and that is a stall which only resolves when the guest happens to
     /// notify for its own reasons — a megabyte took minutes.
     waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Pokes whoever drives non-blocking streams (a reactor) when anything
+    /// a stream might be waiting on has changed: credit, outbound bytes, a
+    /// connection established or gone. Set once by the reactor.
+    stream_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for VsockShared {
@@ -233,6 +256,7 @@ impl VsockShared {
     pub fn new() -> VsockShared {
         VsockShared {
             memory: std::sync::OnceLock::new(),
+            stream_waker: Mutex::new(None),
             inner: Mutex::new(Inner {
                 conns: HashMap::new(),
                 outbox: VecDeque::new(),
@@ -253,6 +277,26 @@ impl VsockShared {
     /// Installs the callback that drains the outbox into the guest.
     pub fn set_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
         *self.waker.lock().expect("vsock waker poisoned") = Some(Arc::new(waker));
+    }
+
+    /// Registers the reactor's waker.
+    pub fn set_stream_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
+        *self.stream_waker.lock().expect("stream waker poisoned") = Some(Arc::new(waker));
+    }
+
+    /// Something a waiter may care about changed: blocking waiters are
+    /// woken through the condvar, the reactor through its waker.
+    fn progressed(&self) {
+        self.progress.notify_all();
+        let waker = self
+            .stream_waker
+            .lock()
+            .expect("stream waker poisoned")
+            .as_ref()
+            .map(Arc::clone);
+        if let Some(waker) = waker {
+            waker();
+        }
     }
 
     /// Asks the transport to deliver whatever is queued.
@@ -322,6 +366,126 @@ impl VsockShared {
         }
     }
 
+    /// The connection's state as a reactor wants it.
+    pub fn status(&self, key: ConnKey) -> Status {
+        match self.lock().conns.get(&key).map(|c| c.state) {
+            Some(State::Connecting) => Status::Connecting,
+            Some(State::Established) => Status::Established,
+            Some(State::Closed) | None => Status::Gone,
+        }
+    }
+
+    /// Queues as much of `data` as credit and the outbox allow, without
+    /// waiting: the count accepted, or `Err` for a connection that is not
+    /// there to take it. A reactor keeps the rest and comes back when its
+    /// waker fires.
+    pub fn try_send(&self, key: ConnKey, data: &[u8]) -> Result<usize, ()> {
+        let mut inner = self.lock();
+        let Some(conn) = inner.conns.get(&key) else {
+            return Err(());
+        };
+        if conn.state != State::Established {
+            return if conn.state == State::Connecting { Ok(0) } else { Err(()) };
+        }
+        let mut allowed = conn.credit.available() as usize;
+        let mut room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+        let (host_port, guest_port) = key;
+        let fwd_cnt = conn.credit.fwd_cnt();
+        let mut offset = 0;
+        while allowed > 0 && room > 0 && offset < data.len() {
+            let take = allowed.min(MAX_PAYLOAD).min(data.len() - offset);
+            let mut packet = Packet::control(Op::Rw, host_port, guest_port);
+            let mut payload = match inner.spare.pop() {
+                Some(mut buf) => {
+                    buf.clear();
+                    buf
+                }
+                None => Vec::with_capacity(MAX_PAYLOAD),
+            };
+            payload.extend_from_slice(&data[offset..offset + take]);
+            packet.payload = payload;
+            packet.buf_alloc = credit::BUF_ALLOC;
+            packet.fwd_cnt = fwd_cnt;
+            inner.outbox.push_back(packet);
+            if let Some(conn) = inner.conns.get_mut(&key) {
+                conn.credit.sent(take as u32);
+            }
+            offset += take;
+            allowed -= take;
+            room -= 1;
+        }
+        drop(inner);
+        if offset > 0 {
+            self.wake();
+        }
+        Ok(offset)
+    }
+
+    /// What the guest has sent, without waiting.
+    pub fn try_take_outbound(&self, key: ConnKey) -> Outbound {
+        let mut inner = self.lock();
+        let Some(conn) = inner.conns.get_mut(&key) else {
+            return Outbound::Gone;
+        };
+        if !conn.outbound.is_empty() {
+            return Outbound::Chunks(conn.outbound.drain(..).collect());
+        }
+        if conn.state == State::Closed || conn.guest_done {
+            return Outbound::Finished;
+        }
+        Outbound::Empty
+    }
+
+    /// Exactly `n` of the guest's first bytes if they have arrived, credited;
+    /// `Ok(None)` when not yet; `Err` for a connection that ended first.
+    pub fn try_read_outbound(&self, key: ConnKey, n: usize) -> Result<Option<Vec<u8>>, ()> {
+        let memory = self.memory.get().cloned();
+        let mut inner = self.lock();
+        let Some(conn) = inner.conns.get_mut(&key) else {
+            return Err(());
+        };
+        let have: usize = conn.outbound.iter().map(Chunk::len).sum();
+        if have < n {
+            if conn.state == State::Closed || conn.guest_done {
+                return Err(());
+            }
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(n);
+        let mut finished: Vec<u16> = Vec::new();
+        while out.len() < n {
+            let Some(chunk) = conn.outbound.pop_front() else { break };
+            let (mut bytes, head) = match chunk {
+                Chunk::Owned(v) => (v, None),
+                Chunk::Guest { head, spans } => {
+                    let mut v = Vec::new();
+                    if let Some(mem) = &memory {
+                        for (gpa, len) in &spans {
+                            let start = v.len();
+                            v.resize(start + len, 0);
+                            let _ = mem.read(*gpa, &mut v[start..]);
+                        }
+                    }
+                    (v, Some(head))
+                }
+            };
+            if let Some(head) = head {
+                finished.push(head);
+            }
+            let take = bytes.len().min(n - out.len());
+            if take < bytes.len() {
+                let rest = bytes.split_off(take);
+                conn.outbound.push_front(Chunk::Owned(rest));
+            }
+            out.extend_from_slice(&bytes[..take]);
+        }
+        inner.done.extend(finished);
+        drop(inner);
+        self.wake();
+        self.acknowledge(key, n as u32);
+        Ok(Some(out))
+    }
+
     /// Takes exactly `n` bytes from what the guest has sent, blocking for
     /// them, and credits the guest for them. `None` if the connection ends
     /// first. For a listener reading the header a stream starts with.
@@ -385,7 +549,7 @@ impl VsockShared {
 
     /// Chains whose bytes are on a socket: back to the guest on the next
     /// look at the ring.
-    fn complete(&self, heads: impl IntoIterator<Item = u16>) {
+    pub fn complete(&self, heads: impl IntoIterator<Item = u16>) {
         let mut inner = self.lock();
         inner.done.extend(heads);
         // Returned on the next look at either ring, which the credit update
@@ -400,7 +564,7 @@ impl VsockShared {
     }
 
     /// Guest memory, once the device is active.
-    fn memory(&self) -> Option<Arc<GuestMemory>> {
+    pub fn memory(&self) -> Option<Arc<GuestMemory>> {
         self.memory.get().cloned()
     }
 
@@ -519,7 +683,7 @@ impl VsockShared {
         inner.outbox.push_back(packet);
         drop(inner);
 
-        self.progress.notify_all();
+        self.progressed();
         self.wake();
     }
 
@@ -538,7 +702,7 @@ impl VsockShared {
             conn.state = State::Closed;
         }
         drop(inner);
-        self.progress.notify_all();
+        self.progressed();
         self.wake();
     }
 
@@ -568,7 +732,7 @@ impl VsockShared {
 
     /// Records that `bytes` reached the host application, freeing the guest to
     /// send that much more.
-    fn acknowledge(&self, key: ConnKey, bytes: u32) {
+    pub fn acknowledge(&self, key: ConnKey, bytes: u32) {
         let mut inner = self.lock();
         let Some(conn) = inner.conns.get_mut(&key) else {
             return;
@@ -612,7 +776,7 @@ impl VsockShared {
 
     /// Hands payload buffers back for the ring reader to fill again. Bounded,
     /// so a burst does not leave a pile of them behind.
-    fn recycle(&self, chunks: Vec<Chunk>) {
+    pub fn recycle(&self, chunks: Vec<Chunk>) {
         const KEEP: usize = 64;
         let mut inner = self.lock();
         for chunk in chunks {
@@ -940,7 +1104,7 @@ impl Vsock {
         drop(inner);
         // Credit may have freed up, and a connection may have been
         // established or torn down; either way somebody may be blocked.
-        self.shared.progress.notify_all();
+        self.shared.progressed();
 
         used_any
     }
@@ -1036,7 +1200,7 @@ impl Vsock {
 
         drop(inner);
         if used_any {
-            self.shared.progress.notify_all();
+            self.shared.progressed();
         }
         used_any
     }
@@ -1125,7 +1289,7 @@ impl VirtioDevice for Vsock {
         inner.conns.clear();
         inner.outbox.clear();
         drop(inner);
-        self.shared.progress.notify_all();
+        self.shared.progressed();
     }
 }
 
@@ -1145,17 +1309,17 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
     }
     // Guest to host, on its own thread. The blocking write has to happen
     // somewhere that is not a vCPU thread; this is that somewhere.
-    let writer = {
+    // The writer's end is signalled by the channel closing, since a cached
+    // thread has no join handle.
+    let (done_tx, writer_done) = std::sync::mpsc::channel::<()>();
+    {
         let shared = shared.clone();
         let Ok(mut socket) = socket.try_clone() else {
             shared.shutdown(key);
             return;
         };
-        std::thread::Builder::new()
-            .name("vsock-write".into())
-            .stack_size(crate::qos::CONNECTION_STACK)
-            .spawn(move || {
-                crate::qos::raise_interactive();
+        crate::workers::run("vsock-write", crate::qos::CONNECTION_STACK, move || {
+                let _done = done_tx;
                 let memory = shared.memory();
                 while let Some(chunks) = shared.take_outbound(key) {
                     if write_all_chunks(&mut socket, &chunks, memory.as_deref()).is_err() {
@@ -1178,8 +1342,8 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
                 // most of them — waits forever on a connection with nothing
                 // left to say.
                 let _ = Socket::shutdown(&socket, std::net::Shutdown::Write);
-            })
-    };
+            });
+    }
 
     // A megabyte per read: what the socket holds arrives in one call and
     // goes to the guest as one batch of packets under one wake.
@@ -1207,23 +1371,19 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
     // a full close here takes that output with it.
     if host_closed {
         shared.shutdown_write(key);
-        if let Ok(writer) = writer {
-            let _ = writer.join();
-        }
+        let _ = writer_done.recv();
         shared.shutdown(key);
         return;
     }
 
     shared.shutdown(key);
-    if let Ok(writer) = writer {
-        let _ = writer.join();
-    }
+    let _ = writer_done.recv();
 }
 
 /// One vectored write per batch, completed across partial writes. Guest
 /// chunks are written from where they are: the kernel copies them out of
 /// guest memory itself.
-fn write_all_chunks(
+pub fn write_all_chunks(
     socket: &mut impl Socket,
     chunks: &[Chunk],
     memory: Option<&GuestMemory>,

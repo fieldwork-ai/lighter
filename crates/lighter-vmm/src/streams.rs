@@ -36,18 +36,36 @@ const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_LEN: usize = 19;
 
+/// Whether streams run on the reactor (one thread for all) or on two
+/// threads each. `LIGHTER_STREAM_THREADS=1` keeps the threads measurable.
+fn on_threads() -> bool {
+    std::env::var("LIGHTER_STREAM_THREADS").is_ok_and(|v| v != "0")
+}
+
+/// The reactor, if streams run on it.
+static REACTOR: std::sync::OnceLock<Arc<crate::reactor::Reactor>> = std::sync::OnceLock::new();
+
 /// Starts answering the agent's streams.
 pub fn start(shared: Arc<VsockShared>) -> io::Result<()> {
     let accepted = shared.listen(STREAM_PORT);
+    if !on_threads() {
+        let reactor = crate::reactor::Reactor::start(shared.clone())?;
+        let _ = REACTOR.set(reactor.clone());
+        std::thread::Builder::new()
+            .name("streams-accept".into())
+            .spawn(move || {
+                for Accepted { key } in accepted {
+                    reactor.accept_outbound(key);
+                }
+            })?;
+        return Ok(());
+    }
     std::thread::Builder::new()
         .name("streams".into())
         .spawn(move || {
             for Accepted { key } in accepted {
                 let shared = shared.clone();
-                let _ = std::thread::Builder::new()
-                    .name("stream".into())
-                    .stack_size(crate::qos::CONNECTION_STACK)
-                    .spawn(move || serve(shared, key));
+                crate::workers::run("stream", crate::qos::CONNECTION_STACK, move || serve(shared, key));
             }
             tracing::debug!("stream listener stopped");
         })?;
@@ -142,11 +160,14 @@ impl lighter_docker::PortMapper for PortMapper {
                         break;
                     }
                     let Ok(mac) = accepted else { continue };
+                    if let Some(reactor) = REACTOR.get() {
+                        reactor.carry_inbound(port, mac);
+                        continue;
+                    }
                     let shared = shared.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("inbound".into())
-                        .stack_size(crate::qos::CONNECTION_STACK)
-                        .spawn(move || carry_inbound(shared, port, mac));
+                    crate::workers::run("inbound", crate::qos::CONNECTION_STACK, move || {
+                        carry_inbound(shared, port, mac)
+                    });
                 }
             })
             .map_err(|e| e.to_string())?;
