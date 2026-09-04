@@ -337,7 +337,7 @@ table inet lighter {
 	}
 	chain output {
 		type nat hook output priority dstnat - 10; policy accept;
-		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
+		meta l4proto tcp oifname "eth0" redirect to :15201
 	}
 }
 EOF
