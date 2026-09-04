@@ -521,7 +521,11 @@ esac
 # to account for exactly as OrbStack's helper is theirs.
 runtime_pids() {
 	case "$TARGET" in
-	lighter)        echo "$VMM_PID $(pgrep -f "gvproxy.*$RUN_DIR" | tr '\n' ' ')" ;;
+	# The sidecar by its own command line, not by the run directory: the VMM's
+	# command line names the gvproxy binary and the run directory too, and a
+	# pattern that matched both counted the VMM twice — every lighter memory
+	# figure before 2026-09-04 was double.
+	lighter)        echo "$VMM_PID $(pgrep -f "gvproxy --listen.*$RUN_DIR" | tr '\n' ' ')" ;;
 	orbstack)       pgrep -f 'OrbStack' | tr '\n' ' ' ;;
 	colima)         pgrep -f 'limactl|lima-driver|com.apple.Virtualization.VirtualMachine|virtiofsd' | tr '\n' ' ' ;;
 	# Its VM is Virtualization.framework's own XPC service, not a docker

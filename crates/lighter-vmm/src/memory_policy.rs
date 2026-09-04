@@ -121,8 +121,21 @@ impl MemoryPolicy {
                 .spawn(move || {
                     let mut last = host.sample();
                     let mut quiet_for = 0u32;
+                    // `LIGHTER_MEM_TRACE=1`: what the guest has reported free
+                    // and what the host holds, every second, to the log.
+                    let trace = std::env::var("LIGHTER_MEM_TRACE").map(|v| v == "1").unwrap_or(false);
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(POLL);
+                        if trace {
+                            eprintln!(
+                                "MEMTRACE footprint_mib={} reported_mib={} offered_mib={} steer_mib={} level_mib={}",
+                                crate::footprint::bytes() >> 20,
+                                steering.balloon.reported_bytes() >> 20,
+                                steering.balloon.offered_bytes() >> 20,
+                                (steering.steer_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20,
+                                (steering.level_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20
+                            );
+                        }
                         let Some(now) = host.sample() else { continue };
                         if let Some(then) = last {
                             let compressed = now.compressed.saturating_sub(then.compressed);
