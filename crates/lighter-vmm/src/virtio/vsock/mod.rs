@@ -907,7 +907,8 @@ impl VsockShared {
         // `LIGHTER_CREDIT_EAGER=1`: an update on every acknowledgement, for
         // measuring what the coalescing costs.
         static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let eager = *EAGER.get_or_init(|| std::env::var("LIGHTER_CREDIT_EAGER").is_ok_and(|v| v == "1"));
+        let eager =
+            *EAGER.get_or_init(|| std::env::var("LIGHTER_CREDIT_EAGER").is_ok_and(|v| v == "1"));
         let window = credit::BUF_ALLOC.min(conn.credit.peer_buf_alloc().max(64 << 10));
         if !eager && conn.unreported < window / 4 {
             return;
