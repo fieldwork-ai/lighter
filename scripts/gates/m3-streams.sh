@@ -90,6 +90,36 @@ code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:180
 $D stop -t 1 m3s-http >/dev/null 2>&1; sleep 2
 if nc -z -w 1 127.0.0.1 18098 2>/dev/null; then fail "the published port is still open after the container stopped"; else pass "the published port closed with the container"; fi
 
+# integrity: a checksummed quarter gigabyte each way. iperf3 checks
+# nothing about the bytes it moves, and a split copy once reordered them.
+python3 - <<'PY' &
+import socket, hashlib
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); srv.bind(("0.0.0.0", 18095)); srv.listen(2)
+c, _ = srv.accept(); h = hashlib.sha256(); buf = bytearray(1 << 20)
+while True:
+    n = c.recv_into(buf)
+    if not n: break
+    h.update(buf[:n])
+open("/tmp/m3s-out.sha", "w").write(h.hexdigest())
+PY
+SUM_PID=$!
+sleep 1
+out="$($D run --rm alpine:3.21 sh -c 'head -c 268435456 /dev/urandom > /tmp/x && sha256sum /tmp/x | cut -c1-64 && nc -w 5 '"$LAN_IP"' 18095 < /tmp/x' 2>/dev/null | tail -1)"
+wait "$SUM_PID" 2>/dev/null
+[ -n "$out" ] && [ "$out" = "$(cat /tmp/m3s-out.sha 2>/dev/null)" ] && pass "256 MiB out of a container arrived intact" || fail "integrity out: sent ${out:-nothing}, got $(cat /tmp/m3s-out.sha 2>/dev/null)"
+$D run -d --rm --name m3s-sink -p 18094:9 alpine:3.21 sh -c 'nc -l -p 9 > /tmp/y; sha256sum /tmp/y | cut -c1-64 > /tmp/y.sha; sleep 30' >/dev/null 2>&1
+sleep 2
+inhash="$(python3 -c '
+import socket, hashlib, os
+s = socket.create_connection(("127.0.0.1", 18094)); h = hashlib.sha256()
+for _ in range(256):
+    b = os.urandom(1 << 20); h.update(b); s.sendall(b)
+s.close(); print(h.hexdigest())')"
+sleep 3
+got="$($D exec m3s-sink cat /tmp/y.sha 2>/dev/null)"
+[ -n "$got" ] && [ "$got" = "$inhash" ] && pass "256 MiB into a published port arrived intact" || fail "integrity in: sent $inhash, got ${got:-nothing}"
+$D rm -f m3s-sink >/dev/null 2>&1
+
 # many: a thousand concurrent connections to a holder on the Mac
 python3 - <<'PY' &
 import socket, threading
