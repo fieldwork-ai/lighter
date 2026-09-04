@@ -92,7 +92,11 @@ pub fn split() -> (u64, u64, u64) {
             &mut count,
         )
     };
-    if rc != 0 { (0, 0, 0) } else { (info.resident_size, info.internal, info.reusable) }
+    if rc != 0 {
+        (0, 0, 0)
+    } else {
+        (info.resident_size, info.internal, info.reusable)
+    }
 }
 
 /// Logs the footprint on an interval, for as long as the process lives.
