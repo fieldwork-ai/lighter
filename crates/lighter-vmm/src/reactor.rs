@@ -150,7 +150,10 @@ impl Reactor {
     /// A DNS stream the guest opened.
     /// The guest's UDP stream: one per boot, every flow on it.
     pub fn accept_udp(&self, key: ConnKey) {
-        self.commands.lock().expect("reactor commands poisoned").push(Command::Udp(key));
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::Udp(key));
         self.wake();
     }
 
@@ -194,7 +197,10 @@ fn udp_destination(payload: &[u8]) -> Option<SocketAddr> {
     }
     let port = u16::from_be_bytes([payload[17], payload[18]]);
     match payload[0] {
-        4 => Some(SocketAddr::new(std::net::Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]).into(), port)),
+        4 => Some(SocketAddr::new(
+            std::net::Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]).into(),
+            port,
+        )),
         6 => {
             let mut b = [0u8; 16];
             b.copy_from_slice(&payload[1..17]);
@@ -689,9 +695,17 @@ impl Loop {
             let flows = self.udp_flows.entry(key).or_default();
             match kind {
                 UDP_KIND_OPEN => {
-                    let Some(dst) = udp_destination(payload) else { continue };
-                    let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0".parse().expect("addr") } else { "[::]:0".parse().expect("addr") };
-                    let Ok(socket) = std::net::UdpSocket::bind(bind) else { continue };
+                    let Some(dst) = udp_destination(payload) else {
+                        continue;
+                    };
+                    let bind: SocketAddr = if dst.is_ipv4() {
+                        "0.0.0.0:0".parse().expect("addr")
+                    } else {
+                        "[::]:0".parse().expect("addr")
+                    };
+                    let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+                        continue;
+                    };
                     if socket.connect(dst).is_err() || socket.set_nonblocking(true).is_err() {
                         continue;
                     }
@@ -730,7 +744,9 @@ impl Loop {
     /// A flow's socket has datagrams: each framed, the batch to the guest.
     /// No credit means the batch is dropped, as UDP allows.
     fn udp_readable(&mut self, key: ConnKey, flow: u32) {
-        let Some(socket) = self.udp_flows.get(&key).and_then(|f| f.get(&flow)) else { return };
+        let Some(socket) = self.udp_flows.get(&key).and_then(|f| f.get(&flow)) else {
+            return;
+        };
         let mut batch: Vec<u8> = Vec::with_capacity(64 * 1500);
         let mut buf = [0u8; 65536];
         for _ in 0..64 {

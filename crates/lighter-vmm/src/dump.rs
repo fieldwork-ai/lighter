@@ -45,7 +45,9 @@ pub fn install(virtio: Vec<Arc<Mutex<VirtioMmio>>>, vsock: Arc<VsockShared>) {
                 let mut byte = [0u8; 1];
                 // SAFETY: reading one byte into a buffer of one.
                 let n = unsafe { libc::read(read, byte.as_mut_ptr().cast(), 1) };
-                if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
                     continue;
                 }
                 if n <= 0 {
