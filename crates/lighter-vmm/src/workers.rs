@@ -9,7 +9,7 @@
 //! and an idle machine sheds them.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;

@@ -36,6 +36,8 @@ const HOST_ALIAS: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 25
 const READ_CHUNK: usize = 256 * 1024;
 
 enum Phase {
+    /// A DNS stream: framed queries in, framed replies out, no socket.
+    Dns,
     /// A guest-opened stream whose header has not all arrived.
     AwaitHeader,
     /// The Mac's socket is connecting; writable means done.
@@ -47,7 +49,6 @@ enum Phase {
 }
 
 struct Stream {
-    key: ConnKey,
     tcp: Option<TcpStream>,
     phase: Phase,
     /// Bytes read from the socket the guest has not had credit for yet.
@@ -61,11 +62,16 @@ struct Stream {
     guest_eof: bool,
     reading: bool,
     writing: bool,
+    /// For a DNS stream: bytes of a frame not yet whole.
+    partial: Vec<u8>,
 }
 
 enum Command {
     Outbound(ConnKey),
     Inbound(u16, TcpStream),
+    Dns(ConnKey),
+    /// A DNS reply resolved off-thread, to go out on its stream.
+    DnsReply(ConnKey, u16, Vec<u8>),
 }
 
 pub struct Reactor {
@@ -108,6 +114,17 @@ impl Reactor {
     /// A connection accepted on a published port, to carry into the guest.
     pub fn carry_inbound(&self, port: u16, mac: TcpStream) {
         self.commands.lock().expect("reactor commands poisoned").push(Command::Inbound(port, mac));
+        self.wake();
+    }
+
+    /// A DNS stream the guest opened.
+    pub fn accept_dns(&self, key: ConnKey) {
+        self.commands.lock().expect("reactor commands poisoned").push(Command::Dns(key));
+        self.wake();
+    }
+
+    fn dns_reply(&self, key: ConnKey, id: u16, reply: Vec<u8>) {
+        self.commands.lock().expect("reactor commands poisoned").push(Command::DnsReply(key, id, reply));
         self.wake();
     }
 
@@ -336,7 +353,6 @@ impl Loop {
         match command {
             Command::Outbound(key) => {
                 self.streams.insert(key, Stream {
-                    key,
                     tcp: None,
                     phase: Phase::AwaitHeader,
                     to_guest: Vec::new(),
@@ -347,7 +363,26 @@ impl Loop {
                     guest_eof: false,
                     reading: false,
                     writing: false,
+                    partial: Vec::new(),
                 });
+            }
+            Command::Dns(key) => {
+                self.streams.insert(key, Stream {
+                    tcp: None,
+                    phase: Phase::Dns,
+                    to_guest: Vec::new(),
+                    to_guest_at: 0,
+                    from_guest: VecDeque::new(),
+                    from_guest_at: 0,
+                    tcp_eof: false,
+                    guest_eof: false,
+                    reading: false,
+                    writing: false,
+                    partial: Vec::new(),
+                });
+            }
+            Command::DnsReply(key, id, reply) => {
+                self.dns_send(key, id, &reply);
             }
             Command::Inbound(port, mac) => {
                 let _ = mac.set_nodelay(true);
@@ -360,7 +395,6 @@ impl Loop {
                 let fd = mac.as_raw_fd();
                 self.by_fd.insert(fd, key);
                 self.streams.insert(key, Stream {
-                    key,
                     tcp: Some(mac),
                     phase: Phase::AwaitEstablished(port),
                     to_guest: Vec::new(),
@@ -371,8 +405,82 @@ impl Loop {
                     guest_eof: false,
                     reading: false,
                     writing: false,
+                    partial: Vec::new(),
                 });
             }
+        }
+    }
+
+    /// A framed reply onto a DNS stream. A reply that will not fit in the
+    /// guest's credit right now is dropped: DNS retries, and a stalled
+    /// resolver stream must not pile up.
+    fn dns_send(&mut self, key: ConnKey, id: u16, reply: &[u8]) {
+        let mut frame = Vec::with_capacity(4 + reply.len());
+        frame.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.extend_from_slice(reply);
+        let _ = self.shared.try_send(key, &frame);
+    }
+
+    /// Queries off a DNS stream: whole frames answered, a partial one kept.
+    fn dns_progress(&mut self, key: ConnKey) {
+        let memory = self.memory.clone();
+        let Some(stream) = self.streams.get_mut(&key) else { return };
+        let chunks = match self.shared.try_take_outbound(key) {
+            Outbound::Chunks(c) => c,
+            Outbound::Empty => return,
+            Outbound::Finished | Outbound::Gone => {
+                self.close(key);
+                return;
+            }
+        };
+        let mut heads: Vec<u16> = Vec::new();
+        let mut bytes = 0u32;
+        for chunk in chunks {
+            match chunk {
+                Chunk::Owned(v) => {
+                    bytes += v.len() as u32;
+                    stream.partial.extend_from_slice(&v);
+                }
+                Chunk::Guest { head, spans } => {
+                    if let Some(mem) = &memory {
+                        for (gpa, len) in &spans {
+                            let start = stream.partial.len();
+                            stream.partial.resize(start + len, 0);
+                            let _ = mem.read(*gpa, &mut stream.partial[start..]);
+                            bytes += *len as u32;
+                        }
+                    }
+                    heads.push(head);
+                }
+            }
+        }
+        if !heads.is_empty() {
+            self.shared.complete(heads);
+        }
+        if bytes > 0 {
+            self.shared.acknowledge(key, bytes);
+        }
+        let mut at = 0usize;
+        let mut replies: Vec<(u16, Vec<u8>)> = Vec::new();
+        while stream.partial.len() - at >= 4 {
+            let len = u16::from_be_bytes([stream.partial[at], stream.partial[at + 1]]) as usize;
+            let id = u16::from_be_bytes([stream.partial[at + 2], stream.partial[at + 3]]);
+            if stream.partial.len() - at - 4 < len {
+                break;
+            }
+            let query = stream.partial[at + 4..at + 4 + len].to_vec();
+            at += 4 + len;
+            let reactor = self.reactor.clone();
+            let deliver: Arc<dyn Fn(u16, Vec<u8>) + Send + Sync> =
+                Arc::new(move |id, reply| reactor.dns_reply(key, id, reply));
+            if let Some(reply) = crate::dns::answer(query, id, deliver) {
+                replies.push((id, reply));
+            }
+        }
+        stream.partial.drain(..at);
+        for (id, reply) in replies {
+            self.dns_send(key, id, &reply);
         }
     }
 
@@ -380,6 +488,7 @@ impl Loop {
     fn progress(&mut self, key: ConnKey) {
         let Some(stream) = self.streams.get_mut(&key) else { return };
         match stream.phase {
+            Phase::Dns => self.dns_progress(key),
             Phase::AwaitHeader => match self.shared.try_read_outbound(key, HEADER_LEN) {
                 Ok(Some(header)) => {
                     let Some(addr) = destination(&header) else {

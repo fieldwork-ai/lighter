@@ -13,10 +13,11 @@
 //!   docker CLI ──unix──▶ lighter ──vsock──▶ agent ──unix──▶ dockerd
 //! ```
 
+mod sockmap;
 mod vsock;
 
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use vsock::VsockListener;
@@ -202,6 +203,67 @@ fn container_cpu_usec(cgroup: &str) -> u64 {
 
 /// The host's vsock port for outbound streams.
 const STREAM_PORT: u32 = 2377;
+
+/// The kernel-side join for streams, if this kernel and this boot allow
+/// it (`lighter.nosockmap` on the command line keeps the copying path).
+fn joiner() -> Option<&'static sockmap::Joiner> {
+    static JOINER: std::sync::OnceLock<Option<sockmap::Joiner>> = std::sync::OnceLock::new();
+    JOINER
+        .get_or_init(|| {
+            let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+            if cmdline.split_whitespace().any(|w| w == "lighter.nosockmap") {
+                return None;
+            }
+            match sockmap::Joiner::new() {
+                Ok(j) => {
+                    println!("AGENT sockmap=on");
+                    Some(j)
+                }
+                Err(e) => {
+                    eprintln!("lighter-agent: streams copy in this process: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Two sockets joined in the kernel until either end closes: this thread
+/// only watches for hangups and propagates the half-close each way.
+fn joined(joiner: &sockmap::Joiner, tcp: RawFd, host: RawFd) -> io::Result<()> {
+    let slots = joiner.join(tcp, host)?;
+    let mut fds = [
+        libc::pollfd { fd: tcp, events: libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR, revents: 0 },
+        libc::pollfd { fd: host, events: libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR, revents: 0 },
+    ];
+    let mut tcp_done = false;
+    let mut host_done = false;
+    while !(tcp_done && host_done) {
+        // SAFETY: two live descriptors in a pollfd array.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if !tcp_done && fds[0].revents != 0 {
+            tcp_done = true;
+            fds[0].events = 0;
+            // The container is done sending; the host is owed its EOF.
+            // SAFETY: a live descriptor; write-half shutdown only.
+            unsafe { libc::shutdown(host, libc::SHUT_WR) };
+        }
+        if !host_done && fds[1].revents != 0 {
+            host_done = true;
+            fds[1].events = 0;
+            // SAFETY: as above.
+            unsafe { libc::shutdown(tcp, libc::SHUT_WR) };
+        }
+    }
+    joiner.part(tcp, host, slots);
+    Ok(())
+}
 /// The credit window a stream advertises: a millisecond of a fast link.
 const STREAM_WINDOW: u64 = 8 << 20;
 
@@ -286,6 +348,11 @@ fn forward_outbound(tcp: std::net::TcpStream) {
         return;
     }
     let _ = tcp.set_nodelay(true);
+    if let Some(j) = joiner()
+        && joined(j, tcp.as_raw_fd(), host_write.0.as_raw_fd()).is_ok()
+    {
+        return;
+    }
     let Ok(mut tcp_read) = tcp.try_clone() else { return };
     let mut tcp_write = tcp;
 
@@ -424,6 +491,11 @@ fn forward_inbound(host: OwnedFd) {
         }
     };
     let _ = tcp.set_nodelay(true);
+    if let Some(j) = joiner()
+        && joined(j, tcp.as_raw_fd(), host_read.0.as_raw_fd()).is_ok()
+    {
+        return;
+    }
     let Ok(mut tcp_read) = tcp.try_clone() else { return };
     let mut tcp_write = tcp;
     // host -> container

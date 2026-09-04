@@ -51,6 +51,7 @@ pub fn start(shared: Arc<VsockShared>) -> io::Result<()> {
     if !on_threads() {
         let reactor = crate::reactor::Reactor::start(shared.clone())?;
         let _ = REACTOR.set(reactor.clone());
+        crate::dns::start(shared.clone(), reactor.clone())?;
         std::thread::Builder::new()
             .name("streams-accept".into())
             .spawn(move || {

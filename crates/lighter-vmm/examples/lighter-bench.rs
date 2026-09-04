@@ -130,7 +130,6 @@ fn main() -> ExitCode {
     if streams
         && config.gvproxy.is_some()
         && let Err(e) = lighter_vmm::streams::start(machine.vsock())
-            .and_then(|()| lighter_vmm::dns::start(machine.vsock()))
     {
         eprintln!("lighter: cannot start streams: {e}");
         return ExitCode::FAILURE;
