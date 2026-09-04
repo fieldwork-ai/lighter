@@ -60,7 +60,6 @@ cleanup() {
 	# A machine that will not stop (the failure this script exists to catch)
 	# is killed by pid, so the next run does not inherit it.
 	[ -f "$LIGHTER_HOME/lighter.pid" ] && kill -9 "$(cat "$LIGHTER_HOME/lighter.pid")" 2>/dev/null || true
-	pkill -f "gvproxy.*$LIGHTER_HOME" 2>/dev/null || true
 	rm -rf "$LIGHTER_HOME"
 }
 trap cleanup EXIT

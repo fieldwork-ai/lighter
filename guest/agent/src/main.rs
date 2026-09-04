@@ -887,7 +887,7 @@ fn serve_dns(addr: &str) -> std::process::ExitCode {
 }
 
 /// The address Docker publishes ports on inside this guest: eth0's, which
-/// gvproxy leases by DHCP. Loopback would not do — with no userland proxy a
+/// the VMM leases by DHCP. Loopback would not do — with no userland proxy a
 /// published port is a DNAT rule, and Docker's rule exempts loopback.
 const PUBLISHED_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 2);
 

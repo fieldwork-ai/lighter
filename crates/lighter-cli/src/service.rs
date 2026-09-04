@@ -23,7 +23,6 @@ pub fn install() -> anyhow::Result<()> {
     // process launchd starts from the bundle carries a name and an icon.
     let exe = crate::bundle::ensure()?;
     let guest = paths::guest_dir()?;
-    let gvproxy = paths::gvproxy()?;
     let log = paths::log_file()?;
     let path = plist_path()?;
     if let Some(parent) = path.parent() {
@@ -50,8 +49,6 @@ pub fn install() -> anyhow::Result<()> {
     <dict>
         <key>LIGHTER_GUEST_DIR</key>
         <string>{guest}</string>
-        <key>LIGHTER_GVPROXY</key>
-        <string>{gvproxy}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -71,7 +68,6 @@ pub fn install() -> anyhow::Result<()> {
 "#,
         exe = exe.display(),
         guest = guest.display(),
-        gvproxy = gvproxy.display(),
         log = log.display(),
     );
     std::fs::write(&path, plist)?;

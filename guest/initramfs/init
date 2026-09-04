@@ -144,7 +144,7 @@ case "$cmdline" in
 
 	# DHCP rather than a static address, because it is the honest end-to-end
 	# test: a broadcast out through the transmit queue, a unicast reply back
-	# through the receive queue, and a userspace stack that agreed to both.
+	# through the receive queue, and the VMM's responder agreeing to both.
 	if udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1; then
 		echo "NETTEST dhcp=ok addr=$(ip -4 -o addr show eth0 | awk '{print $4}')"
 	else
@@ -153,40 +153,16 @@ case "$cmdline" in
 
 	echo "NETTEST route=$(ip route show default | head -1)"
 
-	# The gateway is gvproxy itself, so this proves frames make the round trip
-	# without depending on anything outside the host.
+	# The gateway is the VMM's own responder, so this proves frames make the
+	# round trip through both queues without depending on anything outside
+	# the host. Everything else a network is for — DNS, TCP, UDP, published
+	# ports — is a stream over vsock and never touches this card; the streams
+	# gate exercises those.
 	if ping -c 3 -W 2 192.168.127.1 >/dev/null 2>&1; then
 		echo "NETTEST gateway_ping=ok"
 	else
 		echo "NETTEST gateway_ping=failed"
 	fi
-
-	# Name resolution goes to gvproxy's resolver, which follows the Mac's own
-	# DNS configuration — including whatever a VPN has done to it.
-	if nslookup example.com >/dev/null 2>&1; then
-		echo "NETTEST dns=ok"
-	else
-		echo "NETTEST dns=failed"
-	fi
-
-	# Real egress: a TCP connection terminated on a host socket and back.
-	if wget -q -T 15 -O /tmp/egress http://example.com/ 2>/dev/null; then
-		echo "NETTEST egress=ok bytes=$(wc -c < /tmp/egress)"
-	else
-		echo "NETTEST egress=failed"
-	fi
-
-	# A listener for the host to reach through a port forward. The gate connects
-	# to it from macOS while this is running, which is the other direction.
-	case "$cmdline" in
-	*lighter.nettest=listen*)
-		echo "NETTEST listening=8000"
-		# One connection, then done: the gate makes exactly one request, and a
-		# guest that never exits is a gate that hangs instead of failing.
-		echo "hello from lighter" | nc -l -p 8000 >/dev/null 2>&1
-		echo "NETTEST served=ok"
-		;;
-	esac
 
 	echo "NETTEST done"
 	poweroff -f

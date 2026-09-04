@@ -26,7 +26,6 @@ KERNEL="guest/out/Image"
 ROOTFS_MASTER="guest/out/rootfs.ext4"
 ROOTFS="$(mktemp -t lighter-rootfs).ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
-GVPROXY="${GVPROXY:-vendor/gvproxy}"
 PROFILE="${PROFILE:-release}"
 BIN="target/$PROFILE/examples/lighter-bench"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
@@ -45,7 +44,6 @@ note() { printf '  \033[33m··\033[0m   %s\n' "$*"; }
 FAILED=0
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }
-[ -x "$GVPROXY" ] || { echo "gvproxy missing; run scripts/fetch-gvproxy.sh" >&2; exit 1; }
 
 echo "==> Building guest artifacts if missing"
 [ -f "$KERNEL" ] || ./guest/kernel/build.sh
@@ -101,7 +99,7 @@ echo "==> Booting with 8 GiB of guest RAM"
 	--kernel "$KERNEL" \
 	--disk "$ROOTFS" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
-	--net "$GVPROXY" --run-dir "$RUN_DIR" \
+	--net --run-dir "$RUN_DIR" \
 	--vsock "$SOCKET:2375" \
 	--report-memory \
 	--no-tty --cpus 4 --memory-mib 8192 \

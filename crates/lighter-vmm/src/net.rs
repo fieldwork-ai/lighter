@@ -1,107 +1,62 @@
-//! The host side of guest networking.
+//! The host side of the guest's network card: a responder, not a stack.
 //!
-//! Guest traffic goes to a userspace network stack — `gvproxy`, from
-//! containers/gvisor-tap-vsock — running as a sidecar process. It terminates
-//! the guest's TCP flows onto ordinary host sockets, which is what lets a VM
-//! reach the network with no privileged host device, no `pf` rules, and no
-//! utun interface, and what makes it follow the Mac's own DNS and VPN routes.
+//! Nothing a container sends crosses to the Mac as packets any more. TCP and
+//! UDP leave the guest as streams over vsock (`streams`, `reactor`), DNS is
+//! answered on the host over the same channel, and published ports are bound
+//! on the Mac by the VMM itself. What still reaches the virtual network card
+//! is what has no stream form and what the guest needs to believe it is on a
+//! network at all: ARP for its gateway, one DHCP lease, and ICMP. This module
+//! answers those three inside the process and drops the rest.
 //!
-//! # Why a separate process
+//! It replaces `gvproxy`, a userspace TCP/IP stack that ran as a Go sidecar:
+//! a second process, a 25 MB binary in every tarball with its own signing and
+//! notarization, a socket protocol between the two, and a copy of every frame
+//! into it. Once the streams took the traffic, all of that was carrying ARP
+//! and DHCP.
 //!
-//! It is written in Go, so it cannot be linked into a Rust VMM, and shelling
-//! out to it is what podman, lima and vfkit all do. The seam is a documented
-//! socket protocol rather than an API, which is also what makes it replaceable:
-//! a native in-process stack would implement [`crate::virtio::net::NetBackend`]
-//! and delete this file, with nothing else moving.
+//! The addresses are the ones gvproxy used, so nothing that agreed with them
+//! moves: the guest's routes, the gates, `host.docker.internal`.
 
-use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::virtio::net::{Inbox, Net, NetBackend, Outbox};
+use crate::virtio::net::{Inbox, Net, Outbox};
 
-/// The address gvproxy hands the guest by DHCP, and its own gateway address.
-/// Fixed by gvproxy's defaults; recorded here because the guest's routes and
-/// any port-forward diagnostics have to agree with them.
+/// The guest's address, its gateway, and the alias the guest reaches the Mac
+/// itself by (`host.docker.internal`). The streams map the last two to
+/// loopback on the Mac.
 pub const GATEWAY_IP: &str = "192.168.127.1";
 pub const GUEST_IP: &str = "192.168.127.2";
+pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
+pub const GUEST: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
+pub const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
+const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
-/// The MAC gvproxy expects to see from the guest.
-///
-/// Its DHCP server keys the guest's lease on this address, so a different one
-/// produces a link that is up and never gets an IP.
+/// The guest's MAC, which the device advertises and the lease is keyed on.
 pub const GUEST_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+/// The gateway's, which is what the guest's ARP table holds for `.1`.
+pub const GATEWAY_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd];
+
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_ARP: u16 = 0x0806;
+const ETHERTYPE_IPV6: u16 = 0x86dd;
+const PROTO_ICMP: u8 = 1;
+const PROTO_UDP: u8 = 17;
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
-    #[error(
-        "gvproxy was not found at {0}. Networking needs it; fetch it with \
-         `scripts/fetch-gvproxy.sh`"
-    )]
-    NotFound(PathBuf),
-    #[error("could not start gvproxy: {0}")]
-    Spawn(#[source] io::Error),
-    #[error("gvproxy did not create its socket at {path} within {timeout:?}")]
-    NoSocket {
-        path: PathBuf,
-        timeout: std::time::Duration,
-    },
-    #[error("could not connect to gvproxy: {0}")]
-    Connect(#[source] io::Error),
-    #[error("gvproxy rejected {path}: {status} {body}")]
-    Control {
-        path: String,
-        status: String,
-        body: String,
-    },
     #[error("io: {0}")]
     Io(#[from] io::Error),
 }
 
-/// Waits for gvproxy to create one of its listening sockets.
-fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> Result<(), NetError> {
-    let deadline = std::time::Instant::now() + timeout;
-    while !path.exists() {
-        if std::time::Instant::now() > deadline {
-            return Err(NetError::NoSocket {
-                path: path.to_path_buf(),
-                timeout,
-            });
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    Ok(())
-}
-
-/// A port on the host forwarded to the guest.
-#[derive(Debug, Clone, Copy)]
-pub struct PortForward {
-    pub host_port: u16,
-    pub guest_port: u16,
-}
-
-/// A running gvproxy, and the socket the VMM talks to it over.
-pub struct Network {
-    child: Child,
-    socket_path: PathBuf,
-    control_path: PathBuf,
-    /// The socket. Written only by the transmit thread; cloned for the
-    /// receive thread.
-    stream: Arc<Mutex<UnixStream>>,
-    /// Frames the device has taken off the guest's ring for the wire.
-    outbox: Arc<Outbox>,
-    /// The link's MTU, agreed with gvproxy at spawn.
-    mtu: u16,
-}
-
-/// The MTU for the link to gvproxy.
-///
-/// gvproxy terminates every flow onto a host socket, so nothing past it sees
-/// this number; it only decides how many frames a byte costs on the way
-/// there. `LIGHTER_NET_MTU` overrides it for an A/B.
+/// The MTU the guest is told the link carries. Nothing on the far side of
+/// the card sees it — every flow is a stream — so it only sizes the frames
+/// the three protocols above travel in. `LIGHTER_NET_MTU` overrides it.
 pub fn link_mtu() -> u16 {
     std::env::var("LIGHTER_NET_MTU")
         .ok()
@@ -110,132 +65,54 @@ pub fn link_mtu() -> u16 {
         .unwrap_or(crate::virtio::net::DEFAULT_MTU)
 }
 
+/// What the card saw and what it did with it. Diagnostics: a rule that lets
+/// a flow escape the redirects shows up here as a dropped protocol.
+#[derive(Default)]
+pub struct Counters {
+    pub arp: AtomicU64,
+    pub dhcp: AtomicU64,
+    pub icmp_local: AtomicU64,
+    pub icmp_forwarded: AtomicU64,
+    pub icmp_replied: AtomicU64,
+    pub dropped: AtomicU64,
+}
+
+/// The card's other end.
+pub struct Network {
+    outbox: Arc<Outbox>,
+    mtu: u16,
+    /// An unprivileged ICMP socket, for echo to the world. macOS lets any
+    /// process open `SOCK_DGRAM`/`IPPROTO_ICMP` and send echo requests on
+    /// it; the replies come back with their IP header. `None` when the
+    /// kernel refused, in which case `ping` from a container reaches the
+    /// gateway and nothing beyond it.
+    icmp: Option<Arc<OwnedFd>>,
+    counters: Arc<Counters>,
+}
+
 impl Network {
-    /// Starts gvproxy and connects to it.
-    pub fn start(gvproxy: &Path, run_dir: &Path, mtu: u16) -> Result<Network, NetError> {
-        if !gvproxy.exists() {
-            return Err(NetError::NotFound(gvproxy.to_path_buf()));
-        }
-        std::fs::create_dir_all(run_dir)?;
-
-        let socket_path = run_dir.join("network.sock");
-        let control_path = run_dir.join("gvproxy.sock");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_file(&control_path);
-
-        let mut command = Command::new(gvproxy);
-        command
-            // The control endpoint, used to add port forwards at runtime.
-            .arg("--listen")
-            .arg(format!("unix://{}", control_path.display()))
-            // The data endpoint: a stream socket carrying length-prefixed
-            // Ethernet frames, which is the protocol implemented below.
-            .arg("--listen-qemu")
-            .arg(format!("unix://{}", socket_path.display()))
-            .arg("--mtu")
-            .arg(mtu.to_string())
-            // gvproxy's built-in SSH forward binds 127.0.0.1:2222 by default,
-            // which we never use and which makes every second machine on the
-            // Mac die at boot — the benchmark harness beside the daily
-            // driver, most memorably. -1 turns the service off entirely.
-            .arg("-ssh-port")
-            .arg("-1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        let child = command.spawn().map_err(NetError::Spawn)?;
-
-        // gvproxy creates its listening sockets a moment after starting, so
-        // connecting immediately races it. Both matter: the data socket carries
-        // frames, and the control socket is the only way to add a port forward.
-        let timeout = std::time::Duration::from_secs(5);
-        wait_for_socket(&socket_path, timeout)?;
-        wait_for_socket(&control_path, timeout)?;
-
-        let stream = UnixStream::connect(&socket_path).map_err(NetError::Connect)?;
-        crate::sockbuf::widen(&stream);
+    /// Opens the ICMP socket; the rest of the card needs nothing from the
+    /// host at all.
+    pub fn start(mtu: u16) -> Result<Network, NetError> {
+        let icmp = match icmp_socket() {
+            Ok(fd) => Some(Arc::new(fd)),
+            Err(e) => {
+                tracing::warn!(%e, "no ICMP socket; ping from a container stops at the gateway");
+                None
+            }
+        };
         tracing::info!(
-            socket = %socket_path.display(),
-            control = %control_path.display(),
             gateway = GATEWAY_IP,
             guest = GUEST_IP,
             mtu,
             "network started"
         );
-
         Ok(Network {
-            child,
-            socket_path,
-            control_path,
-            stream: Arc::new(Mutex::new(stream)),
             outbox: Outbox::new(),
             mtu,
+            icmp,
+            counters: Arc::new(Counters::default()),
         })
-    }
-
-    /// Forwards a host port to the same address inside the guest.
-    ///
-    /// Deliberately a runtime call rather than a start-up argument: Docker
-    /// publishes ports when a container starts, which is long after the VM
-    /// booted, so the set of forwards is never known at spawn time.
-    pub fn expose(&self, forward: PortForward) -> Result<(), NetError> {
-        let body = format!(
-            r#"{{"local":"127.0.0.1:{}","remote":"{GUEST_IP}:{}"}}"#,
-            forward.host_port, forward.guest_port
-        );
-        self.control("POST", "/services/forwarder/expose", &body)?;
-        tracing::info!(
-            host_port = forward.host_port,
-            guest_port = forward.guest_port,
-            "port forwarded"
-        );
-        Ok(())
-    }
-
-    /// Withdraws a forward added by [`Network::expose`].
-    pub fn unexpose(&self, host_port: u16) -> Result<(), NetError> {
-        let body = format!(r#"{{"local":"127.0.0.1:{host_port}"}}"#);
-        self.control("POST", "/services/forwarder/unexpose", &body)?;
-        Ok(())
-    }
-
-    /// The forwards gvproxy currently holds, as the JSON it reports them in.
-    pub fn forwards(&self) -> Result<String, NetError> {
-        self.control("GET", "/services/forwarder/all", "")
-    }
-
-    /// One request to gvproxy's control endpoint.
-    ///
-    /// Hand-rolled HTTP/1.0 over the unix socket rather than a client crate:
-    /// the entire vocabulary is three fixed request shapes to a local socket we
-    /// spawned ourselves, and `Connection: close` makes the response body
-    /// exactly "everything until EOF" with no chunked encoding to parse.
-    fn control(&self, method: &str, path: &str, body: &str) -> Result<String, NetError> {
-        let mut stream = UnixStream::connect(&self.control_path).map_err(NetError::Connect)?;
-        let request = format!(
-            "{method} {path} HTTP/1.0\r\nHost: gvproxy\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(request.as_bytes())?;
-        stream.flush()?;
-
-        let mut response = String::new();
-        stream.read_to_string(&mut response)?;
-
-        let (head, payload) = response
-            .split_once("\r\n\r\n")
-            .unwrap_or((response.as_str(), ""));
-        let status = head.lines().next().unwrap_or("").to_string();
-        if !status.contains(" 200") {
-            return Err(NetError::Control {
-                path: path.to_string(),
-                status,
-                body: payload.trim().to_string(),
-            });
-        }
-        Ok(payload.to_string())
     }
 
     /// The link's MTU, for the device to advertise.
@@ -243,189 +120,507 @@ impl Network {
         self.mtu
     }
 
-    /// Where the device puts frames for the wire.
+    /// Where the device puts frames the guest transmitted.
     pub fn outbox(&self) -> Arc<Outbox> {
         self.outbox.clone()
     }
 
-    /// Spawns the thread that moves transmitted frames from the outbox to
-    /// the wire.
-    ///
-    /// This is the only thread that writes the socket, and the only one that
-    /// may block on it. `wake` is called when the device had parked on a full
-    /// outbox and there is room again, so the transport looks at the ring
-    /// the device left chains on.
-    pub fn spawn_transmitter(&self, wake: impl Fn() + Send + 'static) -> io::Result<()> {
+    pub fn counters(&self) -> Arc<Counters> {
+        self.counters.clone()
+    }
+
+    /// Starts the two threads of the card. The responder takes what the guest
+    /// transmitted and answers it into `inbox`; `wake_rx` is called once per
+    /// batch of answers so the device delivers them under one interrupt, and
+    /// `wake_tx` when the device had parked on a full outbox and there is
+    /// room again. The ICMP reader turns the host's echo replies into frames
+    /// the same way.
+    pub fn spawn(
+        &self,
+        inbox: Inbox,
+        wake_rx: impl Fn() + Send + Sync + 'static,
+        wake_tx: impl Fn() + Send + 'static,
+    ) -> io::Result<()> {
+        let wake_rx = Arc::new(wake_rx);
         let outbox = self.outbox.clone();
-        let mut backend = FramedStream {
-            stream: self.stream.clone(),
+        let responder = Responder {
+            icmp: self.icmp.clone(),
+            counters: self.counters.clone(),
         };
+        let deliver_inbox = inbox.clone();
+        let deliver_wake = wake_rx.clone();
         std::thread::Builder::new()
-            .name("net-tx".into())
+            .name("net-lan".into())
             .spawn(move || {
                 crate::qos::raise_interactive();
                 while let Some((frames, parked)) = outbox.take() {
-                    if let Err(e) = backend.send_many(&frames) {
-                        // The backend's problem, not the guest's: the frames
-                        // are lost, exactly as they would be on a real
-                        // network.
-                        tracing::debug!(%e, dropped = frames.len(), "dropping transmitted frames");
+                    let mut answered = 0usize;
+                    for frame in &frames {
+                        if let Some(reply) = responder.answer(frame)
+                            && Net::enqueue_received(&deliver_inbox, reply)
+                        {
+                            answered += 1;
+                        }
+                    }
+                    if answered > 0 {
+                        deliver_wake();
                     }
                     if parked {
-                        wake();
+                        wake_tx();
                     }
                 }
-                tracing::debug!("network transmitter stopped");
+                tracing::debug!("network responder stopped");
             })?;
-        Ok(())
-    }
-
-    /// Spawns the thread that reads frames from the network into the guest.
-    ///
-    /// `wake` is called once per burst — after the last frame the socket had
-    /// ready, not after each — so the transport moves a batch into the
-    /// guest's receive queue under one lock and one interrupt. The reader
-    /// itself touches no virtio state.
-    pub fn spawn_receiver(&self, inbox: Inbox, wake: impl Fn() + Send + 'static) -> io::Result<()> {
-        let mut reader = self
-            .stream
-            .lock()
-            .expect("net stream poisoned")
-            .try_clone()?;
-        std::thread::Builder::new()
-            .name("net-rx".into())
-            .spawn(move || {
-                crate::qos::raise_interactive();
-                // One read takes whatever the socket holds, up to a megabyte,
-                // and the frames are cut out of that: two syscalls per frame
-                // was a third of a frame's cost at 1500 bytes. A frame split
-                // across two reads is carried over in `buf`.
-                let mut buf = vec![0u8; 1 << 20];
-                let mut filled = 0usize;
-                let mut pending = 0usize;
-                loop {
-                    let n = match reader.read(&mut buf[filled..]) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    filled += n;
-                    let mut at = 0usize;
-                    while filled - at >= 4 {
-                        let len = u32::from_be_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
-                        if len == 0 || len > 65_550 {
-                            // A length we cannot honour means the stream is
-                            // out of sync, and there is no way to
-                            // resynchronize a framed protocol other than to
-                            // stop.
-                            tracing::error!(len, "network stream framing lost");
-                            return;
-                        }
-                        if filled - at - 4 < len {
+        if let Some(icmp) = &self.icmp {
+            let icmp = icmp.clone();
+            let counters = self.counters.clone();
+            std::thread::Builder::new()
+                .name("net-icmp".into())
+                .spawn(move || {
+                    let mut buf = vec![0u8; 65_536];
+                    loop {
+                        // SAFETY: a read into a buffer we own, of its length.
+                        let n = unsafe {
+                            libc::recv(icmp.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0)
+                        };
+                        if n <= 0 {
+                            if n < 0
+                                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
                             break;
                         }
-                        let frame = buf[at + 4..at + 4 + len].to_vec();
-                        at += 4 + len;
-                        if Net::enqueue_received(&inbox, frame) {
-                            pending += 1;
-                        } else {
-                            tracing::trace!("receive backlog full; frame dropped");
+                        if let Some(frame) = echo_reply_frame(&buf[..n as usize]) {
+                            counters.icmp_replied.fetch_add(1, Ordering::Relaxed);
+                            if Net::enqueue_received(&inbox, frame) {
+                                wake_rx();
+                            }
                         }
                     }
-                    // What is left is the start of a frame the next read
-                    // completes.
-                    buf.copy_within(at..filled, 0);
-                    filled -= at;
-                    // Keep reading while the socket has more: a burst is moved
-                    // into the guest as one batch. A burst longer than the
-                    // backlog is flushed part way so nothing is dropped for
-                    // want of a look.
-                    if pending > 0 && (bytes_ready(&reader) == 0 || pending >= 256) {
-                        wake();
-                        pending = 0;
-                    }
-                }
-                tracing::debug!("network receiver stopped");
-            })?;
+                    tracing::debug!("ICMP reader stopped");
+                })?;
+        }
         Ok(())
-    }
-
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    pub fn control_path(&self) -> &Path {
-        &self.control_path
     }
 }
 
 impl Drop for Network {
     fn drop(&mut self) {
         self.outbox.close();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket_path);
-        let _ = std::fs::remove_file(&self.control_path);
     }
 }
 
-/// The "qemu" wire protocol: a stream socket carrying each Ethernet frame
-/// behind a 4-byte big-endian length.
-struct FramedStream {
-    stream: Arc<Mutex<UnixStream>>,
+/// Answers a frame the guest transmitted, or drops it.
+struct Responder {
+    icmp: Option<Arc<OwnedFd>>,
+    counters: Arc<Counters>,
 }
 
-impl NetBackend for FramedStream {
-    fn send(&mut self, frame: &[u8]) -> io::Result<()> {
-        let mut stream = self.stream.lock().expect("net stream poisoned");
-        // Length and payload must reach the socket together: a partial write
-        // between them desynchronizes the stream permanently, so they go in one
-        // buffer rather than two writes.
-        let mut buf = Vec::with_capacity(4 + frame.len());
-        buf.extend_from_slice(&(frame.len() as u32).to_be_bytes());
-        buf.extend_from_slice(frame);
-        stream.write_all(&buf)
+impl Responder {
+    fn answer(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        match classify(frame) {
+            Some(Seen::Arp) => {
+                self.counters.arp.fetch_add(1, Ordering::Relaxed);
+                arp_reply(frame)
+            }
+            Some(Seen::Dhcp) => {
+                self.counters.dhcp.fetch_add(1, Ordering::Relaxed);
+                dhcp_reply(frame)
+            }
+            Some(Seen::IcmpLocal) => {
+                self.counters.icmp_local.fetch_add(1, Ordering::Relaxed);
+                echo_reply_local(frame)
+            }
+            Some(Seen::IcmpForward) => {
+                if let Some(icmp) = &self.icmp
+                    && forward_echo(icmp.as_raw_fd(), frame)
+                {
+                    self.counters.icmp_forwarded.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            None => {
+                let dropped = self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                // The first few say what they were: a flow escaping the
+                // redirects would show here as TCP or UDP, and be a bug.
+                if dropped < 8 {
+                    tracing::debug!(
+                        ethertype = ethertype(frame).map(|t| format!("{t:#06x}")),
+                        proto = ipv4_proto(frame),
+                        "frame with no answer dropped"
+                    );
+                }
+                None
+            }
+        }
     }
+}
 
-    /// A batch goes to the socket as one `writev`: two iovecs per frame, the
-    /// length and the payload, up to the platform's limit per call. One
-    /// syscall per burst instead of one per frame is most of what a stream
-    /// socket costs, and a partial write is completed before the next call
-    /// so the framing stays intact.
-    fn send_many(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
-        // IOV_MAX on macOS; frames beyond it go in the next call.
-        const IOVS_PER_CALL: usize = 1024;
-        let stream = self.stream.lock().expect("net stream poisoned");
-        let fd = stream.as_raw_fd();
-        let headers: Vec<[u8; 4]> = frames
-            .iter()
-            .map(|f| (f.len() as u32).to_be_bytes())
-            .collect();
-        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(frames.len() * 2);
-        for (header, frame) in headers.iter().zip(frames) {
-            iovs.push(libc::iovec {
-                iov_base: header.as_ptr() as *mut libc::c_void,
-                iov_len: 4,
-            });
-            iovs.push(libc::iovec {
-                iov_base: frame.as_ptr() as *mut libc::c_void,
-                iov_len: frame.len(),
-            });
-        }
-        for chunk in iovs.chunks_mut(IOVS_PER_CALL) {
-            write_all_vectored(fd, chunk)?;
-        }
-        Ok(())
+/// What a transmitted frame is, as far as the card cares.
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    Arp,
+    Dhcp,
+    /// Echo to the gateway or the host alias: answered here.
+    IcmpLocal,
+    /// Echo to anywhere else: sent on the host's ICMP socket.
+    IcmpForward,
+}
+
+fn ethertype(frame: &[u8]) -> Option<u16> {
+    frame.get(12..14).map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+
+/// The IPv4 packet inside a frame, if that is what it carries.
+fn ipv4(frame: &[u8]) -> Option<&[u8]> {
+    if ethertype(frame)? != ETHERTYPE_IPV4 {
+        return None;
     }
+    let packet = frame.get(14..)?;
+    let ihl = (packet.first()? & 0x0f) as usize * 4;
+    if packet.first()? >> 4 != 4 || ihl < 20 || packet.len() < ihl {
+        return None;
+    }
+    let total = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total < ihl || total > packet.len() {
+        return None;
+    }
+    Some(&packet[..total])
+}
+
+fn ipv4_proto(frame: &[u8]) -> Option<u8> {
+    ipv4(frame).map(|p| p[9])
+}
+
+fn ipv4_header_len(packet: &[u8]) -> usize {
+    (packet[0] & 0x0f) as usize * 4
+}
+
+fn ipv4_dst(packet: &[u8]) -> Ipv4Addr {
+    Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19])
+}
+
+fn ipv4_src(packet: &[u8]) -> Ipv4Addr {
+    Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15])
+}
+
+fn classify(frame: &[u8]) -> Option<Seen> {
+    match ethertype(frame)? {
+        ETHERTYPE_ARP => {
+            let arp = frame.get(14..42)?;
+            // Ethernet/IPv4 request for one of our two addresses.
+            let request = arp[0..8] == [0, 1, 8, 0, 6, 4, 0, 1];
+            let target = Ipv4Addr::new(arp[24], arp[25], arp[26], arp[27]);
+            (request && (target == GATEWAY || target == HOST_ALIAS)).then_some(Seen::Arp)
+        }
+        ETHERTYPE_IPV4 => {
+            let packet = ipv4(frame)?;
+            let ihl = ipv4_header_len(packet);
+            match packet[9] {
+                PROTO_UDP => {
+                    let udp = packet.get(ihl..)?;
+                    let src = u16::from_be_bytes([udp[0], udp[1]]);
+                    let dst = u16::from_be_bytes([udp[2], udp[3]]);
+                    (src == DHCP_CLIENT_PORT && dst == DHCP_SERVER_PORT).then_some(Seen::Dhcp)
+                }
+                PROTO_ICMP => {
+                    let icmp = packet.get(ihl..)?;
+                    if icmp.first()? != &8 {
+                        return None;
+                    }
+                    let dst = ipv4_dst(packet);
+                    Some(if dst == GATEWAY || dst == HOST_ALIAS {
+                        Seen::IcmpLocal
+                    } else {
+                        Seen::IcmpForward
+                    })
+                }
+                _ => None,
+            }
+        }
+        ETHERTYPE_IPV6 => None,
+        _ => None,
+    }
+}
+
+// --- ARP ---------------------------------------------------------------------
+
+fn arp_reply(frame: &[u8]) -> Option<Vec<u8>> {
+    let arp = frame.get(14..42)?;
+    let sender_mac = &arp[8..14];
+    let sender_ip = &arp[14..18];
+    let target_ip = &arp[24..28];
+    let mut out = Vec::with_capacity(42);
+    out.extend_from_slice(sender_mac);
+    out.extend_from_slice(&GATEWAY_MAC);
+    out.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    out.extend_from_slice(&[0, 1, 8, 0, 6, 4, 0, 2]);
+    out.extend_from_slice(&GATEWAY_MAC);
+    out.extend_from_slice(target_ip);
+    out.extend_from_slice(sender_mac);
+    out.extend_from_slice(sender_ip);
+    Some(out)
+}
+
+// --- DHCP --------------------------------------------------------------------
+
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
+
+/// The lease: `.2/24`, router `.1`, DNS `.2` (the agent's resolver — what
+/// init writes to `resolv.conf` regardless), and no expiry, so the guest
+/// never wakes to renew it.
+fn dhcp_reply(frame: &[u8]) -> Option<Vec<u8>> {
+    let packet = ipv4(frame)?;
+    let ihl = ipv4_header_len(packet);
+    let udp = packet.get(ihl..)?;
+    let bootp = udp.get(8..)?;
+    if bootp.len() < 240 || bootp[0] != 1 || bootp[236..240] != DHCP_MAGIC {
+        return None;
+    }
+    let xid = &bootp[4..8];
+    let broadcast = bootp[10] & 0x80 != 0;
+    let chaddr = &bootp[28..34];
+    let mut kind = None;
+    let mut at = 240;
+    while at + 1 < bootp.len() {
+        let (code, len) = (bootp[at], bootp[at + 1] as usize);
+        if code == 255 {
+            break;
+        }
+        if code == 53 && len == 1 {
+            kind = bootp.get(at + 2).copied();
+        }
+        at += 2 + len;
+    }
+    let reply_kind = match kind? {
+        DHCP_DISCOVER => DHCP_OFFER,
+        DHCP_REQUEST => DHCP_ACK,
+        _ => return None,
+    };
+
+    let mut b = Vec::with_capacity(300);
+    b.push(2); // BOOTREPLY
+    b.extend_from_slice(&[1, 6, 0]); // Ethernet, 6-byte address, hops 0
+    b.extend_from_slice(xid);
+    b.extend_from_slice(&[0, 0]); // secs
+    b.extend_from_slice(&[if broadcast { 0x80 } else { 0 }, 0]); // flags
+    b.extend_from_slice(&[0; 4]); // ciaddr
+    b.extend_from_slice(&GUEST.octets()); // yiaddr
+    b.extend_from_slice(&GATEWAY.octets()); // siaddr
+    b.extend_from_slice(&[0; 4]); // giaddr
+    b.extend_from_slice(chaddr);
+    b.extend_from_slice(&[0; 10]); // chaddr padding
+    b.extend_from_slice(&[0; 64]); // sname
+    b.extend_from_slice(&[0; 128]); // file
+    b.extend_from_slice(&DHCP_MAGIC);
+    b.extend_from_slice(&[53, 1, reply_kind]);
+    b.extend_from_slice(&[54, 4]);
+    b.extend_from_slice(&GATEWAY.octets());
+    b.extend_from_slice(&[51, 4, 0xff, 0xff, 0xff, 0xff]);
+    b.extend_from_slice(&[1, 4]);
+    b.extend_from_slice(&NETMASK.octets());
+    b.extend_from_slice(&[3, 4]);
+    b.extend_from_slice(&GATEWAY.octets());
+    b.extend_from_slice(&[6, 4]);
+    b.extend_from_slice(&GUEST.octets());
+    b.push(255);
+
+    // Unicast to the lease's holder unless it asked for broadcast: a client
+    // with no address yet reads its own MAC off a raw socket either way.
+    let (dst_mac, dst_ip) = if broadcast {
+        ([0xff; 6], Ipv4Addr::BROADCAST)
+    } else {
+        (chaddr.try_into().ok()?, GUEST)
+    };
+    Some(udp_frame(
+        dst_mac,
+        GATEWAY,
+        dst_ip,
+        DHCP_SERVER_PORT,
+        DHCP_CLIENT_PORT,
+        &b,
+    ))
+}
+
+// --- ICMP --------------------------------------------------------------------
+
+/// Echo to the gateway itself: the request turned around.
+fn echo_reply_local(frame: &[u8]) -> Option<Vec<u8>> {
+    let packet = ipv4(frame)?;
+    let ihl = ipv4_header_len(packet);
+    let icmp = &packet[ihl..];
+    let mut reply = icmp.to_vec();
+    reply[0] = 0;
+    reply[2] = 0;
+    reply[3] = 0;
+    let sum = checksum(&reply);
+    reply[2..4].copy_from_slice(&sum.to_be_bytes());
+    let src: [u8; 6] = frame[6..12].try_into().ok()?;
+    Some(ipv4_frame(
+        src,
+        ipv4_dst(packet),
+        ipv4_src(packet),
+        PROTO_ICMP,
+        64,
+        &reply,
+    ))
+}
+
+/// Sends the guest's echo request out of the host's ICMP socket, to the
+/// address the guest named. The kernel fills the IP header; the identifier
+/// and sequence travel as they are, which is how the reply finds its way
+/// back into a frame.
+fn forward_echo(fd: libc::c_int, frame: &[u8]) -> bool {
+    let Some(packet) = ipv4(frame) else {
+        return false;
+    };
+    let ihl = ipv4_header_len(packet);
+    let icmp = &packet[ihl..];
+    if icmp.len() < 8 {
+        return false;
+    }
+    let dst = ipv4_dst(packet);
+    let addr = libc::sockaddr_in {
+        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+        sin_family: libc::AF_INET as u8,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(dst.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: the buffer and the address are valid for the call's duration.
+    let n = unsafe {
+        libc::sendto(
+            fd,
+            icmp.as_ptr().cast(),
+            icmp.len(),
+            0,
+            (&addr as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    n == icmp.len() as isize
+}
+
+/// A reply read off the host's ICMP socket, as the frame the guest sees.
+/// macOS hands the datagram back with its IP header on; the source is the
+/// host that answered, the destination becomes the guest.
+fn echo_reply_frame(datagram: &[u8]) -> Option<Vec<u8>> {
+    let (src, icmp) = if datagram.first()? >> 4 == 4 {
+        let ihl = ipv4_header_len(datagram);
+        (ipv4_src(datagram), datagram.get(ihl..)?)
+    } else {
+        return None;
+    };
+    if icmp.len() < 8 || icmp[0] != 0 {
+        return None;
+    }
+    Some(ipv4_frame(GUEST_MAC, src, GUEST, PROTO_ICMP, 64, icmp))
+}
+
+fn icmp_socket() -> io::Result<OwnedFd> {
+    // SAFETY: a socket call with constant arguments.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is ours and open.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+// --- frames ------------------------------------------------------------------
+
+fn checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for pair in bytes.chunks(2) {
+        let word = if pair.len() == 2 {
+            u16::from_be_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], 0])
+        };
+        sum += u32::from(word);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An Ethernet frame from the gateway carrying one IPv4 packet.
+fn ipv4_frame(
+    dst_mac: [u8; 6],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    proto: u8,
+    ttl: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total = 20 + payload.len();
+    let mut out = Vec::with_capacity(14 + total);
+    out.extend_from_slice(&dst_mac);
+    out.extend_from_slice(&GATEWAY_MAC);
+    out.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    let header_at = out.len();
+    out.extend_from_slice(&[0x45, 0]);
+    out.extend_from_slice(&(total as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0x40, 0]); // id 0, don't fragment
+    out.push(ttl);
+    out.push(proto);
+    out.extend_from_slice(&[0, 0]); // checksum
+    out.extend_from_slice(&src.octets());
+    out.extend_from_slice(&dst.octets());
+    let sum = checksum(&out[header_at..header_at + 20]);
+    out[header_at + 10..header_at + 12].copy_from_slice(&sum.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// An Ethernet frame from the gateway carrying one UDP datagram, with the
+/// UDP checksum computed over the pseudo-header the receiver will use.
+fn udp_frame(
+    dst_mac: [u8; 6],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let len = (8 + payload.len()) as u16;
+    let mut udp = Vec::with_capacity(len as usize);
+    udp.extend_from_slice(&src_port.to_be_bytes());
+    udp.extend_from_slice(&dst_port.to_be_bytes());
+    udp.extend_from_slice(&len.to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(payload);
+    let mut pseudo = Vec::with_capacity(12 + udp.len());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&[0, PROTO_UDP]);
+    pseudo.extend_from_slice(&len.to_be_bytes());
+    pseudo.extend_from_slice(&udp);
+    let sum = match checksum(&pseudo) {
+        0 => 0xffff,
+        s => s,
+    };
+    udp[6..8].copy_from_slice(&sum.to_be_bytes());
+    ipv4_frame(dst_mac, src, dst, PROTO_UDP, 64, &udp)
 }
 
 /// `writev` until every iovec is on the socket, advancing past whatever a
-/// partial write took.
+/// partial write took. The vsock writer's, kept here from the days the card
+/// had a socket of its own.
 pub(crate) fn write_all_vectored(fd: libc::c_int, iovs: &mut [libc::iovec]) -> io::Result<()> {
     let mut first = 0usize;
     while first < iovs.len() {
         let rest = &iovs[first..];
-        // SAFETY: every iovec points into a frame or header that outlives
-        // this call, and the count is what the slice holds.
+        // SAFETY: every iovec points into a buffer that outlives this call,
+        // and the count is what the slice holds.
         let n = unsafe { libc::writev(fd, rest.as_ptr(), rest.len() as libc::c_int) };
         if n < 0 {
             let e = io::Error::last_os_error();
@@ -449,61 +644,210 @@ pub(crate) fn write_all_vectored(fd: libc::c_int, iovs: &mut [libc::iovec]) -> i
     Ok(())
 }
 
-/// Bytes the kernel holds for this socket that have not been read yet.
-fn bytes_ready(stream: &UnixStream) -> usize {
-    let mut n: libc::c_int = 0;
-    // SAFETY: FIONREAD writes one int through the pointer given.
-    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut n) };
-    if rc < 0 { 0 } else { n.max(0) as usize }
-}
-
-/// The network as somewhere Docker's published ports can be sent.
-///
-/// The implementation is trivial; the point of the trait is direction. The
-/// crate that understands Docker's API must not also have to understand
-/// gvproxy, and this is the one place the two meet.
-impl lighter_docker::PortMapper for Network {
-    fn expose(&self, port: u16) -> Result<(), String> {
-        Network::expose(
-            self,
-            PortForward {
-                host_port: port,
-                guest_port: port,
-            },
-        )
-        .map_err(|e| e.to_string())
-    }
-
-    fn unexpose(&self, port: u16) -> Result<(), String> {
-        Network::unexpose(self, port).map_err(|e| e.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn frames_are_length_prefixed_big_endian() {
-        let (a, b) = UnixStream::pair().unwrap();
-        let mut backend = FramedStream {
-            stream: Arc::new(Mutex::new(a)),
-        };
-        backend.send(&[0xde, 0xad, 0xbe, 0xef]).unwrap();
-
-        let mut reader = b;
-        let mut header = [0u8; 4];
-        reader.read_exact(&mut header).unwrap();
-        assert_eq!(u32::from_be_bytes(header), 4, "length must be big-endian");
-        let mut payload = [0u8; 4];
-        reader.read_exact(&mut payload).unwrap();
-        assert_eq!(payload, [0xde, 0xad, 0xbe, 0xef]);
+    fn eth(dst: [u8; 6], src: [u8; 6], ethertype: u16, payload: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&dst);
+        f.extend_from_slice(&src);
+        f.extend_from_slice(&ethertype.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
     }
 
-    /// The DHCP lease is keyed on this address; a different one is a link that
-    /// comes up and never gets an IP.
+    fn arp_request(target: Ipv4Addr) -> Vec<u8> {
+        let mut p = vec![0, 1, 8, 0, 6, 4, 0, 1];
+        p.extend_from_slice(&GUEST_MAC);
+        p.extend_from_slice(&GUEST.octets());
+        p.extend_from_slice(&[0; 6]);
+        p.extend_from_slice(&target.octets());
+        eth([0xff; 6], GUEST_MAC, ETHERTYPE_ARP, &p)
+    }
+
+    fn guest_ipv4(dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
+        // Built with the same helper the responder uses, from the guest's side.
+        let mut f = ipv4_frame(GATEWAY_MAC, GUEST, dst, proto, 64, payload);
+        f[6..12].copy_from_slice(&GUEST_MAC);
+        f
+    }
+
+    fn echo_request(dst: Ipv4Addr, id: u16, seq: u16, data: &[u8]) -> Vec<u8> {
+        let mut icmp = vec![8, 0, 0, 0];
+        icmp.extend_from_slice(&id.to_be_bytes());
+        icmp.extend_from_slice(&seq.to_be_bytes());
+        icmp.extend_from_slice(data);
+        let sum = checksum(&icmp);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+        guest_ipv4(dst, PROTO_ICMP, &icmp)
+    }
+
+    fn dhcp(kind: u8, broadcast: bool) -> Vec<u8> {
+        let mut b = vec![
+            1,
+            1,
+            6,
+            0,
+            0xde,
+            0xad,
+            0xbe,
+            0xef,
+            0,
+            0,
+            if broadcast { 0x80 } else { 0 },
+            0,
+        ];
+        b.extend_from_slice(&[0; 16]);
+        b.extend_from_slice(&GUEST_MAC);
+        b.extend_from_slice(&[0; 10 + 64 + 128]);
+        b.extend_from_slice(&DHCP_MAGIC);
+        b.extend_from_slice(&[53, 1, kind, 255]);
+        let mut udp = Vec::new();
+        udp.extend_from_slice(&DHCP_CLIENT_PORT.to_be_bytes());
+        udp.extend_from_slice(&DHCP_SERVER_PORT.to_be_bytes());
+        udp.extend_from_slice(&((8 + b.len()) as u16).to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(&b);
+        let mut f = ipv4_frame(
+            [0xff; 6],
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            PROTO_UDP,
+            64,
+            &udp,
+        );
+        f[6..12].copy_from_slice(&GUEST_MAC);
+        f
+    }
+
     #[test]
-    fn guest_mac_matches_what_gvproxy_expects() {
+    fn the_gateway_and_the_host_alias_answer_arp_and_nothing_else_does() {
+        let reply = arp_reply(&arp_request(GATEWAY)).unwrap();
+        assert_eq!(&reply[0..6], &GUEST_MAC, "to the asker");
+        assert_eq!(&reply[6..12], &GATEWAY_MAC);
+        assert_eq!(reply[20..22], [0, 2], "an ARP reply");
+        assert_eq!(&reply[22..28], &GATEWAY_MAC, "sender hardware address");
+        assert_eq!(&reply[28..32], &GATEWAY.octets(), "sender protocol address");
+        assert_eq!(classify(&arp_request(HOST_ALIAS)), Some(Seen::Arp));
+        assert_eq!(classify(&arp_request(GUEST)), None, "the guest's own probe");
+        assert_eq!(
+            classify(&arp_request(Ipv4Addr::new(192, 168, 127, 9))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_discover_gets_an_offer_and_a_request_an_ack_with_the_lease() {
+        for (kind, expected) in [(DHCP_DISCOVER, DHCP_OFFER), (DHCP_REQUEST, DHCP_ACK)] {
+            let frame = dhcp(kind, false);
+            assert_eq!(classify(&frame), Some(Seen::Dhcp));
+            let reply = dhcp_reply(&frame).unwrap();
+            assert_eq!(&reply[0..6], &GUEST_MAC, "unicast to the lease holder");
+            let packet = ipv4(&reply).unwrap();
+            assert_eq!(packet[9], PROTO_UDP);
+            assert_eq!(ipv4_src(packet), GATEWAY);
+            assert_eq!(ipv4_dst(packet), GUEST);
+            let udp = &packet[20..];
+            assert_eq!(u16::from_be_bytes([udp[0], udp[1]]), DHCP_SERVER_PORT);
+            assert_eq!(u16::from_be_bytes([udp[2], udp[3]]), DHCP_CLIENT_PORT);
+            let bootp = &udp[8..];
+            assert_eq!(bootp[0], 2, "BOOTREPLY");
+            assert_eq!(&bootp[4..8], &[0xde, 0xad, 0xbe, 0xef], "the client's xid");
+            assert_eq!(&bootp[16..20], &GUEST.octets(), "yiaddr");
+            assert_eq!(&bootp[28..34], &GUEST_MAC);
+            let options = &bootp[240..];
+            assert_eq!(&options[0..3], &[53, 1, expected]);
+            assert!(
+                options.windows(6).any(|w| w == [3, 4, 192, 168, 127, 1]),
+                "router"
+            );
+            assert!(
+                options.windows(6).any(|w| w == [1, 4, 255, 255, 255, 0]),
+                "mask"
+            );
+            assert!(
+                options.windows(6).any(|w| w == [6, 4, 192, 168, 127, 2]),
+                "dns is the agent"
+            );
+            assert!(
+                options.windows(6).any(|w| w == [51, 4, 255, 255, 255, 255]),
+                "no expiry"
+            );
+        }
+        let reply = dhcp_reply(&dhcp(DHCP_DISCOVER, true)).unwrap();
+        assert_eq!(&reply[0..6], &[0xff; 6], "broadcast when asked");
+    }
+
+    #[test]
+    fn echo_to_the_gateway_comes_straight_back_with_its_payload() {
+        let frame = echo_request(GATEWAY, 0x1234, 7, b"hello, gateway");
+        assert_eq!(classify(&frame), Some(Seen::IcmpLocal));
+        let reply = echo_reply_local(&frame).unwrap();
+        assert_eq!(&reply[0..6], &GUEST_MAC);
+        let packet = ipv4(&reply).unwrap();
+        assert_eq!(ipv4_src(packet), GATEWAY);
+        assert_eq!(ipv4_dst(packet), GUEST);
+        let icmp = &packet[20..];
+        assert_eq!(icmp[0], 0, "echo reply");
+        assert_eq!(&icmp[4..8], &[0x12, 0x34, 0, 7]);
+        assert_eq!(&icmp[8..], b"hello, gateway");
+        assert_eq!(checksum(icmp), 0, "a valid checksum sums to zero");
+        assert_eq!(
+            classify(&echo_request(HOST_ALIAS, 1, 1, b"")),
+            Some(Seen::IcmpLocal)
+        );
+        assert_eq!(
+            classify(&echo_request(Ipv4Addr::new(1, 1, 1, 1), 1, 1, b"")),
+            Some(Seen::IcmpForward)
+        );
+    }
+
+    #[test]
+    fn a_reply_off_the_host_socket_becomes_a_frame_to_the_guest() {
+        // What macOS hands back: the IP header, then the echo reply.
+        let mut icmp = vec![0, 0, 0, 0, 0x12, 0x34, 0, 7];
+        icmp.extend_from_slice(b"pong");
+        let sum = checksum(&icmp);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+        let datagram = ipv4_frame(
+            [0; 6],
+            Ipv4Addr::new(1, 1, 1, 1),
+            GUEST,
+            PROTO_ICMP,
+            57,
+            &icmp,
+        );
+        let frame = echo_reply_frame(&datagram[14..]).unwrap();
+        assert_eq!(&frame[0..6], &GUEST_MAC);
+        let packet = ipv4(&frame).unwrap();
+        assert_eq!(ipv4_src(packet), Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(ipv4_dst(packet), GUEST);
+        assert_eq!(&packet[20..], &icmp[..]);
+    }
+
+    #[test]
+    fn what_has_a_stream_is_dropped_and_ipv6_is_ignored() {
+        let tcp = guest_ipv4(Ipv4Addr::new(93, 184, 216, 34), 6, &[0; 20]);
+        assert_eq!(classify(&tcp), None);
+        let udp = guest_ipv4(
+            Ipv4Addr::new(8, 8, 8, 8),
+            PROTO_UDP,
+            &[0, 53, 0, 53, 0, 8, 0, 0],
+        );
+        assert_eq!(classify(&udp), None, "UDP that is not DHCP");
+        let v6 = eth(
+            [0x33, 0x33, 0, 0, 0, 2],
+            GUEST_MAC,
+            ETHERTYPE_IPV6,
+            &[0x60; 48],
+        );
+        assert_eq!(classify(&v6), None);
+        assert_eq!(classify(&[0u8; 10]), None, "a runt");
+    }
+
+    #[test]
+    fn the_guest_mac_is_the_one_the_lease_is_keyed_on() {
         assert_eq!(GUEST_MAC, [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
     }
 }

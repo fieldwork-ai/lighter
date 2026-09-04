@@ -20,9 +20,6 @@ initramfs*.cpio*
 .DS_Store
 .context/
 
-# The gvproxy sidecar, fetched by scripts/fetch-gvproxy.sh rather than vendored.
-vendor/
-
 # Release archives
 /dist/
 

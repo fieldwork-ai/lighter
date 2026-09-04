@@ -5,7 +5,6 @@
 #
 # Produces dist/lighter-<version>-arm64.tar.gz containing:
 #   bin/lighter             (Developer ID signed with hypervisor entitlement)
-#   bin/gvproxy             (Developer ID signed)
 #   share/lighter/Image     (guest kernel)
 #   share/lighter/rootfs.ext4 (sparse Alpine rootfs)
 #   share/lighter/entitlements.plist
@@ -111,13 +110,11 @@ echo "==> Signing identity: $IDENTITY"
 echo "==> Building lighter-cli release binary"
 cargo build --release -p lighter-cli
 
-[ -x vendor/gvproxy ] || ./scripts/fetch-gvproxy.sh
 for artifact in guest/out/Image guest/out/rootfs.ext4; do
 	[ -f "$artifact" ] || { echo "error: $artifact is missing; run 'make guest'" >&2; exit 1; }
 done
 
 cp target/release/lighter "$STAGE/bin/lighter"
-cp vendor/gvproxy "$STAGE/bin/gvproxy"
 cp guest/out/Image guest/out/rootfs.ext4 "$STAGE/share/lighter/"
 cp LICENSE README.md "$STAGE/"
 cp entitlements.plist "$STAGE/share/lighter/"
@@ -140,12 +137,6 @@ codesign --sign "$IDENTITY" \
 	"$STAGE/bin/lighter"
 
 codesign --sign "$IDENTITY" \
-	--force \
-	--options runtime \
-	--timestamp \
-	"$STAGE/bin/gvproxy"
-
-codesign --sign "$IDENTITY" \
 	--entitlements entitlements.plist \
 	--force \
 	--options runtime \
@@ -154,7 +145,6 @@ codesign --sign "$IDENTITY" \
 
 echo "==> Verifying signatures"
 codesign --verify --verbose=2 "$STAGE/bin/lighter"
-codesign --verify --verbose=2 "$STAGE/bin/gvproxy"
 codesign --verify --verbose=2 --deep "$APP"
 
 # --- notarize ----------------------------------------------------------------

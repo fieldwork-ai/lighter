@@ -4,7 +4,7 @@
 # m3-network.sh proves the guest is on the network; this proves it stays
 # there. Twenty seconds of iperf3 on each of four paths, then the two checks
 # that matter: no RCU stall in the guest's log, and a Docker socket that
-# still answers. The first device blocked a vCPU thread on gvproxy's socket
+# still answers. The first device blocked a vCPU thread on the sidecar's socket
 # and failed both at 1.5 Gbit/s.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

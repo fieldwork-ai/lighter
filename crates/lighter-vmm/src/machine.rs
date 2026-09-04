@@ -81,11 +81,10 @@ pub struct MachineConfig {
     pub disks: Vec<PathBuf>,
     /// Logical size for a disk image that has to be created.
     pub disk_size_bytes: u64,
-    /// The gvproxy binary to run the network through. `None` builds a machine
-    /// with no network device at all, which is what the boot and device gates
-    /// want: they are testing something else, and a missing sidecar should not
-    /// fail them.
-    pub gvproxy: Option<PathBuf>,
+    /// Whether the machine has a network device. Off builds one with no card
+    /// at all, which is what the boot and device gates want: they are testing
+    /// something else.
+    pub network: bool,
     /// Where the network's sockets live.
     pub run_dir: PathBuf,
     /// Host directories carried into the guest, each on its own device.
@@ -105,7 +104,7 @@ impl Default for MachineConfig {
             interactive: true,
             disks: Vec::new(),
             disk_size_bytes: 64 << 30,
-            gvproxy: None,
+            network: false,
             run_dir: std::env::temp_dir().join("lighter"),
             shares: Vec::new(),
         }
@@ -131,8 +130,7 @@ pub struct Machine {
     virtio: Vec<Arc<Mutex<VirtioMmio>>>,
     disks: Vec<Arc<Disk>>,
     balloon: Arc<BalloonState>,
-    /// The gvproxy sidecar, if there is one. Held because dropping it kills the
-    /// process, and because port forwards are added through it at runtime.
+    /// The card's host side, if the machine has one.
     network: Option<Arc<Network>>,
     vsock: Arc<VsockShared>,
     /// Socket proxies, held because dropping one unlinks its socket.
@@ -214,18 +212,13 @@ impl Machine {
         let mut virtio: Vec<Box<dyn VirtioDevice>> = Vec::new();
         let mut disks = Vec::new();
 
-        // Networking starts before the device that uses it, so that a missing
-        // or unstartable gvproxy is an error about the network rather than a
-        // half-built machine. The device's slot index is remembered because the
-        // receive pump needs the transport, which does not exist until every
-        // device has been placed.
-        let network = match &config.gvproxy {
-            Some(path) => Some(Arc::new(Network::start(
-                path,
-                &config.run_dir,
-                net::link_mtu(),
-            )?)),
-            None => None,
+        // The card's host side starts before the device that uses it. The
+        // device's slot index is remembered because the pumps need the
+        // transport, which does not exist until every device has been placed.
+        let network = if config.network {
+            Some(Arc::new(Network::start(net::link_mtu())?))
+        } else {
+            None
         };
         let mut net_slot = None;
         let net_inbox = Net::new_inbox();
@@ -473,29 +466,30 @@ impl Machine {
             pollers.push((kicks, poller));
         }
 
-        // The pump that moves frames off the network and into the guest. It runs
-        // outside the vCPU threads because a frame can arrive at any time,
-        // including while every core is idle in WFI — which is exactly the
-        // moment a guest is waiting for a reply.
+        // The card's threads: the responder answers what the guest transmits
+        // into the receive queue, outside the vCPU threads because an answer
+        // (an echo reply from the world) can arrive while every core is idle
+        // in WFI, which is exactly when a guest is waiting for one; and when
+        // the device has parked on a full outbox it is the responder that has
+        // the transmit ring looked at again.
         if let (Some(network), Some(slot)) = (&network, net_slot) {
-            let transport = virtio_devices[slot].clone();
-            network.spawn_receiver(net_inbox, move || {
-                transport
-                    .lock()
-                    .expect("net transport poisoned")
-                    .service_queue(virtio::net::RX_QUEUE);
-            })?;
-            // And the one that moves them the other way. The wire is a socket
-            // that blocks when full, and the only thread allowed to block on
-            // it is this one; when the device has parked on a full outbox it
-            // is this thread that has the ring looked at again.
-            let transport = virtio_devices[slot].clone();
-            network.spawn_transmitter(move || {
-                transport
-                    .lock()
-                    .expect("net transport poisoned")
-                    .service_queue(virtio::net::TX_QUEUE);
-            })?;
+            let rx_transport = virtio_devices[slot].clone();
+            let tx_transport = virtio_devices[slot].clone();
+            network.spawn(
+                net_inbox,
+                move || {
+                    rx_transport
+                        .lock()
+                        .expect("net transport poisoned")
+                        .service_queue(virtio::net::RX_QUEUE);
+                },
+                move || {
+                    tx_transport
+                        .lock()
+                        .expect("net transport poisoned")
+                        .service_queue(virtio::net::TX_QUEUE);
+                },
+            )?;
             // The transmit ring gets the watcher the disks have. A single TCP
             // stream hands the driver one frame at a time, and the driver
             // kicks for each unless the device has said not to: at 1500 bytes

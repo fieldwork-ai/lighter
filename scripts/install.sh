@@ -79,7 +79,7 @@ xattr -dr com.apple.quarantine "$INSTALL_DIR/bin" "$INSTALL_DIR/share" 2>/dev/nu
 
 # 4. Symlink to PATH
 BIN="$INSTALL_DIR/bin/lighter"
-chmod +x "$BIN" "$INSTALL_DIR/bin/gvproxy"
+chmod +x "$BIN"
 
 TARGET_BIN=""
 if [ -w "/usr/local/bin" ]; then

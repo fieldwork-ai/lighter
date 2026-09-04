@@ -2,7 +2,7 @@
 //!
 //! netfilter diverts every UDP datagram that would leave through eth0 to the
 //! socket here by TPROXY (DNS and DHCP excepted; the first is answered by the
-//! DNS forwarder, the second is the guest's own business with gvproxy), so it
+//! DNS forwarder, the second by the VMM's responder on the network device), so it
 //! arrives with its destination intact; the socket is transparent, and reads
 //! that destination with each datagram (`IP_RECVORIGDSTADDR`), which with the
 //! source names a flow. The host keeps one socket per flow and the two ends

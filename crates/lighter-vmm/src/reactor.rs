@@ -28,7 +28,7 @@ pub const HEADER_LEN: usize = 19;
 /// The vsock port the agent answers inbound streams on.
 pub const INBOUND_PORT: u32 = 2378;
 
-/// gvproxy's addresses for the Mac itself, as seen from the guest.
+/// The card's addresses for the Mac itself, as seen from the guest.
 const GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 1);
 const HOST_ALIAS: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 254);
 

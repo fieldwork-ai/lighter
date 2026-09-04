@@ -27,7 +27,7 @@ pub const STREAM_PORT: u32 = 2377;
 /// The vsock port the agent answers inbound streams on.
 pub const INBOUND_PORT: u32 = 2378;
 
-/// gvproxy's addresses for the Mac itself, as seen from the guest. A
+/// The card's addresses for the Mac itself, as seen from the guest. A
 /// container that dials the gateway or `host.docker.internal` wants the
 /// Mac, and a socket to loopback is what that is here.
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
@@ -146,7 +146,7 @@ fn serve(shared: Arc<VsockShared>, key: ConnKey) {
 /// Published ports, the other way round: a listener on the Mac per port
 /// Docker publishes, each accepted connection carried into the guest as a
 /// vsock stream naming the port, where the agent connects to what Docker
-/// has there. The forward that used to be gvproxy's.
+/// has there.
 pub struct PortMapper {
     shared: Arc<VsockShared>,
     listeners: std::sync::Mutex<std::collections::HashMap<u16, Arc<std::sync::atomic::AtomicBool>>>,

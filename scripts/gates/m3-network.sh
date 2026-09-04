@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Milestone 3 gate, part one: the guest is on the network, in both directions.
+# Milestone 3 gate, part one: the network card, and what the VMM answers on it.
 #
-# Docker is useless without this and hard to debug through, so networking is
-# proven on its own first. Each check pins a different half of the path:
+# Everything a container uses a network for — TCP, UDP, DNS, published ports —
+# is a stream over vsock and never touches the card; the streams gate proves
+# those. What the card still carries is what the guest needs to believe it is
+# on a network, and each check pins one of them:
 #
 #   link      — the device tree slot became an interface with our MAC
-#   dhcp      — a broadcast went out the transmit queue and a reply came back
-#               in through the receive queue, which is the whole virtio-net
-#               round trip with nothing else involved
-#   gateway   — ICMP to gvproxy itself, so a failure here is ours and not the
-#               internet's
-#   dns       — resolution through gvproxy, which follows the Mac's own resolver
-#   egress    — a real TCP connection terminated on a host socket
-#   forward   — the other direction: macOS connects to a guest listener through
-#               a forward added at runtime over gvproxy's control socket
+#   dhcp      — a broadcast went out the transmit queue and the responder's
+#               lease came back in through the receive queue, which is the
+#               whole virtio-net round trip with nothing else involved
+#   gateway   — ICMP to the responder itself, so a failure here is ours
+#   quiet     — nothing else reached the card: a TCP or UDP frame there is a
+#               flow that escaped the redirects
 set -euo pipefail
 
 # cargo lives in ~/.cargo/bin, which a non-login shell does not have on PATH —
@@ -29,24 +28,17 @@ cd "$ROOT"
 
 KERNEL="guest/out/Image"
 INITRAMFS="guest/out/initramfs.cpio.gz"
-GVPROXY="${GVPROXY:-vendor/gvproxy}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-90}"
 PROFILE="${PROFILE:-debug}"
 BIN="target/$PROFILE/examples/lighter-bench"
 
 # High and unprivileged, and not a port anything else on a developer's Mac is
 # likely to be sitting on.
-HOST_PORT="${HOST_PORT:-18080}"
-GUEST_PORT=8000
 
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
 FAILED=0
 
-if [ ! -x "$GVPROXY" ]; then
-	echo "gvproxy not found at $GVPROXY; run scripts/fetch-gvproxy.sh" >&2
-	exit 1
-fi
 
 echo "==> Building guest artifacts if missing"
 [ -f "$KERNEL" ]    || ./guest/kernel/build.sh
@@ -73,42 +65,18 @@ echo "==> Booting with networking"
 	--initramfs "$INITRAMFS" \
 	--no-tty \
 	--cpus 2 \
-	--net "$GVPROXY" \
+	--net \
 	--run-dir "$RUN_DIR" \
-	--forward "$HOST_PORT:$GUEST_PORT" \
-	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 lighter.nettest=listen" \
+	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 lighter.nettest" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 
 # The guest gets to the listener only after DHCP, ping, DNS and an HTTP fetch,
 # so waiting for the marker rather than a fixed sleep is both faster and immune
 # to a slow network making the gate flaky.
+# The guest powers itself off once done; give it that long before judging.
 waited=0
-while ! grep -q "NETTEST listening=$GUEST_PORT" "$LOG" 2>/dev/null; do
-	if ! kill -0 "$VMM_PID" 2>/dev/null; then
-		break
-	fi
-	if [ "$waited" -ge "$BOOT_TIMEOUT" ]; then
-		fail "guest did not reach its listener within ${BOOT_TIMEOUT}s"
-		break
-	fi
-	sleep 1
-	waited=$((waited + 1))
-done
-
-# Inbound, from macOS, while the guest is still up.
-if grep -q "NETTEST listening=$GUEST_PORT" "$LOG" 2>/dev/null; then
-	reply="$(nc -w 5 127.0.0.1 "$HOST_PORT" 2>/dev/null || true)"
-	if [ "$reply" = "hello from lighter" ]; then
-		pass "host reached the guest through 127.0.0.1:$HOST_PORT"
-	else
-		fail "port forward returned ${reply:-nothing}"
-	fi
-fi
-
-# The guest powers itself off once served; give it a moment before judging.
-waited=0
-while kill -0 "$VMM_PID" 2>/dev/null && [ "$waited" -lt 30 ]; do
+while kill -0 "$VMM_PID" 2>/dev/null && [ "$waited" -lt "$BOOT_TIMEOUT" ]; do
 	sleep 1
 	waited=$((waited + 1))
 done
@@ -123,22 +91,13 @@ grep -q "NETTEST dhcp=ok addr=192.168.127.2/24" "$LOG" \
 	&& pass "DHCP leased 192.168.127.2" \
 	|| fail "DHCP: $(grep -o 'NETTEST dhcp=.*' "$LOG" || echo 'nothing reported')"
 
-grep -q "NETTEST gateway_ping=ok" "$LOG" && pass "gateway reachable"  || fail "cannot ping 192.168.127.1"
-grep -q "NETTEST dns=ok"          "$LOG" && pass "DNS resolves"       || fail "DNS did not resolve"
+grep -q "NETTEST gateway_ping=ok" "$LOG" && pass "gateway answers ICMP" || fail "cannot ping 192.168.127.1"
+grep -q "NETTEST done"            "$LOG" && pass "nettest completed"    || fail "nettest did not finish"
 
-if grep -q "NETTEST egress=ok" "$LOG"; then
-	pass "TCP egress works ($(grep -o 'NETTEST egress=ok bytes=[0-9]*' "$LOG" | cut -d= -f3) bytes fetched)"
-else
-	fail "no TCP egress"
-fi
-
-grep -q "NETTEST served=ok" "$LOG" && pass "guest served the forwarded connection" || fail "guest listener never completed"
-grep -q "NETTEST done"      "$LOG" && pass "nettest completed"                     || fail "nettest did not finish"
-
-# A frame-length mismatch or a wrong header size shows up here long before it
-# shows up as a failed check, because it takes the stream down permanently.
-if grep -q "network stream framing lost" "$LOG"; then
-	fail "the gvproxy stream desynchronized"
+# A frame the responder had no answer for is logged at debug; TCP or UDP
+# there would be a flow escaping the redirects.
+if grep -q "frame with no answer dropped" "$LOG"; then
+	fail "the card saw a frame it should not have: $(grep -m1 -o 'frame with no answer dropped.*' "$LOG")"
 fi
 
 for signature in "Kernel panic" "Internal error: Oops" "Unable to handle kernel"; do
