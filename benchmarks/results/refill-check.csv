@@ -1,0 +1,13 @@
+case,rep,ms
+net-tcp-egress,1,90013
+net-tcp-egress,2,80155
+net-tcp-egress,3,89560
+net-tcp-egress-r,1,79908
+net-tcp-egress-r,2,58663
+net-tcp-egress-r,3,63407
+net-tcp-port,1,69664
+net-tcp-port,2,60591
+net-tcp-port,3,69955
+net-tcp-port-r,1,67844
+net-tcp-port-r,2,62183
+net-tcp-port-r,3,67938

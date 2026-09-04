@@ -515,6 +515,7 @@ impl Machine {
             balloon_state.clone(),
             virtio_devices[balloon_slot].clone(),
             config.ram_bytes,
+            vsock_state.clone(),
         ) {
             Ok(policy) => Some(policy),
             Err(why) => {

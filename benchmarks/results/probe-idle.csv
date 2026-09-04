@@ -1,0 +1,4 @@
+case,rep,ms
+power-cpu-ms-per-s,1,5
+power-wakeups-per-s,1,103
+power-pkg-idle-wakeups-per-s,1,0

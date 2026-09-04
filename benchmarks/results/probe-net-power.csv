@@ -1,0 +1,13 @@
+case,rep,ms
+net-tcp-egress,1,88265
+net-tcp-egress-r,1,82462
+net-tcp-port,1,82515
+net-tcp-port-r,1,89475
+net-udp,1,4912
+net-connect-rate,1,18374
+net-http-p99,1,204
+net-http-latency,1,63
+net-dns,1,61
+power-cpu-ms-per-s,1,6
+power-wakeups-per-s,1,98
+power-pkg-idle-wakeups-per-s,1,0

@@ -1,0 +1,12 @@
+case,rep,ms
+npm-install,1,6372
+pnpm-install,1,5883
+yarn-install,1,6591
+ripgrep,1,2837
+find-walk,1,127
+copy-tree,1,5419
+rm-rf,1,3904
+memory-settled,1,6422
+memory-peak,1,6422
+memory-after-15s,1,2102
+memory-after-60s,1,2057

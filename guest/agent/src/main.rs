@@ -181,7 +181,7 @@ fn bound_container_cache() {
     let Some(total) = total else { return };
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
-    // RAM for it: an eighth of RAM from eight gigabytes up, none below, and
+    // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
     // `lighter.cachebound=<MiB>` on the command line to say otherwise (0
     // for none). An install's working set is a gigabyte or two and fits;
     // what the bound evicts is the stale cache of the builds before it,
@@ -189,10 +189,14 @@ fn bound_container_cache() {
     // a 16 GiB guest read 17 GB in Activity Monitor through an install
     // against OrbStack's 5.5, whose guest is sized dynamically. On the M1's
     // 4 GiB guests a bound at half or three quarters of RAM was measured to
-    // cost an install a third, so small guests keep none.
+    // cost an install a third, so small guests keep none. An eighth on the
+    // 16 GiB guest was measured too: pnpm 4.2–7.9 s against 3.8–4.3, a
+    // working set larger than two gigabytes paid on every page. It shipped
+    // by accident for a morning (the UDP commit carried it), which is what
+    // the pnpm regressions of 2026-09-04's memory runs were.
     let bound = cmdline_value("lighter.cachebound")
         .map(|mib| mib << 20)
-        .unwrap_or(if total >= 8 << 30 { total / 8 } else { 0 });
+        .unwrap_or(if total >= 8 << 30 { total / 4 } else { 0 });
     // dockerd makes the containers' cgroup at the first container, which
     // can be any time: the bound is written once it exists.
     let mut bounded = bound == 0;
@@ -207,6 +211,7 @@ fn bound_container_cache() {
     let engine = "/sys/fs/cgroup/engine";
     let mut idle_for = 0u32;
     let mut last = container_cpu_usec(containers);
+    let mut memory_stream: Option<OwnedFd> = None;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
         if !bounded && std::path::Path::new(containers).exists() {
@@ -229,19 +234,15 @@ fn bound_container_cache() {
         if (idle_for == 0 || idle_for == 25) && !always_fast {
             set_reporting(2000, 9);
         }
-        // Two seconds idle: hurry reporting, before any trim. What the
-        // containers freed while they worked — a removed tree, a finished
-        // install's scratch — sits in the guest's free lists in file-sized
-        // pieces the churn setting never reports, and the host holds all of
-        // it: traced through the storage cases, the guest had 13 GB free
-        // with the host at 6.4 GB, and the first trim's hurried window,
-        // not the trim, returned 4.5 GB of it. Hurrying costs nothing on an
-        // idle guest (no reuse to fault on), and the churn setting comes
-        // back the moment the containers do.
-        if idle_for == 2 && !always_fast {
-            set_reporting(100, 5);
-            compact_until_reportable();
-        }
+        // Two seconds idle: offer the host what is free beyond a reserve,
+        // through the balloon (`memory_guest` on the host side). What the
+        // containers freed while they worked sits in the free lists in
+        // file-sized pieces that reporting cannot return without a
+        // compaction pass, and a pass costs the next command; the balloon
+        // takes pages at host-page size from any free list. The offer is
+        // withdrawn — the whole balloon asked back — the moment the
+        // containers work again or free memory falls under the reserve.
+        offer_memory(&mut memory_stream, total, idle_for);
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
@@ -287,6 +288,52 @@ fn bound_container_cache() {
         // trimmed guest took twenty seconds to reach its resting footprint
         // where a few passes take two.
         compact_until_reportable();
+    }
+}
+
+/// The host port that takes the guest's memory offer.
+const MEMORY_PORT: u32 = 2381;
+
+/// Sixteen bytes to the host: what the guest can spare beyond a reserve of
+/// a sixteenth of RAM (MiB; zero holds the balloon where it is), available
+/// and free (MiB), and a release flag that asks the whole balloon back.
+/// Reconnects on the next tick if the stream is gone; the host treats a
+/// closed stream as a release.
+fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, idle_for: u32) {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let field = |name: &str| -> u64 {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .unwrap_or(0)
+            >> 10
+    };
+    let (avail, free) = (field("MemAvailable:"), field("MemFree:"));
+    let reserve = (total >> 20) / 16;
+    // Release is its own word: an offer of zero means "nothing more", and
+    // the balloon holds what it has. Said as one number, the guest asked
+    // for everything back each time inflation dipped it under its line,
+    // and the target flapped between fourteen gigabytes and none.
+    let release = idle_for == 0 || free < reserve / 4;
+    let spare = if !release && idle_for >= 2 && avail > reserve {
+        avail - reserve
+    } else {
+        0
+    };
+    if stream.is_none() {
+        *stream = vsock::connect(MEMORY_PORT).ok();
+    }
+    let Some(fd) = stream.as_ref() else { return };
+    let mut bytes = [0u8; 16];
+    for (i, v) in [spare as u32, avail as u32, free as u32, u32::from(release)].iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // SAFETY: a plain write of a stack buffer to a descriptor we own.
+    let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), 16) };
+    if n != 16 {
+        *stream = None;
     }
 }
 
