@@ -196,6 +196,12 @@ fn bound_container_cache() {
     // dockerd makes the containers' cgroup at the first container, which
     // can be any time: the bound is written once it exists.
     let mut bounded = bound == 0;
+    let always_fast = std::fs::read_to_string("/proc/cmdline")
+        .map(|c| c.split_whitespace().any(|w| w == "lighter.reporting=fast"))
+        .unwrap_or(false);
+    if always_fast {
+        set_reporting(100, 5);
+    }
     // The engine's cgroup (init puts dockerd there): the image layers it
     // extracted, and whatever else it read, charged where a trim can reach.
     let engine = "/sys/fs/cgroup/engine";
@@ -217,7 +223,10 @@ fn bound_container_cache() {
         // Freed memory goes back at reporting's idle rate for a while after
         // a trim, and at its churn rate again once the containers work or
         // the burst is over (guest kernel patch 0019).
-        if idle_for == 0 || idle_for == 25 {
+        // `lighter.reporting=fast` on the command line keeps reporting
+        // hurried throughout, to measure what the churn of an install
+        // costs against the footprint it holds while waiting to re-report.
+        if (idle_for == 0 || idle_for == 25) && !always_fast {
             set_reporting(2000, 9);
         }
         // Two passes, five and ten seconds idle: the containers down to a
