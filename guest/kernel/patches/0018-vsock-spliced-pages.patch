@@ -1,0 +1,143 @@
+vsock: pages offered by reference go into the packet as they are; skb_send_sock sends an skb's frags in one call
+
+The join sends a container's TCP data into vsock through skb_send_sock,
+which offered the skb one page fragment per sendmsg; vsock made a packet of
+each call and copied it. A container's stream reached the host as 4–32 KiB
+packets, each with its header, credit arithmetic, descriptor and copy,
+where the host's stream into the container moved in 256 KiB linear packets
+in one call each — the asymmetry measured as 78–87 Gbit/s out against 90
+in.
+
+skb_send_sock now offers every remaining fragment in one bvec array, so a
+transport that makes a packet of each call makes one of the skb. And vsock
+honors MSG_SPLICE_PAGES from a kernel caller: the pages go into the packet
+as fragments by reference, charged to the socket as the zero-copy path
+charges its pages, with no copy and no completion to report — a user's
+MSG_SPLICE_PAGES never reaches a protocol, so only the kernel's own
+callers take this path.
+
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -3308,36 +3308,54 @@ static int __skb_send_sock(struct sock *sk, struct sk_buff *skb, int offset,
+ 		offset -= skb_frag_size(frag);
+ 	}
+ 
+-	for (; len && fragidx < skb_shinfo(skb)->nr_frags; fragidx++) {
+-		skb_frag_t *frag  = &skb_shinfo(skb)->frags[fragidx];
++	/* Every remaining frag in one call: a transport that makes a packet
++	 * of each call (vsock) then makes one of the skb, not one of each
++	 * page.
++	 */
++	while (len && fragidx < skb_shinfo(skb)->nr_frags) {
++		struct bio_vec bvecs[MAX_SKB_FRAGS];
++		struct msghdr msg = {
++			.msg_flags = MSG_SPLICE_PAGES | MSG_DONTWAIT | flags,
++		};
++		unsigned short i = fragidx;
++		int total = 0, off = offset;
++
++		while (i < skb_shinfo(skb)->nr_frags && total < len) {
++			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
++			int part = min_t(int, len - total,
++					 skb_frag_size(frag) - off);
+ 
+-		slen = min_t(size_t, len, skb_frag_size(frag) - offset);
+-
+-		while (slen) {
+-			struct bio_vec bvec;
+-			struct msghdr msg = {
+-				.msg_flags = MSG_SPLICE_PAGES | MSG_DONTWAIT |
+-					     flags,
+-			};
+-
+-			if (slen < len)
+-				msg.msg_flags |= more_hint;
+-			bvec_set_page(&bvec, skb_frag_page(frag), slen,
+-				      skb_frag_off(frag) + offset);
+-			iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1,
+-				      slen);
+-
+-			ret = INDIRECT_CALL_2(sendmsg, sendmsg_locked,
+-					      sendmsg_unlocked, sk, &msg);
+-			if (ret <= 0)
+-				goto error;
+-
+-			len -= ret;
+-			offset += ret;
+-			slen -= ret;
++			bvec_set_page(&bvecs[i - fragidx], skb_frag_page(frag),
++				      part, skb_frag_off(frag) + off);
++			total += part;
++			off = 0;
++			i++;
+ 		}
++		if (total < len)
++			msg.msg_flags |= more_hint;
++		iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, bvecs, i - fragidx,
++			      total);
++
++		ret = INDIRECT_CALL_2(sendmsg, sendmsg_locked,
++				      sendmsg_unlocked, sk, &msg);
++		if (ret <= 0)
++			goto error;
+ 
+-		offset = 0;
++		len -= ret;
++		/* Move past what was sent, frag by frag. */
++		while (ret) {
++			skb_frag_t *frag = &skb_shinfo(skb)->frags[fragidx];
++			int avail = skb_frag_size(frag) - offset;
++
++			if (ret < avail) {
++				offset += ret;
++				ret = 0;
++			} else {
++				ret -= avail;
++				offset = 0;
++				fragidx++;
++			}
++		}
+ 	}
+ 
+ 	if (len) {
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -87,6 +87,22 @@ static int virtio_transport_fill_skb(struct sk_buff *skb,
+ {
+ 	struct msghdr *msg = info->msg;
+ 
++	if (zcopy && (msg->msg_flags & MSG_SPLICE_PAGES)) {
++		/* Pages a kernel caller offers by reference (skb_send_sock
++		 * from a sockmap redirect): taken as frags, no copy, and no
++		 * completion to report. Charged to the socket as the
++		 * zero-copy path charges its pages.
++		 */
++		ssize_t spliced = skb_splice_from_iter(skb, &msg->msg_iter, len);
++
++		if (spliced < 0)
++			return spliced;
++		if (spliced != len)
++			return -EIO;
++		refcount_add(spliced, &skb->sk->sk_wmem_alloc);
++		return 0;
++	}
++
+ 	if (zcopy)
+ 		return __zerocopy_sg_from_iter(msg, NULL, skb,
+ 					       &msg->msg_iter, len, NULL);
+@@ -348,6 +364,15 @@ static int virtio_transport_send_pkt_info(struct vsock_sock *vsk,
+ 		if (info->msg->msg_flags & MSG_ZEROCOPY)
+ 			can_zcopy = virtio_transport_can_zcopy(t_ops, info, pkt_len);
+ 
++		/* Pages offered by reference from inside the kernel go into
++		 * the packet as they are; a user's MSG_SPLICE_PAGES never
++		 * reaches here.
++		 */
++		if (info->msg->msg_flags & MSG_SPLICE_PAGES &&
++		    iov_iter_is_bvec(&info->msg->msg_iter) &&
++		    info->op == VIRTIO_VSOCK_OP_RW)
++			can_zcopy = virtio_transport_can_zcopy(t_ops, info, pkt_len);
++
+ 		if (can_zcopy)
+ 			max_skb_len = min_t(u32, VIRTIO_VSOCK_MAX_PKT_BUF_SIZE,
+ 					    (MAX_SKB_FRAGS * PAGE_SIZE));
