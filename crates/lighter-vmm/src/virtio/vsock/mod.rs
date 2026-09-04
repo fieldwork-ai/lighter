@@ -391,7 +391,15 @@ impl VsockShared {
             while allowed > 0 && room > 0 && offset < data.len() {
                 let take = allowed.min(MAX_PAYLOAD).min(data.len() - offset);
                 let mut packet = Packet::control(Op::Rw, host_port, guest_port);
-                packet.payload = data[offset..offset + take].to_vec();
+                let mut payload = match inner.spare.pop() {
+                    Some(mut buf) => {
+                        buf.clear();
+                        buf
+                    }
+                    None => Vec::with_capacity(MAX_PAYLOAD),
+                };
+                payload.extend_from_slice(&data[offset..offset + take]);
+                packet.payload = payload;
                 packet.buf_alloc = credit::BUF_ALLOC;
                 packet.fwd_cnt = fwd_cnt;
                 inner.outbox.push_back(packet);
@@ -846,6 +854,13 @@ impl Vsock {
 
             queue.push_used(mem, head, offset as u32);
             used_any = true;
+            // The payload is in the guest now; its buffer goes back for the
+            // next one rather than to the allocator.
+            if packet.payload.capacity() >= MAX_PAYLOAD / 4 && inner.spare.len() < 64 {
+                let mut buf = std::mem::take(&mut packet.payload);
+                buf.clear();
+                inner.spare.push(buf);
+            }
         }
 
         drop(inner);
