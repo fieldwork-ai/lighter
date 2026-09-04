@@ -221,6 +221,8 @@ fn bound_container_cache() {
     let mut idle_for = 0u32;
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
+    let mut cpu_last = guest_cpu_usec();
+    let mut quiet_for = 0u32;
     // Quarter-second ticks: the offer to the host waits for two seconds of
     // idle, and a one-second tick put the first offer three seconds after
     // the last container stopped — past the moment anything looking at the
@@ -264,9 +266,18 @@ fn bound_container_cache() {
         // after the last case where anything looking at the machine looks
         // at five.) The release, though, is theirs: only work that is
         // running and short of memory asks the balloon back.
+        // The offer waits for the guest as a whole to be idle — a second of
+        // its CPU under a tenth of a core — not for the containers' cgroup,
+        // which outlives a container's exit by seconds. An offer made while
+        // work ran seesawed a 4 GiB guest: the work's next allocation
+        // tripped the release, the next tick offered everything again, three
+        // gigabytes moved every second and a half and copy-tree took twice
+        // as long. The release stays with active work short of memory.
         let running = running_containers(containers);
         let active = idle_for == 0 && running > 0;
-        offer_memory(&mut memory_stream, total, active, running == 0);
+        let busy = guest_cpu_busy(&mut cpu_last);
+        quiet_for = if busy < 100_000 / TICKS_PER_SEC as u64 { quiet_for + 1 } else { 0 };
+        offer_memory(&mut memory_stream, total, active, quiet_for >= TICKS_PER_SEC, running == 0);
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
@@ -335,7 +346,26 @@ fn running_containers(containers: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool, nothing_runs: bool) {
+/// Busy CPU time of the whole guest since the last call, in microseconds
+/// of core (user, system and interrupt time from `/proc/stat`).
+fn guest_cpu_busy(last: &mut u64) -> u64 {
+    let now = guest_cpu_usec();
+    let busy = now.saturating_sub(*last);
+    *last = now;
+    busy
+}
+
+fn guest_cpu_usec() -> u64 {
+    let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    let Some(line) = stat.lines().next() else { return 0 };
+    let fields: Vec<u64> = line.split_whitespace().skip(1).filter_map(|f| f.parse().ok()).collect();
+    // user nice system idle iowait irq softirq steal: everything but idle
+    // and iowait, in jiffies at USER_HZ (100), to microseconds.
+    let busy: u64 = fields.iter().enumerate().filter(|(i, _)| *i != 3 && *i != 4).map(|(_, v)| *v).sum();
+    busy * 10_000
+}
+
+fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool, quiet: bool, nothing_runs: bool) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
         meminfo
@@ -377,7 +407,7 @@ fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool, nothing_
     // containers have been idle; the balloon takes only what is already
     // free.
     let release = active && free < reserve / 2;
-    let spare = if !release && free > reserve + reserve / 4 {
+    let spare = if !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
         0

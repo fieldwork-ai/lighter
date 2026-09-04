@@ -415,8 +415,9 @@ setup_lighter() {
 		--vsock "$RUN_DIR/control.sock:2376" \
 		--docker-ports "$SOCKET" \
 		--share "bench:$WORK" \
+		${LIGHTER_BENCH_DEV_AGENT:+--share "dev:$(dirname "$LIGHTER_BENCH_DEV_AGENT")"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
