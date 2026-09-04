@@ -58,15 +58,15 @@ a container. `native` is the Mac over loopback where that means anything.
 
 | case | unit | native | lighter (share) | orbstack (share) | colima (share) | docker-desktop (share) |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Mbit/s | 123472 | 95564 | 97161 | 4479 | 23245 |
-| TCP, the Mac to a container | Mbit/s | 129208 | 85270 | 52870 | 3927 | 14257 |
-| TCP into a published port | Mbit/s | — | 87786 | 54227 | 3838 | 14314 |
-| TCP out of a published port | Mbit/s | — | 84353 | 93100 | 4357 | 33392 |
-| UDP, container to the Mac | Mbit/s | 21838 | 4983 | 3123 | 3283 | 0 |
-| connects to a published port | per second | 25963 | 17656 | 16155 | 15819 | 16994 |
-| GET on a published port, median | µs | 40 | 58 | 73 | 224 | 119 |
-| GET on a published port, p99 | µs | 70 | 153 | 119 | 361 | 245 |
-| DNS lookup from a container, median | µs | 2850 | 54 | 251 | 483 | 474 |
+| TCP, container to the Mac | Mbit/s | 123472 | 98541 | 97161 | 4479 | 23245 |
+| TCP, the Mac to a container | Mbit/s | 129208 | 90111 | 52870 | 3927 | 14257 |
+| TCP into a published port | Mbit/s | — | 97710 | 54227 | 3838 | 14314 |
+| TCP out of a published port | Mbit/s | — | 89929 | 93100 | 4357 | 33392 |
+| UDP, container to the Mac | Mbit/s | 21838 | 5018 | 3123 | 3283 | 0 |
+| connects to a published port | per second | 25963 | 17612 | 16155 | 15819 | 16994 |
+| GET on a published port, median | µs | 40 | 68 | 73 | 224 | 119 |
+| GET on a published port, p99 | µs | 70 | 220 | 119 | 361 | 245 |
+| DNS lookup from a container, median | µs | 2850 | 55 | 251 | 483 | 474 |
 
 ### What an idle runtime costs
 
@@ -145,15 +145,15 @@ a container. `native` is the Mac over loopback where that means anything.
 
 | case | unit | native | lighter (share) | orbstack (share) | colima (share) | docker-desktop (share) |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Mbit/s | 118995 | 52498 | 63579 | 4311 | 13592 |
-| TCP, the Mac to a container | Mbit/s | 118041 | 42745 | 30343 | 3185 | 10426 |
-| TCP into a published port | Mbit/s | — | 43174 | 29949 | 3048 | 10292 |
-| TCP out of a published port | Mbit/s | — | 54282 | 67470 | 3791 | 22382 |
-| UDP, container to the Mac | Mbit/s | 24503 | 4858 | 3139 | 2612 | 0 |
-| connects to a published port | per second | 25453 | 13413 | 16477 | 9077 | 16221 |
-| GET on a published port, median | µs | 54 | 154 | 128 | 464 | 191 |
-| GET on a published port, p99 | µs | 97 | 245 | 231 | 539 | 497 |
-| DNS lookup from a container, median | µs | 3851 | 153 | 422 | 714 | 765 |
+| TCP, container to the Mac | Mbit/s | 118995 | 52696 | 63579 | 4311 | 13592 |
+| TCP, the Mac to a container | Mbit/s | 118041 | 32896 | 30343 | 3185 | 10426 |
+| TCP into a published port | Mbit/s | — | 43463 | 29949 | 3048 | 10292 |
+| TCP out of a published port | Mbit/s | — | 54468 | 67470 | 3791 | 22382 |
+| UDP, container to the Mac | Mbit/s | 24503 | 4860 | 3139 | 2612 | 0 |
+| connects to a published port | per second | 25453 | 14924 | 16477 | 9077 | 16221 |
+| GET on a published port, median | µs | 54 | 133 | 128 | 464 | 191 |
+| GET on a published port, p99 | µs | 97 | 242 | 231 | 539 | 497 |
+| DNS lookup from a container, median | µs | 3851 | 141 | 422 | 714 | 765 |
 
 ### What an idle runtime costs
 
