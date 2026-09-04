@@ -205,7 +205,7 @@ lighter does not carry packets across the boundary at all:
 - **Joined in the guest kernel:** The container's socket and its vsock stream are joined by a BPF sockmap, so the data path inside the guest is a kernel-to-kernel copy with no process in the middle. This is where the throughput comes from: 98 Gbit/s out of a container on an M5 Pro, and 90 into one, against 97 and 53 for OrbStack.
 - **Published ports the same way:** A port a container publishes is bound on the Mac by lighter itself, and each accepted connection becomes a stream into the guest. There is no userland proxy inside the VM to double-copy every byte.
 - **DNS answered on the Mac:** A container's lookups are resolved by the Mac's own resolver, so split DNS from a VPN works and a lookup costs 55 µs instead of a trip through a virtual network.
-- **Latency by not sleeping:** The host thread that moves bytes polls for a few tens of microseconds after every event before it parks, so a reply that follows a request is picked up without a scheduler wake-up. A GET on a published port costs 68 µs on the M5 and 133 µs on an M1, against 73 and 128 for OrbStack.
+- **Low request latency:** After every event, the host thread that moves bytes keeps polling for a few tens of microseconds before it goes to sleep, so the reply that follows a request is picked up without waiting for the scheduler to wake it. A GET on a published port costs 68 µs on the M5 and 133 µs on an M1, against 73 and 128 for OrbStack.
 
 UDP takes the same stream, tagged per flow, and only what has no stream form, ARP, DHCP, ICMP, stays on the virtual network card behind `gvproxy`.
 
