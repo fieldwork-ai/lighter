@@ -326,7 +326,10 @@ fi
 if grep -qw "lighter.streams" /proc/cmdline; then
 	/sbin/lighter-agent --tcp-proxy 15201 &
 	/sbin/lighter-agent --inbound 2378 &
-	if nft -f - <<'EOF'
+	# The ruleset goes through a file: busybox's shell does not take a
+	# heredoc on an `if` line the way bash does, and the rule that had
+	# worked by hand failed at every boot.
+	cat > /run/lighter.nft <<'EOF'
 table inet lighter {
 	chain prerouting {
 		type nat hook prerouting priority dstnat - 10; policy accept;
@@ -338,7 +341,11 @@ table inet lighter {
 	}
 }
 EOF
-	then echo "INIT streams=on"; else echo "INIT streams=failed"; fi
+	if nft -f /run/lighter.nft 2>/dev/console; then
+		echo "INIT streams=on"
+	else
+		echo "INIT streams=failed"
+	fi
 fi
 
 echo "INIT ready"
