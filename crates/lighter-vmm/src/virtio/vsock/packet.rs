@@ -164,7 +164,12 @@ impl Packet {
     /// `None` when the header's length does not match the payload given.
     pub fn from_parts(header: &[u8; HDR_LEN], payload: Vec<u8>) -> Option<Packet> {
         let u32_at = |off: usize| {
-            u32::from_le_bytes([header[off], header[off + 1], header[off + 2], header[off + 3]])
+            u32::from_le_bytes([
+                header[off],
+                header[off + 1],
+                header[off + 2],
+                header[off + 3],
+            ])
         };
         let u64_at = |off: usize| {
             let mut buf = [0u8; 8];

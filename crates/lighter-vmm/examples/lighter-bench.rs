@@ -113,7 +113,9 @@ fn main() -> ExitCode {
 
     // The same default as the CLI: TCP as streams unless LIGHTER_STREAMS=0,
     // so the benchmark measures what a user gets.
-    let streams = std::env::var("LIGHTER_STREAMS").map(|v| v != "0").unwrap_or(true);
+    let streams = std::env::var("LIGHTER_STREAMS")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     if streams && config.gvproxy.is_some() {
         config.cmdline.push_str(" lighter.streams");
     }
@@ -125,11 +127,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if streams && config.gvproxy.is_some() {
-        if let Err(e) = lighter_vmm::streams::start(machine.vsock()) {
-            eprintln!("lighter: cannot start streams: {e}");
-            return ExitCode::FAILURE;
-        }
+    if streams
+        && config.gvproxy.is_some()
+        && let Err(e) = lighter_vmm::streams::start(machine.vsock())
+    {
+        eprintln!("lighter: cannot start streams: {e}");
+        return ExitCode::FAILURE;
     }
 
     if report_memory {

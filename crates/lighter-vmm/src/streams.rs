@@ -111,9 +111,13 @@ fn serve(mut guest: UnixStream) {
     let _ = mac.set_nodelay(true);
     crate::sockbuf::widen(&mac);
     crate::sockbuf::widen(&guest);
-    let Ok(mut mac_read) = mac.try_clone() else { return };
+    let Ok(mut mac_read) = mac.try_clone() else {
+        return;
+    };
     let mut mac_write = mac;
-    let Ok(mut guest_read) = guest.try_clone() else { return };
+    let Ok(mut guest_read) = guest.try_clone() else {
+        return;
+    };
 
     // guest -> the world
     let outbound = std::thread::spawn(move || {
@@ -190,7 +194,11 @@ impl lighter_docker::PortMapper for PortMapper {
     }
 
     fn unexpose(&self, port: u16) -> Result<(), String> {
-        let stop = self.listeners.lock().expect("port mapper poisoned").remove(&port);
+        let stop = self
+            .listeners
+            .lock()
+            .expect("port mapper poisoned")
+            .remove(&port);
         if let Some(stop) = stop {
             stop.store(true, std::sync::atomic::Ordering::Release);
             // The accept loop notices on its next connection, which this is.
@@ -207,7 +215,9 @@ impl lighter_docker::PortMapper for PortMapper {
 fn carry_inbound(shared: Arc<VsockShared>, port: u16, mac: TcpStream) {
     let _ = mac.set_nodelay(true);
     crate::sockbuf::widen(&mac);
-    let Ok((device_side, mut guest)) = UnixStream::pair() else { return };
+    let Ok((device_side, mut guest)) = UnixStream::pair() else {
+        return;
+    };
     crate::sockbuf::widen(&device_side);
     crate::sockbuf::widen(&guest);
     let key = shared.open(INBOUND_PORT, device_side.try_clone().expect("socket clone"));
@@ -222,9 +232,13 @@ fn carry_inbound(shared: Arc<VsockShared>, port: u16, mac: TcpStream) {
     if guest.write_all(&port.to_be_bytes()).is_err() {
         return;
     }
-    let Ok(mut mac_read) = mac.try_clone() else { return };
+    let Ok(mut mac_read) = mac.try_clone() else {
+        return;
+    };
     let mut mac_write = mac;
-    let Ok(mut guest_read) = guest.try_clone() else { return };
+    let Ok(mut guest_read) = guest.try_clone() else {
+        return;
+    };
     // the Mac -> the container
     let inbound = std::thread::spawn(move || {
         copy(&mut mac_read, &mut guest);
@@ -259,7 +273,10 @@ mod tests {
             header[0] = 4;
             header[1..5].copy_from_slice(&ip.octets());
             header[17..19].copy_from_slice(&8080u16.to_be_bytes());
-            assert_eq!(destination(&header), Some("127.0.0.1:8080".parse().unwrap()));
+            assert_eq!(
+                destination(&header),
+                Some("127.0.0.1:8080".parse().unwrap())
+            );
         }
     }
 

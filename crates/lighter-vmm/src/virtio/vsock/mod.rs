@@ -542,7 +542,8 @@ impl Vsock {
                         };
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
                         inner.conns.insert(key, conn);
-                        let mut response = Packet::control(Op::Response, host_port, packet.src_port);
+                        let mut response =
+                            Packet::control(Op::Response, host_port, packet.src_port);
                         response.buf_alloc = credit::BUF_ALLOC;
                         inner.outbox.push_back(response);
                     }
@@ -591,9 +592,9 @@ impl Vsock {
                     addr += take as u64;
                     len -= take;
                     if have == HDR_LEN {
-                        let declared = u32::from_le_bytes([
-                            header[24], header[25], header[26], header[27],
-                        ]) as usize;
+                        let declared =
+                            u32::from_le_bytes([header[24], header[25], header[26], header[27]])
+                                as usize;
                         if declared > MAX_PAYLOAD {
                             ok = false;
                             break;
@@ -620,7 +621,8 @@ impl Vsock {
                 // A chain may carry more bytes than the header declares
                 // (the driver posts whole buffers); only the declared part
                 // is payload.
-                let declared = u32::from_le_bytes([header[24], header[25], header[26], header[27]]) as usize;
+                let declared =
+                    u32::from_le_bytes([header[24], header[25], header[26], header[27]]) as usize;
                 if payload.len() >= declared {
                     payload.truncate(declared);
                     Packet::from_parts(&header, payload)
@@ -723,10 +725,7 @@ impl Vsock {
                 if room > 0 && offset >= HDR_LEN && offset < total {
                     let start = offset - HDR_LEN;
                     let take = room.min(total - offset);
-                    if mem
-                        .write(at, &packet.payload[start..start + take])
-                        .is_err()
-                    {
+                    if mem.write(at, &packet.payload[start..start + take]).is_err() {
                         break;
                     }
                     offset += take;
@@ -1004,7 +1003,10 @@ mod tests {
         drop(inner);
 
         // Buffered data first — a half-close must not discard it.
-        assert_eq!(flat(shared.take_outbound(port)).as_deref(), Some(&b"tail"[..]));
+        assert_eq!(
+            flat(shared.take_outbound(port)).as_deref(),
+            Some(&b"tail"[..])
+        );
         assert_eq!(shared.take_outbound(port), None, "then end of stream");
     }
 
@@ -1031,7 +1033,11 @@ mod tests {
         Vsock::handle(&mut inner, data);
 
         assert_eq!(
-            inner.conns[&port].outbound.iter().map(Vec::len).sum::<usize>(),
+            inner.conns[&port]
+                .outbound
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
             5,
             "the payload should be queued for the writer thread"
         );
@@ -1075,7 +1081,10 @@ mod tests {
         Vsock::handle(&mut inner, data);
         drop(inner);
 
-        assert_eq!(flat(shared.take_outbound(port)).as_deref(), Some(&b"hello"[..]));
+        assert_eq!(
+            flat(shared.take_outbound(port)).as_deref(),
+            Some(&b"hello"[..])
+        );
     }
 
     #[test]
