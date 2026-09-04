@@ -78,7 +78,6 @@ else
 fi
 
 step "The network sidecar"
-remote "cd $REMOTE_DIR && bash scripts/fetch-gvproxy.sh"
 
 step "Building and signing"
 remote "cd $REMOTE_DIR && export PATH=\$HOME/.cargo/bin:/opt/homebrew/bin:\$HOME/.orbstack/bin:\$PATH &&

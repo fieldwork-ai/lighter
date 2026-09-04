@@ -36,7 +36,6 @@ cd "$ROOT"
 
 KERNEL="guest/out/Image"
 ROOTFS="guest/out/rootfs.ext4"
-GVPROXY="${GVPROXY:-vendor/gvproxy}"
 BIN="target/release/examples/lighter-bench"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 CPUS="${CPUS:-$(sysctl -n hw.ncpu)}"
@@ -49,7 +48,6 @@ for artifact in "$KERNEL" "$ROOTFS"; do
 		exit 1
 	}
 done
-[ -x "$GVPROXY" ] || { echo "gvproxy missing; run scripts/fetch-gvproxy.sh" >&2; exit 1; }
 
 echo "==> Building and signing the VMM"
 cargo build --release --example lighter-bench -p lighter-vmm
@@ -77,7 +75,7 @@ echo "==> Booting lighter (${CPUS} cores, ${MEMORY_MIB} MiB)"
 	--kernel "$KERNEL" \
 	--disk "$RUN_DIR/root.img" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 96 \
-	--net "$GVPROXY" --run-dir "$RUN_DIR" \
+	--net --run-dir "$RUN_DIR" \
 	--vsock "$SOCKET:2375" \
 	--share repo:"$ROOT" \
 	--no-tty --cpus "$CPUS" --memory-mib "$MEMORY_MIB" \

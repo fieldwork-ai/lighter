@@ -252,7 +252,6 @@ reap
 # on the Mac, bind-mounted into a container, written from both sides.
 echo
 echo "==> Boot 4: a macOS directory bind-mounted into a container"
-GVPROXY="${GVPROXY:-vendor/gvproxy}"
 # A private clone, not the master: the master is an artifact, and any second
 # machine mounting it read-write beside the first corrupts both.
 ROOTFS_MASTER="guest/out/rootfs.ext4"
@@ -260,8 +259,6 @@ ROOTFS="$(mktemp -t lighter-rootfs).ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 if ! command -v docker >/dev/null 2>&1; then
 	echo "  (skipped: no docker client on this machine)"
-elif [ ! -x "$GVPROXY" ]; then
-	echo "  (skipped: gvproxy missing; run scripts/fetch-gvproxy.sh)"
 else
 	[ -f "$ROOTFS" ] || ./guest/rootfs/build.sh
 	rm -rf "${SHARE:?}"/*
@@ -274,7 +271,7 @@ else
 		--kernel "$KERNEL" \
 		--disk "$ROOTFS" \
 		--disk "$RUN_DIR/data.img" --disk-size-gib 16 \
-		--net "$GVPROXY" --run-dir "$RUN_DIR" \
+		--net --run-dir "$RUN_DIR" \
 		--vsock "$SOCKET:2375" \
 		--share "$TAG:$SHARE" \
 		--no-tty --cpus 4 --memory-mib 4096 \

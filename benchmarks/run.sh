@@ -374,7 +374,6 @@ bench_memory_mib() {
 
 setup_lighter() {
 	KERNEL="${LIGHTER_BENCH_KERNEL:-guest/out/Image}"
-	GVPROXY="${GVPROXY:-vendor/gvproxy}"
 	BIN="target/release/examples/lighter-bench"
 	[ -f "$KERNEL" ] || ./guest/kernel/build.sh
 	# A private clone, not the master: the master is an artifact, and any
@@ -410,7 +409,7 @@ setup_lighter() {
 		--kernel "$KERNEL" \
 		--disk "$ROOTFS" \
 		--disk "$RUN_DIR/data.img" --disk-size-gib "$(bench_disk_gib)" \
-		--net "$GVPROXY" --run-dir "$RUN_DIR" \
+		--net --run-dir "$RUN_DIR" \
 		--vsock "$SOCKET:2375" \
 		--vsock "$RUN_DIR/control.sock:2376" \
 		--docker-ports "$SOCKET" \
@@ -518,15 +517,10 @@ esac
 # runtime here, so the figures compare with each other and with what a
 # user sees, not with the guest's size.
 # The runtime's processes: every one that exists because the runtime is up,
-# which for lighter is the VMM and its gvproxy sidecar — the sidecar is ours
-# to account for exactly as OrbStack's helper is theirs.
+# which for lighter is the one VMM process.
 runtime_pids() {
 	case "$TARGET" in
-	# The sidecar by its own command line, not by the run directory: the VMM's
-	# command line names the gvproxy binary and the run directory too, and a
-	# pattern that matched both counted the VMM twice — every lighter memory
-	# figure before 2026-09-04 was double.
-	lighter)        echo "$VMM_PID $(pgrep -f "gvproxy --listen.*$RUN_DIR" | tr '\n' ' ')" ;;
+	lighter)        echo "$VMM_PID" ;;
 	orbstack)       pgrep -f 'OrbStack' | tr '\n' ' ' ;;
 	colima)         pgrep -f 'limactl|lima-driver|com.apple.Virtualization.VirtualMachine|virtiofsd' | tr '\n' ' ' ;;
 	# Its VM is Virtualization.framework's own XPC service, not a docker

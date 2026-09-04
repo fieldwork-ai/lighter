@@ -25,7 +25,6 @@ class Lighter < Formula
 
   def install
     bin.install "bin/lighter"
-    libexec.install "bin/gvproxy"
     pkgshare.install Dir["share/lighter/*"]
     prefix.install "LICENSE", "README.md"
   end

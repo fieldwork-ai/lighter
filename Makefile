@@ -40,11 +40,11 @@ latency: ## Per-operation latency, macOS against the share (~15s)
 	@benchmarks/latency.sh
 
 .PHONY: bench
-bench: gvproxy ## Phase one: the workload cases on a small fixture (~60s)
+bench: ## Phase one: the workload cases on a small fixture (~60s)
 	@benchmarks/quick.sh
 
 .PHONY: bench-full
-bench-full: gvproxy ## Phase two: the real fixture, for numbers that get published (~20min)
+bench-full: ## Phase two: the real fixture, for numbers that get published (~20min)
 	@./benchmarks/run.sh --target native --reps 3
 	@./benchmarks/run.sh --target lighter --reps 3
 	@python3 benchmarks/report.py
@@ -83,7 +83,7 @@ smoke: ## Prove the hypervisor path works on this machine
 # One target per milestone. `make gates` runs every gate that has landed.
 
 .PHONY: gates
-gates: gvproxy ## Run all landed milestone gates, and report what each one cost
+gates: ## Run all landed milestone gates, and report what each one cost
 	@scripts/gates/run-all.sh
 
 .PHONY: gate-m1
@@ -95,7 +95,7 @@ gate-m2: ## M2: virtio block/entropy/balloon, and a disk that gives space back
 	@scripts/gates/m2-devices.sh
 
 .PHONY: gate-m3-network
-gate-m3-network: gvproxy ## M3: the guest is on the network, both directions
+gate-m3-network: ## M3: the guest is on the network, both directions
 	@scripts/gates/m3-network.sh
 
 .PHONY: gate-m3-vsock
@@ -103,7 +103,7 @@ gate-m3-vsock: ## M3: a host socket reaches a guest process over vsock
 	@scripts/gates/m3-vsock.sh
 
 .PHONY: gate-m3-docker
-gate-m3-docker: gvproxy ## M3: docker and compose on macOS, against our VMM
+gate-m3-docker: ## M3: docker and compose on macOS, against our VMM
 	@scripts/gates/m3-docker.sh
 
 .PHONY: gate-m4-fs
@@ -111,12 +111,9 @@ gate-m4-fs: ## M4: a shared host directory the guest and macOS agree about
 	@scripts/gates/m4-fs.sh
 
 .PHONY: gate-m5-speed
-gate-m5-speed: gvproxy ## M5: caching earns its keep, measured against itself
+gate-m5-speed: ## M5: caching earns its keep, measured against itself
 	@scripts/gates/m5-speed.sh
 
-.PHONY: gvproxy
-gvproxy: ## Fetch the gvproxy sidecar that backs guest networking
-	@scripts/fetch-gvproxy.sh
 
 .PHONY: guest
 guest: ## Build the guest kernel, agent, initramfs, and root filesystem
@@ -127,19 +124,19 @@ guest: ## Build the guest kernel, agent, initramfs, and root filesystem
 	@guest/rootfs/build.sh
 
 .PHONY: gate-m6-memory
-gate-m6-memory: gvproxy ## M6: memory tracks load, and idling costs nothing
+gate-m6-memory: ## M6: memory tracks load, and idling costs nothing
 	@scripts/gates/m6-memory.sh
 
 .PHONY: gate-m7-amd64
-gate-m7-amd64: gvproxy ## M7: x86-64 containers run
+gate-m7-amd64: ## M7: x86-64 containers run
 	@scripts/gates/m7-amd64.sh
 
 .PHONY: gate-m8-daily
-gate-m8-daily: gvproxy ## M8: a day of work, and a night of sleep
+gate-m8-daily: ## M8: a day of work, and a night of sleep
 	@scripts/gates/m8-daily.sh
 
 .PHONY: dogfood
-dogfood: gvproxy ## Rebuild the guest using lighter itself, not somebody else's VM
+dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh
 
 .PHONY: dist

@@ -290,7 +290,8 @@ fi
 # binary, and dockerd refuses to start rather than degrade ("userland-proxy is
 # enabled, but userland-proxy-path is not set"). Turning it off is the right
 # answer regardless: publishing a port then rests on netfilter DNAT alone, and
-# the host side of the journey is gvproxy's job, not a hairpin process here.
+# the host side of the journey is a stream the VMM carries, not a hairpin
+# process here.
 #
 # --mtu is the link's own, read back from eth0: the host terminates every
 # flow on its side of the link, so the only thing the number decides is how
@@ -369,14 +370,15 @@ fi
 "$AGENT" --port 2376 --control &
 
 # --- Streams --------------------------------------------------------------
-# With `lighter.streams` on the command line, every TCP connection that
-# would leave through eth0 — from a container or from this machine — is
-# redirected to the agent, which carries it to the host as a vsock stream;
-# the host's kernel makes the real connection. TCP only: UDP and ICMP keep
-# going out the network device. `fib daddr oif` is the routing decision
-# itself, so anything bound for a container, this machine, or a bridge is
-# left alone without listing subnets that Docker changes at will.
-if grep -qw "lighter.streams" /proc/cmdline; then
+# Every TCP connection that would leave through eth0 — from a container or
+# from this machine — is redirected to the agent, which carries it to the
+# host as a vsock stream; the host's kernel makes the real connection. UDP
+# goes the same way by TPROXY. Only ARP, DHCP and ICMP still go out the
+# network device, where the VMM answers them itself. `fib daddr oif` is the
+# routing decision itself, so anything bound for a container, this machine,
+# or a bridge is left alone without listing subnets that Docker changes at
+# will.
+{
 	"$AGENT" --tcp-proxy 15201 &
 	"$AGENT" --udp-proxy 15202 &
 	"$AGENT" --inbound 2378 &
@@ -418,7 +420,7 @@ EOF
 	else
 		echo "INIT streams=failed"
 	fi
-fi
+}
 
 echo "INIT ready"
 

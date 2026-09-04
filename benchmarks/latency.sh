@@ -53,7 +53,7 @@ measure_once() {
 	target/release/examples/lighter-bench \
 		--kernel guest/out/Image --disk guest/out/rootfs.ext4 \
 		--disk "$run_dir/data.img" --disk-size-gib 16 \
-		--net vendor/gvproxy --run-dir "$run_dir" \
+		--net --run-dir "$run_dir" \
 		--vsock "$run_dir/docker.sock:2375" \
 		--share "lat:$WORK" --no-tty --cpus "${BENCH_CPUS:-8}" \
 		--memory-mib "${BENCH_MEMORY_MIB:-8192}" \

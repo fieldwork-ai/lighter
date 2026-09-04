@@ -33,7 +33,6 @@ KERNEL="guest/out/Image"
 ROOTFS_MASTER="guest/out/rootfs.ext4"
 ROOTFS="$(mktemp -t lighter-rootfs).ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
-GVPROXY="${GVPROXY:-vendor/gvproxy}"
 COMPOSE="scripts/gates/fixtures/compose.yml"
 PROFILE="${PROFILE:-debug}"
 BIN="target/$PROFILE/examples/lighter-bench"
@@ -46,7 +45,6 @@ FAILED=0
 for tool in docker curl; do
 	command -v "$tool" >/dev/null 2>&1 || { echo "$tool is required" >&2; exit 1; }
 done
-[ -x "$GVPROXY" ] || { echo "gvproxy missing; run scripts/fetch-gvproxy.sh" >&2; exit 1; }
 
 echo "==> Building guest artifacts if missing"
 [ -f "$KERNEL" ] || ./guest/kernel/build.sh
@@ -78,7 +76,7 @@ echo "==> Booting the Docker guest"
 	--kernel "$KERNEL" \
 	--disk "$ROOTFS" \
 	--disk "$DATA" --disk-size-gib 16 \
-	--net "$GVPROXY" --run-dir "$RUN_DIR" \
+	--net --run-dir "$RUN_DIR" \
 	--vsock "$SOCKET:2375" \
 	--docker-ports "$SOCKET" \
 	--no-tty --cpus 4 --memory-mib 4096 \

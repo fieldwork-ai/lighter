@@ -207,7 +207,7 @@ lighter does not carry packets across the boundary at all:
 - **DNS answered on the Mac:** A container's lookups are resolved by the Mac's own resolver, so split DNS from a VPN works and a lookup costs 55 µs instead of a trip through a virtual network.
 - **Low request latency:** After every event, the host thread that moves bytes keeps polling for a few tens of microseconds before it goes to sleep, so the reply that follows a request is picked up without waiting for the scheduler to wake it. A GET on a published port costs 68 µs on the M5 and 133 µs on an M1, against 73 and 128 for OrbStack.
 
-UDP takes the same stream, tagged per flow, and only what has no stream form, ARP, DHCP, ICMP, stays on the virtual network card behind `gvproxy`.
+UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP and ICMP, still reaches the virtual network card, and lighter answers those itself, in process: there is no network stack and no sidecar behind the card at all.
 
 ---
 
@@ -233,7 +233,7 @@ UDP takes the same stream, tagged per flow, and only what has no stream form, AR
 The codebase is split into discrete crates, each responsible for one layer:
 
 ```text
-lighter (CLI)  ──spawns──▶  lighter run  ──────────▶  gvproxy (network sidecar)
+lighter (CLI)  ──spawns──▶  lighter run
                                  │
                                  ├── lighter-hv       Safe Rust bindings to Hypervisor.framework
                                  ├── lighter-vmm      vCPUs, GICv3, device tree, memory layout, virtio

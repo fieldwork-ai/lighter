@@ -61,7 +61,7 @@ pub fn config_file() -> anyhow::Result<PathBuf> {
 /// Homebrew both reach it through a symlink (`~/.local/bin/lighter`,
 /// `/opt/homebrew/bin/lighter`), and `current_exe` answers with the link:
 /// "beside the executable" then means beside the link, where there is no
-/// gvproxy and no `share`, and a fresh install could not start.
+/// `share`, and a fresh install could not start.
 fn executable() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
@@ -97,27 +97,4 @@ pub fn kernel() -> anyhow::Result<PathBuf> {
 
 pub fn rootfs() -> anyhow::Result<PathBuf> {
     Ok(guest_dir()?.join("rootfs.ext4"))
-}
-
-/// The network sidecar, looked for beside the binary and then in the checkout.
-pub fn gvproxy() -> anyhow::Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os("LIGHTER_GVPROXY") {
-        return Ok(PathBuf::from(explicit));
-    }
-    let exe = executable()?;
-    if let Some(beside) = exe.parent().map(|dir| dir.join("gvproxy"))
-        && beside.exists()
-    {
-        return Ok(beside);
-    }
-    if let Some(libexec) = exe.parent().map(|dir| dir.join("../libexec/gvproxy"))
-        && libexec.exists()
-    {
-        return Ok(libexec);
-    }
-    let repo = exe
-        .ancestors()
-        .find(|dir| dir.join("vendor/gvproxy").exists())
-        .map(|dir| dir.join("vendor/gvproxy"));
-    repo.ok_or_else(|| anyhow::anyhow!("cannot find gvproxy; run scripts/fetch-gvproxy.sh"))
 }

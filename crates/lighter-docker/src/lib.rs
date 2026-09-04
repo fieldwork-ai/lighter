@@ -47,7 +47,7 @@ pub trait PortMapper: Send + Sync {
 /// asks for is host 15434 to guest 15434, and `PrivatePort` is not part of it.
 ///
 /// Forwarding to the private port instead produces exactly what you would
-/// expect and is maddening to diagnose: gvproxy accepts the forward, the host
+/// expect and is maddening to diagnose: the host side accepts the forward, the host
 /// port opens, and every connection to it hangs, because nothing in the guest
 /// is listening on the container's internal port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -73,7 +73,7 @@ pub fn published_ports(containers: &serde_json::Value) -> HashSet<Published> {
             continue;
         };
         for entry in entries {
-            // UDP is not forwarded. gvproxy's expose API is TCP, and silently
+            // UDP is not forwarded. The stream carrying a published port is TCP, and silently
             // mapping a UDP publish to a TCP forward would be worse than not
             // doing it: the port would answer, wrongly.
             if entry.get("Type").and_then(|t| t.as_str()) != Some("tcp") {
@@ -219,7 +219,7 @@ mod tests {
     }
 
     /// Docker reports one publish twice, once per address family. They are one
-    /// forward, and asking gvproxy to open the same host port twice fails the
+    /// forward, and binding the same host port twice fails the
     /// second time.
     #[test]
     fn collapses_the_ipv4_and_ipv6_entries_of_one_publish() {
@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(published_ports(&value).len(), 1);
     }
 
-    /// gvproxy's expose is TCP. Forwarding a UDP publish onto it would leave a
+    /// A published port is carried as a TCP stream. Forwarding a UDP publish onto it would leave a
     /// port that answers, incorrectly, which is worse than one that does not.
     #[test]
     fn skips_udp() {

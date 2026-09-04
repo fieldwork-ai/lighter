@@ -19,7 +19,7 @@ use crate::virtio::vsock::{Accepted, VsockShared};
 /// The vsock port the agent dials for DNS.
 pub const DNS_PORT: u32 = 2379;
 
-/// gvproxy's addresses for the Mac, which the stream host maps to loopback.
+/// The card's addresses for the Mac, which the stream host maps to loopback.
 const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
 

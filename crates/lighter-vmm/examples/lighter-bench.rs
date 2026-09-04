@@ -7,17 +7,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use lighter_vmm::net::PortForward;
 use lighter_vmm::virtio::fs::Share;
 use lighter_vmm::{Machine, MachineConfig, StopReason};
-
-fn parse_forward(spec: &str) -> Option<PortForward> {
-    let (host, guest) = spec.split_once(':')?;
-    Some(PortForward {
-        host_port: host.parse().ok()?,
-        guest_port: guest.parse().ok()?,
-    })
-}
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -29,7 +20,6 @@ fn main() -> ExitCode {
         .init();
 
     let mut config = MachineConfig::default();
-    let mut forwards: Vec<PortForward> = Vec::new();
     let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
     let mut docker_socket: Option<PathBuf> = None;
     let mut report_memory = false;
@@ -58,7 +48,7 @@ fn main() -> ExitCode {
             // memory gate has no other way to watch a number only this process
             // can see.
             "--report-memory" => report_memory = true,
-            "--net" => config.gvproxy = Some(PathBuf::from(args.next().unwrap_or_default())),
+            "--net" => config.network = true,
             "--vsock" => {
                 // PATH:GUEST_PORT — a host socket carried to a guest port.
                 let spec = args.next().unwrap_or_default();
@@ -93,31 +83,11 @@ fn main() -> ExitCode {
             // Watch the guest's Docker daemon and mirror whatever it publishes
             // onto the host, for as long as the machine runs.
             "--docker-ports" => docker_socket = args.next().map(PathBuf::from),
-            "--forward" => {
-                // host:guest, added once the machine is up.
-                let spec = args.next().unwrap_or_default();
-                match parse_forward(&spec) {
-                    Some(f) => forwards.push(f),
-                    None => {
-                        eprintln!("--forward wants HOST:GUEST, got {spec:?}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
             other => {
                 eprintln!("unknown argument: {other}");
                 return ExitCode::from(2);
             }
         }
-    }
-
-    // The same default as the CLI: TCP as streams unless LIGHTER_STREAMS=0,
-    // so the benchmark measures what a user gets.
-    let streams = std::env::var("LIGHTER_STREAMS")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    if streams && config.gvproxy.is_some() {
-        config.cmdline.push_str(" lighter.streams");
     }
 
     let mut machine = match Machine::start(&config) {
@@ -127,8 +97,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if streams
-        && config.gvproxy.is_some()
+    if config.network
         && let Err(e) = lighter_vmm::streams::start(machine.vsock())
     {
         eprintln!("lighter: cannot start streams: {e}");
@@ -164,38 +133,17 @@ fn main() -> ExitCode {
         }
     }
 
-    for forward in &forwards {
-        // A forward the guest is not listening on yet is fine: gvproxy accepts
-        // on the host side and only then dials the guest.
-        if let Some(network) = machine.network()
-            && let Err(e) = network.expose(*forward)
-        {
-            eprintln!("lighter: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
-
     if let Some(socket) = &docker_socket {
-        match machine.network() {
-            Some(_) if streams => {
-                let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
-                if let Err(e) = lighter_docker::PortWatcher::start(socket, mapper) {
-                    eprintln!("lighter: cannot watch docker ports: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            Some(network) => {
-                if let Err(e) = lighter_docker::PortWatcher::start(socket, network.clone()) {
-                    eprintln!("lighter: cannot watch docker ports: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            // Without a network there is nowhere to put a forward, and silently
-            // doing nothing would look like the watcher working.
-            None => {
-                eprintln!("lighter: --docker-ports needs --net");
-                return ExitCode::from(2);
-            }
+        // Without a network there are no streams to carry a published port,
+        // and silently doing nothing would look like the watcher working.
+        if !config.network {
+            eprintln!("lighter: --docker-ports needs --net");
+            return ExitCode::from(2);
+        }
+        let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+        if let Err(e) = lighter_docker::PortWatcher::start(socket, mapper) {
+            eprintln!("lighter: cannot watch docker ports: {e}");
+            return ExitCode::FAILURE;
         }
     }
 

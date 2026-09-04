@@ -82,16 +82,6 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("guest filesystem", e.to_string(), "set LIGHTER_GUEST_DIR"),
     });
 
-    findings.push(match paths::gvproxy() {
-        Ok(path) if path.exists() => Finding::good("network sidecar", path.display().to_string()),
-        Ok(path) => Finding::bad(
-            "network sidecar",
-            format!("missing at {}", path.display()),
-            "run `scripts/fetch-gvproxy.sh`, or reinstall",
-        ),
-        Err(e) => Finding::bad("network sidecar", e.to_string(), "set LIGHTER_GVPROXY"),
-    });
-
     findings.push(match which("docker") {
         Some(path) => Finding::good("docker client", path),
         None => Finding::bad(
