@@ -191,12 +191,12 @@ fn bound_container_cache() {
             5 | 10 => (total / 64, 8 << 20),
             _ => continue,
         };
-        // Hurried, and down to 512 KiB runs: what a trim frees merges
+        // Hurried, and down to 128 KiB runs: what a trim frees merges
         // upward over twenty seconds as compaction works around the pages
         // still in use, and the runs it sits in meanwhile are a third of
         // what was freed. The two-megabyte order is for a guest that is
         // churning, where a reported page reused is a fault on the host.
-        set_reporting(100, 7);
+        set_reporting(100, 5);
         for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
@@ -223,11 +223,15 @@ fn bound_container_cache() {
     }
 }
 
-/// The kernel's delay before a free page reporting cycle (patch 0019), and
-/// the smallest order it reports.
+/// The kernel's delay before a free page reporting cycle (patch 0019), the
+/// smallest order it reports, and how hard the background compactor works
+/// meanwhile: hurried reporting goes with full-strength compaction, the
+/// churn setting with the kernel's default.
 fn set_reporting(delay_ms: u32, order: u32) {
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_delay_ms", delay_ms.to_string());
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_order", order.to_string());
+    let proactiveness = if delay_ms < 2000 { "100" } else { "20" };
+    let _ = std::fs::write("/proc/sys/vm/compaction_proactiveness", proactiveness);
 }
 
 /// Runs compaction until little free memory is left below the reporting
