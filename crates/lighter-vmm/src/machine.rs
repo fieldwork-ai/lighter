@@ -294,6 +294,51 @@ impl Machine {
         // them itself; see the note on the waker in the vsock module.
         {
             let transport = virtio_devices[vsock_slot].clone();
+            // Delivery into the guest on a thread of its own rather than on
+            // whoever queued the packet: the copy into guest memory and the
+            // interrupt are a core's worth at 90 Gbit/s, and the reactor that
+            // queued it has the read of the same bytes to do. The thread
+            // spins a moment before parking, so a busy stream pays no
+            // scheduler hop per packet and an idle one costs nothing.
+            let deliver = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            {
+                let deliver = deliver.clone();
+                let transport = transport.clone();
+                std::thread::Builder::new()
+                    .name("vsock-deliver".into())
+                    .spawn(move || {
+                        crate::qos::raise_interactive();
+                        let (pending, arrived) = &*deliver;
+                        loop {
+                            let mut go = false;
+                            let spin_until = std::time::Instant::now() + std::time::Duration::from_micros(50);
+                            while std::time::Instant::now() < spin_until {
+                                if std::mem::take(&mut *pending.lock().expect("deliver poisoned")) {
+                                    go = true;
+                                    break;
+                                }
+                                std::hint::spin_loop();
+                            }
+                            if !go {
+                                let mut flag = pending.lock().expect("deliver poisoned");
+                                while !*flag {
+                                    flag = arrived.wait(flag).expect("deliver poisoned");
+                                }
+                                *flag = false;
+                            }
+                            transport
+                                .lock()
+                                .expect("vsock transport poisoned")
+                                .service_queue(virtio::vsock::RX_QUEUE);
+                        }
+                    })?;
+            }
+            vsock_state.set_deferred_waker(move || {
+                let (pending, arrived) = &*deliver;
+                *pending.lock().expect("deliver poisoned") = true;
+                arrived.notify_one();
+            });
+            let transport = virtio_devices[vsock_slot].clone();
             vsock_state.set_waker(move || {
                 transport
                     .lock()

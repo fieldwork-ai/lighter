@@ -240,6 +240,10 @@ pub struct VsockShared {
     /// caller and that is a stall which only resolves when the guest happens to
     /// notify for its own reasons — a megabyte took minutes.
     waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Like `waker`, but on a thread of its own: for bulk data, where the
+    /// copy into the guest is a core's worth and the caller has a read of
+    /// its own to get back to. Falls back to `waker` when unset.
+    deferred_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Pokes whoever drives non-blocking streams (a reactor) when anything
     /// a stream might be waiting on has changed: credit, outbound bytes, a
     /// connection established or gone. Set once by the reactor.
@@ -257,6 +261,7 @@ impl VsockShared {
         VsockShared {
             memory: std::sync::OnceLock::new(),
             stream_waker: Mutex::new(None),
+            deferred_waker: Mutex::new(None),
             inner: Mutex::new(Inner {
                 conns: HashMap::new(),
                 outbox: VecDeque::new(),
@@ -277,6 +282,25 @@ impl VsockShared {
     /// Installs the callback that drains the outbox into the guest.
     pub fn set_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
         *self.waker.lock().expect("vsock waker poisoned") = Some(Arc::new(waker));
+    }
+
+    /// Registers the waker for bulk deliveries.
+    pub fn set_deferred_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
+        *self.deferred_waker.lock().expect("vsock waker poisoned") = Some(Arc::new(waker));
+    }
+
+    /// Asks for delivery on the delivery thread if there is one.
+    fn wake_deferred(&self) {
+        let waker = self
+            .deferred_waker
+            .lock()
+            .expect("vsock waker poisoned")
+            .as_ref()
+            .map(Arc::clone);
+        match waker {
+            Some(waker) => waker(),
+            None => self.wake(),
+        }
     }
 
     /// Registers the reactor's waker.
@@ -425,10 +449,10 @@ impl VsockShared {
     /// allows the whole of it and the outbox has room; otherwise queues what
     /// fits and returns the rest as a new buffer. `Err` when the connection
     /// is not there to take it.
-    pub fn try_send_owned(&self, key: ConnKey, mut data: Vec<u8>) -> Result<Option<Vec<u8>>, ()> {
+    pub fn try_send_owned(&self, key: ConnKey, mut data: Vec<u8>, bulk: bool) -> Result<Option<Vec<u8>>, ()> {
         if data.len() > MAX_PAYLOAD {
             let rest = data.split_off(MAX_PAYLOAD);
-            return match self.try_send_owned(key, data)? {
+            return match self.try_send_owned(key, data, bulk)? {
                 None => Ok(Some(rest)),
                 Some(mut unsent) => {
                     unsent.extend_from_slice(&rest);
@@ -461,7 +485,14 @@ impl VsockShared {
             conn.credit.sent(take as u32);
         }
         drop(inner);
-        self.wake();
+        // A full read is a stream in flow, and its copy into the guest
+        // goes on the delivery thread; a small one is a request somebody is
+        // waiting on, delivered on this thread with no hop.
+        if bulk {
+            self.wake_deferred();
+        } else {
+            self.wake();
+        }
         Ok(rest)
     }
 

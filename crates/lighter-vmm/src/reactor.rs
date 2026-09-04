@@ -630,7 +630,8 @@ impl Loop {
             // SAFETY: `n` bytes were just written into the buffer by read.
             unsafe { self.buf.set_len(n) };
             let buf = std::mem::take(&mut self.buf);
-            match self.shared.try_send_owned(key, buf) {
+            let bulk = n >= READ_CHUNK / 2;
+            match self.shared.try_send_owned(key, buf, bulk) {
                 Ok(None) => {}
                 Ok(Some(rest)) => {
                     // Out of credit: keep the rest, stop reading until the
