@@ -224,8 +224,16 @@ fi
 #
 # The tag is the only handle the guest has on a virtio-fs device — nothing
 # enumerates them — so the host names each one on the command line.
+devagent=""
 for arg in $(cat /proc/cmdline); do
 	case "$arg" in
+	lighter.devagent=*)
+		# A development copy of the agent, read from a share once mounted:
+		# an agent change is then a 30-second build and a reboot, not a
+		# rootfs image. Only ever passed by the developer's own command
+		# line; nothing in the product sets it.
+		devagent=${arg#lighter.devagent=}
+		;;
 	lighter.share=*)
 		spec=${arg#lighter.share=}
 		tag=${spec%%:*}
@@ -239,6 +247,15 @@ for arg in $(cat /proc/cmdline); do
 		;;
 	esac
 done
+AGENT=/sbin/lighter-agent
+if [ -n "$devagent" ] && [ -f "$devagent" ]; then
+	if cp "$devagent" /run/lighter-agent && chmod +x /run/lighter-agent; then
+		AGENT=/run/lighter-agent
+		echo "INIT devagent=$devagent"
+	else
+		echo "INIT devagent=$devagent unusable; the built-in agent runs"
+	fi
+fi
 
 # --- Networking -----------------------------------------------------------
 # A socket may ask for a send buffer up to this; the agent asks for 8 MiB
@@ -343,13 +360,13 @@ fi
 # --- The agent ------------------------------------------------------------
 # Started last, on purpose: it is what the host connects to, and advertising it
 # before dockerd answers turns a slow start into a connection refused.
-/sbin/lighter-agent --port 2375 --to /run/docker.sock &
+"$AGENT" --port 2375 --to /run/docker.sock &
 
 # The control channel, on its own port. The host uses it to put the clock right
 # after the Mac has slept: the machine has no real-time clock, so a guest whose
 # host suspended for an hour wakes an hour behind, and everything that checks a
 # certificate starts failing with an error about the certificate.
-/sbin/lighter-agent --port 2376 --control &
+"$AGENT" --port 2376 --control &
 
 # --- Streams --------------------------------------------------------------
 # With `lighter.streams` on the command line, every TCP connection that
@@ -360,13 +377,13 @@ fi
 # itself, so anything bound for a container, this machine, or a bridge is
 # left alone without listing subnets that Docker changes at will.
 if grep -qw "lighter.streams" /proc/cmdline; then
-	/sbin/lighter-agent --tcp-proxy 15201 &
-	/sbin/lighter-agent --udp-proxy 15202 &
-	/sbin/lighter-agent --inbound 2378 &
+	"$AGENT" --tcp-proxy 15201 &
+	"$AGENT" --udp-proxy 15202 &
+	"$AGENT" --inbound 2378 &
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
 	# container and drops loopback nameservers on the way.
-	/sbin/lighter-agent --dns 192.168.127.2 &
+	"$AGENT" --dns 192.168.127.2 &
 	printf 'nameserver 192.168.127.2\n' > /etc/resolv.conf
 	# The ruleset goes through a file: busybox's shell does not take a
 	# heredoc on an `if` line the way bash does, and the rule that had
