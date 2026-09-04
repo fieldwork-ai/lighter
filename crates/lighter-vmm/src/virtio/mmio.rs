@@ -571,6 +571,29 @@ impl VirtioMmio {
         }
     }
 
+    /// Raises the device's interrupt line unprompted (`kill -USR2`): a driver
+    /// treats a spurious interrupt as a poll, so a guest that wakes and
+    /// refills its ring on this had been waiting for one we never sent.
+    pub fn debug_interrupt(&self) {
+        self.line.raise(INT_VRING);
+    }
+
+    /// The transport's state for the stall dump.
+    pub fn debug_dump(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "{} status={:#x} isr={:#x} features={:#x} activated={}",
+            self.device.name(),
+            self.device_status,
+            self.interrupt_status.load(Ordering::Relaxed),
+            self.acked_features,
+            self.activated
+        )];
+        for (i, queue) in self.queues.iter().enumerate() {
+            lines.push(format!("  q{i} {}", queue.debug_line(&self.memory)));
+        }
+        lines
+    }
+
     pub fn queues(&mut self) -> &mut [Virtqueue] {
         &mut self.queues
     }

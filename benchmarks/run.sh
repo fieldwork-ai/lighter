@@ -31,7 +31,7 @@ cd "$ROOT"
 TARGET=""
 LABEL=""
 REPS=3
-CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency"
+CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle"
 # Cases that read a package tree rather than making one. They run after the
 # installs, on a tree materialized once by npm — which installer produced it
 # changes what they see, and pnpm in particular builds a farm of symlinks.
@@ -115,6 +115,7 @@ now_ms() { node -e 'process.stdout.write(String(Date.now()))'; }
 # the guest wrote. A run that was killed leaves them otherwise, and nine
 # hundred such leftovers once filled the disk of an unsupervised machine.
 cleanup() {
+	net_teardown 2>/dev/null || true
 	[ -n "$HELPER_PID" ] && kill "$HELPER_PID" 2>/dev/null || true
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	[ "$KEEP" -eq 1 ] || rm -rf "$WORK"
@@ -412,9 +413,11 @@ setup_lighter() {
 		--net "$GVPROXY" --run-dir "$RUN_DIR" \
 		--vsock "$SOCKET:2375" \
 		--vsock "$RUN_DIR/control.sock:2376" \
+		--docker-ports "$SOCKET" \
 		--share "bench:$WORK" \
+		${LIGHTER_BENCH_DEV_AGENT:+--share "dev:$(dirname "$LIGHTER_BENCH_DEV_AGENT")"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
@@ -505,8 +508,272 @@ case " $CASES " in
 	;;
 esac
 
+# What the runtime costs the Mac, as Activity Monitor accounts it: the
+# physical footprint of the runtime's own processes, in MiB, summed. Four
+# readings: settled before an install, the peak through one (sampled every
+# second), and fifteen and sixty seconds after it ends with nothing running
+# — the last two being what a runtime gives back on its own. The footprint
+# of a Hypervisor.framework guest reads high (a 2 GiB guest that had touched
+# all its memory read 3.5 GB), and the same accounting applies to every
+# runtime here, so the figures compare with each other and with what a
+# user sees, not with the guest's size.
+# The runtime's processes: every one that exists because the runtime is up,
+# which for lighter is the VMM and its gvproxy sidecar — the sidecar is ours
+# to account for exactly as OrbStack's helper is theirs.
+runtime_pids() {
+	case "$TARGET" in
+	# The sidecar by its own command line, not by the run directory: the VMM's
+	# command line names the gvproxy binary and the run directory too, and a
+	# pattern that matched both counted the VMM twice — every lighter memory
+	# figure before 2026-09-04 was double.
+	lighter)        echo "$VMM_PID $(pgrep -f "gvproxy --listen.*$RUN_DIR" | tr '\n' ' ')" ;;
+	orbstack)       pgrep -f 'OrbStack' | tr '\n' ' ' ;;
+	colima)         pgrep -f 'limactl|lima-driver|com.apple.Virtualization.VirtualMachine|virtiofsd' | tr '\n' ' ' ;;
+	# Its VM is Virtualization.framework's own XPC service, not a docker
+	# process: without it the reading was the app's 300 MiB and never the
+	# guest's gigabytes.
+	docker-desktop) pgrep -f 'com.docker|com.apple.Virtualization.VirtualMachine' | tr '\n' ' ' ;;
+	esac
+}
+
+runtime_footprint_mib() {
+	local pids; pids="$(runtime_pids)"
+	local total=0 pid mb
+	for pid in $pids; do
+		local raw; raw="$(footprint "$pid" 2>&1)"
+		[ -z "${LIGHTER_BENCH_DEBUG_FOOTPRINT:-}" ] || echo "FOOTPRINT pid=$pid $(echo "$raw" | grep -E 'phys_footprint|rror|annot|ailed' | head -2 | tr '\n' ' ')" >&2
+		# `footprint` switches to GB at ten gigabytes; a guest that has just
+		# run the storage cases holds its whole RAM as cache and reads there.
+		mb="$(echo "$raw" | sed -n 's/.*phys_footprint: *\([0-9.]*\) \([MG]\)B.*/\1 \2/p' | head -1 | awk '{v=$1; if ($2=="G") v=v*1024; printf "%d", v}')"
+		total=$(( total + ${mb:-0} ))
+	done
+	echo "$total"
+}
+
+run_memory_case() {
+	[ "$TARGET" != native ] || return 0
+	printf '==> %s: memory' "$TARGET"
+	sleep 5
+	local settled peak after15 after60 now
+	settled="$(runtime_footprint_mib)"
+	REPS=1 run_case npm-install >/dev/null 2>&1 &
+	local install=$!
+	peak="$settled"
+	while kill -0 "$install" 2>/dev/null; do
+		now="$(runtime_footprint_mib)"
+		[ "$now" -le "$peak" ] || peak="$now"
+		sleep 1
+	done
+	sleep 15; after15="$(runtime_footprint_mib)"
+	sleep 45; after60="$(runtime_footprint_mib)"
+	printf ' settled=%s peak=%s after15s=%s after60s=%s (MiB)\n' "$settled" "$peak" "$after15" "$after60"
+	echo "memory-settled,1,$settled" >> "$RESULTS"
+	echo "memory-peak,1,$peak" >> "$RESULTS"
+	echo "memory-after-15s,1,$after15" >> "$RESULTS"
+	echo "memory-after-60s,1,$after60" >> "$RESULTS"
+}
+
+
+# ---------------------------------------------------------------- network --
+#
+# Four paths, from the container's point of view, plus what surrounds them:
+#   net-tcp-egress    container -> the Mac's LAN address     (Mbit/s)
+#   net-tcp-egress-r  the Mac -> container, same connection  (Mbit/s)
+#   net-tcp-port      the Mac -> a published port            (Mbit/s)
+#   net-tcp-port-r    the container -> the Mac, same port    (Mbit/s)
+#   net-udp           container -> the Mac, UDP, unthrottled (Mbit/s)
+#   net-connect-rate  TCP connects/s from the Mac to a published port
+#   net-http-latency  µs per GET on a kept-alive connection to a published
+#                     port, the median (net-http-p99 is recorded beside it)
+#   net-dns           µs per lookup of a real name from inside a container
+#
+# `native` is the Mac talking to itself over loopback for the transfer and
+# request cases, which is the ceiling every runtime's published port is
+# measured against; the egress direction has no native meaning.
+# docker with the target's context, if it has one. bash 3.2 reads an empty
+# array as unbound under `set -u`, and the lighter target's is empty.
+dk() { docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} "$@"; }
+NET_CASES=" net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns "
+NET_HOST_PORT="${NET_HOST_PORT:-5399}"
+NET_PUB_PORT="${NET_PUB_PORT:-5398}"
+NET_HTTP_PORT="${NET_HTTP_PORT:-5397}"
+NET_LAN_IP=""
+NET_READY=0
+NET_HTTP_PID=""
+net_setup() {
+	[ "$NET_READY" -eq 0 ] || return 0
+	command -v iperf3 >/dev/null || { echo "iperf3 is required on the host for the network cases (brew install iperf3)" >&2; return 1; }
+	NET_LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
+	pkill -f "iperf3 -s -D -p $NET_HOST_PORT" 2>/dev/null || true
+	iperf3 -s -D -p "$NET_HOST_PORT" --logfile /dev/null
+	if [ "$TARGET" = native ]; then
+		node -e 'require("http").createServer((q, r) => r.end("ok")).listen(process.argv[1], "127.0.0.1")' "$NET_HTTP_PORT" &
+		NET_HTTP_PID=$!
+	else
+		dk rm -f "lighter-bench-net-$TARGET" "lighter-bench-http-$TARGET" >/dev/null 2>&1 || true
+		dk run -d --name "lighter-bench-net-$TARGET" -p "$NET_PUB_PORT:5201" "$IMAGE" iperf3 -s >/dev/null
+		dk run -d --name "lighter-bench-http-$TARGET" -p "$NET_HTTP_PORT:8080" "$IMAGE" \
+			node -e 'require("http").createServer((q, r) => r.end("ok")).listen(8080)' >/dev/null
+	fi
+	# The published ports take a moment to be reachable on every runtime.
+	local i; for i in $(seq 1 50); do
+		python3 -c "import socket,sys; s=socket.create_connection(('127.0.0.1', int(sys.argv[1])), 0.2); s.close()" "$NET_HTTP_PORT" 2>/dev/null && break
+		sleep 0.2
+	done
+	NET_READY=1
+}
+net_teardown() {
+	[ "$NET_READY" -eq 1 ] || return 0
+	pkill -f "iperf3 -s -D -p $NET_HOST_PORT" 2>/dev/null || true
+	[ -z "$NET_HTTP_PID" ] || kill "$NET_HTTP_PID" 2>/dev/null || true
+	[ "$TARGET" = native ] || dk rm -f "lighter-bench-net-$TARGET" "lighter-bench-http-$TARGET" >/dev/null 2>&1 || true
+	NET_READY=0
+}
+# iperf3's JSON, reduced to the receiver's Mbit/s (the sender's for UDP,
+# where the receiver's figure is after loss, and loss is its own number).
+iperf_mbits() { python3 -c 'import json,sys
+d=json.load(sys.stdin); e=d["end"]
+bps=(e.get("sum_received") or e.get("sum") or {}).get("bits_per_second", 0)
+print(int(bps/1e6))' 2>/dev/null || echo ""; }
+# A client in the container for the egress paths; on the Mac for the rest.
+net_client() { dk run --rm "$IMAGE" "$@"; }
+run_net_case() {
+	local name="$1" rep value out
+	# A measurement that fails is a dash in the table, not the end of the
+	# run: the script is `set -e` and a client that could not connect would
+	# otherwise take every case after it down silently.
+	set +e
+	net_setup || { set -e; return 1; }
+	printf '==> %s: %s' "$TARGET" "$name"
+	for rep in $(seq 1 "$REPS"); do
+		value=""
+		case "$name" in
+		net-tcp-egress)
+			[ "$TARGET" = native ] && out="$(iperf3 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)" \
+				|| out="$(net_client iperf3 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)"
+			value="$(echo "$out" | iperf_mbits)" ;;
+		net-tcp-egress-r)
+			[ "$TARGET" = native ] && out="$(iperf3 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -R -J 2>/dev/null)" \
+				|| out="$(net_client iperf3 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -R -J 2>/dev/null)"
+			value="$(echo "$out" | iperf_mbits)" ;;
+		net-tcp-port)
+			[ "$TARGET" = native ] || { out="$(iperf3 -c 127.0.0.1 -p "$NET_PUB_PORT" -t 3 -J 2>/dev/null)"; value="$(echo "$out" | iperf_mbits)"; } ;;
+		net-tcp-port-r)
+			[ "$TARGET" = native ] || { out="$(iperf3 -c 127.0.0.1 -p "$NET_PUB_PORT" -t 3 -R -J 2>/dev/null)"; value="$(echo "$out" | iperf_mbits)"; } ;;
+		net-udp)
+			[ "$TARGET" = native ] && out="$(iperf3 -u -b 0 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)" \
+				|| out="$(net_client iperf3 -u -b 0 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)"
+			value="$(echo "$out" | iperf_mbits)" ;;
+		net-connect-rate)
+			value="$(python3 -c 'import socket,sys,time
+port=int(sys.argv[1]); n=1000; t=time.perf_counter()
+for _ in range(n):
+    s=socket.create_connection(("127.0.0.1", port)); s.close()
+print(int(n/(time.perf_counter()-t)))' "$NET_HTTP_PORT" 2>/dev/null)" ;;
+		net-http-latency)
+			# Two rows from one run: the median, and the tail beside it.
+			out="$(python3 -c 'import http.client,sys,time
+port=int(sys.argv[1]); c=http.client.HTTPConnection("127.0.0.1", port); ts=[]
+for _ in range(2000):
+    t=time.perf_counter(); c.request("GET","/"); c.getresponse().read(); ts.append(time.perf_counter()-t)
+ts.sort(); print(int(ts[len(ts)//2]*1e6), int(ts[int(len(ts)*0.99)]*1e6))' "$NET_HTTP_PORT" 2>/dev/null)"
+			value="${out%% *}"
+			[ -z "$out" ] || echo "net-http-p99,$rep,${out##* }" >> "$RESULTS" ;;
+		net-dns)
+			local script='const dns=require("dns").promises;(async()=>{const ts=[];for(let i=0;i<200;i++){const t=process.hrtime.bigint();await dns.resolve4("example.com");ts.push(Number(process.hrtime.bigint()-t)/1000)}ts.sort((a,b)=>a-b);console.log(Math.round(ts[100]))})()'
+			[ "$TARGET" = native ] && value="$(node -e "$script" 2>/dev/null)" || value="$(net_client node -e "$script" 2>/dev/null)" ;;
+		esac
+		if [ -n "$value" ]; then
+			printf ' %s' "$value"
+			echo "$name,$rep,$value" >> "$RESULTS"
+		else
+			printf ' —'
+		fi
+	done
+	printf '\n'
+	set -e
+}
+
+# ------------------------------------------------------------------ power --
+#
+# What the runtime costs the Mac while doing nothing: after a minute of quiet,
+# a minute of samples over the runtime's processes. CPU as milliseconds per
+# second (1% of a core = 10) and wakeups per second — the interrupt wakeups
+# powermetrics counts, and the ones that pull the package out of idle, which
+# are the battery's. powermetrics needs root; a machine that lets `sudo -n`
+# run it (a sudoers line for that one binary) gets it, and any other gets
+# `top`'s idle-wakeup and energy-impact columns instead, which need nothing.
+run_power_case() {
+	[ "$TARGET" != native ] || return 0
+	printf '==> %s: power-idle (a minute of quiet, then a minute of samples)' "$TARGET"
+	sleep 60
+	local pids pid
+	pids="$(runtime_pids)"
+	[ -n "$(echo "$pids" | tr -d ' ')" ] || { printf ' no processes\n'; return 0; }
+	local cpu wakeups pkg energy
+	if sudo -n powermetrics --samplers tasks -i 1000 -n 1 >/dev/null 2>&1; then
+		# Twelve five-second samples; the Name column can hold spaces, so the
+		# numbers are taken from the right.
+		read -r cpu wakeups pkg < <(sudo -n powermetrics --samplers tasks -i 5000 -n 12 2>/dev/null | python3 -c '
+import sys
+want=set(sys.argv[1].split()); samples=0; cpu=0.0; intr=0.0; pkg=0.0
+for line in sys.stdin:
+    if line.startswith("*** Sampled"): samples+=1; continue
+    f=line.split()
+    if len(f) < 7: continue
+    try:
+        pid=f[-7]; c=float(f[-6]); i=float(f[-2]); p=float(f[-1])
+    except ValueError: continue
+    if pid in want: cpu+=c; intr+=i; pkg+=p
+if samples == 0: sys.exit(1)
+print("%d %d %d" % (round(cpu/samples), round(intr/samples), round(pkg/samples)))' "$pids")
+		[ -n "${cpu:-}" ] || { printf ' no samples\n'; return 0; }
+		printf ' cpu=%s ms/s wakeups=%s/s pkg-idle-wakeups=%s/s (powermetrics)\n' "$cpu" "$wakeups" "$pkg"
+		echo "power-cpu-ms-per-s,1,$cpu" >> "$RESULTS"
+		echo "power-wakeups-per-s,1,$wakeups" >> "$RESULTS"
+		echo "power-pkg-idle-wakeups-per-s,1,$pkg" >> "$RESULTS"
+		return 0
+	fi
+	local args=""
+	for pid in $pids; do args="$args -pid $pid"; done
+	# shellcheck disable=SC2086
+	read -r cpu wakeups energy < <(top -l 13 -s 5 -stats pid,cpu,idlew,power $args 2>/dev/null | python3 -c '
+import re,sys
+samples=[]; cur=None
+for line in sys.stdin:
+    if line.startswith("PID"):
+        if cur is not None: samples.append(cur)
+        cur={"cpu":0.0,"idlew":0,"power":0.0}
+        continue
+    m=re.match(r"\s*(\d+)\s+([\d.]+)\s+(\d+)\s+([\d.]+)", line)
+    if m and cur is not None:
+        cur["cpu"]+=float(m.group(2)); cur["idlew"]+=int(m.group(3)); cur["power"]+=float(m.group(4))
+if cur is not None: samples.append(cur)
+samples=samples[1:]   # the first sample is since process start
+if len(samples) < 2: sys.exit(1)
+cpu=sum(s["cpu"] for s in samples)/len(samples)
+wakeups=(samples[-1]["idlew"]-samples[0]["idlew"])/(5*(len(samples)-1))
+power=sum(s["power"] for s in samples)/len(samples)
+print("%d %d %d" % (round(cpu*10), round(wakeups), round(power*10)))')
+	[ -n "${cpu:-}" ] || { printf ' no samples\n'; return 0; }
+	printf ' cpu=%s ms/s wakeups=%s/s energy=%s (x0.1, top)\n' "$cpu" "$wakeups" "$energy"
+	echo "power-cpu-ms-per-s,1,$cpu" >> "$RESULTS"
+	echo "power-wakeups-per-s,1,$wakeups" >> "$RESULTS"
+	echo "power-energy-x10,1,$energy" >> "$RESULTS"
+}
+
 materialized=0
 for name in $CASES; do
+	if [ "$name" = memory ]; then
+		run_memory_case
+		continue
+	fi
+	case "$NET_CASES" in *" $name "*) run_net_case "$name"; continue ;; esac
+	if [ "$name" = power-idle ]; then
+		net_teardown
+		run_power_case
+		continue
+	fi
 	# A tree the previous case deleted is a case that measures nothing and
 	# says so in milliseconds. This is not timed.
 	case "$TREE_CASES" in
@@ -599,6 +866,7 @@ for name in $CASES; do
 	printf '\n'
 	if [ -n "$HELPER_PID" ]; then kill "$HELPER_PID" 2>/dev/null || true; HELPER_PID=""; fi
 done
+net_teardown
 
 echo
 echo "==> results in $RESULTS"

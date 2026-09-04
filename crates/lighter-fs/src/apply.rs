@@ -88,6 +88,12 @@ impl Keys {
         Keys(out)
     }
 
+    /// The first key named: the parent directory for a create, mkdir or
+    /// symlink, the file for a write.
+    fn first(&self) -> u64 {
+        self.0[0]
+    }
+
     fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.0.iter().copied().filter(|&k| k != 0)
     }
@@ -122,37 +128,56 @@ pub enum Kind {
 
 const KINDS: usize = 10;
 
+/// Which of the queue's three lanes a job runs in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// One at a time: renames, links, setattrs — the jobs whose order and
+    /// isolation the promises depend on.
+    Serial,
+    /// As wide as the workers: clones, unlinks and rmdirs. Their cost is
+    /// inside the file, and more of them finish per second under company.
+    Wide,
+    /// Wide up to `create_width()`: creates, writes, mkdirs, symlinks.
+    /// Creating names in the same directories from many threads has APFS
+    /// handing the directory between them; on the M1, whose eight cores are
+    /// the guest's too, three apply threads beat five on an npm install
+    /// (11.6 s against 12.2) while pnpm's clones wanted eight (5.5 against
+    /// 6.6). One pool cannot serve both, so the creates get their own width.
+    Bounded,
+}
+
 impl Kind {
-    /// Whether jobs of this kind may run beside the serial lane.
-    ///
-    /// Clones, whose cost is inside the file; and unlinks and rmdirs,
-    /// which are keyed by their directory and so only ever overlap across
-    /// directories — the one parallelism APFS rewards, and the one `rm -rf`
-    /// offers as it moves on while a directory's removals are still queued.
-    fn concurrent(self) -> bool {
-        if matches!(self, Kind::Clone | Kind::Unlink | Kind::Rmdir) {
-            return true;
+    fn lane(self) -> Lane {
+        match self {
+            Kind::Clone | Kind::Unlink | Kind::Rmdir => Lane::Wide,
+            Kind::Create | Kind::Write | Kind::Mkdir | Kind::Symlink => {
+                static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let wide = *WIDE.get_or_init(|| {
+                    std::env::var("LIGHTER_FS_APPLY_WIDE")
+                        .ok()
+                        .is_none_or(|v| v != "0")
+                });
+                if wide { Lane::Bounded } else { Lane::Serial }
+            }
+            Kind::Rename | Kind::Setattr | Kind::Link => Lane::Serial,
         }
-        // Creates, writes, mkdirs and symlinks are keyed by their directory
-        // and file too, so they only ever overlap across directories, and
-        // an install is thousands of directories. On the serial lane alone
-        // they were npm's whole bound: 122,000 creates at a hundred
-        // microseconds, one at a time, while the clone lane ran five wide.
-        // Beside it, npm on the M5 share 8.3–9.0 s → 6.2–6.9 and yarn
-        // 6.1–6.4 → 5.5–5.8; the M1, whose eight cores the vCPUs already
-        // fill, neither gains nor loses. `LIGHTER_FS_APPLY_WIDE=0` keeps
-        // them serial, for measurement.
-        static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let wide = *WIDE.get_or_init(|| {
-            std::env::var("LIGHTER_FS_APPLY_WIDE")
-                .ok()
-                .is_none_or(|v| v != "0")
-        });
-        wide && matches!(
-            self,
-            Kind::Create | Kind::Write | Kind::Mkdir | Kind::Symlink
-        )
     }
+}
+
+/// How many jobs of the bounded lane may run at once. Three: with eight
+/// workers on the M1, npm read 12.0 s at three against 12.4 unbounded and
+/// 13.7 at one, pnpm's clones keeping the other five; on the M5 three was
+/// level with unbounded (npm 6.62 against 6.81, pnpm 4.10 against 4.01).
+/// `LIGHTER_FS_APPLY_CREATE_WIDTH` overrides.
+fn create_width() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        std::env::var("LIGHTER_FS_APPLY_CREATE_WIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(3)
+    })
 }
 
 const fn kind_of(index: usize) -> Kind {
@@ -230,12 +255,87 @@ fn jobs_cap() -> usize {
 /// M1 five beats three and four (best rep 5.7 s against 6.6 and 6.1).
 /// Each job takes longer with company — a clone 154 → 240 µs on the M5,
 /// APFS contending — but more of them finish per second.
+///
+/// Measured again with the lanes (2026-09-04): the M1, whose eight cores the
+/// guest fills, wants eight — pnpm 6.6 → 5.5 s, npm level with the creates
+/// held to three — while the M5 (18 cores) loses at eight (pnpm 4.0 → 4.3,
+/// npm 6.8 → 7.3) and keeps five. The lane is bound by APFS latency, not
+/// CPU, and on the small machine more in flight is the only route to more
+/// through; why the large one pays for the same is not understood, only
+/// measured.
 fn workers() -> usize {
     std::env::var("LIGHTER_FS_APPLY_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(5)
+        .unwrap_or(if crate::sys::core_count() <= 8 { 8 } else { 5 })
+}
+
+/// Whether the bounded lane runs at most one job per directory at a time.
+///
+/// APFS hands a directory between the threads creating names in it, at a
+/// cost each time; with the lane keyed on the parent, creates in one
+/// directory stay on one worker and the workers spread across directories
+/// instead. On the M1 at eight workers it gave npm a second back (13.4 →
+/// 12.4 s); on the M5 it was level to a little better (npm 6.81 → 6.64).
+/// `LIGHTER_FS_APPLY_DIR_AFFINITY=0` for the one queue.
+fn dir_affinity() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LIGHTER_FS_APPLY_DIR_AFFINITY")
+            .ok()
+            .is_none_or(|v| v != "0")
+    })
+}
+
+/// The bounded lane: ready jobs by lane key, each key's oldest first, and
+/// the keys that have a ready job and nothing running.
+#[derive(Default)]
+struct Bounded {
+    by_key: HashMap<u64, VecDeque<u64>>,
+    /// In the order they became pickable. A key is here exactly when it
+    /// has a ready job and no running one.
+    ready_keys: VecDeque<u64>,
+    running: std::collections::HashSet<u64>,
+    /// Jobs of the lane running now.
+    count: usize,
+}
+
+impl Bounded {
+    /// The key a job of this lane is queued and serialized under: its
+    /// parent directory with affinity on, itself otherwise (no two jobs
+    /// share a key, so nothing serializes and the lane is one FIFO).
+    fn key_of(keys: &Keys, seq: u64) -> u64 {
+        if dir_affinity() { keys.first() } else { seq }
+    }
+
+    fn offer(&mut self, key: u64, seq: u64) {
+        let queue = self.by_key.entry(key).or_default();
+        queue.push_back(seq);
+        if queue.len() == 1 && !self.running.contains(&key) {
+            self.ready_keys.push_back(key);
+        }
+    }
+
+    fn pick(&mut self) -> Option<(u64, u64)> {
+        let key = self.ready_keys.pop_front()?;
+        let queue = self.by_key.get_mut(&key).expect("a listed key has a queue");
+        let seq = queue.pop_front().expect("a listed key has a job");
+        if queue.is_empty() {
+            self.by_key.remove(&key);
+        }
+        self.running.insert(key);
+        self.count += 1;
+        Some((key, seq))
+    }
+
+    fn finished(&mut self, key: u64) {
+        self.running.remove(&key);
+        self.count -= 1;
+        if self.by_key.contains_key(&key) {
+            self.ready_keys.push_back(key);
+        }
+    }
 }
 
 /// Below this much free space, acknowledgement stops and service goes back to
@@ -254,6 +354,8 @@ struct Slot {
     /// Jobs waiting on this one.
     successors: Vec<u64>,
     done: bool,
+    /// The bounded lane's key, for a job of that lane.
+    lane_key: u64,
 }
 
 struct State {
@@ -271,6 +373,7 @@ struct State {
     /// measured, four threads cloning small files reach a third of the
     /// per-file latency of one — and the one job a pnpm install is made of.
     serial_running: bool,
+    bounded: Bounded,
     slots: HashMap<u64, Slot>,
     /// Ready to run, oldest first: the serial lane, and the clones that
     /// may run beside it. Two queues so that a worker's pick is one pop
@@ -333,6 +436,7 @@ impl Apply {
                 retired: false,
                 held: false,
                 serial_running: false,
+                bounded: Bounded::default(),
                 slots: HashMap::new(),
                 ready: VecDeque::new(),
                 ready_clones: VecDeque::new(),
@@ -427,7 +531,7 @@ impl Apply {
         shared.depth.fetch_add(1, Ordering::Relaxed);
         shared.bytes.fetch_add(job.bytes, Ordering::Relaxed);
         let seq = shared.pushed.fetch_add(1, Ordering::Relaxed) + 1;
-        let concurrent = job.kind.concurrent();
+        let lane = job.kind.lane();
         // Ordered behind the most recent job on each of its keys, if that
         // job is still held. One that has finished has left the table, and
         // took its tail entries with it.
@@ -448,6 +552,7 @@ impl Apply {
         for key in job.keys.iter() {
             state.tails.insert(key, seq);
         }
+        let lane_key = Bounded::key_of(&job.keys, seq);
         state.incomplete.insert(seq);
         state.slots.insert(
             seq,
@@ -456,13 +561,14 @@ impl Apply {
                 waiting,
                 successors: Vec::new(),
                 done: false,
+                lane_key,
             },
         );
         if waiting == 0 {
-            if concurrent {
-                state.ready_clones.push_back(seq);
-            } else {
-                state.ready.push_back(seq);
+            match lane {
+                Lane::Serial => state.ready.push_back(seq),
+                Lane::Wide => state.ready_clones.push_back(seq),
+                Lane::Bounded => state.bounded.offer(lane_key, seq),
             }
         }
         drop(state);
@@ -600,6 +706,10 @@ impl Shared {
                     // is running, else the oldest clone.
                     let pick = if !state.serial_running && !state.ready.is_empty() {
                         state.ready.pop_front()
+                    } else if state.bounded.count < create_width()
+                        && !state.bounded.ready_keys.is_empty()
+                    {
+                        state.bounded.pick().map(|(_, seq)| seq)
                     } else {
                         state.ready_clones.pop_front()
                     };
@@ -609,7 +719,7 @@ impl Shared {
                             .get_mut(&seq)
                             .and_then(|slot| slot.job.take())
                             .expect("a ready job is held and untaken");
-                        if !job.kind.concurrent() {
+                        if job.kind.lane() == Lane::Serial {
                             state.serial_running = true;
                         }
                         break (seq, job);
@@ -636,10 +746,12 @@ impl Shared {
             }
             {
                 let mut state = self.state.lock().expect("apply queue poisoned");
-                if !kind_of(kind).concurrent() {
-                    state.serial_running = false;
-                }
                 let slot = state.slots.remove(&seq).expect("a running job is held");
+                match kind_of(kind).lane() {
+                    Lane::Serial => state.serial_running = false,
+                    Lane::Bounded => state.bounded.finished(slot.lane_key),
+                    Lane::Wide => {}
+                }
                 debug_assert!(!slot.done);
                 let mut clones_ready = 0;
                 for next in slot.successors {
@@ -649,15 +761,22 @@ impl Shared {
                         .expect("a successor is held until it runs");
                     successor.waiting -= 1;
                     if successor.waiting == 0 {
-                        let concurrent = successor
+                        let lane = successor
                             .job
                             .as_ref()
-                            .is_some_and(|job| job.kind.concurrent());
-                        if concurrent {
-                            state.ready_clones.push_back(next);
-                            clones_ready += 1;
-                        } else {
-                            state.ready.push_back(next);
+                            .map(|job| job.kind.lane())
+                            .unwrap_or(Lane::Serial);
+                        match lane {
+                            Lane::Serial => state.ready.push_back(next),
+                            Lane::Wide => {
+                                state.ready_clones.push_back(next);
+                                clones_ready += 1;
+                            }
+                            Lane::Bounded => {
+                                let key = successor.lane_key;
+                                state.bounded.offer(key, next);
+                                clones_ready += 1;
+                            }
                         }
                     }
                 }

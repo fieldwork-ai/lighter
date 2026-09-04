@@ -59,12 +59,9 @@ impl VsockProxy {
                     }
                     let Ok(stream) = stream else { continue };
                     let shared = accept_shared.clone();
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("vsock-conn".into())
-                        .spawn(move || serve(stream, guest_port, shared))
-                    {
-                        tracing::warn!(%e, "could not spawn a connection thread");
-                    }
+                    crate::workers::run("vsock-conn", crate::qos::CONNECTION_STACK, move || {
+                        serve(stream, guest_port, shared)
+                    });
                 }
             })?;
 
@@ -97,6 +94,7 @@ fn serve(stream: UnixStream, guest_port: u32, shared: Arc<VsockShared>) {
         return;
     };
 
+    crate::sockbuf::widen(&stream);
     let host_port = shared.open(guest_port, device_side);
     if !shared.await_established(host_port, ACCEPT_TIMEOUT) {
         tracing::debug!(

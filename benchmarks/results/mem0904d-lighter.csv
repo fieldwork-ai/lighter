@@ -1,0 +1,5 @@
+case,rep,ms
+memory-settled,1,1624
+memory-peak,1,4420
+memory-after-15s,1,3846
+memory-after-60s,1,1819

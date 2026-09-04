@@ -18,7 +18,7 @@
 /// 256 KiB. Large enough that a Docker image pull is not a sequence of
 /// stop-and-wait round trips, small enough that a few hundred idle connections
 /// are not a memory problem.
-pub const BUF_ALLOC: u32 = 256 * 1024;
+pub const BUF_ALLOC: u32 = 4 * 1024 * 1024;
 
 /// One direction's accounting for one connection.
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +54,21 @@ impl Credit {
     }
 
     /// Records the credit fields carried by every packet from the peer.
+    /// The receive buffer the peer advertised.
+    pub const fn peer_buf_alloc(&self) -> u32 {
+        self.peer_buf_alloc
+    }
+
+    /// The counters, for a trace: (peer_buf_alloc, peer_fwd_cnt, tx_cnt, fwd_cnt).
+    pub fn counters(&self) -> (u32, u32, u32, u32) {
+        (
+            self.peer_buf_alloc,
+            self.peer_fwd_cnt,
+            self.tx_cnt,
+            self.fwd_cnt,
+        )
+    }
+
     pub fn observe(&mut self, buf_alloc: u32, fwd_cnt: u32) {
         self.peer_buf_alloc = buf_alloc;
         self.peer_fwd_cnt = fwd_cnt;

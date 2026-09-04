@@ -28,6 +28,8 @@
 pub mod bus;
 pub mod console;
 pub mod devices;
+pub mod dns;
+pub mod dump;
 pub mod exitstats;
 pub mod fdt;
 pub mod footprint;
@@ -40,12 +42,17 @@ pub mod memory_policy;
 pub mod mempressure;
 pub mod net;
 pub mod psci;
+pub mod qos;
+pub mod reactor;
 pub mod smp;
+pub mod sockbuf;
+pub mod streams;
 pub mod sysreg;
 pub mod vcpu;
 pub mod virtio;
 pub mod vsock_proxy;
 pub mod wake;
+pub mod workers;
 
 pub use machine::{Machine, MachineConfig, MachineError};
 pub use vcpu::StopReason;

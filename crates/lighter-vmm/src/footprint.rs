@@ -78,6 +78,27 @@ pub fn bytes() -> u64 {
     if rc != 0 { 0 } else { info.phys_footprint }
 }
 
+/// Resident, internal (anonymous) and reusable bytes, for a trace.
+pub fn split() -> (u64, u64, u64) {
+    let mut info = TaskVmInfo::default();
+    let mut count = TASK_VM_INFO_COUNT
+        .min((std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<u32>()) as libc::c_uint);
+    // SAFETY: as in `bytes`.
+    let rc = unsafe {
+        task_info(
+            mach_task_self(),
+            TASK_VM_INFO,
+            &mut info as *mut TaskVmInfo as *mut libc::c_void,
+            &mut count,
+        )
+    };
+    if rc != 0 {
+        (0, 0, 0)
+    } else {
+        (info.resident_size, info.internal, info.reusable)
+    }
+}
+
 /// Logs the footprint on an interval, for as long as the process lives.
 ///
 /// Used by the memory gate, which has no other way to watch a number that only

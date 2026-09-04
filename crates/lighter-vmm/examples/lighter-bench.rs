@@ -111,6 +111,15 @@ fn main() -> ExitCode {
         }
     }
 
+    // The same default as the CLI: TCP as streams unless LIGHTER_STREAMS=0,
+    // so the benchmark measures what a user gets.
+    let streams = std::env::var("LIGHTER_STREAMS")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if streams && config.gvproxy.is_some() {
+        config.cmdline.push_str(" lighter.streams");
+    }
+
     let mut machine = match Machine::start(&config) {
         Ok(m) => m,
         Err(e) => {
@@ -118,6 +127,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if streams
+        && config.gvproxy.is_some()
+        && let Err(e) = lighter_vmm::streams::start(machine.vsock())
+    {
+        eprintln!("lighter: cannot start streams: {e}");
+        return ExitCode::FAILURE;
+    }
 
     if report_memory {
         // Footprint and what the guest has handed back, together: the first
@@ -161,6 +177,13 @@ fn main() -> ExitCode {
 
     if let Some(socket) = &docker_socket {
         match machine.network() {
+            Some(_) if streams => {
+                let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+                if let Err(e) = lighter_docker::PortWatcher::start(socket, mapper) {
+                    eprintln!("lighter: cannot watch docker ports: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
             Some(network) => {
                 if let Err(e) = lighter_docker::PortWatcher::start(socket, network.clone()) {
                     eprintln!("lighter: cannot watch docker ports: {e}");

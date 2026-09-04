@@ -29,6 +29,54 @@ CASES = [
     ("watch-latency", "host change to guest visibility, round trip", "lower is better"),
 ]
 
+# The runtime's cost to the Mac, in MiB rather than milliseconds: the
+# physical footprint of its processes as Activity Monitor accounts it, settled
+# before an install, at the peak through one, and fifteen and sixty seconds
+# after it ends. Reported in their own table; `native` has no runtime.
+MEMORY_CASES = [
+    ("memory-settled", "settled, before an install"),
+    ("memory-peak", "peak through an npm install"),
+    ("memory-after-15s", "15 s after it ends"),
+    ("memory-after-60s", "60 s after it ends"),
+]
+
+# The network, in the unit each path is naturally read in. Throughput cases
+# are Mbit/s and higher is better; the rest are rates and latencies. `native`
+# is the Mac over loopback where that means something, and blank where it
+# does not (there is no "egress" from the Mac to itself).
+# (case, label, unit shown, direction, divisor from the CSV's unit). The CSVs
+# hold Mbit/s and connects per second; the tables show Gbit/s and thousands
+# of connects, to one decimal.
+NETWORK_CASES = [
+    ("net-tcp-egress", "TCP, container to the Mac", "Gbit/s", "higher", 1000),
+    ("net-tcp-egress-r", "TCP, the Mac to a container", "Gbit/s", "higher", 1000),
+    ("net-tcp-port", "TCP into a published port", "Gbit/s", "higher", 1000),
+    ("net-tcp-port-r", "TCP out of a published port", "Gbit/s", "higher", 1000),
+    ("net-udp", "UDP, container to the Mac", "Gbit/s", "higher", 1000),
+    ("net-connect-rate", "connects to a published port", "thousand per second", "higher", 1000),
+    ("net-http-latency", "GET on a published port, median", "µs", "lower", 1),
+    ("net-http-p99", "GET on a published port, p99", "µs", "lower", 1),
+    ("net-dns", "DNS lookup from a container, median", "µs", "lower", 1),
+]
+
+
+def network_cell(value, divisor):
+    """A network reading in the table's unit: one decimal where the CSV's
+    unit was divided down, whole otherwise."""
+    if value is None:
+        return "—"
+    return f"{value / divisor:.1f}" if divisor != 1 else f"{int(value)}"
+
+# What an idle runtime costs, sampled by `top` over a quiet minute: CPU as
+# milliseconds per second, idle wakeups per second, and top's energy-impact
+# figure (stored times ten, shown with one decimal). Lower is better for all.
+POWER_CASES = [
+    ("power-cpu-ms-per-s", "CPU, ms per second", 1),
+    ("power-wakeups-per-s", "wakeups per second", 1),
+    ("power-pkg-idle-wakeups-per-s", "package-idle wakeups per second", 1),
+    ("power-energy-x10", "energy impact (top)", 10),
+]
+
 # Cases the native ratio says nothing useful about. `watch-latency` is the
 # only one: on the Mac a file is visible the moment it is written, so the
 # reference is nearly zero and every ratio against it is a division by noise —
@@ -153,25 +201,28 @@ def render(results, description, _primary):
     # one reference for both: the share is asked how close it comes to the
     # Mac's disk from inside a VM, the own disk how a Linux filesystem in a
     # VM compares with the Mac's.
+    # The own disk first: it is where a container's writable layer and its
+    # volumes live, the case every container has; the share is the one a
+    # bind mount adds.
     columns = []
     if REFERENCE in targets:
         columns.append((REFERENCE, reference))
-    for t in targets:
-        if t != REFERENCE:
-            columns.append((f"{t} (share)", measured[t]))
     for t in RUNTIMES:
         if (results / f"{t}-guest.csv").exists():
             columns.append((f"{t} (own disk)", load(f"{t}-guest", results)))
+    for t in targets:
+        if t != REFERENCE:
+            columns.append((f"{t} (host share)", measured[t]))
 
     lines = [
         f"## {description}",
         "",
         "### Wall time, milliseconds",
         "",
-        "`native` is the command on the Mac's own disk. `share` is a bind mount of",
-        "the same tree into the container; `own disk` is a named volume, the",
-        "runtime's own filesystem inside the VM, where a container's writable layer",
-        "and its data volumes live.",
+        "`native` is the command on the Mac's own disk. `own disk` is a named volume,",
+        "the runtime's own filesystem inside the VM, where a container's writable",
+        "layer and its data volumes live; `host share` is a bind mount of the same",
+        "tree from the Mac into the container.",
         "",
         "| case | " + " | ".join(name for name, _ in columns) + " |",
         "|" + "---|" * (len(columns) + 1),
@@ -186,14 +237,104 @@ def render(results, description, _primary):
         lines.append(f"| {case} | " + " | ".join(cells) + " |")
     lines.append("")
 
+    # The share columns only: the reading is of the runtime, and the own-disk
+    # leg of the same runtime measures the same processes again.
+    memory_columns = [
+        (name, values)
+        for name, values in columns
+        if name != REFERENCE
+        and not name.endswith("(own disk)")
+        and any(case in values for case, _ in MEMORY_CASES)
+    ]
+    if memory_columns:
+        lines += [
+            "### What the runtime costs the Mac, MiB",
+            "",
+            "The physical footprint of the runtime's own processes, as Activity Monitor",
+            "accounts it — which reads high for any Hypervisor.framework guest, and the",
+            "same way for every runtime here. Lower is better; the last two columns are",
+            "what a runtime gives back on its own after the work ends.",
+            "",
+            "| reading | " + " | ".join(name for name, _ in memory_columns) + " |",
+            "|" + "---|" * (len(memory_columns) + 1),
+        ]
+        for case, label in MEMORY_CASES:
+            cells = []
+            for _, values in memory_columns:
+                value = values.get(case)
+                cells.append("—" if value is None else f"{int(value)}")
+            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    # The share columns plus native: the network does not care where the
+    # fixture lives, and the own-disk leg measures the same link again.
+    network_columns = [
+        (name, values)
+        for name, values in columns
+        if not name.endswith("(own disk)")
+        and any(case in values for case, _, _, _, _ in NETWORK_CASES)
+    ]
+    if network_columns:
+        lines += [
+            "### The network",
+            "",
+            "iperf3 between a container and the Mac in both directions, on the",
+            "path a container sees (its egress to the Mac's LAN address) and on the",
+            "path the Mac sees (a published port on localhost); then connection",
+            "setup, request latency on a kept-alive connection, and DNS from inside",
+            "a container. `native` is the Mac over loopback where that means anything.",
+            "",
+            "| case | unit | " + " | ".join(name for name, _ in network_columns) + " |",
+            "|" + "---|" * (len(network_columns) + 2),
+        ]
+        for case, label, unit, _, divisor in NETWORK_CASES:
+            if not any(case in values for _, values in network_columns):
+                continue
+            cells = [network_cell(values.get(case), divisor) for _, values in network_columns]
+            lines.append(f"| {label} | {unit} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    power_columns = [
+        (name, values)
+        for name, values in columns
+        if name != REFERENCE
+        and not name.endswith("(own disk)")
+        and any(case in values for case, _, _ in POWER_CASES)
+    ]
+    if power_columns:
+        lines += [
+            "### What an idle runtime costs",
+            "",
+            "After a quiet minute, a minute of powermetrics samples over the",
+            "runtime's processes (top's columns where powermetrics is not allowed):",
+            "CPU as milliseconds of core per second, wakeups per second, and the",
+            "wakeups that pull the package out of idle, which are the battery's.",
+            "Lower is better throughout.",
+            "",
+            "| reading | " + " | ".join(name for name, _ in power_columns) + " |",
+            "|" + "---|" * (len(power_columns) + 1),
+        ]
+        for case, label, scale in POWER_CASES:
+            cells = []
+            for _, values in power_columns:
+                value = values.get(case)
+                if value is None:
+                    cells.append("—")
+                elif scale == 1:
+                    cells.append(f"{int(value)}")
+                else:
+                    cells.append(f"{value / scale:.1f}")
+            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append("")
+
     if reference:
         ratioed = [(name, values) for name, values in columns if name != REFERENCE]
         lines += [
             f"### As a fraction of `{REFERENCE}`",
             "",
-            "100% is the Mac's own disk. For the share, higher is the boundary costing",
-            "less; for the own disk, more than 100% is a filesystem inside the VM",
-            "outrunning the Mac's. `watch-latency` is left out: it is a latency against",
+            "100% is the Mac's own disk. For the own disk, more than 100% is a",
+            "filesystem inside the VM outrunning the Mac's; for the host share, higher",
+            "is the boundary costing less. `watch-latency` is left out: it is a latency against",
             "a reference of about a millisecond, so the ratio is a division by noise —",
             "read it from the table above in milliseconds.",
             "",

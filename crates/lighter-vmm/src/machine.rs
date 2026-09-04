@@ -220,7 +220,11 @@ impl Machine {
         // receive pump needs the transport, which does not exist until every
         // device has been placed.
         let network = match &config.gvproxy {
-            Some(path) => Some(Arc::new(Network::start(path, &config.run_dir)?)),
+            Some(path) => Some(Arc::new(Network::start(
+                path,
+                &config.run_dir,
+                net::link_mtu(),
+            )?)),
             None => None,
         };
         let mut net_slot = None;
@@ -243,9 +247,10 @@ impl Machine {
         if let Some(network) = &network {
             net_slot = Some(virtio.len());
             virtio.push(Box::new(Net::new(
-                network.backend(),
+                network.outbox(),
                 net::GUEST_MAC,
                 net_inbox.clone(),
+                network.mtu(),
             )));
         }
 
@@ -288,6 +293,67 @@ impl Machine {
         // vsock queues packets from host threads and must be able to deliver
         // them itself; see the note on the waker in the vsock module.
         {
+            let transport = virtio_devices[vsock_slot].clone();
+            // Delivery into the guest on a thread of its own rather than on
+            // whoever queued the packet: the copy into guest memory and the
+            // interrupt are a core's worth at 90 Gbit/s, and the reactor that
+            // queued it has the read of the same bytes to do. The thread
+            // spins a moment before parking, so a busy stream pays no
+            // scheduler hop per packet and an idle one costs nothing.
+            let deliver = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            {
+                let deliver = deliver.clone();
+                let transport = transport.clone();
+                let deliver_shared = vsock_state.clone();
+                std::thread::Builder::new()
+                    .name("vsock-deliver".into())
+                    .spawn(move || {
+                        let deliver_shared = deliver_shared;
+                        crate::qos::raise_interactive();
+                        let (pending, arrived) = &*deliver;
+                        loop {
+                            let mut go = false;
+                            let spin_until =
+                                std::time::Instant::now() + std::time::Duration::from_micros(50);
+                            while std::time::Instant::now() < spin_until {
+                                if std::mem::take(&mut *pending.lock().expect("deliver poisoned")) {
+                                    go = true;
+                                    break;
+                                }
+                                std::hint::spin_loop();
+                            }
+                            if !go {
+                                let mut flag = pending.lock().expect("deliver poisoned");
+                                while !*flag {
+                                    // Bounded while finished chains wait to go
+                                    // back: the service below returns them, and
+                                    // nothing else may be coming to prompt it.
+                                    if deliver_shared.has_done() {
+                                        let (guard, _) = arrived
+                                            .wait_timeout(flag, std::time::Duration::from_millis(1))
+                                            .expect("deliver poisoned");
+                                        flag = guard;
+                                        if !*flag {
+                                            break;
+                                        }
+                                    } else {
+                                        flag = arrived.wait(flag).expect("deliver poisoned");
+                                    }
+                                }
+                                *flag = false;
+                            }
+                            transport
+                                .lock()
+                                .expect("vsock transport poisoned")
+                                .service_queue(virtio::vsock::RX_QUEUE);
+                        }
+                    })?;
+            }
+            vsock_state.set_deferred_waker(move || {
+                let (pending, arrived) = &*deliver;
+                *pending.lock().expect("deliver poisoned") = true;
+                arrived.notify_one();
+            });
             let transport = virtio_devices[vsock_slot].clone();
             vsock_state.set_waker(move || {
                 transport
@@ -382,6 +448,31 @@ impl Machine {
             pollers.push((kicks, poller));
         }
 
+        // The vsock transmit ring gets the same watcher: a stream from the
+        // guest arrives as 64 KiB packets, each a kick, and the copy out of
+        // the ring was happening on the vCPU that kicked. Watched, the guest
+        // publishes and moves on and the copy is this thread's.
+        {
+            let transport = virtio_devices[vsock_slot].clone();
+            let kicks = virtio::poll::Kicks::new();
+            {
+                let mut held = transport.lock().expect("vsock transport poisoned");
+                let signal = kicks.clone();
+                held.set_kick_observer(Arc::new(move |queue| {
+                    if queue == virtio::vsock::TX_QUEUE {
+                        signal.kicked();
+                    }
+                }));
+            }
+            let poller = virtio::poll::spawn(
+                "vsock-tx",
+                transport.clone(),
+                vec![virtio::vsock::TX_QUEUE],
+                kicks.clone(),
+            )?;
+            pollers.push((kicks, poller));
+        }
+
         // The pump that moves frames off the network and into the guest. It runs
         // outside the vCPU threads because a frame can arrive at any time,
         // including while every core is idle in WFI — which is exactly the
@@ -394,6 +485,41 @@ impl Machine {
                     .expect("net transport poisoned")
                     .service_queue(virtio::net::RX_QUEUE);
             })?;
+            // And the one that moves them the other way. The wire is a socket
+            // that blocks when full, and the only thread allowed to block on
+            // it is this one; when the device has parked on a full outbox it
+            // is this thread that has the ring looked at again.
+            let transport = virtio_devices[slot].clone();
+            network.spawn_transmitter(move || {
+                transport
+                    .lock()
+                    .expect("net transport poisoned")
+                    .service_queue(virtio::net::TX_QUEUE);
+            })?;
+            // The transmit ring gets the watcher the disks have. A single TCP
+            // stream hands the driver one frame at a time, and the driver
+            // kicks for each unless the device has said not to: at 1500 bytes
+            // a frame that is a trap every three microseconds, which was the
+            // whole of the 3.8 Gbit/s. Watched, the guest publishes and moves
+            // on, and the copy into the outbox happens on this thread.
+            let transport = virtio_devices[slot].clone();
+            let kicks = virtio::poll::Kicks::new();
+            {
+                let mut held = transport.lock().expect("net transport poisoned");
+                let signal = kicks.clone();
+                held.set_kick_observer(Arc::new(move |queue| {
+                    if queue == virtio::net::TX_QUEUE {
+                        signal.kicked();
+                    }
+                }));
+            }
+            let poller = virtio::poll::spawn(
+                "net-tx",
+                transport.clone(),
+                vec![virtio::net::TX_QUEUE],
+                kicks.clone(),
+            )?;
+            pollers.push((kicks, poller));
         }
 
         // The balloon only matters when the Mac itself is short, so it is
@@ -404,6 +530,7 @@ impl Machine {
             balloon_state.clone(),
             virtio_devices[balloon_slot].clone(),
             config.ram_bytes,
+            vsock_state.clone(),
         ) {
             Ok(policy) => Some(policy),
             Err(why) => {
@@ -498,6 +625,8 @@ impl Machine {
             "machine started"
         );
 
+        crate::dump::install(virtio_devices.clone(), vsock_state.clone());
+
         Ok(Machine {
             _vm: vm,
             ctx,
@@ -530,6 +659,11 @@ impl Machine {
     /// Kept on the machine rather than returned, because the proxy unlinks its
     /// socket when dropped and a caller that let it fall out of scope would get
     /// a path that briefly worked.
+    /// The vsock state, for host-side listeners.
+    pub fn vsock(&self) -> Arc<VsockShared> {
+        self.vsock.clone()
+    }
+
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
         let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone())?;
         self.proxies.push(proxy);

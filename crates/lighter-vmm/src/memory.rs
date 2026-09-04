@@ -56,7 +56,17 @@ impl Mmap {
                 ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                // `LIGHTER_MEM_SHARED=1`: a shared mapping, to measure whether
+                // the host's double charge on host-written guest pages is the
+                // private mapping's.
+                if std::env::var("LIGHTER_MEM_SHARED")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    libc::MAP_ANON | libc::MAP_SHARED | libc::MAP_NORESERVE
+                } else {
+                    libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE
+                },
                 -1,
                 0,
             )

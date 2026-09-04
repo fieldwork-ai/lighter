@@ -140,6 +140,23 @@ pub fn machine() -> anyhow::Result<()> {
             share.path.display()
         ));
     }
+    // TCP as streams over vsock rather than frames through gvproxy: on
+    // unless `LIGHTER_STREAMS=0`, which keeps the frame path measurable.
+    // The guest's rules are behind the same switch.
+    let streams = std::env::var("LIGHTER_STREAMS")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if streams {
+        cmdline.push_str(" lighter.streams");
+    }
+    // The kernel join of a stream's two sockets: on unless `LIGHTER_SOCKMAP=0`,
+    // which keeps the agent's copying path measurable.
+    if std::env::var("LIGHTER_SOCKMAP")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        cmdline.push_str(" lighter.nosockmap");
+    }
 
     let machine_config = MachineConfig {
         vcpus: config.cpus,
@@ -159,10 +176,17 @@ pub fn machine() -> anyhow::Result<()> {
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;
     }
+    if streams {
+        lighter_vmm::streams::start(machine.vsock())?;
+    }
 
     // Ports a container publishes appear on the Mac, for as long as the
-    // container is running and no longer.
-    if let Some(network) = machine.network() {
+    // container is running and no longer: through a stream into the guest
+    // when streams are on, through gvproxy's forwarder otherwise.
+    if streams {
+        let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+        lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
+    } else if let Some(network) = machine.network() {
         lighter_docker::PortWatcher::start(&paths::docker_socket()?, network.clone())?;
     }
 

@@ -224,8 +224,16 @@ fi
 #
 # The tag is the only handle the guest has on a virtio-fs device — nothing
 # enumerates them — so the host names each one on the command line.
+devagent=""
 for arg in $(cat /proc/cmdline); do
 	case "$arg" in
+	lighter.devagent=*)
+		# A development copy of the agent, read from a share once mounted:
+		# an agent change is then a 30-second build and a reboot, not a
+		# rootfs image. Only ever passed by the developer's own command
+		# line; nothing in the product sets it.
+		devagent=${arg#lighter.devagent=}
+		;;
 	lighter.share=*)
 		spec=${arg#lighter.share=}
 		tag=${spec%%:*}
@@ -239,8 +247,33 @@ for arg in $(cat /proc/cmdline); do
 		;;
 	esac
 done
+AGENT=/sbin/lighter-agent
+if [ -n "$devagent" ] && [ -f "$devagent" ]; then
+	if cp "$devagent" /run/lighter-agent && chmod +x /run/lighter-agent; then
+		AGENT=/run/lighter-agent
+		echo "INIT devagent=$devagent"
+	else
+		echo "INIT devagent=$devagent unusable; the built-in agent runs"
+	fi
+fi
 
 # --- Networking -----------------------------------------------------------
+# A socket may ask for a send buffer up to this; the agent asks for 8 MiB
+# on every stream, because a vsock packet's memory stays charged to its
+# socket until the host has taken it off the ring, and the default ceiling
+# is under one packet.
+sysctl -q -w net.core.wmem_max=16777216 net.core.rmem_max=16777216 fs.pipe-max-size=16777216 2>/dev/null || true
+# Unmovable allocations (slab, page tables) kept out of movable blocks. An
+# install fills memory with page cache and the slab it needs spills into
+# blocks that were movable; when the cache is trimmed afterwards the free
+# memory around those pages cannot form the two-megabyte runs free page
+# reporting hands the host, and a third of what the trim freed came back
+# over thirty seconds as compaction worked around them, or not at all.
+echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
+# TCP inside the guest carries a container's stream to the agent; its
+# windows are what lets that leg run ahead of the vsock leg behind it. The
+# defaults top out at 4 and 6 MB.
+sysctl -q -w net.ipv4.tcp_wmem="4096 262144 16777216" net.ipv4.tcp_rmem="4096 1048576 16777216" 2>/dev/null || true
 if [ -e /sys/class/net/eth0 ]; then
 	ip link set eth0 up
 	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok" || echo "INIT dhcp=failed"
@@ -258,13 +291,33 @@ fi
 # enabled, but userland-proxy-path is not set"). Turning it off is the right
 # answer regardless: publishing a port then rests on netfilter DNAT alone, and
 # the host side of the journey is gvproxy's job, not a hairpin process here.
+#
+# --mtu is the link's own, read back from eth0: the host terminates every
+# flow on its side of the link, so the only thing the number decides is how
+# many frames a byte costs between here and there, and a bridge left at 1500
+# would have every container segment at 1460 whatever the link could carry.
 mkdir -p /var/log
-dockerd \
-	--host=unix:///run/docker.sock \
-	--data-root=/var/lib/docker \
-	--storage-driver=overlay2 \
-	--userland-proxy=false \
-	>/var/log/dockerd.log 2>&1 &
+link_mtu=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1500)
+# The engine in a cgroup of its own. The page cache a process fills is
+# charged to its cgroup, and the root cgroup cannot be asked to reclaim: an
+# image's layers, extracted by dockerd, sat as a gigabyte of cache no trim
+# could reach after the containers that used them had given theirs back.
+# Here the agent can reclaim it like the containers' (see the agent's
+# bound_container_cache).
+mkdir -p /sys/fs/cgroup/engine
+echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+# A fresh shell rather than a subshell: in a subshell `$$` is still the
+# parent's pid, and the engine ran in the root cgroup for a day — a daily
+# driver held eight gigabytes of image-layer cache no trim could reach.
+sh -c '
+	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	exec dockerd \
+		--host=unix:///run/docker.sock \
+		--data-root=/var/lib/docker \
+		--storage-driver=overlay2 \
+		--userland-proxy=false \
+		--mtu="$1" \
+		>/var/log/dockerd.log 2>&1' engine "$link_mtu" &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on
@@ -291,6 +344,13 @@ while [ "$waited" -lt 60 ]; do
 done
 
 echo "INIT dockerd=$dockerd_state after=${waited}s"
+# dockerd turns the bridge's netfilter call on at start, which runs the IP
+# prerouting hooks in the bridge's context for traffic off docker0 — and a
+# socket TPROXY assigns there does not survive into routing, so a
+# container's UDP counted as "no port". Off: published ports are DNAT on
+# routed traffic and unaffected, and the isolation between Docker networks
+# is on the forward hook, likewise.
+sysctl -q -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 if [ "$dockerd_state" != ready ]; then
 	echo "--- dockerd log ---"
 	tail -30 /var/log/dockerd.log
@@ -300,13 +360,65 @@ fi
 # --- The agent ------------------------------------------------------------
 # Started last, on purpose: it is what the host connects to, and advertising it
 # before dockerd answers turns a slow start into a connection refused.
-/sbin/lighter-agent --port 2375 --to /run/docker.sock &
+"$AGENT" --port 2375 --to /run/docker.sock &
 
 # The control channel, on its own port. The host uses it to put the clock right
 # after the Mac has slept: the machine has no real-time clock, so a guest whose
 # host suspended for an hour wakes an hour behind, and everything that checks a
 # certificate starts failing with an error about the certificate.
-/sbin/lighter-agent --port 2376 --control &
+"$AGENT" --port 2376 --control &
+
+# --- Streams --------------------------------------------------------------
+# With `lighter.streams` on the command line, every TCP connection that
+# would leave through eth0 — from a container or from this machine — is
+# redirected to the agent, which carries it to the host as a vsock stream;
+# the host's kernel makes the real connection. TCP only: UDP and ICMP keep
+# going out the network device. `fib daddr oif` is the routing decision
+# itself, so anything bound for a container, this machine, or a bridge is
+# left alone without listing subnets that Docker changes at will.
+if grep -qw "lighter.streams" /proc/cmdline; then
+	"$AGENT" --tcp-proxy 15201 &
+	"$AGENT" --udp-proxy 15202 &
+	"$AGENT" --inbound 2378 &
+	# DNS answered by the Mac's resolver over the same channel. On eth0's
+	# address rather than loopback: Docker copies this file into every
+	# container and drops loopback nameservers on the way.
+	"$AGENT" --dns 192.168.127.2 &
+	printf 'nameserver 192.168.127.2\n' > /etc/resolv.conf
+	# The ruleset goes through a file: busybox's shell does not take a
+	# heredoc on an `if` line the way bash does, and the rule that had
+	# worked by hand failed at every boot.
+	cat > /run/lighter.nft <<'EOF'
+table inet lighter {
+	chain prerouting {
+		type nat hook prerouting priority dstnat - 10; policy accept;
+		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
+	}
+	chain output {
+		type nat hook output priority dstnat - 10; policy accept;
+		meta l4proto tcp oifname "eth0" redirect to :15201
+	}
+	# UDP by TPROXY rather than REDIRECT: a redirected datagram reaches the
+	# agent with its destination already rewritten and no way back to the
+	# original (the socket option that names it reports the rewritten
+	# header; conntrack answers only for a connected socket). TPROXY hands
+	# the datagram over untouched — the agent's socket is transparent — and
+	# the policy route below is what makes a foreign destination deliverable
+	# locally. DNS and DHCP excepted, as for TCP's redirect.
+	chain divert {
+		type filter hook prerouting priority mangle; policy accept;
+		meta l4proto udp udp dport != { 53, 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
+	}
+}
+EOF
+	ip rule add fwmark 0x1 lookup 100 2>/dev/null
+	ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+	if nft -f /run/lighter.nft 2>/dev/console; then
+		echo "INIT streams=on"
+	else
+		echo "INIT streams=failed"
+	fi
+fi
 
 echo "INIT ready"
 

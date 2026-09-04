@@ -75,6 +75,10 @@ const POLL: Duration = Duration::from_secs(1);
 
 /// The guest port the agent's control channel listens on.
 pub const AGENT_CONTROL_PORT: u32 = 2376;
+/// The host port the agent dials to say what it can spare (`memory_guest`).
+pub const MEMORY_PORT: u32 = 2381;
+/// The guest keeps at least this fraction of its RAM out of the balloon.
+const GUEST_RESERVE_FRACTION: u64 = 16;
 
 /// The balloon, and the signals that drive it.
 pub struct MemoryPolicy {
@@ -90,6 +94,7 @@ impl MemoryPolicy {
         balloon: Arc<BalloonState>,
         transport: Arc<Mutex<VirtioMmio>>,
         ram_bytes: u64,
+        vsock: Arc<crate::virtio::vsock::VsockShared>,
     ) -> Result<MemoryPolicy, String> {
         let steering = Arc::new(Steering {
             balloon,
@@ -98,7 +103,9 @@ impl MemoryPolicy {
             level: AtomicU32::new(Pressure::Normal as u32),
             level_pages: AtomicU32::new(0),
             steer_pages: AtomicU32::new(0),
+            guest_pages: AtomicU32::new(0),
         });
+        memory_guest(vsock, steering.clone())?;
         let watcher = Watcher::start(Box::new(Levels(steering.clone())))?;
         let stop = Arc::new(AtomicBool::new(false));
         // A fixed target, for measuring what the guest gives back and what
@@ -121,8 +128,25 @@ impl MemoryPolicy {
                 .spawn(move || {
                     let mut last = host.sample();
                     let mut quiet_for = 0u32;
+                    // `LIGHTER_MEM_TRACE=1`: what the guest has reported free
+                    // and what the host holds, every second, to the log.
+                    let trace = std::env::var("LIGHTER_MEM_TRACE").map(|v| v == "1").unwrap_or(false);
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(POLL);
+                        if trace {
+                            let (resident, internal, reusable) = crate::footprint::split();
+                            eprintln!(
+                                "MEMTRACE footprint_mib={} resident_mib={} internal_mib={} reusable_mib={} reported_mib={} offered_mib={} steer_mib={} level_mib={}",
+                                crate::footprint::bytes() >> 20,
+                                resident >> 20,
+                                internal >> 20,
+                                reusable >> 20,
+                                steering.balloon.reported_bytes() >> 20,
+                                steering.balloon.offered_bytes() >> 20,
+                                (steering.steer_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20,
+                                (steering.level_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20
+                            );
+                        }
                         let Some(now) = host.sample() else { continue };
                         if let Some(then) = last {
                             let compressed = now.compressed.saturating_sub(then.compressed);
@@ -166,10 +190,11 @@ struct Steering {
     transport: Arc<Mutex<VirtioMmio>>,
     ram_bytes: u64,
     level: AtomicU32,
-    /// What the pressure level asks for, and what the compressor asks for:
-    /// the balloon's target is the larger.
+    /// What the pressure level asks for, what the compressor asks for, and
+    /// what the guest itself offers: the balloon's target is the largest.
     level_pages: AtomicU32,
     steer_pages: AtomicU32,
+    guest_pages: AtomicU32,
 }
 
 impl Steering {
@@ -186,11 +211,51 @@ impl Steering {
         }
     }
 
+    /// The guest says it can spare `spare_mib` beyond what the balloon
+    /// already holds; `release` asks the whole balloon back. An offer under
+    /// 64 MiB holds the target where it is. A step is at most 8 GiB, so
+    /// the next second's offer is measured against inflation that has
+    /// actually happened rather than a target still being filled — the
+    /// balloon's own count of what it holds lags its allocations, and a
+    /// target summed from the two overshoots the guest's reserve.
+    fn guest_offers(&self, spare_mib: u64, release: bool) {
+        const STEP_MIB: u64 = 8192;
+        let cap = ((self.ram_bytes - self.ram_bytes / GUEST_RESERVE_FRACTION) / BALLOON_PAGE_SIZE)
+            .min(u64::from(u32::MAX)) as u32;
+        let pages = if release {
+            0
+        } else if spare_mib < 64 {
+            // Hold at what the balloon actually holds, not at the target it
+            // was given: a target past what the guest could spare has the
+            // driver retrying its last pages every 200 ms for good ("Out of
+            // puff"), reclaiming a little each time.
+            let actual = self.balloon.actual_pages();
+            if actual >= self.guest_pages.load(Ordering::Relaxed) {
+                return;
+            }
+            actual
+        } else {
+            // Never lower on an offer: the balloon's count of what it holds
+            // lags its allocations, and a target summed from a stale count
+            // fell below the one being filled — the driver deflated, the
+            // next offer inflated, and two seconds went on the seesaw.
+            let actual = u64::from(self.balloon.actual_pages());
+            let wanted = (actual + (spare_mib.min(STEP_MIB) << 20) / BALLOON_PAGE_SIZE)
+                .min(u64::from(cap))
+                .min(u64::from(u32::MAX)) as u32;
+            wanted.max(self.guest_pages.load(Ordering::Relaxed))
+        };
+        if pages != self.guest_pages.swap(pages, Ordering::Relaxed) {
+            self.apply();
+        }
+    }
+
     fn apply(&self) {
         let pages = self
             .level_pages
             .load(Ordering::Relaxed)
-            .max(self.steer_pages.load(Ordering::Relaxed));
+            .max(self.steer_pages.load(Ordering::Relaxed))
+            .max(self.guest_pages.load(Ordering::Relaxed));
         let before = self.balloon.target_pages();
         if pages == before {
             return;
@@ -212,6 +277,43 @@ impl Steering {
             tracing::debug!(target_mib = mib, "balloon target");
         }
     }
+}
+
+/// The guest's own offer, and the third input to the balloon.
+///
+/// Free page reporting returns runs of two megabytes, and what a package
+/// install frees is in file-sized pieces below that: traced through the
+/// storage cases, the guest had 13 GB free with the host still holding
+/// 6.4 GB of it, and only a compaction pass — which costs the next
+/// command — made it reportable. The balloon needs no contiguity beyond a
+/// host page. So the agent, which knows when its containers are idle and
+/// how much is free, dials in and says each second what it can spare; the
+/// host inflates by that much and deflates the moment the guest says zero
+/// — work resumed, or free memory below its reserve. Sixteen bytes a
+/// second: spare, available, free (MiB), and the idle count, all `u32`.
+fn memory_guest(
+    vsock: Arc<crate::virtio::vsock::VsockShared>,
+    steering: Arc<Steering>,
+) -> Result<(), String> {
+    let accepted = vsock.listen(MEMORY_PORT);
+    std::thread::Builder::new()
+        .name("memory-guest".into())
+        .spawn(move || {
+            for crate::virtio::vsock::Accepted { key } in accepted {
+                while let Some(bytes) = vsock.read_outbound_exact(key, 16) {
+                    let word = |i: usize| {
+                        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+                    };
+                    let spare_mib = u64::from(word(0));
+                    let release = word(12) != 0;
+                    steering.guest_offers(spare_mib, release);
+                }
+                // The agent went away: whatever it offered is withdrawn.
+                steering.guest_offers(0, true);
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("cannot start the guest memory listener: {e}"))
 }
 
 /// The steering rule, as arithmetic: a step up while the host compresses,

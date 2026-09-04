@@ -1,0 +1,251 @@
+sockmap: a source is paused while its redirect target's backlog is deep
+
+A redirect consumes the source's data the moment the verdict runs: TCP's
+copied_seq advances (tcp_eat_skb) and the window stays open, vsock's credit
+is returned in read_skb, while the bytes sit in the target's ingress_skb
+backlog waiting for its worker to send them. Nothing bounds that queue. A
+container sending a bulk stream to the host (iperf3 through the joined
+sockets) filled the guest's memory in a second and the OOM killer took
+dockerd.
+
+Now the target's backlog is counted, and when it passes a high mark every
+source redirecting into it is paused: its data-ready callback returns
+without reading, so data accumulates in its own receive queue and the
+protocol's own flow control reaches the sender — TCP's window closes,
+vsock's credit runs out and the host stops reading its socket. When the
+backlog drains below a low mark the sources are resumed from their own
+backlog workers, the one context that may take a socket's lock, and the
+read that follows drains the receive queue in order, marking EOF, sending
+TCP's window update. One global lock over the pause lists lets a source and
+its target be torn down in either order.
+
+And the wake after EAGAIN: the backlog parks a jiffy when the target has no
+room, and the write-space callback's schedule deferred to that timer, so a
+stream into a socket that runs out of room by design (vsock, on credit)
+moved one window per tick — 4.3 Gbit/s at HZ=250. The callback now pulls
+the timer forward.
+
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -68,8 +68,23 @@ struct sk_psock_progs {
+ enum sk_psock_state_bits {
+ 	SK_PSOCK_TX_ENABLED,
+ 	SK_PSOCK_RX_STRP_ENABLED,
++	/* Reading is held: the target of this socket's redirects has a deep
++	 * backlog. Data stays in the receive queue, and the protocol's own
++	 * flow control (TCP's window, vsock's credit) reaches the sender.
++	 */
++	SK_PSOCK_PAUSED,
++	/* The hold was lifted; the backlog worker reads on its next run. */
++	SK_PSOCK_RESUME,
+ };
+ 
++/* A redirect target's backlog, in bytes, at which its sources are paused,
++ * and below which they read again. A redirect consumes the source's data
++ * the moment the verdict runs, so without this a source's window never
++ * closes and a bulk sender queues unboundedly into the target's backlog.
++ */
++#define SK_PSOCK_BACKLOG_HIGH	(4U << 20)
++#define SK_PSOCK_BACKLOG_LOW	(1U << 20)
++
+ struct sk_psock_link {
+ 	struct list_head		list;
+ 	struct bpf_map			*map;
+@@ -96,6 +111,14 @@ struct sk_psock {
+ 	u32				ingress_bytes;
+ #endif
+ 	struct sk_buff_head		ingress_skb;
++	/** @ingress_skb_bytes: Total bytes queued in ingress_skb (ingress_lock). */
++	u32				ingress_skb_bytes;
++	/* Sources paused on this psock's backlog, and where this psock is
++	 * paused, if it is; both under sk_psock_pause_lock.
++	 */
++	struct list_head		paused;
++	struct list_head		pause_link;
++	struct sk_psock			*paused_on;
+ 	struct list_head		ingress_msg;
+ 	spinlock_t			ingress_lock;
+ 	/** @msg_tot_len: Total bytes queued in ingress_msg list. */
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -11,6 +11,54 @@
+ #include <linux/virtio_vsock.h>
+ #include <trace/events/sock.h>
+ 
++/* Guards every psock's paused list and paused_on: a source and its target
++ * may be torn down in either order, and one lock over both is what keeps
++ * each side's cleanup from racing the other's.
++ */
++static DEFINE_SPINLOCK(sk_psock_pause_lock);
++
++static void sk_psock_pause(struct sk_psock *from, struct sk_psock *on)
++{
++	spin_lock_bh(&sk_psock_pause_lock);
++	if (!from->paused_on && sk_psock_test_state(on, SK_PSOCK_TX_ENABLED)) {
++		from->paused_on = on;
++		list_add_tail(&from->pause_link, &on->paused);
++		sk_psock_set_state(from, SK_PSOCK_PAUSED);
++	}
++	spin_unlock_bh(&sk_psock_pause_lock);
++}
++
++/* Lifts the hold on every source paused on this psock; each reads again
++ * from its own backlog worker, which is the context that may take its
++ * socket's lock.
++ */
++static void sk_psock_unpause_all(struct sk_psock *psock)
++{
++	struct sk_psock *from, *tmp;
++
++	spin_lock_bh(&sk_psock_pause_lock);
++	list_for_each_entry_safe(from, tmp, &psock->paused, pause_link) {
++		list_del_init(&from->pause_link);
++		from->paused_on = NULL;
++		sk_psock_clear_state(from, SK_PSOCK_PAUSED);
++		sk_psock_set_state(from, SK_PSOCK_RESUME);
++		if (sk_psock_test_state(from, SK_PSOCK_TX_ENABLED))
++			schedule_delayed_work(&from->work, 0);
++	}
++	spin_unlock_bh(&sk_psock_pause_lock);
++}
++
++static void sk_psock_pause_leave(struct sk_psock *psock)
++{
++	spin_lock_bh(&sk_psock_pause_lock);
++	if (psock->paused_on) {
++		list_del_init(&psock->pause_link);
++		psock->paused_on = NULL;
++	}
++	spin_unlock_bh(&sk_psock_pause_lock);
++	sk_psock_unpause_all(psock);
++}
++
+ static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
+ {
+ 	if (msg->sg.end > msg->sg.start &&
+@@ -695,8 +743,16 @@ static void sk_psock_backlog(struct work_struct *work)
+ 	 */
+ 	if (!sk_psock_get(psock->sk))
+ 		return;
++	if (test_and_clear_bit(SK_PSOCK_RESUME, &psock->state)) {
++		lock_sock(psock->sk);
++		psock->sk->sk_data_ready(psock->sk);
++		release_sock(psock->sk);
++	}
+ 	mutex_lock(&psock->work_mutex);
+ 	while ((skb = skb_peek(&psock->ingress_skb))) {
++		u32 skb_len = skb->len;
++		bool low;
++
+ 		len = skb->len;
+ 		off = 0;
+ 		if (skb_bpf_strparser(skb)) {
+@@ -749,8 +805,14 @@ static void sk_psock_backlog(struct work_struct *work)
+ 
+ 		/* The entire skb sent, clear state */
+ 		sk_psock_skb_state(psock, state, 0, 0);
+-		skb = skb_dequeue(&psock->ingress_skb);
++		spin_lock_bh(&psock->ingress_lock);
++		skb = __skb_dequeue(&psock->ingress_skb);
++		psock->ingress_skb_bytes -= skb_len;
++		low = psock->ingress_skb_bytes < SK_PSOCK_BACKLOG_LOW;
++		spin_unlock_bh(&psock->ingress_lock);
+ 		kfree_skb(skb);
++		if (low && !list_empty(&psock->paused))
++			sk_psock_unpause_all(psock);
+ 		if (eof && !ingress) {
+ 			struct socket *sock = READ_ONCE(psock->sk->sk_socket);
+ 
+@@ -803,6 +865,8 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
+ 	INIT_LIST_HEAD(&psock->ingress_msg);
+ 	spin_lock_init(&psock->ingress_lock);
+ 	skb_queue_head_init(&psock->ingress_skb);
++	INIT_LIST_HEAD(&psock->paused);
++	INIT_LIST_HEAD(&psock->pause_link);
+ 
+ 	sk_psock_set_state(psock, SK_PSOCK_TX_ENABLED);
+ 	refcount_set(&psock->refcnt, 1);
+@@ -854,6 +918,7 @@ static void __sk_psock_zap_ingress(struct sk_psock *psock)
+ 		skb_bpf_redirect_clear(skb);
+ 		sock_drop(psock->sk, skb);
+ 	}
++	psock->ingress_skb_bytes = 0;
+ 	__sk_psock_purge_ingress_msg(psock);
+ }
+ 
+@@ -873,6 +938,8 @@ void sk_psock_stop(struct sk_psock *psock)
+ 	sk_psock_clear_state(psock, SK_PSOCK_TX_ENABLED);
+ 	sk_psock_cork_free(psock);
+ 	spin_unlock_bh(&psock->ingress_lock);
++	/* Sources held on this backlog read again, to find it gone. */
++	sk_psock_unpause_all(psock);
+ }
+ 
+ static void sk_psock_done_strp(struct sk_psock *psock);
+@@ -885,6 +952,7 @@ static void sk_psock_destroy(struct work_struct *work)
+ 
+ 	sk_psock_done_strp(psock);
+ 
++	sk_psock_pause_leave(psock);
+ 	cancel_delayed_work_sync(&psock->work);
+ 	__sk_psock_zap_ingress(psock);
+ 	mutex_destroy(&psock->work_mutex);
+@@ -975,6 +1043,7 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
+ {
+ 	struct sk_psock *psock_other;
+ 	struct sock *sk_other;
++	bool deep;
+ 
+ 	sk_other = skb_bpf_redirect_fetch(skb);
+ 	/* This error is a buggy BPF program, it returned a redirect
+@@ -1004,8 +1073,12 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
+ 	}
+ 
+ 	skb_queue_tail(&psock_other->ingress_skb, skb);
++	psock_other->ingress_skb_bytes += skb->len;
++	deep = psock_other->ingress_skb_bytes > SK_PSOCK_BACKLOG_HIGH;
+ 	schedule_delayed_work(&psock_other->work, 0);
+ 	spin_unlock_bh(&psock_other->ingress_lock);
++	if (deep)
++		sk_psock_pause(from, psock_other);
+ 	return 0;
+ }
+ 
+@@ -1113,8 +1186,13 @@ static void sk_psock_write_space(struct sock *sk)
+ 	rcu_read_lock();
+ 	psock = sk_psock(sk);
+ 	if (likely(psock)) {
++		/* The backlog parks a jiffy after EAGAIN; this is the wake it
++		 * was waiting for, and a schedule would defer to that timer
++		 * — a stream to a socket that runs out of room (vsock credit)
++		 * moved one window per tick.
++		 */
+ 		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
+-			schedule_delayed_work(&psock->work, 0);
++			mod_delayed_work(system_wq, &psock->work, 0);
+ 		write_space = psock->saved_write_space;
+ 	}
+ 	rcu_read_unlock();
+@@ -1292,6 +1370,11 @@ static int sk_psock_verdict_recv(struct sock *sk, struct sk_buff *skb)
+ 	ret = sk_psock_verdict_apply(psock, skb, ret);
+ 	if (ret < 0)
+ 		len = ret;
++	else if (sk_psock_test_state(psock, SK_PSOCK_PAUSED))
++		/* Consumed, and the reader stops here: the rest stays queued
++		 * until the target's backlog drains.
++		 */
++		len = -EAGAIN;
+ out:
+ 	rcu_read_unlock();
+ 	return len;
+@@ -1313,6 +1396,10 @@ static void sk_psock_verdict_data_ready(struct sock *sk)
+ 		rcu_read_unlock();
+ 		return;
+ 	}
++	if (psock && sk_psock_test_state(psock, SK_PSOCK_PAUSED)) {
++		rcu_read_unlock();
++		return;
++	}
+ 	sock = READ_ONCE(sk->sk_socket);
+ 	if (likely(sock))
+ 		ops = READ_ONCE(sock->ops);
