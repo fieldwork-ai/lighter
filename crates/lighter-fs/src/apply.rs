@@ -88,6 +88,12 @@ impl Keys {
         Keys(out)
     }
 
+    /// The first key named: the parent directory for a create, mkdir or
+    /// symlink, the file for a write.
+    fn first(&self) -> u64 {
+        self.0[0]
+    }
+
     fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.0.iter().copied().filter(|&k| k != 0)
     }
@@ -254,6 +260,67 @@ fn workers() -> usize {
         .unwrap_or(5)
 }
 
+/// Whether the bounded lane runs at most one job per directory at a time.
+///
+/// APFS hands a directory between the threads creating names in it, at a
+/// cost each time; with the lane keyed on the parent, creates in one
+/// directory stay on one worker and the workers spread across directories
+/// instead. `LIGHTER_FS_APPLY_DIR_AFFINITY=1`; off, the lane is one queue.
+fn dir_affinity() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LIGHTER_FS_APPLY_DIR_AFFINITY").is_ok_and(|v| v != "0"))
+}
+
+/// The bounded lane: ready jobs by lane key, each key's oldest first, and
+/// the keys that have a ready job and nothing running.
+#[derive(Default)]
+struct Bounded {
+    by_key: HashMap<u64, VecDeque<u64>>,
+    /// In the order they became pickable. A key is here exactly when it
+    /// has a ready job and no running one.
+    ready_keys: VecDeque<u64>,
+    running: std::collections::HashSet<u64>,
+    /// Jobs of the lane running now.
+    count: usize,
+}
+
+impl Bounded {
+    /// The key a job of this lane is queued and serialized under: its
+    /// parent directory with affinity on, itself otherwise (no two jobs
+    /// share a key, so nothing serializes and the lane is one FIFO).
+    fn key_of(keys: &Keys, seq: u64) -> u64 {
+        if dir_affinity() { keys.first() } else { seq }
+    }
+
+    fn offer(&mut self, key: u64, seq: u64) {
+        let queue = self.by_key.entry(key).or_default();
+        queue.push_back(seq);
+        if queue.len() == 1 && !self.running.contains(&key) {
+            self.ready_keys.push_back(key);
+        }
+    }
+
+    fn pick(&mut self) -> Option<(u64, u64)> {
+        let key = self.ready_keys.pop_front()?;
+        let queue = self.by_key.get_mut(&key).expect("a listed key has a queue");
+        let seq = queue.pop_front().expect("a listed key has a job");
+        if queue.is_empty() {
+            self.by_key.remove(&key);
+        }
+        self.running.insert(key);
+        self.count += 1;
+        Some((key, seq))
+    }
+
+    fn finished(&mut self, key: u64) {
+        self.running.remove(&key);
+        self.count -= 1;
+        if self.by_key.contains_key(&key) {
+            self.ready_keys.push_back(key);
+        }
+    }
+}
+
 /// Below this much free space, acknowledgement stops and service goes back to
 /// synchronous, so ENOSPC lands on the operation that earned it.
 const FREE_FLOOR: u64 = 512 << 20;
@@ -270,6 +337,8 @@ struct Slot {
     /// Jobs waiting on this one.
     successors: Vec<u64>,
     done: bool,
+    /// The bounded lane's key, for a job of that lane.
+    lane_key: u64,
 }
 
 struct State {
@@ -287,8 +356,7 @@ struct State {
     /// measured, four threads cloning small files reach a third of the
     /// per-file latency of one — and the one job a pnpm install is made of.
     serial_running: bool,
-    /// Jobs of the bounded lane running now.
-    bounded_running: usize,
+    bounded: Bounded,
     slots: HashMap<u64, Slot>,
     /// Ready to run, oldest first: the serial lane, and the clones that
     /// may run beside it. Two queues so that a worker's pick is one pop
@@ -296,7 +364,6 @@ struct State {
     /// the lot on every completion cost an npm install three seconds.
     ready: VecDeque<u64>,
     ready_clones: VecDeque<u64>,
-    ready_bounded: VecDeque<u64>,
     /// The most recent job queued on each key, while it is still held.
     tails: HashMap<u64, u64>,
     /// Sequence numbers queued and not yet applied.
@@ -352,11 +419,10 @@ impl Apply {
                 retired: false,
                 held: false,
                 serial_running: false,
-                bounded_running: 0,
+                bounded: Bounded::default(),
                 slots: HashMap::new(),
                 ready: VecDeque::new(),
                 ready_clones: VecDeque::new(),
-                ready_bounded: VecDeque::new(),
                 tails: HashMap::new(),
                 incomplete: BTreeSet::new(),
             }),
@@ -469,6 +535,7 @@ impl Apply {
         for key in job.keys.iter() {
             state.tails.insert(key, seq);
         }
+        let lane_key = Bounded::key_of(&job.keys, seq);
         state.incomplete.insert(seq);
         state.slots.insert(
             seq,
@@ -477,13 +544,14 @@ impl Apply {
                 waiting,
                 successors: Vec::new(),
                 done: false,
+                lane_key,
             },
         );
         if waiting == 0 {
             match lane {
                 Lane::Serial => state.ready.push_back(seq),
                 Lane::Wide => state.ready_clones.push_back(seq),
-                Lane::Bounded => state.ready_bounded.push_back(seq),
+                Lane::Bounded => state.bounded.offer(lane_key, seq),
             }
         }
         drop(state);
@@ -621,10 +689,10 @@ impl Shared {
                     // is running, else the oldest clone.
                     let pick = if !state.serial_running && !state.ready.is_empty() {
                         state.ready.pop_front()
-                    } else if state.bounded_running < create_width()
-                        && !state.ready_bounded.is_empty()
+                    } else if state.bounded.count < create_width()
+                        && !state.bounded.ready_keys.is_empty()
                     {
-                        state.ready_bounded.pop_front()
+                        state.bounded.pick().map(|(_, seq)| seq)
                     } else {
                         state.ready_clones.pop_front()
                     };
@@ -634,10 +702,8 @@ impl Shared {
                             .get_mut(&seq)
                             .and_then(|slot| slot.job.take())
                             .expect("a ready job is held and untaken");
-                        match job.kind.lane() {
-                            Lane::Serial => state.serial_running = true,
-                            Lane::Bounded => state.bounded_running += 1,
-                            Lane::Wide => {}
+                        if job.kind.lane() == Lane::Serial {
+                            state.serial_running = true;
                         }
                         break (seq, job);
                     }
@@ -663,12 +729,12 @@ impl Shared {
             }
             {
                 let mut state = self.state.lock().expect("apply queue poisoned");
+                let slot = state.slots.remove(&seq).expect("a running job is held");
                 match kind_of(kind).lane() {
                     Lane::Serial => state.serial_running = false,
-                    Lane::Bounded => state.bounded_running -= 1,
+                    Lane::Bounded => state.bounded.finished(slot.lane_key),
                     Lane::Wide => {}
                 }
-                let slot = state.slots.remove(&seq).expect("a running job is held");
                 debug_assert!(!slot.done);
                 let mut clones_ready = 0;
                 for next in slot.successors {
@@ -690,7 +756,8 @@ impl Shared {
                                 clones_ready += 1;
                             }
                             Lane::Bounded => {
-                                state.ready_bounded.push_back(next);
+                                let key = successor.lane_key;
+                                state.bounded.offer(key, next);
                                 clones_ready += 1;
                             }
                         }
