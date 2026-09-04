@@ -140,6 +140,12 @@ pub fn machine() -> anyhow::Result<()> {
             share.path.display()
         ));
     }
+    // TCP as streams over vsock rather than frames through gvproxy, while it
+    // is being measured; the guest's rules are behind the same switch.
+    let streams = std::env::var("LIGHTER_STREAMS").map(|v| v != "0").unwrap_or(false);
+    if streams {
+        cmdline.push_str(" lighter.streams");
+    }
 
     let machine_config = MachineConfig {
         vcpus: config.cpus,
@@ -158,6 +164,9 @@ pub fn machine() -> anyhow::Result<()> {
     let mut machine = Machine::start(&machine_config)?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;
+    }
+    if streams {
+        lighter_vmm::streams::start(machine.vsock())?;
     }
 
     // Ports a container publishes appear on the Mac, for as long as the

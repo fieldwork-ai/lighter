@@ -41,6 +41,8 @@ pub mod mempressure;
 pub mod net;
 pub mod psci;
 pub mod smp;
+pub mod sockbuf;
+pub mod streams;
 pub mod sysreg;
 pub mod vcpu;
 pub mod virtio;

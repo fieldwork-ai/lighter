@@ -29,7 +29,10 @@ import socket, sys, time
 path, n = sys.argv[1], int(sys.argv[2])
 def gbits(nbytes, secs): return nbytes * 8 / secs / 1e9
 
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+    s.setsockopt(socket.SOL_SOCKET, opt, 4 << 20)
+s.connect(path)
 s.sendall(b"ping\n"); assert s.recv(16).startswith(b"pong")
 s.sendall(f"blast {n}\n".encode())
 t = time.perf_counter(); left = n; buf = bytearray(1 << 20)

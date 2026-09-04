@@ -595,6 +595,11 @@ impl Machine {
     /// Kept on the machine rather than returned, because the proxy unlinks its
     /// socket when dropped and a caller that let it fall out of scope would get
     /// a path that briefly worked.
+    /// The vsock state, for host-side listeners.
+    pub fn vsock(&self) -> Arc<VsockShared> {
+        self.vsock.clone()
+    }
+
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
         let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone())?;
         self.proxies.push(proxy);

@@ -97,6 +97,7 @@ fn serve(stream: UnixStream, guest_port: u32, shared: Arc<VsockShared>) {
         return;
     };
 
+    crate::sockbuf::widen(&stream);
     let host_port = shared.open(guest_port, device_side);
     if !shared.await_established(host_port, ACCEPT_TIMEOUT) {
         tracing::debug!(

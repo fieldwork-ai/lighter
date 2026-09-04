@@ -154,6 +154,7 @@ impl Network {
         wait_for_socket(&control_path, timeout)?;
 
         let stream = UnixStream::connect(&socket_path).map_err(NetError::Connect)?;
+        crate::sockbuf::widen(&stream);
         tracing::info!(
             socket = %socket_path.display(),
             control = %control_path.display(),

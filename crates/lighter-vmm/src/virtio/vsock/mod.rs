@@ -324,9 +324,9 @@ impl VsockShared {
     /// matters. Sending a full close here instead loses the reply.
     pub fn shutdown_write(&self, key: ConnKey) {
         let mut inner = self.lock();
-        let Some(conn) = inner.conns.get(&key) else {
+        if !inner.conns.contains_key(&key) {
             return;
-        };
+        }
         let (host_port, guest_port) = key;
         let mut packet = Packet::control(Op::Shutdown, host_port, guest_port);
         packet.flags = shutdown::SEND;
@@ -341,9 +341,9 @@ impl VsockShared {
     /// Closes our end, telling the guest we will write no more.
     pub fn shutdown(&self, key: ConnKey) {
         let mut inner = self.lock();
-        let Some(conn) = inner.conns.get(&key) else {
+        if !inner.conns.contains_key(&key) {
             return;
-        };
+        }
         let (host_port, guest_port) = key;
         let mut packet = Packet::control(Op::Shutdown, host_port, guest_port);
         packet.flags = shutdown::BOTH;
@@ -389,7 +389,6 @@ impl VsockShared {
             return;
         };
         conn.credit.consumed(bytes);
-        let guest_port = conn.guest_port;
         let fwd_cnt = conn.credit.fwd_cnt();
 
         let (host_port, guest_port) = key;
@@ -511,12 +510,48 @@ impl Vsock {
             Op::CreditUpdate => {}
 
             Op::Request => {
-                // A guest-initiated connection. Nothing listens on the host
-                // side yet, and a silent drop would hang the guest, so refuse
-                // it explicitly.
-                let mut rst = Packet::control(Op::Rst, packet.dst_port, packet.src_port);
-                rst.buf_alloc = credit::BUF_ALLOC;
-                inner.outbox.push_back(rst);
+                // A guest-initiated connection: accepted when something on
+                // the host listens on the port, refused explicitly otherwise
+                // (a silent drop would hang the guest). The new connection is
+                // one end of a socket pair for the pump and the other for
+                // the listener, which the listener threads together itself;
+                // nothing is spawned under this lock.
+                let accepted = inner.listeners.get(&host_port).and_then(|listener| {
+                    let (device_side, stream) = UnixStream::pair().ok()?;
+                    crate::sockbuf::widen(&device_side);
+                    crate::sockbuf::widen(&stream);
+                    let device_clone = device_side.try_clone().ok()?;
+                    listener
+                        .send(Accepted {
+                            key,
+                            device_side: device_clone,
+                            stream,
+                        })
+                        .ok()?;
+                    Some(device_side)
+                });
+                match accepted {
+                    Some(socket) => {
+                        let mut conn = Conn {
+                            guest_port: packet.src_port,
+                            state: State::Established,
+                            credit: Credit::new(),
+                            outbound: VecDeque::new(),
+                            guest_done: false,
+                            socket,
+                        };
+                        conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
+                        inner.conns.insert(key, conn);
+                        let mut response = Packet::control(Op::Response, host_port, packet.src_port);
+                        response.buf_alloc = credit::BUF_ALLOC;
+                        inner.outbox.push_back(response);
+                    }
+                    None => {
+                        let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
+                        rst.buf_alloc = credit::BUF_ALLOC;
+                        inner.outbox.push_back(rst);
+                    }
+                }
             }
 
             Op::Invalid => {
@@ -875,7 +910,7 @@ mod tests {
         chunks.map(|c| c.concat())
     }
 
-    fn shared_with_connection() -> (Arc<VsockShared>, u32, UnixStream) {
+    fn shared_with_connection() -> (Arc<VsockShared>, ConnKey, UnixStream) {
         let shared = Arc::new(VsockShared::new());
         let (ours, theirs) = UnixStream::pair().unwrap();
         let port = shared.open(2375, ours);
@@ -889,7 +924,7 @@ mod tests {
         assert_eq!(inner.outbox.len(), 1);
         let request = &inner.outbox[0];
         assert_eq!(request.op, Op::Request);
-        assert_eq!(request.src_port, port);
+        assert_eq!(request.src_port, port.0);
         assert_eq!(request.dst_port, 2375);
         assert_eq!(
             request.buf_alloc,
@@ -902,7 +937,7 @@ mod tests {
     #[test]
     fn a_response_establishes_the_connection() {
         let (shared, port, _peer) = shared_with_connection();
-        let mut response = Packet::control(Op::Response, 2375, port);
+        let mut response = Packet::control(Op::Response, 2375, port.0);
         response.buf_alloc = 4096;
 
         let mut inner = shared.lock();
@@ -919,9 +954,9 @@ mod tests {
     fn a_send_only_shutdown_keeps_the_connection_open() {
         let (shared, port, _peer) = shared_with_connection();
         let mut inner = shared.lock();
-        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port.0));
 
-        let mut half = Packet::control(Op::Shutdown, 2375, port);
+        let mut half = Packet::control(Op::Shutdown, 2375, port.0);
         half.flags = shutdown::SEND;
         Vsock::handle(&mut inner, half);
 
@@ -941,9 +976,9 @@ mod tests {
     fn a_full_shutdown_closes_the_connection() {
         let (shared, port, _peer) = shared_with_connection();
         let mut inner = shared.lock();
-        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port.0));
 
-        let mut full = Packet::control(Op::Shutdown, 2375, port);
+        let mut full = Packet::control(Op::Shutdown, 2375, port.0);
         full.flags = shutdown::BOTH;
         Vsock::handle(&mut inner, full);
 
@@ -957,13 +992,13 @@ mod tests {
     fn the_writer_is_told_to_finish_after_a_half_close() {
         let (shared, port, _peer) = shared_with_connection();
         let mut inner = shared.lock();
-        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port.0));
 
-        let mut data = Packet::control(Op::Rw, 2375, port);
+        let mut data = Packet::control(Op::Rw, 2375, port.0);
         data.payload = b"tail".to_vec();
         Vsock::handle(&mut inner, data);
 
-        let mut half = Packet::control(Op::Shutdown, 2375, port);
+        let mut half = Packet::control(Op::Shutdown, 2375, port.0);
         half.flags = shutdown::SEND;
         Vsock::handle(&mut inner, half);
         drop(inner);
@@ -977,7 +1012,7 @@ mod tests {
     fn a_reset_removes_the_connection() {
         let (shared, port, _peer) = shared_with_connection();
         let mut inner = shared.lock();
-        Vsock::handle(&mut inner, Packet::control(Op::Rst, 2375, port));
+        Vsock::handle(&mut inner, Packet::control(Op::Rst, 2375, port.0));
         assert!(!inner.conns.contains_key(&port));
     }
 
@@ -988,10 +1023,10 @@ mod tests {
         let (shared, port, _peer) = shared_with_connection();
 
         let mut inner = shared.lock();
-        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port.0));
         inner.outbox.clear();
 
-        let mut data = Packet::control(Op::Rw, 2375, port);
+        let mut data = Packet::control(Op::Rw, 2375, port.0);
         data.payload = b"hello".to_vec();
         Vsock::handle(&mut inner, data);
 
@@ -1014,7 +1049,7 @@ mod tests {
     fn acknowledging_delivery_advances_credit_and_tells_the_guest() {
         let (shared, port, _peer) = shared_with_connection();
         let mut inner = shared.lock();
-        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port.0));
         inner.outbox.clear();
         drop(inner);
 
@@ -1034,8 +1069,8 @@ mod tests {
     fn the_writer_receives_what_the_guest_sent() {
         let (shared, port, _peer) = shared_with_connection();
         let mut inner = shared.lock();
-        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port));
-        let mut data = Packet::control(Op::Rw, 2375, port);
+        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port.0));
+        let mut data = Packet::control(Op::Rw, 2375, port.0);
         data.payload = b"hello".to_vec();
         Vsock::handle(&mut inner, data);
         drop(inner);
@@ -1067,7 +1102,7 @@ mod tests {
     #[test]
     fn sending_respects_the_peers_credit() {
         let (shared, port, _peer) = shared_with_connection();
-        let mut response = Packet::control(Op::Response, 2375, port);
+        let mut response = Packet::control(Op::Response, 2375, port.0);
         response.buf_alloc = 4;
         let mut inner = shared.lock();
         Vsock::handle(&mut inner, response);
