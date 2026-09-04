@@ -1,0 +1,33 @@
+mm/page_reporting: the cycle delay is a runtime parameter
+
+A reporting request waits two seconds for more pages to accumulate before a
+cycle runs, and a cycle's budget is a fraction of each free list. Right for
+a guest churning memory, where every reported page it reuses is a fault on
+the host (measured: eight times upstream's rate made a pnpm install take
+four times as long). Wrong for a guest that has just trimmed its cache and
+is idle: with 2 MiB blocks freed by a trim the budget comes to one report a
+cycle, and the Mac saw the guest's footprint fall by a hundred megabytes
+every two seconds for twenty seconds. page_reporting_delay_ms, writable, is
+what lets the guest's agent ask for the freed memory back now and restore
+the two seconds once it has gone.
+
+--- a/mm/page_reporting.c
++++ b/mm/page_reporting.c
+@@ -47,7 +47,16 @@ MODULE_PARM_DESC(page_reporting_order, "Set page reporting order");
+  */
+ EXPORT_SYMBOL_GPL(page_reporting_order);
+ 
+-#define PAGE_REPORTING_DELAY	(2 * HZ)
++/* How long a reporting request waits for more pages to accumulate before a
++ * cycle runs. Two seconds is right for a guest that is churning memory —
++ * every reported page it reuses is a fault on the host — and wrong for one
++ * that has just trimmed its cache and is idle: a runtime knob lets its agent
++ * ask for the freed memory to go back now.
++ */
++static unsigned int page_reporting_delay_ms = 2000;
++module_param(page_reporting_delay_ms, uint, 0644);
++MODULE_PARM_DESC(page_reporting_delay_ms, "Delay before a reporting cycle, in milliseconds");
++#define PAGE_REPORTING_DELAY	msecs_to_jiffies(page_reporting_delay_ms)
+ static struct page_reporting_dev_info __rcu *pr_dev_info __read_mostly;
+ 
+ enum {

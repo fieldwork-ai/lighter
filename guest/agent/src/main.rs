@@ -169,6 +169,12 @@ fn bound_container_cache() {
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < 50_000 { idle_for + 1 } else { 0 };
+        // Freed memory goes back at reporting's idle rate for a while after
+        // a trim, and at its churn rate again once the containers work or
+        // the burst is over (guest kernel patch 0019).
+        if idle_for == 0 || idle_for == 25 {
+            set_reporting_delay_ms(2000);
+        }
         // Two stages. Five seconds idle: the containers keep a sixteenth
         // of RAM, their warmest pages, and the engine almost nothing, since
         // nothing it cached is a build's working set. Ten seconds idle: the
@@ -186,6 +192,7 @@ fn bound_container_cache() {
             10 => (total / 64, 8 << 20),
             _ => continue,
         };
+        set_reporting_delay_ms(100);
         for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
@@ -210,6 +217,11 @@ fn bound_container_cache() {
         // where a few passes take two.
         compact_until_reportable();
     }
+}
+
+/// The kernel's delay before a free page reporting cycle (patch 0019).
+fn set_reporting_delay_ms(ms: u32) {
+    let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_delay_ms", ms.to_string());
 }
 
 /// Runs compaction until little free memory is left below the reporting
