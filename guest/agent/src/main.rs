@@ -157,38 +157,52 @@ fn bound_container_cache() {
         })
         .map(|kb| kb * 1024);
     let Some(total) = total else { return };
-    let resting = total / 16;
-    let cgroup = "/sys/fs/cgroup/docker";
+    let containers = "/sys/fs/cgroup/docker";
+    // The engine's cgroup (init puts dockerd there): the image layers it
+    // extracted, and whatever else it read, charged where a trim can reach.
+    let engine = "/sys/fs/cgroup/engine";
     let mut idle_for = 0u32;
-    let mut last = container_cpu_usec(cgroup);
+    let mut last = container_cpu_usec(containers);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let now = container_cpu_usec(cgroup);
+        let now = container_cpu_usec(containers);
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < 50_000 { idle_for + 1 } else { 0 };
-        if idle_for < 10 {
-            continue;
+        // Two stages. Ten seconds idle: the containers keep a sixteenth of
+        // RAM, their warmest pages, for the build a minute away; the
+        // engine keeps almost nothing, since nothing it cached is a build's
+        // working set. Forty seconds idle: the containers go down to a
+        // sixty-fourth, and the memory is compacted again — what the first
+        // trim freed was in file-sized pieces, and compaction on a guest
+        // that has been idle a while coalesces what the first pass missed.
+        // OrbStack's footprint is back to its resting size within fifteen
+        // seconds of an install; the first stage is what matches that, the
+        // second what beats it at a minute.
+        let (floor, engine_floor) = match idle_for {
+            10 => (total / 16, 32 << 20),
+            40 => (total / 64, 8 << 20),
+            _ => continue,
+        };
+        for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
+            let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
+                .ok()
+                .and_then(|c| c.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if current > resting {
+                let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
+            }
         }
-        let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
-            .ok()
-            .and_then(|c| c.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        if current > resting {
-            let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
-            // What the trim freed is in pieces the size of the files that
-            // held it, and free page reporting hands the host only runs of
-            // two megabytes: reported as it stood, a trimmed guest still
-            // cost the Mac most of its size. Reporting smaller runs was
-            // measured and rejected — the guest reports its free memory as
-            // fast as it churns it, and every reported page it reuses is a
-            // fault on the host; a pnpm install took four times as long.
-            // Compaction instead, once, on a guest that has nothing else to
-            // do: the pieces coalesce, and the runs go back.
-            let _ = std::fs::write("/proc/sys/vm/compact_memory", "1");
-        }
-        // Trimmed: not again until the containers have worked and rested.
-        idle_for = 0;
+        // What the trim freed is in pieces the size of the files that held
+        // it, and free page reporting hands the host only runs of two
+        // megabytes: reported as it stood, a trimmed guest still cost the
+        // Mac most of its size. Reporting smaller runs was measured and
+        // rejected — the guest reports its free memory as fast as it churns
+        // it, and every reported page it reuses is a fault on the host; a
+        // pnpm install took four times as long. Compaction instead, on a
+        // guest that has nothing else to do: the pieces coalesce, and the
+        // runs go back.
+        let _ = std::fs::write("/proc/sys/vm/compact_memory", "1");
     }
 }
 

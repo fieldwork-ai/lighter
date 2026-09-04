@@ -274,13 +274,24 @@ fi
 # would have every container segment at 1460 whatever the link could carry.
 mkdir -p /var/log
 link_mtu=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1500)
-dockerd \
-	--host=unix:///run/docker.sock \
-	--data-root=/var/lib/docker \
-	--storage-driver=overlay2 \
-	--userland-proxy=false \
-	--mtu="$link_mtu" \
-	>/var/log/dockerd.log 2>&1 &
+# The engine in a cgroup of its own. The page cache a process fills is
+# charged to its cgroup, and the root cgroup cannot be asked to reclaim: an
+# image's layers, extracted by dockerd, sat as a gigabyte of cache no trim
+# could reach after the containers that used them had given theirs back.
+# Here the agent can reclaim it like the containers' (see the agent's
+# bound_container_cache).
+mkdir -p /sys/fs/cgroup/engine
+echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+(
+	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	exec dockerd \
+		--host=unix:///run/docker.sock \
+		--data-root=/var/lib/docker \
+		--storage-driver=overlay2 \
+		--userland-proxy=false \
+		--mtu="$link_mtu" \
+		>/var/log/dockerd.log 2>&1
+) &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on

@@ -127,9 +127,13 @@ impl MemoryPolicy {
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(POLL);
                         if trace {
+                            let (resident, internal, reusable) = crate::footprint::split();
                             eprintln!(
-                                "MEMTRACE footprint_mib={} reported_mib={} offered_mib={} steer_mib={} level_mib={}",
+                                "MEMTRACE footprint_mib={} resident_mib={} internal_mib={} reusable_mib={} reported_mib={} offered_mib={} steer_mib={} level_mib={}",
                                 crate::footprint::bytes() >> 20,
+                                resident >> 20,
+                                internal >> 20,
+                                reusable >> 20,
                                 steering.balloon.reported_bytes() >> 20,
                                 steering.balloon.offered_bytes() >> 20,
                                 (steering.steer_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20,
