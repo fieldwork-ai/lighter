@@ -183,6 +183,10 @@ pub enum Chunk {
 }
 
 impl Chunk {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Chunk::Owned(v) => v.len(),
@@ -229,6 +233,11 @@ pub struct Accepted {
 }
 
 /// State shared between the device and the host threads driving connections.
+/// The connection is not there to take or give bytes: closed, reset, or
+/// never opened. The one thing a stream's caller can be told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gone;
+
 pub struct VsockShared {
     inner: Mutex<Inner>,
     /// Guest memory, for a writer reading a payload where the guest left
@@ -431,16 +440,16 @@ impl VsockShared {
     /// waiting: the count accepted, or `Err` for a connection that is not
     /// there to take it. A reactor keeps the rest and comes back when its
     /// waker fires.
-    pub fn try_send(&self, key: ConnKey, data: &[u8]) -> Result<usize, ()> {
+    pub fn try_send(&self, key: ConnKey, data: &[u8]) -> Result<usize, Gone> {
         let mut inner = self.lock();
         let Some(conn) = inner.conns.get(&key) else {
-            return Err(());
+            return Err(Gone);
         };
         if conn.state != State::Established {
             return if conn.state == State::Connecting {
                 Ok(0)
             } else {
-                Err(())
+                Err(Gone)
             };
         }
         let mut allowed = conn.credit.available() as usize;
@@ -486,7 +495,7 @@ impl VsockShared {
         key: ConnKey,
         mut data: Vec<u8>,
         bulk: bool,
-    ) -> Result<Option<Vec<u8>>, ()> {
+    ) -> Result<Option<Vec<u8>>, Gone> {
         if data.len() > MAX_PAYLOAD {
             let rest = data.split_off(MAX_PAYLOAD);
             return match self.try_send_owned(key, data, bulk)? {
@@ -499,13 +508,13 @@ impl VsockShared {
         }
         let mut inner = self.lock();
         let Some(conn) = inner.conns.get(&key) else {
-            return Err(());
+            return Err(Gone);
         };
         if conn.state != State::Established {
             return if conn.state == State::Connecting {
                 Ok(Some(data))
             } else {
-                Err(())
+                Err(Gone)
             };
         }
         let allowed = conn.credit.available() as usize;
@@ -558,16 +567,16 @@ impl VsockShared {
 
     /// Exactly `n` of the guest's first bytes if they have arrived, credited;
     /// `Ok(None)` when not yet; `Err` for a connection that ended first.
-    pub fn try_read_outbound(&self, key: ConnKey, n: usize) -> Result<Option<Vec<u8>>, ()> {
+    pub fn try_read_outbound(&self, key: ConnKey, n: usize) -> Result<Option<Vec<u8>>, Gone> {
         let memory = self.memory.get().cloned();
         let mut inner = self.lock();
         let Some(conn) = inner.conns.get_mut(&key) else {
-            return Err(());
+            return Err(Gone);
         };
         let have: usize = conn.outbound.iter().map(Chunk::len).sum();
         if have < n {
             if conn.state == State::Closed || conn.guest_done {
-                return Err(());
+                return Err(Gone);
             }
             return Ok(None);
         }
@@ -988,6 +997,10 @@ pub struct Vsock {
     shared: Arc<VsockShared>,
 }
 
+/// One TX entry: the packet, and for an RW one the chain and the payload's
+/// spans in guest memory, which the writer reads in place.
+type TxEntry = (Packet, Option<(u16, Vec<(u64, usize)>)>);
+
 impl Vsock {
     pub fn new(shared: Arc<VsockShared>) -> Vsock {
         Vsock { shared }
@@ -1191,7 +1204,7 @@ impl Vsock {
         let mut used_any = false;
         // Each entry: the packet, and for an RW one the chain and the
         // payload's spans in guest memory, which the writer reads in place.
-        let mut packets: Vec<(Packet, Option<(u16, Vec<(u64, usize)>)>)> = Vec::new();
+        let mut packets: Vec<TxEntry> = Vec::new();
 
         while let Some(chain) = queue.pop(mem) {
             let head = chain.head();

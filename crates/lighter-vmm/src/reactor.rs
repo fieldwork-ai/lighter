@@ -20,7 +20,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
-use crate::virtio::vsock::{Chunk, ConnKey, Outbound, Status, VsockShared};
+use crate::virtio::vsock::{Chunk, ConnKey, Gone, Outbound, Status, VsockShared};
 
 /// Sixteen bytes of address with IPv4 in the first four, a family byte
 /// first, the port last: what the guest sends before a stream's bytes.
@@ -926,7 +926,7 @@ impl Loop {
                     }
                 }
                 Ok(None) => {}
-                Err(()) => self.close(key),
+                Err(Gone) => self.close(key),
             },
             Phase::Connecting => {}
             Phase::AwaitEstablished(port) => match self.shared.status(key) {
@@ -938,7 +938,7 @@ impl Loop {
                         self.kq.read(fd, true);
                     }
                     Ok(_) => {}
-                    Err(()) => self.close(key),
+                    Err(Gone) => self.close(key),
                 },
                 Status::Connecting => {}
                 Status::Gone => self.close(key),
@@ -972,7 +972,7 @@ impl Loop {
                         }
                     }
                 }
-                Err(()) => self.close(key),
+                Err(Gone) => self.close(key),
             }
         }
     }
@@ -1195,7 +1195,7 @@ impl Loop {
                     self.kq.read(fd, false);
                     return;
                 }
-                Err(()) => {
+                Err(Gone) => {
                     self.close(key);
                     return;
                 }
