@@ -256,7 +256,13 @@ fn bound_container_cache() {
         // takes pages at host-page size from any free list. The offer is
         // withdrawn — the whole balloon asked back — the moment the
         // containers work again or free memory falls under the reserve.
-        offer_memory(&mut memory_stream, total, idle_for / TICKS_PER_SEC);
+        // With no container running at all the fuse is a second; with some
+        // running, two seconds of their CPU idle. The suite's cases stop
+        // their containers, and their teardown shows CPU in the cgroup for
+        // a couple of seconds after the last one exits.
+        let running = running_containers(containers);
+        let fuse_ticks = if running == 0 { TICKS_PER_SEC } else { 2 * TICKS_PER_SEC };
+        offer_memory(&mut memory_stream, total, idle_for >= fuse_ticks);
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
@@ -309,11 +315,29 @@ fn bound_container_cache() {
 const MEMORY_PORT: u32 = 2381;
 
 /// Sixteen bytes to the host: what the guest can spare beyond a reserve of
-/// a sixteenth of RAM (MiB; zero holds the balloon where it is), available
+/// an eighth of RAM (MiB; zero holds the balloon where it is), available
 /// and free (MiB), and a release flag that asks the whole balloon back.
 /// Reconnects on the next tick if the stream is gone; the host treats a
 /// closed stream as a release.
-fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, idle_for: u32) {
+/// Containers with a process in them: one child cgroup each under the
+/// containers' cgroup.
+fn running_containers(containers: &str) -> usize {
+    std::fs::read_dir(containers)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter(|e| {
+                    std::fs::read_to_string(e.path().join("cgroup.procs"))
+                        .map(|p| !p.trim().is_empty())
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, idle: bool) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
         meminfo
@@ -325,13 +349,21 @@ fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, idle_for: u32) {
             >> 10
     };
     let (avail, free) = (field("MemAvailable:"), field("MemFree:"));
-    let reserve = (total >> 20) / 16;
+    let reserve = (total >> 20) / 8;
     // Release is its own word: an offer of zero means "nothing more", and
     // the balloon holds what it has. Said as one number, the guest asked
     // for everything back each time inflation dipped it under its line,
     // and the target flapped between fourteen gigabytes and none.
-    let release = idle_for == 0 || free < reserve / 4;
-    let spare = if !release && idle_for >= 2 && avail > reserve {
+    //
+    // And the balloon is asked back when memory is wanted, not when a
+    // container merely does something: a daily driver's idle Postgres
+    // answering a query would otherwise deflate gigabytes and take them
+    // again two seconds later, every time. Work draws on the reserve —
+    // an eighth of RAM — and when half of it is gone the whole balloon
+    // comes back at a few gigabytes a second; deflate-on-OOM stands
+    // behind that.
+    let release = free < reserve / 2;
+    let spare = if !release && idle && avail > reserve {
         avail - reserve
     } else {
         0
