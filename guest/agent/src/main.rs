@@ -264,8 +264,9 @@ fn bound_container_cache() {
         // after the last case where anything looking at the machine looks
         // at five.) The release, though, is theirs: only work that is
         // running and short of memory asks the balloon back.
-        let active = idle_for == 0 && running_containers(containers) > 0;
-        offer_memory(&mut memory_stream, total, active);
+        let running = running_containers(containers);
+        let active = idle_for == 0 && running > 0;
+        offer_memory(&mut memory_stream, total, active, running == 0);
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
@@ -334,7 +335,7 @@ fn running_containers(containers: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool) {
+fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool, nothing_runs: bool) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
         meminfo
@@ -346,7 +347,13 @@ fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool) {
             >> 10
     };
     let (avail, free) = (field("MemAvailable:"), field("MemFree:"));
-    let reserve = (total >> 20) / 8;
+    // An eighth of RAM while containers run — a command starting draws on
+    // it while the balloon deflates — and a thirty-second when nothing runs
+    // at all: a 4 GiB guest with no container kept 512 MiB free that
+    // reporting could not return in runs, 600 MB at a minute against the
+    // record. Deflation at gigabytes a second, and deflate-on-OOM behind
+    // it, are what a container starting into the thin reserve gets.
+    let reserve = (total >> 20) / if nothing_runs { 32 } else { 8 };
     // Release is its own word: an offer of zero means "nothing more", and
     // the balloon holds what it has. Said as one number, the guest asked
     // for everything back each time inflation dipped it under its line,
