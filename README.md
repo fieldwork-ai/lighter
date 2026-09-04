@@ -78,7 +78,7 @@ OrbStack, Colima and Docker Desktop were measured on the same machines in the sa
 | `rm -rf node_modules` | 3.65 s | **2.39 s** (153%) | 2.97 s (123%) | 8.05 s (45%) | 6.56 s (56%) |
 | Host file edit -> container | 2 ms | **2 ms** | — | 1.00 s | 1.00 s |
 
-#### What the runtime costs the Mac
+#### Memory footprint
 
 The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: settled before an `npm ci`, at its peak during one, and 15 and 60 seconds after it ends with nothing running. Lower is better throughout.
 
@@ -105,7 +105,7 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 | GET on a published port, p99 | µs | 70 | 220 | **119** | 361 | 245 |
 | DNS lookup from a container, median | µs | 2850 | **55** | 251 | 483 | 474 |
 
-#### What an idle runtime costs
+#### Idle power
 
 After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better.
 
@@ -137,7 +137,7 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 | `rm -rf node_modules` | 5.37 s | **3.46 s** (155%) | 3.97 s (135%) | 12.38 s (43%) | 12.78 s (42%) |
 | Host file edit -> container | 2 ms | **2 ms** | **2 ms** | 6 ms | 10 ms |
 
-#### What the runtime costs the Mac
+#### Memory footprint
 
 The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: settled before an `npm ci`, at its peak during one, and 15 and 60 seconds after it ends with nothing running. Lower is better throughout.
 
@@ -164,7 +164,7 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 | GET on a published port, p99 | µs | 97 | 242 | **231** | 539 | 497 |
 | DNS lookup from a container, median | µs | 3851 | **141** | 422 | 714 | 765 |
 
-#### What an idle runtime costs
+#### Idle power
 
 After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better.
 

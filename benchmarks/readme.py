@@ -174,13 +174,13 @@ def section():
             out += [share, ""]
         memory = memory_table(results)
         if memory:
-            out += ["#### What the runtime costs the Mac", "", MEMORY_INTRO, "", memory, ""]
+            out += ["#### Memory footprint", "", MEMORY_INTRO, "", memory, ""]
         network = network_table(results)
         if network:
             out += ["#### The network", "", NETWORK_INTRO, "", network, ""]
         power = power_table(results)
         if power:
-            out += ["#### What an idle runtime costs", "", POWER_INTRO, "", power, ""]
+            out += ["#### Idle power", "", POWER_INTRO, "", power, ""]
     out += ["`benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.", ""]
     return "\n".join(out)
 
