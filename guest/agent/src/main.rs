@@ -677,50 +677,70 @@ fn splice_copy(from: &impl AsRawFd, to: &impl AsRawFd, fallback: impl FnOnce()) 
     }
     // SAFETY: fresh descriptors we own.
     let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    // The pipe's capacity bounds each splice; a megabyte keeps the two
-    // calls per chunk from being the cost.
-    // SAFETY: F_SETPIPE_SZ with an int argument.
-    unsafe { libc::fcntl(wr.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
-    const CHUNK: usize = 1 << 20;
-    let mut first = true;
-    loop {
-        // SAFETY: descriptors are live; null offsets for sockets and pipes.
-        let n = unsafe {
-            libc::splice(from.as_raw_fd(), std::ptr::null_mut(), wr.as_raw_fd(), std::ptr::null_mut(), CHUNK, libc::SPLICE_F_MOVE)
-        };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if first && e.raw_os_error() == Some(libc::EINVAL) {
-                return fallback();
-            }
-            break;
+    // The pipe is the buffer between the two legs, and the legs run on two
+    // threads: one moves the socket's bytes into the pipe as they arrive,
+    // the other moves the pipe's onto vsock as it has credit. One thread
+    // doing both in turn waited for each in turn — 62% busy at 60 Gbit/s
+    // with every other stage of the path measured above 120.
+    // SAFETY: F_SETPIPE_SZ with an int argument; init raised the ceiling.
+    unsafe { libc::fcntl(wr.as_raw_fd(), libc::F_SETPIPE_SZ, 4 << 20) };
+    const CHUNK: usize = 4 << 20;
+    let from_fd = from.as_raw_fd();
+    let to_fd = to.as_raw_fd();
+
+    // Probe once on this thread so an unsupported source falls back before
+    // anything is split across threads.
+    // SAFETY: descriptors are live; null offsets for sockets and pipes.
+    let first = unsafe {
+        libc::splice(from_fd, std::ptr::null_mut(), wr.as_raw_fd(), std::ptr::null_mut(), CHUNK, libc::SPLICE_F_MOVE)
+    };
+    if first < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINVAL) {
+            return fallback();
         }
-        if n == 0 {
-            break;
-        }
-        first = false;
-        let mut left = n as usize;
-        while left > 0 {
+        return;
+    }
+    if first == 0 {
+        return;
+    }
+
+    let inbound = std::thread::spawn(move || {
+        loop {
             // SAFETY: as above.
-            let m = unsafe {
-                libc::splice(rd.as_raw_fd(), std::ptr::null_mut(), to.as_raw_fd(), std::ptr::null_mut(), left, libc::SPLICE_F_MOVE)
+            let n = unsafe {
+                libc::splice(from_fd, std::ptr::null_mut(), wr.as_raw_fd(), std::ptr::null_mut(), CHUNK, libc::SPLICE_F_MOVE)
             };
-            if m < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted {
+            if n < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return;
+                break;
             }
-            if m == 0 {
-                return;
+            if n == 0 {
+                break;
             }
-            left -= m as usize;
+        }
+        // Dropping the write end is the pipe's EOF for the other thread.
+        drop(wr);
+    });
+    loop {
+        // SAFETY: as above.
+        let m = unsafe {
+            libc::splice(rd.as_raw_fd(), std::ptr::null_mut(), to_fd, std::ptr::null_mut(), CHUNK, libc::SPLICE_F_MOVE)
+        };
+        if m < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if m == 0 {
+            break;
         }
     }
+    drop(rd);
+    let _ = inbound.join();
 }
 
 fn copy(from: &mut impl Read, to: &mut impl Write) {
