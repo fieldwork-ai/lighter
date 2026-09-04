@@ -238,14 +238,17 @@ fn map_lookup_present(map: RawFd, key: &[u8], value_len: usize) -> bool {
 fn kick(fd: RawFd) {
     let one: libc::c_int = 1;
     // SAFETY: a live socket descriptor and an int-sized option value.
-    unsafe {
+    let rc = unsafe {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVLOWAT,
             std::ptr::addr_of!(one).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        )
+    };
+    if rc < 0 {
+        eprintln!("lighter-agent: kick fd={fd}: {}", io::Error::last_os_error());
     }
 }
 
