@@ -16,6 +16,7 @@ FROM alpine:3.21 AS rootfs
 # Virtualization.framework, which is a check we are not going to work around.
 # See `docs/x86-64.md`.
 RUN apk add --no-cache \
+	iproute2 \
 	docker-engine \
 	containerd \
 	runc \

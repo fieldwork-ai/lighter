@@ -699,6 +699,7 @@ impl Loop {
                     crate::sockbuf::widen(&socket);
                     self.kq.read(fd, true);
                     self.udp_by_fd.insert(fd, (key, flow));
+                    tracing::debug!(flow, %dst, fd, "udp: flow opened");
                     if let Some(old) = flows.insert(flow, socket) {
                         let ofd = old.as_raw_fd();
                         self.kq.forget(ofd);
@@ -709,7 +710,8 @@ impl Loop {
                     if let Some(socket) = flows.get(&flow) {
                         // A datagram the socket cannot take right now is a
                         // datagram lost, which is what UDP promises.
-                        let _ = socket.send(payload);
+                        let r = socket.send(payload);
+                        tracing::debug!(flow, len = payload.len(), ok = r.is_ok(), "udp: sent");
                     }
                 }
                 UDP_KIND_CLOSE => {
@@ -743,7 +745,9 @@ impl Loop {
             }
         }
         if !batch.is_empty() {
-            let _ = self.shared.try_send_owned(key, batch, false);
+            let len = batch.len();
+            let r = self.shared.try_send_owned(key, batch, false);
+            tracing::debug!(flow, len, ok = r.is_ok(), "udp: replies to the guest");
         }
     }
 

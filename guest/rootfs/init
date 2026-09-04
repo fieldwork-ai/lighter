@@ -367,15 +367,26 @@ table inet lighter {
 	chain prerouting {
 		type nat hook prerouting priority dstnat - 10; policy accept;
 		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
-		meta l4proto udp udp dport != { 53, 67, 68 } fib daddr oif "eth0" redirect to :15202
 	}
 	chain output {
 		type nat hook output priority dstnat - 10; policy accept;
 		meta l4proto tcp oifname "eth0" redirect to :15201
-		meta l4proto udp udp dport != { 53, 67, 68 } oifname "eth0" redirect to :15202
+	}
+	# UDP by TPROXY rather than REDIRECT: a redirected datagram reaches the
+	# agent with its destination already rewritten and no way back to the
+	# original (the socket option that names it reports the rewritten
+	# header; conntrack answers only for a connected socket). TPROXY hands
+	# the datagram over untouched — the agent's socket is transparent — and
+	# the policy route below is what makes a foreign destination deliverable
+	# locally. DNS and DHCP excepted, as for TCP's redirect.
+	chain divert {
+		type filter hook prerouting priority mangle; policy accept;
+		meta l4proto udp udp dport != { 53, 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
 	}
 }
 EOF
+	ip rule add fwmark 0x1 lookup 100 2>/dev/null
+	ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
 	if nft -f /run/lighter.nft 2>/dev/console; then
 		echo "INIT streams=on"
 	else

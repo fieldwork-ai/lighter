@@ -1,18 +1,19 @@
 //! UDP carried to the host as datagrams over one vsock stream.
 //!
-//! netfilter redirects every UDP datagram that would leave through eth0 to
-//! the socket here (DNS and DHCP excepted; the first is answered by the DNS
-//! forwarder, the second is the guest's own business with gvproxy). Each
-//! datagram's original destination comes back with it (`IP_RECVORIGDSTADDR`),
-//! which with its source names a flow; the host keeps one socket per flow
-//! and the two ends exchange frames over a single stream:
+//! netfilter diverts every UDP datagram that would leave through eth0 to the
+//! socket here by TPROXY (DNS and DHCP excepted; the first is answered by the
+//! DNS forwarder, the second is the guest's own business with gvproxy), so it
+//! arrives with its destination intact; the socket is transparent, and reads
+//! that destination with each datagram (`IP_RECVORIGDSTADDR`), which with the
+//! source names a flow. The host keeps one socket per flow and the two ends
+//! exchange frames over a single stream:
 //!
 //!     len u16 | flow u32 | kind u8 | payload
 //!
 //! `kind` is 0 for data, 1 for a flow opening (the payload is the destination:
 //! family, sixteen address bytes, port), 2 for a flow closing. A reply is sent
-//! to the container from the redirected socket itself, so conntrack restores
-//! the destination the container spoke to as the source it hears from.
+//! to the container from a transparent socket bound to the destination it
+//! spoke to, so that is the source it hears from.
 //!
 //! Datagrams are taken in batches (`recvmmsg`) and written as one frame batch,
 //! so a stream of small datagrams is a stream of large vsock packets rather
@@ -38,7 +39,74 @@ const IDLE: Duration = Duration::from_secs(60);
 
 struct Flow {
     src: SocketAddr,
+    /// Bound to the flow's destination, transparently: replies come from
+    /// where the container sent to.
+    reply: Option<UdpSocket>,
     last: Instant,
+}
+
+const IP_TRANSPARENT: libc::c_int = 19;
+
+fn transparent(fd: i32) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: a live socket and an int-sized option value.
+    if unsafe {
+        libc::setsockopt(fd, libc::SOL_IP, IP_TRANSPARENT, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t)
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A socket that answers as the flow's destination.
+fn reply_socket(dst: SocketAddr) -> Option<UdpSocket> {
+    // SAFETY: plain socket creation.
+    let fd = unsafe { libc::socket(if dst.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 }, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a fresh descriptor we own.
+    let socket: UdpSocket = unsafe { <UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    transparent(fd).ok()?;
+    let one: libc::c_int = 1;
+    // SAFETY: as above; the port may be one a local service also holds.
+    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t) };
+    let sa = sockaddr_of(dst);
+    // SAFETY: a sockaddr filled for the family, of the length given.
+    if unsafe { libc::bind(fd, sa.0.as_ptr().cast(), sa.1) } < 0 {
+        return None;
+    }
+    Some(socket)
+}
+
+fn sockaddr_of(addr: SocketAddr) -> ([u8; size_of::<libc::sockaddr_storage>()], libc::socklen_t) {
+    let mut buf = [0u8; size_of::<libc::sockaddr_storage>()];
+    match addr {
+        SocketAddr::V4(a) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from(*a.ip()).to_be() },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: copying a plain struct into a buffer of at least its size.
+            unsafe { std::ptr::write_unaligned(buf.as_mut_ptr().cast(), sin) };
+            (buf, size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        SocketAddr::V6(a) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+                sin6_scope_id: 0,
+            };
+            // SAFETY: as above.
+            unsafe { std::ptr::write_unaligned(buf.as_mut_ptr().cast(), sin6) };
+            (buf, size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
 }
 
 /// Flows by id, for the reply thread; and by (source, destination), for the
@@ -74,7 +142,21 @@ fn destination_bytes(dst: SocketAddr) -> [u8; 19] {
 }
 
 pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))?;
+    // Transparent before bind: what TPROXY diverts is delivered to it
+    // whatever the destination says.
+    // SAFETY: plain socket creation.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor we own.
+    let socket: UdpSocket = unsafe { <UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+    transparent(raw)?;
+    let sa = sockaddr_of(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port));
+    // SAFETY: a sockaddr_in in a buffer of its size.
+    if unsafe { libc::bind(raw, sa.0.as_ptr().cast(), sa.1) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     let fd = socket.as_raw_fd();
     let one: libc::c_int = 1;
     // SAFETY: a live socket and an int-sized option value.
@@ -115,7 +197,10 @@ pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
                     KIND_DATA => {
                         if let Some(f) = flows.by_id.get_mut(&flow) {
                             f.last = Instant::now();
-                            let _ = reply_socket.send_to(&payload[..len], f.src);
+                            let _ = match &f.reply {
+                                Some(s) => s.send_to(&payload[..len], f.src),
+                                None => reply_socket.send_to(&payload[..len], f.src),
+                            };
                         }
                     }
                     KIND_CLOSE => {
@@ -163,7 +248,7 @@ pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
         }
         // SAFETY: the tables above outlive the call and describe BATCH
         // messages with buffers of DATAGRAM bytes each.
-        let n = unsafe { libc::recvmmsg(fd, msgs.as_mut_ptr(), BATCH as libc::c_uint, libc::MSG_WAITFORONE, std::ptr::null_mut()) };
+        let n = unsafe { libc::recvmmsg(fd, msgs.as_mut_ptr(), BATCH as libc::c_uint, libc::MSG_WAITFORONE as libc::c_uint, std::ptr::null_mut()) };
         if n < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -188,7 +273,7 @@ pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
                         let id = flows.next;
                         flows.next = flows.next.wrapping_add(1);
                         flows.ids.insert((src, dst), id);
-                        flows.by_id.insert(id, Flow { src, last: Instant::now() });
+                        flows.by_id.insert(id, Flow { src, reply: reply_socket(dst), last: Instant::now() });
                         frame(&mut out, id, KIND_OPEN, &destination_bytes(dst));
                         id
                     }
