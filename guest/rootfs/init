@@ -289,16 +289,18 @@ link_mtu=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1500)
 # bound_container_cache).
 mkdir -p /sys/fs/cgroup/engine
 echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
-(
+# A fresh shell rather than a subshell: in a subshell `$$` is still the
+# parent's pid, and the engine ran in the root cgroup for a day — a daily
+# driver held eight gigabytes of image-layer cache no trim could reach.
+sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
 	exec dockerd \
 		--host=unix:///run/docker.sock \
 		--data-root=/var/lib/docker \
 		--storage-driver=overlay2 \
 		--userland-proxy=false \
-		--mtu="$link_mtu" \
-		>/var/log/dockerd.log 2>&1
-) &
+		--mtu="$1" \
+		>/var/log/dockerd.log 2>&1' engine "$link_mtu" &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on
