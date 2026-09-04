@@ -232,18 +232,29 @@ fn joiner() -> Option<&'static sockmap::Joiner> {
         .as_ref()
 }
 
-/// Two sockets joined in the kernel until either end closes: this thread
-/// only watches for hangups and propagates the half-close each way.
+/// Two sockets joined in the kernel until both are done: the kernel moves
+/// the bytes and, when either end's stream ends, shuts the other down for
+/// sending behind the last of them (guest kernel patch 0016). This thread
+/// only waits for the hangup on both, then closes them.
 fn joined(joiner: &sockmap::Joiner, tcp: RawFd, host: RawFd) -> io::Result<()> {
+    // The host's end of a stream that ended before the join never reaches
+    // the kernel's marker (it is queued only for a socket already joined);
+    // such a stream is carried by the copying path instead.
+    if hung_up(host) & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+        return Err(io::Error::other("already half-closed"));
+    }
     let slots = joiner.join(tcp, host)?;
+    // A socket reports HUP once both its directions are shut: its peer's
+    // end seen, and its own sent by the kernel behind the redirected bytes.
+    // HUP on both means neither backlog holds anything. An error on either
+    // is an abort, and the other side is closed with whatever it has.
     let mut fds = [
-        libc::pollfd { fd: tcp, events: libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR, revents: 0 },
-        libc::pollfd { fd: host, events: libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR, revents: 0 },
+        libc::pollfd { fd: tcp, events: libc::POLLRDHUP, revents: 0 },
+        libc::pollfd { fd: host, events: libc::POLLRDHUP, revents: 0 },
     ];
-    let mut tcp_done = false;
-    let mut host_done = false;
-    while !(tcp_done && host_done) {
-        // SAFETY: two live descriptors in a pollfd array.
+    let mut hups = 0;
+    while hups < 2 {
+        // SAFETY: two descriptors (or -1 for one already done) in a pollfd array.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
         if n < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -251,23 +262,38 @@ fn joined(joiner: &sockmap::Joiner, tcp: RawFd, host: RawFd) -> io::Result<()> {
             }
             break;
         }
-        if !tcp_done && fds[0].revents != 0 {
-            tcp_done = true;
-            fds[0].events = 0;
-            // The container is done sending; the host is owed its EOF.
-            // SAFETY: a live descriptor; write-half shutdown only.
-            unsafe { libc::shutdown(host, libc::SHUT_WR) };
+        let mut aborted = false;
+        for p in fds.iter_mut() {
+            if p.fd < 0 {
+                continue;
+            }
+            if p.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                aborted = true;
+            } else if p.revents & libc::POLLHUP != 0 {
+                hups += 1;
+                p.fd = -1;
+            } else if p.revents & libc::POLLRDHUP != 0 {
+                // Level-triggered; the half-close is noted, the HUP is what
+                // is waited for now.
+                p.events = 0;
+            }
         }
-        if !host_done && fds[1].revents != 0 {
-            host_done = true;
-            fds[1].events = 0;
-            // SAFETY: as above.
-            unsafe { libc::shutdown(tcp, libc::SHUT_WR) };
+        if aborted {
+            break;
         }
     }
     joiner.part(tcp, host, slots);
     Ok(())
 }
+
+/// The socket's poll state right now, without waiting.
+fn hung_up(fd: RawFd) -> libc::c_short {
+    let mut p = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
+    // SAFETY: one live descriptor, zero timeout.
+    unsafe { libc::poll(&mut p, 1, 0) };
+    p.revents
+}
+
 /// The credit window a stream advertises: a millisecond of a fast link.
 const STREAM_WINDOW: u64 = 8 << 20;
 

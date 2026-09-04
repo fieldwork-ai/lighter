@@ -14,6 +14,17 @@
 //! toolchain — and does one thing: look up the socket's cookie in a hash to
 //! find its peer's slot, and redirect to it.
 //!
+//! Two sockmaps, because a socket starts running verdicts the moment it
+//! enters a map with a program, and a verdict whose peer is not yet in the
+//! target map drops the bytes. Both sockets enter `targets`, which has no
+//! program, before either enters `attach`, which has the verdict — so every
+//! verdict finds its peer. And joining hooks a socket's data-ready callback
+//! without running it, so bytes queued before the join (a request that
+//! arrived in full while this process was still connecting the other end)
+//! would sit until the next packet: the join ends by poking each socket's
+//! receive low-water mark, which is TCP's own "signal readiness now" path
+//! and runs the verdict over the queue in order.
+//!
 //!     r6 = r1                      ; the skb
 //!     r1 = r6; call get_socket_cookie ; r0 = cookie
 //!     *(u64 *)(r10 - 8) = r0
@@ -220,6 +231,24 @@ fn map_lookup_present(map: RawFd, key: &[u8], value_len: usize) -> bool {
     bpf(BPF_MAP_LOOKUP_ELEM, &mut attr).is_ok()
 }
 
+/// Runs the socket's data-ready path now, so bytes queued before it joined
+/// are put through the verdict. Setting the receive low-water mark is how
+/// TCP offers that from user space (`tcp_set_rcvlowat` calls
+/// `tcp_data_ready`); the value, one byte, is the default anyway.
+fn kick(fd: RawFd) {
+    let one: libc::c_int = 1;
+    // SAFETY: a live socket descriptor and an int-sized option value.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVLOWAT,
+            std::ptr::addr_of!(one).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 fn socket_cookie(fd: RawFd) -> io::Result<u64> {
     let mut cookie: u64 = 0;
     let mut len = size_of::<u64>() as libc::socklen_t;
@@ -292,7 +321,10 @@ pub fn probe() {
 
 /// The maps and the program, created once.
 pub struct Joiner {
-    sockets: OwnedFd,
+    /// Where redirects land; no program attached.
+    targets: OwnedFd,
+    /// Where the verdict program is attached; entered last.
+    attach: OwnedFd,
     peers: OwnedFd,
     _program: OwnedFd,
     /// Free slots in `sockets`, reused after a stream ends.
@@ -301,9 +333,10 @@ pub struct Joiner {
 
 impl Joiner {
     pub fn new() -> io::Result<Joiner> {
-        let sockets = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
+        let targets = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
+        let attach = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
         let peers = map_create(BPF_MAP_TYPE_HASH, 8, 4, SLOTS)?;
-        let insns = program(peers.as_raw_fd(), sockets.as_raw_fd());
+        let insns = program(peers.as_raw_fd(), targets.as_raw_fd());
         let mut log = vec![0u8; 64 * 1024];
         let mut attr = Attr { zero: [0; 128] };
         attr.prog = ProgLoad {
@@ -330,14 +363,15 @@ impl Joiner {
         let program = unsafe { OwnedFd::from_raw_fd(prog) };
         let mut attr = Attr { zero: [0; 128] };
         attr.attach = ProgAttach {
-            target_fd: sockets.as_raw_fd() as u32,
+            target_fd: attach.as_raw_fd() as u32,
             attach_bpf_fd: program.as_raw_fd() as u32,
             attach_type: BPF_SK_SKB_VERDICT,
             attach_flags: 0,
         };
         bpf(BPF_PROG_ATTACH, &mut attr)?;
         Ok(Joiner {
-            sockets,
+            targets,
+            attach,
             peers,
             _program: program,
             free: Mutex::new((0..SLOTS).rev().collect()),
@@ -360,10 +394,14 @@ impl Joiner {
         // finds where to go.
         map_update(self.peers.as_raw_fd(), &cookie_a.to_ne_bytes(), &slot_b.to_ne_bytes())?;
         map_update(self.peers.as_raw_fd(), &cookie_b.to_ne_bytes(), &slot_a.to_ne_bytes())?;
-        let fd_a = a as u64;
-        let fd_b = b as u64;
-        map_update(self.sockets.as_raw_fd(), &slot_a.to_ne_bytes(), &fd_a.to_ne_bytes()[..4])?;
-        map_update(self.sockets.as_raw_fd(), &slot_b.to_ne_bytes(), &fd_b.to_ne_bytes()[..4])?;
+        let fd_a = (a as u32).to_ne_bytes();
+        let fd_b = (b as u32).to_ne_bytes();
+        map_update(self.targets.as_raw_fd(), &slot_a.to_ne_bytes(), &fd_a)?;
+        map_update(self.targets.as_raw_fd(), &slot_b.to_ne_bytes(), &fd_b)?;
+        map_update(self.attach.as_raw_fd(), &slot_a.to_ne_bytes(), &fd_a)?;
+        map_update(self.attach.as_raw_fd(), &slot_b.to_ne_bytes(), &fd_b)?;
+        kick(a);
+        kick(b);
         Ok((slot_a, slot_b))
     }
 
@@ -376,8 +414,10 @@ impl Joiner {
         if let Ok(c) = socket_cookie(b) {
             let _ = map_delete(self.peers.as_raw_fd(), &c.to_ne_bytes());
         }
-        let _ = map_delete(self.sockets.as_raw_fd(), &slots.0.to_ne_bytes());
-        let _ = map_delete(self.sockets.as_raw_fd(), &slots.1.to_ne_bytes());
+        for map in [self.attach.as_raw_fd(), self.targets.as_raw_fd()] {
+            let _ = map_delete(map, &slots.0.to_ne_bytes());
+            let _ = map_delete(map, &slots.1.to_ne_bytes());
+        }
         let mut free = self.free.lock().expect("sockmap slots poisoned");
         free.push(slots.0);
         free.push(slots.1);
@@ -385,6 +425,6 @@ impl Joiner {
 
     /// Whether a socket is still in the map (it leaves when it closes).
     pub fn holds(&self, slot: u32) -> bool {
-        map_lookup_present(self.sockets.as_raw_fd(), &slot.to_ne_bytes(), 8)
+        map_lookup_present(self.targets.as_raw_fd(), &slot.to_ne_bytes(), 8)
     }
 }
