@@ -387,11 +387,14 @@ impl VsockShared {
     /// look at the ring.
     fn complete(&self, heads: impl IntoIterator<Item = u16>) {
         let mut inner = self.lock();
-        let before = inner.done.len();
         inner.done.extend(heads);
-        let any = inner.done.len() > before;
+        // Returned on the next look at either ring, which the credit update
+        // or the guest's next packet brings; a wake per batch was a guest
+        // interrupt for every few hundred kilobytes. A pile of them is
+        // pushed out rather than left: the ring is finite.
+        let pile = inner.done.len() >= 32;
         drop(inner);
-        if any {
+        if pile {
             self.wake();
         }
     }
@@ -671,6 +674,8 @@ impl Vsock {
                     Vsock::retire(inner, conn);
                     tracing::debug!(host_port, "vsock reset by guest");
                 }
+                // Running under the transport lock already: the retired
+                // chains go back in this very pass.
             }
 
             Op::Shutdown => {
