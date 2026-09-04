@@ -348,12 +348,12 @@ fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool, nothing_
     };
     let (avail, free) = (field("MemAvailable:"), field("MemFree:"));
     // An eighth of RAM while containers run — a command starting draws on
-    // it while the balloon deflates — and a thirty-second when nothing runs
-    // at all: a 4 GiB guest with no container kept 512 MiB free that
+    // it while the balloon deflates — and a sixteenth when nothing runs at
+    // all: a 4 GiB guest with no container kept 512 MiB free that
     // reporting could not return in runs, 600 MB at a minute against the
-    // record. Deflation at gigabytes a second, and deflate-on-OOM behind
-    // it, are what a container starting into the thin reserve gets.
-    let reserve = (total >> 20) / if nothing_runs { 32 } else { 8 };
+    // record. A thirty-second was tried: 128 MiB left the container that
+    // materializes the next case's tree without room to start.
+    let reserve = (total >> 20) / if nothing_runs { 16 } else { 8 };
     // Release is its own word: an offer of zero means "nothing more", and
     // the balloon holds what it has. Said as one number, the guest asked
     // for everything back each time inflation dipped it under its line,

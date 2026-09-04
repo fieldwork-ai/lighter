@@ -225,7 +225,15 @@ impl Steering {
         let pages = if release {
             0
         } else if spare_mib < 64 {
-            return;
+            // Hold at what the balloon actually holds, not at the target it
+            // was given: a target past what the guest could spare has the
+            // driver retrying its last pages every 200 ms for good ("Out of
+            // puff"), reclaiming a little each time.
+            let actual = self.balloon.actual_pages();
+            if actual >= self.guest_pages.load(Ordering::Relaxed) {
+                return;
+            }
+            actual
         } else {
             // Never lower on an offer: the balloon's count of what it holds
             // lags its allocations, and a target summed from a stale count
