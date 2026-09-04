@@ -159,6 +159,19 @@ impl Packet {
         out
     }
 
+    /// A packet from its header alone, the payload left where it is: for a
+    /// reader that hands the guest's own buffers to a writer. The declared
+    /// length is the caller's to check against what it found.
+    pub fn header_only(header: &[u8; HDR_LEN]) -> Option<Packet> {
+        let len = u32::from_le_bytes([header[24], header[25], header[26], header[27]]) as usize;
+        if len > MAX_PAYLOAD {
+            return None;
+        }
+        let mut copy = *header;
+        copy[24..28].copy_from_slice(&0u32.to_le_bytes());
+        Packet::from_parts(&copy, Vec::new())
+    }
+
     /// A packet from a header already read and a payload already owned,
     /// for a reader that copied the payload out of the guest exactly once.
     /// `None` when the header's length does not match the payload given.

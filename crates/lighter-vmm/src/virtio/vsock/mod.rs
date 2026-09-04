@@ -877,7 +877,7 @@ impl Vsock {
             }
             let total: usize = spans.iter().map(|(_, n)| n).sum();
             let parsed = if ok && have == HDR_LEN && total == declared {
-                Packet::from_parts(&header, Vec::new()).map(|mut p| {
+                Packet::header_only(&header).map(|mut p| {
                     // A payload on a packet that is not RW is small and
                     // rare (nothing in the protocol has one); copy it so the
                     // packet can be handled whole.
@@ -1082,6 +1082,22 @@ impl VirtioDevice for Vsock {
                 tracing::debug!(queue = other, "vsock notified on an unknown queue");
                 Serviced::NONE
             }
+        };
+
+        // Chains a writer finished with go back whichever queue was notified:
+        // the writer's wake services RX, and a guest whose transmit ring is
+        // full of held chains is waiting for exactly this before it will
+        // kick TX again.
+        let serviced = match queues.get_mut(TX_QUEUE as usize) {
+            Some(tx) => {
+                let mut inner = self.shared.lock();
+                if Vsock::complete_done(&mut inner, tx, mem) {
+                    serviced.and(Serviced::queue(TX_QUEUE))
+                } else {
+                    serviced
+                }
+            }
+            None => serviced,
         };
 
         // A packet from the guest usually produces a reply — a RESPONSE, a
@@ -1348,7 +1364,7 @@ mod tests {
             flat(shared.take_outbound(port)).as_deref(),
             Some(&b"tail"[..])
         );
-        assert_eq!(shared.take_outbound(port), None, "then end of stream");
+        assert!(shared.take_outbound(port).is_none(), "then end of stream");
     }
 
     #[test]
@@ -1377,7 +1393,7 @@ mod tests {
             inner.conns[&port]
                 .outbound
                 .iter()
-                .map(Vec::len)
+                .map(Chunk::len)
                 .sum::<usize>(),
             5,
             "the payload should be queued for the writer thread"
