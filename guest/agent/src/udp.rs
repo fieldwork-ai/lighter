@@ -60,7 +60,7 @@ fn transparent(fd: i32) -> std::io::Result<()> {
 }
 
 /// A socket that answers as the flow's destination.
-fn reply_socket(dst: SocketAddr) -> Option<UdpSocket> {
+fn bound_reply_socket(dst: SocketAddr) -> Option<UdpSocket> {
     // SAFETY: plain socket creation.
     let fd = unsafe { libc::socket(if dst.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 }, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -158,6 +158,16 @@ pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     let fd = socket.as_raw_fd();
+    // A container sends at line rate into this one socket; the default
+    // receive buffer dropped seven datagrams in eight at 13 Gbit/s.
+    let buf: libc::c_int = 16 << 20;
+    // SAFETY: a live socket and an int-sized option value.
+    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, std::ptr::addr_of!(buf).cast(), size_of::<libc::c_int>() as libc::socklen_t) };
+    // The bridge's netfilter call runs the IP prerouting hooks in the
+    // bridge's context for traffic off docker0, where a socket TPROXY
+    // assigns does not survive into routing: every datagram counted as
+    // "no port". dockerd turns it on at start; off again here, and in init.
+    let _ = std::fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "0");
     let one: libc::c_int = 1;
     // SAFETY: a live socket and an int-sized option value.
     if unsafe {
@@ -273,7 +283,7 @@ pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
                         let id = flows.next;
                         flows.next = flows.next.wrapping_add(1);
                         flows.ids.insert((src, dst), id);
-                        flows.by_id.insert(id, Flow { src, reply: reply_socket(dst), last: Instant::now() });
+                        flows.by_id.insert(id, Flow { src, reply: bound_reply_socket(dst), last: Instant::now() });
                         frame(&mut out, id, KIND_OPEN, &destination_bytes(dst));
                         id
                     }

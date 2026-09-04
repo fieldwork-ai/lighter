@@ -325,6 +325,13 @@ while [ "$waited" -lt 60 ]; do
 done
 
 echo "INIT dockerd=$dockerd_state after=${waited}s"
+# dockerd turns the bridge's netfilter call on at start, which runs the IP
+# prerouting hooks in the bridge's context for traffic off docker0 — and a
+# socket TPROXY assigns there does not survive into routing, so a
+# container's UDP counted as "no port". Off: published ports are DNAT on
+# routed traffic and unaffected, and the isolation between Docker networks
+# is on the forward hook, likewise.
+sysctl -q -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 if [ "$dockerd_state" != ready ]; then
 	echo "--- dockerd log ---"
 	tail -30 /var/log/dockerd.log
