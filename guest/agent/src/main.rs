@@ -14,6 +14,7 @@
 //! ```
 
 mod sockmap;
+mod udp;
 mod vsock;
 
 use std::io::{self, Read, Write};
@@ -30,6 +31,7 @@ fn main() -> std::process::ExitCode {
     let mut tcp_proxy: Option<u16> = None;
     let mut inbound: Option<u32> = None;
     let mut dns: Option<String> = None;
+    let mut udp_proxy: Option<u16> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -54,6 +56,9 @@ fn main() -> std::process::ExitCode {
             // Answers DNS on the given address by carrying each query to the
             // host over one vsock stream; the Mac's own resolver answers.
             "--dns" => dns = args.next(),
+            // Takes the UDP datagrams netfilter redirects to it and carries
+            // every flow to the host over one vsock stream (see udp.rs).
+            "--udp-proxy" => udp_proxy = args.next().and_then(|v| v.parse().ok()),
             "--bpf-probe" => {
                 sockmap::probe();
                 return std::process::ExitCode::SUCCESS;
@@ -70,6 +75,23 @@ fn main() -> std::process::ExitCode {
     }
     if let Some(port) = inbound {
         return serve_inbound(port);
+    }
+    if let Some(port) = udp_proxy {
+        let host = match vsock::connect(udp::UDP_PORT) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("lighter-agent: udp stream to host refused: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let _ = vsock::set_buffer(&host, STREAM_WINDOW);
+        return match udp::serve(port, Fd(host)) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("lighter-agent: udp proxy: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
     if let Some(addr) = dns {
         return serve_dns(&addr);
@@ -158,6 +180,22 @@ fn bound_container_cache() {
         .map(|kb| kb * 1024);
     let Some(total) = total else { return };
     let containers = "/sys/fs/cgroup/docker";
+    // A bound on the containers' cache while they work, on guests with the
+    // RAM for it: an eighth of RAM from eight gigabytes up, none below, and
+    // `lighter.cachebound=<MiB>` on the command line to say otherwise (0
+    // for none). An install's working set is a gigabyte or two and fits;
+    // what the bound evicts is the stale cache of the builds before it,
+    // which the suite's sequence otherwise grows to the whole of RAM —
+    // a 16 GiB guest read 17 GB in Activity Monitor through an install
+    // against OrbStack's 5.5, whose guest is sized dynamically. On the M1's
+    // 4 GiB guests a bound at half or three quarters of RAM was measured to
+    // cost an install a third, so small guests keep none.
+    let bound = cmdline_value("lighter.cachebound")
+        .map(|mib| mib << 20)
+        .unwrap_or(if total >= 8 << 30 { total / 8 } else { 0 });
+    // dockerd makes the containers' cgroup at the first container, which
+    // can be any time: the bound is written once it exists.
+    let mut bounded = bound == 0;
     // The engine's cgroup (init puts dockerd there): the image layers it
     // extracted, and whatever else it read, charged where a trim can reach.
     let engine = "/sys/fs/cgroup/engine";
@@ -165,6 +203,13 @@ fn bound_container_cache() {
     let mut last = container_cpu_usec(containers);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
+        if !bounded && std::path::Path::new(containers).exists() {
+            bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
+            // The engine's cache (image layers) bounded too, at an eighth of
+            // the containers': measured at a quarter of RAM for the
+            // containers alone, the sequence still read ten gigabytes.
+            let _ = std::fs::write(format!("{engine}/memory.high"), (bound / 8).to_string());
+        }
         let now = container_cpu_usec(containers);
         let used = now.saturating_sub(last);
         last = now;
@@ -221,6 +266,15 @@ fn bound_container_cache() {
         // where a few passes take two.
         compact_until_reportable();
     }
+}
+
+/// A `key=<n>` on the kernel command line, if given.
+fn cmdline_value(key: &str) -> Option<u64> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    cmdline
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+        .and_then(|v| v.parse().ok())
 }
 
 /// The kernel's delay before a free page reporting cycle (patch 0019), the

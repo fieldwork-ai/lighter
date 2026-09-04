@@ -46,6 +46,9 @@ enum Phase {
     /// then owed the port as its first bytes.
     AwaitEstablished(u16),
     Open,
+    /// The guest's UDP, every flow multiplexed on this one stream; the
+    /// flows' sockets are in `Loop::udp_flows`.
+    UdpMux,
 }
 
 struct Stream {
@@ -85,7 +88,15 @@ enum Command {
     Dns(ConnKey),
     /// A DNS reply resolved off-thread, to go out on its stream.
     DnsReply(ConnKey, u16, Vec<u8>),
+    /// The guest's UDP stream (see the agent's udp.rs for the framing).
+    Udp(ConnKey),
 }
+
+/// The UDP frame: length, flow, kind; then the payload.
+const UDP_HEADER: usize = 7;
+const UDP_KIND_DATA: u8 = 0;
+const UDP_KIND_OPEN: u8 = 1;
+const UDP_KIND_CLOSE: u8 = 2;
 
 pub struct Reactor {
     shared: Arc<VsockShared>,
@@ -137,6 +148,12 @@ impl Reactor {
     }
 
     /// A DNS stream the guest opened.
+    /// The guest's UDP stream: one per boot, every flow on it.
+    pub fn accept_udp(&self, key: ConnKey) {
+        self.commands.lock().expect("reactor commands poisoned").push(Command::Udp(key));
+        self.wake();
+    }
+
     pub fn accept_dns(&self, key: ConnKey) {
         self.commands
             .lock()
@@ -167,6 +184,24 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// A UDP flow's destination from its opening frame: family, sixteen
+/// address bytes, port.
+fn udp_destination(payload: &[u8]) -> Option<SocketAddr> {
+    if payload.len() < 19 {
+        return None;
+    }
+    let port = u16::from_be_bytes([payload[17], payload[18]]);
+    match payload[0] {
+        4 => Some(SocketAddr::new(std::net::Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]).into(), port)),
+        6 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&payload[1..17]);
+            Some(SocketAddr::new(std::net::Ipv6Addr::from(b).into(), port))
+        }
+        _ => None,
+    }
 }
 
 /// Where the guest's header says to go.
@@ -341,6 +376,9 @@ struct Loop {
     buf: Vec<u8>,
     memory: Option<Arc<crate::memory::GuestMemory>>,
     counters: Counters,
+    /// Per UDP stream, the flows' sockets by the guest's flow id.
+    udp_flows: HashMap<ConnKey, HashMap<u32, std::net::UdpSocket>>,
+    udp_by_fd: HashMap<RawFd, (ConnKey, u32)>,
 }
 
 fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
@@ -362,6 +400,8 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         buf: Vec::with_capacity(READ_CHUNK),
         memory: None,
         counters: Counters::default(),
+        udp_flows: HashMap::new(),
+        udp_by_fd: HashMap::new(),
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
     // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
@@ -405,6 +445,10 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             let fd = ev.ident as RawFd;
             if fd == wake_read {
                 woken = true;
+                continue;
+            }
+            if let Some(&(key, flow)) = l.udp_by_fd.get(&fd) {
+                l.udp_readable(key, flow);
                 continue;
             }
             let Some(&key) = l.by_fd.get(&fd) else {
@@ -528,6 +572,25 @@ impl Loop {
             Command::DnsReply(key, id, reply) => {
                 self.dns_send(key, id, &reply);
             }
+            Command::Udp(key) => {
+                self.streams.insert(
+                    key,
+                    Stream {
+                        tcp: None,
+                        phase: Phase::UdpMux,
+                        to_guest: Vec::new(),
+                        to_guest_at: 0,
+                        from_guest: VecDeque::new(),
+                        from_guest_at: 0,
+                        tcp_eof: false,
+                        guest_eof: false,
+                        reading: false,
+                        writing: false,
+                        partial: Vec::new(),
+                    },
+                );
+                self.udp_flows.insert(key, HashMap::new());
+            }
             Command::Inbound(port, mac) => {
                 let _ = mac.set_nodelay(true);
                 crate::sockbuf::widen(&mac);
@@ -570,6 +633,120 @@ impl Loop {
     }
 
     /// Queries off a DNS stream: whole frames answered, a partial one kept.
+    /// Frames from the guest's UDP stream: flows opened, datagrams sent,
+    /// flows closed.
+    fn udp_progress(&mut self, key: ConnKey) {
+        let memory = self.memory.clone();
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
+        let chunks = match self.shared.try_take_outbound(key) {
+            Outbound::Chunks(c) => c,
+            Outbound::Empty => return,
+            Outbound::Finished | Outbound::Gone => {
+                self.close(key);
+                return;
+            }
+        };
+        let mut heads: Vec<u16> = Vec::new();
+        let mut bytes = 0u32;
+        for chunk in chunks {
+            match chunk {
+                Chunk::Owned(v) => {
+                    bytes += v.len() as u32;
+                    stream.partial.extend_from_slice(&v);
+                }
+                Chunk::Guest { head, spans } => {
+                    if let Some(mem) = &memory {
+                        for (gpa, len) in &spans {
+                            let start = stream.partial.len();
+                            stream.partial.resize(start + len, 0);
+                            let _ = mem.read(*gpa, &mut stream.partial[start..]);
+                            bytes += *len as u32;
+                        }
+                    }
+                    heads.push(head);
+                }
+            }
+        }
+        if !heads.is_empty() {
+            self.shared.complete(heads);
+        }
+        if bytes > 0 {
+            self.shared.acknowledge(key, bytes);
+        }
+        let mut at = 0usize;
+        while stream.partial.len() - at >= UDP_HEADER {
+            let h = &stream.partial[at..at + UDP_HEADER];
+            let len = u16::from_be_bytes([h[0], h[1]]) as usize;
+            let flow = u32::from_be_bytes([h[2], h[3], h[4], h[5]]);
+            let kind = h[6];
+            if stream.partial.len() - at - UDP_HEADER < len {
+                break;
+            }
+            let payload = &stream.partial[at + UDP_HEADER..at + UDP_HEADER + len];
+            at += UDP_HEADER + len;
+            let flows = self.udp_flows.entry(key).or_default();
+            match kind {
+                UDP_KIND_OPEN => {
+                    let Some(dst) = udp_destination(payload) else { continue };
+                    let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0".parse().expect("addr") } else { "[::]:0".parse().expect("addr") };
+                    let Ok(socket) = std::net::UdpSocket::bind(bind) else { continue };
+                    if socket.connect(dst).is_err() || socket.set_nonblocking(true).is_err() {
+                        continue;
+                    }
+                    let fd = socket.as_raw_fd();
+                    crate::sockbuf::widen(&socket);
+                    self.kq.read(fd, true);
+                    self.udp_by_fd.insert(fd, (key, flow));
+                    if let Some(old) = flows.insert(flow, socket) {
+                        let ofd = old.as_raw_fd();
+                        self.kq.forget(ofd);
+                        self.udp_by_fd.remove(&ofd);
+                    }
+                }
+                UDP_KIND_DATA => {
+                    if let Some(socket) = flows.get(&flow) {
+                        // A datagram the socket cannot take right now is a
+                        // datagram lost, which is what UDP promises.
+                        let _ = socket.send(payload);
+                    }
+                }
+                UDP_KIND_CLOSE => {
+                    if let Some(socket) = flows.remove(&flow) {
+                        let fd = socket.as_raw_fd();
+                        self.kq.forget(fd);
+                        self.udp_by_fd.remove(&fd);
+                    }
+                }
+                _ => {}
+            }
+        }
+        stream.partial.drain(..at);
+    }
+
+    /// A flow's socket has datagrams: each framed, the batch to the guest.
+    /// No credit means the batch is dropped, as UDP allows.
+    fn udp_readable(&mut self, key: ConnKey, flow: u32) {
+        let Some(socket) = self.udp_flows.get(&key).and_then(|f| f.get(&flow)) else { return };
+        let mut batch: Vec<u8> = Vec::with_capacity(64 * 1500);
+        let mut buf = [0u8; 65536];
+        for _ in 0..64 {
+            match socket.recv(&mut buf) {
+                Ok(n) => {
+                    batch.extend_from_slice(&(n as u16).to_be_bytes());
+                    batch.extend_from_slice(&flow.to_be_bytes());
+                    batch.push(UDP_KIND_DATA);
+                    batch.extend_from_slice(&buf[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+        if !batch.is_empty() {
+            let _ = self.shared.try_send_owned(key, batch, false);
+        }
+    }
+
     fn dns_progress(&mut self, key: ConnKey) {
         let memory = self.memory.clone();
         let Some(stream) = self.streams.get_mut(&key) else {
@@ -640,6 +817,7 @@ impl Loop {
         };
         match stream.phase {
             Phase::Dns => self.dns_progress(key),
+            Phase::UdpMux => self.udp_progress(key),
             Phase::AwaitHeader => match self.shared.try_read_outbound(key, HEADER_LEN) {
                 Ok(Some(header)) => {
                     let Some(addr) = destination(&header) else {
@@ -967,6 +1145,13 @@ impl Loop {
     }
 
     fn close(&mut self, key: ConnKey) {
+        if let Some(flows) = self.udp_flows.remove(&key) {
+            for (_, socket) in flows {
+                let fd = socket.as_raw_fd();
+                self.kq.forget(fd);
+                self.udp_by_fd.remove(&fd);
+            }
+        }
         if let Some(stream) = self.streams.remove(&key) {
             if let Some(tcp) = stream.tcp {
                 let fd = tcp.as_raw_fd();

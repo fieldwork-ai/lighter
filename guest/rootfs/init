@@ -352,6 +352,7 @@ fi
 # left alone without listing subnets that Docker changes at will.
 if grep -qw "lighter.streams" /proc/cmdline; then
 	/sbin/lighter-agent --tcp-proxy 15201 &
+	/sbin/lighter-agent --udp-proxy 15202 &
 	/sbin/lighter-agent --inbound 2378 &
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
@@ -366,10 +367,12 @@ table inet lighter {
 	chain prerouting {
 		type nat hook prerouting priority dstnat - 10; policy accept;
 		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
+		meta l4proto udp udp dport != { 53, 67, 68 } fib daddr oif "eth0" redirect to :15202
 	}
 	chain output {
 		type nat hook output priority dstnat - 10; policy accept;
 		meta l4proto tcp oifname "eth0" redirect to :15201
+		meta l4proto udp udp dport != { 53, 67, 68 } oifname "eth0" redirect to :15202
 	}
 }
 EOF

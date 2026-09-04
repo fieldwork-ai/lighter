@@ -46,12 +46,25 @@ fn on_threads() -> bool {
 static REACTOR: std::sync::OnceLock<Arc<crate::reactor::Reactor>> = std::sync::OnceLock::new();
 
 /// Starts answering the agent's streams.
+/// The vsock port the agent dials for UDP.
+pub const UDP_PORT: u32 = 2380;
+
 pub fn start(shared: Arc<VsockShared>) -> io::Result<()> {
     let accepted = shared.listen(STREAM_PORT);
     if !on_threads() {
         let reactor = crate::reactor::Reactor::start(shared.clone())?;
         let _ = REACTOR.set(reactor.clone());
         crate::dns::start(shared.clone(), reactor.clone())?;
+        // The guest's UDP: one stream, every flow on it (the agent's udp.rs).
+        let udp = shared.listen(UDP_PORT);
+        let udp_reactor = reactor.clone();
+        std::thread::Builder::new()
+            .name("udp-accept".into())
+            .spawn(move || {
+                for Accepted { key } in udp {
+                    udp_reactor.accept_udp(key);
+                }
+            })?;
         std::thread::Builder::new()
             .name("streams-accept".into())
             .spawn(move || {
