@@ -52,15 +52,28 @@ t0=$(date +%s); out="$($D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{
 { [ "$out" != 0 ] && [ "$dt" -le 3 ]; } && pass "a closed port is refused in ${dt}s (curl exit $out)" || fail "refused: exit=$out after ${dt}s"
 
 # halfclose: a client that sends its request and closes its write side
-# must still get the reply (busybox nc cannot half-close, so node does it)
+# must still get the reply. Against a server on the Mac that answers after
+# EOF (busybox nc cannot half-close and example.com drops a connection that
+# does, so neither is a test of the path).
+python3 - <<'PY' &
+import socket
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); srv.bind(("0.0.0.0", 18096)); srv.listen(5)
+while True:
+    c, _ = srv.accept()
+    while c.recv(4096): pass
+    c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"); c.close()
+PY
+HALF_PID=$!
+sleep 1
 $D pull -q node:24-alpine >/dev/null 2>&1
 reply="$($D run --rm node:24-alpine node -e '
 const net = require("net");
-const s = net.connect(80, "example.com", () => { s.write("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"); s.end(); });
-let got = ""; s.on("data", d => { got += d; }); s.on("close", () => { console.log(got.split("\r\n")[0]); });
-s.on("error", e => { console.log("error " + e.message); }); setTimeout(() => { console.log("timeout"); process.exit(1); }, 15000);
+const s = net.connect(18096, "'"$LAN_IP"'", () => { s.write("GET / HTTP/1.0\r\n\r\n"); s.end(); });
+let got = ""; s.on("data", d => { got += d; }); s.on("close", () => { console.log(got.split("\r\n")[0]); process.exit(0); });
+s.on("error", e => { console.log("error " + e.message); process.exit(1); }); setTimeout(() => { console.log("timeout"); process.exit(1); }, 15000);
 ' 2>/dev/null)"
-echo "$reply" | grep -q "HTTP/1.[01] 200" && pass "half-close: the reply arrives after the request side closed" || fail "half-close: got '${reply}'"
+kill "$HALF_PID" 2>/dev/null
+echo "$reply" | grep -q "HTTP/1.0 200" && pass "half-close: the reply arrives after the request side closed" || fail "half-close: got '${reply}'"
 
 # host.docker.internal -> a server on the Mac
 python3 -m http.server 18099 --bind 127.0.0.1 >/dev/null 2>&1 &
