@@ -17,7 +17,7 @@ mod sockmap;
 mod vsock;
 
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use vsock::VsockListener;
@@ -235,22 +235,53 @@ fn joiner() -> Option<&'static sockmap::Joiner> {
 /// Two sockets joined in the kernel until both are done: the kernel moves
 /// the bytes and, when either end's stream ends, shuts the other down for
 /// sending behind the last of them (guest kernel patch 0016). This thread
-/// only waits for the hangup on both, then closes them.
-fn joined(joiner: &sockmap::Joiner, tcp: RawFd, host: RawFd) -> io::Result<()> {
-    // The host's end of a stream that ended before the join never reaches
-    // the kernel's marker (it is queued only for a socket already joined);
-    // such a stream is carried by the copying path instead.
-    if hung_up(host) & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
-        return Err(io::Error::other("already half-closed"));
+/// waits for the first byte, joins, and then only waits for the hangup on
+/// both. Returns the sockets when the stream is one the join cannot carry,
+/// for the copying path.
+fn joined(
+    joiner: &sockmap::Joiner,
+    tcp: std::net::TcpStream,
+    host_read: Fd,
+    host_write: Fd,
+) -> Result<(), (std::net::TcpStream, Fd, Fd)> {
+    let (t, h) = (tcp.as_raw_fd(), host_write.0.as_raw_fd());
+    // Nothing is joined until a byte exists to carry: a connection that is
+    // opened and closed (a probe, a health check) costs the join's ten
+    // syscalls nothing, and one that is opened and left costs no psock.
+    let mut first = [
+        libc::pollfd { fd: t, events: libc::POLLIN | libc::POLLRDHUP, revents: 0 },
+        libc::pollfd { fd: h, events: libc::POLLIN | libc::POLLRDHUP, revents: 0 },
+    ];
+    loop {
+        // SAFETY: two live descriptors in a pollfd array.
+        let n = unsafe { libc::poll(first.as_mut_ptr(), 2, -1) };
+        if n >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
     }
-    let slots = joiner.join(tcp, host)?;
+    let ended = libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    let data = (first[0].revents | first[1].revents) & libc::POLLIN != 0;
+    if first[1].revents & ended != 0 {
+        // The host's end of a stream that ended before the join never
+        // reaches the kernel's marker (it is queued only for a socket
+        // already joined). With nothing to carry the stream is simply over;
+        // with bytes queued the copying path carries them.
+        if !data {
+            return Ok(());
+        }
+        return Err((tcp, host_read, host_write));
+    }
+    let slots = match joiner.join(t, h) {
+        Ok(slots) => slots,
+        Err(_) => return Err((tcp, host_read, host_write)),
+    };
     // A socket reports HUP once both its directions are shut: its peer's
     // end seen, and its own sent by the kernel behind the redirected bytes.
     // HUP on both means neither backlog holds anything. An error on either
     // is an abort, and the other side is closed with whatever it has.
     let mut fds = [
-        libc::pollfd { fd: tcp, events: libc::POLLRDHUP, revents: 0 },
-        libc::pollfd { fd: host, events: libc::POLLRDHUP, revents: 0 },
+        libc::pollfd { fd: t, events: libc::POLLRDHUP, revents: 0 },
+        libc::pollfd { fd: h, events: libc::POLLRDHUP, revents: 0 },
     ];
     let mut hups = 0;
     while hups < 2 {
@@ -282,17 +313,14 @@ fn joined(joiner: &sockmap::Joiner, tcp: RawFd, host: RawFd) -> io::Result<()> {
             break;
         }
     }
-    joiner.part(tcp, host, slots);
+    // Closed before the slots go back: a closed socket has left the maps.
+    drop(tcp);
+    drop(host_read);
+    drop(host_write);
+    joiner.release(slots);
     Ok(())
 }
 
-/// The socket's poll state right now, without waiting.
-fn hung_up(fd: RawFd) -> libc::c_short {
-    let mut p = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
-    // SAFETY: one live descriptor, zero timeout.
-    unsafe { libc::poll(&mut p, 1, 0) };
-    p.revents
-}
 
 /// The credit window a stream advertises: a millisecond of a fast link.
 const STREAM_WINDOW: u64 = 8 << 20;
@@ -373,16 +401,19 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     }
     header[17..19].copy_from_slice(&port.to_be_bytes());
     let mut host_write = Fd(host);
-    let Ok(mut host_read) = host_write.try_clone() else { return };
+    let Ok(host_read) = host_write.try_clone() else { return };
     if host_write.write_all(&header).is_err() {
         return;
     }
     let _ = tcp.set_nodelay(true);
-    if let Some(j) = joiner()
-        && joined(j, tcp.as_raw_fd(), host_write.0.as_raw_fd()).is_ok()
-    {
-        return;
-    }
+    let (tcp, host_read, mut host_write) = match joiner() {
+        Some(j) => match joined(j, tcp, host_read, host_write) {
+            Ok(()) => return,
+            Err(back) => back,
+        },
+        None => (tcp, host_read, host_write),
+    };
+    let mut host_read = host_read;
     let Ok(mut tcp_read) = tcp.try_clone() else { return };
     let mut tcp_write = tcp;
 
@@ -507,7 +538,7 @@ fn serve_inbound(port: u32) -> std::process::ExitCode {
 
 fn forward_inbound(host: OwnedFd) {
     let mut host_read = Fd(host);
-    let Ok(mut host_write) = host_read.try_clone() else { return };
+    let Ok(host_write) = host_read.try_clone() else { return };
     let mut header = [0u8; 2];
     if host_read.read_exact(&mut header).is_err() {
         return;
@@ -521,11 +552,14 @@ fn forward_inbound(host: OwnedFd) {
         }
     };
     let _ = tcp.set_nodelay(true);
-    if let Some(j) = joiner()
-        && joined(j, tcp.as_raw_fd(), host_read.0.as_raw_fd()).is_ok()
-    {
-        return;
-    }
+    let (tcp, host_read, host_write) = match joiner() {
+        Some(j) => match joined(j, tcp, host_read, host_write) {
+            Ok(()) => return,
+            Err(back) => back,
+        },
+        None => (tcp, host_read, host_write),
+    };
+    let (mut host_read, mut host_write) = (host_read, host_write);
     let Ok(mut tcp_read) = tcp.try_clone() else { return };
     let mut tcp_write = tcp;
     // host -> container

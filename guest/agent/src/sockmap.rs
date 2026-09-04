@@ -45,10 +45,9 @@ use std::sync::Mutex;
 const BPF_MAP_CREATE: libc::c_int = 0;
 const BPF_MAP_LOOKUP_ELEM: libc::c_int = 1;
 const BPF_MAP_UPDATE_ELEM: libc::c_int = 2;
-const BPF_MAP_DELETE_ELEM: libc::c_int = 3;
 const BPF_PROG_LOAD: libc::c_int = 5;
 const BPF_PROG_ATTACH: libc::c_int = 8;
-const BPF_MAP_TYPE_HASH: u32 = 1;
+const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
 const BPF_MAP_TYPE_SOCKMAP: u32 = 15;
 const BPF_PROG_TYPE_SK_SKB: u32 = 14;
 /// `BPF_SK_SKB_VERDICT`: a verdict on each received skb, no stream parser.
@@ -206,18 +205,6 @@ fn map_update(map: RawFd, key: &[u8], value: &[u8]) -> io::Result<()> {
     bpf(BPF_MAP_UPDATE_ELEM, &mut attr).map(|_| ())
 }
 
-fn map_delete(map: RawFd, key: &[u8]) -> io::Result<()> {
-    let mut attr = Attr { zero: [0; 128] };
-    attr.elem = MapElem {
-        map_fd: map as u32,
-        _pad: 0,
-        key: key.as_ptr() as u64,
-        value: 0,
-        flags: 0,
-    };
-    bpf(BPF_MAP_DELETE_ELEM, &mut attr).map(|_| ())
-}
-
 fn map_lookup_present(map: RawFd, key: &[u8], value_len: usize) -> bool {
     let value = vec![0u8; value_len];
     let mut attr = Attr { zero: [0; 128] };
@@ -312,7 +299,7 @@ pub fn probe() {
     println!("trivial sk_skb, expected verdict: {}", try_load(BPF_PROG_TYPE_SK_SKB, &trivial, 1, BPF_SK_SKB_VERDICT));
     println!("trivial sk_msg: {}", try_load(16, &trivial, 1, 0));
     println!("trivial socket_filter: {}", try_load(1, &trivial, 1, 0));
-    match (map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, 16), map_create(BPF_MAP_TYPE_HASH, 8, 4, 16)) {
+    match (map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, 16), map_create(BPF_MAP_TYPE_LRU_HASH, 8, 4, 16)) {
         (Ok(sockets), Ok(peers)) => {
             let full = program(peers.as_raw_fd(), sockets.as_raw_fd());
             println!("full sk_skb: {}", try_load(BPF_PROG_TYPE_SK_SKB, &full, 1, 0));
@@ -338,7 +325,9 @@ impl Joiner {
     pub fn new() -> io::Result<Joiner> {
         let targets = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
         let attach = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
-        let peers = map_create(BPF_MAP_TYPE_HASH, 8, 4, SLOTS)?;
+        // Keyed by socket cookie, never reused, so an entry a closed socket
+        // leaves behind matches nothing and the LRU retires it unasked.
+        let peers = map_create(BPF_MAP_TYPE_LRU_HASH, 8, 4, SLOTS)?;
         let insns = program(peers.as_raw_fd(), targets.as_raw_fd());
         let mut log = vec![0u8; 64 * 1024];
         let mut attr = Attr { zero: [0; 128] };
@@ -408,19 +397,12 @@ impl Joiner {
         Ok((slot_a, slot_b))
     }
 
-    /// Undoes [`Joiner::join`]. The sockets themselves leave the map when
-    /// they close; this frees the peer entries and the slots.
-    pub fn part(&self, a: RawFd, b: RawFd, slots: (u32, u32)) {
-        if let Ok(c) = socket_cookie(a) {
-            let _ = map_delete(self.peers.as_raw_fd(), &c.to_ne_bytes());
-        }
-        if let Ok(c) = socket_cookie(b) {
-            let _ = map_delete(self.peers.as_raw_fd(), &c.to_ne_bytes());
-        }
-        for map in [self.attach.as_raw_fd(), self.targets.as_raw_fd()] {
-            let _ = map_delete(map, &slots.0.to_ne_bytes());
-            let _ = map_delete(map, &slots.1.to_ne_bytes());
-        }
+    /// Returns a pair's slots once both sockets are closed. A closed socket
+    /// leaves every map on its own, and its peer entry matches nothing
+    /// again, so this is bookkeeping and no syscall — which is why the
+    /// sockets must be closed first: a slot handed out while its last
+    /// socket is still in the map would replace it.
+    pub fn release(&self, slots: (u32, u32)) {
         let mut free = self.free.lock().expect("sockmap slots poisoned");
         free.push(slots.0);
         free.push(slots.1);
