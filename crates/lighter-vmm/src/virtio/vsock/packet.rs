@@ -15,7 +15,7 @@ pub const HDR_LEN: usize = 44;
 ///
 /// The specification's limit. Also the unit the credit accounting below is
 /// denominated in, so a larger value here would silently change flow control.
-pub const MAX_PAYLOAD: usize = 64 * 1024;
+pub const MAX_PAYLOAD: usize = 256 * 1024;
 
 /// The host is always CID 2. CID 0 and 1 are reserved (any/hypervisor), so the
 /// first address a guest can have is 3.
@@ -157,6 +157,36 @@ impl Packet {
         out[36..40].copy_from_slice(&self.buf_alloc.to_le_bytes());
         out[40..44].copy_from_slice(&self.fwd_cnt.to_le_bytes());
         out
+    }
+
+    /// A packet from a header already read and a payload already owned,
+    /// for a reader that copied the payload out of the guest exactly once.
+    /// `None` when the header's length does not match the payload given.
+    pub fn from_parts(header: &[u8; HDR_LEN], payload: Vec<u8>) -> Option<Packet> {
+        let u32_at = |off: usize| {
+            u32::from_le_bytes([header[off], header[off + 1], header[off + 2], header[off + 3]])
+        };
+        let u64_at = |off: usize| {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&header[off..off + 8]);
+            u64::from_le_bytes(buf)
+        };
+        let u16_at = |off: usize| u16::from_le_bytes([header[off], header[off + 1]]);
+        let len = u32_at(24) as usize;
+        if len > MAX_PAYLOAD || payload.len() != len {
+            return None;
+        }
+        Some(Packet {
+            src_cid: u64_at(0),
+            dst_cid: u64_at(8),
+            src_port: u32_at(16),
+            dst_port: u32_at(20),
+            op: Op::from_raw(u16_at(30)),
+            flags: u32_at(32),
+            buf_alloc: u32_at(36),
+            fwd_cnt: u32_at(40),
+            payload,
+        })
     }
 
     /// Serializes the packet for the guest's receive queue.

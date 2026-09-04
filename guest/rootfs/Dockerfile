@@ -21,6 +21,7 @@ RUN apk add --no-cache \
 	runc \
 	iptables \
 	ip6tables \
+	nftables \
 	e2fsprogs \
 	e2fsprogs-extra \
 	xfsprogs \

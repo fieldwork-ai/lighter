@@ -41,6 +41,64 @@ impl SockaddrVm {
     }
 }
 
+/// The well-known CID of the host.
+pub const VMADDR_CID_HOST: u32 = 2;
+
+/// `SOL_SOCKET`-level option names are the kernel's for AF_VSOCK: the
+/// socket's receive buffer, which is the credit it advertises to its peer,
+/// and the ceiling it may be raised to. Sixteen-bit ports and a 256 KiB
+/// window is a Docker socket; a stream carrying a container's traffic
+/// wants a window the size of a millisecond of the link.
+const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
+const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
+
+/// Sets the credit window a socket advertises to its peer.
+pub fn set_buffer(fd: &OwnedFd, bytes: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    for name in [SO_VM_SOCKETS_BUFFER_MAX_SIZE, SO_VM_SOCKETS_BUFFER_SIZE] {
+        // SAFETY: a u64 lives at the pointer for the call's duration, and
+        // the length is its size.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                AF_VSOCK as libc::c_int,
+                name,
+                std::ptr::addr_of!(bytes).cast(),
+                size_of::<u64>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Connects to a port on the host.
+pub fn connect(port: u32) -> io::Result<OwnedFd> {
+    // SAFETY: a plain socket(2) call with constant arguments.
+    let raw = unsafe { libc::socket(AF_VSOCK as libc::c_int, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh fd we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let addr = SockaddrVm::new(VMADDR_CID_HOST, port);
+    // SAFETY: `addr` is a correctly-shaped sockaddr_vm living until the call
+    // returns, and its length is its own size.
+    let rc = unsafe {
+        libc::connect(
+            raw,
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            size_of::<SockaddrVm>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
 /// A listening vsock socket.
 pub struct VsockListener {
     fd: OwnedFd,

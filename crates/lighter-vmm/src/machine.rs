@@ -387,6 +387,31 @@ impl Machine {
             pollers.push((kicks, poller));
         }
 
+        // The vsock transmit ring gets the same watcher: a stream from the
+        // guest arrives as 64 KiB packets, each a kick, and the copy out of
+        // the ring was happening on the vCPU that kicked. Watched, the guest
+        // publishes and moves on and the copy is this thread's.
+        {
+            let transport = virtio_devices[vsock_slot].clone();
+            let kicks = virtio::poll::Kicks::new();
+            {
+                let mut held = transport.lock().expect("vsock transport poisoned");
+                let signal = kicks.clone();
+                held.set_kick_observer(Arc::new(move |queue| {
+                    if queue == virtio::vsock::TX_QUEUE {
+                        signal.kicked();
+                    }
+                }));
+            }
+            let poller = virtio::poll::spawn(
+                "vsock-tx",
+                transport.clone(),
+                vec![virtio::vsock::TX_QUEUE],
+                kicks.clone(),
+            )?;
+            pollers.push((kicks, poller));
+        }
+
         // The pump that moves frames off the network and into the guest. It runs
         // outside the vCPU threads because a frame can arrive at any time,
         // including while every core is idle in WFI — which is exactly the

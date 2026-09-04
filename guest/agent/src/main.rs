@@ -26,6 +26,7 @@ fn main() -> std::process::ExitCode {
     let mut target: Option<String> = None;
     let mut echo = false;
     let mut control = false;
+    let mut tcp_proxy: Option<u16> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -39,6 +40,10 @@ fn main() -> std::process::ExitCode {
             // one that exists sets the clock, and the only reason it exists is
             // that a Mac that slept wakes with a guest whose clock did not.
             "--control" => control = true,
+            // Takes the TCP connections netfilter redirects to it — every
+            // connection from a container or the guest that would have left
+            // through eth0 — and carries each to the host as a vsock stream.
+            "--tcp-proxy" => tcp_proxy = args.next().and_then(|v| v.parse().ok()),
             other => {
                 eprintln!("lighter-agent: unknown argument {other}");
                 return std::process::ExitCode::from(2);
@@ -46,8 +51,11 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    if let Some(port) = tcp_proxy {
+        return serve_tcp_proxy(port);
+    }
     if target.is_none() && !echo && !control {
-        eprintln!("lighter-agent: one of --to <path>, --echo or --control is required");
+        eprintln!("lighter-agent: one of --to <path>, --echo, --control or --tcp-proxy <port> is required");
         return std::process::ExitCode::from(2);
     }
 
@@ -75,6 +83,9 @@ fn main() -> std::process::ExitCode {
                 continue;
             }
         };
+        if control {
+            let _ = vsock::set_buffer(&stream, STREAM_WINDOW);
+        }
         let target = target.clone();
         std::thread::spawn(move || match (&target, control) {
             (Some(path), _) => bridge(stream, path),
@@ -172,6 +183,108 @@ fn container_cpu_usec(cgroup: &str) -> u64 {
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(0)
+}
+
+/// The host's vsock port for outbound streams.
+const STREAM_PORT: u32 = 2377;
+/// The credit window a stream advertises: a millisecond of a fast link.
+const STREAM_WINDOW: u64 = 4 << 20;
+
+/// Where a redirected connection was really going, from conntrack.
+///
+/// netfilter's REDIRECT rewrote the destination to this machine and kept the
+/// original in the connection's conntrack entry; SO_ORIGINAL_DST reads it
+/// back. IPv4 first, then IPv6, because a socket accepted on a dual-stack
+/// listener answers one or the other and nothing says which in advance.
+fn original_destination(fd: libc::c_int) -> Option<(std::net::IpAddr, u16)> {
+    const SOL_IP: libc::c_int = 0;
+    const SOL_IPV6: libc::c_int = 41;
+    const SO_ORIGINAL_DST: libc::c_int = 80;
+    let mut v4: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: the buffer is a sockaddr_in and `len` its size.
+    if unsafe { libc::getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, std::ptr::addr_of_mut!(v4).cast(), &mut len) } == 0 {
+        let ip = std::net::Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr));
+        return Some((ip.into(), u16::from_be(v4.sin_port)));
+    }
+    let mut v6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    // SAFETY: the buffer is a sockaddr_in6 and `len` its size.
+    if unsafe { libc::getsockopt(fd, SOL_IPV6, SO_ORIGINAL_DST, std::ptr::addr_of_mut!(v6).cast(), &mut len) } == 0 {
+        let ip = std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr);
+        return Some((ip.into(), u16::from_be(v6.sin6_port)));
+    }
+    None
+}
+
+/// Accepts the connections netfilter redirects here and carries each to the
+/// host as one vsock stream, the destination in a fixed header first.
+///
+/// TCP as streams, not packets: the guest's own kernel terminates the
+/// container's connection and the host's kernel originates the real one, so
+/// the only thing crossing the boundary is bytes, with no stack in between
+/// to get wrong. The header is what the host needs to dial: a family byte,
+/// sixteen bytes of address (IPv4 in the first four), and the port.
+fn serve_tcp_proxy(port: u16) -> std::process::ExitCode {
+    let listener = match std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lighter-agent: cannot bind tcp port {port}: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    println!("AGENT tcp-proxy port={port}");
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        std::thread::spawn(move || forward_outbound(stream));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+fn forward_outbound(tcp: std::net::TcpStream) {
+    let Some((ip, port)) = original_destination(tcp.as_raw_fd()) else {
+        return;
+    };
+    let host = match vsock::connect(STREAM_PORT) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("lighter-agent: stream to host refused: {e}");
+            return;
+        }
+    };
+    let _ = vsock::set_buffer(&host, STREAM_WINDOW);
+    let mut header = [0u8; 19];
+    match ip {
+        std::net::IpAddr::V4(a) => {
+            header[0] = 4;
+            header[1..5].copy_from_slice(&a.octets());
+        }
+        std::net::IpAddr::V6(a) => {
+            header[0] = 6;
+            header[1..17].copy_from_slice(&a.octets());
+        }
+    }
+    header[17..19].copy_from_slice(&port.to_be_bytes());
+    let mut host_write = Fd(host);
+    let Ok(mut host_read) = host_write.try_clone() else { return };
+    if host_write.write_all(&header).is_err() {
+        return;
+    }
+    let _ = tcp.set_nodelay(true);
+    let Ok(mut tcp_read) = tcp.try_clone() else { return };
+    let mut tcp_write = tcp;
+
+    // container -> host
+    let outbound = std::thread::spawn(move || {
+        copy(&mut tcp_read, &mut host_write);
+        // SAFETY: a live descriptor; shutdown of the write half only, so the
+        // reply direction stays open.
+        unsafe { libc::shutdown(host_write.0.as_raw_fd(), libc::SHUT_WR) };
+    });
+    // host -> container
+    copy(&mut host_read, &mut tcp_write);
+    let _ = tcp_write.shutdown(std::net::Shutdown::Write);
+    let _ = outbound.join();
 }
 
 fn serve_control(stream: OwnedFd) {

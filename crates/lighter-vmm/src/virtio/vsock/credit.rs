@@ -18,7 +18,7 @@
 /// 256 KiB. Large enough that a Docker image pull is not a sequence of
 /// stop-and-wait round trips, small enough that a few hundred idle connections
 /// are not a memory problem.
-pub const BUF_ALLOC: u32 = 256 * 1024;
+pub const BUF_ALLOC: u32 = 4 * 1024 * 1024;
 
 /// One direction's accounting for one connection.
 #[derive(Debug, Clone, Copy)]

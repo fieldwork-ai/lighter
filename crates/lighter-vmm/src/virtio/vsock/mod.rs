@@ -96,11 +96,29 @@ struct Conn {
     socket: UnixStream,
 }
 
+/// A connection: our port and the guest's, which together are what every
+/// packet carries. Host-opened connections have a unique port of ours and a
+/// well-known one of the guest's; guest-opened ones share the port they
+/// dialed and differ in theirs, which is why one port was never enough.
+pub type ConnKey = (u32, u32);
+
 struct Inner {
-    /// Keyed by our own port, which is what the guest addresses us by.
-    conns: HashMap<u32, Conn>,
+    conns: HashMap<ConnKey, Conn>,
     outbox: VecDeque<Packet>,
     next_port: u32,
+    /// Ports the host answers: a REQUEST to one is accepted and the new
+    /// connection handed to the listener, one end of a socket pair for the
+    /// device's pump and the other for whoever listens.
+    listeners: HashMap<u32, std::sync::mpsc::Sender<Accepted>>,
+}
+
+/// A connection the guest opened, as handed to its listener.
+pub struct Accepted {
+    pub key: ConnKey,
+    /// The device's end; give it to [`pump`].
+    pub device_side: UnixStream,
+    /// The listener's end.
+    pub stream: UnixStream,
 }
 
 /// State shared between the device and the host threads driving connections.
@@ -134,6 +152,7 @@ impl VsockShared {
                 conns: HashMap::new(),
                 outbox: VecDeque::new(),
                 next_port: FIRST_EPHEMERAL_PORT,
+                listeners: HashMap::new(),
             }),
             progress: Condvar::new(),
             waker: Mutex::new(None),
@@ -172,13 +191,13 @@ impl VsockShared {
     /// life. The REQUEST is only queued here: the guest answers on its own
     /// schedule, and [`VsockShared::await_established`] is where that is waited
     /// for.
-    pub fn open(&self, guest_port: u32, socket: UnixStream) -> u32 {
+    pub fn open(&self, guest_port: u32, socket: UnixStream) -> ConnKey {
         let mut inner = self.lock();
         let host_port = inner.next_port;
         inner.next_port = inner.next_port.wrapping_add(1).max(FIRST_EPHEMERAL_PORT);
 
         inner.conns.insert(
-            host_port,
+            (host_port, guest_port),
             Conn {
                 guest_port,
                 state: State::Connecting,
@@ -194,15 +213,26 @@ impl VsockShared {
         drop(inner);
 
         self.wake();
-        host_port
+        (host_port, guest_port)
+    }
+
+    /// Answers connections the guest opens to `host_port`.
+    ///
+    /// Each accepted connection arrives on the returned channel with both
+    /// ends of a socket pair; the listener runs [`pump`] on the device's end
+    /// and does what it likes with the other.
+    pub fn listen(&self, host_port: u32) -> std::sync::mpsc::Receiver<Accepted> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lock().listeners.insert(host_port, tx);
+        rx
     }
 
     /// Blocks until the guest accepts or refuses. `false` means refused.
-    pub fn await_established(&self, host_port: u32, timeout: std::time::Duration) -> bool {
+    pub fn await_established(&self, key: ConnKey, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut inner = self.lock();
         loop {
-            match inner.conns.get(&host_port).map(|c| c.state) {
+            match inner.conns.get(&key).map(|c| c.state) {
                 Some(State::Established) => return true,
                 // A refused connection is removed outright, so a missing entry
                 // and an explicitly closed one mean the same thing.
@@ -225,13 +255,13 @@ impl VsockShared {
     ///
     /// Returns false once the connection is gone, which is the signal for the
     /// calling thread to stop.
-    pub fn send(&self, host_port: u32, data: &[u8]) -> bool {
+    pub fn send(&self, key: ConnKey, data: &[u8]) -> bool {
         let mut offset = 0;
 
         while offset < data.len() {
             let mut inner = self.lock();
 
-            let Some(conn) = inner.conns.get(&host_port) else {
+            let Some(conn) = inner.conns.get(&key) else {
                 return false;
             };
             if conn.state != State::Established {
@@ -258,20 +288,28 @@ impl VsockShared {
                 continue;
             }
 
-            let take = allowed.min(MAX_PAYLOAD).min(data.len() - offset);
-            let guest_port = conn.guest_port;
+            // As many packets as credit and the outbox allow under one lock,
+            // and one wake for all of them: a wake per 64 KiB was a transport
+            // lock and a guest interrupt per packet, which at 8 Gbit/s was
+            // most of what a packet cost.
+            let (host_port, guest_port) = key;
             let fwd_cnt = conn.credit.fwd_cnt();
-
-            let mut packet = Packet::control(Op::Rw, host_port, guest_port);
-            packet.payload = data[offset..offset + take].to_vec();
-            packet.buf_alloc = credit::BUF_ALLOC;
-            packet.fwd_cnt = fwd_cnt;
-            inner.outbox.push_back(packet);
-
-            if let Some(conn) = inner.conns.get_mut(&host_port) {
-                conn.credit.sent(take as u32);
+            let mut allowed = allowed;
+            let mut room = room;
+            while allowed > 0 && room > 0 && offset < data.len() {
+                let take = allowed.min(MAX_PAYLOAD).min(data.len() - offset);
+                let mut packet = Packet::control(Op::Rw, host_port, guest_port);
+                packet.payload = data[offset..offset + take].to_vec();
+                packet.buf_alloc = credit::BUF_ALLOC;
+                packet.fwd_cnt = fwd_cnt;
+                inner.outbox.push_back(packet);
+                if let Some(conn) = inner.conns.get_mut(&key) {
+                    conn.credit.sent(take as u32);
+                }
+                offset += take;
+                allowed -= take;
+                room -= 1;
             }
-            offset += take;
 
             drop(inner);
             self.wake();
@@ -284,12 +322,12 @@ impl VsockShared {
     /// This is what a peer that has finished its request but still wants the
     /// reply does — `docker run` attaching with no stdin is the case that
     /// matters. Sending a full close here instead loses the reply.
-    pub fn shutdown_write(&self, host_port: u32) {
+    pub fn shutdown_write(&self, key: ConnKey) {
         let mut inner = self.lock();
-        let Some(conn) = inner.conns.get(&host_port) else {
+        let Some(conn) = inner.conns.get(&key) else {
             return;
         };
-        let guest_port = conn.guest_port;
+        let (host_port, guest_port) = key;
         let mut packet = Packet::control(Op::Shutdown, host_port, guest_port);
         packet.flags = shutdown::SEND;
         packet.buf_alloc = credit::BUF_ALLOC;
@@ -301,17 +339,17 @@ impl VsockShared {
     }
 
     /// Closes our end, telling the guest we will write no more.
-    pub fn shutdown(&self, host_port: u32) {
+    pub fn shutdown(&self, key: ConnKey) {
         let mut inner = self.lock();
-        let Some(conn) = inner.conns.get(&host_port) else {
+        let Some(conn) = inner.conns.get(&key) else {
             return;
         };
-        let guest_port = conn.guest_port;
+        let (host_port, guest_port) = key;
         let mut packet = Packet::control(Op::Shutdown, host_port, guest_port);
         packet.flags = shutdown::BOTH;
         packet.buf_alloc = credit::BUF_ALLOC;
         inner.outbox.push_back(packet);
-        if let Some(conn) = inner.conns.get_mut(&host_port) {
+        if let Some(conn) = inner.conns.get_mut(&key) {
             conn.state = State::Closed;
         }
         drop(inner);
@@ -323,10 +361,10 @@ impl VsockShared {
     ///
     /// Returns `None` once the connection is gone. Blocks while the connection
     /// is alive and has nothing pending, so the writer thread does not spin.
-    fn take_outbound(&self, host_port: u32) -> Option<Vec<Vec<u8>>> {
+    fn take_outbound(&self, key: ConnKey) -> Option<Vec<Vec<u8>>> {
         let mut inner = self.lock();
         loop {
-            let conn = inner.conns.get_mut(&host_port)?;
+            let conn = inner.conns.get_mut(&key)?;
             if !conn.outbound.is_empty() {
                 return Some(conn.outbound.drain(..).collect());
             }
@@ -345,15 +383,16 @@ impl VsockShared {
 
     /// Records that `bytes` reached the host application, freeing the guest to
     /// send that much more.
-    fn acknowledge(&self, host_port: u32, bytes: u32) {
+    fn acknowledge(&self, key: ConnKey, bytes: u32) {
         let mut inner = self.lock();
-        let Some(conn) = inner.conns.get_mut(&host_port) else {
+        let Some(conn) = inner.conns.get_mut(&key) else {
             return;
         };
         conn.credit.consumed(bytes);
         let guest_port = conn.guest_port;
         let fwd_cnt = conn.credit.fwd_cnt();
 
+        let (host_port, guest_port) = key;
         let mut update = Packet::control(Op::CreditUpdate, host_port, guest_port);
         update.buf_alloc = credit::BUF_ALLOC;
         update.fwd_cnt = fwd_cnt;
@@ -386,18 +425,19 @@ impl Vsock {
     /// Takes no `self`: everything a packet can affect lives in the shared
     /// state, and saying so lets the caller hold the lock across a batch.
     fn handle(inner: &mut Inner, packet: Packet) {
-        // Our port is the packet's destination; the guest addresses us by the
-        // port we chose when we opened the connection.
+        // Our port is the packet's destination and the guest's its source;
+        // together they name the connection.
         let host_port = packet.dst_port;
+        let key: ConnKey = (packet.dst_port, packet.src_port);
 
         // Credit rides on every packet, including ones we otherwise ignore.
-        if let Some(conn) = inner.conns.get_mut(&host_port) {
+        if let Some(conn) = inner.conns.get_mut(&key) {
             conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
         }
 
         match packet.op {
             Op::Response => {
-                if let Some(conn) = inner.conns.get_mut(&host_port) {
+                if let Some(conn) = inner.conns.get_mut(&key) {
                     conn.state = State::Established;
                     tracing::debug!(host_port, guest_port = conn.guest_port, "vsock established");
                 }
@@ -406,13 +446,13 @@ impl Vsock {
             Op::Rst => {
                 // Refused, or torn down. Either way the connection is over, and
                 // dropping the entry closes the host socket with it.
-                if inner.conns.remove(&host_port).is_some() {
+                if inner.conns.remove(&key).is_some() {
                     tracing::debug!(host_port, "vsock reset by guest");
                 }
             }
 
             Op::Shutdown => {
-                let Some(conn) = inner.conns.get_mut(&host_port) else {
+                let Some(conn) = inner.conns.get_mut(&key) else {
                     return;
                 };
 
@@ -436,11 +476,11 @@ impl Vsock {
                 let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
                 rst.buf_alloc = credit::BUF_ALLOC;
                 inner.outbox.push_back(rst);
-                inner.conns.remove(&host_port);
+                inner.conns.remove(&key);
             }
 
             Op::Rw => {
-                let Some(conn) = inner.conns.get_mut(&host_port) else {
+                let Some(conn) = inner.conns.get_mut(&key) else {
                     // Data for a connection we do not have. Tell the guest, or
                     // it will wait for a reply that is never coming.
                     let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
@@ -457,7 +497,7 @@ impl Vsock {
             }
 
             Op::CreditRequest => {
-                if let Some(conn) = inner.conns.get(&host_port) {
+                if let Some(conn) = inner.conns.get(&key) {
                     let guest_port = conn.guest_port;
                     let fwd_cnt = conn.credit.fwd_cnt();
                     let mut update = Packet::control(Op::CreditUpdate, host_port, guest_port);
@@ -492,26 +532,72 @@ impl Vsock {
 
         while let Some(chain) = queue.pop(mem) {
             let head = chain.head();
-            let mut bytes = Vec::with_capacity(HDR_LEN);
+            // The header into a stack array and the payload into the Vec
+            // that will carry it to the socket: one copy out of the guest.
+            // Reading the chain into one buffer and parsing that copied every
+            // payload byte twice, on the vCPU thread.
+            let mut header = [0u8; HDR_LEN];
+            let mut have = 0usize;
+            let mut payload: Vec<u8> = Vec::new();
+            let mut ok = true;
             for desc in chain {
                 if desc.is_write_only() {
                     continue;
                 }
-                let len = desc.len as usize;
-                if bytes.len() + len > HDR_LEN + MAX_PAYLOAD {
+                let mut addr = desc.addr;
+                let mut len = desc.len as usize;
+                if have < HDR_LEN {
+                    let take = len.min(HDR_LEN - have);
+                    if mem.read(addr, &mut header[have..have + take]).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    have += take;
+                    addr += take as u64;
+                    len -= take;
+                    if have == HDR_LEN {
+                        let declared = u32::from_le_bytes([
+                            header[24], header[25], header[26], header[27],
+                        ]) as usize;
+                        if declared > MAX_PAYLOAD {
+                            ok = false;
+                            break;
+                        }
+                        payload.reserve_exact(declared);
+                    }
+                }
+                if len == 0 {
+                    continue;
+                }
+                if payload.len() + len > MAX_PAYLOAD {
+                    ok = false;
                     break;
                 }
-                let start = bytes.len();
-                bytes.resize(start + len, 0);
-                if mem.read(desc.addr, &mut bytes[start..]).is_err() {
-                    bytes.truncate(start);
+                let start = payload.len();
+                payload.resize(start + len, 0);
+                if mem.read(addr, &mut payload[start..]).is_err() {
+                    ok = false;
                     break;
                 }
             }
 
-            match Packet::parse(&bytes) {
+            let parsed = if ok && have == HDR_LEN {
+                // A chain may carry more bytes than the header declares
+                // (the driver posts whole buffers); only the declared part
+                // is payload.
+                let declared = u32::from_le_bytes([header[24], header[25], header[26], header[27]]) as usize;
+                if payload.len() >= declared {
+                    payload.truncate(declared);
+                    Packet::from_parts(&header, payload)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match parsed {
                 Some(packet) => packets.push(packet),
-                None => tracing::debug!(len = bytes.len(), "malformed vsock packet from guest"),
+                None => tracing::debug!("malformed vsock packet from guest"),
             }
             queue.push_used(mem, head, 0);
             used_any = true;
@@ -696,26 +782,26 @@ impl VirtioDevice for Vsock {
 /// Runs on its own thread per connection. That is a real cost at a thousand
 /// connections and no cost at the dozen a Docker client opens, and it buys a
 /// blocking read with no readiness machinery anywhere.
-pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
+pub fn pump(shared: Arc<VsockShared>, key: ConnKey, mut socket: UnixStream) {
     // Guest to host, on its own thread. The blocking write has to happen
     // somewhere that is not a vCPU thread; this is that somewhere.
     let writer = {
         let shared = shared.clone();
         let Ok(mut socket) = socket.try_clone() else {
-            shared.shutdown(host_port);
+            shared.shutdown(key);
             return;
         };
         std::thread::Builder::new()
             .name("vsock-write".into())
             .spawn(move || {
-                while let Some(chunks) = shared.take_outbound(host_port) {
+                while let Some(chunks) = shared.take_outbound(key) {
                     if write_all_chunks(&mut socket, &chunks).is_err() {
                         break;
                     }
                     // Only now are the bytes the host application's, so only
                     // now may the guest be told it has room for more.
                     let bytes: usize = chunks.iter().map(Vec::len).sum();
-                    shared.acknowledge(host_port, bytes as u32);
+                    shared.acknowledge(key, bytes as u32);
                 }
                 let _ = socket.flush();
                 // The guest will send no more, so the host peer is owed an
@@ -726,7 +812,9 @@ pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
             })
     };
 
-    let mut buf = vec![0u8; 64 * 1024];
+    // A megabyte per read: what the socket holds arrives in one call and
+    // goes to the guest as one batch of packets under one wake.
+    let mut buf = vec![0u8; 1 << 20];
     let mut host_closed = false;
     loop {
         let read = match socket.read(&mut buf) {
@@ -739,7 +827,7 @@ pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
             Err(_) => break,
         };
         // `send` delivers as it goes; there is nothing to poke afterwards.
-        if !shared.send(host_port, &buf[..read]) {
+        if !shared.send(key, &buf[..read]) {
             break;
         }
     }
@@ -749,15 +837,15 @@ pub fn pump(shared: Arc<VsockShared>, host_port: u32, mut socket: UnixStream) {
     // no stdin to forward, and then waits for the container's output. Reporting
     // a full close here takes that output with it.
     if host_closed {
-        shared.shutdown_write(host_port);
+        shared.shutdown_write(key);
         if let Ok(writer) = writer {
             let _ = writer.join();
         }
-        shared.shutdown(host_port);
+        shared.shutdown(key);
         return;
     }
 
-    shared.shutdown(host_port);
+    shared.shutdown(key);
     if let Ok(writer) = writer {
         let _ = writer.join();
     }

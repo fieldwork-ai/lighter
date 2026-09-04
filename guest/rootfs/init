@@ -315,6 +315,31 @@ fi
 # certificate starts failing with an error about the certificate.
 /sbin/lighter-agent --port 2376 --control &
 
+# --- Streams --------------------------------------------------------------
+# With `lighter.streams` on the command line, every TCP connection that
+# would leave through eth0 — from a container or from this machine — is
+# redirected to the agent, which carries it to the host as a vsock stream;
+# the host's kernel makes the real connection. TCP only: UDP and ICMP keep
+# going out the network device. `fib daddr oif` is the routing decision
+# itself, so anything bound for a container, this machine, or a bridge is
+# left alone without listing subnets that Docker changes at will.
+if grep -qw "lighter.streams" /proc/cmdline; then
+	/sbin/lighter-agent --tcp-proxy 15201 &
+	if nft -f - <<'EOF'
+table inet lighter {
+	chain prerouting {
+		type nat hook prerouting priority dstnat - 10; policy accept;
+		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
+	}
+	chain output {
+		type nat hook output priority dstnat - 10; policy accept;
+		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
+	}
+}
+EOF
+	then echo "INIT streams=on"; else echo "INIT streams=failed"; fi
+fi
+
 echo "INIT ready"
 
 # dockerd can die long after it started — containerd failing, a storage driver
