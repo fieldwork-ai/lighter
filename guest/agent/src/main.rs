@@ -283,7 +283,15 @@ fn bound_container_cache() {
         // page it touched — copy-tree 7.4 s against 5.2 on the M1. Three is
         // longer than the gap and inside the five seconds after work that a
         // footprint is read at.
-        offer_memory(&mut memory_stream, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
+        //
+        // Guests of eight gigabytes and up. On a 4 GiB guest the reserve is
+        // a large share of RAM and the balloon broke even against reporting
+        // alone: the peak 600 MB better, the minute reading 500 MB worse,
+        // one install a tenth slower; the 16 GiB guest gains on every
+        // reading. Below the line reporting and the trims are the policy.
+        if total >= 8 << 30 {
+            offer_memory(&mut memory_stream, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
+        }
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
