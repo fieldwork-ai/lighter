@@ -176,7 +176,7 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 ## Why it is fast
 
-The performance of containers on macOS comes down to three bottlenecks: the shared filesystem, virtual disk I/O, and memory management.
+The performance of containers on macOS comes down to four bottlenecks: the shared filesystem, virtual disk I/O, memory management, and the network.
 
 ### 1. Shared filesystems without the boundary tax
 Bind mounts on macOS are notoriously slow because every syscall crosses the hypervisor into APFS, where creating tens of thousands of tiny files incurs synchronous disk latency.
@@ -197,12 +197,24 @@ A guest holding 8 GB of RAM after a heavy build starves the Mac.
 - **Free page reporting:** When memory is freed inside the guest, `CONFIG_PAGE_REPORTING` volunteers those physical pages back to macOS immediately without hypervisor intervention.
 - **Compressor-steered ballooning:** On memory-constrained hosts (like 8 GB M1s), macOS compresses memory before reporting pressure. lighter monitors the host compressor rate: if the Mac begins compressing heavily, the virtio-balloon inflates in aligned 16 KiB host-page compound blocks to safely release host physical memory, deflating once the compressor has quieted.
 
+### 4. The network as streams, not packets
+Every other runtime gives the VM a virtual network card and runs a TCP/IP stack on the Mac side to turn its packets back into connections. Each byte is then copied and checksummed twice, once by the guest kernel and once by that userspace stack, and every packet is a round trip across the hypervisor boundary.
+
+lighter does not carry packets across the boundary at all:
+- **One connection, one stream:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which opens a single vsock stream to the host for it. The host side opens an ordinary macOS socket to the destination and copies bytes between the two. The Mac's own kernel terminates the real connection, so VPNs, proxies and the Mac's routing all apply as they would to any Mac process, and there is no TCP/IP stack to maintain in lighter.
+- **Joined in the guest kernel:** The container's socket and its vsock stream are joined by a BPF sockmap, so the data path inside the guest is a kernel-to-kernel copy with no process in the middle. This is where the throughput comes from: 98 Gbit/s out of a container on an M5 Pro, and 90 into one, against 97 and 53 for OrbStack.
+- **Published ports the same way:** A port a container publishes is bound on the Mac by lighter itself, and each accepted connection becomes a stream into the guest. There is no userland proxy inside the VM to double-copy every byte.
+- **DNS answered on the Mac:** A container's lookups are resolved by the Mac's own resolver, so split DNS from a VPN works and a lookup costs 55 µs instead of a trip through a virtual network.
+- **Latency by not sleeping:** The host thread that moves bytes polls for a few tens of microseconds after every event before it parks, so a reply that follows a request is picked up without a scheduler wake-up. A GET on a published port costs 68 µs on the M5 and 133 µs on an M1, against 73 and 128 for OrbStack.
+
+UDP takes the same stream, tagged per flow, and only what has no stream form, ARP, DHCP, ICMP, stays on the virtual network card behind `gvproxy`.
+
 ---
 
 ## What it does
 
 - **Docker and Compose compatibility:** Full support via standard Docker CLI and Compose plugins.
-- **Bidirectional port forwarding:** Exposed ports appear on `localhost` instantly via a low-overhead network helper (`gvproxy`).
+- **Bidirectional port forwarding:** Published ports appear on `localhost` the moment a container binds them, carried as streams rather than through a proxy.
 - **Native file sharing:** Mount any directory from your Mac with native ownership translation.
 - **x86-64 container emulation:** Run `linux/amd64` images under software emulation (`qemu-user`).
 - **Lean footprint:** Idles at roughly 0.2% CPU and hands memory back as soon as containers stop.
