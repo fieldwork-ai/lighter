@@ -16,7 +16,7 @@
 mod vsock;
 
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use vsock::VsockListener;
@@ -282,12 +282,13 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     let Ok(mut tcp_read) = tcp.try_clone() else { return };
     let mut tcp_write = tcp;
 
-    // container -> host
+    // container -> host, spliced through the kernel where it can be
     let outbound = std::thread::spawn(move || {
-        copy(&mut tcp_read, &mut host_write);
+        let (tcp_fd, host_fd) = (tcp_read.as_raw_fd(), host_write.0.as_raw_fd());
+        splice_copy(&tcp_fd, &host_fd, || copy(&mut tcp_read, &mut host_write));
         // SAFETY: a live descriptor; shutdown of the write half only, so the
         // reply direction stays open.
-        unsafe { libc::shutdown(host_write.0.as_raw_fd(), libc::SHUT_WR) };
+        unsafe { libc::shutdown(host_fd, libc::SHUT_WR) };
     });
     // host -> container
     copy(&mut host_read, &mut tcp_write);
@@ -341,10 +342,11 @@ fn forward_inbound(host: OwnedFd) {
         copy(&mut host_read, &mut tcp_write);
         let _ = tcp_write.shutdown(std::net::Shutdown::Write);
     });
-    // container -> host
-    copy(&mut tcp_read, &mut host_write);
+    // container -> host, spliced through the kernel where it can be
+    let (tcp_fd, host_fd) = (tcp_read.as_raw_fd(), host_write.0.as_raw_fd());
+    splice_copy(&tcp_fd, &host_fd, || copy(&mut tcp_read, &mut host_write));
     // SAFETY: a live descriptor; shutdown of the write half only.
-    unsafe { libc::shutdown(host_write.0.as_raw_fd(), libc::SHUT_WR) };
+    unsafe { libc::shutdown(host_fd, libc::SHUT_WR) };
     let _ = inbound.join();
 }
 
@@ -660,8 +662,69 @@ fn echo_back(stream: OwnedFd) {
     }
 }
 
+/// Moves a TCP socket's bytes to another descriptor without passing them
+/// through this process: `splice` from the socket into a pipe and from the
+/// pipe onward, both inside the kernel. The container's side of a stream is
+/// TCP, which supports it; the vsock side takes the pipe's pages through
+/// `sendmsg`. Falls back to [`copy`] on a kernel or socket that refuses,
+/// which is how the other direction still moves — a vsock socket cannot be
+/// spliced *from*.
+fn splice_copy(from: &impl AsRawFd, to: &impl AsRawFd, fallback: impl FnOnce()) {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: a two-int array for pipe2 to fill.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return fallback();
+    }
+    // SAFETY: fresh descriptors we own.
+    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // The pipe's capacity bounds each splice; a megabyte keeps the two
+    // calls per chunk from being the cost.
+    // SAFETY: F_SETPIPE_SZ with an int argument.
+    unsafe { libc::fcntl(wr.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
+    const CHUNK: usize = 1 << 20;
+    let mut first = true;
+    loop {
+        // SAFETY: descriptors are live; null offsets for sockets and pipes.
+        let n = unsafe {
+            libc::splice(from.as_raw_fd(), std::ptr::null_mut(), wr.as_raw_fd(), std::ptr::null_mut(), CHUNK, libc::SPLICE_F_MOVE)
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if first && e.raw_os_error() == Some(libc::EINVAL) {
+                return fallback();
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        first = false;
+        let mut left = n as usize;
+        while left > 0 {
+            // SAFETY: as above.
+            let m = unsafe {
+                libc::splice(rd.as_raw_fd(), std::ptr::null_mut(), to.as_raw_fd(), std::ptr::null_mut(), left, libc::SPLICE_F_MOVE)
+            };
+            if m < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            if m == 0 {
+                return;
+            }
+            left -= m as usize;
+        }
+    }
+}
+
 fn copy(from: &mut impl Read, to: &mut impl Write) {
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
         match from.read(&mut buf) {
             Ok(0) | Err(_) => break,

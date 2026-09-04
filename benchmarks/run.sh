@@ -413,6 +413,7 @@ setup_lighter() {
 		--net "$GVPROXY" --run-dir "$RUN_DIR" \
 		--vsock "$SOCKET:2375" \
 		--vsock "$RUN_DIR/control.sock:2376" \
+		--docker-ports "$SOCKET" \
 		--share "bench:$WORK" \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
 		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_CMDLINE_EXTRA:-}" \
@@ -626,7 +627,11 @@ print(int(bps/1e6))' 2>/dev/null || echo ""; }
 net_client() { dk run --rm "$IMAGE" "$@"; }
 run_net_case() {
 	local name="$1" rep value out
-	net_setup || return 1
+	# A measurement that fails is a dash in the table, not the end of the
+	# run: the script is `set -e` and a client that could not connect would
+	# otherwise take every case after it down silently.
+	set +e
+	net_setup || { set -e; return 1; }
 	printf '==> %s: %s' "$TARGET" "$name"
 	for rep in $(seq 1 "$REPS"); do
 		value=""
@@ -674,6 +679,7 @@ ts.sort(); print(int(ts[len(ts)//2]*1e6), int(ts[int(len(ts)*0.99)]*1e6))' "$NET
 		fi
 	done
 	printf '\n'
+	set -e
 }
 
 # ------------------------------------------------------------------ power --
