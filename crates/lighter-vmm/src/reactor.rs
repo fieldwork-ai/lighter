@@ -66,6 +66,19 @@ struct Stream {
     partial: Vec<u8>,
 }
 
+/// Counters for `LIGHTER_STREAM_TRACE`.
+#[derive(Default)]
+struct Counters {
+    iters: u64,
+    wakes: u64,
+    events: u64,
+    takes_chunks: u64,
+    takes_empty: u64,
+    writev: u64,
+    eagain: u64,
+    writable: u64,
+}
+
 enum Command {
     Outbound(ConnKey),
     Inbound(u16, TcpStream),
@@ -277,6 +290,7 @@ struct Loop {
     by_fd: HashMap<RawFd, ConnKey>,
     buf: Vec<u8>,
     memory: Option<Arc<crate::memory::GuestMemory>>,
+    counters: Counters,
 }
 
 fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
@@ -297,13 +311,29 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         by_fd: HashMap::new(),
         buf: Vec::with_capacity(READ_CHUNK),
         memory: None,
+        counters: Counters::default(),
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
+    // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
+    let trace = std::env::var("LIGHTER_STREAM_TRACE").map(|v| v == "1").unwrap_or(false);
+    let tick = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+    let mut last_trace = std::time::Instant::now();
     loop {
         // SAFETY: the events buffer has capacity 64 and no changes are given.
         let n = unsafe {
-            libc::kevent(l.kq.0, std::ptr::null(), 0, events.as_mut_ptr(), 64, std::ptr::null())
+            libc::kevent(
+                l.kq.0,
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                64,
+                if trace { &tick } else { std::ptr::null() },
+            )
         };
+        if trace && last_trace.elapsed() >= std::time::Duration::from_millis(10) {
+            last_trace = std::time::Instant::now();
+            l.trace();
+        }
         if n < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -313,6 +343,8 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         }
         // SAFETY: kevent wrote `n` entries.
         unsafe { events.set_len(n as usize) };
+        l.counters.iters += 1;
+        l.counters.events += n as u64;
         let mut woken = false;
         for ev in &events {
             let fd = ev.ident as RawFd;
@@ -328,6 +360,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             }
         }
         if woken {
+            l.counters.wakes += 1;
             // Drain the pipe, take the commands, then look at every stream:
             // the waker says nothing about which one changed.
             let mut sink = [0u8; 256];
@@ -349,6 +382,37 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
 }
 
 impl Loop {
+    fn trace(&self) {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() % 100_000_000).unwrap_or(0);
+        for (key, s) in &self.streams {
+            if !matches!(s.phase, Phase::Open) {
+                continue;
+            }
+            let from_guest: usize = s.from_guest.iter().map(|c| c.len()).sum::<usize>() - s.from_guest_at;
+            eprintln!(
+                "TRACE t={t} stream {:?} from_guest={} to_guest={} reading={} writing={} tcp_eof={} guest_eof={}",
+                key,
+                from_guest,
+                s.to_guest.len() - s.to_guest_at,
+                s.reading,
+                s.writing,
+                s.tcp_eof,
+                s.guest_eof
+            );
+        }
+        let c = &self.counters;
+        eprintln!(
+            "TRACE t={t} reactor iters={} wakes={} events={} takes_chunks={} takes_empty={} writev={} eagain={} writable={}",
+            c.iters, c.wakes, c.events, c.takes_chunks, c.takes_empty, c.writev, c.eagain, c.writable
+        );
+        for line in self.shared.trace_lines() {
+            if line.contains("outbound=0/0") && line.contains("guest_inflight=0 ") {
+                continue;
+            }
+            eprintln!("TRACE t={t} {line}");
+        }
+    }
+
     fn command(&mut self, command: Command) {
         match command {
             Command::Outbound(key) => {
@@ -569,8 +633,11 @@ impl Loop {
             let Some(stream) = self.streams.get_mut(&key) else { return };
             if stream.from_guest.is_empty() && !stream.guest_eof {
                 match self.shared.try_take_outbound(key) {
-                    Outbound::Chunks(chunks) => stream.from_guest.extend(chunks),
-                    Outbound::Empty => {}
+                    Outbound::Chunks(chunks) => {
+                        self.counters.takes_chunks += 1;
+                        stream.from_guest.extend(chunks)
+                    }
+                    Outbound::Empty => self.counters.takes_empty += 1,
                     Outbound::Finished => stream.guest_eof = true,
                     Outbound::Gone => {
                         self.close(key);
@@ -631,9 +698,11 @@ impl Loop {
             // SAFETY: every iovec points into a chunk or guest span that
             // outlives this call.
             let n = unsafe { libc::writev(fd, iovs.as_ptr(), iovs.len() as libc::c_int) };
+            self.counters.writev += 1;
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::WouldBlock {
+                    self.counters.eagain += 1;
                     if !stream.writing {
                         stream.writing = true;
                         self.kq.write(fd, true);
@@ -760,6 +829,7 @@ impl Loop {
     }
 
     fn writable(&mut self, key: ConnKey) {
+        self.counters.writable += 1;
         let Some(stream) = self.streams.get_mut(&key) else { return };
         if matches!(stream.phase, Phase::Connecting) {
             let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();

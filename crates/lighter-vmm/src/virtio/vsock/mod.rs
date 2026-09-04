@@ -103,6 +103,8 @@ struct Conn {
     /// for every few hundred kilobytes; the guest only needs to hear when
     /// a useful fraction of its window has come back.
     unreported: u32,
+    /// Payload bytes taken from the guest, wrapping; for the trace.
+    received: u32,
     /// The host end, kept for shutdown. The writer thread holds its own
     /// clone. None until a pump attaches one.
     socket: Option<Box<dyn Closable>>,
@@ -207,6 +209,11 @@ struct Inner {
     /// Transmit chains whose bytes are on a socket now, waiting to go back
     /// on the used ring the next time the transport looks.
     done: VecDeque<u16>,
+    /// Chains taken from the transmit ring and still held (a payload the
+    /// writer has not finished with, or one in `done` not yet returned).
+    /// The guest's ring is finite: when every held chain is done, nothing
+    /// else will bring the next look at the ring, so `complete` does.
+    held: usize,
     /// Ports the host answers: a REQUEST to one is accepted and the new
     /// connection handed to the listener, one end of a socket pair for the
     /// device's pump and the other for whoever listens.
@@ -268,6 +275,7 @@ impl VsockShared {
                 next_port: FIRST_EPHEMERAL_PORT,
                 spare: Vec::new(),
                 done: VecDeque::new(),
+                held: 0,
                 listeners: HashMap::new(),
             }),
             progress: Condvar::new(),
@@ -360,6 +368,7 @@ impl VsockShared {
                 outbound: VecDeque::new(),
                 guest_done: false,
                 unreported: 0,
+                received: 0,
                 socket: Some(Box::new(socket)),
             },
         );
@@ -630,8 +639,14 @@ impl VsockShared {
         // Returned on the next look at either ring, which the credit update
         // or the guest's next packet brings; a wake per batch was a guest
         // interrupt for every few hundred kilobytes. A pile of them is
-        // pushed out rather than left: the ring is finite.
-        let pile = inner.done.len() >= 32;
+        // pushed out rather than left — and so is the last of what was
+        // held: with every chain the host took now done, the guest's ring
+        // may be full of them, and a guest whose ring is full sends no
+        // packet and gets no credit update, so no look was ever coming.
+        // Measured before this: a stream out of the guest stopping for a
+        // tenth of a second at a time, each time the ring filled with
+        // chains the writer had long finished with.
+        let pile = inner.done.len() >= 32 || inner.done.len() >= inner.held;
         drop(inner);
         if pile {
             self.wake();
@@ -805,6 +820,36 @@ impl VsockShared {
         }
     }
 
+    /// Every connection's state on one line each, for `LIGHTER_STREAM_TRACE`.
+    pub fn trace_lines(&self) -> Vec<String> {
+        let inner = self.lock();
+        inner
+            .conns
+            .iter()
+            .map(|(key, conn)| {
+                let (pba, pfwd, tx, fwd) = conn.credit.counters();
+                let outbound: usize = conn.outbound.iter().map(|c| c.len()).sum();
+                format!(
+                    "vsock {:?} state={:?} received={} fwd={} unreported={} guest_inflight={} outbound={}/{} to_guest_avail={} tx={} peer_fwd={} peer_buf={} outbox={} done={}",
+                    key,
+                    conn.state,
+                    conn.received,
+                    fwd,
+                    conn.unreported,
+                    conn.received.wrapping_sub(fwd.wrapping_sub(conn.unreported)),
+                    conn.outbound.len(),
+                    outbound,
+                    conn.credit.available(),
+                    tx,
+                    pfwd,
+                    pba,
+                    inner.outbox.len(),
+                    conn.guest_done
+                )
+            })
+            .collect()
+    }
+
     /// Records that `bytes` reached the host application, freeing the guest to
     /// send that much more.
     pub fn acknowledge(&self, key: ConnKey, bytes: u32) {
@@ -963,6 +1008,7 @@ impl Vsock {
                 // advanced here — the bytes are not with the host application
                 // yet, and claiming they are would invite the guest to send
                 // more than we can hold.
+                conn.received = conn.received.wrapping_add(packet.payload.len() as u32);
                 conn.outbound.push_back(Chunk::Owned(packet.payload));
             }
 
@@ -1001,6 +1047,7 @@ impl Vsock {
                             outbound: VecDeque::new(),
                             guest_done: false,
                             unreported: 0,
+                received: 0,
                             socket: None,
                         };
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
@@ -1042,7 +1089,10 @@ impl Vsock {
         match inner.conns.get_mut(&key) {
             Some(conn) => {
                 conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
+                let len: usize = spans.iter().map(|s| s.1).sum();
+                conn.received = conn.received.wrapping_add(len as u32);
                 conn.outbound.push_back(Chunk::Guest { head, spans });
+                inner.held += 1;
                 true
             }
             None => {
@@ -1059,6 +1109,7 @@ impl Vsock {
         let mut any = false;
         while let Some(head) = inner.done.pop_front() {
             queue.push_used(mem, head, 0);
+            inner.held = inner.held.saturating_sub(1);
             any = true;
         }
         any

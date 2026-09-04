@@ -54,6 +54,11 @@ impl Credit {
     }
 
     /// Records the credit fields carried by every packet from the peer.
+    /// The counters, for a trace: (peer_buf_alloc, peer_fwd_cnt, tx_cnt, fwd_cnt).
+    pub fn counters(&self) -> (u32, u32, u32, u32) {
+        (self.peer_buf_alloc, self.peer_fwd_cnt, self.tx_cnt, self.fwd_cnt)
+    }
+
     pub fn observe(&mut self, buf_alloc: u32, fwd_cnt: u32) {
         self.peer_buf_alloc = buf_alloc;
         self.peer_fwd_cnt = fwd_cnt;
