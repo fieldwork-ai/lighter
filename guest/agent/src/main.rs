@@ -194,9 +194,18 @@ fn bound_container_cache() {
     // working set larger than two gigabytes paid on every page. It shipped
     // by accident for a morning (the UDP commit carried it), which is what
     // the pnpm regressions of 2026-09-04's memory runs were.
+    //
+    // Opt-in only (`lighter.cachebound=<MiB>`), never a default: on a daily
+    // driver the containers' cgroup is every container the user runs at
+    // once — Postgres, dev servers, brokers — and a shared ceiling there
+    // is `memory.high` throttling the lot. A 24 GiB machine carrying the
+    // benchmark's bound had 36 tasks in D state, a load of 80, every
+    // health check failing and 782,575 throttle events before the bound
+    // was lifted by hand. The benchmark asks for it on its own command
+    // line; a machine that did not ask keeps its cache.
     let bound = cmdline_value("lighter.cachebound")
         .map(|mib| mib << 20)
-        .unwrap_or(if total >= 8 << 30 { total / 4 } else { 0 });
+        .unwrap_or(0);
     // dockerd makes the containers' cgroup at the first container, which
     // can be any time: the bound is written once it exists.
     let mut bounded = bound == 0;
