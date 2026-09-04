@@ -213,13 +213,13 @@ impl Steering {
 
     /// The guest says it can spare `spare_mib` beyond what the balloon
     /// already holds; `release` asks the whole balloon back. An offer under
-    /// 64 MiB holds the target where it is. A step is at most 2 GiB, so
+    /// 64 MiB holds the target where it is. A step is at most 4 GiB, so
     /// the next second's offer is measured against inflation that has
     /// actually happened rather than a target still being filled — the
     /// balloon's own count of what it holds lags its allocations, and a
     /// target summed from the two overshoots the guest's reserve.
     fn guest_offers(&self, spare_mib: u64, release: bool) {
-        const STEP_MIB: u64 = 2048;
+        const STEP_MIB: u64 = 4096;
         let cap = ((self.ram_bytes - self.ram_bytes / GUEST_RESERVE_FRACTION) / BALLOON_PAGE_SIZE)
             .min(u64::from(u32::MAX)) as u32;
         let pages = if release {

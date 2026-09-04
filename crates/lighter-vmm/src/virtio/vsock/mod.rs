@@ -652,6 +652,11 @@ impl VsockShared {
 
     /// Chains whose bytes are on a socket: back to the guest on the next
     /// look at the ring.
+    /// Whether chains the host has finished with are waiting to go back.
+    pub fn has_done(&self) -> bool {
+        !self.lock().done.is_empty()
+    }
+
     pub fn complete(&self, heads: impl IntoIterator<Item = u16>) {
         let mut inner = self.lock();
         inner.done.extend(heads);
@@ -665,6 +670,14 @@ impl VsockShared {
         // Measured before this: a stream out of the guest stopping for a
         // tenth of a second at a time, each time the ring filled with
         // chains the writer had long finished with.
+        // And neither rule fires while one stream holds its chains for
+        // good — a push to a remote that stopped reading — with fewer than
+        // thirty-two others done behind it: a daily driver sat with 51
+        // chains taken and none returned, the guest's every socket out of
+        // send memory, bulk data over the Docker socket dead while `docker
+        // ps` answered. So the deliverer's wait is bounded while anything
+        // is done (`has_done`); a chain goes back within a millisecond
+        // whatever the others are doing.
         let pile = inner.done.len() >= 32 || inner.done.len() >= inner.held;
         drop(inner);
         if pile {

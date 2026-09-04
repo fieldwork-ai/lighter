@@ -221,8 +221,13 @@ fn bound_container_cache() {
     let mut idle_for = 0u32;
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
+    // Quarter-second ticks: the offer to the host waits for two seconds of
+    // idle, and a one-second tick put the first offer three seconds after
+    // the last container stopped — past the moment anything looking at the
+    // machine five seconds after its work would read.
+    const TICKS_PER_SEC: u32 = 4;
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(1000 / TICKS_PER_SEC as u64));
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
             // The engine's cache (image layers) bounded too, at an eighth of
@@ -233,14 +238,14 @@ fn bound_container_cache() {
         let now = container_cpu_usec(containers);
         let used = now.saturating_sub(last);
         last = now;
-        idle_for = if used < 50_000 { idle_for + 1 } else { 0 };
+        idle_for = if used < 50_000 / TICKS_PER_SEC as u64 { idle_for + 1 } else { 0 };
         // Freed memory goes back at reporting's idle rate for a while after
         // a trim, and at its churn rate again once the containers work or
         // the burst is over (guest kernel patch 0019).
         // `lighter.reporting=fast` on the command line keeps reporting
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
-        if (idle_for == 0 || idle_for == 25) && !always_fast {
+        if (idle_for == 0 || idle_for == 25 * TICKS_PER_SEC) && !always_fast {
             set_reporting(2000, 9);
         }
         // Two seconds idle: offer the host what is free beyond a reserve,
@@ -251,7 +256,7 @@ fn bound_container_cache() {
         // takes pages at host-page size from any free list. The offer is
         // withdrawn — the whole balloon asked back — the moment the
         // containers work again or free memory falls under the reserve.
-        offer_memory(&mut memory_stream, total, idle_for);
+        offer_memory(&mut memory_stream, total, idle_for / TICKS_PER_SEC);
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
@@ -265,7 +270,7 @@ fn bound_container_cache() {
         // was measured: 0.4 GB back at five seconds, 1.4 at ten, and the
         // fifteen-second reading caught the second pass mid-drain.
         let (floor, engine_floor) = match idle_for {
-            5 | 10 => (total / 64, 8 << 20),
+            x if x == 5 * TICKS_PER_SEC || x == 10 * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
         };
         // Hurried, and down to 128 KiB runs: what a trim frees merges

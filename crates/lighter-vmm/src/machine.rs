@@ -304,9 +304,11 @@ impl Machine {
             {
                 let deliver = deliver.clone();
                 let transport = transport.clone();
+                let deliver_shared = vsock_state.clone();
                 std::thread::Builder::new()
                     .name("vsock-deliver".into())
                     .spawn(move || {
+                        let deliver_shared = deliver_shared;
                         crate::qos::raise_interactive();
                         let (pending, arrived) = &*deliver;
                         loop {
@@ -323,7 +325,20 @@ impl Machine {
                             if !go {
                                 let mut flag = pending.lock().expect("deliver poisoned");
                                 while !*flag {
-                                    flag = arrived.wait(flag).expect("deliver poisoned");
+                                    // Bounded while finished chains wait to go
+                                    // back: the service below returns them, and
+                                    // nothing else may be coming to prompt it.
+                                    if deliver_shared.has_done() {
+                                        let (guard, _) = arrived
+                                            .wait_timeout(flag, std::time::Duration::from_millis(1))
+                                            .expect("deliver poisoned");
+                                        flag = guard;
+                                        if !*flag {
+                                            break;
+                                        }
+                                    } else {
+                                        flag = arrived.wait(flag).expect("deliver poisoned");
+                                    }
                                 }
                                 *flag = false;
                             }
