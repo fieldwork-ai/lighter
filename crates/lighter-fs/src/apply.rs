@@ -164,8 +164,11 @@ impl Kind {
     }
 }
 
-/// How many jobs of the bounded lane may run at once. Unbounded (the
-/// workers' count) unless `LIGHTER_FS_APPLY_CREATE_WIDTH` says otherwise.
+/// How many jobs of the bounded lane may run at once. Three: with eight
+/// workers on the M1, npm read 12.0 s at three against 12.4 unbounded and
+/// 13.7 at one, pnpm's clones keeping the other five; on the M5 three was
+/// level with unbounded (npm 6.62 against 6.81, pnpm 4.10 against 4.01).
+/// `LIGHTER_FS_APPLY_CREATE_WIDTH` overrides.
 fn create_width() -> usize {
     static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WIDTH.get_or_init(|| {
@@ -173,7 +176,7 @@ fn create_width() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(usize::MAX)
+            .unwrap_or(3)
     })
 }
 
@@ -252,12 +255,20 @@ fn jobs_cap() -> usize {
 /// M1 five beats three and four (best rep 5.7 s against 6.6 and 6.1).
 /// Each job takes longer with company — a clone 154 → 240 µs on the M5,
 /// APFS contending — but more of them finish per second.
+///
+/// Measured again with the lanes (2026-09-04): the M1, whose eight cores the
+/// guest fills, wants eight — pnpm 6.6 → 5.5 s, npm level with the creates
+/// held to three — while the M5 (18 cores) loses at eight (pnpm 4.0 → 4.3,
+/// npm 6.8 → 7.3) and keeps five. The lane is bound by APFS latency, not
+/// CPU, and on the small machine more in flight is the only route to more
+/// through; why the large one pays for the same is not understood, only
+/// measured.
 fn workers() -> usize {
     std::env::var("LIGHTER_FS_APPLY_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(5)
+        .unwrap_or(if crate::sys::core_count() <= 8 { 8 } else { 5 })
 }
 
 /// Whether the bounded lane runs at most one job per directory at a time.
@@ -265,10 +276,16 @@ fn workers() -> usize {
 /// APFS hands a directory between the threads creating names in it, at a
 /// cost each time; with the lane keyed on the parent, creates in one
 /// directory stay on one worker and the workers spread across directories
-/// instead. `LIGHTER_FS_APPLY_DIR_AFFINITY=1`; off, the lane is one queue.
+/// instead. On the M1 at eight workers it gave npm a second back (13.4 →
+/// 12.4 s); on the M5 it was level to a little better (npm 6.81 → 6.64).
+/// `LIGHTER_FS_APPLY_DIR_AFFINITY=0` for the one queue.
 fn dir_affinity() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LIGHTER_FS_APPLY_DIR_AFFINITY").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var("LIGHTER_FS_APPLY_DIR_AFFINITY")
+            .ok()
+            .is_none_or(|v| v != "0")
+    })
 }
 
 /// The bounded lane: ready jobs by lane key, each key's oldest first, and

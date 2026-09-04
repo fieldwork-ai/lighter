@@ -957,6 +957,13 @@ impl Drop for Dir {
 /// vCPU — eight on an M1, with eight vCPUs — they compete with the idle
 /// polling of the guest they serve. macOS schedules by QoS class before
 /// anything else.
+/// The Mac's logical cores.
+pub fn core_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+}
+
 pub fn raise_server_qos() {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let wanted =
