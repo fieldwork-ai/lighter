@@ -246,6 +246,13 @@ done
 # socket until the host has taken it off the ring, and the default ceiling
 # is under one packet.
 sysctl -q -w net.core.wmem_max=16777216 net.core.rmem_max=16777216 fs.pipe-max-size=16777216 2>/dev/null || true
+# Unmovable allocations (slab, page tables) kept out of movable blocks. An
+# install fills memory with page cache and the slab it needs spills into
+# blocks that were movable; when the cache is trimmed afterwards the free
+# memory around those pages cannot form the two-megabyte runs free page
+# reporting hands the host, and a third of what the trim freed came back
+# over thirty seconds as compaction worked around them, or not at all.
+echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
 # TCP inside the guest carries a container's stream to the agent; its
 # windows are what lets that leg run ahead of the vsock leg behind it. The
 # defaults top out at 4 and 6 MB.
