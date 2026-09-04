@@ -277,7 +277,13 @@ fn bound_container_cache() {
         let active = idle_for == 0 && running > 0;
         let busy = guest_cpu_busy(&mut cpu_last);
         quiet_for = if busy < 100_000 / TICKS_PER_SEC as u64 { quiet_for + 1 } else { 0 };
-        offer_memory(&mut memory_stream, total, active, quiet_for >= TICKS_PER_SEC, running == 0);
+        // Three seconds of it, not one: a second's pause between two
+        // commands is the suite's gap between cases, and an offer made in
+        // it had the next case deflating the balloon and faulting on every
+        // page it touched — copy-tree 7.4 s against 5.2 on the M1. Three is
+        // longer than the gap and inside the five seconds after work that a
+        // footprint is read at.
+        offer_memory(&mut memory_stream, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
@@ -291,11 +297,11 @@ fn bound_container_cache() {
         // was measured: 0.4 GB back at five seconds, 1.4 at ten, and the
         // fifteen-second reading caught the second pass mid-drain.
         //
-        // With no container running at all, two and seven seconds instead:
+        // With no container running at all, three and eight seconds instead:
         // nothing is between commands then, and the cache is the last thing
         // the host is still holding for a guest that has stopped.
         let running = running_containers(containers);
-        let (first, second) = if running == 0 { (2, 7) } else { (5, 10) };
+        let (first, second) = if running == 0 { (3, 8) } else { (5, 10) };
         let (floor, engine_floor) = match idle_for {
             x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
