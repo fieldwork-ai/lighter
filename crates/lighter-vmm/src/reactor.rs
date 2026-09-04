@@ -423,12 +423,15 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
     // the vsock side's flag for `spin` rather than blocking, so a reply
     // that follows a request by a few microseconds — every GET on a kept
     // connection — is picked up without the pipe write on the poller and
-    // the scheduler hop here. `LIGHTER_REACTOR_SPIN_US`, 0 disables.
+    // the scheduler hop here. Fifty microseconds: on the M1 a GET on a kept
+    // connection went from 149 µs to 129 (OrbStack's 128), and 200 bought
+    // nothing more; the M5 was level (60 → 63 → 59) with the outbound
+    // port path a few percent up. `LIGHTER_REACTOR_SPIN_US`, 0 disables.
     let spin = std::env::var("LIGHTER_REACTOR_SPIN_US")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_micros)
-        .unwrap_or_default();
+        .unwrap_or(std::time::Duration::from_micros(50));
     let zero = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
