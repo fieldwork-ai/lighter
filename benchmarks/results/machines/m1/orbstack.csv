@@ -23,10 +23,6 @@ rm-rf,3,3969
 watch-latency,1,15
 watch-latency,2,2
 watch-latency,3,2
-memory-settled,1,3273
-memory-peak,1,5041
-memory-after-15s,1,2674
-memory-after-60s,1,1496
 net-tcp-egress,1,63579
 net-tcp-egress,2,64489
 net-tcp-egress,3,63562
@@ -57,3 +53,7 @@ net-dns,3,423
 power-cpu-ms-per-s,1,21
 power-wakeups-per-s,1,91
 power-pkg-idle-wakeups-per-s,1,1
+memory-settled,1,1097
+memory-peak,1,4112
+memory-after-15s,1,2144
+memory-after-60s,1,1027

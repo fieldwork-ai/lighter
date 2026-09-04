@@ -20,10 +20,6 @@ copy-tree,3,8707
 rm-rf,1,2936
 rm-rf,2,2988
 rm-rf,3,2966
-memory-settled,1,2475
-memory-peak,1,5509
-memory-after-15s,1,2357
-memory-after-60s,1,2180
 net-tcp-egress,1,97168
 net-tcp-egress,2,97161
 net-tcp-egress,3,94328
@@ -54,3 +50,7 @@ net-dns,3,251
 power-cpu-ms-per-s,1,2
 power-wakeups-per-s,1,99
 power-pkg-idle-wakeups-per-s,1,0
+memory-settled,1,1028
+memory-peak,1,5498
+memory-after-15s,1,2850
+memory-after-60s,1,2114

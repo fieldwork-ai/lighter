@@ -59,24 +59,24 @@ OrbStack, Colima and Docker Desktop were measured on the same machines in the sa
 
 | Workload | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.16 s | **6.88 s** (89%) | 8.49 s (73%) | 17.79 s (35%) | 17.91 s (34%) |
-| `pnpm install` | 3.77 s | **3.84 s** (98%) | 4.72 s (80%) | 25.43 s (15%) | 28.34 s (13%) |
-| `yarn install` | 5.75 s | **5.31 s** (108%) | 7.79 s (74%) | 22.16 s (26%) | 22.58 s (25%) |
-| `ripgrep` (file read) | 927 ms | **83 ms** (1117%) | 1.02 s (91%) | 6.86 s (14%) | 9.84 s (9%) |
+| `npm ci` | 6.16 s | **6.52 s** (95%) | 8.49 s (73%) | 17.79 s (35%) | 17.91 s (34%) |
+| `pnpm install` | 3.77 s | **4.02 s** (94%) | 4.72 s (80%) | 25.43 s (15%) | 28.34 s (13%) |
+| `yarn install` | 5.75 s | **5.10 s** (113%) | 7.79 s (74%) | 22.16 s (26%) | 22.58 s (25%) |
+| `ripgrep` (file read) | 927 ms | **88 ms** (1053%) | 1.02 s (91%) | 6.86 s (14%) | 9.84 s (9%) |
 | `find` (metadata walk) | 357 ms | **94 ms** (380%) | 595 ms (60%) | 1.43 s (25%) | 1.88 s (19%) |
-| `cp -a node_modules` | 13.55 s | **3.26 s** (416%) | 8.71 s (156%) | 44.30 s (31%) | 33.55 s (40%) |
-| `rm -rf node_modules` | 3.65 s | **2.30 s** (159%) | 2.97 s (123%) | 8.05 s (45%) | 6.56 s (56%) |
-| Host file edit -> container | 2 ms | **2 ms** | — | 1.00 s | 1.00 s |
+| `cp -a node_modules` | 13.55 s | **3.31 s** (409%) | 8.71 s (156%) | 44.30 s (31%) | 33.55 s (40%) |
+| `rm -rf node_modules` | 3.65 s | **2.55 s** (143%) | 2.97 s (123%) | 8.05 s (45%) | 6.56 s (56%) |
+| Host file edit -> container | 2 ms | **5 ms** | — | 1.00 s | 1.00 s |
 
 | Workload (own disk) | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| `npm ci` | **4.60 s** | 7.01 s | 8.59 s | 8.61 s |
-| `pnpm install` | 1.19 s | 2.03 s | **1.14 s** | 2.87 s |
-| `yarn install` | **4.09 s** | 5.08 s | 6.58 s | 11.14 s |
-| `ripgrep` (file read) | **88 ms** | 102 ms | 121 ms | 124 ms |
-| `find` (metadata walk) | **93 ms** | 127 ms | 176 ms | 131 ms |
-| `cp -a node_modules` | **904 ms** | 1.11 s | 1.88 s | 2.58 s |
-| `rm -rf node_modules` | **382 ms** | 496 ms | 551 ms | 428 ms |
+| `npm ci` | **4.74 s** | 7.01 s | 8.59 s | 8.61 s |
+| `pnpm install` | 1.32 s | 2.03 s | **1.14 s** | 2.87 s |
+| `yarn install` | **4.07 s** | 5.08 s | 6.58 s | 11.14 s |
+| `ripgrep` (file read) | **79 ms** | 102 ms | 121 ms | 124 ms |
+| `find` (metadata walk) | **97 ms** | 127 ms | 176 ms | 131 ms |
+| `cp -a node_modules` | **938 ms** | 1.11 s | 1.88 s | 2.58 s |
+| `rm -rf node_modules` | **378 ms** | 496 ms | 551 ms | 428 ms |
 
 #### What the runtime costs the Mac
 
@@ -84,10 +84,10 @@ The physical footprint of the runtime's own processes, which is the "Memory" col
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Settled, before an install | 10255 MiB | **2475 MiB** | 8208 MiB | 9179 MiB |
-| Peak through an npm install | 10255 MiB | **5509 MiB** | 8700 MiB | 9182 MiB |
-| 15 s after it ends | 3495 MiB | **2357 MiB** | 8735 MiB | 9187 MiB |
-| 60 s after it ends | 3299 MiB | **2180 MiB** | 8735 MiB | 9187 MiB |
+| Settled, before an install | 1610 MiB | **1028 MiB** | 8208 MiB | 9179 MiB |
+| Peak through an npm install | **2057 MiB** | 5498 MiB | 8700 MiB | 9182 MiB |
+| 15 s after it ends | **1269 MiB** | 2850 MiB | 8735 MiB | 9187 MiB |
+| 60 s after it ends | **1270 MiB** | 2114 MiB | 8735 MiB | 9187 MiB |
 
 #### The network
 
@@ -95,15 +95,15 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Mbit/s | 123472 | 90429 | **97161** | 4479 | 23245 |
-| TCP, the Mac to a container | Mbit/s | 129208 | **84706** | 52870 | 3927 | 14257 |
-| TCP into a published port | Mbit/s | — | **92322** | 54227 | 3838 | 14314 |
-| TCP out of a published port | Mbit/s | — | 88788 | **93100** | 4357 | 33392 |
-| UDP, container to the Mac | Mbit/s | 21838 | **4919** | 3123 | 3283 | 0 |
-| connects to a published port | per second | 25963 | **17709** | 16155 | 15819 | 16994 |
-| GET on a published port, median | µs | 40 | **61** | 73 | 224 | 119 |
-| GET on a published port, p99 | µs | 70 | 155 | **119** | 361 | 245 |
-| DNS lookup from a container, median | µs | 2850 | **58** | 251 | 483 | 474 |
+| TCP, container to the Mac | Mbit/s | 123472 | 88034 | **97161** | 4479 | 23245 |
+| TCP, the Mac to a container | Mbit/s | 129208 | **81976** | 52870 | 3927 | 14257 |
+| TCP into a published port | Mbit/s | — | **88850** | 54227 | 3838 | 14314 |
+| TCP out of a published port | Mbit/s | — | 83740 | **93100** | 4357 | 33392 |
+| UDP, container to the Mac | Mbit/s | 21838 | **4953** | 3123 | 3283 | 0 |
+| connects to a published port | per second | 25963 | 16296 | 16155 | 15819 | **16994** |
+| GET on a published port, median | µs | 40 | **73** | **73** | 224 | 119 |
+| GET on a published port, p99 | µs | 70 | 260 | **119** | 361 | 245 |
+| DNS lookup from a container, median | µs | 2850 | **57** | 251 | 483 | 474 |
 
 #### What an idle runtime costs
 
@@ -111,31 +111,31 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| CPU, ms per second | 6 | **2** | 5 | 25 |
-| Wakeups per second | 102 | 99 | **50** | 3748 |
+| CPU, ms per second | 10 | **2** | 5 | 25 |
+| Wakeups per second | 120 | 99 | **50** | 3748 |
 
 ### Apple M1 (8 cores, 8 GB RAM)
 
 | Workload | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 7.68 s | 11.90 s (65%) | **11.54 s** (67%) | 23.58 s (33%) | 25.85 s (30%) |
-| `pnpm install` | 4.47 s | 6.90 s (65%) | **5.89 s** (76%) | — | 46.36 s (10%) |
-| `yarn install` | 9.62 s | 11.06 s (87%) | **10.36 s** (93%) | 28.10 s (34%) | 35.38 s (27%) |
-| `ripgrep` (file read) | 1.21 s | **190 ms** (637%) | 1.11 s (109%) | 17.04 s (7%) | 13.24 s (9%) |
+| `npm ci` | 7.68 s | **11.17 s** (69%) | 11.54 s (67%) | 23.58 s (33%) | 25.85 s (30%) |
+| `pnpm install` | 4.47 s | 6.02 s (74%) | **5.89 s** (76%) | — | 46.36 s (10%) |
+| `yarn install` | 9.62 s | 11.13 s (86%) | **10.36 s** (93%) | 28.10 s (34%) | 35.38 s (27%) |
+| `ripgrep` (file read) | 1.21 s | **178 ms** (680%) | 1.11 s (109%) | 17.04 s (7%) | 13.24 s (9%) |
 | `find` (metadata walk) | 512 ms | **122 ms** (420%) | 552 ms (93%) | 3.81 s (13%) | 4.10 s (12%) |
-| `cp -a node_modules` | 21.50 s | **5.19 s** (415%) | 15.19 s (142%) | 62.92 s (34%) | 44.64 s (48%) |
-| `rm -rf node_modules` | 5.37 s | **3.29 s** (163%) | 3.97 s (135%) | 12.38 s (43%) | 12.78 s (42%) |
+| `cp -a node_modules` | 21.50 s | **5.64 s** (381%) | 15.19 s (142%) | 62.92 s (34%) | 44.64 s (48%) |
+| `rm -rf node_modules` | 5.37 s | **2.63 s** (204%) | 3.97 s (135%) | 12.38 s (43%) | 12.78 s (42%) |
 | Host file edit -> container | 2 ms | **2 ms** | **2 ms** | 6 ms | 10 ms |
 
 | Workload (own disk) | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| `npm ci` | **8.31 s** | 10.39 s | 11.30 s | 12.60 s |
-| `pnpm install` | 1.79 s | 2.44 s | **1.56 s** | 2.23 s |
-| `yarn install` | 7.90 s | **7.88 s** | 11.55 s | 11.74 s |
-| `ripgrep` (file read) | **138 ms** | 160 ms | 183 ms | 260 ms |
-| `find` (metadata walk) | **128 ms** | 132 ms | 215 ms | 152 ms |
-| `cp -a node_modules` | **3.10 s** | 3.21 s | 3.26 s | 6.20 s |
-| `rm -rf node_modules` | 595 ms | 736 ms | 729 ms | **592 ms** |
+| `npm ci` | **8.08 s** | 10.39 s | 11.30 s | 12.60 s |
+| `pnpm install` | 1.80 s | 2.44 s | **1.56 s** | 2.23 s |
+| `yarn install` | 7.94 s | **7.88 s** | 11.55 s | 11.74 s |
+| `ripgrep` (file read) | **133 ms** | 160 ms | 183 ms | 260 ms |
+| `find` (metadata walk) | **129 ms** | 132 ms | 215 ms | 152 ms |
+| `cp -a node_modules` | **1.81 s** | 3.21 s | 3.26 s | 6.20 s |
+| `rm -rf node_modules` | 658 ms | 736 ms | 729 ms | **592 ms** |
 
 #### What the runtime costs the Mac
 
@@ -143,10 +143,10 @@ The physical footprint of the runtime's own processes, which is the "Memory" col
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Settled, before an install | **1263 MiB** | 3273 MiB | 4343 MiB | 4503 MiB |
-| Peak through an npm install | **3875 MiB** | 5041 MiB | 4344 MiB | 4503 MiB |
-| 15 s after it ends | **1029 MiB** | 2674 MiB | 4316 MiB | 4472 MiB |
-| 60 s after it ends | **1014 MiB** | 1496 MiB | 4315 MiB | 4472 MiB |
+| Settled, before an install | 2282 MiB | **1097 MiB** | 4343 MiB | 4503 MiB |
+| Peak through an npm install | **3611 MiB** | 4112 MiB | 4344 MiB | 4503 MiB |
+| 15 s after it ends | **1413 MiB** | 2144 MiB | 4316 MiB | 4472 MiB |
+| 60 s after it ends | 1317 MiB | **1027 MiB** | 4315 MiB | 4472 MiB |
 
 #### The network
 
@@ -154,15 +154,15 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Mbit/s | 118995 | 52319 | **63579** | 4311 | 13592 |
-| TCP, the Mac to a container | Mbit/s | 118041 | 29073 | **30343** | 3185 | 10426 |
-| TCP into a published port | Mbit/s | — | **44047** | 29949 | 3048 | 10292 |
-| TCP out of a published port | Mbit/s | — | 54510 | **67470** | 3791 | 22382 |
-| UDP, container to the Mac | Mbit/s | 24503 | **4971** | 3139 | 2612 | 0 |
-| connects to a published port | per second | 25453 | 15311 | **16477** | 9077 | 16221 |
-| GET on a published port, median | µs | 54 | 150 | **128** | 464 | 191 |
-| GET on a published port, p99 | µs | 97 | 236 | **231** | 539 | 497 |
-| DNS lookup from a container, median | µs | 3851 | **154** | 422 | 714 | 765 |
+| TCP, container to the Mac | Mbit/s | 118995 | 51648 | **63579** | 4311 | 13592 |
+| TCP, the Mac to a container | Mbit/s | 118041 | 29889 | **30343** | 3185 | 10426 |
+| TCP into a published port | Mbit/s | — | **35981** | 29949 | 3048 | 10292 |
+| TCP out of a published port | Mbit/s | — | 53009 | **67470** | 3791 | 22382 |
+| UDP, container to the Mac | Mbit/s | 24503 | **4890** | 3139 | 2612 | 0 |
+| connects to a published port | per second | 25453 | 13575 | **16477** | 9077 | 16221 |
+| GET on a published port, median | µs | 54 | 149 | **128** | 464 | 191 |
+| GET on a published port, p99 | µs | 97 | 717 | **231** | 539 | 497 |
+| DNS lookup from a container, median | µs | 3851 | **164** | 422 | 714 | 765 |
 
 #### What an idle runtime costs
 
@@ -170,8 +170,8 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| CPU, ms per second | 23 | 21 | **12** | 42 |
-| Wakeups per second | 325 | 91 | **59** | 2011 |
+| CPU, ms per second | 54 | 21 | **12** | 42 |
+| Wakeups per second | 369 | 91 | **59** | 2011 |
 
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 ## Why it is fast
