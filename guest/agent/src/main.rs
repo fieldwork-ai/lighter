@@ -175,21 +175,20 @@ fn bound_container_cache() {
         if idle_for == 0 || idle_for == 25 {
             set_reporting_delay_ms(2000);
         }
-        // Two stages. Five seconds idle: the containers keep a sixteenth
-        // of RAM, their warmest pages, and the engine almost nothing, since
-        // nothing it cached is a build's working set. Ten seconds idle: the
-        // containers go down to a sixty-fourth and the memory is compacted
-        // again — what the first trim freed was in file-sized pieces, and
-        // compaction on a guest that has been idle a while coalesces what
-        // the first pass missed; measured on the M5, the second stage
-        // returns 1.6 GB within two seconds of firing. Five and ten
+        // Two passes, five and ten seconds idle: the containers down to a
+        // sixty-fourth of RAM (their warmest pages) and the engine to
+        // almost nothing, since nothing it cached is a build's working
+        // set; then the same again, and compaction again — what the first
+        // trim freed was in file-sized pieces, and a second pass on a guest
+        // that has been idle a while coalesces what the first missed. Five
         // because the suite pauses three seconds between installs, and a
         // trim between two would cost the second its cache; and because
         // OrbStack's footprint is back at its resting size within fifteen
-        // seconds of an install, which the second stage now beats.
+        // seconds of an install. A sixteenth of RAM kept at the first pass
+        // was measured: 0.4 GB back at five seconds, 1.4 at ten, and the
+        // fifteen-second reading caught the second pass mid-drain.
         let (floor, engine_floor) = match idle_for {
-            5 => (total / 16, 32 << 20),
-            10 => (total / 64, 8 << 20),
+            5 | 10 => (total / 64, 8 << 20),
             _ => continue,
         };
         set_reporting_delay_ms(100);

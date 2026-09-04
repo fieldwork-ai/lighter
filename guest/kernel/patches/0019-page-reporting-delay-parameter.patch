@@ -10,6 +10,10 @@ cycle, and the Mac saw the guest's footprint fall by a hundred megabytes
 every two seconds for twenty seconds. page_reporting_delay_ms, writable, is
 what lets the guest's agent ask for the freed memory back now and restore
 the two seconds once it has gone.
+And when hurried, a cycle's budget is the whole free list rather than a
+sixteenth of it: upstream's budget reports an idle system in about thirty
+seconds by design, which after a trim was a footprint falling at a hundred
+megabytes a second for twenty.
 
 --- a/mm/page_reporting.c
 +++ b/mm/page_reporting.c
@@ -31,3 +35,17 @@ the two seconds once it has gone.
  static struct page_reporting_dev_info __rcu *pr_dev_info __read_mostly;
  
  enum {
+@@ -179,6 +188,13 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 	 * should always be a power of 2.
+ 	 */
+ 	budget = DIV_ROUND_UP(area->nr_free, PAGE_REPORTING_CAPACITY * 16);
++	/* Asked to hurry (the delay under its default), the whole list goes
++	 * in one cycle: the thirty seconds above were a guest that had just
++	 * trimmed two gigabytes of cache costing the Mac that memory for the
++	 * whole of them.
++	 */
++	if (page_reporting_delay_ms < 2000)
++		budget = DIV_ROUND_UP(area->nr_free, PAGE_REPORTING_CAPACITY) + 1;
+ 
+ 	/* loop through free list adding unreported pages to sg list */
+ 	list_for_each_entry_safe(page, next, list, lru) {
