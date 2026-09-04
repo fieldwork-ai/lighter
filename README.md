@@ -53,7 +53,7 @@ lighter stop        # Cleanly shut down the machine
 
 Measured on clean machines against a 1,232-package `package.json` fixture (`benchmarks/`). Each figure is the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). The first table is the runtime's own disk, where a container's writable layer and its volumes live; the second is a host share, the Mac's directory bind-mounted into the container. Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
 
-OrbStack, Colima and Docker Desktop were measured on the same machines in the same sessions, not quoted from marketing materials.
+OrbStack, Colima and Docker Desktop were measured on the same machines in the same sessions.
 
 ### Apple M5 Pro (18 cores, 48 GB RAM)
 
