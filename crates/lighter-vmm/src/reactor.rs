@@ -419,7 +419,30 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         tv_nsec: 10_000_000,
     };
     let mut last_trace = std::time::Instant::now();
+    // Spinning before parking: after any activity the loop polls kqueue and
+    // the vsock side's flag for `spin` rather than blocking, so a reply
+    // that follows a request by a few microseconds — every GET on a kept
+    // connection — is picked up without the pipe write on the poller and
+    // the scheduler hop here. `LIGHTER_REACTOR_SPIN_US`, 0 disables.
+    let spin = std::env::var("LIGHTER_REACTOR_SPIN_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_micros)
+        .unwrap_or_default();
+    let zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut spinning = false;
+    let mut last_activity = std::time::Instant::now();
     loop {
+        let timeout: *const libc::timespec = if spinning {
+            &zero
+        } else if trace {
+            &tick
+        } else {
+            std::ptr::null()
+        };
         // SAFETY: the events buffer has capacity 64 and no changes are given.
         let n = unsafe {
             libc::kevent(
@@ -428,7 +451,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
                 0,
                 events.as_mut_ptr(),
                 64,
-                if trace { &tick } else { std::ptr::null() },
+                timeout,
             )
         };
         if trace && last_trace.elapsed() >= std::time::Duration::from_millis(10) {
@@ -466,13 +489,20 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
                 l.writable(key);
             }
         }
+        let pending = l
+            .shared
+            .stream_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
         if woken {
-            l.counters.wakes += 1;
-            // Drain the pipe, take the commands, then look at every stream:
-            // the waker says nothing about which one changed.
+            // Drain the pipe.
             let mut sink = [0u8; 256];
             // SAFETY: reading into a stack buffer on a non-blocking fd.
             while unsafe { libc::read(wake_read, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+        }
+        if woken || pending {
+            l.counters.wakes += 1;
+            // Take the commands, then look at every stream: the waker says
+            // nothing about which one changed.
             let commands: Vec<Command> = std::mem::take(
                 &mut *l
                     .reactor
@@ -489,6 +519,38 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             let keys: Vec<ConnKey> = l.streams.keys().copied().collect();
             for key in keys {
                 l.progress(key);
+            }
+        }
+        if spin.is_zero() {
+            continue;
+        }
+        if n > 0 || woken || pending {
+            last_activity = std::time::Instant::now();
+            if !spinning {
+                spinning = true;
+                l.shared
+                    .reactor_spinning
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        } else if spinning {
+            if last_activity.elapsed() < spin {
+                std::hint::spin_loop();
+                continue;
+            }
+            spinning = false;
+            l.shared
+                .reactor_spinning
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            // Parked as far as the vsock side can see; anything it flagged
+            // in the gap is taken now rather than waited for.
+            if l.shared
+                .stream_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                spinning = true;
+                l.shared
+                    .reactor_spinning
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }

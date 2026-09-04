@@ -255,6 +255,15 @@ pub struct VsockShared {
     /// a stream might be waiting on has changed: credit, outbound bytes, a
     /// connection established or gone. Set once by the reactor.
     stream_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Set whenever a stream progressed; the reactor takes it. While the
+    /// reactor says it is spinning (`reactor_spinning`) the flag alone is
+    /// the wake, and the pipe — a syscall here and a scheduler hop there —
+    /// is written only for a reactor that has parked. Both SeqCst: the
+    /// reactor stores "parked" and then reads the flag, this side stores
+    /// the flag and then reads "parked", and one of them must see the
+    /// other's store or a wake is lost.
+    pub stream_pending: std::sync::atomic::AtomicBool,
+    pub reactor_spinning: std::sync::atomic::AtomicBool,
 }
 
 impl Default for VsockShared {
@@ -268,6 +277,8 @@ impl VsockShared {
         VsockShared {
             memory: std::sync::OnceLock::new(),
             stream_waker: Mutex::new(None),
+            stream_pending: std::sync::atomic::AtomicBool::new(false),
+            reactor_spinning: std::sync::atomic::AtomicBool::new(false),
             deferred_waker: Mutex::new(None),
             inner: Mutex::new(Inner {
                 conns: HashMap::new(),
@@ -320,6 +331,14 @@ impl VsockShared {
     /// woken through the condvar, the reactor through its waker.
     fn progressed(&self) {
         self.progress.notify_all();
+        self.stream_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .reactor_spinning
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let waker = self
             .stream_waker
             .lock()
