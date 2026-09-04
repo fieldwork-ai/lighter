@@ -512,6 +512,33 @@ fn serve_tcp_proxy(port: u16) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+static HOST_TIMEOUTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HOST_LOST_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A host that stops answering vsock connects is, from inside, a stall with
+/// no visible cause: the control channel that would carry a diagnosis rides
+/// the same device. So after a few consecutive timeouts the guest reports
+/// its own state the one way that still reaches the host — the console:
+/// sysrq's memory summary, blocked tasks, and every task's stack, once.
+fn host_lost() {
+    use std::sync::atomic::Ordering;
+    if HOST_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1 < 3 {
+        return;
+    }
+    if HOST_LOST_REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("lighter-agent: the host has stopped answering; dumping the guest's state to the console");
+    for key in ["m", "w", "t"] {
+        let _ = std::fs::write("/proc/sysrq-trigger", key);
+    }
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines().take(8) {
+            eprintln!("lighter-agent: {line}");
+        }
+    }
+}
+
 fn forward_outbound(tcp: std::net::TcpStream) {
     let Some((ip, port)) = original_destination(tcp.as_raw_fd()) else {
         return;
@@ -520,9 +547,13 @@ fn forward_outbound(tcp: std::net::TcpStream) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("lighter-agent: stream to host refused: {e}");
+            if e.raw_os_error() == Some(libc::ETIMEDOUT) {
+                host_lost();
+            }
             return;
         }
     };
+    HOST_TIMEOUTS.store(0, std::sync::atomic::Ordering::Relaxed);
     let _ = vsock::set_buffer(&host, STREAM_WINDOW);
     let mut header = [0u8; 19];
     match ip {

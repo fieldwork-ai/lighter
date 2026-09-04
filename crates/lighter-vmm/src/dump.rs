@@ -1,5 +1,5 @@
 //! `kill -USR1 <vmm pid>` prints every virtqueue's state and the vsock
-//! counters to stderr.
+//! counters to stderr; `kill -USR2` raises every device's interrupt line.
 //!
 //! It is the one probe that works on a machine whose control channel is the
 //! thing that has stopped answering: a guest asleep on an interrupt it never
@@ -15,11 +15,12 @@ use crate::virtio::vsock::VsockShared;
 
 static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
-extern "C" fn on_signal(_: libc::c_int) {
+extern "C" fn on_signal(signal: libc::c_int) {
     let fd = PIPE_WRITE.load(Ordering::Relaxed);
     if fd >= 0 {
+        let byte: &[u8; 1] = if signal == libc::SIGUSR2 { b"i" } else { b"d" };
         // SAFETY: a plain write of one byte to a pipe we own; async-signal-safe.
-        let _ = unsafe { libc::write(fd, b"d".as_ptr().cast(), 1) };
+        let _ = unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
     }
 }
 
@@ -34,6 +35,10 @@ pub fn install(virtio: Vec<Arc<Mutex<VirtioMmio>>>, vsock: Arc<VsockShared>) {
     unsafe {
         libc::signal(
             libc::SIGUSR1,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGUSR2,
             on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
     }
@@ -52,6 +57,16 @@ pub fn install(virtio: Vec<Arc<Mutex<VirtioMmio>>>, vsock: Arc<VsockShared>) {
                 }
                 if n <= 0 {
                     break;
+                }
+                if byte[0] == b'i' {
+                    for (slot, transport) in virtio.iter().enumerate() {
+                        match transport.try_lock() {
+                            Ok(transport) => transport.debug_interrupt(),
+                            Err(_) => eprintln!("DUMP slot{slot} locked, no interrupt"),
+                        }
+                    }
+                    eprintln!("DUMP interrupted every device");
+                    continue;
                 }
                 eprintln!("DUMP begin");
                 for (slot, transport) in virtio.iter().enumerate() {

@@ -571,6 +571,13 @@ impl VirtioMmio {
         }
     }
 
+    /// Raises the device's interrupt line unprompted (`kill -USR2`): a driver
+    /// treats a spurious interrupt as a poll, so a guest that wakes and
+    /// refills its ring on this had been waiting for one we never sent.
+    pub fn debug_interrupt(&self) {
+        self.line.raise(INT_VRING);
+    }
+
     /// The transport's state for the stall dump.
     pub fn debug_dump(&self) -> Vec<String> {
         let mut lines = vec![format!(
