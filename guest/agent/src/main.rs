@@ -256,13 +256,16 @@ fn bound_container_cache() {
         // takes pages at host-page size from any free list. The offer is
         // withdrawn — the whole balloon asked back — the moment the
         // containers work again or free memory falls under the reserve.
-        // With no container running at all the fuse is a second; with some
-        // running, two seconds of their CPU idle. The suite's cases stop
-        // their containers, and their teardown shows CPU in the cgroup for
-        // a couple of seconds after the last one exits.
-        let running = running_containers(containers);
-        let fuse_ticks = if running == 0 { TICKS_PER_SEC } else { 2 * TICKS_PER_SEC };
-        offer_memory(&mut memory_stream, total, idle_for >= fuse_ticks);
+        // The offer does not wait for the containers: free memory beyond the
+        // reserve is free whatever they are doing, and taking it costs only a
+        // fault on reuse. (Waiting for them was measured: a stopped
+        // container's cgroup stays populated past its exit, its teardown
+        // shows CPU for two seconds more, and the offer came four seconds
+        // after the last case where anything looking at the machine looks
+        // at five.) The release, though, is theirs: only work that is
+        // running and short of memory asks the balloon back.
+        let active = idle_for == 0 && running_containers(containers) > 0;
+        offer_memory(&mut memory_stream, total, active);
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
         // almost nothing, since nothing it cached is a build's working
@@ -337,7 +340,7 @@ fn running_containers(containers: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, idle: bool) {
+fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, active: bool) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
         meminfo
@@ -362,8 +365,11 @@ fn offer_memory(stream: &mut Option<OwnedFd>, total: u64, idle: bool) {
     // an eighth of RAM — and when half of it is gone the whole balloon
     // comes back at a few gigabytes a second; deflate-on-OOM stands
     // behind that.
-    let release = free < reserve / 2;
-    let spare = if !release && idle && avail > reserve {
+    // Not on free memory alone: inflation toward a target computed a tick
+    // ago dips free memory under the line for a moment, and a release on
+    // that dip alternated with the next offer, every tick.
+    let release = active && free < reserve / 2;
+    let spare = if !release && avail > reserve + reserve / 4 {
         avail - reserve
     } else {
         0
