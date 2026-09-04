@@ -39,7 +39,7 @@ RUNTIMES = [
     ("docker-desktop", "Docker Desktop"),
 ]
 
-INTRO = """Measured on clean machines against a 1,232-package `package.json` fixture (`benchmarks/`). Each figure is the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
+INTRO = """Measured on clean machines against a 1,232-package `package.json` fixture (`benchmarks/`). Each figure is the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). The first table is the runtime's own disk, where a container's writable layer and its volumes live; the second is a host share, the Mac's directory bind-mounted into the container. Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
 
 OrbStack, Colima and Docker Desktop were measured on the same machines in the same sessions, not quoted from marketing materials."""
 
@@ -59,16 +59,17 @@ def ms(value):
 
 
 def storage_table(results, where):
-    """The share or own-disk table: native (share only), then each runtime."""
+    """The own-disk or host-share table: native, then each runtime, each
+    figure with its fraction of native."""
     suffix = "" if where == "share" else "-guest"
-    native = report.load("native", results) if where == "share" else {}
+    native = report.load("native", results)
     runtimes = [(key, name, report.load(f"{key}{suffix}", results)) for key, name in RUNTIMES]
     runtimes = [(key, name, values) for key, name, values in runtimes if values]
     if not runtimes:
         return ""
-    head = "| Workload" + (" | native APFS" if where == "share" else " (own disk)")
+    head = "| Workload (" + ("host share" if where == "share" else "own disk") + ") | native APFS"
     head += "".join(f" | {name}" for _, name, _ in runtimes) + " |"
-    lines = [head, "|---" * (1 + (where == "share") + len(runtimes)) + "|"]
+    lines = [head, "|---" * (2 + len(runtimes)) + "|"]
     for case, label in STORAGE:
         if where != "share" and case == "watch-latency":
             continue
@@ -77,9 +78,7 @@ def storage_table(results, where):
             continue
         present = [v for v in values if v is not None]
         best = min(present) if present else None
-        cells = [label]
-        if where == "share":
-            cells.append(ms(native.get(case)))
+        cells = [label, ms(native.get(case))]
         for value in values:
             if value is None:
                 cells.append("—")
@@ -87,7 +86,7 @@ def storage_table(results, where):
             cell = ms(value)
             if value == best and len(present) > 1:
                 cell = f"**{cell}**"
-            if where == "share" and native.get(case) and case not in report.UNRATIOED:
+            if native.get(case) and case not in report.UNRATIOED:
                 cell += f" ({native[case] / value * 100:.0f}%)"
             cells.append(cell)
         lines.append("| " + " | ".join(cells) + " |")
@@ -119,19 +118,19 @@ def memory_table(results):
 def network_table(results):
     native = report.load("native", results)
     runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _, _, _ in report.NETWORK_CASES)]
+    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _, _, _, _ in report.NETWORK_CASES)]
     if not runtimes:
         return ""
     lines = ["| Case | unit | native" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (3 + len(runtimes)) + "|"]
-    for case, label, unit, direction in report.NETWORK_CASES:
+    for case, label, unit, direction, divisor in report.NETWORK_CASES:
         values = [v.get(case) for _, v in runtimes]
         present = [v for v in values if v is not None]
         if not present:
             continue
         best = max(present) if direction == "higher" else min(present)
-        cells = [label, unit, "—" if native.get(case) is None else f"{int(native[case])}"]
+        cells = [label, unit, report.network_cell(native.get(case), divisor)]
         for value in values:
-            cell = "—" if value is None else f"{int(value)}"
+            cell = report.network_cell(value, divisor)
             if value == best and len(present) > 1:
                 cell = f"**{cell}**"
             cells.append(cell)
@@ -167,12 +166,12 @@ def section():
         if not results.exists() or not any(results.glob("*.csv")):
             continue
         out += [f"### {heading}", ""]
-        share = storage_table(results, "share")
-        if share:
-            out += [share, ""]
         guest = storage_table(results, "guest")
         if guest:
             out += [guest, ""]
+        share = storage_table(results, "share")
+        if share:
+            out += [share, ""]
         memory = memory_table(results)
         if memory:
             out += ["#### What the runtime costs the Mac", "", MEMORY_INTRO, "", memory, ""]

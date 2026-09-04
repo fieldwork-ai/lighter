@@ -51,13 +51,23 @@ lighter stop        # Cleanly shut down the machine
 
 ## Benchmarks
 
-Measured on clean machines against a 1,232-package `package.json` fixture (`benchmarks/`). Each figure is the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
+Measured on clean machines against a 1,232-package `package.json` fixture (`benchmarks/`). Each figure is the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). The first table is the runtime's own disk, where a container's writable layer and its volumes live; the second is a host share, the Mac's directory bind-mounted into the container. Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
 
 OrbStack, Colima and Docker Desktop were measured on the same machines in the same sessions, not quoted from marketing materials.
 
 ### Apple M5 Pro (18 cores, 48 GB RAM)
 
-| Workload | native APFS | lighter | OrbStack | Colima | Docker Desktop |
+| Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
+|---|---|---|---|---|---|
+| `npm ci` | 6.16 s | **4.74 s** (130%) | 7.01 s (88%) | 8.59 s (72%) | 8.61 s (72%) |
+| `pnpm install` | 3.77 s | 1.32 s (286%) | 2.03 s (185%) | **1.14 s** (332%) | 2.87 s (131%) |
+| `yarn install` | 5.75 s | **4.07 s** (141%) | 5.08 s (113%) | 6.58 s (87%) | 11.14 s (52%) |
+| `ripgrep` (file read) | 927 ms | **79 ms** (1173%) | 102 ms (909%) | 121 ms (766%) | 124 ms (748%) |
+| `find` (metadata walk) | 357 ms | **97 ms** (368%) | 127 ms (281%) | 176 ms (203%) | 131 ms (273%) |
+| `cp -a node_modules` | 13.55 s | **938 ms** (1445%) | 1.11 s (1216%) | 1.88 s (722%) | 2.58 s (526%) |
+| `rm -rf node_modules` | 3.65 s | **378 ms** (967%) | 496 ms (737%) | 551 ms (663%) | 428 ms (854%) |
+
+| Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
 | `npm ci` | 6.16 s | **6.29 s** (98%) | 8.49 s (73%) | 17.79 s (35%) | 17.91 s (34%) |
 | `pnpm install` | 3.77 s | **3.69 s** (102%) | 4.72 s (80%) | 25.43 s (15%) | 28.34 s (13%) |
@@ -67,16 +77,6 @@ OrbStack, Colima and Docker Desktop were measured on the same machines in the sa
 | `cp -a node_modules` | 13.55 s | **3.29 s** (412%) | 8.71 s (156%) | 44.30 s (31%) | 33.55 s (40%) |
 | `rm -rf node_modules` | 3.65 s | **2.39 s** (153%) | 2.97 s (123%) | 8.05 s (45%) | 6.56 s (56%) |
 | Host file edit -> container | 2 ms | **2 ms** | — | 1.00 s | 1.00 s |
-
-| Workload (own disk) | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|
-| `npm ci` | **4.74 s** | 7.01 s | 8.59 s | 8.61 s |
-| `pnpm install` | 1.32 s | 2.03 s | **1.14 s** | 2.87 s |
-| `yarn install` | **4.07 s** | 5.08 s | 6.58 s | 11.14 s |
-| `ripgrep` (file read) | **79 ms** | 102 ms | 121 ms | 124 ms |
-| `find` (metadata walk) | **97 ms** | 127 ms | 176 ms | 131 ms |
-| `cp -a node_modules` | **938 ms** | 1.11 s | 1.88 s | 2.58 s |
-| `rm -rf node_modules` | **378 ms** | 496 ms | 551 ms | 428 ms |
 
 #### What the runtime costs the Mac
 
@@ -95,12 +95,12 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Mbit/s | 123472 | **98541** | 97161 | 4479 | 23245 |
-| TCP, the Mac to a container | Mbit/s | 129208 | **90111** | 52870 | 3927 | 14257 |
-| TCP into a published port | Mbit/s | — | **97710** | 54227 | 3838 | 14314 |
-| TCP out of a published port | Mbit/s | — | 89929 | **93100** | 4357 | 33392 |
-| UDP, container to the Mac | Mbit/s | 21838 | **5018** | 3123 | 3283 | 0 |
-| connects to a published port | per second | 25963 | **17612** | 16155 | 15819 | 16994 |
+| TCP, container to the Mac | Gbit/s | 123.5 | **98.5** | 97.2 | 4.5 | 23.2 |
+| TCP, the Mac to a container | Gbit/s | 129.2 | **90.1** | 52.9 | 3.9 | 14.3 |
+| TCP into a published port | Gbit/s | — | **97.7** | 54.2 | 3.8 | 14.3 |
+| TCP out of a published port | Gbit/s | — | 89.9 | **93.1** | 4.4 | 33.4 |
+| UDP, container to the Mac | Gbit/s | 21.8 | **5.0** | 3.1 | 3.3 | 0.0 |
+| connects to a published port | thousand per second | 26.0 | **17.6** | 16.2 | 15.8 | 17.0 |
 | GET on a published port, median | µs | 40 | **68** | 73 | 224 | 119 |
 | GET on a published port, p99 | µs | 70 | 220 | **119** | 361 | 245 |
 | DNS lookup from a container, median | µs | 2850 | **55** | 251 | 483 | 474 |
@@ -116,7 +116,17 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 ### Apple M1 (8 cores, 8 GB RAM)
 
-| Workload | native APFS | lighter | OrbStack | Colima | Docker Desktop |
+| Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
+|---|---|---|---|---|---|
+| `npm ci` | 7.68 s | **7.96 s** (96%) | 10.39 s (74%) | 11.30 s (68%) | 12.60 s (61%) |
+| `pnpm install` | 4.47 s | 2.04 s (219%) | 2.44 s (183%) | **1.56 s** (286%) | 2.23 s (201%) |
+| `yarn install` | 9.62 s | **7.84 s** (123%) | 7.88 s (122%) | 11.55 s (83%) | 11.74 s (82%) |
+| `ripgrep` (file read) | 1.21 s | **132 ms** (917%) | 160 ms (756%) | 183 ms (661%) | 260 ms (465%) |
+| `find` (metadata walk) | 512 ms | **128 ms** (400%) | 132 ms (388%) | 215 ms (238%) | 152 ms (337%) |
+| `cp -a node_modules` | 21.50 s | **3.12 s** (689%) | 3.21 s (669%) | 3.26 s (660%) | 6.20 s (347%) |
+| `rm -rf node_modules` | 5.37 s | 602 ms (893%) | 736 ms (730%) | 729 ms (737%) | **592 ms** (908%) |
+
+| Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
 | `npm ci` | 7.68 s | **11.19 s** (69%) | 11.54 s (67%) | 23.58 s (33%) | 25.85 s (30%) |
 | `pnpm install` | 4.47 s | **5.53 s** (81%) | 5.89 s (76%) | — | 46.36 s (10%) |
@@ -126,16 +136,6 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 | `cp -a node_modules` | 21.50 s | **5.32 s** (404%) | 15.19 s (142%) | 62.92 s (34%) | 44.64 s (48%) |
 | `rm -rf node_modules` | 5.37 s | **3.46 s** (155%) | 3.97 s (135%) | 12.38 s (43%) | 12.78 s (42%) |
 | Host file edit -> container | 2 ms | **2 ms** | **2 ms** | 6 ms | 10 ms |
-
-| Workload (own disk) | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|
-| `npm ci` | **7.96 s** | 10.39 s | 11.30 s | 12.60 s |
-| `pnpm install` | 2.04 s | 2.44 s | **1.56 s** | 2.23 s |
-| `yarn install` | **7.84 s** | 7.88 s | 11.55 s | 11.74 s |
-| `ripgrep` (file read) | **132 ms** | 160 ms | 183 ms | 260 ms |
-| `find` (metadata walk) | **128 ms** | 132 ms | 215 ms | 152 ms |
-| `cp -a node_modules` | **3.12 s** | 3.21 s | 3.26 s | 6.20 s |
-| `rm -rf node_modules` | 602 ms | 736 ms | 729 ms | **592 ms** |
 
 #### What the runtime costs the Mac
 
@@ -154,12 +154,12 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Mbit/s | 118995 | 52696 | **63579** | 4311 | 13592 |
-| TCP, the Mac to a container | Mbit/s | 118041 | **32896** | 30343 | 3185 | 10426 |
-| TCP into a published port | Mbit/s | — | **43463** | 29949 | 3048 | 10292 |
-| TCP out of a published port | Mbit/s | — | 54468 | **67470** | 3791 | 22382 |
-| UDP, container to the Mac | Mbit/s | 24503 | **4860** | 3139 | 2612 | 0 |
-| connects to a published port | per second | 25453 | 14924 | **16477** | 9077 | 16221 |
+| TCP, container to the Mac | Gbit/s | 119.0 | 52.7 | **63.6** | 4.3 | 13.6 |
+| TCP, the Mac to a container | Gbit/s | 118.0 | **32.9** | 30.3 | 3.2 | 10.4 |
+| TCP into a published port | Gbit/s | — | **43.5** | 29.9 | 3.0 | 10.3 |
+| TCP out of a published port | Gbit/s | — | 54.5 | **67.5** | 3.8 | 22.4 |
+| UDP, container to the Mac | Gbit/s | 24.5 | **4.9** | 3.1 | 2.6 | 0.0 |
+| connects to a published port | thousand per second | 25.5 | 14.9 | **16.5** | 9.1 | 16.2 |
 | GET on a published port, median | µs | 54 | 133 | **128** | 464 | 191 |
 | GET on a published port, p99 | µs | 97 | 242 | **231** | 539 | 497 |
 | DNS lookup from a container, median | µs | 3851 | **141** | 422 | 714 | 765 |
