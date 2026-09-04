@@ -150,6 +150,11 @@ struct Inner {
     conns: HashMap<ConnKey, Conn>,
     outbox: VecDeque<Packet>,
     next_port: u32,
+    /// Payload buffers the writers have finished with, for the ring reader
+    /// to fill again. A fresh 256 KiB Vec per packet is a page-faulted,
+    /// zeroed mapping and an unmap on every packet — the host's writer
+    /// thread sat at a core in `writev` and the copies never got faster.
+    spare: Vec<Vec<u8>>,
     /// Ports the host answers: a REQUEST to one is accepted and the new
     /// connection handed to the listener, one end of a socket pair for the
     /// device's pump and the other for whoever listens.
@@ -195,6 +200,7 @@ impl VsockShared {
                 conns: HashMap::new(),
                 outbox: VecDeque::new(),
                 next_port: FIRST_EPHEMERAL_PORT,
+                spare: Vec::new(),
                 listeners: HashMap::new(),
             }),
             progress: Condvar::new(),
@@ -489,6 +495,34 @@ impl VsockShared {
         self.wake();
     }
 
+    /// A buffer to read a payload into: one a writer finished with, or a
+    /// new one. Capacity is kept; length is zero.
+    fn spare_buffer(&self) -> Vec<u8> {
+        let mut inner = self.lock();
+        match inner.spare.pop() {
+            Some(mut buf) => {
+                buf.clear();
+                buf
+            }
+            None => Vec::with_capacity(MAX_PAYLOAD),
+        }
+    }
+
+    /// Hands payload buffers back for the ring reader to fill again. Bounded,
+    /// so a burst does not leave a pile of them behind.
+    fn recycle(&self, chunks: Vec<Vec<u8>>) {
+        const KEEP: usize = 64;
+        let mut inner = self.lock();
+        for chunk in chunks {
+            if inner.spare.len() >= KEEP {
+                break;
+            }
+            if chunk.capacity() >= MAX_PAYLOAD / 4 {
+                inner.spare.push(chunk);
+            }
+        }
+    }
+
     /// Whether anything is waiting to go to the guest.
     pub fn has_pending(&self) -> bool {
         !self.lock().outbox.is_empty()
@@ -652,7 +686,7 @@ impl Vsock {
             // payload byte twice, on the vCPU thread.
             let mut header = [0u8; HDR_LEN];
             let mut have = 0usize;
-            let mut payload: Vec<u8> = Vec::new();
+            let mut payload: Vec<u8> = self.shared.spare_buffer();
             let mut ok = true;
             for desc in chain {
                 if desc.is_write_only() {
@@ -917,6 +951,7 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
                     // now may the guest be told it has room for more.
                     let bytes: usize = chunks.iter().map(Vec::len).sum();
                     shared.acknowledge(key, bytes as u32);
+                    shared.recycle(chunks);
                 }
                 let _ = socket.flush();
                 // The guest will send no more, so the host peer is owed an

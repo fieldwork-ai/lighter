@@ -56,15 +56,15 @@ pub const NET_HDR_LEN: usize = 12;
 
 /// The MTU the guest is told the link carries.
 ///
-/// The largest a virtio-net frame can be, not Ethernet's 1500: the far end
-/// of this link is a userspace stack that terminates every flow onto a host
-/// socket, so no frame on it is ever forwarded anywhere with a smaller MTU,
-/// and the only thing the number decides is how many frames a byte costs.
-/// With the bridge following it (the rootfs init reads eth0's MTU into
-/// dockerd's `--mtu`) a container's stream moves in 64 KiB frames instead of
-/// 1500-byte ones, and the sidecar path went from 3.8 to 6.3 Gbit/s on the
-/// M5 for it. `LIGHTER_NET_MTU` overrides it for an A/B.
-pub const DEFAULT_MTU: u16 = 65_520;
+/// Ethernet's, because what crosses this link now is UDP, ICMP and DNS —
+/// TCP goes to the host as streams over vsock — and a bigger MTU serves
+/// UDP badly: a datagram sized to a 65520-byte path reaches gvproxy and
+/// goes no further, macOS capping a UDP datagram at 9 KiB. While TCP still
+/// rode the frames, 64 KiB frames took that path from 3.8 to 6.6 Gbit/s on
+/// the M5; with the streams carrying TCP the link's MTU makes no difference
+/// to them (51.9 / 58.8 / 58.6 / 50.7 at 1500 against 48.1 / 65.2 / 62.4 /
+/// 48.5 at 65520, noise both ways). `LIGHTER_NET_MTU` overrides it.
+pub const DEFAULT_MTU: u16 = 1500;
 
 /// Largest frame we will move in either direction.
 const MAX_FRAME: usize = 65_550;
