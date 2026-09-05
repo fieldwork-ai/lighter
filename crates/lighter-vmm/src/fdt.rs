@@ -230,7 +230,7 @@ mod tests {
             spi_base: 32,
             spi_count: 988,
         };
-        GuestLayout::new(&gic, 2, 1 << 30).unwrap()
+        GuestLayout::new(&gic, 2, 1 << 30, 0).unwrap()
     }
 
     #[test]

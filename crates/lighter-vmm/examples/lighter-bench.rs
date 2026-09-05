@@ -23,6 +23,7 @@ fn main() -> ExitCode {
     let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
     let mut docker_socket: Option<PathBuf> = None;
     let mut report_memory = false;
+    let mut mem_plan: Vec<(u64, u64)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -35,6 +36,17 @@ fn main() -> ExitCode {
             "--memory-mib" => {
                 let mib: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(2048);
                 config.ram_bytes = mib << 20;
+                // As the CLI: `LIGHTER_VIRTIO_MEM=<base MiB>` boots with that
+                // much RAM and offers the rest through virtio-mem.
+                if let Some(base) = std::env::var("LIGHTER_VIRTIO_MEM")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|b| b << 20)
+                    .filter(|b| *b < config.ram_bytes)
+                {
+                    config.hotplug_bytes = config.ram_bytes - base;
+                    config.ram_bytes = base;
+                }
             }
             "--disk" => config
                 .disks
@@ -49,6 +61,20 @@ fn main() -> ExitCode {
             // memory gate has no other way to watch a number only this process
             // can see.
             "--report-memory" => report_memory = true,
+            // `--mem-plan 30:4096,90:1024`: at 30 s offer 4096 MiB of the
+            // virtio-mem range, at 90 s offer 1024. How the device behaves
+            // when the offer moves, without a policy in the way.
+            "--mem-plan" => {
+                mem_plan = args
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|step| {
+                        let (at, mib) = step.split_once(':')?;
+                        Some((at.parse::<u64>().ok()?, mib.parse::<u64>().ok()?))
+                    })
+                    .collect();
+            }
             "--net" => config.network = true,
             "--vsock" => {
                 // PATH:GUEST_PORT — a host socket carried to a guest port.
@@ -110,6 +136,7 @@ fn main() -> ExitCode {
         // alone cannot tell "the guest is not reporting" from "the guest
         // reported and macOS kept the pages anyway".
         let balloon = machine.balloon().clone();
+        let mem = machine.mem().cloned();
         std::thread::Builder::new()
             .name("memory-report".into())
             .spawn(move || {
@@ -120,11 +147,30 @@ fn main() -> ExitCode {
                         offered_mib = balloon.offered_bytes() / (1 << 20),
                         reported_mib = balloon.reported_bytes() / (1 << 20),
                         ballooned_mib = balloon.ballooned_bytes() / (1 << 20),
+                        plugged_mib = mem.as_ref().map_or(0, |m| m.state().plugged_bytes() >> 20),
                         "FOOTPRINT"
                     );
                 }
             })
             .expect("failed to spawn the memory reporter");
+    }
+
+    if !mem_plan.is_empty() {
+        let Some(mem) = machine.mem().cloned() else {
+            eprintln!("lighter: --mem-plan needs LIGHTER_VIRTIO_MEM");
+            return ExitCode::from(2);
+        };
+        let started = std::time::Instant::now();
+        std::thread::Builder::new()
+            .name("mem-plan".into())
+            .spawn(move || {
+                for (at, mib) in mem_plan {
+                    let at = std::time::Duration::from_secs(at);
+                    std::thread::sleep(at.saturating_sub(started.elapsed()));
+                    mem.request(mib << 20);
+                }
+            })
+            .expect("failed to spawn the memory plan");
     }
 
     for (path, guest_port) in &sockets {

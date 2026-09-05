@@ -169,9 +169,22 @@ pub fn machine() -> anyhow::Result<()> {
         cmdline.push_str(" lighter.nosockmap");
     }
 
+    // `LIGHTER_VIRTIO_MEM=<base MiB>`: boot with that much RAM and let the
+    // guest plug the rest in as the host offers it (`lighter_vmm::virtio::mem`),
+    // while it is measured. Unset, the guest is given all of it at boot.
+    let total = config.memory_mib << 20;
+    let (ram_bytes, hotplug_bytes) = match std::env::var("LIGHTER_VIRTIO_MEM")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mib| mib << 20)
+    {
+        Some(base) if base < total => (base, total - base),
+        _ => (total, 0),
+    };
     let machine_config = MachineConfig {
         vcpus: config.cpus,
-        ram_bytes: config.memory_mib << 20,
+        ram_bytes,
+        hotplug_bytes,
         kernel: paths::kernel(crate::config::kernel_hz(config.cpus))?,
         initramfs: None,
         cmdline,
