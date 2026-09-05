@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Milestone 7 gate: x86-64 containers run.
+# Milestone 7 gate: x86-64 containers run — under Rosetta when the Mac has it.
 #
-# The plan wanted this done with Rosetta, which would be two to three times
-# faster than what is here. It is not available to us and the reason is not a
-# bug we can fix — see `docs/x86-64.md`. What this checks is the capability
-# rather than the mechanism: an amd64 image runs, reports the right
-# architecture, and executes a real program rather than just `uname`.
+# An amd64 image runs, reports the right architecture, and executes a real
+# program rather than just `uname`. On a Mac with Rosetta installed the guest
+# has to have registered Rosetta rather than qemu, the kernel has to have found
+# the per-thread memory-ordering switch Rosetta asks for, and an x86-64
+# multi-threaded program has to see x86's ordering — see `docs/x86-64.md`.
 set -euo pipefail
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -54,6 +54,18 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' INT TERM
 
+ROSETTA_DIR=/Library/Apple/usr/libexec/oah/RosettaLinux
+if [ -x "$ROSETTA_DIR/rosetta" ]; then
+	VIA=rosetta
+	ROSETTA_ARGS=(--share "rosetta:$ROSETTA_DIR")
+	ROSETTA_CMDLINE=" lighter.rosetta"
+else
+	VIA=qemu
+	ROSETTA_ARGS=()
+	ROSETTA_CMDLINE=""
+	note "Rosetta is not installed on this Mac; checking the emulator"
+fi
+
 echo
 echo "==> Booting"
 : > "$LOG"
@@ -63,8 +75,9 @@ echo "==> Booting"
 	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
 	--net --run-dir "$RUN_DIR" \
 	--vsock "$SOCKET:2375" \
+	"${ROSETTA_ARGS[@]}" \
 	--no-tty --cpus 4 --memory-mib 4096 \
-	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
+	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)$ROSETTA_CMDLINE" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 disown "$VMM_PID" 2>/dev/null || true
@@ -79,11 +92,19 @@ done
 export DOCKER_HOST="unix://$SOCKET"
 pass "guest booted in ${waited}s"
 
-if grep -q "INIT binfmt=x86_64" "$LOG"; then
-	pass "the guest registered an x86-64 handler"
+if grep -q "INIT binfmt=x86_64 via=$VIA" "$LOG"; then
+	pass "the guest registered $VIA as the x86-64 handler"
 else
-	fail "binfmt_misc was not registered"
-	grep -a "INIT binfmt" "$LOG" | sed 's/^/    /'
+	fail "the guest did not register $VIA"
+	grep -a "INIT binfmt\|INIT rosetta" "$LOG" | sed 's/^/    /'
+fi
+if [ "$VIA" = rosetta ]; then
+	if grep -q "Apple TSO: available per thread" "$LOG"; then
+		pass "the kernel found the per-thread memory-ordering switch"
+	else
+		fail "the kernel did not find the per-thread memory-ordering switch"
+		grep -a "Apple TSO" "$LOG" | sed 's/^/    /'
+	fi
 fi
 
 echo
@@ -129,11 +150,48 @@ else
 	fail "a native container reported '${native:-nothing}'"
 fi
 
-note "this is emulation, not Rosetta; see docs/x86-64.md for why"
+if [ "$VIA" = rosetta ]; then
+	# The ordering Rosetta's threads run with, seen from the x86 side: a
+	# writer stores x then y, a reader loads y then x, and x86 forbids
+	# seeing the second store without the first. Compiled by the amd64
+	# image's own gcc, under Rosetta, and run for two million rounds; ARM's
+	# ordering shows a handful of reorderings in that many, x86's none.
+	litmus="$(docker run --rm --platform linux/amd64 lighter-test:amd64 sh -c '
+		apk add -q gcc musl-dev >/dev/null 2>&1 || exit 9
+		cat > /mp.c <<"EOF"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdio.h>
+#include <sched.h>
+#include <stdatomic.h>
+static volatile int x, y;
+static atomic_long bar1, bar2;
+static long iters = 2000000, hits;
+static void pin(int cpu){cpu_set_t s;CPU_ZERO(&s);CPU_SET(cpu,&s);sched_setaffinity(0,sizeof s,&s);}
+static void spin(unsigned n){for(volatile unsigned k=0;k<n;k++);}
+static void* writer(void*a){pin(1);unsigned r=1;for(long i=0;i<iters;i++){
+  atomic_fetch_add(&bar1,1);while(atomic_load(&bar1)<2*(i+1));
+  r=r*1103515245u+12345u;spin((r>>16)&63);x=1;y=1;
+  atomic_fetch_add(&bar2,1);while(atomic_load(&bar2)<2*(i+1));}return 0;}
+int main(void){pin(2);pthread_t t;pthread_create(&t,0,writer,0);unsigned r=7;
+for(long i=0;i<iters;i++){x=0;y=0;
+  atomic_fetch_add(&bar1,1);while(atomic_load(&bar1)<2*(i+1));
+  r=r*1103515245u+12345u;spin((r>>16)&63);
+  int ry=y;int rx=x;if(ry==1&&rx==0)hits++;
+  atomic_fetch_add(&bar2,1);while(atomic_load(&bar2)<2*(i+1));}
+pthread_join(t,0);printf("%ld\n",hits);return 0;}
+EOF
+		gcc -O2 -pthread -o /mp /mp.c && timeout 120 /mp' 2>/dev/null || echo error)"
+	case "$litmus" in
+	0) pass "x86-64 threads under Rosetta see x86 memory ordering (0 reorderings in 2M rounds)" ;;
+	error | "") fail "the x86-64 litmus test did not run" ;;
+	*) fail "x86-64 threads under Rosetta saw $litmus reorderings in 2M rounds" ;;
+	esac
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then
-	printf '\033[32mmilestone 7 gate passed\033[0m — x86-64 containers run.\n'
+	printf '\033[32mmilestone 7 gate passed\033[0m — x86-64 containers run under '"$VIA"'.\n'
 	exit 0
 fi
 printf '\033[31mmilestone 7 gate failed\033[0m — log at %s\n' "$LOG"
