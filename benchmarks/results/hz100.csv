@@ -1,0 +1,10 @@
+case,rep,ms
+net-http-p99,1,356
+net-http-latency,1,125
+net-http-p99,2,542
+net-http-latency,2,139
+net-http-p99,3,242
+net-http-latency,3,108
+net-connect-rate,1,18096
+net-connect-rate,2,16371
+net-connect-rate,3,15366
