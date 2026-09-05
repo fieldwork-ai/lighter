@@ -49,6 +49,8 @@ NETWORK_INTRO = """iperf3 between a container and the Mac in both directions, on
 
 POWER_INTRO = """After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better."""
 
+BOOT_INTRO = """From a cold stop, the runtime asked to start the way a person would (`lighter start`, `orb start`, `colima start`, opening Docker Desktop): how long until `docker version` answers, and until the first container has run. Median of three; lower is better."""
+
 
 def ms(value):
     if value is None:
@@ -160,6 +162,28 @@ def power_table(results):
     return "\n".join(lines)
 
 
+def boot_table(results):
+    runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
+    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _ in report.BOOT_CASES)]
+    if not runtimes:
+        return ""
+    lines = ["| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (1 + len(runtimes)) + "|"]
+    for case, label in report.BOOT_CASES:
+        values = [v.get(case) for _, v in runtimes]
+        present = [v for v in values if v is not None]
+        if not present:
+            continue
+        best = min(present)
+        cells = [label[0].upper() + label[1:]]
+        for value in values:
+            cell = "—" if value is None else f"{value / 1000:.1f} s"
+            if value == best and len(present) > 1:
+                cell = f"**{cell}**"
+            cells.append(cell)
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def section():
     out = ["## Benchmarks", "", INTRO, ""]
     for results, heading in MACHINES:
@@ -181,6 +205,9 @@ def section():
         power = power_table(results)
         if power:
             out += ["#### Idle power", "", POWER_INTRO, "", power, ""]
+        boot = boot_table(results)
+        if boot:
+            out += ["#### Starting up", "", BOOT_INTRO, "", boot, ""]
     out += ["`benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.", ""]
     return "\n".join(out)
 

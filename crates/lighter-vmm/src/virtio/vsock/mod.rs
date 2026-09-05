@@ -246,6 +246,9 @@ pub struct VsockShared {
     /// Signalled when credit frees up or a connection changes state, so a
     /// blocked writer wakes without polling.
     progress: Condvar,
+    /// How many threads are waiting on `progress`, so that `progressed` can
+    /// skip the broadcast — a syscall per packet — when nobody is.
+    waiters: std::sync::atomic::AtomicUsize,
     /// Pokes the transport to drain the outbox into the guest.
     ///
     /// Set after construction because the transport does not exist yet when the
@@ -299,8 +302,30 @@ impl VsockShared {
                 listeners: HashMap::new(),
             }),
             progress: Condvar::new(),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
             waker: Mutex::new(None),
         }
+    }
+
+    /// Waits on `progress` with the lock held, counted so that `progressed`
+    /// can skip the broadcast when nobody waits. The count goes up under the
+    /// lock, and every state change a waiter checks is made under the same
+    /// lock, so a notifier that changes state after the waiter's check sees
+    /// the count before it decides whether to broadcast.
+    fn wait_progress<'a>(
+        &self,
+        inner: std::sync::MutexGuard<'a, Inner>,
+        timeout: std::time::Duration,
+    ) -> std::sync::MutexGuard<'a, Inner> {
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (guard, _) = self
+            .progress
+            .wait_timeout(inner, timeout)
+            .expect("vsock state poisoned");
+        self.waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        guard
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -339,7 +364,9 @@ impl VsockShared {
     /// Something a waiter may care about changed: blocking waiters are
     /// woken through the condvar, the reactor through its waker.
     fn progressed(&self) {
-        self.progress.notify_all();
+        if self.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.progress.notify_all();
+        }
         self.stream_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if self
@@ -666,11 +693,7 @@ impl VsockShared {
             if ended {
                 return None;
             }
-            let (guard, _) = self
-                .progress
-                .wait_timeout(inner, std::time::Duration::from_millis(100))
-                .expect("vsock state poisoned");
-            inner = guard;
+            inner = self.wait_progress(inner, std::time::Duration::from_millis(100));
         }
         drop(inner);
         self.wake();
@@ -734,11 +757,7 @@ impl VsockShared {
             if remaining.is_zero() {
                 return false;
             }
-            let (guard, _) = self
-                .progress
-                .wait_timeout(inner, remaining)
-                .expect("vsock state poisoned");
-            inner = guard;
+            inner = self.wait_progress(inner, remaining);
         }
     }
 
@@ -772,10 +791,7 @@ impl VsockShared {
                 self.wake();
 
                 let inner = self.lock();
-                let _unused = self
-                    .progress
-                    .wait_timeout(inner, std::time::Duration::from_millis(50))
-                    .expect("vsock state poisoned");
+                let _unused = self.wait_progress(inner, std::time::Duration::from_millis(50));
                 continue;
             }
 
@@ -872,11 +888,7 @@ impl VsockShared {
             if conn.state == State::Closed || conn.guest_done {
                 return None;
             }
-            let (guard, _) = self
-                .progress
-                .wait_timeout(inner, std::time::Duration::from_millis(100))
-                .expect("vsock state poisoned");
-            inner = guard;
+            inner = self.wait_progress(inner, std::time::Duration::from_millis(100));
         }
     }
 
