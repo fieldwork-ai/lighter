@@ -202,6 +202,17 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 | Start until docker answers | **0.5 s** | 1.2 s | 9.8 s | 2.7 s |
 | Start until the first container has run | **0.7 s** | 1.5 s | 10.0 s | 3.2 s |
 
+#### x86-64 images
+
+The same runtimes running `linux/amd64` images on their own disk: an install that mostly waits on the disk and the network, straight-line computation (a gigabyte through `sha256sum`), and a container's start, so the translator's price shows on each kind of work. lighter, OrbStack and Docker Desktop run these under Rosetta; Colima was started with `--vz-rosetta`. The first column is lighter's own arm64 number for the same case, for scale. Median of three; lower is better.
+
+| Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Docker Desktop |
+|---|---|---|---|---|
+| `npm ci` | 8.71 s | **16.82 s** | 19.59 s | 21.94 s |
+| `pnpm install` | 1.78 s | **4.10 s** | 4.61 s | 4.18 s |
+| `sha256sum` of 1 GiB | 6.24 s | **7.18 s** | 13.09 s | 7.34 s |
+| container start, `alpine true` | 224 ms | **203 ms** | 302 ms | 232 ms |
+
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 ## Why it is fast
 

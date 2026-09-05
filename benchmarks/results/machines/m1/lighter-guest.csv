@@ -20,3 +20,9 @@ copy-tree,3,2062
 rm-rf,1,598
 rm-rf,2,647
 rm-rf,3,606
+cpu-sha256,1,6239
+cpu-sha256,2,6240
+cpu-sha256,3,6239
+container-start,1,229
+container-start,2,224
+container-start,3,220
