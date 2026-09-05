@@ -186,6 +186,39 @@ else
 	echo "INIT data=absent"
 fi
 
+# --- containerd -----------------------------------------------------------
+# Started here, the moment the data disk is there, rather than by dockerd.
+# dockerd's own managed containerd is started and then polled once a second,
+# and the first poll always missed, so every boot carried a second of waiting
+# for a process that was up in twenty milliseconds (dockerd's log: 1041 ms
+# between "started new containerd process" and the graph driver). Here it
+# comes up while the network and the shares are being set up, and dockerd
+# finds it ready. The same root dockerd would have given it, so either
+# arrangement finds the other's content. Without the CRI plugin, which is
+# Kubernetes' door and a tenth of a second of start-up nobody here uses.
+#
+# The engine's cgroup is made here because containerd is the first of the
+# engine's processes: the page cache a process fills is charged to its
+# cgroup, and the root cgroup cannot be asked to reclaim, so both daemons
+# live in one the agent can trim (see its bound_container_cache).
+mkdir -p /var/log /run/containerd /sys/fs/cgroup/engine
+echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+cat > /run/containerd.toml <<'TOML'
+version = 2
+disabled_plugins = ["io.containerd.grpc.v1.cri"]
+TOML
+# A fresh shell rather than a subshell: in a subshell `$$` is still the
+# parent's pid, and the engine ran in the root cgroup for a day.
+sh -c '
+	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	exec containerd \
+		--config /run/containerd.toml \
+		--address /run/containerd/containerd.sock \
+		--root /var/lib/docker/containerd \
+		--state /run/containerd/state \
+		>/var/log/containerd.log 2>&1' engine &
+CONTAINERD_PID=$!
+
 # --- Running x86-64 containers --------------------------------------------
 # `binfmt_misc` is how Linux learns that an ELF it cannot execute should be
 # handed to an interpreter instead. With this registered, `docker run
@@ -297,13 +330,15 @@ echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
 sysctl -q -w net.ipv4.tcp_wmem="4096 262144 16777216" net.ipv4.tcp_rmem="4096 1048576 16777216" 2>/dev/null || true
 if [ -e /sys/class/net/eth0 ]; then
 	ip link set eth0 up
-	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok" || echo "INIT dhcp=failed"
+	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok t=$(cut -d' ' -f1 /proc/uptime)" || echo "INIT dhcp=failed"
 fi
 
 # --- The engine -----------------------------------------------------------
-# dockerd starts and supervises its own containerd. Naming one with
-# --containerd instead points it at a socket nothing is listening on, and it
-# waits for a daemon that is never coming.
+# dockerd is pointed at the containerd started above. It connects at once
+# when the socket is there, and gives up in a way that reads as "containerd
+# is never coming" when it is not, so the socket is waited for first — a few
+# milliseconds normally, since containerd has had the network's whole set-up
+# to come up in.
 # --iptables is left on: Docker's own bridge networking needs it, and the
 # kernel carries the netfilter modules for exactly this.
 #
@@ -318,23 +353,19 @@ fi
 # flow on its side of the link, so the only thing the number decides is how
 # many frames a byte costs between here and there, and a bridge left at 1500
 # would have every container segment at 1460 whatever the link could carry.
-mkdir -p /var/log
 link_mtu=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1500)
-# The engine in a cgroup of its own. The page cache a process fills is
-# charged to its cgroup, and the root cgroup cannot be asked to reclaim: an
-# image's layers, extracted by dockerd, sat as a gigabyte of cache no trim
-# could reach after the containers that used them had given theirs back.
-# Here the agent can reclaim it like the containers' (see the agent's
-# bound_container_cache).
-mkdir -p /sys/fs/cgroup/engine
-echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
-# A fresh shell rather than a subshell: in a subshell `$$` is still the
-# parent's pid, and the engine ran in the root cgroup for a day — a daily
-# driver held eight gigabytes of image-layer cache no trim could reach.
+waited=0
+while [ ! -S /run/containerd/containerd.sock ] && [ "$waited" -lt 200 ]; do
+	kill -0 "$CONTAINERD_PID" 2>/dev/null || break
+	sleep 0.01
+	waited=$((waited + 1))
+done
+[ -S /run/containerd/containerd.sock ] || echo "INIT containerd=missing after=$((waited * 10))ms"
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
 	exec dockerd \
 		--host=unix:///run/docker.sock \
+		--containerd=/run/containerd/containerd.sock \
 		--data-root=/var/lib/docker \
 		--storage-driver=overlay2 \
 		--userland-proxy=false \
@@ -350,9 +381,12 @@ DOCKERD_PID=$!
 # and can die during later setup, leaving a socket file that accepts nothing —
 # so waiting on the file alone reports "ready" for a daemon that is already
 # gone, and the failure resurfaces much later as a bare ECONNREFUSED.
+# Polled every 50 ms, not every second: the daemon is up in a few hundred
+# milliseconds and a one-second poll made a machine wait most of a second
+# for a socket that was already there.
 waited=0
 dockerd_state=timeout
-while [ "$waited" -lt 60 ]; do
+while [ "$waited" -lt 1200 ]; do
 	if ! kill -0 "$DOCKERD_PID" 2>/dev/null; then
 		dockerd_state=died
 		break
@@ -361,11 +395,11 @@ while [ "$waited" -lt 60 ]; do
 		dockerd_state=ready
 		break
 	fi
-	sleep 1
+	sleep 0.05
 	waited=$((waited + 1))
 done
 
-echo "INIT dockerd=$dockerd_state after=${waited}s"
+echo "INIT dockerd=$dockerd_state after=$((waited * 50))ms t=$(cut -d' ' -f1 /proc/uptime)"
 # dockerd turns the bridge's netfilter call on at start, which runs the IP
 # prerouting hooks in the bridge's context for traffic off docker0 — and a
 # socket TPROXY assigns there does not survive into routing, so a
@@ -443,7 +477,9 @@ EOF
 	fi
 }
 
-echo "INIT ready"
+# `t=` is seconds since the kernel started, for reading a boot's timeline
+# off the console (the host's log has no clock for these lines).
+echo "INIT ready t=$(cut -d' ' -f1 /proc/uptime)"
 
 # dockerd can die long after it started — containerd failing, a storage driver
 # rejecting the data disk — and from outside that is indistinguishable from a
