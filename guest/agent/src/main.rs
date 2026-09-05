@@ -917,7 +917,7 @@ fn forward_inbound(host: OwnedFd) {
         return;
     }
     let port = u16::from_be_bytes(header);
-    let tcp = match std::net::TcpStream::connect((PUBLISHED_ADDR, port)) {
+    let mut tcp = match std::net::TcpStream::connect((PUBLISHED_ADDR, port)) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("lighter-agent: inbound to {PUBLISHED_ADDR}:{port} refused: {e}");
@@ -925,6 +925,14 @@ fn forward_inbound(host: OwnedFd) {
         }
     };
     let _ = tcp.set_nodelay(true);
+    // Whatever followed the header in the same packet is carried by hand
+    // before the join. The join hands sockmap whole socket buffers, and a
+    // buffer the header was read out of still holds the header: joined as
+    // it stands, the container would see the port bytes ahead of the
+    // request (it did — an HTTP server answered 501 to `;\xc7GET`).
+    if copy_queued(host_read.0.as_raw_fd(), &mut tcp).is_err() {
+        return;
+    }
     let (tcp, host_read, host_write) = match joiner() {
         Some(j) => match joined(j, tcp, host_read, host_write) {
             Ok(()) => return,
@@ -1077,6 +1085,23 @@ fn handle_control(line: &str) -> String {
             Ok(text) => format!("{text}\n--end--\n"),
             Err(e) => format!("error {e}\n--end--\n"),
         },
+        // The host asks on `lighter stop`: the engine down first so the data
+        // disk is quiet, then sync, then power off. A machine stopped from
+        // outside mid-commit (btrfs commits every 30 s) lost an image once.
+        (Some("poweroff"), _) => {
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg("pid=$(pidof dockerd); [ -n \"$pid\" ] && kill $pid; for i in $(seq 1 50); do kill -0 $pid 2>/dev/null || break; sleep 0.1; done; sync; umount /var/lib/docker 2>/dev/null; sync")
+                    .status();
+                unsafe {
+                    libc::sync();
+                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                }
+            });
+            "ok\n".into()
+        }
         (Some("time"), Some(seconds)) => match seconds.parse::<i64>() {
             Ok(epoch) => match set_clock(epoch) {
                 Ok(()) => "ok\n".into(),
@@ -1334,6 +1359,23 @@ fn copy(from: &mut impl Read, to: &mut impl Write) {
         }
     }
     let _ = to.flush();
+}
+
+/// Copies whatever the kernel already holds for `from` to `to`, and stops
+/// when nothing more is queued right now.
+fn copy_queued(from: std::os::fd::RawFd, to: &mut impl Write) -> std::io::Result<()> {
+    loop {
+        let mut queued: libc::c_int = 0;
+        if unsafe { libc::ioctl(from, libc::FIONREAD, &mut queued) } < 0 || queued <= 0 {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; queued as usize];
+        let n = unsafe { libc::read(from, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        to.write_all(&buf[..n as usize])?;
+    }
 }
 
 /// `Read`/`Write` over a raw fd.

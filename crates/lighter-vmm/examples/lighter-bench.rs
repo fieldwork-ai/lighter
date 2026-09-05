@@ -44,6 +44,7 @@ fn main() -> ExitCode {
                 config.disk_size_bytes = gib << 30;
             }
             "--no-tty" => config.interactive = false,
+            "--tso" => config.tso = true,
             // Logs the process's own physical footprint on an interval. The
             // memory gate has no other way to watch a number only this process
             // can see.

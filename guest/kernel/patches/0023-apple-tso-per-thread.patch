@@ -1,0 +1,241 @@
+arm64: x86 memory ordering per thread on Apple silicon (PR_SET_MEM_MODEL)
+
+Apple silicon can run with x86's memory ordering, total store ordering, per
+thread: bit 1 of the implementation-defined ACTLR_EL1, advertised by bit 9
+of AIDR_EL1. Rosetta-translated code assumes that ordering, and Rosetta asks
+for it itself, twice at startup, with prctl(0x4d4d444c, 1); a kernel that
+answers EINVAL leaves its threads on ARM's model, and multi-threaded x86
+programs then see stores out of order. The alternative, the hypervisor
+switching every vCPU into TSO for the whole machine, costs native code:
+memcpy bandwidth fell by a quarter (45-48 GB/s to 31-38) with nothing else
+moving, measured 2026-09-05.
+
+So the model is a thread's, kept in thread_struct, inherited across fork and
+clone, reset by exec, and written to the register only when the incoming
+thread's setting differs from what this CPU last had. The register's other
+bits are preserved from the boot value. Whether the bit can be written at
+all is proved at boot rather than assumed, because a hypervisor may present
+it and ignore it, and x86 code would then run with the wrong ordering
+silently. The prctl numbers and semantics follow the series Hector Martin
+sent upstream in April 2024 and Apple's own patch of the same month, which
+is what Rosetta was written against.
+
+diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+index 61d62bfd5..50fe67616 100644
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -184,6 +184,8 @@ struct thread_struct {
+ 	u64			mte_ctrl;
+ #endif
+ 	u64			sctlr_user;
++	/* PR_SET_MEM_MODEL: this thread runs with x86 ordering (Apple TSO). */
++	unsigned int		tso;
+ 	u64			svcr;
+ 	u64			tpidr2_el0;
+ 	u64			por_el0;
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index 4c328b7c7..697426eac 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -58,6 +58,7 @@
+ #include <asm/stacktrace.h>
+ #include <asm/switch_to.h>
+ #include <asm/system_misc.h>
++#include <linux/memory_ordering_model.h>
+ 
+ #if defined(CONFIG_STACKPROTECTOR) && !defined(CONFIG_STACKPROTECTOR_PER_TASK)
+ #include <linux/stackprotector.h>
+@@ -330,8 +331,102 @@ static int copy_thread_gcs(struct task_struct *p,
+ 
+ #endif
+ 
++/*
++ * Apple silicon can run with x86's memory ordering (total store ordering)
++ * per thread: bit 1 of the implementation-defined ACTLR_EL1, advertised by
++ * bit 9 of AIDR_EL1. Rosetta asks for it with PR_SET_MEM_MODEL, and native
++ * threads never pay for it. The register is written only when the next
++ * thread's setting differs from what this CPU last had, and once per CPU to
++ * begin with, whatever the boot value was.
++ */
++#define ACTLR_EL1_TSOEN		BIT(1)
++#define AIDR_EL1_TSO		BIT(9)
++
++static bool apple_tso;
++static u64 actlr_base;
++/* 0: not yet written on this CPU; 1: default; 2: TSO. */
++static DEFINE_PER_CPU(unsigned int, tso_cur);
++
++static void tso_write(unsigned int tso)
++{
++	write_sysreg(actlr_base | (tso ? ACTLR_EL1_TSOEN : 0), actlr_el1);
++	isb();
++	__this_cpu_write(tso_cur, tso + 1);
++}
++
++static void tso_thread_switch(struct task_struct *next)
++{
++	if (!apple_tso)
++		return;
++	if (__this_cpu_read(tso_cur) == next->thread.tso + 1)
++		return;
++	tso_write(next->thread.tso);
++}
++
++static int __init apple_tso_init(void)
++{
++	u64 actlr;
++
++	if (read_cpuid_implementor() != ARM_CPU_IMP_APPLE)
++		return 0;
++	if (!(read_sysreg_s(SYS_AIDR_EL1) & AIDR_EL1_TSO)) {
++		pr_info("Apple TSO: not advertised\n");
++		return 0;
++	}
++	actlr = read_sysreg(actlr_el1);
++	actlr_base = actlr & ~ACTLR_EL1_TSOEN;
++	/*
++	 * Proved, not assumed: a hypervisor may present the bit and ignore
++	 * writes to it, and x86 code would then run with the wrong ordering.
++	 */
++	write_sysreg(actlr ^ ACTLR_EL1_TSOEN, actlr_el1);
++	isb();
++	if ((read_sysreg(actlr_el1) ^ actlr) != ACTLR_EL1_TSOEN) {
++		write_sysreg(actlr, actlr_el1);
++		isb();
++		pr_info("Apple TSO: advertised but ACTLR_EL1.TSOEN is not writable here\n");
++		return 0;
++	}
++	apple_tso = true;
++	preempt_disable();
++	tso_write(0);
++	preempt_enable();
++	pr_info("Apple TSO: available per thread (PR_SET_MEM_MODEL); boot value %s\n",
++		actlr & ACTLR_EL1_TSOEN ? "on" : "off");
++	return 0;
++}
++early_initcall(apple_tso_init);
++
++int arch_prctl_mem_model_get(struct task_struct *t)
++{
++	if (!apple_tso)
++		return -EINVAL;
++	return t->thread.tso ? PR_SET_MEM_MODEL_TSO : PR_SET_MEM_MODEL_DEFAULT;
++}
++
++int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
++{
++	if (!apple_tso)
++		return -EINVAL;
++	if (val != PR_SET_MEM_MODEL_DEFAULT && val != PR_SET_MEM_MODEL_TSO)
++		return -EINVAL;
++	t->thread.tso = val == PR_SET_MEM_MODEL_TSO;
++	if (t == current) {
++		preempt_disable();
++		tso_write(t->thread.tso);
++		preempt_enable();
++	}
++	return 0;
++}
++
+ void flush_thread(void)
+ {
++	if (apple_tso && current->thread.tso) {
++		current->thread.tso = 0;
++		preempt_disable();
++		tso_write(0);
++		preempt_enable();
++	}
+ 	fpsimd_flush_thread();
+ 	tls_thread_flush();
+ 	flush_ptrace_hw_breakpoint(current);
+@@ -754,6 +849,7 @@ struct task_struct *__switch_to(struct task_struct *prev,
+ 	ptrauth_thread_switch_user(next);
+ 	permission_overlay_switch(next);
+ 	gcs_thread_switch(next);
++	tso_thread_switch(next);
+ 
+ 	/*
+ 	 * Complete any pending TLB or cache maintenance on this CPU in case the
+diff --git a/include/linux/memory_ordering_model.h b/include/linux/memory_ordering_model.h
+new file mode 100644
+index 000000000..b8491d92d
+--- /dev/null
++++ b/include/linux/memory_ordering_model.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __LINUX_MEMORY_ORDERING_MODEL_H
++#define __LINUX_MEMORY_ORDERING_MODEL_H
++
++struct task_struct;
++
++/* PR_GET_MEM_MODEL / PR_SET_MEM_MODEL; -EINVAL where the hardware has one model. */
++int arch_prctl_mem_model_get(struct task_struct *t);
++int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val);
++
++#endif
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index 51c4e8c82..557fc17b3 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -386,4 +386,15 @@ struct prctl_mm_map {
+ # define PR_FUTEX_HASH_SET_SLOTS	1
+ # define PR_FUTEX_HASH_GET_SLOTS	2
+ 
++/*
++ * Memory ordering model. For emulators of x86 on hardware that can run
++ * with x86's stronger ordering (Apple silicon's TSO mode): per thread,
++ * inherited across fork and clone, reset by exec. The values are the
++ * ones Rosetta for Linux asks for.
++ */
++#define PR_GET_MEM_MODEL			0x6d4d444c
++#define PR_SET_MEM_MODEL			0x4d4d444c
++# define PR_SET_MEM_MODEL_DEFAULT		0
++# define PR_SET_MEM_MODEL_TSO			1
++
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 8b58eece4..43952b43d 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -12,6 +12,7 @@
+ #include <linux/mman.h>
+ #include <linux/reboot.h>
+ #include <linux/prctl.h>
++#include <linux/memory_ordering_model.h>
+ #include <linux/highuid.h>
+ #include <linux/fs.h>
+ #include <linux/kmod.h>
+@@ -2362,6 +2363,16 @@ static int propagate_has_child_subreaper(struct task_struct *p, void *data)
+ 	return 1;
+ }
+ 
++int __weak arch_prctl_mem_model_get(struct task_struct *t)
++{
++	return -EINVAL;
++}
++
++int __weak arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
++{
++	return -EINVAL;
++}
++
+ int __weak arch_prctl_spec_ctrl_get(struct task_struct *t, unsigned long which)
+ {
+ 	return -EINVAL;
+@@ -2811,6 +2822,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 	case PR_SET_VMA:
+ 		error = prctl_set_vma(arg2, arg3, arg4, arg5);
+ 		break;
++	case PR_GET_MEM_MODEL:
++		if (arg2 || arg3 || arg4 || arg5)
++			return -EINVAL;
++		error = arch_prctl_mem_model_get(me);
++		break;
++	case PR_SET_MEM_MODEL:
++		if (arg3 || arg4 || arg5)
++			return -EINVAL;
++		error = arch_prctl_mem_model_set(me, arg2);
++		break;
+ 	case PR_GET_AUXV:
+ 		if (arg4 || arg5)
+ 			return -EINVAL;

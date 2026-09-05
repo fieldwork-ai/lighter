@@ -140,6 +140,23 @@ pub fn machine() -> anyhow::Result<()> {
             share.path.display()
         ));
     }
+    // Rosetta rides its own share, mounted by the guest's init at a fixed
+    // place when told; amd64 containers run under qemu otherwise.
+    let mut shares = shares;
+    if lighter_vmm::rosetta::installed() {
+        match lighter_vmm::rosetta::key() {
+            Ok(_) => {
+                shares.push(Share {
+                    tag: lighter_vmm::rosetta::TAG.to_string(),
+                    path: std::path::PathBuf::from(lighter_vmm::rosetta::DIR),
+                });
+                cmdline.push_str(" lighter.rosetta");
+            }
+            Err(e) => {
+                tracing::warn!(%e, "Rosetta is installed but not usable; amd64 under emulation")
+            }
+        }
+    }
     // The kernel join of a stream's two sockets: on unless `LIGHTER_SOCKMAP=0`,
     // which keeps the agent's copying path measurable.
     if std::env::var("LIGHTER_SOCKMAP")
@@ -161,6 +178,8 @@ pub fn machine() -> anyhow::Result<()> {
         network: true,
         run_dir: home.clone(),
         shares,
+        // Rosetta asks the kernel for x86 ordering on its own threads.
+        tso: false,
     };
 
     let mut machine = Machine::start(&machine_config)?;
