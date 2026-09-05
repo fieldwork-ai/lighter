@@ -11,6 +11,7 @@ repository = "https://github.com/fieldwork-ai/lighter"
 authors = ["Nick Rogers"]
 
 [workspace.dependencies]
+lighter-hv = { path = "crates/lighter-hv", version = "0.2.0" }
 lighter-vmm = { path = "crates/lighter-vmm", version = "0.2.0" }
 lighter-docker = { path = "crates/lighter-docker", version = "0.2.0" }
 lighter-fs = { path = "crates/lighter-fs", version = "0.2.0" }

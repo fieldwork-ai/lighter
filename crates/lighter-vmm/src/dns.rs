@@ -1,7 +1,7 @@
 //! DNS for the guest, answered by the Mac's resolver.
 //!
 //! The agent serves DNS inside the guest and carries every query here over
-//! one connection over the link, framed `[len u16][id u16][query]`; replies go back the
+//! one vsock stream, framed `[len u16][id u16][query]`; replies go back the
 //! same way. Address questions are answered through `getaddrinfo`, which is
 //! the Mac's own resolver with its cache, its scoped resolvers and whatever
 //! a VPN configured — the same answer a Mac process gets, at the same
@@ -13,6 +13,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::virtio::vsock::{Accepted, VsockShared};
+
+/// The vsock port the agent dials for DNS.
+pub const DNS_PORT: u32 = 2379;
 
 /// The card's addresses for the Mac, which the stream host maps to loopback.
 const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
@@ -40,6 +45,25 @@ fn nameserver() -> SocketAddr {
 
 /// Starts answering the agent's DNS stream: each accepted stream goes to
 /// the reactor, which answers cache hits inline and misses off-thread.
+pub fn start(
+    shared: Arc<VsockShared>,
+    reactor: Arc<crate::reactor::Reactor>,
+) -> std::io::Result<()> {
+    let accepted = shared.listen(DNS_PORT);
+    std::thread::Builder::new()
+        .name("dns-accept".into())
+        .spawn(move || {
+            for Accepted { key } in accepted {
+                reactor.accept_dns(key);
+            }
+        })?;
+    Ok(())
+}
+
+/// A short cache in front of the system resolver. The resolver has its own,
+/// but asking it is an IPC round trip of 150 µs; a hit here is a hash
+/// lookup. Ten seconds is under any TTL that matters and what a stub
+/// resolver keeps anyway.
 struct Cached {
     addrs: Vec<IpAddr>,
     until: std::time::Instant,

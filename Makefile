@@ -1,7 +1,7 @@
 # lighter — build, sign, and gate targets.
 #
-# Everything that starts a virtual machine must be code-signed with the
-# virtualization entitlement before it will run, so no target here builds without
+# Everything that touches Hypervisor.framework must be code-signed with the
+# hypervisor entitlement before it will run, so no target here builds without
 # signing afterwards. `make gates` is the milestone ledger: each gate is a
 # scripted check, and a milestone is done when its gate passes.
 
@@ -25,7 +25,7 @@ build: ## Build all crates and sign anything that runs a VM
 	@$(MAKE) --no-print-directory sign
 
 .PHONY: sign
-sign: ## Ad-hoc sign built binaries with the virtualization entitlement
+sign: ## Ad-hoc sign built binaries with the hypervisor entitlement
 	@bins=$$(find $(TARGET_DIR) -maxdepth 2 \( -path '*/examples/*' -o -path '$(TARGET_DIR)/*' \) \
 		-type f -perm -111 ! -name '*.d' ! -name '*.rlib' ! -name '*.dylib' 2>/dev/null \
 		| grep -vE '/(build|deps|incremental)/' || true); \
@@ -66,6 +66,18 @@ check: ## Type-check without building binaries
 .PHONY: test
 test: ## Unit tests that need no VM
 	$(CARGO) test --all
+
+# Tests that create a real VM have to be signed between build and run, which
+# cargo cannot do on its own — hence build, sign, then execute by path.
+.PHONY: test-hv
+test-hv: ## Tests that drive the hypervisor (needs entitlement + real hardware)
+	@scripts/run-hv-tests.sh $(CARGO_PROFILE_FLAG)
+
+.PHONY: smoke
+smoke: ## Prove the hypervisor path works on this machine
+	$(CARGO) build $(CARGO_PROFILE_FLAG) --example smoke -p lighter-hv
+	@$(SIGN) $(TARGET_DIR)/examples/smoke
+	@$(TARGET_DIR)/examples/smoke
 
 # ---------------------------------------------------------------- gates ----
 # One target per milestone. `make gates` runs every gate that has landed.

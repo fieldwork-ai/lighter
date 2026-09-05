@@ -80,7 +80,7 @@ pub fn ensure() -> anyhow::Result<PathBuf> {
 /// opened" on a Mac with a screen and sat blocked forever on one without.
 /// A checkout build is ad hoc already and was never affected. Signing the
 /// bundle as a whole seals the plist and re-signs the copy, and ad hoc is
-/// all a local copy needs: the entitlement is what makes the framework
+/// all a local copy needs: the entitlement is what makes the hypervisor
 /// answer, and it is carried over from the source rather than looked up on
 /// disk, so no layout — checkout, installer, Homebrew — has to be known.
 fn sign(source: &Path, bundle: &Path) -> anyhow::Result<()> {

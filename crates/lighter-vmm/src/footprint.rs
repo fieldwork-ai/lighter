@@ -61,49 +61,7 @@ unsafe extern "C" {
 }
 
 /// This process's physical footprint, in bytes. Zero if it cannot be read.
-/// The physical footprint of this process and of the framework's helper
-/// process, which is where the guest's memory is charged. This is the
-/// "Memory" column of Activity Monitor for the pair.
 pub fn bytes() -> u64 {
-    own_bytes() + helper_bytes()
-}
-
-static HELPER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// Names the helper process, once the machine knows it.
-pub fn set_helper(pid: i32) {
-    HELPER.store(pid, Ordering::Relaxed);
-}
-
-unsafe extern "C" {
-    fn proc_pid_rusage(
-        pid: libc::c_int,
-        flavor: libc::c_int,
-        buffer: *mut libc::c_void,
-    ) -> libc::c_int;
-}
-
-const RUSAGE_INFO_V4: libc::c_int = 4;
-
-/// The helper's physical footprint, as macOS accounts it.
-fn helper_bytes() -> u64 {
-    let pid = HELPER.load(Ordering::Relaxed);
-    if pid <= 0 {
-        return 0;
-    }
-    // rusage_info_v4 opens with a 16-byte uuid (two words here), then user
-    // time, system time, two wakeup counts, pageins, wired and resident
-    // sizes, and ri_phys_footprint: the tenth word.
-    let mut info = [0u64; 40];
-    // SAFETY: the flavour's struct fits in the buffer.
-    if unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V4, info.as_mut_ptr().cast()) } == 0 {
-        info[9]
-    } else {
-        0
-    }
-}
-
-fn own_bytes() -> u64 {
     let mut info = TaskVmInfo::default();
     let mut count = TASK_VM_INFO_COUNT
         .min((std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<u32>()) as libc::c_uint);

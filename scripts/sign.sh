@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sign a binary with the virtualization entitlement.
+# Sign a binary with the hypervisor entitlement.
 #
-# Virtualization.framework refuses to start a machine from an unsigned binary, so this runs
+# Hypervisor.framework refuses every call from an unsigned binary, so this runs
 # after each build rather than at release time only. Ad-hoc signing (`-`) is
 # enough for a binary that never leaves this machine; releases pass
 # LIGHTER_SIGN_IDENTITY to use a real Developer ID.

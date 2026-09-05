@@ -1,0 +1,125 @@
+vsock/virtio: a receive refill that cannot be refused
+
+A 256 KiB linear receive buffer is an order-6 page allocation. The allocator
+may refuse one under fragmentation, the refill breaks out on the first
+refusal, and nothing retries: the device is left with no buffer to answer
+into and the guest sits with an empty ring and a host it can no longer hear,
+which is what a package install on a 4 GiB guest turned into once the
+memory policy had trimmed and reported its free pages away.
+
+When the large buffer is refused, a 32 KiB one is posted instead — an order-3 allocation the allocator does not
+give up on. A packet is only ever as large as the buffer it lands in, so
+mixed sizes in the ring cost throughput while memory is fragmented and
+nothing else, and every refill asks for the large size again. A refill that
+still posts nothing is retried from a delayed work rather than forgotten,
+and says so once.
+
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -33,6 +33,8 @@
+ 	/* Virtqueue processing is deferred to a workqueue */
+ 	struct work_struct tx_work;
+ 	struct work_struct rx_work;
++	/* lighter: a refill that posted nothing is retried from here. */
++	struct delayed_work rx_refill_work;
+ 	struct work_struct event_work;
+ 
+ 	/* The following fields are protected by tx_lock.  vqs[VSOCK_VQ_TX]
+@@ -305,6 +307,22 @@
+ 	return ret;
+ }
+ 
++/* lighter: a 256 KiB receive buffer is an order-6 page allocation, which
++ * the allocator may refuse under fragmentation — and with the refill
++ * breaking out on the first refusal and nothing retrying it, the device is
++ * left with no buffer to answer into and the guest with a host it can no
++ * longer hear. So when the large buffer is refused a 32 KiB one is posted
++ * instead: an order-3 allocation the allocator does not give up on. (Asking
++ * for the large one without reclaim was tried and costs a third of the
++ * host → guest throughput on a 16 GiB guest: the memory policy leaves few
++ * free order-6 blocks, and only compaction makes more.) A packet is only ever as large as the
++ * buffer it lands in, so mixed sizes in the ring cost throughput while
++ * memory is fragmented and nothing else; every refill asks for the large
++ * size again. A refill that still posts nothing is retried from a delayed
++ * work rather than forgotten, and says so once.
++ */
++#define VIRTIO_VSOCK_SMALL_RX_BUF_SIZE	SKB_WITH_OVERHEAD(1024 * 32)
++
+ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
+ {
+ 	int total_len = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
+@@ -312,19 +330,26 @@
+ 	struct virtqueue *vq;
+ 	struct sk_buff *skb;
+ 	int ret;
+-
+ 	int posted = 0;
+ 
+ 	vq = vsock->vqs[VSOCK_VQ_RX];
+ 	ret = 0;
+ 
+ 	do {
+-		skb = virtio_vsock_alloc_linear_skb(total_len, GFP_KERNEL);
++		int len = total_len;
++
++		skb = virtio_vsock_alloc_linear_skb(len, GFP_KERNEL | __GFP_NOWARN);
++		if (!skb) {
++			len = VIRTIO_VSOCK_SMALL_RX_BUF_SIZE;
++			skb = virtio_vsock_alloc_linear_skb(len, GFP_KERNEL);
++			if (skb)
++				pr_info_ratelimited("virtio_vsock: the large receive buffer was refused; posting a small one\n");
++		}
+ 		if (!skb)
+ 			break;
+ 
+ 		memset(skb->head, 0, VIRTIO_VSOCK_SKB_HEADROOM);
+-		sg_init_one(&pkt, virtio_vsock_hdr(skb), total_len);
++		sg_init_one(&pkt, virtio_vsock_hdr(skb), len);
+ 		p = &pkt;
+ 		ret = virtqueue_add_sgs(vq, &p, 0, 1, skb, GFP_KERNEL);
+ 		if (ret < 0) {
+@@ -337,14 +362,24 @@
+ 	} while (vq->num_free);
+ 	if (vsock->rx_buf_nr > vsock->rx_buf_max_nr)
+ 		vsock->rx_buf_max_nr = vsock->rx_buf_nr;
+-	/* lighter: a refill that posts nothing leaves the device with no
+-	 * buffer to answer into, and nothing retries it; say why.
+-	 */
+-	if (!posted)
++	if (!posted) {
+ 		pr_warn_ratelimited("virtio_vsock: rx_fill posted nothing: num_free=%u rx_buf_nr=%d max=%d ret=%d alloc=%d\n",
+ 				    vq->num_free, vsock->rx_buf_nr,
+ 				    vsock->rx_buf_max_nr, ret, skb != NULL);
++		if (!vsock->rx_buf_nr)
++			queue_delayed_work(virtio_vsock_workqueue,
++					   &vsock->rx_refill_work,
++					   msecs_to_jiffies(10));
++	}
+ 	virtqueue_kick(vq);
++}
++
++static void virtio_vsock_rx_refill_work(struct work_struct *work)
++{
++	struct virtio_vsock *vsock =
++		container_of(work, struct virtio_vsock, rx_refill_work.work);
++
++	queue_work(virtio_vsock_workqueue, &vsock->rx_work);
+ }
+ 
+ static void virtio_transport_tx_work(struct work_struct *work)
+@@ -822,6 +857,7 @@
+ 	mutex_init(&vsock->event_lock);
+ 	skb_queue_head_init(&vsock->send_pkt_queue);
+ 	INIT_WORK(&vsock->rx_work, virtio_transport_rx_work);
++	INIT_DELAYED_WORK(&vsock->rx_refill_work, virtio_vsock_rx_refill_work);
+ 	INIT_WORK(&vsock->tx_work, virtio_transport_tx_work);
+ 	INIT_WORK(&vsock->event_work, virtio_transport_event_work);
+ 	INIT_WORK(&vsock->send_pkt_work, virtio_transport_send_pkt_work);
+@@ -866,6 +902,7 @@
+ 	/* Other works can be queued before 'config->del_vqs()', so we flush
+ 	 * all works before to free the vsock object to avoid use after free.
+ 	 */
++	cancel_delayed_work_sync(&vsock->rx_refill_work);
+ 	flush_work(&vsock->rx_work);
+ 	flush_work(&vsock->tx_work);
+ 	flush_work(&vsock->event_work);

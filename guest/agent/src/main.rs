@@ -15,13 +15,13 @@
 
 mod sockmap;
 mod udp;
-mod link;
+mod vsock;
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use link::Listener;
+use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
     let mut port: u32 = 2375;
@@ -77,14 +77,14 @@ fn main() -> std::process::ExitCode {
         return serve_inbound(port);
     }
     if let Some(port) = udp_proxy {
-        let host = match link::connect(udp::UDP_PORT) {
+        let host = match vsock::connect(udp::UDP_PORT) {
             Ok(fd) => fd,
             Err(e) => {
                 eprintln!("lighter-agent: udp stream to host refused: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         };
-        let _ = link::set_buffer(&host, STREAM_WINDOW);
+        let _ = vsock::set_buffer(&host, STREAM_WINDOW);
         return match udp::serve(port, Fd(host)) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
@@ -105,10 +105,10 @@ fn main() -> std::process::ExitCode {
         std::thread::spawn(bound_container_cache);
     }
 
-    let listener = match Listener::bind(port) {
+    let listener = match VsockListener::bind(port) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("lighter-agent: cannot bind port {port}: {e}");
+            eprintln!("lighter-agent: cannot bind vsock port {port}: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -126,7 +126,7 @@ fn main() -> std::process::ExitCode {
             }
         };
         if control {
-            let _ = link::set_buffer(&stream, STREAM_WINDOW);
+            let _ = vsock::set_buffer(&stream, STREAM_WINDOW);
         }
         let target = target.clone();
         std::thread::spawn(move || match (&target, control) {
@@ -204,11 +204,9 @@ fn bound_container_cache() {
     // was lifted by hand. The benchmark asks for it on its own command
     // line; a machine that did not ask keeps its cache.
     let trims = cmdline_value("lighter.trim").is_none_or(|v| v != 0);
-    // Under Virtualization.framework the balloon is the only way memory goes
-    // back (no free page reporting), so every guest offers, whatever its
-    // size. `lighter.balloonmin=<GiB>` raises the line below which it does
-    // not, for an A/B.
-    let balloon_min = cmdline_value("lighter.balloonmin").map(|g| g << 30).unwrap_or(0);
+    // `lighter.balloonmin=<GiB>` lowers the line below which the balloon is
+    // not offered memory (eight gigabytes), for the A/B on a small guest.
+    let balloon_min = cmdline_value("lighter.balloonmin").map(|g| g << 30).unwrap_or(8 << 30);
     let bound = cmdline_value("lighter.cachebound")
         .map(|mib| mib << 20)
         .unwrap_or(0);
@@ -298,11 +296,11 @@ fn bound_container_cache() {
         // longer than the gap and inside the five seconds after work that a
         // footprint is read at.
         //
-        // On the old machine a 4 GiB guest broke even against reporting
-        // alone here (the peak 600 MB better, the minute reading 500 MB
-        // worse, one install a tenth slower) and only 8 GiB and up offered.
-        // Without reporting the offer is the whole return path, so every
-        // size offers, and the small guest's cost is Phase 3's to measure.
+        // Guests of eight gigabytes and up. On a 4 GiB guest the reserve is
+        // a large share of RAM and the balloon broke even against reporting
+        // alone: the peak 600 MB better, the minute reading 500 MB worse,
+        // one install a tenth slower; the 16 GiB guest gains on every
+        // reading. Below the line reporting and the trims are the policy.
         if total >= balloon_min {
             offer_memory(&mut memory_stream, &mut last_offer, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
         }
@@ -461,7 +459,7 @@ fn offer_memory(
         0
     };
     if stream.is_none() {
-        *stream = link::connect(MEMORY_PORT).ok();
+        *stream = vsock::connect(MEMORY_PORT).ok();
         *last = None;
     }
     let Some(fd) = stream.as_ref() else { return };
@@ -751,7 +749,7 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     let Some((ip, port)) = original_destination(tcp.as_raw_fd()) else {
         return;
     };
-    let host = match link::connect(STREAM_PORT) {
+    let host = match vsock::connect(STREAM_PORT) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("lighter-agent: stream to host refused: {e}");
@@ -762,7 +760,7 @@ fn forward_outbound(tcp: std::net::TcpStream) {
         }
     };
     HOST_TIMEOUTS.store(0, std::sync::atomic::Ordering::Relaxed);
-    let _ = link::set_buffer(&host, STREAM_WINDOW);
+    let _ = vsock::set_buffer(&host, STREAM_WINDOW);
     let mut header = [0u8; 19];
     match ip {
         std::net::IpAddr::V4(a) => {
@@ -825,7 +823,7 @@ fn serve_dns(addr: &str) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let host = match link::connect(DNS_PORT) {
+    let host = match vsock::connect(DNS_PORT) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("lighter-agent: dns stream to host refused: {e}");
@@ -896,17 +894,17 @@ const PUBLISHED_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127
 /// Answers the host's inbound streams: two bytes of port, then bytes both
 /// ways to whatever Docker has on that port.
 fn serve_inbound(port: u32) -> std::process::ExitCode {
-    let listener = match Listener::bind(port) {
+    let listener = match VsockListener::bind(port) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("lighter-agent: cannot bind port {port}: {e}");
+            eprintln!("lighter-agent: cannot bind vsock port {port}: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
     println!("AGENT inbound port={port}");
     loop {
         let Ok(stream) = listener.accept() else { continue };
-        let _ = link::set_buffer(&stream, STREAM_WINDOW);
+        let _ = vsock::set_buffer(&stream, STREAM_WINDOW);
         std::thread::spawn(move || forward_inbound(stream));
     }
 }
@@ -919,7 +917,7 @@ fn forward_inbound(host: OwnedFd) {
         return;
     }
     let port = u16::from_be_bytes(header);
-    let mut tcp = match std::net::TcpStream::connect((PUBLISHED_ADDR, port)) {
+    let tcp = match std::net::TcpStream::connect((PUBLISHED_ADDR, port)) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("lighter-agent: inbound to {PUBLISHED_ADDR}:{port} refused: {e}");
@@ -927,16 +925,6 @@ fn forward_inbound(host: OwnedFd) {
         }
     };
     let _ = tcp.set_nodelay(true);
-    // Whatever followed the header in the same segment is carried by hand
-    // before the join. The join hands sockmap whole socket buffers, and a
-    // buffer the header was read out of still holds the header: joined as
-    // it stands, the container would see the port bytes ahead of the
-    // request (it did — an HTTP server answered 501 to `;\xc7GET`). On the
-    // old device the header always travelled alone; on TCP the two arrive
-    // together whenever the host sends them back to back.
-    if copy_queued(host_read.0.as_raw_fd(), &mut tcp).is_err() {
-        return;
-    }
     let (tcp, host_read, host_write) = match joiner() {
         Some(j) => match joined(j, tcp, host_read, host_write) {
             Ok(()) => return,
@@ -1089,22 +1077,6 @@ fn handle_control(line: &str) -> String {
             Ok(text) => format!("{text}\n--end--\n"),
             Err(e) => format!("error {e}\n--end--\n"),
         },
-        // The host asks on `lighter stop`: the engine down first so the data
-        // disk is quiet, then sync, then the power off the framework reports.
-        (Some("poweroff"), _) => {
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let _ = std::process::Command::new("/bin/sh")
-                    .arg("-c")
-                    .arg("pid=$(pidof dockerd); [ -n \"$pid\" ] && kill $pid; for i in $(seq 1 50); do kill -0 $pid 2>/dev/null || break; sleep 0.1; done; sync; umount /var/lib/docker 2>/dev/null; sync")
-                    .status();
-                unsafe {
-                    libc::sync();
-                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
-                }
-            });
-            "ok\n".into()
-        }
         (Some("time"), Some(seconds)) => match seconds.parse::<i64>() {
             Ok(epoch) => match set_clock(epoch) {
                 Ok(()) => "ok\n".into(),
@@ -1368,23 +1340,6 @@ fn copy(from: &mut impl Read, to: &mut impl Write) {
 ///
 /// std has no owned-fd stream type that is not tied to a socket family it
 /// knows, and vsock is not one of those.
-/// Copies whatever the kernel already holds for `from` to `to`, and stops
-/// when nothing more is queued right now.
-fn copy_queued(from: std::os::fd::RawFd, to: &mut impl Write) -> std::io::Result<()> {
-    loop {
-        let mut queued: libc::c_int = 0;
-        if unsafe { libc::ioctl(from, libc::FIONREAD, &mut queued) } < 0 || queued <= 0 {
-            return Ok(());
-        }
-        let mut buf = vec![0u8; queued as usize];
-        let n = unsafe { libc::read(from, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        to.write_all(&buf[..n as usize])?;
-    }
-}
-
 struct Fd(OwnedFd);
 
 impl Fd {

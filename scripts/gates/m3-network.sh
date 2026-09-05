@@ -2,7 +2,7 @@
 # Milestone 3 gate, part one: the network card, and what the VMM answers on it.
 #
 # Everything a container uses a network for — TCP, UDP, DNS, published ports —
-# is a stream over the link and never touches the card; the streams gate proves
+# is a stream over vsock and never touches the card; the streams gate proves
 # those. What the card still carries is what the guest needs to believe it is
 # on a network, and each check pins one of them:
 #
@@ -67,7 +67,7 @@ echo "==> Booting with networking"
 	--cpus 2 \
 	--net \
 	--run-dir "$RUN_DIR" \
-	--cmdline "console=hvc0 panic=-1 lighter.nettest" \
+	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 lighter.nettest" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 

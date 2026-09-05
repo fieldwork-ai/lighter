@@ -54,10 +54,10 @@ measure_once() {
 		--kernel guest/out/Image --disk guest/out/rootfs.ext4 \
 		--disk "$run_dir/data.img" --disk-size-gib 16 \
 		--net --run-dir "$run_dir" \
-		--proxy "$run_dir/docker.sock:2375" \
+		--vsock "$run_dir/docker.sock:2375" \
 		--share "lat:$WORK" --no-tty --cpus "${BENCH_CPUS:-8}" \
 		--memory-mib "${BENCH_MEMORY_MIB:-8192}" \
-		--cmdline "console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=lat:/mnt/lat ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=lat:/mnt/lat ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$log" 2>&1 &
 	vmm=$!
 	waited=0
