@@ -1,6 +1,6 @@
 [package]
 name = "lighter-vmm"
-description = "The lighter machine model: memory map, boot protocol, devices, and the vCPU run loop"
+description = "The lighter machine: what the guest runs on under Virtualization.framework, and the host half of every channel into it"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,14 +9,18 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-lighter-hv.workspace = true
 lighter-docker.workspace = true
 lighter-fs.workspace = true
 
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-vm-fdt = "0.3"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-virtualization = "0.3"
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-tcp-cubic"] }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

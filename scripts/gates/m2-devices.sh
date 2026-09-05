@@ -80,7 +80,7 @@ boot() {
 		--cpus 2 \
 		--disk "$IMG" \
 		--disk-size-gib 4 \
-		--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 $extra" \
+		--cmdline "console=hvc0 panic=-1 $extra" \
 		>"$LOG" 2>&1
 }
 

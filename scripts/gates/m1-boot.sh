@@ -5,12 +5,12 @@
 # The checks are deliberately not "did it print something". Each one pins a
 # distinct subsystem that can fail silently:
 #
-#   cpus     — PSCI CPU_ON actually started every secondary
+#   cpus     — every core came up
 #   memory   — the device tree's /memory matched what we mapped
 #   dt       — the kernel parsed our tree rather than falling back
-#   console  — the real PL011 driver bound, not just earlycon
+#   console  — the virtio console bound
 #   timer    — the virtual timer delivers interrupts, so sleep() returns
-#   poweroff — PSCI SYSTEM_OFF reached us and stopped the machine
+#   poweroff — the guest's power-off stopped the machine
 set -euo pipefail
 
 # cargo lives in ~/.cargo/bin, which a non-login shell does not have on PATH —
@@ -60,8 +60,8 @@ echo "==> Building and signing the VMM"
 cargo build $([ "$PROFILE" = release ] && echo --release) --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 
-# One boot per core count: 1 exercises the plain path, 4 exercises PSCI CPU_ON
-# and the multi-threaded shutdown that a single core never reaches.
+# One boot per core count: 1 exercises the plain path, 4 the SMP bring-up and
+# the multi-core shutdown that a single core never reaches.
 for cpus in 1 4; do
 	echo
 	echo "==> Booting with $cpus vCPU(s)"
@@ -72,7 +72,7 @@ for cpus in 1 4; do
 		--initramfs "$INITRAMFS" \
 		--no-tty \
 		--cpus "$cpus" \
-		--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 lighter.selftest" \
+		--cmdline "console=hvc0 panic=-1 lighter.selftest" \
 		>"$log" 2>&1; then
 		elapsed=$(( $(date +%s) - started ))
 		pass "guest ran and exited (${elapsed}s wall)"
@@ -102,10 +102,10 @@ for cpus in 1 4; do
 	fi
 
 	grep -q "SELFTEST dt=ok"            "$log" && pass "device tree parsed"        || fail "no /proc/device-tree"
-	grep -q "SELFTEST console=ttyAMA0"  "$log" && pass "PL011 driver bound"        || fail "amba-pl011 did not bind"
+	grep -q "SELFTEST console=hvc0"     "$log" && pass "virtio console bound"     || fail "hvc0 did not bind"
 	grep -q "SELFTEST timer=ok"         "$log" && pass "virtual timer advances"    || fail "guest clock did not advance"
 	grep -q "SELFTEST done"             "$log" && pass "init completed"            || fail "init did not finish"
-	grep -q "guest powered off"         "$log" && pass "PSCI SYSTEM_OFF handled"   || fail "machine did not power off cleanly"
+	grep -q "guest powered off"         "$log" && pass "guest powered off cleanly" || fail "machine did not power off cleanly"
 
 	# A guest that panicked but still printed its selftest would otherwise pass.
 	if grep -q "Kernel panic" "$log"; then
@@ -113,19 +113,11 @@ for cpus in 1 4; do
 		grep -A3 "Kernel panic" "$log" | head -4 | sed 's/^/    /'
 	fi
 
-	# Signatures of a machine the guest could not make sense of. These have all
-	# been seen for real and none of them stop the boot on their own: the guest
-	# carries on with a broken device and dies somewhere unrelated, so the log
-	# is the only place the actual cause is written down.
-	#
-	# "No redistributor present" is here because it happened: vCPU threads raced
-	# to hv_vcpu_create, so framework ids stopped matching the thread indices we
-	# were deriving MPIDR from, and roughly one SMP boot in eight came up with a
-	# core whose redistributor the GIC could not find. Creation is serialized
-	# now, but the check stays — it is the only outward sign of that whole class
-	# of bug.
+	# Signatures of a machine the guest could not make sense of. None of
+	# them stop the boot on their own: the guest carries on with a broken
+	# device and dies somewhere unrelated, so the log is the only place the
+	# actual cause is written down.
 	for signature in \
-		"No redistributor present" \
 		"Unable to handle kernel" \
 		"Internal error: Oops" \
 		"BUG: " \
@@ -135,14 +127,6 @@ for cpus in 1 4; do
 			grep -F -m1 -A2 "$signature" "$log" | sed 's/^/    /'
 		fi
 	done
-
-	# The GIC has to have found every core's redistributor, not just core 0.
-	found=$(grep -c "found redistributor" "$log" || true)
-	if [ "$found" -eq "$cpus" ]; then
-		pass "GIC located $cpus redistributor(s)"
-	else
-		fail "GIC located $found redistributor(s), expected $cpus"
-	fi
 
 	rm -f "$log"
 done

@@ -6,7 +6,7 @@
 # up and is reachable. Nothing here is a stand-in: it is the Docker CLI, Docker
 # Compose, real images from Docker Hub, and curl from macOS.
 #
-#   docker version    the daemon answers over vsock
+#   docker version    the daemon answers over the link
 #   hello-world       registry pull, TLS against a clock we set, container run,
 #                     and the attached output stream
 #   compose up        three services, health checks green, a named volume
@@ -77,10 +77,10 @@ echo "==> Booting the Docker guest"
 	--disk "$ROOTFS" \
 	--disk "$DATA" --disk-size-gib 16 \
 	--net --run-dir "$RUN_DIR" \
-	--vsock "$SOCKET:2375" \
+	--proxy "$SOCKET:2375" \
 	--docker-ports "$SOCKET" \
 	--no-tty --cpus 4 --memory-mib 4096 \
-	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
+	--cmdline "console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 

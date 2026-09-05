@@ -24,8 +24,8 @@ jobs:
       - name: Lints
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
-        # The hypervisor-backed tests are marked `#[ignore]` and skipped here;
-        # `make test-hv` runs them where there is a hypervisor to talk to.
+        # Tests that start a machine live in the gates (`make gates`), which
+        # need a Mac with Virtualization.framework; the unit tests run here.
         run: cargo test --all
       - name: Shell scripts parse
         run: |

@@ -30,7 +30,18 @@ make_pattern() {
 # nothing enumerates them: the driver binds a device, and a mount by tag is how
 # you reach it. Passing the list on the command line rather than probing keeps
 # the guest from having to guess which of several shares is which.
+# The link to the host: everything that reaches it (the shares, the agent's
+# ports) is TCP to the gateway, so the card comes up and takes its lease
+# before any of it.
+net_up() {
+	[ -e /sys/class/net/eth0 ] || return 1
+	ip link set lo up
+	ip link set eth0 up
+	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1
+}
+
 mount_shares() {
+	net_up || echo "SHARE net=failed"
 	for arg in $cmdline; do
 		case "$arg" in
 		lighter.share=*)
@@ -38,7 +49,7 @@ mount_shares() {
 			tag=${spec%%:*}
 			at=${spec#*:}
 			mkdir -p "$at"
-			if mount -t virtiofs "$tag" "$at"; then
+			if mount -t lighterfs "$tag" "$at"; then
 				echo "SHARE tag=$tag at=$at mounted"
 			else
 				echo "SHARE tag=$tag at=$at FAILED"
@@ -105,9 +116,9 @@ case "$cmdline" in
 *lighter.vsocktest*)
 	echo "VSOCKTEST mode=start"
 
-	# The driver binds to the virtio-vsock slot and creates this; without it
+	# The card has to be up and leased before the agent can bind; without it
 	# nothing below can even be attempted.
-	if [ -e /dev/vsock ]; then
+	if net_up; then
 		echo "VSOCKTEST device=ok"
 	else
 		echo "VSOCKTEST device=missing"
@@ -188,8 +199,8 @@ case "$cmdline" in
 
 	# A PL011 the driver actually bound to, not just an earlycon: if amba-pl011
 	# had failed to probe, output would have stopped when the kernel handed over.
-	if [ -e /sys/class/tty/ttyAMA0 ]; then
-		echo "SELFTEST console=ttyAMA0"
+	if [ -e /sys/class/tty/hvc0 ]; then
+		echo "SELFTEST console=hvc0"
 	else
 		echo "SELFTEST console=missing"
 	fi

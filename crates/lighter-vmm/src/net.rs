@@ -1,12 +1,13 @@
 //! The host side of the guest's network card: a responder, not a stack.
 //!
-//! Nothing a container sends crosses to the Mac as packets any more. TCP and
-//! UDP leave the guest as streams over vsock (`streams`, `reactor`), DNS is
-//! answered on the host over the same channel, and published ports are bound
-//! on the Mac by the VMM itself. What still reaches the virtual network card
-//! is what has no stream form and what the guest needs to believe it is on a
-//! network at all: ARP for its gateway, one DHCP lease, and ICMP. This module
-//! answers those three inside the process and drops the rest.
+//! Nothing a container sends crosses to the Mac as packets it has to route.
+//! TCP and UDP leave the guest as streams to the gateway, terminated on the
+//! link (`link.rs`), DNS is answered on the host over the same channel, and
+//! published ports are bound on the Mac by the VMM itself. What the card
+//! still carries besides those streams is what the guest needs to believe it
+//! is on a network at all: one DHCP lease, and ICMP echo to the world. This
+//! module answers those inside the process; ARP and echo to the gateway the
+//! link's own stack answers.
 //!
 //! It replaces `gvproxy`, a userspace TCP/IP stack that ran as a Go sidecar:
 //! a second process, a 25 MB binary in every tarball with its own signing and
@@ -22,8 +23,6 @@ use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use crate::virtio::net::{Inbox, Net, Outbox};
 
 /// The guest's address, its gateway, and the alias the guest reaches the Mac
 /// itself by (`host.docker.internal`). The streams map the last two to
@@ -54,15 +53,18 @@ pub enum NetError {
     Io(#[from] io::Error),
 }
 
-/// The MTU the guest is told the link carries. Nothing on the far side of
-/// the card sees it — every flow is a stream — so it only sizes the frames
-/// the three protocols above travel in. `LIGHTER_NET_MTU` overrides it.
+/// The largest frame the card carries. As large as Ethernet's length field
+/// allows: every byte to the host is a TCP segment on this link, and a
+/// 65535-byte MTU is what makes one datagram of it (S2: 82 Gbit/s of such
+/// frames against 21 of 1400-byte ones). `LIGHTER_NET_MTU` overrides it.
+pub const DEFAULT_MTU: u16 = 65_535;
+
 pub fn link_mtu() -> u16 {
     std::env::var("LIGHTER_NET_MTU")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|m| (68..=65_520).contains(m))
-        .unwrap_or(crate::virtio::net::DEFAULT_MTU)
+        .filter(|m| (1280..=65_535).contains(m))
+        .unwrap_or(DEFAULT_MTU)
 }
 
 /// What the card saw and what it did with it. Diagnostics: a rule that lets
@@ -79,7 +81,6 @@ pub struct Counters {
 
 /// The card's other end.
 pub struct Network {
-    outbox: Arc<Outbox>,
     mtu: u16,
     /// An unprivileged ICMP socket, for echo to the world. macOS lets any
     /// process open `SOCK_DGRAM`/`IPPROTO_ICMP` and send echo requests on
@@ -108,7 +109,6 @@ impl Network {
             "network started"
         );
         Ok(Network {
-            outbox: Outbox::new(),
             mtu,
             icmp,
             counters: Arc::new(Counters::default()),
@@ -120,95 +120,27 @@ impl Network {
         self.mtu
     }
 
-    /// Where the device puts frames the guest transmitted.
-    pub fn outbox(&self) -> Arc<Outbox> {
-        self.outbox.clone()
+    /// Answers one frame the guest transmitted, or drops it (counted). For
+    /// a card whose frames arrive on a socket rather than a ring: the caller
+    /// reads a frame, asks, and writes whatever comes back.
+    pub fn answer(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        Responder {
+            icmp: self.icmp.clone(),
+            counters: self.counters.clone(),
+        }
+        .answer(frame)
+    }
+
+    /// The host's ICMP datagram socket, whose replies [`echo_reply_frame`]
+    /// turns back into frames; `None` when the Mac refused one.
+    pub fn icmp_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.icmp.as_ref().map(|fd| fd.as_raw_fd())
     }
 
     pub fn counters(&self) -> Arc<Counters> {
         self.counters.clone()
     }
 
-    /// Starts the two threads of the card. The responder takes what the guest
-    /// transmitted and answers it into `inbox`; `wake_rx` is called once per
-    /// batch of answers so the device delivers them under one interrupt, and
-    /// `wake_tx` when the device had parked on a full outbox and there is
-    /// room again. The ICMP reader turns the host's echo replies into frames
-    /// the same way.
-    pub fn spawn(
-        &self,
-        inbox: Inbox,
-        wake_rx: impl Fn() + Send + Sync + 'static,
-        wake_tx: impl Fn() + Send + 'static,
-    ) -> io::Result<()> {
-        let wake_rx = Arc::new(wake_rx);
-        let outbox = self.outbox.clone();
-        let responder = Responder {
-            icmp: self.icmp.clone(),
-            counters: self.counters.clone(),
-        };
-        let deliver_inbox = inbox.clone();
-        let deliver_wake = wake_rx.clone();
-        std::thread::Builder::new()
-            .name("net-lan".into())
-            .spawn(move || {
-                crate::qos::raise_interactive();
-                while let Some((frames, parked)) = outbox.take() {
-                    let mut answered = 0usize;
-                    for frame in &frames {
-                        if let Some(reply) = responder.answer(frame)
-                            && Net::enqueue_received(&deliver_inbox, reply)
-                        {
-                            answered += 1;
-                        }
-                    }
-                    if answered > 0 {
-                        deliver_wake();
-                    }
-                    if parked {
-                        wake_tx();
-                    }
-                }
-                tracing::debug!("network responder stopped");
-            })?;
-        if let Some(icmp) = &self.icmp {
-            let icmp = icmp.clone();
-            let counters = self.counters.clone();
-            std::thread::Builder::new()
-                .name("net-icmp".into())
-                .spawn(move || {
-                    let mut buf = vec![0u8; 65_536];
-                    loop {
-                        // SAFETY: a read into a buffer we own, of its length.
-                        let n = unsafe {
-                            libc::recv(icmp.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0)
-                        };
-                        if n <= 0 {
-                            if n < 0
-                                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-                            {
-                                continue;
-                            }
-                            break;
-                        }
-                        if let Some(frame) = echo_reply_frame(&buf[..n as usize]) {
-                            counters.icmp_replied.fetch_add(1, Ordering::Relaxed);
-                            if Net::enqueue_received(&inbox, frame) {
-                                wake_rx();
-                            }
-                        }
-                    }
-                    tracing::debug!("ICMP reader stopped");
-                })?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Network {
-    fn drop(&mut self) {
-        self.outbox.close();
-    }
 }
 
 /// Answers a frame the guest transmitted, or drops it.
@@ -259,7 +191,7 @@ impl Responder {
 
 /// What a transmitted frame is, as far as the card cares.
 #[derive(Debug, PartialEq, Eq)]
-enum Seen {
+pub enum Seen {
     Arp,
     Dhcp,
     /// Echo to the gateway or the host alias: answered here.
@@ -305,7 +237,7 @@ fn ipv4_src(packet: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15])
 }
 
-fn classify(frame: &[u8]) -> Option<Seen> {
+pub fn classify(frame: &[u8]) -> Option<Seen> {
     match ethertype(frame)? {
         ETHERTYPE_ARP => {
             let arp = frame.get(14..42)?;
@@ -511,7 +443,7 @@ fn forward_echo(fd: libc::c_int, frame: &[u8]) -> bool {
 /// A reply read off the host's ICMP socket, as the frame the guest sees.
 /// macOS hands the datagram back with its IP header on; the source is the
 /// host that answered, the destination becomes the guest.
-fn echo_reply_frame(datagram: &[u8]) -> Option<Vec<u8>> {
+pub fn echo_reply_frame(datagram: &[u8]) -> Option<Vec<u8>> {
     let (src, icmp) = if datagram.first()? >> 4 == 4 {
         let ihl = ipv4_header_len(datagram);
         (ipv4_src(datagram), datagram.get(ihl..)?)
@@ -612,37 +544,6 @@ fn udp_frame(
     ipv4_frame(dst_mac, src, dst, PROTO_UDP, 64, &udp)
 }
 
-/// `writev` until every iovec is on the socket, advancing past whatever a
-/// partial write took. The vsock writer's, kept here from the days the card
-/// had a socket of its own.
-pub(crate) fn write_all_vectored(fd: libc::c_int, iovs: &mut [libc::iovec]) -> io::Result<()> {
-    let mut first = 0usize;
-    while first < iovs.len() {
-        let rest = &iovs[first..];
-        // SAFETY: every iovec points into a buffer that outlives this call,
-        // and the count is what the slice holds.
-        let n = unsafe { libc::writev(fd, rest.as_ptr(), rest.len() as libc::c_int) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        let mut n = n as usize;
-        while first < iovs.len() && n >= iovs[first].iov_len {
-            n -= iovs[first].iov_len;
-            first += 1;
-        }
-        if first < iovs.len() && n > 0 {
-            // SAFETY: advancing within the same buffer by fewer bytes than
-            // its length.
-            iovs[first].iov_base = unsafe { iovs[first].iov_base.add(n) };
-            iovs[first].iov_len -= n;
-        }
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

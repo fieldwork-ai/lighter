@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use lighter_vmm::virtio::fs::Share;
+use lighter_vmm::share::Share;
 use lighter_vmm::{Machine, MachineConfig, StopReason};
 
 fn main() -> ExitCode {
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         .init();
 
     let mut config = MachineConfig::default();
-    let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
+    let mut sockets: Vec<(PathBuf, u16)> = Vec::new();
     let mut docker_socket: Option<PathBuf> = None;
     let mut report_memory = false;
     let mut args = std::env::args().skip(1);
@@ -49,16 +49,17 @@ fn main() -> ExitCode {
             // can see.
             "--report-memory" => report_memory = true,
             "--net" => config.network = true,
-            "--vsock" => {
-                // PATH:GUEST_PORT — a host socket carried to a guest port.
+            "--proxy" | "--vsock" => {
+                // PATH:GUEST_PORT — a host socket carried to a guest port
+                // over the link (`--vsock` is the old spelling).
                 let spec = args.next().unwrap_or_default();
                 match spec
                     .rsplit_once(':')
-                    .and_then(|(p, port)| port.parse().ok().map(|port| (PathBuf::from(p), port)))
+                    .and_then(|(p, port)| port.parse::<u16>().ok().map(|port| (PathBuf::from(p), port)))
                 {
                     Some(pair) => sockets.push(pair),
                     None => {
-                        eprintln!("--vsock wants PATH:GUEST_PORT, got {spec:?}");
+                        eprintln!("--proxy wants PATH:GUEST_PORT, got {spec:?}");
                         return ExitCode::from(2);
                     }
                 }
@@ -97,12 +98,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if config.network
-        && let Err(e) = lighter_vmm::streams::start(machine.vsock())
-    {
-        eprintln!("lighter: cannot start streams: {e}");
-        return ExitCode::FAILURE;
-    }
 
     if report_memory {
         // Footprint and what the guest has handed back, together: the first
@@ -117,7 +112,6 @@ fn main() -> ExitCode {
                     tracing::info!(
                         mib = lighter_vmm::footprint::bytes() / (1 << 20),
                         offered_mib = balloon.offered_bytes() / (1 << 20),
-                        reported_mib = balloon.reported_bytes() / (1 << 20),
                         ballooned_mib = balloon.ballooned_bytes() / (1 << 20),
                         "FOOTPRINT"
                     );
@@ -140,7 +134,11 @@ fn main() -> ExitCode {
             eprintln!("lighter: --docker-ports needs --net");
             return ExitCode::from(2);
         }
-        let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+        let Some(link) = machine.link() else {
+            eprintln!("lighter: --docker-ports needs --net");
+            return ExitCode::from(2);
+        };
+        let mapper = lighter_vmm::streams::PortMapper::new(link);
         if let Err(e) = lighter_docker::PortWatcher::start(socket, mapper) {
             eprintln!("lighter: cannot watch docker ports: {e}");
             return ExitCode::FAILURE;
@@ -148,7 +146,7 @@ fn main() -> ExitCode {
     }
 
     match machine.wait() {
-        Ok(StopReason::SystemOff) => {
+        Ok(StopReason::Shutdown) => {
             eprintln!("\nlighter: guest powered off");
             ExitCode::SUCCESS
         }

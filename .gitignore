@@ -31,3 +31,4 @@ results/*-boot.log
 # Benchmark scratch. Results are committed; the VMM log a run leaves behind is
 # not, and neither is the fixture's installed tree.
 benchmarks/results/*-boot.log
+__pycache__/

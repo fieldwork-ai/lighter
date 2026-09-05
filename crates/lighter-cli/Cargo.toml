@@ -13,7 +13,6 @@ name = "lighter"
 path = "src/main.rs"
 
 [dependencies]
-lighter-hv.workspace = true
 lighter-vmm.workspace = true
 lighter-docker.workspace = true
 

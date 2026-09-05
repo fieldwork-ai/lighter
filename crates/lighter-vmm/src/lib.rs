@@ -1,58 +1,44 @@
-//! The lighter machine model.
+//! The lighter machine.
 //!
 //! # The secret this crate keeps
 //!
-//! What the guest's machine *is*: where memory and devices sit, how a kernel is
-//! loaded, what the device tree says, how a core is started and stopped, and
-//! how a device access is serviced. It knows there is a hypervisor underneath
-//! only through [`lighter_hv`]'s interface.
+//! What the guest's machine *is*, as a Virtualization.framework configuration
+//! (`vz`), and the host half of every channel into it: the link the network
+//! and the file server ride (`link`), the balloon the memory comes back
+//! through (`balloon`, `memory_policy`), the shares (`share`), the published
+//! ports (`streams`). It knows nothing about FUSE (`lighter-fs` does) or
+//! Docker's API (`lighter-docker` does).
 //!
 //! # Layering
 //!
 //! ```text
-//!   machine   assembles everything in the one legal order
-//!     ├── layout    where things are, derived once and shared
-//!     ├── memory    guest RAM, as raw shared memory rather than slices
-//!     ├── kernel    the arm64 boot protocol
-//!     ├── fdt       the machine description handed to the kernel
-//!     ├── bus       MMIO dispatch
-//!     ├── vcpu      the run loop
-//!     ├── smp       PSCI core power state
-//!     ├── sysreg    trapped system-register policy
-//!     ├── devices   models that answer MMIO
-//!     ├── virtio    the transport and the device models on it, file sharing
-//!     │             among them
-//!     └── net       the host end of the network, behind a process boundary
+//!   machine   assembles the machine and starts the channels
+//!     ├── vz             the framework: boot, devices, lifecycle, the balloon knob
+//!     ├── disk           the image files the block devices serve
+//!     ├── link           the card: responder, smoltcp, and the reactor over it
+//!     │     ├── net      DHCP and echo answered in process
+//!     │     ├── dns      the Mac's resolver, for the guest
+//!     │     └── share    FUSE requests to lighter-fs and replies back
+//!     ├── streams        published ports bound on the Mac
+//!     ├── balloon        the one number the framework's balloon takes
+//!     └── memory_policy  what that number should be
 //! ```
 
-pub mod bus;
-pub mod console;
-pub mod devices;
+pub mod balloon;
+pub mod disk;
 pub mod dns;
-pub mod dump;
-pub mod exitstats;
-pub mod fdt;
 pub mod footprint;
-pub mod irq;
-pub mod kernel;
-pub mod layout;
+pub mod link;
 pub mod machine;
-pub mod memory;
 pub mod memory_policy;
 pub mod mempressure;
 pub mod net;
-pub mod psci;
 pub mod qos;
-pub mod reactor;
-pub mod smp;
+pub mod share;
 pub mod sockbuf;
 pub mod streams;
-pub mod sysreg;
-pub mod vcpu;
-pub mod virtio;
-pub mod vsock_proxy;
+pub mod vz;
 pub mod wake;
 pub mod workers;
 
-pub use machine::{Machine, MachineConfig, MachineError};
-pub use vcpu::StopReason;
+pub use machine::{Machine, MachineConfig, MachineError, StopReason};
