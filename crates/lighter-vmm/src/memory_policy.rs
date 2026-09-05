@@ -83,9 +83,6 @@ const GUEST_RESERVE_FRACTION: u64 = 16;
 /// The least a range grows by when the guest is short: a small guest
 /// doubles, a tiny one gets this.
 const GROW_STEP_MIN: u64 = 256 << 20;
-/// How long the balloon stands inflated, at a target the guest has stopped
-/// raising, before it is let go.
-const PULSE_HELD_SECS: u32 = 5;
 
 /// The balloon, and the signals that drive it.
 pub struct MemoryPolicy {
@@ -110,10 +107,6 @@ impl MemoryPolicy {
             ram_bytes,
             mem,
             last_line: Mutex::new((0, false)),
-            pulsed: AtomicBool::new(false),
-            inflated_for: AtomicU32::new(0),
-            pulse_target: AtomicU32::new(0),
-            pulse_held: AtomicU32::new(0),
             level: AtomicU32::new(Pressure::Normal as u32),
             level_pages: AtomicU32::new(0),
             steer_pages: AtomicU32::new(0),
@@ -165,7 +158,6 @@ impl MemoryPolicy {
                             );
                         }
                         steering.resize_again();
-                        steering.pulse();
                         let Some(now) = host.sample() else { continue };
                         if let Some(then) = last {
                             let compressed = now.compressed.saturating_sub(then.compressed);
@@ -195,12 +187,15 @@ impl MemoryPolicy {
     }
 }
 
-/// Makes the guest whole before a container starts: the balloon comes back
-/// first, because a plugged block needs its page array from the base and
-/// the balloon holds the base's free pages once the range is out — a plug
-/// against an inflated balloon left a container seeing half the machine
-/// (m6, 4036 of 8192 MiB). Then the range goes in, and the call waits for
-/// it (`MemControl::plug_all`).
+/// Makes the guest whole before a container starts: the range goes in, and
+/// the call waits for it (`MemControl::plug_all`). The balloon stays where
+/// it is. It used to come back first, because a plugged block needed its
+/// page array from the base and the balloon held the base's free pages;
+/// with guest patch 0024 a block carries its own, and a balloon that stands
+/// through the container's run is what keeps an install's peak where it
+/// was before the range (4168 MiB on the M5 against 5355–6576 with the
+/// balloon let go at the floor). The guest's own release rule brings it
+/// back when running work is short.
 #[derive(Clone)]
 pub struct MakeWhole(Arc<Steering>);
 
@@ -210,7 +205,6 @@ impl MakeWhole {
         if mem.state().plugged_bytes() == mem.state().region_bytes() {
             return;
         }
-        self.0.guest_offers(0, true);
         mem.plug_all();
     }
 }
@@ -242,28 +236,6 @@ struct Steering {
     /// ends, and an idle guest sends nothing new: the policy's loop asks
     /// again (`resize_again`).
     last_line: Mutex<(u64, bool)>,
-    /// The balloon has pulsed at the floor: inflated once the range was
-    /// out, for the reclaim its pressure brings, then let go — the pages
-    /// stay released on the host until the guest touches them, and a
-    /// container's plug is not gated on two gigabytes deflating (854 ms
-    /// starts on the M5 with the balloon held). Cleared when the range
-    /// goes in again.
-    pulsed: AtomicBool,
-    /// Seconds the balloon has stood inflated to a target that has not
-    /// moved, at the floor. The target moves while the guest is still
-    /// offering — its first offer after a shrink is small, made while the
-    /// unplug is migrating pages into the base — and a pulse on that first
-    /// offer took 160 MiB and then ignored the two gigabytes that followed.
-    inflated_for: AtomicU32,
-    /// The target the count above was made against.
-    pulse_target: AtomicU32,
-    /// What the last pulse held, in balloon pages. A later offer of a
-    /// block or more beyond it means the guest has since given up more
-    /// (the first pulse's pressure freed slab and cache that the second
-    /// can take), and the balloon pulses again: after a full suite the M1
-    /// sat at 513 MiB resident with one pulse of 370, against 305 after a
-    /// short one.
-    pulse_held: AtomicU32,
     level: AtomicU32,
     /// What the pressure level asks for, what the compressor asks for, and
     /// what the guest itself offers: the balloon's target is the largest.
@@ -391,42 +363,6 @@ impl Steering {
             .is_none_or(|m| m.state().plugged_bytes() == 0)
     }
 
-    /// The balloon's pulse at the floor, a second at a time from the policy
-    /// loop: once the range is out and the balloon has stood at its target
-    /// for a few seconds, its pressure has done what it does (the kernel's
-    /// caches and slab given up, the pages released) and it is let go.
-    fn pulse(&self) {
-        if self.mem.is_none() {
-            return;
-        }
-        if !self.range_out() {
-            self.pulsed.store(false, Ordering::Relaxed);
-            self.pulse_held.store(0, Ordering::Relaxed);
-            self.inflated_for.store(0, Ordering::Relaxed);
-            return;
-        }
-        if self.pulsed.load(Ordering::Relaxed) {
-            return;
-        }
-        let target = self.balloon.target_pages();
-        if target != self.pulse_target.swap(target, Ordering::Relaxed)
-            || target == 0
-            || self.balloon.actual_pages() < target - target / 8
-        {
-            self.inflated_for.store(0, Ordering::Relaxed);
-            return;
-        }
-        if self.inflated_for.fetch_add(1, Ordering::Relaxed) + 1 >= PULSE_HELD_SECS {
-            tracing::info!(
-                held_mib = (u64::from(target) * BALLOON_PAGE_SIZE) >> 20,
-                "balloon pulsed at the floor; letting it go"
-            );
-            self.pulsed.store(true, Ordering::Relaxed);
-            self.pulse_held.store(target, Ordering::Relaxed);
-            self.guest_offers(0, true);
-        }
-    }
-
     /// The guest's last line, applied again: for the shrink a hold deferred.
     fn resize_again(&self) {
         // An unplug the driver has not finished in a minute is one it cannot
@@ -525,15 +461,7 @@ fn memory_guest(
                     if release || need {
                         steering.guest_offers(0, true);
                     } else if !taken && steering.range_out() {
-                        let held_mib = (u64::from(steering.pulse_held.load(Ordering::Relaxed))
-                            * BALLOON_PAGE_SIZE)
-                            >> 20;
-                        if !steering.pulsed.load(Ordering::Relaxed) {
-                            steering.guest_offers(spare_mib, false);
-                        } else if spare_mib >= held_mib + (BLOCK_SIZE >> 20) {
-                            steering.pulsed.store(false, Ordering::Relaxed);
-                            steering.guest_offers(spare_mib, false);
-                        }
+                        steering.guest_offers(spare_mib, false);
                     }
                 }
                 // The agent went away: whatever it offered is withdrawn.
