@@ -88,6 +88,22 @@ create is three round trips — `getattr` of the parent, `lookup`, `create` —
 and that the first two are the kernel asking for things it has been told. One
 number says stop tuning the transport; the other says what to patch instead.
 
+For the disk, `LIGHTER_BLK_TRACE=1` logs, every hundred flushes, what the
+host's side of a flush cost and how many writes and kilobytes preceded each
+one; the guest's own view of the same is `/sys/block/vdb/stat` (fields 16 and
+17, flushes and their milliseconds). The two together are how a 3.7 ms flush
+was traced to `F_FULLFSYNC` rather than to anything the guest did. For a
+container's life, `lighter.dockerd_debug` on the kernel command line starts
+dockerd with its debug log, whose timestamps take a `docker run` apart step
+by step; and the guest's `INIT` lines carry `t=`, seconds since the kernel
+started, so a boot can be read off the console.
+
+The guest's own accounting is the first thing to read when a path is slow and
+nothing on the host is busy: `/proc/stat` before and after says whether the
+guest was computing or waiting (a container start that spent four times as
+long in iowait as in CPU was waiting on flushes), and a `fio` write with
+`--fsync=1` against a plain direct write splits the device from the flush.
+
 ## Correct the record when it turns out to be wrong
 
 Three explanations in this repository were confidently stated and false: that

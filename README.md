@@ -31,7 +31,7 @@ Then start the daemon:
 lighter start
 ```
 
-`lighter start` boots the VM in under two seconds and registers a Docker CLI context. Your existing `docker` and `docker compose` commands point at it immediately, with nothing to export and no manual socket flags.
+`lighter start` boots the VM in under half a second and registers a Docker CLI context. Your existing `docker` and `docker compose` commands point at it immediately, with nothing to export and no manual socket flags.
 
 ```bash
 docker run --rm alpine echo "hello from lighter"
@@ -176,7 +176,7 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 ## Why it is fast
 
-The performance of containers on macOS comes down to four bottlenecks: the shared filesystem, virtual disk I/O, memory management, and the network.
+The performance of containers on macOS comes down to five bottlenecks: the shared filesystem, virtual disk I/O, memory management, the network, and the time between asking for a container and having one.
 
 ### 1. Shared filesystems without the boundary tax
 Bind mounts on macOS are notoriously slow because every syscall crosses the hypervisor into APFS, where creating tens of thousands of tiny files incurs synchronous disk latency.
@@ -208,6 +208,14 @@ lighter does not carry packets across the boundary at all:
 - **Low request latency:** After every event, the host thread that moves bytes keeps polling for a few tens of microseconds before it goes to sleep, so the reply that follows a request is picked up without waiting for the scheduler to wake it. A GET on a published port costs 68 µs on the M5 and 133 µs on an M1, against 73 and 128 for OrbStack.
 
 UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP and ICMP, still reaches the virtual network card, and lighter answers those itself, in process: there is no network stack and no sidecar behind the card at all.
+
+### 5. Starting up, and starting containers
+`lighter start` answers `docker version` in under half a second, and a container runs in about a tenth of one.
+- **A kernel that boots in fifty milliseconds:** Nothing is probed that a VM does not have, and the one library that benchmarked itself at boot (the raid6 code btrfs pulls in, 0.55 s of nine algorithms) is told which to use.
+- **containerd first, in parallel:** The guest's init starts containerd the moment the data disk is mounted and points dockerd at it, instead of letting dockerd start its own and poll for it once a second. Everything waits in tens of milliseconds, not seconds: init on dockerd, the CLI on docker.
+- **A flush is `fsync`:** A guest's disk flush becomes an `fsync` of the image, the data at the drive, which is what every Mac runtime gives a guest and takes tens of microseconds. Not the drive-cache commit Rust's standard library performs on macOS, which costs four milliseconds and which a container start would pay eighty times over.
+- **A thousand ticks a second:** The waits inside the block layer, the scheduler and the network stack are measured in jiffies, and a container start is a chain of them; idle cores stop the tick, so nothing is paid for it at rest.
+- **A stop that is a shutdown:** `lighter stop` asks the guest to stop the engine, sync and power off, in half a second, so nothing written in the last half minute is lost.
 
 ---
 
