@@ -41,3 +41,6 @@ net-http-latency,3,52
 net-dns,1,3866
 net-dns,2,3897
 net-dns,3,3876
+net-http-p99,1,144
+net-http-p99,2,106
+net-http-p99,3,92
