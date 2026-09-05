@@ -6,8 +6,61 @@
 //! async runtime and a TLS stack to a conversation that needs neither.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+/// A way to end a stream from another thread.
+///
+/// The connection is shut down under the reader, which sees end of file and
+/// returns; a caller that loops on reconnecting asks [`Stop::asked`] first.
+/// Needed because dockerd, asked to stop, gives an active connection five
+/// seconds of grace before it will exit, and the event stream is exactly
+/// that connection.
+#[derive(Default)]
+pub struct Stop {
+    fd: AtomicI32,
+    asked: AtomicBool,
+}
+
+impl Stop {
+    pub fn new() -> std::sync::Arc<Stop> {
+        std::sync::Arc::new(Stop {
+            fd: AtomicI32::new(-1),
+            asked: AtomicBool::new(false),
+        })
+    }
+
+    pub fn asked(&self) -> bool {
+        self.asked.load(Ordering::SeqCst)
+    }
+
+    /// Ends the stream now, and any stream opened after this.
+    pub fn stop(&self) {
+        self.asked.store(true, Ordering::SeqCst);
+        let fd = self.fd.load(Ordering::SeqCst);
+        if fd >= 0 {
+            // SAFETY: shutdown on a descriptor the stream owns; a descriptor
+            // the stream has since closed is not reused for another stream
+            // without going through `attach` first, which re-checks `asked`.
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        }
+    }
+
+    fn attach(&self, fd: i32) -> bool {
+        self.fd.store(fd, Ordering::SeqCst);
+        if self.asked() {
+            self.fd.store(-1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn detach(&self) {
+        self.fd.store(-1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -118,6 +171,7 @@ pub fn get_json(socket: &Path, path: &str) -> Result<serde_json::Value, HttpErro
 pub fn stream_json(
     socket: &Path,
     path: &str,
+    stop: Option<&Stop>,
     mut on_event: impl FnMut(serde_json::Value),
 ) -> Result<(), HttpError> {
     let (mut reader, body) = send(socket, path)?;
@@ -126,12 +180,28 @@ pub fn stream_json(
             "an event stream must be chunked".into(),
         ));
     }
+    if let Some(stop) = stop
+        && !stop.attach(reader.get_ref().as_raw_fd())
+    {
+        return Ok(());
+    }
+    let result = stream_body(&mut reader, &mut on_event);
+    if let Some(stop) = stop {
+        stop.detach();
+    }
+    result
+}
+
+fn stream_body(
+    reader: &mut BufReader<UnixStream>,
+    on_event: &mut impl FnMut(serde_json::Value),
+) -> Result<(), HttpError> {
     // A chunk boundary is not a message boundary — Docker may split one event
     // across two chunks or pack several into one — so events are recovered from
     // the byte stream by newline, not by chunk.
     let mut pending: Vec<u8> = Vec::new();
 
-    while let Some(chunk) = read_chunk(&mut reader)? {
+    while let Some(chunk) = read_chunk(reader)? {
         pending.extend_from_slice(&chunk);
         while let Some(newline) = pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = pending.drain(..=newline).collect();

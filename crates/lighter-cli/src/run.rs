@@ -191,16 +191,19 @@ pub fn machine() -> anyhow::Result<()> {
     // Ports a container publishes appear on the Mac, for as long as the
     // container is running and no longer, through a stream into the guest.
     let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
-    lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
+    let ports = lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
 
     // A Mac that slept wakes with a guest whose clock did not.
     let _power = lighter_vmm::wake::Watcher::start(Box::new(Resync {
         woke: Arc::new(AtomicBool::new(false)),
     }));
 
-    // SIGTERM is how `lighter stop` asks, and a machine that ignored it would
-    // have to be killed — which is a guest that never unmounts its disk.
-    install_signal_handler();
+    // SIGUSR1 is `lighter stop` saying the guest is about to be powered off:
+    // the event stream into dockerd is dropped, so that dockerd, asked to
+    // stop a moment later, does not sit out its five-second grace on it.
+    // SIGTERM is the same command's fallback, and a machine that ignored it
+    // would have to be killed — which is a guest that never unmounts its disk.
+    install_signal_handler(ports);
 
     let reason = machine.wait()?;
     tracing::info!(?reason, "machine stopped");
@@ -251,16 +254,48 @@ pub fn resync_clock() {
     tracing::warn!("could not set the guest clock after waking");
 }
 
+/// The write end of the pipe SIGUSR1 pokes; a thread on the read end does
+/// the work a handler may not.
+static PREPARE_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 /// Asks the machine to stop when the process is asked to.
-fn install_signal_handler() {
-    // SAFETY: installing a handler for SIGTERM and SIGINT. The handler does
-    // nothing but set a flag and write to a self-pipe-free path — see below.
+fn install_signal_handler(ports: Arc<lighter_docker::http::Stop>) {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: a pipe for the self-pipe pattern; both ends are ours.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+        PREPARE_PIPE.store(fds[1], Ordering::SeqCst);
+        let read_end = fds[0];
+        let _ = std::thread::Builder::new()
+            .name("prepare-stop".into())
+            .spawn(move || {
+                let mut byte = [0u8; 1];
+                // SAFETY: a blocking read on our own pipe.
+                while unsafe { libc::read(read_end, byte.as_mut_ptr().cast(), 1) } == 1 {
+                    ports.stop();
+                    tracing::info!("stop announced; the port watcher let go of docker");
+                }
+            });
+    }
+    // SAFETY: installing handlers for SIGUSR1, SIGTERM and SIGINT. The
+    // handlers do nothing but write a byte to a pipe, or exit — see below.
     unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            handle_prepare_stop as *const () as libc::sighandler_t,
+        );
         libc::signal(
             libc::SIGTERM,
             handle_stop as *const () as libc::sighandler_t,
         );
         libc::signal(libc::SIGINT, handle_stop as *const () as libc::sighandler_t);
+    }
+}
+
+extern "C" fn handle_prepare_stop(_signal: libc::c_int) {
+    let fd = PREPARE_PIPE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: `write` is async-signal-safe; one byte to our own pipe.
+        unsafe { libc::write(fd, b"s".as_ptr().cast(), 1) };
     }
 }
 
