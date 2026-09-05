@@ -61,6 +61,23 @@ unsafe extern "C" {
 }
 
 /// This process's physical footprint, in bytes. Zero if it cannot be read.
+/// What macOS holds compressed of this process, as of the last `sample`:
+/// the release path reads it on every call, so it is a load, not a
+/// `task_info`.
+static COMPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Samples the split and remembers the compressed figure (`compressed`).
+pub fn sample() -> (u64, u64, u64, u64) {
+    let split = self::split();
+    COMPRESSED.store(split.3, std::sync::atomic::Ordering::Relaxed);
+    split
+}
+
+/// The compressed figure from the last `sample`.
+pub fn compressed() -> u64 {
+    COMPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn bytes() -> u64 {
     let mut info = TaskVmInfo::default();
     let mut count = TASK_VM_INFO_COUNT

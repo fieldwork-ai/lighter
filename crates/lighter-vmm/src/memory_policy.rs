@@ -146,8 +146,10 @@ impl MemoryPolicy {
                     let trace = std::env::var("LIGHTER_MEM_TRACE").map(|v| v == "1").unwrap_or(false);
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(POLL);
+                        // Sampled every second whether traced or not: the
+                        // release path decides from it (`memory::release`).
+                        let (resident, internal, reusable, compressed) = crate::footprint::sample();
                         if trace {
-                            let (resident, internal, reusable, compressed) = crate::footprint::split();
                             eprintln!(
                                 "MEMTRACE footprint_mib={} resident_mib={} internal_mib={} reusable_mib={} compressed_mib={} reported_mib={} offered_mib={} steer_mib={} level_mib={}",
                                 crate::footprint::bytes() >> 20,

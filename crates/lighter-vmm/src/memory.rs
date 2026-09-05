@@ -376,7 +376,7 @@ impl GuestMemory {
         // of the call, so no vCPU can see the old pages go.
         // `LIGHTER_RELEASE=reusable|free` are the other two, for the A/B.
         let rc = match release_mode() {
-            ReleaseMode::Remap if unmapped && span >= REMAP_MIN_SPAN => {
+            ReleaseMode::Remap if unmapped && span >= REMAP_MIN_SPAN && remap_wanted() => {
                 // SAFETY: a fixed anonymous mapping over a span this process
                 // owns, with the second-stage translation withdrawn above.
                 let fresh = unsafe {
@@ -482,6 +482,24 @@ enum ReleaseMode {
 /// rows at 922 MiB against 456 with them covered; the balloon's smaller
 /// pieces go the old way.
 const REMAP_MIN_SPAN: usize = 128 << 10;
+
+/// Whether replacing mappings is worth its price right now. A replaced span
+/// is a `mmap` and a fresh VM object where `madvise` was a walk, and after a
+/// trim hurried reporting hands over thousands of runs: a container that
+/// started during that storm took 450–611 ms on the M5 against 150–190.
+/// The price buys nothing unless macOS holds compressed pages of ours, so
+/// the mapping is replaced only while it does (a 48 GB Mac with a 12 GiB
+/// guest rarely compresses; an 8 GB one always). `LIGHTER_RELEASE=remap`
+/// replaces regardless, for the A/B.
+fn remap_wanted() -> bool {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALWAYS.get_or_init(|| std::env::var("LIGHTER_RELEASE").as_deref() == Ok("remap"))
+        || crate::footprint::compressed() >= REMAP_WHEN_COMPRESSED
+}
+
+/// Compressed pages of ours above which released spans have their
+/// mappings replaced.
+const REMAP_WHEN_COMPRESSED: u64 = 64 << 20;
 
 /// `LIGHTER_RELEASE=reusable|free|remap`, read once.
 fn release_mode() -> ReleaseMode {
