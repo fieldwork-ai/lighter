@@ -363,7 +363,41 @@ impl GuestMemory {
         // checked above. MADV_FREE_REUSABLE does not unmap: the address stays
         // valid and reads fault in zeroes, which is what the guest expects of
         // memory it told us it was not using.
-        let rc = unsafe { libc::madvise(addr.cast(), span, MADV_FREE_REUSABLE) };
+        // A page macOS compressed while the guest was using it, then freed
+        // by the guest and released here, kept its compressed copy for the
+        // life of the process: `madvise` walks resident pages, and neither
+        // MADV_FREE_REUSABLE nor MADV_FREE touched the compressor's — 620
+        // MiB of a 977 MiB footprint after an install suite, none of it in
+        // the guest, and 864 on the next run. So a span of two megabytes or
+        // more has its mapping replaced instead (a fresh anonymous mapping
+        // has no pages of any kind): the same suite then read 135 MiB
+        // compressed and 517 at the floor, with 254 entries in the address
+        // map. Safe exactly here: the stage-2 mapping is down for the length
+        // of the call, so no vCPU can see the old pages go.
+        // `LIGHTER_RELEASE=reusable|free` are the other two, for the A/B.
+        let rc = match release_mode() {
+            ReleaseMode::Remap if unmapped && span >= REMAP_MIN_SPAN => {
+                // SAFETY: a fixed anonymous mapping over a span this process
+                // owns, with the second-stage translation withdrawn above.
+                let fresh = unsafe {
+                    libc::mmap(
+                        addr.cast(),
+                        span,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                        -1,
+                        0,
+                    )
+                };
+                if fresh == libc::MAP_FAILED { -1 } else { 0 }
+            }
+            ReleaseMode::Free => {
+                // SAFETY: as below, the same live mapping.
+                unsafe { libc::madvise(addr.cast(), span, libc::MADV_FREE) };
+                unsafe { libc::madvise(addr.cast(), span, MADV_FREE_REUSABLE) }
+            }
+            _ => unsafe { libc::madvise(addr.cast(), span, MADV_FREE_REUSABLE) },
+        };
         let released = if rc == 0 {
             span as u64
         } else {
@@ -428,6 +462,31 @@ fn host_page_size() -> u64 {
         // SAFETY: sysconf with a valid name has no side effects.
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if size > 0 { size as u64 } else { 16384 }
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleaseMode {
+    /// `MADV_FREE_REUSABLE` alone, as shipped through 0.3.0.
+    Reusable,
+    /// `MADV_FREE` first, for what it may drop, then `MADV_FREE_REUSABLE`.
+    Free,
+    /// Replace the span's mapping (the default; see `release`).
+    Remap,
+}
+
+/// Spans below this are released with `madvise` even in remap mode: each
+/// replaced span is an entry of its own in the process's address map, and
+/// hurried reporting hands over runs down to 128 KiB.
+const REMAP_MIN_SPAN: usize = 2 << 20;
+
+/// `LIGHTER_RELEASE=reusable|free|remap`, read once.
+fn release_mode() -> ReleaseMode {
+    static MODE: std::sync::OnceLock<ReleaseMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("LIGHTER_RELEASE").as_deref() {
+        Ok("free") => ReleaseMode::Free,
+        Ok("reusable") => ReleaseMode::Reusable,
+        _ => ReleaseMode::Remap,
     })
 }
 

@@ -1,0 +1,113 @@
+virtio_mem: a plugged block carries its own page array
+
+A hot-plugged block's page array (1.56% of it, two megabytes per 128 MiB
+block) is otherwise allocated from the memory the guest already has, which
+in this guest is the base beside the virtio-mem range: the one zone for
+everything unmovable. Two things followed from that. A plug needed memory
+to add memory, so a guest whose base was full of an install's slab plugged
+slowly (a container's start waited on it) and one whose base a tmpfs writer
+had taken could not plug at all. And the arrays fragmented the base as
+blocks came and went. With MHP_MEMMAP_ON_MEMORY the array lives in the
+block it describes, is not counted in what the block gives the buddy, and
+goes with the block when it is unplugged. The core checks the arrangement
+is possible (the array must span whole PMDs and leave whole pageblocks;
+128 MiB blocks with 4 KiB pages do) and falls back to the old way if not.
+
+The mode is on by default here rather than asked for on the command line,
+because every command line that boots this kernel would have to remember
+to ask.
+
+Unplugging then needs one more thing. Before a big block is offlined the
+driver fake-offlines it, allocating every page of it with
+alloc_contig_range() so nothing else can take them; with the block's own
+page array reserved in its first two megabytes that allocation can never
+succeed, and every unplug failed, silently, forever (the driver retries
+after fifty seconds and fails again). The core already keeps those pages
+out of what it offlines (memory_block_offline() starts past them), so the
+driver's own walk starts past them too, on the way in and on the way back.
+
+diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
+index 1688ecd..ee45897 100644
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -654,7 +654,8 @@ static int virtio_mem_add_memory(struct virtio_mem *vm, uint64_t addr,
+ 	/* Memory might get onlined immediately. */
+ 	atomic64_add(size, &vm->offline_size);
+ 	rc = add_memory_driver_managed(vm->mgid, addr, size, vm->resource_name,
+-				       MHP_MERGE_RESOURCE | MHP_NID_IS_MGID);
++				       MHP_MERGE_RESOURCE | MHP_NID_IS_MGID |
++				       MHP_MEMMAP_ON_MEMORY);
+ 	if (rc) {
+ 		atomic64_sub(size, &vm->offline_size);
+ 		dev_warn(&vm->vdev->dev, "adding memory failed: %d\n", rc);
+@@ -2148,6 +2149,24 @@ static int virtio_mem_sbm_unplug_request(struct virtio_mem *vm, uint64_t diff)
+ 	return rc;
+ }
+ 
++/*
++ * How many pages at the start of the memory block holding @pfn are its own
++ * page array (memmap_on_memory), which the core never onlines or offlines
++ * and which alloc_contig_range() can never have.
++ */
++static unsigned long virtio_mem_vmemmap_pages(unsigned long pfn)
++{
++	struct memory_block *mem = find_memory_block(pfn_to_section_nr(pfn));
++	unsigned long pages = 0;
++
++	if (!mem)
++		return 0;
++	if (mem->altmap)
++		pages = mem->altmap->free;
++	put_device(&mem->dev);
++	return pages;
++}
++
+ /*
+  * Try to offline and remove a big block from Linux and unplug it. Will fail
+  * with -EBUSY if some memory is busy and cannot get unplugged.
+@@ -2179,11 +2198,16 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
+ 	virtio_mem_bbm_set_bb_state(vm, bb_id, VIRTIO_MEM_BBM_BB_FAKE_OFFLINE);
+ 
+ 	for (pfn = start_pfn; pfn < end_pfn; pfn += PAGES_PER_SECTION) {
++		unsigned long skip;
++
+ 		page = pfn_to_online_page(pfn);
+ 		if (!page)
+ 			continue;
+ 
+-		rc = virtio_mem_fake_offline(vm, pfn, PAGES_PER_SECTION);
++		/* The block's own page array, when it carries one. */
++		skip = virtio_mem_vmemmap_pages(pfn);
++		rc = virtio_mem_fake_offline(vm, pfn + skip,
++					     PAGES_PER_SECTION - skip);
+ 		if (rc) {
+ 			end_pfn = pfn;
+ 			goto rollback;
+@@ -2208,10 +2232,13 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
+ 
+ rollback:
+ 	for (pfn = start_pfn; pfn < end_pfn; pfn += PAGES_PER_SECTION) {
++		unsigned long skip;
++
+ 		page = pfn_to_online_page(pfn);
+ 		if (!page)
+ 			continue;
+-		virtio_mem_fake_online(pfn, PAGES_PER_SECTION);
++		skip = virtio_mem_vmemmap_pages(pfn);
++		virtio_mem_fake_online(pfn + skip, PAGES_PER_SECTION - skip);
+ 	}
+ 	virtio_mem_bbm_set_bb_state(vm, bb_id, VIRTIO_MEM_BBM_BB_ADDED);
+ 	mutex_unlock(&vm->hotplug_mutex);
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index b7030bc..e8d238a 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -48,7 +48,7 @@ enum {
+ 	MEMMAP_ON_MEMORY_FORCE,
+ };
+ 
+-static int memmap_mode __read_mostly = MEMMAP_ON_MEMORY_DISABLE;
++static int memmap_mode __read_mostly = MEMMAP_ON_MEMORY_ENABLE;
+ 
+ static inline unsigned long memory_block_memmap_size(void)
+ {

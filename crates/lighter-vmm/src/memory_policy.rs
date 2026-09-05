@@ -83,8 +83,9 @@ const GUEST_RESERVE_FRACTION: u64 = 16;
 /// The least a range grows by when the guest is short: a small guest
 /// doubles, a tiny one gets this.
 const GROW_STEP_MIN: u64 = 256 << 20;
-/// How long the balloon stands inflated at the floor before it is let go.
-const PULSE_HELD_SECS: u32 = 3;
+/// How long the balloon stands inflated, at a target the guest has stopped
+/// raising, before it is let go.
+const PULSE_HELD_SECS: u32 = 5;
 
 /// The balloon, and the signals that drive it.
 pub struct MemoryPolicy {
@@ -111,6 +112,7 @@ impl MemoryPolicy {
             last_line: Mutex::new((0, false)),
             pulsed: AtomicBool::new(false),
             inflated_for: AtomicU32::new(0),
+            pulse_target: AtomicU32::new(0),
             level: AtomicU32::new(Pressure::Normal as u32),
             level_pages: AtomicU32::new(0),
             steer_pages: AtomicU32::new(0),
@@ -145,13 +147,14 @@ impl MemoryPolicy {
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(POLL);
                         if trace {
-                            let (resident, internal, reusable) = crate::footprint::split();
+                            let (resident, internal, reusable, compressed) = crate::footprint::split();
                             eprintln!(
-                                "MEMTRACE footprint_mib={} resident_mib={} internal_mib={} reusable_mib={} reported_mib={} offered_mib={} steer_mib={} level_mib={}",
+                                "MEMTRACE footprint_mib={} resident_mib={} internal_mib={} reusable_mib={} compressed_mib={} reported_mib={} offered_mib={} steer_mib={} level_mib={}",
                                 crate::footprint::bytes() >> 20,
                                 resident >> 20,
                                 internal >> 20,
                                 reusable >> 20,
+                                compressed >> 20,
                                 steering.balloon.reported_bytes() >> 20,
                                 steering.balloon.offered_bytes() >> 20,
                                 (steering.steer_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20,
@@ -243,8 +246,14 @@ struct Steering {
     /// starts on the M5 with the balloon held). Cleared when the range
     /// goes in again.
     pulsed: AtomicBool,
-    /// Seconds the balloon has stood inflated to its target at the floor.
+    /// Seconds the balloon has stood inflated to a target that has not
+    /// moved, at the floor. The target moves while the guest is still
+    /// offering — its first offer after a shrink is small, made while the
+    /// unplug is migrating pages into the base — and a pulse on that first
+    /// offer took 160 MiB and then ignored the two gigabytes that followed.
     inflated_for: AtomicU32,
+    /// The target the count above was made against.
+    pulse_target: AtomicU32,
     level: AtomicU32,
     /// What the pressure level asks for, what the compressor asks for, and
     /// what the guest itself offers: the balloon's target is the largest.
@@ -389,7 +398,10 @@ impl Steering {
             return;
         }
         let target = self.balloon.target_pages();
-        if target == 0 || self.balloon.actual_pages() < target - target / 8 {
+        if target != self.pulse_target.swap(target, Ordering::Relaxed)
+            || target == 0
+            || self.balloon.actual_pages() < target - target / 8
+        {
             self.inflated_for.store(0, Ordering::Relaxed);
             return;
         }
