@@ -262,16 +262,23 @@ impl Disk {
 
     /// Flushes written data to stable storage.
     ///
-    /// `File::sync_data` maps to `fsync`, which on macOS returns once the data
-    /// reaches the drive's cache rather than the platter. That is the same
-    /// guarantee every other Mac container runtime provides, and going further
-    /// with `F_FULLFSYNC` would cost roughly an order of magnitude on every
-    /// flush the guest issues.
+    /// `fsync(2)` itself, not `File::sync_data`: on Apple platforms the
+    /// standard library implements both `sync_data` and `sync_all` with
+    /// `F_FULLFSYNC`, which waits for the drive to commit its cache and cost
+    /// 3.7 ms a flush here (a container start issues about eighty). `fsync`
+    /// returns once the data has reached the drive, which is the guarantee
+    /// every other Mac container runtime gives a guest's flush, and takes
+    /// tens of microseconds.
     pub fn flush(&self) -> io::Result<()> {
         if self.read_only {
             return Ok(());
         }
-        self.file.sync_data()
+        // SAFETY: a plain fsync on a descriptor this struct owns.
+        if unsafe { libc::fsync(self.file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     /// Deallocates a byte range, returning its blocks to the host.

@@ -361,16 +361,20 @@ while [ ! -S /run/containerd/containerd.sock ] && [ "$waited" -lt 200 ]; do
 	waited=$((waited + 1))
 done
 [ -S /run/containerd/containerd.sock ] || echo "INIT containerd=missing after=$((waited * 10))ms"
+# `lighter.dockerd_debug` on the command line: dockerd's debug log, whose
+# timestamps are how a container start is taken apart.
+dockerd_debug=""
+grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
-	exec dockerd \
+	exec dockerd $2 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \
 		--data-root=/var/lib/docker \
 		--storage-driver=overlay2 \
 		--userland-proxy=false \
 		--mtu="$1" \
-		>/var/log/dockerd.log 2>&1' engine "$link_mtu" &
+		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on
