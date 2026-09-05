@@ -8,7 +8,7 @@ Apple ships two levels. Virtualization.framework gives you a whole virtual machi
 
 Everything interesting about running containers on a Mac is in the parts the higher level does not expose. The filesystem numbers in the README come from a caching policy driven by FSEvents and a patch to the guest's virtio-fs driver; the memory numbers come from noticing that guest-dirtied pages cannot be reclaimed while the second-stage mapping exists. Neither is reachable through an API that hands you the device.
 
-The cost is Rosetta, which is bound to the higher-level framework by a check we will not work around. [`x86-64.md`](x86-64.md) has that story.
+This was tested rather than believed: lighter ran on Virtualization.framework for a day (branch `framework`, `docs/worklog.md` 2026-09-05). The framework never returned memory the guest had given back, and a synchronous filesystem request through its helper process cost about 33 µs against 3–5 µs here. Rosetta, the reason for trying, does not need the framework after all: [`x86-64.md`](x86-64.md) has that story.
 
 ## The crates
 

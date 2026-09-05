@@ -216,7 +216,7 @@ UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP a
 - **Docker and Compose compatibility:** Full support via standard Docker CLI and Compose plugins.
 - **Bidirectional port forwarding:** Published ports appear on `localhost` the moment a container binds them, carried as streams rather than through a proxy.
 - **Native file sharing:** Mount any directory from your Mac with native ownership translation.
-- **x86-64 container emulation:** Run `linux/amd64` images under software emulation (`qemu-user`).
+- **x86-64 containers under Rosetta:** `linux/amd64` images run under Apple's Rosetta when the Mac has it (`lighter rosetta --install`), and under `qemu-user` otherwise. [How, and what it costs](docs/x86-64.md).
 - **Lean footprint:** Idles at roughly 0.2% CPU and hands memory back as soon as containers stop.
 
 ## Out of scope
