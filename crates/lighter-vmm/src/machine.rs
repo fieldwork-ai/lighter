@@ -741,12 +741,12 @@ impl Machine {
     /// than the guest could ask for more (`MemControl::plug_all`). The
     /// request line is what is looked for, in each chunk as it passes.
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
-        let inspect: Option<crate::vsock_proxy::Inspector> = match &self.mem {
-            Some(mem) if guest_port == DOCKER_PORT => {
-                let mem = mem.clone();
+        let inspect: Option<crate::vsock_proxy::Inspector> = match &self._memory_policy {
+            Some(policy) if guest_port == DOCKER_PORT && self.mem.is_some() => {
+                let whole = policy.whole();
                 Some(Arc::new(move |bytes: &[u8]| {
                     if starts_a_container(bytes) {
-                        mem.plug_all();
+                        whole.call();
                     }
                 }))
             }

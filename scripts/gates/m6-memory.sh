@@ -169,7 +169,7 @@ fi
 
 # -------------------------------------------------------------------- idle --
 # -------------------------------------------------------------- the range --
-# The guest boots with a base and a virtio-mem range (an eighth of the
+# The guest boots with a base and a virtio-mem range (a quarter of the
 # configured memory and the rest). With nothing running the range comes back
 # out, page arrays and all, and that is the idle floor; a container start
 # makes the guest whole again before dockerd sees the request, so what runs

@@ -200,6 +200,12 @@ if [ -e /sys/block/zram0/disksize ] && ! grep -qw lighter.zram=0 /proc/cmdline; 
 		&& mkswap /dev/zram0 >/dev/null 2>&1 \
 		&& swapon -p 100 /dev/zram0 2>/dev/null \
 		&& echo "INIT zram=on" || echo "INIT zram=off"
+	# Swap is for the agent's trims and for a guest with nothing left, not
+	# for the kernel's ordinary reclaim: an install's working set is its
+	# cache, and a kernel that swapped a little of node's heap to keep
+	# more of it read yarn a tenth slower on the M1 and npm on its own
+	# disk half as fast again on the M5.
+	sysctl -q -w vm.swappiness=0 2>/dev/null || true
 fi
 
 # --- containerd -----------------------------------------------------------

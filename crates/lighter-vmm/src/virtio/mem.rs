@@ -76,6 +76,8 @@ pub struct MemState {
     /// a container that comes back with the machine keeps it whole by
     /// running, and a machine with none should reach its floor at once.
     grown_at: AtomicU64,
+    /// When the offer last changed, in the same milliseconds.
+    changed_at: AtomicU64,
 }
 
 impl MemState {
@@ -93,6 +95,7 @@ impl MemState {
             plugged: AtomicU64::new(0),
             blocks: Mutex::new(vec![false; (region / BLOCK_SIZE) as usize]),
             grown_at: AtomicU64::new(u64::MAX),
+            changed_at: AtomicU64::new(0),
         }
     }
 
@@ -171,8 +174,10 @@ impl MemControl {
     pub fn request(&self, bytes: u64) -> u64 {
         let before = self.state.requested_bytes();
         let rounded = self.state.set_requested_bytes(bytes);
+        let now = monotonic_ms();
+        self.state.changed_at.store(now, Ordering::Relaxed);
         if rounded > before {
-            self.state.grown_at.store(monotonic_ms(), Ordering::Relaxed);
+            self.state.grown_at.store(now, Ordering::Relaxed);
         }
         self.transport
             .lock()
@@ -194,6 +199,15 @@ impl MemControl {
     pub fn held(&self) -> bool {
         let grown_at = self.state.grown_at.load(Ordering::Relaxed);
         grown_at != u64::MAX && monotonic_ms().saturating_sub(grown_at) < HOLD_AFTER_GROWTH_MS
+    }
+
+    /// Whether an unplug has been outstanding for longer than the driver
+    /// takes to do one it can do (tens of milliseconds per gigabyte).
+    pub fn stuck(&self) -> bool {
+        let state = &self.state;
+        state.requested_bytes() < state.plugged_bytes()
+            && monotonic_ms().saturating_sub(state.changed_at.load(Ordering::Relaxed))
+                > STUCK_AFTER_MS
     }
 
     /// Offers the whole range and waits, briefly, for the guest to hold it.
@@ -219,10 +233,14 @@ impl MemControl {
     }
 }
 
-/// How long a container start waits for the guest to plug everything.
-const PLUG_ALL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a container start waits for the guest to plug everything: tens
+/// of milliseconds when the base is free, longer when the balloon is on its
+/// way back first.
+const PLUG_ALL_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 /// How long the size holds after it went up before a quiet guest shrinks.
 const HOLD_AFTER_GROWTH_MS: u64 = 30_000;
+/// How long an unplug may stay unfinished before it is given up.
+const STUCK_AFTER_MS: u64 = 60_000;
 
 fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -234,13 +252,16 @@ fn monotonic_ms() -> u64 {
 
 /// The base and the range for a guest of `total` bytes.
 ///
-/// The base is an eighth of the total and a gigabyte at least. The kernel's
+/// The base is a quarter of the total and a gigabyte at least. The kernel's
 /// unmovable allocations (slab, page tables, the plugged blocks' own page
 /// arrays at 1.56% of them, socket buffers) all come from it while the
-/// range is onlined movable, so it cannot be tiny; but it is paid for at
-/// idle in its page array and the structures the kernel sizes by it, and
-/// a quarter was measured at 58 MiB more than an eighth on a 12 GiB guest
-/// (335 against 277 MiB, M5), for headroom nothing measured has needed.
+/// range is onlined movable, and when it is short the kernel reclaims slab
+/// node-wide to make room: an eighth (1.5 GiB of 12) cost an `npm ci` on
+/// the guest's own disk 40% (7250/6780 ms against 5041/4982 plain and
+/// 4793/5055 at a quarter, M5), its inodes and dentries thrashing, and
+/// pnpm a tenth. A quarter reads the same as plain memory and costs 58 MiB
+/// more at idle than an eighth (335 against 277); three movable to one is
+/// also the kernel's own default ratio.
 ///
 /// `LIGHTER_VIRTIO_MEM=0` gives the guest everything at boot, as before,
 /// for the A/B; `LIGHTER_VIRTIO_MEM=<MiB>` sets the base by hand.
@@ -251,7 +272,7 @@ pub fn split(total: u64) -> (u64, u64) {
     {
         Some(0) => return (total, 0),
         Some(mib) => mib << 20,
-        None => (total / 8).max(1 << 30),
+        None => (total / 4).max(1 << 30),
     };
     let base = base.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
     if base >= total {
@@ -439,13 +460,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_base_is_an_eighth_and_a_gigabyte_at_least() {
+    fn the_base_is_a_quarter_and_a_gigabyte_at_least() {
         // Not through the environment: a parallel test may be reading it.
         if std::env::var_os("LIGHTER_VIRTIO_MEM").is_some() {
             return;
         }
-        assert_eq!(split(16 << 30), (2 << 30, 14 << 30));
-        assert_eq!(split(12 << 30), ((1536 << 20), (12 << 30) - (1536 << 20)));
+        assert_eq!(split(16 << 30), (4 << 30, 12 << 30));
+        assert_eq!(split(12 << 30), (3 << 30, 9 << 30));
         assert_eq!(split(2 << 30), (1 << 30, 1 << 30));
         assert_eq!(split(1 << 30), (1 << 30, 0));
         assert_eq!(split(512 << 20), (512 << 20, 0));
