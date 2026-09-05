@@ -62,9 +62,9 @@ echo "==> Booting"
 	--disk "$ROOTFS" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
 	--net --run-dir "$RUN_DIR" \
-	--vsock "$SOCKET:2375" \
+	--proxy "$SOCKET:2375" \
 	--no-tty --cpus 4 --memory-mib 4096 \
-	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
+	--cmdline "console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 disown "$VMM_PID" 2>/dev/null || true

@@ -1,0 +1,1054 @@
+lighterfs: FUSE over TCP to the host
+
+Under Virtualization.framework the only virtio-fs device is Apple's own
+server, so lighter's file server reaches the guest another way: a few TCP
+connections to the gateway over the card, each carrying FUSE requests and
+replies in the /dev/fuse wire format, with the kernel's FUSE core doing
+everything but the transport. Modelled on virtio_fs.c — the same iqueue
+ops, the same connection and mount lifecycle — with a socket where the
+virtqueue was. Foreground requests are written on the caller's context
+without waiting; anything that cannot go at once, and everything sent
+from atomic context, goes through a sender thread that owns the socket
+until its queue drains. Replies are read straight into the request's
+arguments and pages by one thread per connection. Notifications arrive
+as replies with `unique` zero and are handed to the FUSE core's
+invalidation entry points.
+
+--- a/fs/fuse/Kconfig	2026-09-05 01:18:43
++++ b/fs/fuse/Kconfig	2026-09-05 01:18:43
+@@ -76,3 +76,11 @@
+ 
+ 	  If you want to allow fuse server/client communication through io-uring,
+ 	  answer Y
++
++config LIGHTER_FS
++	bool "lighterfs: FUSE over TCP to the host (lighter)"
++	depends on FUSE_FS && INET
++	help
++	  lighter's shared directories: FUSE requests carried to the host's
++	  file server over TCP connections to the gateway, in the /dev/fuse
++	  wire format. Mounted as `mount -t lighterfs <tag> <dir>`.
+--- a/fs/fuse/Makefile	2026-09-05 01:18:43
++++ b/fs/fuse/Makefile	2026-09-05 01:18:43
+@@ -9,6 +9,7 @@
+ obj-$(CONFIG_FUSE_FS) += fuse.o
+ obj-$(CONFIG_CUSE) += cuse.o
+ obj-$(CONFIG_VIRTIO_FS) += virtiofs.o
++obj-$(CONFIG_LIGHTER_FS) += lighter_fs.o
+ 
+ fuse-y := trace.o	# put trace.o first so we see ftrace errors sooner
+ fuse-y += dev.o dir.o file.o inode.o control.o xattr.o acl.o readdir.o ioctl.o
+--- /dev/null	2026-09-05 01:18:43
++++ b/fs/fuse/lighter_fs.c	2026-09-05 01:18:43
+@@ -0,0 +1,1011 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * lighterfs: FUSE over TCP to the host, for lighter's shared directories.
++ *
++ * Under Virtualization.framework the only virtio-fs device is Apple's own
++ * server, so lighter's file server reaches the guest another way: a few TCP
++ * connections to the gateway over the card, each carrying FUSE requests and
++ * replies in the /dev/fuse wire format, with the kernel's FUSE core doing
++ * everything but the transport. Modelled on virtio_fs.c — the same iqueue
++ * ops, the same connection and mount lifecycle — with a socket where the
++ * virtqueue was.
++ *
++ *	mount -t lighterfs <tag> <dir> [-o port=N,conns=N]
++ *
++ * Each connection introduces itself with one line, "lighterfs <tag>\n", and
++ * from then on carries requests (fuse_in_header, the fixed arguments, then
++ * page data) and replies (fuse_out_header, the fixed arguments, then page
++ * data), framed by the lengths in their own headers. Notifications from the
++ * host arrive as replies with `unique` zero, exactly as on /dev/fuse.
++ *
++ * Sending: a foreground request is written on the calling task's own
++ * context, without waiting — the socket buffer is large and the host drains
++ * it — because that is where the latency is. Anything that could not go at
++ * once, and everything sent from atomic context (forgets under fiq->lock,
++ * background requests under fc->bg_lock), is queued for a sender thread
++ * that owns the socket until the queue is empty again, so the byte stream
++ * is never interleaved. Replies are read by one thread per connection,
++ * straight into the request's arguments and pages.
++ */
++
++#include <linux/fs.h>
++#include <linux/fs_context.h>
++#include <linux/fs_parser.h>
++#include <linux/module.h>
++#include <linux/net.h>
++#include <linux/in.h>
++#include <linux/inet.h>
++#include <linux/kthread.h>
++#include <linux/slab.h>
++#include <linux/uio.h>
++#include <linux/bvec.h>
++#include <linux/highmem.h>
++#include <linux/wait.h>
++#include <net/sock.h>
++#include <net/tcp.h>
++#include "fuse_i.h"
++
++#define LIGHTERFS_DEFAULT_PORT	2382
++#define LIGHTERFS_DEFAULT_CONNS	4
++#define LIGHTERFS_MAX_CONNS	16
++#define LIGHTERFS_GATEWAY	0xc0a87f01u	/* 192.168.127.1 */
++#define LIGHTERFS_SOCKBUF	(16 << 20)
++
++struct lighterfs;
++
++/* One message on the wire, or the part of it still to go. */
++struct lighterfs_msg {
++	struct list_head list;
++	struct fuse_req *req;	/* NULL for a forget */
++	void *buf;		/* a forget: header and argument */
++	size_t len;		/* wire length */
++	size_t sent;
++};
++
++struct lighterfs_conn {
++	struct lighterfs *fs;
++	unsigned int index;
++	struct socket *sock;
++	bool connected;
++
++	/* Requests sent and not yet answered, by unique. */
++	spinlock_t lock;
++	struct list_head in_flight;
++
++	/* The sender: whoever holds send_lock owns the socket's write side. */
++	struct mutex send_lock;
++	struct list_head tx_queue;	/* under lock */
++	wait_queue_head_t tx_wait;
++	struct task_struct *tx;
++	struct bio_vec *tx_bvecs;	/* under send_lock */
++
++	struct task_struct *rx;
++	struct bio_vec *rx_bvecs;	/* the rx thread's */
++
++	struct fuse_dev *fud;
++};
++
++struct lighterfs {
++	struct kref ref;
++	char *tag;
++	u16 port;
++	unsigned int nconns;
++	struct lighterfs_conn *conns;
++	struct fuse_conn *fc;
++};
++
++enum {
++	OPT_PORT,
++	OPT_CONNS,
++};
++
++static const struct fs_parameter_spec lighterfs_parameters[] = {
++	fsparam_u32("port", OPT_PORT),
++	fsparam_u32("conns", OPT_CONNS),
++	{}
++};
++
++struct lighterfs_ctx {
++	struct fuse_fs_context fuse;	/* must be first: fsc->fs_private */
++	u16 port;
++	unsigned int conns;
++};
++
++/* -- the wire ------------------------------------------------------------- */
++
++static int lighterfs_recv_iter(struct lighterfs_conn *c, struct iov_iter *iter)
++{
++	while (iov_iter_count(iter)) {
++		struct msghdr msg = { .msg_flags = MSG_WAITALL };
++		int n;
++
++		msg.msg_iter = *iter;
++		n = sock_recvmsg(c->sock, &msg, MSG_WAITALL);
++		if (n < 0)
++			return n;
++		if (n == 0)
++			return -ECONNRESET;
++		iov_iter_advance(iter, n);
++	}
++	return 0;
++}
++
++static int lighterfs_recv_exact(struct lighterfs_conn *c, void *buf, size_t len)
++{
++	struct kvec kv = { .iov_base = buf, .iov_len = len };
++	struct iov_iter iter;
++
++	iov_iter_kvec(&iter, ITER_DEST, &kv, 1, len);
++	return lighterfs_recv_iter(c, &iter);
++}
++
++static int lighterfs_discard(struct lighterfs_conn *c, size_t len)
++{
++	struct iov_iter iter;
++
++	iov_iter_discard(&iter, ITER_DEST, len);
++	return lighterfs_recv_iter(c, &iter);
++}
++
++/*
++ * Sends what remains of `m`. With MSG_DONTWAIT it sends what fits and
++ * returns -EAGAIN for the rest; without, it blocks until done. Either way
++ * `m->sent` records progress so a later call resumes exactly there.
++ */
++static int lighterfs_xmit(struct lighterfs_conn *c, struct lighterfs_msg *m,
++			  int flags)
++{
++	struct kvec kv[1 + ARRAY_SIZE(((struct fuse_args *)0)->in_args)];
++	unsigned int nkv = 0;
++	size_t fixed = 0;
++	struct fuse_args_pages *ap = NULL;
++	unsigned int num_in = 0;
++	unsigned int i;
++	int n;
++
++	if (m->req) {
++		struct fuse_args *args = m->req->args;
++
++		num_in = args->in_numargs - args->in_pages;
++		kv[nkv].iov_base = &m->req->in.h;
++		kv[nkv].iov_len = sizeof(m->req->in.h);
++		fixed += kv[nkv++].iov_len;
++		for (i = 0; i < num_in; i++) {
++			kv[nkv].iov_base = (void *)args->in_args[i].value;
++			kv[nkv].iov_len = args->in_args[i].size;
++			fixed += kv[nkv++].iov_len;
++		}
++		if (args->in_pages)
++			ap = container_of(args, struct fuse_args_pages, args);
++	} else {
++		kv[nkv].iov_base = m->buf;
++		kv[nkv].iov_len = m->len;
++		fixed += kv[nkv++].iov_len;
++	}
++
++	while (m->sent < fixed) {
++		struct msghdr msg = {
++			.msg_flags = flags | (ap ? MSG_MORE : 0),
++		};
++
++		iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, kv, nkv, fixed);
++		iov_iter_advance(&msg.msg_iter, m->sent);
++		n = sock_sendmsg(c->sock, &msg);
++		if (n < 0)
++			return n;
++		m->sent += n;
++		if (flags & MSG_DONTWAIT && m->sent < fixed)
++			return -EAGAIN;
++	}
++
++	if (ap && m->sent < m->len) {
++		size_t total = m->len - fixed;
++		struct msghdr msg = { .msg_flags = flags };
++
++		for (i = 0; i < ap->num_folios; i++)
++			bvec_set_folio(&c->tx_bvecs[i], ap->folios[i],
++				       ap->descs[i].length, ap->descs[i].offset);
++		while (m->sent < m->len) {
++			iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, c->tx_bvecs,
++				      ap->num_folios, total);
++			iov_iter_advance(&msg.msg_iter, m->sent - fixed);
++			n = sock_sendmsg(c->sock, &msg);
++			if (n < 0)
++				return n;
++			m->sent += n;
++			if (flags & MSG_DONTWAIT && m->sent < m->len)
++				return -EAGAIN;
++		}
++	}
++	return 0;
++}
++
++static void lighterfs_break(struct lighterfs_conn *c)
++{
++	spin_lock(&c->lock);
++	c->connected = false;
++	spin_unlock(&c->lock);
++	if (c->sock)
++		kernel_sock_shutdown(c->sock, SHUT_RDWR);
++}
++
++static void lighterfs_msg_free(struct lighterfs_msg *m)
++{
++	kfree(m->buf);
++	kfree(m);
++}
++
++/* Hands `m` to the sender thread. `c->lock` held by the caller. */
++static void lighterfs_enqueue_locked(struct lighterfs_conn *c,
++				     struct lighterfs_msg *m)
++{
++	list_add_tail(&m->list, &c->tx_queue);
++	wake_up(&c->tx_wait);
++}
++
++static int lighterfs_tx_thread(void *data)
++{
++	struct lighterfs_conn *c = data;
++
++	while (!kthread_should_stop()) {
++		struct lighterfs_msg *m;
++
++		wait_event_interruptible(c->tx_wait,
++					 kthread_should_stop() ||
++					 !list_empty(&c->tx_queue));
++		if (kthread_should_stop())
++			break;
++		mutex_lock(&c->send_lock);
++		for (;;) {
++			int err;
++
++			spin_lock(&c->lock);
++			m = list_first_entry_or_null(&c->tx_queue,
++						     struct lighterfs_msg, list);
++			if (m)
++				list_del(&m->list);
++			spin_unlock(&c->lock);
++			if (!m)
++				break;
++			err = lighterfs_xmit(c, m, 0);
++			lighterfs_msg_free(m);
++			if (err) {
++				pr_warn("lighterfs: %s: send failed (%d)\n",
++					c->fs->tag, err);
++				lighterfs_break(c);
++				break;
++			}
++		}
++		mutex_unlock(&c->send_lock);
++	}
++	return 0;
++}
++
++/* -- requests ------------------------------------------------------------- */
++
++static struct lighterfs_conn *lighterfs_pick(struct lighterfs *fs)
++{
++	return &fs->conns[raw_smp_processor_id() % fs->nconns];
++}
++
++static void lighterfs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
++{
++	struct lighterfs *fs = fiq->priv;
++	struct lighterfs_conn *c = lighterfs_pick(fs);
++	struct lighterfs_msg *m;
++	bool inline_ok;
++	int err;
++
++	fuse_request_assign_unique(fiq, req);
++	clear_bit(FR_PENDING, &req->flags);
++
++	m = kzalloc(sizeof(*m), GFP_NOFS | __GFP_NOFAIL);
++	m->req = req;
++	m->len = req->in.h.len;
++
++	spin_lock(&c->lock);
++	if (!c->connected) {
++		spin_unlock(&c->lock);
++		kfree(m);
++		req->out.h.error = -ENOTCONN;
++		clear_bit(FR_SENT, &req->flags);
++		fuse_request_end(req);
++		return;
++	}
++	list_add_tail(&req->list, &c->in_flight);
++	set_bit(FR_SENT, &req->flags);
++	/*
++	 * A background request arrives under fc->bg_lock and may not sleep;
++	 * a foreground one arrives from fuse_send_one with nothing held, and
++	 * is about to block on its own reply, so the fastest thing is to
++	 * write it here and now.
++	 */
++	inline_ok = !test_bit(FR_BACKGROUND, &req->flags) &&
++		    list_empty(&c->tx_queue) && !signal_pending(current);
++	if (!inline_ok) {
++		lighterfs_enqueue_locked(c, m);
++		spin_unlock(&c->lock);
++		return;
++	}
++	spin_unlock(&c->lock);
++
++	mutex_lock(&c->send_lock);
++	spin_lock(&c->lock);
++	if (!list_empty(&c->tx_queue)) {
++		/* Something got in first; behind it, then. */
++		lighterfs_enqueue_locked(c, m);
++		spin_unlock(&c->lock);
++		mutex_unlock(&c->send_lock);
++		return;
++	}
++	spin_unlock(&c->lock);
++	err = lighterfs_xmit(c, m, MSG_DONTWAIT);
++	if (err == -EAGAIN) {
++		spin_lock(&c->lock);
++		lighterfs_enqueue_locked(c, m);
++		spin_unlock(&c->lock);
++	} else {
++		if (err) {
++			pr_warn("lighterfs: %s: send failed (%d)\n", fs->tag, err);
++			lighterfs_break(c);
++		}
++		kfree(m);
++	}
++	mutex_unlock(&c->send_lock);
++}
++
++static void lighterfs_send_forget(struct fuse_iqueue *fiq,
++				  struct fuse_forget_link *link)
++{
++	struct lighterfs *fs = fiq->priv;
++	struct lighterfs_conn *c = lighterfs_pick(fs);
++	struct {
++		struct fuse_in_header ih;
++		struct fuse_forget_in arg;
++	} __packed *forget;
++	struct lighterfs_msg *m;
++
++	/* Under fiq->lock: no sleeping, so no sending; the thread does it. */
++	m = kzalloc(sizeof(*m), GFP_ATOMIC | __GFP_NOFAIL);
++	forget = kzalloc(sizeof(*forget), GFP_ATOMIC | __GFP_NOFAIL);
++	forget->ih = (struct fuse_in_header){
++		.opcode = FUSE_FORGET,
++		.nodeid = link->forget_one.nodeid,
++		.unique = fuse_get_unique(fiq),
++		.len = sizeof(*forget),
++	};
++	forget->arg = (struct fuse_forget_in){
++		.nlookup = link->forget_one.nlookup,
++	};
++	m->buf = forget;
++	m->len = sizeof(*forget);
++	spin_lock(&c->lock);
++	if (c->connected)
++		lighterfs_enqueue_locked(c, m);
++	else
++		lighterfs_msg_free(m);
++	spin_unlock(&c->lock);
++	kfree(link);
++}
++
++static void lighterfs_send_interrupt(struct fuse_iqueue *fiq,
++				     struct fuse_req *req)
++{
++	/* As virtio-fs: the host answers in its own time. */
++}
++
++static void lighterfs_put(struct kref *ref);
++
++static void lighterfs_fiq_release(struct fuse_iqueue *fiq)
++{
++	struct lighterfs *fs = fiq->priv;
++
++	kref_put(&fs->ref, lighterfs_put);
++}
++
++static const struct fuse_iqueue_ops lighterfs_fiq_ops = {
++	.send_forget	= lighterfs_send_forget,
++	.send_interrupt	= lighterfs_send_interrupt,
++	.send_req	= lighterfs_send_req,
++	.release	= lighterfs_fiq_release,
++};
++
++/* -- replies -------------------------------------------------------------- */
++
++static struct fuse_req *lighterfs_take(struct lighterfs_conn *c, u64 unique)
++{
++	struct fuse_req *req;
++
++	spin_lock(&c->lock);
++	list_for_each_entry(req, &c->in_flight, list) {
++		if (req->in.h.unique == unique) {
++			list_del_init(&req->list);
++			spin_unlock(&c->lock);
++			return req;
++		}
++	}
++	spin_unlock(&c->lock);
++	return NULL;
++}
++
++/* The reply's payload, straight into the request's arguments and pages. */
++static int lighterfs_recv_reply(struct lighterfs_conn *c, struct fuse_req *req,
++				size_t remaining)
++{
++	struct fuse_args *args = req->args;
++	unsigned int num_out = args->out_numargs - args->out_pages;
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < num_out; i++) {
++		unsigned int argsize = args->out_args[i].size;
++
++		if (args->out_argvar && i == args->out_numargs - 1 &&
++		    argsize > remaining)
++			argsize = remaining;
++		if (argsize > remaining)
++			return -EPROTO;
++		err = lighterfs_recv_exact(c, args->out_args[i].value, argsize);
++		if (err)
++			return err;
++		remaining -= argsize;
++		if (args->out_argvar && i == args->out_numargs - 1)
++			args->out_args[i].size = argsize;
++	}
++
++	if (args->out_pages) {
++		struct fuse_args_pages *ap =
++			container_of(args, struct fuse_args_pages, args);
++		size_t capacity = 0;
++		size_t take;
++		size_t left;
++
++		for (i = 0; i < ap->num_folios; i++) {
++			bvec_set_folio(&c->rx_bvecs[i], ap->folios[i],
++				       ap->descs[i].length, ap->descs[i].offset);
++			capacity += ap->descs[i].length;
++		}
++		take = min(remaining, capacity);
++		if (take) {
++			struct iov_iter iter;
++
++			iov_iter_bvec(&iter, ITER_DEST, c->rx_bvecs,
++				      ap->num_folios, take);
++			err = lighterfs_recv_iter(c, &iter);
++			if (err)
++				return err;
++		}
++		remaining -= take;
++		if (args->out_argvar)
++			args->out_args[args->out_numargs - 1].size = take;
++		if (args->page_zeroing) {
++			left = take;
++			for (i = 0; i < ap->num_folios; i++) {
++				unsigned int thislen = ap->descs[i].length;
++
++				if (left < thislen) {
++					folio_zero_segment(ap->folios[i],
++							   ap->descs[i].offset + left,
++							   ap->descs[i].offset + thislen);
++					left = 0;
++				} else {
++					left -= thislen;
++				}
++			}
++		}
++	}
++
++	/* A reply longer than the request has room for: the rest is dropped. */
++	if (remaining)
++		return lighterfs_discard(c, remaining);
++	return 0;
++}
++
++static void lighterfs_notify(struct lighterfs_conn *c, int code, size_t len)
++{
++	struct fuse_conn *fc = c->fs->fc;
++	void *buf;
++
++	buf = kmalloc(len + 1, GFP_KERNEL);
++	if (!buf) {
++		lighterfs_discard(c, len);
++		return;
++	}
++	if (lighterfs_recv_exact(c, buf, len)) {
++		kfree(buf);
++		return;
++	}
++	((char *)buf)[len] = '\0';
++
++	switch (code) {
++	case FUSE_NOTIFY_INVAL_INODE: {
++		struct fuse_notify_inval_inode_out out;
++
++		if (len < sizeof(out))
++			break;
++		memcpy(&out, buf, sizeof(out));
++		down_read(&fc->killsb);
++		fuse_reverse_inval_inode(fc, out.ino, out.off, out.len);
++		up_read(&fc->killsb);
++		break;
++	}
++	case FUSE_NOTIFY_INVAL_ENTRY: {
++		struct fuse_notify_inval_entry_out out;
++		struct qstr name;
++
++		if (len < sizeof(out))
++			break;
++		memcpy(&out, buf, sizeof(out));
++		if (out.namelen == 0 || out.namelen > FUSE_NAME_MAX ||
++		    sizeof(out) + (size_t)out.namelen > len)
++			break;
++		name.name = (char *)buf + sizeof(out);
++		name.len = out.namelen;
++		down_read(&fc->killsb);
++		fuse_reverse_inval_entry(fc, out.parent, 0, &name, out.flags);
++		up_read(&fc->killsb);
++		break;
++	}
++	default:
++		break;
++	}
++	kfree(buf);
++}
++
++static void lighterfs_end_in_flight(struct lighterfs_conn *c)
++{
++	LIST_HEAD(gone);
++	struct fuse_req *req, *next;
++
++	spin_lock(&c->lock);
++	list_splice_init(&c->in_flight, &gone);
++	spin_unlock(&c->lock);
++	list_for_each_entry_safe(req, next, &gone, list) {
++		list_del_init(&req->list);
++		req->out.h.error = -ECONNABORTED;
++		clear_bit(FR_SENT, &req->flags);
++		fuse_request_end(req);
++	}
++}
++
++static int lighterfs_rx_thread(void *data)
++{
++	struct lighterfs_conn *c = data;
++	struct fuse_out_header oh;
++	int err = 0;
++
++	while (!kthread_should_stop()) {
++		size_t payload;
++		struct fuse_req *req;
++
++		err = lighterfs_recv_exact(c, &oh, sizeof(oh));
++		if (err)
++			break;
++		if (oh.len < sizeof(oh)) {
++			err = -EPROTO;
++			break;
++		}
++		payload = oh.len - sizeof(oh);
++		if (oh.unique == 0) {
++			lighterfs_notify(c, oh.error, payload);
++			continue;
++		}
++		req = lighterfs_take(c, oh.unique);
++		if (!req) {
++			/* Answered late, or twice: nothing waits for it. */
++			err = lighterfs_discard(c, payload);
++			if (err)
++				break;
++			continue;
++		}
++		if (oh.error) {
++			err = lighterfs_discard(c, payload);
++		} else {
++			err = lighterfs_recv_reply(c, req, payload);
++		}
++		req->out.h = oh;
++		clear_bit(FR_SENT, &req->flags);
++		if (err) {
++			req->out.h.error = -EIO;
++			fuse_request_end(req);
++			break;
++		}
++		fuse_request_end(req);
++	}
++	if (err && err != -ECONNRESET && c->connected)
++		pr_warn("lighterfs: %s: connection %u lost (%d)\n",
++			c->fs->tag, c->index, err);
++	lighterfs_break(c);
++	lighterfs_end_in_flight(c);
++	/* Until told to stop, so kthread_stop() finds us. */
++	while (!kthread_should_stop())
++		schedule_timeout_interruptible(HZ);
++	return 0;
++}
++
++/* -- connections ---------------------------------------------------------- */
++
++static int lighterfs_connect(struct lighterfs_conn *c)
++{
++	struct sockaddr_in sin = {
++		.sin_family = AF_INET,
++		.sin_port = htons(c->fs->port),
++		.sin_addr.s_addr = htonl(LIGHTERFS_GATEWAY),
++	};
++	struct socket *sock;
++	int bufsize = LIGHTERFS_SOCKBUF;
++	char hello[64];
++	struct kvec kv;
++	struct msghdr msg = {};
++	int err;
++	int len;
++
++	err = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
++	if (err)
++		return err;
++	tcp_sock_set_nodelay(sock->sk);
++	sock_setsockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE,
++			KERNEL_SOCKPTR(&bufsize), sizeof(bufsize));
++	sock_setsockopt(sock, SOL_SOCKET, SO_RCVBUFFORCE,
++			KERNEL_SOCKPTR(&bufsize), sizeof(bufsize));
++	err = kernel_connect(sock, (struct sockaddr *)&sin, sizeof(sin), 0);
++	if (err) {
++		sock_release(sock);
++		return err;
++	}
++	len = scnprintf(hello, sizeof(hello), "lighterfs %s\n", c->fs->tag);
++	kv.iov_base = hello;
++	kv.iov_len = len;
++	err = kernel_sendmsg(sock, &msg, &kv, 1, len);
++	if (err != len) {
++		sock_release(sock);
++		return err < 0 ? err : -EIO;
++	}
++	c->sock = sock;
++	c->connected = true;
++	return 0;
++}
++
++static void lighterfs_put(struct kref *ref)
++{
++	struct lighterfs *fs = container_of(ref, struct lighterfs, ref);
++	unsigned int i;
++
++	for (i = 0; i < fs->nconns; i++) {
++		struct lighterfs_conn *c = &fs->conns[i];
++
++		if (c->sock)
++			sock_release(c->sock);
++		kfree(c->tx_bvecs);
++		kfree(c->rx_bvecs);
++	}
++	kfree(fs->conns);
++	kfree(fs->tag);
++	kfree(fs);
++}
++
++static struct lighterfs *lighterfs_new(const char *tag, u16 port,
++				       unsigned int nconns)
++{
++	struct lighterfs *fs;
++	unsigned int i;
++	int err = -ENOMEM;
++
++	fs = kzalloc(sizeof(*fs), GFP_KERNEL);
++	if (!fs)
++		return ERR_PTR(-ENOMEM);
++	kref_init(&fs->ref);
++	fs->tag = kstrdup(tag, GFP_KERNEL);
++	fs->port = port;
++	fs->nconns = nconns;
++	fs->conns = kcalloc(nconns, sizeof(*fs->conns), GFP_KERNEL);
++	if (!fs->tag || !fs->conns)
++		goto fail;
++	for (i = 0; i < nconns; i++) {
++		struct lighterfs_conn *c = &fs->conns[i];
++
++		c->fs = fs;
++		c->index = i;
++		spin_lock_init(&c->lock);
++		INIT_LIST_HEAD(&c->in_flight);
++		mutex_init(&c->send_lock);
++		INIT_LIST_HEAD(&c->tx_queue);
++		init_waitqueue_head(&c->tx_wait);
++	}
++	for (i = 0; i < nconns; i++) {
++		err = lighterfs_connect(&fs->conns[i]);
++		if (err) {
++			pr_err("lighterfs: %s: cannot reach the host on port %u (%d)\n",
++			       tag, port, err);
++			goto fail;
++		}
++	}
++	return fs;
++fail:
++	kref_put(&fs->ref, lighterfs_put);
++	return ERR_PTR(err);
++}
++
++static int lighterfs_start_threads(struct lighterfs *fs)
++{
++	unsigned int i;
++
++	for (i = 0; i < fs->nconns; i++) {
++		struct lighterfs_conn *c = &fs->conns[i];
++
++		c->tx = kthread_run(lighterfs_tx_thread, c, "lighterfs-tx/%s/%u",
++				    fs->tag, i);
++		if (IS_ERR(c->tx)) {
++			int err = PTR_ERR(c->tx);
++
++			c->tx = NULL;
++			return err;
++		}
++		c->rx = kthread_run(lighterfs_rx_thread, c, "lighterfs-rx/%s/%u",
++				    fs->tag, i);
++		if (IS_ERR(c->rx)) {
++			int err = PTR_ERR(c->rx);
++
++			c->rx = NULL;
++			return err;
++		}
++	}
++	return 0;
++}
++
++static void lighterfs_stop(struct lighterfs *fs)
++{
++	unsigned int i;
++
++	for (i = 0; i < fs->nconns; i++) {
++		struct lighterfs_conn *c = &fs->conns[i];
++
++		lighterfs_break(c);
++		if (c->tx) {
++			kthread_stop(c->tx);
++			c->tx = NULL;
++		}
++		if (c->rx) {
++			kthread_stop(c->rx);
++			c->rx = NULL;
++		}
++		lighterfs_end_in_flight(c);
++		while (!list_empty(&c->tx_queue)) {
++			struct lighterfs_msg *m = list_first_entry(&c->tx_queue,
++						struct lighterfs_msg, list);
++			list_del(&m->list);
++			lighterfs_msg_free(m);
++		}
++	}
++}
++
++/* -- mounting ------------------------------------------------------------- */
++
++static void lighterfs_free_fsc(struct fs_context *fsc)
++{
++	kfree(fsc->fs_private);
++}
++
++static int lighterfs_parse_param(struct fs_context *fsc,
++				 struct fs_parameter *param)
++{
++	struct fs_parse_result result;
++	struct lighterfs_ctx *ctx = fsc->fs_private;
++	int opt;
++
++	opt = fs_parse(fsc, lighterfs_parameters, param, &result);
++	if (opt < 0)
++		return opt;
++	switch (opt) {
++	case OPT_PORT:
++		if (result.uint_32 == 0 || result.uint_32 > 65535)
++			return invalf(fsc, "lighterfs: bad port");
++		ctx->port = result.uint_32;
++		break;
++	case OPT_CONNS:
++		if (result.uint_32 == 0 || result.uint_32 > LIGHTERFS_MAX_CONNS)
++			return invalf(fsc, "lighterfs: bad conns");
++		ctx->conns = result.uint_32;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int lighterfs_test_super(struct super_block *sb, struct fs_context *fsc)
++{
++	struct fuse_mount *fsc_fm = fsc->s_fs_info;
++	struct fuse_mount *sb_fm = get_fuse_mount_super(sb);
++
++	return fsc_fm->fc->iq.priv == sb_fm->fc->iq.priv;
++}
++
++static int lighterfs_fill_super(struct super_block *sb, struct fs_context *fsc)
++{
++	struct fuse_mount *fm = get_fuse_mount_super(sb);
++	struct fuse_conn *fc = fm->fc;
++	struct lighterfs *fs = fc->iq.priv;
++	struct lighterfs_ctx *ctx = fsc->fs_private;
++	unsigned int i;
++	int err;
++
++	ctx->fuse.rootmode = S_IFDIR;
++	ctx->fuse.default_permissions = 1;
++	ctx->fuse.allow_other = 1;
++	ctx->fuse.max_read = UINT_MAX;
++	ctx->fuse.blksize = 512;
++	ctx->fuse.destroy = true;
++	ctx->fuse.no_control = true;
++	ctx->fuse.no_force_umount = true;
++	ctx->fuse.fudptr = NULL;
++
++	for (i = 0; i < fs->nconns; i++) {
++		struct lighterfs_conn *c = &fs->conns[i];
++
++		c->fud = fuse_dev_alloc();
++		/* A request carries at most fc->max_pages_limit folios. */
++		c->tx_bvecs = kcalloc(fc->max_pages_limit, sizeof(struct bio_vec),
++				      GFP_KERNEL);
++		c->rx_bvecs = kcalloc(fc->max_pages_limit, sizeof(struct bio_vec),
++				      GFP_KERNEL);
++		if (!c->fud || !c->tx_bvecs || !c->rx_bvecs) {
++			err = -ENOMEM;
++			goto err_devs;
++		}
++	}
++	err = fuse_fill_super_common(sb, &ctx->fuse);
++	if (err < 0)
++		goto err_devs;
++	for (i = 0; i < fs->nconns; i++)
++		fuse_dev_install(fs->conns[i].fud, fc);
++	err = lighterfs_start_threads(fs);
++	if (err) {
++		lighterfs_stop(fs);
++		return err;
++	}
++	fuse_send_init(fm);
++	return 0;
++
++err_devs:
++	for (i = 0; i < fs->nconns; i++) {
++		if (fs->conns[i].fud)
++			fuse_dev_free(fs->conns[i].fud);
++		fs->conns[i].fud = NULL;
++	}
++	return err;
++}
++
++static int lighterfs_get_tree(struct fs_context *fsc)
++{
++	struct lighterfs_ctx *ctx = fsc->fs_private;
++	struct lighterfs *fs;
++	struct super_block *sb;
++	struct fuse_conn *fc = NULL;
++	struct fuse_mount *fm;
++	int err = -ENOMEM;
++
++	if (!fsc->source)
++		return invalf(fsc, "lighterfs: no tag");
++
++	fs = lighterfs_new(fsc->source, ctx->port ?: LIGHTERFS_DEFAULT_PORT,
++			   ctx->conns ?: LIGHTERFS_DEFAULT_CONNS);
++	if (IS_ERR(fs))
++		return PTR_ERR(fs);
++
++	fc = kzalloc(sizeof(*fc), GFP_KERNEL);
++	if (!fc)
++		goto out_err;
++	fm = kzalloc(sizeof(*fm), GFP_KERNEL);
++	if (!fm)
++		goto out_err;
++
++	fuse_conn_init(fc, fm, fsc->user_ns, &lighterfs_fiq_ops, fs);
++	fc->release = fuse_free_conn;
++	fc->delete_stale = true;
++	fc->auto_submounts = true;
++	fc->sync_fs = true;
++	fc->use_pages_for_kvec_io = true;
++	fs->fc = fc;
++
++	fsc->s_fs_info = fm;
++	sb = sget_fc(fsc, lighterfs_test_super, set_anon_super_fc);
++	if (fsc->s_fs_info)
++		fuse_mount_destroy(fm);
++	if (IS_ERR(sb))
++		return PTR_ERR(sb);
++
++	if (!sb->s_root) {
++		err = lighterfs_fill_super(sb, fsc);
++		if (err) {
++			deactivate_locked_super(sb);
++			return err;
++		}
++		sb->s_flags |= SB_ACTIVE;
++	}
++
++	WARN_ON(fsc->root);
++	fsc->root = dget(sb->s_root);
++	return 0;
++
++out_err:
++	kfree(fc);
++	kref_put(&fs->ref, lighterfs_put);
++	return err;
++}
++
++static const struct fs_context_operations lighterfs_context_ops = {
++	.free		= lighterfs_free_fsc,
++	.parse_param	= lighterfs_parse_param,
++	.get_tree	= lighterfs_get_tree,
++};
++
++static int lighterfs_init_fs_context(struct fs_context *fsc)
++{
++	struct lighterfs_ctx *ctx;
++
++	if (fsc->purpose == FS_CONTEXT_FOR_SUBMOUNT)
++		return fuse_init_fs_context_submount(fsc);
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	fsc->fs_private = ctx;
++	fsc->ops = &lighterfs_context_ops;
++	return 0;
++}
++
++static void lighterfs_conn_destroy(struct fuse_mount *fm)
++{
++	struct fuse_conn *fc = fm->fc;
++	struct lighterfs *fs = fc->iq.priv;
++	unsigned int i;
++
++	/* DESTROY goes out over the connections, so they close after. */
++	fuse_conn_destroy(fm);
++	lighterfs_stop(fs);
++	for (i = 0; i < fs->nconns; i++) {
++		if (fs->conns[i].fud)
++			fuse_dev_free(fs->conns[i].fud);
++		fs->conns[i].fud = NULL;
++	}
++}
++
++static void lighterfs_kill_sb(struct super_block *sb)
++{
++	struct fuse_mount *fm = get_fuse_mount_super(sb);
++	bool last;
++
++	if (sb->s_root) {
++		last = fuse_mount_remove(fm);
++		if (last)
++			lighterfs_conn_destroy(fm);
++	}
++	kill_anon_super(sb);
++	fuse_mount_destroy(fm);
++}
++
++static struct file_system_type lighterfs_type = {
++	.owner		= THIS_MODULE,
++	.name		= "lighterfs",
++	.init_fs_context = lighterfs_init_fs_context,
++	.kill_sb	= lighterfs_kill_sb,
++	.fs_flags	= FS_ALLOW_IDMAP,
++};
++MODULE_ALIAS_FS("lighterfs");
++
++static int __init lighterfs_init(void)
++{
++	return register_filesystem(&lighterfs_type);
++}
++module_init(lighterfs_init);
++
++static void __exit lighterfs_exit(void)
++{
++	unregister_filesystem(&lighterfs_type);
++}
++module_exit(lighterfs_exit);
++
++MODULE_AUTHOR("lighter");
++MODULE_DESCRIPTION("FUSE over TCP to the host, for lighter");
++MODULE_LICENSE("GPL");

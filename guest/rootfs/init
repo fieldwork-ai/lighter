@@ -190,31 +190,72 @@ fi
 # `binfmt_misc` is how Linux learns that an ELF it cannot execute should be
 # handed to an interpreter instead. With this registered, `docker run
 # --platform linux/amd64` works with no further arrangement: the kernel sees an
-# x86-64 header, and runs qemu against it.
+# x86-64 header and runs the interpreter against it.
+#
+# The interpreter is Rosetta when the host attached its share (the command
+# line says `lighter.rosetta`), and qemu otherwise. Rosetta runs x86-64 at
+# about two thirds of native speed; qemu at about a tenth.
 #
 # The `F` flag is the load-bearing one. Without it the kernel resolves the
 # interpreter path at exec time — inside the container's mount namespace, where
-# /usr/bin/qemu-x86_64 does not exist. With it, the interpreter is opened once,
-# here, and the open file is what every later exec uses. That is the difference
-# between this working everywhere and working only outside containers.
+# neither path exists. With it, the interpreter is opened once, here, and the
+# open file is what every later exec uses. That is the difference between this
+# working everywhere and working only outside containers.
 if mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null; then
+	interpreter=/usr/bin/qemu-x86_64
+	via=qemu
+	flags=FP
+	if grep -qw lighter.rosetta /proc/cmdline; then
+		mkdir -p /mnt/rosetta
+		if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null && [ -x /mnt/rosetta/rosetta ]; then
+			interpreter=/mnt/rosetta/rosetta
+			via=rosetta
+			flags=OCF
+		else
+			echo "INIT rosetta=unmountable"
+		fi
+	fi
 	# `%s` and not a bare format string, because the escapes must reach the
 	# kernel *as text*: binfmt_misc unquotes `\xHH` itself. Letting the shell
 	# expand them first writes real NUL bytes, `write` stops at the first one,
 	# and the kernel registers a truncated magic — which then matches every
 	# 64-bit ELF, hands each one to an x86 emulator, and turns the next
 	# command in this script into `exit 127`.
-	printf '%s\n' ':qemu-x86_64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-x86_64:FP' \
+	printf '%s\n' ":x86_64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:$interpreter:$flags" \
 		> /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
 	# Checked by looking, not by the exit status of a redirect into procfs,
 	# which is not a reliable report of whether the kernel accepted the entry.
-	if [ -f /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; then
-		echo "INIT binfmt=x86_64"
+	if [ -f /proc/sys/fs/binfmt_misc/x86_64 ]; then
+		echo "INIT binfmt=x86_64 via=$via"
 	else
 		echo "INIT binfmt=failed"
 	fi
 else
 	echo "INIT binfmt=unavailable"
+fi
+
+# --- Networking -----------------------------------------------------------
+# Before the shares: they are mounted over a TCP connection to the gateway,
+# so the link and its lease have to exist first.
+# A socket may ask for a send buffer up to this; the agent asks for 8 MiB
+# on every stream, because a vsock packet's memory stays charged to its
+# socket until the host has taken it off the ring, and the default ceiling
+# is under one packet.
+sysctl -q -w net.core.wmem_max=16777216 net.core.rmem_max=16777216 fs.pipe-max-size=16777216 2>/dev/null || true
+# Unmovable allocations (slab, page tables) kept out of movable blocks. An
+# install fills memory with page cache and the slab it needs spills into
+# blocks that were movable; when the cache is trimmed afterwards the free
+# memory around those pages cannot form the two-megabyte runs free page
+# reporting hands the host, and a third of what the trim freed came back
+# over thirty seconds as compaction worked around them, or not at all.
+echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
+# TCP inside the guest carries a container's stream to the agent; its
+# windows are what lets that leg run ahead of the vsock leg behind it. The
+# defaults top out at 4 and 6 MB.
+sysctl -q -w net.ipv4.tcp_wmem="4096 262144 16777216" net.ipv4.tcp_rmem="4096 1048576 16777216" 2>/dev/null || true
+if [ -e /sys/class/net/eth0 ]; then
+	ip link set eth0 up
+	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok" || echo "INIT dhcp=failed"
 fi
 
 # --- Shared directories ---------------------------------------------------
@@ -239,7 +280,7 @@ for arg in $(cat /proc/cmdline); do
 		tag=${spec%%:*}
 		at=${spec#*:}
 		mkdir -p "$at"
-		if mount -t virtiofs "$tag" "$at"; then
+		if mount -t lighterfs "$tag" "$at"; then
 			echo "INIT share=$tag at=$at"
 		else
 			echo "INIT share=$tag at=$at failed"
@@ -255,28 +296,6 @@ if [ -n "$devagent" ] && [ -f "$devagent" ]; then
 	else
 		echo "INIT devagent=$devagent unusable; the built-in agent runs"
 	fi
-fi
-
-# --- Networking -----------------------------------------------------------
-# A socket may ask for a send buffer up to this; the agent asks for 8 MiB
-# on every stream, because a vsock packet's memory stays charged to its
-# socket until the host has taken it off the ring, and the default ceiling
-# is under one packet.
-sysctl -q -w net.core.wmem_max=16777216 net.core.rmem_max=16777216 fs.pipe-max-size=16777216 2>/dev/null || true
-# Unmovable allocations (slab, page tables) kept out of movable blocks. An
-# install fills memory with page cache and the slab it needs spills into
-# blocks that were movable; when the cache is trimmed afterwards the free
-# memory around those pages cannot form the two-megabyte runs free page
-# reporting hands the host, and a third of what the trim freed came back
-# over thirty seconds as compaction worked around them, or not at all.
-echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
-# TCP inside the guest carries a container's stream to the agent; its
-# windows are what lets that leg run ahead of the vsock leg behind it. The
-# defaults top out at 4 and 6 MB.
-sysctl -q -w net.ipv4.tcp_wmem="4096 262144 16777216" net.ipv4.tcp_rmem="4096 1048576 16777216" 2>/dev/null || true
-if [ -e /sys/class/net/eth0 ]; then
-	ip link set eth0 up
-	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok" || echo "INIT dhcp=failed"
 fi
 
 # --- The engine -----------------------------------------------------------
@@ -396,9 +415,20 @@ table inet lighter {
 		type nat hook prerouting priority dstnat - 10; policy accept;
 		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
 	}
+	# This machine's own connections to the gateway are the streams
+	# themselves (and the file server, and DNS): they must not be
+	# redirected into the agent that made them.
 	chain output {
 		type nat hook output priority dstnat - 10; policy accept;
+		ip daddr 192.168.127.1 accept
 		meta l4proto tcp oifname "eth0" redirect to :15201
+	}
+	# The ports the host connects to are root on this machine (the
+	# Docker socket, the control channel). Only the card may reach them;
+	# a container's packet arrives from a bridge.
+	chain input {
+		type filter hook input priority filter; policy accept;
+		tcp dport { 2375, 2376, 2378 } iifname != { "eth0", "lo" } drop
 	}
 	# UDP by TPROXY rather than REDIRECT: a redirected datagram reaches the
 	# agent with its destination already rewritten and no way back to the

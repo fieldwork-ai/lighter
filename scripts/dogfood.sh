@@ -76,10 +76,10 @@ echo "==> Booting lighter (${CPUS} cores, ${MEMORY_MIB} MiB)"
 	--disk "$RUN_DIR/root.img" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 96 \
 	--net --run-dir "$RUN_DIR" \
-	--vsock "$SOCKET:2375" \
+	--proxy "$SOCKET:2375" \
 	--share repo:"$ROOT" \
 	--no-tty --cpus "$CPUS" --memory-mib "$MEMORY_MIB" \
-	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=repo:$ROOT" \
+	--cmdline "console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=repo:$ROOT" \
 	>"$BOOT_LOG" 2>&1 &
 VMM_PID=$!
 disown "$VMM_PID" 2>/dev/null || true

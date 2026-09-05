@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Milestone 3 gate, part two: a host socket reaches a guest process over vsock.
+# Milestone 3 gate, part two: a host socket reaches a guest process over the link.
 #
 # This is the path the Docker socket takes, proven with an echo server instead
 # of dockerd so that a failure here is unambiguously the transport:
 #
-#   docker CLI ──unix──▶ lighter ──vsock──▶ agent ──unix──▶ dockerd
+#   docker CLI ──unix──▶ lighter ──link──▶ agent ──unix──▶ dockerd
 #                        └───────── this gate ────────┘
 #
 # The round trip exercises both directions and the credit accounting: the host's
@@ -58,8 +58,9 @@ echo "==> Booting with a socket proxied to guest port $GUEST_PORT"
 	--initramfs "$INITRAMFS" \
 	--no-tty \
 	--cpus 2 \
-	--vsock "$SOCKET:$GUEST_PORT" \
-	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 lighter.vsocktest" \
+	--net --run-dir "$(mktemp -d -t lighter-m3v)" \
+	--proxy "$SOCKET:$GUEST_PORT" \
+	--cmdline "console=hvc0 panic=-1 lighter.vsocktest" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 
@@ -80,7 +81,7 @@ while ! grep -q "AGENT listening port=$GUEST_PORT" "$LOG" 2>/dev/null; do
 done
 
 if grep -q "AGENT listening port=$GUEST_PORT" "$LOG" 2>/dev/null; then
-	pass "guest agent bound vsock port $GUEST_PORT"
+	pass "guest agent bound port $GUEST_PORT"
 
 	[ -S "$SOCKET" ] && pass "host socket exists" || fail "no socket at $SOCKET"
 
@@ -90,7 +91,7 @@ if grep -q "AGENT listening port=$GUEST_PORT" "$LOG" 2>/dev/null; then
 	MESSAGE="the quick brown fox jumps over the lazy dog"
 	reply="$( (echo "$MESSAGE"; sleep 3) | nc -U -w 6 "$SOCKET" 2>/dev/null | head -1 || true)"
 	if [ "$reply" = "$MESSAGE" ]; then
-		pass "round trip through vsock returned the message intact"
+		pass "round trip through the link returned the message intact"
 	else
 		fail "expected the message back, got: ${reply:-nothing}"
 	fi

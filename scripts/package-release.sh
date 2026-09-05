@@ -4,7 +4,7 @@
 #   scripts/package-release.sh <version> [--skip-notarize]
 #
 # Produces dist/lighter-<version>-arm64.tar.gz containing:
-#   bin/lighter             (Developer ID signed with hypervisor entitlement)
+#   bin/lighter             (Developer ID signed with the virtualization entitlement)
 #   share/lighter/Image     (guest kernel)
 #   share/lighter/rootfs.ext4 (sparse Alpine rootfs)
 #   share/lighter/entitlements.plist

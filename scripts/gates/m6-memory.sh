@@ -100,10 +100,10 @@ echo "==> Booting with 8 GiB of guest RAM"
 	--disk "$ROOTFS" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
 	--net --run-dir "$RUN_DIR" \
-	--vsock "$SOCKET:2375" \
+	--proxy "$SOCKET:2375" \
 	--report-memory \
 	--no-tty --cpus 4 --memory-mib 8192 \
-	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
+	--cmdline "console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 disown "$VMM_PID" 2>/dev/null || true
@@ -163,8 +163,8 @@ if [ "$PERCENT" -ge "$RETURN_FRACTION" ]; then
 	pass "gave back ${RETURNED} of ${GREW} MiB (${PERCENT}%) within ${waited}s"
 else
 	fail "only gave back ${RETURNED} of ${GREW} MiB (${PERCENT}%) in ${RECLAIM_WINDOW}s"
-	note "the guest reported $(field reported_mib) MiB of free pages over that time"
-	note "zero there means the guest is not reporting; a large number means macOS kept the pages anyway"
+	note "the guest offered $(field offered_mib) MiB and the balloon holds $(field ballooned_mib) MiB"
+	note "zero offered means the agent never trimmed; a large balloon with no return means macOS kept the pages anyway"
 fi
 
 # -------------------------------------------------------------------- idle --
@@ -184,7 +184,7 @@ else
 	fail "idle CPU ${IDLE_CPU}% over ${IDLE_SECONDS}s, budget ${MAX_IDLE_CPU}%"
 fi
 note "idle footprint $(footprint) MiB"
-note "guest reported $(field reported_mib) MiB free, balloon holds $(field ballooned_mib) MiB"
+note "guest offered $(field offered_mib) MiB, balloon holds $(field ballooned_mib) MiB"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

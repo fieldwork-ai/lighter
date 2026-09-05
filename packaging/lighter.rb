@@ -4,7 +4,7 @@
 # will not take a formula that installs a binary needing a code-signing
 # entitlement, and it is the entitlement that makes this work at all.
 #
-# The install signs the binary ad-hoc with `com.apple.security.hypervisor`.
+# The install signs the binary ad-hoc with `com.apple.security.virtualization`.
 # That is not a workaround — it is how Apple intends an unsigned local build to
 # get the entitlement, and the same thing `make sign` does in a checkout.
 # Without it every start fails with `HV_DENIED`, which says nothing about
@@ -30,7 +30,7 @@ class Lighter < Formula
   end
 
   def post_install
-    # Verify the signature; if unsigned or stripped, sign ad-hoc with the hypervisor entitlement.
+    # Verify the signature; if unsigned or stripped, sign ad-hoc with the virtualization entitlement.
     unless quiet_system("/usr/bin/codesign", "--verify", bin/"lighter")
       system "/usr/bin/codesign", "--force", "--sign", "-",
              "--entitlements", pkgshare/"entitlements.plist",

@@ -410,13 +410,13 @@ setup_lighter() {
 		--disk "$ROOTFS" \
 		--disk "$RUN_DIR/data.img" --disk-size-gib "$(bench_disk_gib)" \
 		--net --run-dir "$RUN_DIR" \
-		--vsock "$SOCKET:2375" \
-		--vsock "$RUN_DIR/control.sock:2376" \
+		--proxy "$SOCKET:2375" \
+		--proxy "$RUN_DIR/control.sock:2376" \
 		--docker-ports "$SOCKET" \
 		--share "bench:$WORK" \
 		${LIGHTER_BENCH_DEV_AGENT:+--share "dev:$(dirname "$LIGHTER_BENCH_DEV_AGENT")"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")} ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
@@ -517,10 +517,11 @@ esac
 # runtime here, so the figures compare with each other and with what a
 # user sees, not with the guest's size.
 # The runtime's processes: every one that exists because the runtime is up,
-# which for lighter is the one VMM process.
+# which for lighter is the VMM process and the Virtualization.framework
+# helper it spawned (the guest's memory is charged to the helper).
 runtime_pids() {
 	case "$TARGET" in
-	lighter)        echo "$VMM_PID" ;;
+	lighter)        echo "$VMM_PID $(cat "$RUN_DIR/helper.pid" 2>/dev/null)" ;;
 	orbstack)       pgrep -f 'OrbStack' | tr '\n' ' ' ;;
 	colima)         pgrep -f 'limactl|lima-driver|com.apple.Virtualization.VirtualMachine|virtiofsd' | tr '\n' ' ' ;;
 	# Its VM is Virtualization.framework's own XPC service, not a docker

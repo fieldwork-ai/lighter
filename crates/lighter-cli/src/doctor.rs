@@ -1,7 +1,7 @@
 //! Checking that this Mac can run lighter, and saying what to do if not.
 //!
 //! Every check here exists because something failed confusingly once. The
-//! entitlement one reports `HV_DENIED` from deep inside the hypervisor; the
+//! entitlement one fails from deep inside the framework; the
 //! missing-guest one produces a VMM that starts and exits; a stale Docker
 //! context makes `docker ps` talk to something that is not running. None of
 //! those errors point at their cause, which is what this is for.
@@ -42,24 +42,38 @@ impl Finding {
 pub fn run() -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    findings.push(if lighter_hv::hv_supported() {
-        Finding::good("hardware virtualization", "supported")
+    findings.push(if lighter_vmm::vz::Vm::supported() {
+        Finding::good("virtualization", "supported")
     } else {
         Finding::bad(
-            "hardware virtualization",
-            "kern.hv_support is 0",
+            "virtualization",
+            "Virtualization.framework reports no support",
             "lighter cannot run inside another virtual machine, and needs Apple Silicon",
         )
     });
 
     findings.push(match std::env::current_exe() {
-        Ok(exe) if is_entitled(&exe) => Finding::good("hypervisor entitlement", "present"),
+        Ok(exe) if is_entitled(&exe) => Finding::good("virtualization entitlement", "present"),
         Ok(_) => Finding::bad(
-            "hypervisor entitlement",
-            "the binary is not signed with com.apple.security.hypervisor",
+            "virtualization entitlement",
+            "the binary is not signed with com.apple.security.virtualization",
             "reinstall lighter, or run `make sign` in a checkout",
         ),
-        Err(e) => Finding::bad("hypervisor entitlement", e.to_string(), "unreadable binary"),
+        Err(e) => Finding::bad("virtualization entitlement", e.to_string(), "unreadable binary"),
+    });
+
+    findings.push(match lighter_vmm::vz::rosetta() {
+        lighter_vmm::vz::Rosetta::Installed => Finding::good("rosetta", "installed; amd64 containers run under Rosetta"),
+        lighter_vmm::vz::Rosetta::NotInstalled => Finding::bad(
+            "rosetta",
+            "not installed; amd64 containers run under emulation",
+            "run `lighter rosetta --install` (or `softwareupdate --install-rosetta`)",
+        ),
+        lighter_vmm::vz::Rosetta::NotSupported => Finding::bad(
+            "rosetta",
+            "not supported on this Mac; amd64 containers run under emulation",
+            "nothing to do",
+        ),
     });
 
     findings.push(match paths::kernel() {
@@ -146,7 +160,7 @@ pub fn report(findings: &[Finding]) -> String {
     out
 }
 
-/// Whether a binary carries the hypervisor entitlement.
+/// Whether a binary carries the virtualization entitlement.
 ///
 /// Asked of `codesign` rather than parsed out of the Mach-O: the entitlement
 /// only counts if the signature is valid, and validating a signature by hand is
@@ -160,7 +174,7 @@ fn is_entitled(path: &std::path::Path) -> bool {
         return false;
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    text.contains("com.apple.security.hypervisor")
+    text.contains("com.apple.security.virtualization")
 }
 
 fn which(program: &str) -> Option<String> {
