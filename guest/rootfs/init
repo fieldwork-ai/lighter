@@ -186,6 +186,28 @@ else
 	echo "INIT data=absent"
 fi
 
+# --- zram ------------------------------------------------------------------
+# Swap into compressed RAM, for the engine's idle pages: dockerd and
+# containerd hold a hundred megabytes between them doing nothing, and the
+# agent's idle trim of the engine's cgroup can move that into zram (a third
+# the size) where a plain trim could only drop its file cache. Containers'
+# own trims stay file-only (the agent says so), so a workload's memory is
+# never swapped behind its back; the kernel reaches for swap otherwise only
+# under real pressure, which a guest sized by virtio-mem rarely sees.
+# `lighter.zram=0` on the command line leaves the guest without swap.
+if [ -e /sys/block/zram0/disksize ] && ! grep -qw lighter.zram=0 /proc/cmdline; then
+	echo 2G > /sys/block/zram0/disksize 2>/dev/null \
+		&& mkswap /dev/zram0 >/dev/null 2>&1 \
+		&& swapon -p 100 /dev/zram0 2>/dev/null \
+		&& echo "INIT zram=on" || echo "INIT zram=off"
+	# Swap is for the agent's trims and for a guest with nothing left, not
+	# for the kernel's ordinary reclaim: an install's working set is its
+	# cache, and a kernel that swapped a little of node's heap to keep
+	# more of it read yarn a tenth slower on the M1 and npm on its own
+	# disk half as fast again on the M5.
+	sysctl -q -w vm.swappiness=0 2>/dev/null || true
+fi
+
 # --- containerd -----------------------------------------------------------
 # Started here, the moment the data disk is there, rather than by dockerd.
 # dockerd's own managed containerd is started and then polled once a second,
@@ -208,14 +230,28 @@ echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
 # at HZ=250; expedited they are microseconds. `docker run --rm alpine true`
 # 150 to 110 ms on the M5, with installs and idle unchanged (2026-09-05).
 echo 1 > /sys/kernel/rcu_expedited 2>/dev/null || true
+# Not every wait is a synchronize_rcu: taking a network device down ends in
+# rcu_barrier, twice, and those are normal grace periods whatever the switch
+# above says. The grace-period thread sleeps one jiffy before its first
+# scan for quiescent CPUs; with most vCPUs idle there is nothing to wait
+# for, and told not to it finds them at once. A/B/A on the M5: a container
+# run 150 → 131–140 → 149–158 ms, veth delete 45 → 31 ms, idle unchanged.
+# The next-scan interval stays at its default: zero there would spin the
+# thread through a long grace period.
+echo 0 > /sys/module/rcutree/parameters/jiffies_till_first_fqs 2>/dev/null || true
 cat > /run/containerd.toml <<'TOML'
 version = 2
 disabled_plugins = ["io.containerd.grpc.v1.cri"]
 TOML
 # A fresh shell rather than a subshell: in a subshell `$$` is still the
 # parent's pid, and the engine ran in the root cgroup for a day.
+# The engine is shielded from the OOM killer (-900; the agent is -1000):
+# a container filling memory faster than the guest can grow had the killer
+# take dockerd, containerd and the agent by their size before it took the
+# writer, and the machine with them. Containers themselves stay at zero.
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	echo -900 > /proc/self/oom_score_adj 2>/dev/null
 	exec containerd \
 		--config /run/containerd.toml \
 		--address /run/containerd/containerd.sock \
@@ -231,10 +267,15 @@ CONTAINERD_PID=$!
 # x86-64 header and runs the interpreter against it.
 #
 # The interpreter is Rosetta when the host attached its share (the command
-# line says `lighter.rosetta`), and qemu otherwise. Rosetta runs x86-64 at
-# about two thirds of native speed; qemu at about a tenth. Rosetta asks the
-# kernel for x86 memory ordering on its own threads (PR_SET_MEM_MODEL, kernel
-# patch 0023); nothing here has to.
+# line says `lighter.rosetta`). Rosetta runs x86-64 at about two thirds of
+# native speed and asks the kernel for x86 memory ordering on its own threads
+# (PR_SET_MEM_MODEL, kernel patch 0023); nothing here has to. There is no
+# emulator behind it: qemu ran the same programs at a tenth of native speed,
+# which is slow enough to read as broken, and shipped an emulator in every
+# image for the Macs that had not installed Rosetta. Without the share, the
+# handler is a copy of the agent that says what to install and exits, so an
+# amd64 image fails with the fix in its output rather than "exec format
+# error".
 #
 # The `F` flag is the load-bearing one. Without it the kernel resolves the
 # interpreter path at exec time — inside the container's mount namespace, where
@@ -244,9 +285,9 @@ CONTAINERD_PID=$!
 # binary itself with the caller's credentials, which is what lets a setuid
 # program inside a container behave.
 if mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null; then
-	interpreter=/usr/bin/qemu-x86_64
-	via=qemu
-	flags=FP
+	interpreter=/sbin/lighter-noamd64
+	via=hint
+	flags=F
 	if grep -qw lighter.rosetta /proc/cmdline; then
 		mkdir -p /mnt/rosetta
 		if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null && [ -x /mnt/rosetta/rosetta ]; then
@@ -377,6 +418,7 @@ dockerd_debug=""
 grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	echo -900 > /proc/self/oom_score_adj 2>/dev/null
 	exec dockerd $2 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \

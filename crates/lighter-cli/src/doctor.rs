@@ -68,19 +68,44 @@ pub fn run() -> Vec<Finding> {
             Err(e) => Finding::bad(
                 "rosetta",
                 format!("installed but not usable: {e}"),
-                "amd64 containers run under emulation until lighter is updated for this Rosetta",
+                "amd64 containers will not run until lighter is updated for this Rosetta",
             ),
         }
     } else {
-        // Optional, so not a fault: without it amd64 containers still run.
-        Finding::good(
+        // Not a fault the machine cannot start with (`start` ignores this
+        // finding), but a fault: there is no emulator, so amd64 images fail
+        // until Rosetta is installed.
+        Finding::bad(
             "rosetta",
-            "not installed; amd64 containers run under emulation (`lighter rosetta --install`)",
+            "not installed; amd64 containers will not run",
+            "lighter rosetta --install",
         )
     });
 
-    findings.push(match paths::kernel() {
-        Ok(path) if path.exists() => Finding::good("guest kernel", path.display().to_string()),
+    // The kernel the next start would boot (`config::kernel_hz`).
+    let cpus = crate::config::Config::load()
+        .map(|c| c.cpus)
+        .unwrap_or_else(|_| crate::config::Config::default().cpus);
+    let hz = crate::config::kernel_hz(cpus);
+    findings.push(match paths::kernel(hz) {
+        Ok(path) if path.exists() => {
+            let actual = if path.ends_with("Image-hz1000") {
+                1000
+            } else {
+                250
+            };
+            let note = if actual != hz {
+                format!("; the {hz} Hz image is not installed")
+            } else if actual == 250 {
+                "; LIGHTER_KERNEL_HZ=1000 for the other".to_string()
+            } else {
+                String::new()
+            };
+            Finding::good(
+                "guest kernel",
+                format!("{} ({actual} Hz{note})", path.display()),
+            )
+        }
         Ok(path) => Finding::bad(
             "guest kernel",
             format!("missing at {}", path.display()),

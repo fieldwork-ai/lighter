@@ -26,6 +26,7 @@
 //! ```
 
 pub mod bus;
+pub mod clock;
 pub mod console;
 pub mod devices;
 pub mod dns;

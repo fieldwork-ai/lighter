@@ -117,9 +117,12 @@ pub fn machine() -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>();
 
-    // The guest is told where to mount each share, and what time it is. It has
-    // no real-time clock, so without the second one every TLS handshake fails
-    // with a complaint about a certificate.
+    // The guest is told where to mount each share, and roughly what time it
+    // is. It has no real-time clock, so without the second one every TLS
+    // handshake fails with a complaint about a certificate. Whole seconds,
+    // read here before the kernel starts: the seed for init, which the agent
+    // replaces with an answer it asks the VMM for and corrects for the trip
+    // (`lighter_vmm::clock`) as soon as it runs.
     let mut cmdline =
         String::from("console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t");
     cmdline.push_str(&format!(
@@ -141,7 +144,7 @@ pub fn machine() -> anyhow::Result<()> {
         ));
     }
     // Rosetta rides its own share, mounted by the guest's init at a fixed
-    // place when told; amd64 containers run under qemu otherwise.
+    // place when told; without it amd64 containers fail naming the fix.
     let mut shares = shares;
     if lighter_vmm::rosetta::installed() {
         match lighter_vmm::rosetta::key() {
@@ -166,10 +169,14 @@ pub fn machine() -> anyhow::Result<()> {
         cmdline.push_str(" lighter.nosockmap");
     }
 
+    // The configured memory is the guest's maximum: it boots with a base
+    // and plugs the rest in as the host offers it (`lighter_vmm::virtio::mem`).
+    let (ram_bytes, hotplug_bytes) = lighter_vmm::virtio::mem::split(config.memory_mib << 20);
     let machine_config = MachineConfig {
         vcpus: config.cpus,
-        ram_bytes: config.memory_mib << 20,
-        kernel: paths::kernel()?,
+        ram_bytes,
+        hotplug_bytes,
+        kernel: paths::kernel(crate::config::kernel_hz(config.cpus))?,
         initramfs: None,
         cmdline,
         interactive: false,
@@ -229,21 +236,21 @@ impl Observer for Resync {
     }
 }
 
-/// Sets the guest's clock to now, retrying while the agent comes back.
+/// Has the guest set its clock again, retrying while the agent comes back.
 ///
 /// The same work `lighter resync` does, and deliberately the same code: a
 /// recovery path that only runs when the lid opens is one nobody can test.
+/// The time itself is not in the message: the agent asks the VMM for it and
+/// corrects for the trip (`lighter_vmm::clock`), so a retry that lands five
+/// seconds after this was called is as accurate as the first attempt. It
+/// used to carry whole seconds read once, before the retries.
 pub fn resync_clock() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     // The agent may take a moment to be reachable after a wake, so this is
     // retried rather than attempted once.
     for attempt in 0..20 {
-        match machine::control(&format!("time {now}")) {
+        match machine::control("time") {
             Ok(reply) if reply == "ok" => {
-                tracing::info!(epoch = now, attempt, "guest clock resynchronised");
+                tracing::info!(attempt, "guest clock resynchronised");
                 return;
             }
             Ok(reply) => tracing::debug!(%reply, "guest declined the time"),

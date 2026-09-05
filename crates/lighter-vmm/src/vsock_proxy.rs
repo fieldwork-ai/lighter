@@ -21,6 +21,11 @@ use crate::virtio::vsock::{VsockShared, pump};
 /// that waits four seconds does not.
 const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// Looks at every chunk a host client sends into the guest before it goes,
+/// on the connection's own thread; what it does with the look is its own
+/// business, and a slow look is a slow connection.
+pub type Inspector = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 pub struct VsockProxy {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -35,6 +40,7 @@ impl VsockProxy {
         path: &Path,
         guest_port: u32,
         shared: Arc<VsockShared>,
+        inspect: Option<Inspector>,
     ) -> io::Result<VsockProxy> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -59,8 +65,9 @@ impl VsockProxy {
                     }
                     let Ok(stream) = stream else { continue };
                     let shared = accept_shared.clone();
+                    let inspect = inspect.clone();
                     crate::workers::run("vsock-conn", crate::qos::CONNECTION_STACK, move || {
-                        serve(stream, guest_port, shared)
+                        serve(stream, guest_port, shared, inspect)
                     });
                 }
             })?;
@@ -87,7 +94,12 @@ impl Drop for VsockProxy {
 }
 
 /// One accepted connection, from open to close.
-fn serve(stream: UnixStream, guest_port: u32, shared: Arc<VsockShared>) {
+fn serve(
+    stream: UnixStream,
+    guest_port: u32,
+    shared: Arc<VsockShared>,
+    inspect: Option<Inspector>,
+) {
     // The reader half goes to the pump; the writer half stays with the device,
     // which writes guest data into it from the vCPU thread servicing TX.
     let Ok(device_side) = stream.try_clone() else {
@@ -104,5 +116,5 @@ fn serve(stream: UnixStream, guest_port: u32, shared: Arc<VsockShared>) {
         return;
     }
 
-    pump(shared, host_port, stream);
+    pump(shared, host_port, stream, inspect);
 }

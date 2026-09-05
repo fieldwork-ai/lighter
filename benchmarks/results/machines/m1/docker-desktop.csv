@@ -23,7 +23,6 @@ rm-rf,3,12736
 watch-latency,1,12
 watch-latency,2,12
 watch-latency,3,3
-memory-settled,1,4505
 memory-peak,1,4505
 memory-after-15s,1,4473
 memory-after-60s,1,4472
@@ -57,9 +56,10 @@ net-http-p99,2,372
 net-http-latency,2,152
 net-http-p99,3,233
 net-http-latency,3,153
-boot-docker,1,2657
-boot-first-container,1,2940
-boot-docker,2,2962
-boot-first-container,2,3323
-boot-docker,3,2505
-boot-first-container,3,2846
+boot-docker,1,2733
+boot-first-container,1,3195
+boot-docker,2,2643
+boot-first-container,2,3087
+boot-docker,3,2729
+boot-first-container,3,3178
+memory-idle,1,1753

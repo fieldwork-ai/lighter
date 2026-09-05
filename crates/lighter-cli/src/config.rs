@@ -80,6 +80,27 @@ pub fn idle_poll_ns(cpus: u32) -> u32 {
     if cpus >= num_cpus() { 50_000 } else { 200_000 }
 }
 
+/// The guest kernel's tick rate: 250 unless `LIGHTER_KERNEL_HZ=1000`.
+///
+/// Every tick is an exit from the VM, per vCPU, and what the tick buys is
+/// every wait the kernel counts in jiffies, which after expedited grace
+/// periods is still most of a container's start and stop. Two kernels ship.
+/// At 1000 a container's life on an M5 Pro is 60 ms against 112, and the
+/// start-up's first container 0.47 s against 0.55; but the same A/B/A/B on
+/// the share installs read pnpm 3.9–4.2 s at 250 against 4.2–4.9 and
+/// 4.9–8.3 at 1000, npm level, yarn level to slightly worse, and on an M1
+/// with four vCPUs npm 7% worse. The share installs are what most people do
+/// most of the time, so 250 is the default on every machine, and 1000 is
+/// there for a container-heavy day: compose stacks, test suites that start
+/// containers by the hundred. The rule that picked by vCPUs against cores
+/// was measured and dropped (`docs/worklog.md`, 2026-09-05).
+pub fn kernel_hz(_cpus: u32) -> u32 {
+    match std::env::var("LIGHTER_KERNEL_HZ").ok().as_deref() {
+        Some("1000") => 1000,
+        _ => 250,
+    }
+}
+
 pub fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)

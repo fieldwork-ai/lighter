@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::paths;
 
 /// Guest vsock ports. The agent binds both.
-const DOCKER_PORT: u32 = 2375;
+const DOCKER_PORT: u32 = lighter_vmm::machine::DOCKER_PORT;
 const CONTROL_PORT: u32 = lighter_vmm::memory_policy::AGENT_CONTROL_PORT;
 
 /// What `lighter status` found.

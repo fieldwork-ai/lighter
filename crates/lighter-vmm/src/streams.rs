@@ -58,6 +58,9 @@ pub fn start(shared: Arc<VsockShared>) -> io::Result<()> {
     let reactor = crate::reactor::Reactor::start(shared.clone())?;
     let _ = REACTOR.set(reactor.clone());
     crate::dns::start(shared.clone(), reactor.clone())?;
+    // The time, for the agent to ask (clock.rs): here because this is where
+    // the host's answering services start, not because it is a stream.
+    crate::clock::start(shared.clone())?;
     // The guest's UDP: one stream, every flow on it (the agent's udp.rs).
     let udp = shared.listen(UDP_PORT);
     let udp_reactor = reactor.clone();
@@ -140,7 +143,7 @@ fn serve(shared: Arc<VsockShared>, key: ConnKey) {
     };
     let _ = mac.set_nodelay(true);
     crate::sockbuf::widen(&mac);
-    pump(shared, key, mac);
+    pump(shared, key, mac, None);
 }
 
 /// Published ports, the other way round: a listener on the Mac per port
@@ -229,7 +232,7 @@ fn carry_inbound(shared: Arc<VsockShared>, port: u16, mac: TcpStream) {
     if !shared.send(key, &port.to_be_bytes()) {
         return;
     }
-    pump(shared, key, mac);
+    pump(shared, key, mac, None);
 }
 
 #[cfg(test)]

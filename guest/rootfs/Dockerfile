@@ -11,8 +11,8 @@ FROM alpine:3.22 AS rootfs
 # pulls its own runtime deps. e2fsprogs is here for the overlay2 storage driver
 # and for fsck of the data volume on boot.
 #
-# `qemu-x86_64` is the fallback for `--platform linux/amd64` on a Mac without
-# Rosetta installed; with it, Rosetta is the handler. See `docs/x86-64.md`.
+# No emulator: `--platform linux/amd64` runs under Rosetta, served from the
+# Mac, or not at all. See `docs/x86-64.md`.
 RUN apk add --no-cache \
 	iproute2 \
 	docker-engine \
@@ -30,12 +30,16 @@ RUN apk add --no-cache \
 	ca-certificates \
 	tzdata \
 	openrc \
-	busybox-openrc \
-	qemu-x86_64
+	busybox-openrc
 
 COPY init /sbin/lighter-init
 COPY lighter-agent /sbin/lighter-agent
-RUN chmod +x /sbin/lighter-init /sbin/lighter-agent
+# The binfmt handler for x86-64 when Rosetta is not there: the agent under a
+# second name, which it recognizes and answers with what to install. A hard
+# link, because `binfmt_misc` opens the registered path once at boot and the
+# agent tells the two apart by `/proc/self/exe`.
+RUN chmod +x /sbin/lighter-init /sbin/lighter-agent \
+	&& ln /sbin/lighter-agent /sbin/lighter-noamd64
 
 # Docker's data root lives on the dedicated disk, mounted at boot. Creating the
 # mount point here means init does not have to.

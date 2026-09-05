@@ -24,6 +24,27 @@ use std::os::unix::net::UnixStream;
 use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
+    // Last to go when the guest runs out of memory: the machine is dead
+    // without the agent, and the OOM killer chose it once by size.
+    let _ = std::fs::write("/proc/self/oom_score_adj", "-1000");
+
+    // Run under its other name, this is the binfmt handler for x86-64 on a
+    // machine whose Mac has no Rosetta: the kernel hands it every amd64
+    // program with the program's own path as the first argument. Say what
+    // to do and stop, so `docker run --platform linux/amd64 …` prints the
+    // fix instead of "exec format error". `/proc/self/exe` and not argv[0]:
+    // binfmt_misc puts the program's path there, not the interpreter's.
+    if std::fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n == "lighter-noamd64"))
+        .unwrap_or(false)
+    {
+        let program = std::env::args().nth(1).unwrap_or_default();
+        eprintln!(
+            "lighter: {program} is an x86-64 program, and this Mac has no Rosetta to run it. Install it once with `lighter rosetta --install` on the Mac, then `lighter stop` and `lighter start`."
+        );
+        return std::process::ExitCode::from(126);
+    }
     let mut port: u32 = 2375;
     let mut target: Option<String> = None;
     let mut echo = false;
@@ -103,6 +124,20 @@ fn main() -> std::process::ExitCode {
 
     if control {
         std::thread::spawn(bound_container_cache);
+        // The clock, as soon as there is an agent to ask for it: the seed on
+        // the command line is a whole second old before the kernel starts.
+        std::thread::spawn(|| {
+            for attempt in 0..50u32 {
+                match sync_clock_from_host() {
+                    Ok(trip) => {
+                        println!("AGENT clock=set trip_us={} attempt={attempt}", trip / 1000);
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            println!("AGENT clock=unset");
+        });
     }
 
     let listener = match VsockListener::bind(port) {
@@ -169,16 +204,11 @@ fn main() -> std::process::ExitCode {
 /// one started cold. dockerd makes the cgroup at the first container, which
 /// can be any time, so this simply keeps looking.
 fn bound_container_cache() {
-    let total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            m.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-        })
-        .map(|kb| kb * 1024);
-    let Some(total) = total else { return };
+    let Some(mut total) = mem_total() else { return };
+    // With a virtio-mem range the guest's size is the host's to set, from
+    // the lines this loop sends: they go whatever the size, and `MemTotal`
+    // is read again each tick because it moves.
+    let dynamic = std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem").exists();
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -242,6 +272,9 @@ fn bound_container_cache() {
         // (the trims, the reporting rate at 25 s) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
         std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
+        if dynamic {
+            total = mem_total().unwrap_or(total);
+        }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
             // The engine's cache (image layers) bounded too, at an eighth of
@@ -301,8 +334,16 @@ fn bound_container_cache() {
         // alone: the peak 600 MB better, the minute reading 500 MB worse,
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
-        if total >= balloon_min {
-            offer_memory(&mut memory_stream, &mut last_offer, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
+        if dynamic || total >= balloon_min {
+            offer_memory(
+                &mut memory_stream,
+                &mut last_offer,
+                total,
+                active,
+                quiet_for >= 3 * TICKS_PER_SEC,
+                running == 0,
+                dynamic && quiet_for == 0,
+            );
         }
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
@@ -336,13 +377,21 @@ fn bound_container_cache() {
             x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
         };
-        for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
+        // The containers' trim takes file cache only: a workload's memory
+        // is never swapped behind its back. The engine's takes anonymous
+        // pages first, into zram when init set it up: dockerd and containerd
+        // idle at a hundred megabytes between them, and compressed they are
+        // a third of it.
+        for (cgroup, resting, swappiness) in [(containers, floor, 0), (engine, engine_floor, 200)] {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
                 .and_then(|c| c.trim().parse::<u64>().ok())
                 .unwrap_or(0);
             if current > resting {
-                let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
+                let _ = std::fs::write(
+                    format!("{cgroup}/memory.reclaim"),
+                    format!("{} swappiness={swappiness}", current - resting),
+                );
             }
         }
         // What the trim freed is in pieces the size of the files that held
@@ -411,6 +460,7 @@ fn offer_memory(
     active: bool,
     quiet: bool,
     nothing_runs: bool,
+    busy: bool,
 ) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -453,6 +503,11 @@ fn offer_memory(
     // containers have been idle; the balloon takes only what is already
     // free.
     let release = active && free < reserve / 2;
+    // With a range to grow into, work that has less than a quarter of the
+    // guest available asks for more before it is short — available, not
+    // free, because the cache it could reclaim is its own working set and
+    // reclaiming it is the cost this avoids. The host doubles the guest.
+    let need = busy && avail < (total >> 20) / 4;
     let spare = if !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
@@ -467,7 +522,8 @@ fn offer_memory(
     // Available and free are rounded to 16 MiB: they drift by a page or two
     // on an idle guest and would defeat the comparison.
     let coarse = |v: u64| (v & !15) as u32;
-    for (i, v) in [spare as u32, coarse(avail), coarse(free), u32::from(release)].iter().enumerate() {
+    let flags = u32::from(release) | (u32::from(need) << 1) | (u32::from(nothing_runs) << 2);
+    for (i, v) in [spare as u32, coarse(avail), coarse(free), flags].iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     if *last == Some(bytes) {
@@ -481,6 +537,17 @@ fn offer_memory(
     } else {
         *last = Some(bytes);
     }
+}
+
+/// `MemTotal`, in bytes.
+fn mem_total() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
 }
 
 /// A `key=<n>` on the kernel command line, if given.
@@ -1105,12 +1172,11 @@ fn handle_control(line: &str) -> String {
             });
             "ok\n".into()
         }
-        (Some("time"), Some(seconds)) => match seconds.parse::<i64>() {
-            Ok(epoch) => match set_clock(epoch) {
-                Ok(()) => "ok\n".into(),
-                Err(e) => format!("error {e}\n"),
-            },
-            Err(_) => "error not-a-number\n".into(),
+        // The host's nudge after a wake; whatever it used to say after the
+        // word is ignored, the agent asks for the time itself.
+        (Some("time"), _) => match sync_clock_from_host() {
+            Ok(_) => "ok\n".into(),
+            Err(e) => format!("error {e}\n"),
         },
         _ => "error unknown\n".into(),
     }
@@ -1204,18 +1270,57 @@ fn read_kmsg() -> Result<String, std::io::Error> {
 /// from the host at boot and then drifts — and after the Mac sleeps, it does
 /// not so much drift as stop. Everything that checks a certificate breaks, and
 /// the error names the certificate rather than the clock.
-fn set_clock(epoch: i64) -> Result<(), std::io::Error> {
-    let tv = libc::timeval {
-        tv_sec: epoch as libc::time_t,
-        tv_usec: 0,
+///
+/// The clock is asked for, not pushed (the VMM's `clock.rs`): the guest's
+/// monotonic clock is the host's counter and cannot drift, so one accurate
+/// set is enough, and accurate means measured from this side. Three
+/// questions on one connection, the answer with the shortest round trip
+/// kept, and the wallclock set to that answer plus half its trip plus what
+/// the monotonic clock has moved since — microseconds of error where the
+/// pushed whole seconds carried half a second, the boot time and the wake
+/// retries. `set_clock` was `settimeofday` with `tv_usec: 0`.
+const TIME_PORT: u32 = 2382;
+
+fn monotonic_ns() -> i128 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
-    // SAFETY: a correctly-shaped timeval and a null timezone, which is the
-    // documented way to leave the timezone alone.
-    let rc = unsafe { libc::settimeofday(&tv, std::ptr::null()) };
+    // SAFETY: a valid timespec for the call's duration.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
+}
+
+fn sync_clock_from_host() -> Result<i128, std::io::Error> {
+    let fd = vsock::connect(TIME_PORT)?;
+    let mut sock = std::fs::File::from(fd);
+    let mut best: Option<(i128, i128, i128)> = None; // (host ns, at monotonic ns, round trip)
+    for _ in 0..3 {
+        let t1 = monotonic_ns();
+        sock.write_all(&[1])?;
+        let mut reply = [0u8; 12];
+        sock.read_exact(&mut reply)?;
+        let t2 = monotonic_ns();
+        let secs = u64::from_le_bytes(reply[..8].try_into().expect("8 bytes"));
+        let nanos = u32::from_le_bytes(reply[8..].try_into().expect("4 bytes"));
+        let host = secs as i128 * 1_000_000_000 + nanos as i128;
+        let trip = t2 - t1;
+        if best.is_none_or(|(_, _, t)| trip < t) {
+            best = Some((host + trip / 2, t2, trip));
+        }
+    }
+    let (host_at_t2, t2, trip) = best.expect("three rounds");
+    let now = host_at_t2 + (monotonic_ns() - t2);
+    let ts = libc::timespec {
+        tv_sec: (now / 1_000_000_000) as libc::time_t,
+        tv_nsec: (now % 1_000_000_000) as libc::c_long,
+    };
+    // SAFETY: a correctly-shaped timespec for the call's duration.
+    let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(())
+    Ok(trip)
 }
 
 /// Copies between the vsock connection and a unix socket until either ends.

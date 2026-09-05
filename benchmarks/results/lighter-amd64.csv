@@ -1,0 +1,13 @@
+case,rep,ms
+npm-install,1,9496
+npm-install,2,9283
+npm-install,3,9210
+pnpm-install,1,2944
+pnpm-install,2,3007
+pnpm-install,3,2981
+cpu-sha256,1,4147
+cpu-sha256,2,4186
+cpu-sha256,3,4169
+container-start,1,157
+container-start,2,155
+container-start,3,153

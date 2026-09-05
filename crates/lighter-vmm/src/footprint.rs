@@ -79,7 +79,7 @@ pub fn bytes() -> u64 {
 }
 
 /// Resident, internal (anonymous) and reusable bytes, for a trace.
-pub fn split() -> (u64, u64, u64) {
+pub fn split() -> (u64, u64, u64, u64) {
     let mut info = TaskVmInfo::default();
     let mut count = TASK_VM_INFO_COUNT
         .min((std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<u32>()) as libc::c_uint);
@@ -93,9 +93,14 @@ pub fn split() -> (u64, u64, u64) {
         )
     };
     if rc != 0 {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     } else {
-        (info.resident_size, info.internal, info.reusable)
+        (
+            info.resident_size,
+            info.internal,
+            info.reusable,
+            info.compressed,
+        )
     }
 }
 
