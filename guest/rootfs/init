@@ -342,12 +342,17 @@ fi
 # --iptables is left on: Docker's own bridge networking needs it, and the
 # kernel carries the netfilter modules for exactly this.
 #
-# --userland-proxy=false because Alpine's docker-engine ships no docker-proxy
-# binary, and dockerd refuses to start rather than degrade ("userland-proxy is
-# enabled, but userland-proxy-path is not set"). Turning it off is the right
-# answer regardless: publishing a port then rests on netfilter DNAT alone, and
-# the host side of the journey is a stream the VMM carries, not a hairpin
-# process here.
+# The userland proxy stays on (Alpine 3.22 ships docker-proxy). Off, Docker
+# 28 insists on br_netfilter for hairpin traffic and will not start without
+# it, and br_netfilter is the one thing this guest must not have: it runs the
+# IP prerouting hooks in bridge context for a container's frames, where the
+# socket TPROXY assigns does not survive into routing, so a container's UDP
+# never reached the agent while it was on — and Docker turns it on at every
+# bridge network it makes, so a knob turned off here did not stay off. The
+# kernel does not carry it. Published ports still reach a container by DNAT
+# (the agent connects to the guest's own address, which Docker's nat OUTPUT
+# chain rewrites); docker-proxy only carries what DNAT cannot, one container
+# reaching another's published port through the host's own address.
 #
 # --mtu is the link's own, read back from eth0: the host terminates every
 # flow on its side of the link, so the only thing the number decides is how
@@ -372,7 +377,6 @@ sh -c '
 		--containerd=/run/containerd/containerd.sock \
 		--data-root=/var/lib/docker \
 		--storage-driver=overlay2 \
-		--userland-proxy=false \
 		--mtu="$1" \
 		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
 DOCKERD_PID=$!
@@ -404,13 +408,6 @@ while [ "$waited" -lt 1200 ]; do
 done
 
 echo "INIT dockerd=$dockerd_state after=$((waited * 50))ms t=$(cut -d' ' -f1 /proc/uptime)"
-# dockerd turns the bridge's netfilter call on at start, which runs the IP
-# prerouting hooks in the bridge's context for traffic off docker0 — and a
-# socket TPROXY assigns there does not survive into routing, so a
-# container's UDP counted as "no port". Off: published ports are DNAT on
-# routed traffic and unaffected, and the isolation between Docker networks
-# is on the forward hook, likewise.
-sysctl -q -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 if [ "$dockerd_state" != ready ]; then
 	echo "--- dockerd log ---"
 	tail -30 /var/log/dockerd.log
