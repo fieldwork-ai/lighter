@@ -156,6 +156,20 @@ if [ -b "$DATA_DEV" ]; then
 	echo none > "/sys/block/${DATA_DEV#/dev/}/queue/scheduler" 2>/dev/null
 	if mount -o "$DATA_OPTS" "$DATA_DEV" /mnt/data; then
 		echo "INIT data=mounted"
+		# `lighter.data_warm=<GiB>`: an experiment's knob. btrfs allocates
+		# its block groups on first use, a gigabyte of data at a time with
+		# the chunk, device and free-space trees written for each; a file
+		# preallocated and removed leaves the groups behind, so a first
+		# write onto never-used space costs what a write onto used space
+		# does. Measured against the first-touch cost of the guest's disk.
+		for arg in $(cat /proc/cmdline); do
+			case "$arg" in
+			lighter.data_warm=*)
+				warm="${arg#lighter.data_warm=}"
+				fallocate -l "${warm}G" /mnt/data/.warm 2>/dev/null && rm -f /mnt/data/.warm && sync && echo "INIT data_warm=${warm}G"
+				;;
+			esac
+		done
 		mkdir -p /mnt/data/docker
 		mount --bind /mnt/data/docker /var/lib/docker
 		# The first trim after a mount covers every free block group, so

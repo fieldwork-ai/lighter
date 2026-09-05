@@ -85,6 +85,18 @@ impl Disk {
 
         let actual_len = file.metadata()?.len();
         let len = if actual_len == 0 && !read_only {
+            // `LIGHTER_DISK_PREALLOC=1`: an experiment's knob. APFS
+            // allocates an image's extents as the guest first writes each
+            // block, and F_PREALLOCATE only allocates from the end of the
+            // file — which, before the size is set, is the start. Asked
+            // then, the whole image is allocated in one go, and a first
+            // write onto never-used space costs what a write onto used
+            // space does on the host. Measured against the guest's disk's
+            // first-touch cost; not a default, since it makes every image
+            // cost its full size on the Mac from the day it is made.
+            if std::env::var("LIGHTER_DISK_PREALLOC").is_ok_and(|v| v == "1") {
+                preallocate(&file, len);
+            }
             file.set_len(len)?;
             len
         } else {
@@ -341,6 +353,35 @@ impl Disk {
             written += n as u64;
         }
         Ok(())
+    }
+}
+
+/// Allocates `len` bytes of an empty file's space up front (see `open_or_create`).
+fn preallocate(file: &File, len: u64) {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct Fstore {
+        fst_flags: u32,
+        fst_posmode: libc::c_int,
+        fst_offset: libc::off_t,
+        fst_length: libc::off_t,
+        fst_bytesalloc: libc::off_t,
+    }
+    const F_ALLOCATEALL: u32 = 4;
+    const F_PEOFPOSMODE: libc::c_int = 3;
+    let mut store = Fstore {
+        fst_flags: F_ALLOCATEALL,
+        fst_posmode: F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: a valid descriptor and a correctly laid out fstore_t.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    if rc != 0 {
+        tracing::warn!(err = %io::Error::last_os_error(), "could not preallocate the image");
+    } else {
+        tracing::info!(mib = store.fst_bytesalloc >> 20, "image preallocated");
     }
 }
 
