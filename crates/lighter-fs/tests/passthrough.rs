@@ -66,6 +66,29 @@ impl Sink for Buffer {
     }
 }
 
+/// Held by every test that lowers the fd budget or counts revivals. The
+/// budget is a process-wide variable read when a server is built, and
+/// `REOPENS` a process-wide counter, and cargo runs tests on parallel threads:
+/// without this, one test's reclaim lands inside another's window. CI once
+/// counted 17 revivals against a bound of 16 on a commit that touched only
+/// the worklog.
+static RECLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn reclaim_alone() -> std::sync::MutexGuard<'static, ()> {
+    RECLAIM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A low fd budget for the servers built while the guard is held.
+fn with_budget(budget: &str) -> std::sync::MutexGuard<'static, ()> {
+    let guard = reclaim_alone();
+    // SAFETY: set before the server is built, and the value is read once; the
+    // guard keeps every other budgeted test out until this one removes it.
+    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", budget) };
+    guard
+}
+
 struct Guest {
     server: Server,
     unique: u64,
@@ -853,8 +876,7 @@ fn a_listing_and_a_lookup_agree_about_inode_numbers() {
 /// reclaim run — at the real budget this would need a hundred thousand.
 #[test]
 fn a_parked_inode_still_reads_back_what_was_written() {
-    // SAFETY: set before the server is built, and the value is read once.
-    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "64") };
+    let _alone = with_budget("64");
     let mut guest = Guest::new("parked-read");
 
     const FILES: usize = 400;
@@ -908,8 +930,7 @@ fn a_parked_inode_still_reads_back_what_was_written() {
 /// while every sweep reports finding nothing to park.
 #[test]
 fn the_reclaim_keeps_up_while_the_tree_is_being_walked() {
-    // SAFETY: set before the server is built, and the value is read once.
-    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "128") };
+    let _alone = with_budget("128");
     let mut guest = Guest::new("parked-hot");
 
     const FILES: usize = 1500;
@@ -1560,8 +1581,7 @@ fn a_listing_in_progress_survives_a_thousand_other_listings() {
 #[test]
 fn a_parked_file_is_reached_through_its_parent() {
     use std::os::unix::fs::PermissionsExt;
-    // SAFETY: set before the server is built, and the value is read once.
-    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "64") };
+    let _alone = with_budget("64");
     let mut guest = Guest::new("placed");
     std::fs::create_dir(guest.host("d")).unwrap();
     let dir = guest.lookup(1, "d").unwrap();
@@ -1968,6 +1988,7 @@ fn two_renames_onto_one_promised_name_land_in_order() {
 /// file it had just made.
 #[test]
 fn listing_parked_clones_revives_none_of_them() {
+    let _alone = reclaim_alone();
     let mut guest = Guest::new("readdirplus-parked");
     std::fs::write(guest.host("store"), b"bytes").unwrap();
     let store = guest.lookup(1, "store").expect("lookup");
@@ -2001,8 +2022,7 @@ fn listing_parked_clones_revives_none_of_them() {
 
 #[test]
 fn a_parked_directory_is_not_revived_by_creating_inside_it() {
-    // SAFETY: set before the server is built, and the value is read once.
-    unsafe { std::env::set_var("LIGHTER_FS_FD_BUDGET", "64") };
+    let _alone = with_budget("64");
     let mut guest = Guest::new("parked-dirs");
     const DIRS: usize = 200;
     let mut dirs = Vec::new();
