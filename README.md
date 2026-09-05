@@ -174,15 +174,15 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 117.7 | 53.8 | **64.9** | 4.3 | 13.6 |
-| TCP, the Mac to a container | Gbit/s | 117.0 | **34.7** | 29.2 | 3.2 | 10.1 |
-| TCP into a published port | Gbit/s | — | **43.1** | 29.9 | 3.1 | 10.1 |
-| TCP out of a published port | Gbit/s | — | 54.6 | **67.6** | 3.8 | 22.2 |
+| TCP, container to the Mac | Gbit/s | 117.7 | 57.1 | **64.9** | 4.3 | 13.6 |
+| TCP, the Mac to a container | Gbit/s | 117.0 | **47.0** | 29.2 | 3.2 | 10.1 |
+| TCP into a published port | Gbit/s | — | **45.5** | 29.9 | 3.1 | 10.1 |
+| TCP out of a published port | Gbit/s | — | 54.7 | **67.6** | 3.8 | 22.2 |
 | UDP, container to the Mac | Gbit/s | 24.4 | **5.0** | 3.1 | 2.6 | 0.0 |
-| connects to a published port | thousand per second | 24.9 | **19.1** | 16.4 | 7.9 | 17.7 |
-| GET on a published port, median | µs | 54 | 133 | **127** | 453 | 153 |
-| GET on a published port, p99 | µs | 106 | 230 | **221** | 574 | 372 |
-| DNS lookup from a container, median | µs | 3876 | **153** | 425 | 686 | 758 |
+| connects to a published port | thousand per second | 24.9 | 15.0 | 16.4 | 7.9 | **17.7** |
+| GET on a published port, median | µs | 54 | 128 | **127** | 453 | 153 |
+| GET on a published port, p99 | µs | 106 | 284 | **221** | 574 | 372 |
+| DNS lookup from a container, median | µs | 3876 | **130** | 425 | 686 | 758 |
 
 #### Idle power
 
@@ -190,8 +190,8 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| CPU, ms per second | **10** | 20 | 11 | 44 |
-| Wakeups per second | 103 | 84 | **55** | 1998 |
+| CPU, ms per second | **11** | 20 | **11** | 44 |
+| Wakeups per second | 135 | 84 | **55** | 1998 |
 
 #### Starting up
 
