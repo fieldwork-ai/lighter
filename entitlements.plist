@@ -2,10 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Required to run a virtual machine with Virtualization.framework.
-	     Unrestricted: no provisioning profile or Apple approval is needed,
-	     only a signature. -->
-	<key>com.apple.security.virtualization</key>
+	<!-- Required to call any Hypervisor.framework API. Unrestricted: no
+	     provisioning profile or Apple approval is needed, only a signature. -->
+	<key>com.apple.security.hypervisor</key>
 	<true/>
 </dict>
 </plist>

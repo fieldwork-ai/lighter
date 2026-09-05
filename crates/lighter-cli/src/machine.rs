@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::paths;
 
-/// Guest ports on the link. The agent binds both.
-const DOCKER_PORT: u16 = lighter_vmm::link::DOCKER_PORT;
-const CONTROL_PORT: u16 = lighter_vmm::link::CONTROL_PORT;
+/// Guest vsock ports. The agent binds both.
+const DOCKER_PORT: u32 = 2375;
+const CONTROL_PORT: u32 = lighter_vmm::memory_policy::AGENT_CONTROL_PORT;
 
 /// What `lighter status` found.
 pub struct Status {
@@ -184,32 +184,21 @@ pub fn control(command: &str) -> anyhow::Result<String> {
     Ok(reply.trim().to_string())
 }
 
-/// The machine's resident memory: the VMM and the framework's helper
-/// (named in `helper.pid` by the machine), which is where the guest's
-/// memory is charged.
+/// The machine's physical footprint, as macOS accounts it.
 fn footprint_mib(pid: u32) -> Option<u64> {
-    let mut pids = vec![pid.to_string()];
-    if let Ok(helper) =
-        paths::home().and_then(|h| Ok(std::fs::read_to_string(h.join("helper.pid"))?))
-    {
-        let helper = helper.trim();
-        if !helper.is_empty() {
-            pids.push(helper.to_string());
-        }
-    }
     let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "rss=", "-p", &pids.join(",")])
+        .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
         .ok()?;
     let kib: u64 = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .filter_map(|v| v.parse::<u64>().ok())
-        .sum();
+        .trim()
+        .parse()
+        .ok()?;
     Some(kib / 1024)
 }
 
-/// The guest ports the machine serves, and where they appear on the Mac.
-pub fn sockets() -> anyhow::Result<Vec<(std::path::PathBuf, u16)>> {
+/// The vsock ports the machine serves, and where they appear on the Mac.
+pub fn sockets() -> anyhow::Result<Vec<(std::path::PathBuf, u32)>> {
     Ok(vec![
         (paths::docker_socket()?, DOCKER_PORT),
         (paths::home()?.join("control.sock"), CONTROL_PORT),

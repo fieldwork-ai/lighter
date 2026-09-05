@@ -1,0 +1,310 @@
+virtio-fs: a queue for notifications from the device
+
+Linux's virtio-fs driver has a high-priority queue and request queues, and
+nothing else. Both carry traffic from the guest to the host, so FUSE's
+reverse channel — the one a server uses to say "forget what you cached
+about this file" — has nowhere to go over virtio-fs, and a share can only
+be cached for a fixed timeout that nothing is able to shorten.
+
+That timeout is the whole performance story. Measured on this machine, a
+metadata walk of an installed package tree costs 275ms with a 100ms entry
+timeout and 15ms with an unbounded one, against 62ms for the same walk on
+the Mac's own disk. The difference is entirely dentry revalidation, and
+the only reason we cannot simply raise the timeout is that we would then
+have no way to correct the guest when the host changes something.
+
+So: one more virtqueue, written by the device, carrying FUSE's own
+notification messages verbatim — a fuse_out_header with `unique` of zero
+and the notification code in `error`, exactly as a server writes to
+/dev/fuse. The device advertises VIRTIO_FS_F_NOTIFICATION; a driver that
+does not negotiate it behaves as before. The queue is placed last rather
+than second so that both sides agree about every other index either way.
+
+Only the two invalidations are handled, which are the two that matter for
+a shared directory: INVAL_ENTRY for a name appearing or disappearing, and
+INVAL_INODE for contents changing. Everything else is ignored rather than
+rejected, so a future notification can be added on the device side without
+this becoming a compatibility problem.
+
+Notifications are consumed in a work item because invalidating a dentry
+takes inode locks and may sleep, and because nothing in the guest is
+waiting on the result.
+
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index b2f6486fe..bb56a25f4 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -39,9 +39,31 @@ static struct kset *virtio_fs_kset;
+ 
+ enum {
+ 	VQ_HIPRIO,
+-	VQ_REQUEST
++	VQ_REQUEST,
++	/*
++	 * A queue the *device* writes to, carrying FUSE notifications into the
++	 * guest. It is not a third kind of request queue: it lives at the end
++	 * of the array so that a driver which does not negotiate
++	 * VIRTIO_FS_F_NOTIFICATION simply never touches it.
++	 */
++	VQ_NOTIFY
+ };
+ 
++/* The device can push FUSE notifications to the driver. */
++#define VIRTIO_FS_F_NOTIFICATION 0
++
++/*
++ * How many notification buffers to keep posted, and how large each is.
++ *
++ * Notifications are small — a header, an inode number and a name — so the
++ * size is one page for comfort rather than for need. The count bounds how
++ * many the device may have in flight before it has to wait for the guest to
++ * consume some, which matters when a build on the host touches thousands of
++ * files at once.
++ */
++#define VIRTIO_FS_NOTIFY_BUFS 64
++#define VIRTIO_FS_NOTIFY_BUF_SIZE 4096
++
+ #define VQ_NAME_LEN	24
+ 
+ /* Per-virtqueue state */
+@@ -73,6 +95,9 @@ struct virtio_fs {
+ 
+ 	unsigned int *mq_map; /* index = cpu id, value = request vq id */
+ 
++	/* Set when VIRTIO_FS_F_NOTIFICATION was negotiated. */
++	bool notify_enabled;
++
+ 	/* DAX memory window where file contents are mapped */
+ 	void *window_kaddr;
+ 	phys_addr_t window_phys_addr;
+@@ -894,6 +919,144 @@ static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *f
+ 	kfree(masks);
+ }
+ 
++/*
++ * Hands one notification to FUSE.
++ *
++ * The wire format is FUSE's own: a fuse_out_header whose `unique` is zero and
++ * whose `error` field carries the notification code, exactly as a server
++ * writes it to /dev/fuse. Reusing it means the device side has nothing
++ * virtio-specific to invent, and this side has nothing to translate.
++ *
++ * Everything is bounds-checked against the length the device actually wrote,
++ * because that length is the only thing here the guest did not choose.
++ */
++static void virtio_fs_notify_one(struct fuse_conn *fc, void *buf,
++				 unsigned int len)
++{
++	struct fuse_out_header oh;
++	void *payload;
++	unsigned int plen;
++
++	if (len < sizeof(oh))
++		return;
++	memcpy(&oh, buf, sizeof(oh));
++	if (oh.unique != 0 || oh.len < sizeof(oh) || oh.len > len)
++		return;
++	payload = (char *)buf + sizeof(oh);
++	plen = oh.len - sizeof(oh);
++
++	switch (oh.error) {
++	case FUSE_NOTIFY_INVAL_INODE: {
++		struct fuse_notify_inval_inode_out out;
++
++		if (plen < sizeof(out))
++			return;
++		memcpy(&out, payload, sizeof(out));
++		fuse_reverse_inval_inode(fc, out.ino, out.off, out.len);
++		break;
++	}
++	case FUSE_NOTIFY_INVAL_ENTRY: {
++		struct fuse_notify_inval_entry_out out;
++		struct qstr name;
++
++		if (plen < sizeof(out))
++			return;
++		memcpy(&out, payload, sizeof(out));
++		if (out.namelen == 0 || out.namelen > FUSE_NAME_MAX)
++			return;
++		/* The name is NUL-terminated, and the NUL is inside the buffer. */
++		if (sizeof(out) + (size_t)out.namelen + 1 > plen)
++			return;
++		name.name = (char *)payload + sizeof(out);
++		name.len = out.namelen;
++		if (name.name[name.len] != '\0')
++			return;
++		fuse_reverse_inval_entry(fc, out.parent, 0, &name, out.flags);
++		break;
++	}
++	default:
++		break;
++	}
++}
++
++/* Gives one buffer back to the device to be filled again. */
++static int virtio_fs_notify_post(struct virtio_fs_vq *fsvq, void *buf)
++{
++	struct scatterlist sg;
++
++	sg_init_one(&sg, buf, VIRTIO_FS_NOTIFY_BUF_SIZE);
++	return virtqueue_add_inbuf(fsvq->vq, &sg, 1, buf, GFP_ATOMIC);
++}
++
++/*
++ * Consumes whatever the device has written.
++ *
++ * In a work item rather than the interrupt handler because invalidating a
++ * dentry takes inode locks and may sleep, and because there is no hurry: the
++ * guest is not waiting on any of this.
++ */
++static void virtio_fs_notify_done_work(struct work_struct *work)
++{
++	struct virtio_fs_vq *fsvq = container_of(work, struct virtio_fs_vq,
++						 done_work);
++	struct fuse_conn *fc = fsvq->fud ? fsvq->fud->fc : NULL;
++	unsigned int len;
++	void *buf;
++
++	for (;;) {
++		spin_lock(&fsvq->lock);
++		buf = virtqueue_get_buf(fsvq->vq, &len);
++		spin_unlock(&fsvq->lock);
++		if (!buf)
++			break;
++
++		/* Before the filesystem is mounted there is nothing to tell. */
++		if (fc) {
++			down_read(&fc->killsb);
++			virtio_fs_notify_one(fc, buf, len);
++			up_read(&fc->killsb);
++		}
++
++		spin_lock(&fsvq->lock);
++		if (!fsvq->connected || virtio_fs_notify_post(fsvq, buf) < 0) {
++			spin_unlock(&fsvq->lock);
++			kfree(buf);
++			continue;
++		}
++		virtqueue_kick(fsvq->vq);
++		spin_unlock(&fsvq->lock);
++	}
++}
++
++/* The notification queue queues nothing of its own. */
++static void virtio_fs_notify_dispatch_work(struct work_struct *work)
++{
++}
++
++/* Fills the notification queue so the device has somewhere to write. */
++static int virtio_fs_notify_fill(struct virtio_fs_vq *fsvq)
++{
++	unsigned int i;
++
++	for (i = 0; i < VIRTIO_FS_NOTIFY_BUFS; i++) {
++		void *buf = kmalloc(VIRTIO_FS_NOTIFY_BUF_SIZE, GFP_KERNEL);
++
++		if (!buf)
++			return -ENOMEM;
++		spin_lock(&fsvq->lock);
++		if (virtio_fs_notify_post(fsvq, buf) < 0) {
++			spin_unlock(&fsvq->lock);
++			kfree(buf);
++			break;
++		}
++		spin_unlock(&fsvq->lock);
++	}
++	spin_lock(&fsvq->lock);
++	virtqueue_kick(fsvq->vq);
++	spin_unlock(&fsvq->lock);
++	return 0;
++}
++
+ /* Virtqueue interrupt handler */
+ static void virtio_fs_vq_done(struct virtqueue *vq)
+ {
+@@ -913,7 +1076,11 @@ static void virtio_fs_init_vq(struct virtio_fs_vq *fsvq, char *name,
+ 	INIT_LIST_HEAD(&fsvq->end_reqs);
+ 	init_completion(&fsvq->in_flight_zero);
+ 
+-	if (vq_type == VQ_REQUEST) {
++	if (vq_type == VQ_NOTIFY) {
++		INIT_WORK(&fsvq->done_work, virtio_fs_notify_done_work);
++		INIT_WORK(&fsvq->dispatch_work,
++				virtio_fs_notify_dispatch_work);
++	} else if (vq_type == VQ_REQUEST) {
+ 		INIT_WORK(&fsvq->done_work, virtio_fs_requests_done_work);
+ 		INIT_WORK(&fsvq->dispatch_work,
+ 				virtio_fs_request_dispatch_work);
+@@ -943,10 +1110,17 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 	if (fs->num_request_queues == 0)
+ 		return -EINVAL;
+ 
+-	/* Truncate nr of request queues to nr_cpu_id */
+-	fs->num_request_queues = min_t(unsigned int, fs->num_request_queues,
+-					nr_cpu_ids);
+-	fs->nvqs = VQ_REQUEST + fs->num_request_queues;
++	/*
++	 * Mainline truncates the request queue count to nr_cpu_ids here. This
++	 * driver must not: the device places its notification queue
++	 * immediately after the request queues it ADVERTISED, so a driver
++	 * that silently uses fewer renumbers every later queue and the two
++	 * sides no longer agree about which ring carries what. The device
++	 * already bounds the count it offers.
++	 */
++	fs->notify_enabled = virtio_has_feature(vdev, VIRTIO_FS_F_NOTIFICATION);
++	fs->nvqs = VQ_REQUEST + fs->num_request_queues +
++		   (fs->notify_enabled ? 1 : 0);
+ 	fs->vqs = kcalloc(fs->nvqs, sizeof(fs->vqs[VQ_HIPRIO]), GFP_KERNEL);
+ 	if (!fs->vqs)
+ 		return -ENOMEM;
+@@ -966,7 +1140,7 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 	vqs_info[VQ_HIPRIO].name = fs->vqs[VQ_HIPRIO].name;
+ 
+ 	/* Initialize the requests virtqueues */
+-	for (i = VQ_REQUEST; i < fs->nvqs; i++) {
++	for (i = VQ_REQUEST; i < VQ_REQUEST + fs->num_request_queues; i++) {
+ 		char vq_name[VQ_NAME_LEN];
+ 
+ 		snprintf(vq_name, VQ_NAME_LEN, "requests.%u", i - VQ_REQUEST);
+@@ -975,6 +1149,17 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 		vqs_info[i].name = fs->vqs[i].name;
+ 	}
+ 
++	/* And the notification queue, which is last so that a driver without
++	 * it and a device with it still agree about every other index.
++	 */
++	if (fs->notify_enabled) {
++		unsigned int n = fs->nvqs - 1;
++
++		virtio_fs_init_vq(&fs->vqs[n], "notify", VQ_NOTIFY);
++		vqs_info[n].callback = virtio_fs_vq_done;
++		vqs_info[n].name = fs->vqs[n].name;
++	}
++
+ 	ret = virtio_find_vqs(vdev, fs->nvqs, vqs, vqs_info, &desc);
+ 	if (ret < 0)
+ 		goto out;
+@@ -983,6 +1168,12 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 		fs->vqs[i].vq = vqs[i];
+ 
+ 	virtio_fs_start_all_queues(fs);
++
++	if (fs->notify_enabled) {
++		ret = virtio_fs_notify_fill(&fs->vqs[fs->nvqs - 1]);
++		if (ret < 0)
++			goto out;
++	}
+ out:
+ 	kfree(vqs_info);
+ 	kfree(vqs);
+@@ -1216,7 +1407,9 @@ static const struct virtio_device_id id_table[] = {
+ 	{},
+ };
+ 
+-static const unsigned int feature_table[] = {};
++static const unsigned int feature_table[] = {
++	VIRTIO_FS_F_NOTIFICATION,
++};
+ 
+ static struct virtio_driver virtio_fs_driver = {
+ 	.driver.name		= KBUILD_MODNAME,

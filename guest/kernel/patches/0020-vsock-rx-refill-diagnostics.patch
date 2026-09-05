@@ -1,0 +1,52 @@
+vsock: say why a receive refill posted nothing
+
+A refill that posts no buffer leaves the device unable to answer and nothing retries it. Print the ring's free count, the driver's buffer count and the add's error the first time that happens, and flag a buffer count that says half the ring is posted while the ring is empty.
+
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -312,8 +312,11 @@
+ 	struct virtqueue *vq;
+ 	struct sk_buff *skb;
+ 	int ret;
++
++	int posted = 0;
+ 
+ 	vq = vsock->vqs[VSOCK_VQ_RX];
++	ret = 0;
+ 
+ 	do {
+ 		skb = virtio_vsock_alloc_linear_skb(total_len, GFP_KERNEL);
+@@ -330,9 +333,17 @@
+ 		}
+ 
+ 		vsock->rx_buf_nr++;
++		posted++;
+ 	} while (vq->num_free);
+ 	if (vsock->rx_buf_nr > vsock->rx_buf_max_nr)
+ 		vsock->rx_buf_max_nr = vsock->rx_buf_nr;
++	/* lighter: a refill that posts nothing leaves the device with no
++	 * buffer to answer into, and nothing retries it; say why.
++	 */
++	if (!posted)
++		pr_warn_ratelimited("virtio_vsock: rx_fill posted nothing: num_free=%u rx_buf_nr=%d max=%d ret=%d alloc=%d\n",
++				    vq->num_free, vsock->rx_buf_nr,
++				    vsock->rx_buf_max_nr, ret, skb != NULL);
+ 	virtqueue_kick(vq);
+ }
+ 
+@@ -665,6 +676,15 @@
+ 	} while (!virtqueue_enable_cb(vq));
+ 
+ out:
++	/* lighter: the ring is empty from the device's side when num_free is
++	 * the whole ring; a count that still says half of it is posted is
++	 * the leak that ends in a receive ring nobody refills.
++	 */
++	if (vq->num_free >= virtqueue_get_vring_size(vq) &&
++	    vsock->rx_buf_nr >= vsock->rx_buf_max_nr / 2)
++		pr_warn_ratelimited("virtio_vsock: rx ring empty but rx_buf_nr=%d max=%d num_free=%u\n",
++				    vsock->rx_buf_nr, vsock->rx_buf_max_nr,
++				    vq->num_free);
+ 	if (vsock->rx_buf_nr < vsock->rx_buf_max_nr / 2)
+ 		virtio_vsock_rx_fill(vsock);
+ 	mutex_unlock(&vsock->rx_lock);

@@ -69,7 +69,6 @@ cargo build $([ "$PROFILE" = release ] && echo --release) --example lighter-benc
 ./scripts/sign.sh "$BIN" >/dev/null
 
 SHARE="$(mktemp -d -t lighter-share)"
-RUN_DIR="$(mktemp -d -t lighter-m4)"
 LOG="$(mktemp -t lighter-m4)"
 VMM_PID=""
 
@@ -90,9 +89,8 @@ boot() {
 		--initramfs "$INITRAMFS" \
 		--no-tty \
 		--cpus 4 \
-		--net --run-dir "$RUN_DIR" \
 		--share "$TAG:$SHARE" \
-		--cmdline "console=hvc0 panic=-1 lighter.share=$TAG:$MOUNT lighter.fstest=$mode" \
+		--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 lighter.share=$TAG:$MOUNT lighter.fstest=$mode" \
 		>>"$LOG" 2>&1 &
 	VMM_PID=$!
 	# Part three kills this with SIGKILL on purpose; without disowning it, bash
@@ -266,6 +264,7 @@ else
 	rm -rf "${SHARE:?}"/*
 	printf 'placed by macOS' > "$SHARE/from-host"
 
+	RUN_DIR="$(mktemp -d -t lighter-m4d)"
 	SOCKET="$RUN_DIR/docker.sock"
 	: > "$LOG"
 	"$BIN" \
@@ -273,10 +272,10 @@ else
 		--disk "$ROOTFS" \
 		--disk "$RUN_DIR/data.img" --disk-size-gib 16 \
 		--net --run-dir "$RUN_DIR" \
-		--proxy "$SOCKET:2375" \
+		--vsock "$SOCKET:2375" \
 		--share "$TAG:$SHARE" \
 		--no-tty --cpus 4 --memory-mib 4096 \
-		--cmdline "console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=$TAG:$MOUNT" \
+		--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.share=$TAG:$MOUNT" \
 		>>"$LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true

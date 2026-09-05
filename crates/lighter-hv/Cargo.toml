@@ -1,0 +1,16 @@
+[package]
+name = "lighter-hv"
+description = "Safe bindings to Apple's Hypervisor.framework on Apple silicon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

@@ -2,7 +2,7 @@
 
 The fastest Docker runtime for macOS, open-source.
 
-lighter runs a Linux guest on Apple's Virtualization.framework and puts its own code on every path that matters: a file server with a cache the Mac can correct in milliseconds, a network that carries connections rather than packets, a kernel built from source with its own patches, and a memory policy that hands RAM back when the containers stop. Built from scratch to be the fastest way to run containers on a Mac, lighter is an open-source, MIT-licensed competitor to OrbStack and Docker Desktop, and it runs amd64 images under Rosetta.
+lighter is a virtual machine monitor built directly on `Hypervisor.framework` in Rust, implementing its own vCPU loop, GICv3 interrupt controller, virtio device models, and guest Linux kernel. Built from scratch to be the fastest way to run containers on a Mac, lighter is an open-source, MIT-licensed competitor to OrbStack and Docker Desktop.
 
 **MIT licensed. No commercial subscriptions, no paid tiers, no "free during beta", and no telemetry.**
 
@@ -182,7 +182,7 @@ The performance of containers on macOS comes down to four bottlenecks: the share
 Bind mounts on macOS are notoriously slow because every syscall crosses the hypervisor into APFS, where creating tens of thousands of tiny files incurs synchronous disk latency.
 
 lighter approaches this differently:
-- **Cached reads with real-time invalidation:** The guest's page cache serves reads in memory without crossing the VM boundary. To keep it coherent with macOS edits, lighter's file server has a channel back into the guest: when macOS `FSEvents` detects a host file change, it invalidates the exact guest dentry within milliseconds. The shares travel over a FUSE transport lighter adds to the guest kernel, straight to lighter's own server, rather than through the framework's virtio-fs.
+- **Cached reads with real-time invalidation:** The guest's page cache serves reads in memory without crossing the VM boundary. To keep it coherent with macOS edits, lighter's custom virtio-fs driver incorporates a notification channel: when macOS `FSEvents` detects a host file change, it invalidates the exact guest dentry within milliseconds.
 - **Asynchronous mutation lanes:** Creates, writes, and renames are promised to the guest immediately and flushed to APFS via dedicated asynchronous worker queues.
 - **Identity-based inode tracking:** When descriptor limits are reached under massive trees (e.g. 100,000+ files in `node_modules`), inodes are parked and referenced through parent directory descriptors by identity, avoiding slow path walks and descriptor churn.
 
@@ -194,20 +194,20 @@ The container writable layer and named volumes live on an internal virtual disk 
 
 ### 3. Cooperative memory management
 A guest holding 8 GB of RAM after a heavy build starves the Mac.
-- **The guest offers what it does not need:** Seconds after the containers go quiet, lighter's agent trims their caches, compacts, and tells the Mac how much it can spare; the balloon takes it and macOS gets it back. Nothing waits for memory pressure.
-- **Compressor-steered ballooning:** On memory-constrained hosts (like 8 GB M1s), macOS compresses memory before reporting pressure. lighter monitors the host compressor rate: if the Mac begins compressing heavily, the balloon inflates in aligned 16 KiB host-page compound blocks to release host physical memory, deflating once the compressor has quieted.
+- **Free page reporting:** When memory is freed inside the guest, `CONFIG_PAGE_REPORTING` volunteers those physical pages back to macOS immediately without hypervisor intervention.
+- **Compressor-steered ballooning:** On memory-constrained hosts (like 8 GB M1s), macOS compresses memory before reporting pressure. lighter monitors the host compressor rate: if the Mac begins compressing heavily, the virtio-balloon inflates in aligned 16 KiB host-page compound blocks to safely release host physical memory, deflating once the compressor has quieted.
 
 ### 4. The network as streams, not packets
 Every other runtime gives the VM a virtual network card and runs a TCP/IP stack on the Mac side to turn its packets back into connections. Each byte is then copied and checksummed twice, once by the guest kernel and once by that userspace stack, and every packet is a round trip across the hypervisor boundary.
 
 lighter does not carry packets across the boundary at all:
-- **One connection, one stream:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which opens a single connection to the Mac for it, over the link to the gateway address. The host side terminates that connection in a small in-process TCP (smoltcp), opens an ordinary macOS socket to the destination and copies bytes between the two. The Mac's own kernel terminates the real connection, so VPNs, proxies and the Mac's routing all apply as they would to any Mac process.
-- **Joined in the guest kernel:** The container's socket and its stream are joined by a BPF sockmap, so the data path inside the guest is a kernel-to-kernel copy with no process in the middle, and the link carries 64 KiB frames.
+- **One connection, one stream:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which opens a single vsock stream to the host for it. The host side opens an ordinary macOS socket to the destination and copies bytes between the two. The Mac's own kernel terminates the real connection, so VPNs, proxies and the Mac's routing all apply as they would to any Mac process, and there is no TCP/IP stack to maintain in lighter.
+- **Joined in the guest kernel:** The container's socket and its vsock stream are joined by a BPF sockmap, so the data path inside the guest is a kernel-to-kernel copy with no process in the middle. This is where the throughput comes from: 98 Gbit/s out of a container on an M5 Pro, and 90 into one, against 97 and 53 for OrbStack.
 - **Published ports the same way:** A port a container publishes is bound on the Mac by lighter itself, and each accepted connection becomes a stream into the guest. There is no userland proxy inside the VM to double-copy every byte.
 - **DNS answered on the Mac:** A container's lookups are resolved by the Mac's own resolver, so split DNS from a VPN works and a lookup costs 55 µs instead of a trip through a virtual network.
 - **Low request latency:** After every event, the host thread that moves bytes keeps polling for a few tens of microseconds before it goes to sleep, so the reply that follows a request is picked up without waiting for the scheduler to wake it. A GET on a published port costs 68 µs on the M5 and 133 µs on an M1, against 73 and 128 for OrbStack.
 
-UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP and ICMP, still reaches the virtual network card, and lighter answers those itself, in process: there is no sidecar behind the card at all.
+UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP and ICMP, still reaches the virtual network card, and lighter answers those itself, in process: there is no network stack and no sidecar behind the card at all.
 
 ---
 
@@ -216,7 +216,7 @@ UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP a
 - **Docker and Compose compatibility:** Full support via standard Docker CLI and Compose plugins.
 - **Bidirectional port forwarding:** Published ports appear on `localhost` the moment a container binds them, carried as streams rather than through a proxy.
 - **Native file sharing:** Mount any directory from your Mac with native ownership translation.
-- **amd64 containers under Rosetta:** `docker run --platform linux/amd64` runs under Rosetta on any Mac that has it, at about two thirds of native speed; without it, under emulation.
+- **x86-64 container emulation:** Run `linux/amd64` images under software emulation (`qemu-user`).
 - **Lean footprint:** Idles at roughly 0.2% CPU and hands memory back as soon as containers stop.
 
 ## Out of scope
@@ -235,13 +235,14 @@ The codebase is split into discrete crates, each responsible for one layer:
 ```text
 lighter (CLI)  ──spawns──▶  lighter run
                                  │
-                                 ├── lighter-vmm      the machine on Virtualization.framework, the link (network, shares, balloon)
-                                 ├── lighter-fs       the file server: FUSE, caching, FSEvents
+                                 ├── lighter-hv       Safe Rust bindings to Hypervisor.framework
+                                 ├── lighter-vmm      vCPUs, GICv3, device tree, memory layout, virtio
+                                 ├── lighter-fs       virtio-fs host implementation, caching, FSEvents
                                  └── lighter-docker   Docker socket bridge and port forwarder
 ```
 
 The guest environment consists of:
-- A custom 6.18 longterm Linux kernel with lighter's patches, among them the transport that carries the shares over the link.
+- A custom 6.18 longterm Linux kernel booting uncompressed directly from memory (no bootloader).
 - Minimal Alpine-based root filesystem with `dockerd` and a lightweight Rust guest agent.
 
 See [`docs/architecture.md`](docs/architecture.md) for detailed internals.
@@ -254,7 +255,7 @@ See [`docs/architecture.md`](docs/architecture.md) for detailed internals.
 
 - Rust 1.85+
 - Docker (only needed to build the guest kernel and rootfs images)
-- macOS 15+ SDK; the binaries are signed with the virtualization entitlement (`make sign`)
+- macOS 15+ SDK with Hypervisor entitlement
 
 ### Build commands
 

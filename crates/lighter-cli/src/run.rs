@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lighter_vmm::share::Share;
+use lighter_vmm::virtio::fs::Share;
 use lighter_vmm::wake::{Observer, Power};
 use lighter_vmm::{Machine, MachineConfig};
 
@@ -121,13 +121,7 @@ pub fn machine() -> anyhow::Result<()> {
     // no real-time clock, so without the second one every TLS handshake fails
     // with a complaint about a certificate.
     let mut cmdline =
-        String::from("console=hvc0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t");
-    // Rosetta: the share is attached when the Mac has it, and the guest is
-    // told so it registers the handler instead of the emulator.
-    let rosetta = lighter_vmm::vz::rosetta() == lighter_vmm::vz::Rosetta::Installed;
-    if rosetta {
-        cmdline.push_str(" lighter.rosetta");
-    }
+        String::from("console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t");
     cmdline.push_str(&format!(
         " idle.poll_ns={}",
         crate::config::idle_poll_ns(config.cpus)
@@ -167,43 +161,27 @@ pub fn machine() -> anyhow::Result<()> {
         network: true,
         run_dir: home.clone(),
         shares,
-        rosetta,
     };
 
     let mut machine = Machine::start(&machine_config)?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;
     }
-    let link = machine
-        .link()
-        .ok_or_else(|| anyhow::anyhow!("the machine has no network"))?;
+    lighter_vmm::streams::start(machine.vsock())?;
 
     // Ports a container publishes appear on the Mac, for as long as the
     // container is running and no longer, through a stream into the guest.
-    let mapper = lighter_vmm::streams::PortMapper::new(link);
+    let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
     lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
-    let machine = Arc::new(machine);
 
     // A Mac that slept wakes with a guest whose clock did not.
     let _power = lighter_vmm::wake::Watcher::start(Box::new(Resync {
         woke: Arc::new(AtomicBool::new(false)),
     }));
 
-    // SIGTERM is how `lighter stop` asks. The handler only raises a flag; a
-    // thread of ours asks the guest to power off and stops the machine if
-    // it does not.
+    // SIGTERM is how `lighter stop` asks, and a machine that ignored it would
+    // have to be killed — which is a guest that never unmounts its disk.
     install_signal_handler();
-    {
-        let machine = machine.clone();
-        std::thread::Builder::new()
-            .name("stop-watch".into())
-            .spawn(move || {
-                while !STOP.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                machine.shutdown();
-            })?;
-    }
 
     let reason = machine.wait()?;
     tracing::info!(?reason, "machine stopped");
@@ -267,11 +245,15 @@ fn install_signal_handler() {
     }
 }
 
-static STOP: AtomicBool = AtomicBool::new(false);
-
-/// The whole handler: raise the flag. A signal handler may call almost
-/// nothing, and a shutdown asks the guest over the link; the stop-watch
-/// thread does that.
+/// The whole handler: ask the process to end.
+///
+/// Deliberately not "stop the machine tidily". A signal handler may call
+/// almost nothing, and a VM shutdown involves locks, threads and the
+/// hypervisor. `_exit` drops the machine the way a crash would — which the
+/// guest survives, because its disk is journalled and the one thing that must
+/// not be lost, a container's `fsync`, has already reached the Mac by then.
 extern "C" fn handle_stop(_signal: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
+    // SAFETY: `_exit` is async-signal-safe, which is the whole reason it is
+    // what this handler does.
+    unsafe { libc::_exit(0) };
 }

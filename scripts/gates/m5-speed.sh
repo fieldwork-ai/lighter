@@ -98,10 +98,10 @@ if native_is_fresh; then
 	echo "==> Reusing the native baseline ($(date -r "$NATIVE" '+%Y-%m-%d'); REFRESH_NATIVE=1 to redo it)"
 else
 	echo "==> Measuring macOS itself"
-	./benchmarks/run.sh --target native --reps "$REPS" --cases "$CASES" ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
+	./benchmarks/run.sh --target native --reps "$REPS" --cases "$CASES" >/dev/null
 fi
 echo "==> Measuring the share"
-./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
+./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" >/dev/null
 
 echo
 compare() {

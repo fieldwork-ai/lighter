@@ -101,10 +101,10 @@ fn mounted(dir: &Path) -> Result<(), String> {
             continue;
         };
         if at == target {
-            return if kind == "lighterfs" {
+            return if kind == "virtiofs" {
                 Ok(())
             } else {
-                Err(format!("{target} is a {kind}, not a lighterfs"))
+                Err(format!("{target} is a {kind}, not a virtiofs"))
             };
         }
     }

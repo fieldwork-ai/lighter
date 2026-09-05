@@ -1,0 +1,204 @@
+virtio-fs: spin for a reply instead of sleeping for one
+
+A synchronous FUSE request costs far more to deliver than the server takes
+to answer it. The reply lands in the used ring, the device raises an
+interrupt, the handler schedules a work item, the workqueue thread runs
+and ends the request, and only then is the waiting task woken. That is two
+trips through the scheduler and an interrupt, for work that finished
+microseconds ago.
+
+On a shared filesystem this is the entire cost. Measured on this VMM, a
+package install of a 66,000-file tree makes roughly six hundred thousand
+requests and the server's own syscalls account for well under a fifth of
+the wall time; the rest is the delivery. Spinning for ten microseconds
+before sleeping took the install from eighteen seconds to thirteen and a
+half.
+
+So the submitting task spins for its own reply first. `fuse_send_one`
+holds no lock when it calls into the transport, and the caller is about to
+block on this very request, so draining the used ring here and ending the
+request in place skips the interrupt and both scheduler hops. Callbacks
+are disabled for the duration so the device does not raise an interrupt
+nobody is waiting for.
+
+Background and async requests are excluded: they end through paths that
+take `fc->bg_lock` or call back into the filesystem, and the context that
+submitted one may already hold it — `flush_bg_queue` calls into the
+transport with that lock held. Anything drained that cannot be ended here
+is handed to a worker, which is the same escape the interrupt path already
+uses for requests that may block.
+
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index bb56a25f4..9240ad348 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -52,6 +52,45 @@ enum {
+ /* The device can push FUSE notifications to the driver. */
+ #define VIRTIO_FS_F_NOTIFICATION 0
+ 
++/*
++ * How long a task will spin for its own reply before going to sleep.
++ *
++ * A synchronous FUSE request costs far more to deliver than the server takes
++ * to answer it. The reply lands in the used ring, the device raises an
++ * interrupt, the handler schedules a work item, the workqueue thread runs and
++ * ends the request, and only then is the waiting task woken — two trips
++ * through the scheduler for work that finished microseconds ago.
++ *
++ * Spinning instead skips all of it: the submitting task drains its own reply
++ * in its own context, so nothing is scheduled and nothing is woken.
++ *
++ * How long to spin depends on what the other end is doing, and there are two
++ * regimes. With the device relying on the notification register, the trap the
++ * driver takes to ring it is also a rendezvous: the host answers inside the
++ * trap, so the reply is already there when the write retires and ten
++ * microseconds is plenty. Spinning longer than that only takes a core away
++ * from the work that would have filled the ring, and at two milliseconds it is
++ * twice as slow as not polling at all.
++ *
++ * With a device that watches the ring instead, there is no trap and so no
++ * rendezvous: a reply that arrives after the spin gives up costs an interrupt
++ * and a wake-up, which is dearer than the trap that was removed. The spin then
++ * has to cover the operation rather than the delivery, and a create on APFS is
++ * twenty-five microseconds of it. Measured against such a device the curve
++ * bottoms out at a hundred: create-and-close falls from 50.3 microseconds to
++ * 35.3, and a four-kilobyte write from 60.6 to 45.7. Thirty is most of the
++ * win and three hundred is no better.
++ *
++ * Zero disables it, and `virtiofs.poll_usecs=` on the kernel command line
++ * changes it, so the trade can be re-measured without rebuilding anything.
++ * The module is `virtiofs` and not `virtio_fs`; getting that wrong silently
++ * leaves the default in place and makes an A/B compare a value with itself.
++ */
++static unsigned int poll_usecs = 100;
++module_param_named(poll_usecs, poll_usecs, uint, 0644);
++MODULE_PARM_DESC(poll_usecs,
++		 "microseconds to spin for a reply before sleeping (0 disables)");
++
+ /*
+  * How many notification buffers to keep posted, and how large each is.
+  *
+@@ -1665,6 +1704,105 @@ static int virtio_fs_enqueue_req(struct virtio_fs_vq *fsvq,
+ 	return ret;
+ }
+ 
++/*
++ * Whether a completed request may be ended right here.
++ *
++ * Background and async requests end through paths that take `fc->bg_lock` or
++ * call back into the filesystem, and the context that submitted a request may
++ * already hold either — `flush_bg_queue` calls into the transport with that
++ * lock held. They are handed to a worker instead, which is the same escape the
++ * interrupt path already uses for requests that may block.
++ */
++static bool virtio_fs_may_end_here(struct fuse_req *req)
++{
++	return !test_bit(FR_BACKGROUND, &req->flags) &&
++	       !test_bit(FR_ASYNC, &req->flags) &&
++	       !req->args->may_block;
++}
++
++/* Hands a completed request to a worker, as the interrupt path does. */
++static void virtio_fs_end_later(struct virtio_fs_vq *fsvq, struct fuse_req *req)
++{
++	struct virtio_fs_req_work *w;
++
++	w = kzalloc(sizeof(*w), GFP_NOFS | __GFP_NOFAIL);
++	INIT_WORK(&w->done_work, virtio_fs_complete_req_work);
++	w->fsvq = fsvq;
++	w->req = req;
++	schedule_work(&w->done_work);
++}
++
++/*
++ * Spins for a short while collecting replies, and ends them here.
++ *
++ * Callbacks are disabled for the duration so the device does not raise an
++ * interrupt nobody needs; `virtqueue_enable_cb` at the end reports whether
++ * anything slipped in while they were off, which is the one race this has.
++ */
++static void virtio_fs_poll_for_replies(struct virtio_fs_vq *fsvq)
++{
++	struct virtqueue *vq = fsvq->vq;
++	struct fuse_pqueue *fpq;
++	struct fuse_req *req, *next;
++	unsigned int len;
++	unsigned int token;
++	ktime_t deadline;
++	LIST_HEAD(reqs);
++
++	if (!poll_usecs || !fsvq->fud)
++		return;
++	fpq = &fsvq->fud->pq;
++
++	/*
++	 * The spin takes no lock. `fsvq->lock` is the same lock every other
++	 * thread needs to *submit*, so a loop that grabs it to ask "anything
++	 * yet?" starves the queue it is waiting on — and the answer is no
++	 * almost every time. With sixteen threads doing file system work at
++	 * once it was the difference between 75 and 43 microseconds a create.
++	 *
++	 * `virtqueue_poll` against an index captured up front is the lock-free
++	 * form of the same question. Callbacks stay off for the duration so the
++	 * device does not raise an interrupt nobody is waiting for.
++	 */
++	spin_lock(&fsvq->lock);
++	token = virtqueue_enable_cb_prepare(vq);
++	virtqueue_disable_cb(vq);
++	spin_unlock(&fsvq->lock);
++
++	deadline = ktime_add_us(ktime_get(), poll_usecs);
++	while (!virtqueue_poll(vq, token)) {
++		if (ktime_after(ktime_get(), deadline))
++			break;
++		cpu_relax();
++	}
++
++	spin_lock(&fsvq->lock);
++	while ((req = virtqueue_get_buf(vq, &len)) != NULL) {
++		spin_lock(&fpq->lock);
++		list_move_tail(&req->list, &reqs);
++		spin_unlock(&fpq->lock);
++	}
++	spin_unlock(&fsvq->lock);
++
++	spin_lock(&fsvq->lock);
++	if (!virtqueue_enable_cb(vq)) {
++		while ((req = virtqueue_get_buf(vq, &len)) != NULL) {
++			spin_lock(&fpq->lock);
++			list_move_tail(&req->list, &reqs);
++			spin_unlock(&fpq->lock);
++		}
++	}
++	spin_unlock(&fsvq->lock);
++
++	list_for_each_entry_safe(req, next, &reqs, list) {
++		list_del_init(&req->list);
++		if (virtio_fs_may_end_here(req))
++			virtio_fs_request_complete(req, fsvq);
++		else
++			virtio_fs_end_later(fsvq, req);
++	}
++}
++
+ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ {
+ 	unsigned int queue_id;
+@@ -1687,6 +1825,17 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ 
+ 	fsvq = &fs->vqs[queue_id];
+ 	ret = virtio_fs_enqueue_req(fsvq, req, false, GFP_ATOMIC);
++	if (ret == 0) {
++		/*
++		 * Nothing is held here — `fuse_send_one` takes no lock — and
++		 * the caller is about to block on this very request. Spinning
++		 * for it is strictly cheaper than the interrupt and the two
++		 * scheduler hops that would otherwise deliver it.
++		 */
++		if (!test_bit(FR_BACKGROUND, &req->flags))
++			virtio_fs_poll_for_replies(fsvq);
++		return;
++	}
+ 	if (ret < 0) {
+ 		if (ret == -ENOSPC) {
+ 			/*

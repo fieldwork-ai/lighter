@@ -73,12 +73,6 @@ enum Command {
     /// Done automatically when the Mac wakes; this is the same thing, for when
     /// you want to check it or something has drifted anyway.
     Resync,
-    /// Rosetta for amd64 containers: what this Mac has, and installing it.
-    Rosetta {
-        /// Run Apple's installer for Rosetta.
-        #[arg(long)]
-        install: bool,
-    },
     /// Start lighter when you log in.
     Install,
     /// Stop starting lighter when you log in.
@@ -134,34 +128,6 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
                 }
                 reply => anyhow::bail!("the guest refused: {reply}"),
             }
-        }
-        Command::Rosetta { install } => {
-            use lighter_vmm::vz::{Rosetta, rosetta};
-            let before = rosetta();
-            if install {
-                match before {
-                    Rosetta::Installed => println!("Rosetta is already installed."),
-                    Rosetta::NotSupported => anyhow::bail!("this Mac cannot run Rosetta"),
-                    Rosetta::NotInstalled => {
-                        lighter_vmm::vz::install_rosetta().map_err(|e| anyhow::anyhow!(e))?;
-                        println!(
-                            "Rosetta installed. Restart lighter to run amd64 containers under it."
-                        );
-                    }
-                }
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-            match before {
-                Rosetta::Installed => println!("installed: amd64 containers run under Rosetta"),
-                Rosetta::NotInstalled => {
-                    println!("not installed: amd64 containers run under emulation");
-                    println!("run `lighter rosetta --install` to install it");
-                }
-                Rosetta::NotSupported => {
-                    println!("not supported on this Mac: amd64 containers run under emulation")
-                }
-            }
-            Ok(std::process::ExitCode::SUCCESS)
         }
         Command::Install => {
             service::install()?;
