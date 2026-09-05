@@ -31,7 +31,7 @@ cd "$ROOT"
 TARGET=""
 LABEL=""
 REPS=3
-CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle"
+CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot"
 # Cases that read a package tree rather than making one. They run after the
 # installs, on a tree materialized once by npm — which installer produced it
 # changes what they see, and pnpm in particular builds a farm of symlinks.
@@ -757,6 +757,95 @@ print("%d %d %d" % (round(cpu*10), round(wakeups), round(power*10)))')
 }
 
 materialized=0
+# ------------------------------------------------------------------ boot ----
+
+# From a cold stop until usable, the way a person starts each runtime:
+# `lighter start`, `orb start`, `colima start`, opening Docker Desktop. Two
+# readings a repetition: `docker version` answering, then the first container
+# having run — an image already present, so no pull is in it — after one
+# untimed round that pays for the pull and, for lighter, a first data disk.
+# Last in the list, because it stops the runtime the other cases were using.
+# For lighter it is the real command on a home of its own, not the benchmark
+# machine, so the CLI's own work (doctor, the rootfs clone, waiting for the
+# engine) is inside the number as the others' is inside theirs.
+BOOT_HOME=""
+LIGHTER_CLI="target/release/lighter"
+boot_stop() {
+	case "$TARGET" in
+	lighter) LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" stop >/dev/null 2>&1 || true ;;
+	orbstack) orb stop >/dev/null 2>&1 || true ;;
+	colima) colima stop >/dev/null 2>&1 || true ;;
+	docker-desktop)
+		# It answers to either name depending on the version installed.
+		osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+		osascript -e 'quit app "Docker Desktop"' >/dev/null 2>&1 || true
+		local waited=0
+		while pgrep -f 'com.docker.backend' >/dev/null 2>&1 && [ "$waited" -lt 90 ]; do
+			sleep 1; waited=$((waited + 1))
+		done
+		;;
+	esac
+}
+boot_start() {
+	case "$TARGET" in
+	lighter) LIGHTER_HOME="$BOOT_HOME" LIGHTER_GUEST_DIR="${LIGHTER_GUEST_DIR:-guest/out}" "$LIGHTER_CLI" start >/dev/null 2>&1 & ;;
+	orbstack) orb start >/dev/null 2>&1 & ;;
+	colima) colima start >/dev/null 2>&1 & ;;
+	docker-desktop) open -a Docker 2>/dev/null || open -a "Docker Desktop" 2>/dev/null; sleep 0.1 & ;;
+	esac
+	START_PID=$!
+}
+# Milliseconds from now until `docker version` answers, or empty after three
+# minutes.
+boot_await_docker() {
+	local t0="$1"
+	while ! dk version >/dev/null 2>&1; do
+		[ $(( $(now_ms) - t0 )) -lt 180000 ] || return 1
+		sleep 0.05
+	done
+}
+run_boot_case() {
+	[ "$TARGET" != native ] || return 0
+	if [ "$TARGET" = lighter ]; then
+		cargo build --release -p lighter-cli >/dev/null 2>&1
+		./scripts/sign.sh "$LIGHTER_CLI" >/dev/null
+		BOOT_HOME="$(mktemp -d -t lighter-boot-home)"
+		# The benchmark machine goes first: two of our machines on one Mac is
+		# not the measurement.
+		if [ -n "$VMM_PID" ]; then
+			kill "$VMM_PID" 2>/dev/null; wait "$VMM_PID" 2>/dev/null || true; VMM_PID=""
+		fi
+		export DOCKER_HOST="unix://$BOOT_HOME/docker.sock"
+		DOCKER_ARGS=()
+	fi
+	printf '==> %s: boot (a cold stop, then a start, %s times; untimed round first)' "$TARGET" "$REPS"
+	local rep t0 t1 t2 START_PID
+	for rep in $(seq 0 "$REPS"); do
+		boot_stop
+		sleep 2
+		t0=$(now_ms)
+		boot_start
+		if ! boot_await_docker "$t0"; then
+			printf ' no measurement: docker did not answer within three minutes'
+			echo "boot-docker,$rep,timeout" >> "$RESULTS"
+			break
+		fi
+		t1=$(now_ms)
+		dk run --rm alpine:3.21 true >/dev/null 2>&1
+		t2=$(now_ms)
+		wait "$START_PID" 2>/dev/null || true
+		[ "$rep" -gt 0 ] || continue
+		printf ' %s/%s' "$((t1 - t0))" "$((t2 - t0))"
+		echo "boot-docker,$rep,$((t1 - t0))" >> "$RESULTS"
+		echo "boot-first-container,$rep,$((t2 - t0))" >> "$RESULTS"
+	done
+	printf '\n'
+	if [ "$TARGET" = lighter ]; then
+		boot_stop
+		rm -rf "$BOOT_HOME"
+	fi
+}
+
 for name in $CASES; do
 	if [ "$name" = memory ]; then
 		run_memory_case
@@ -766,6 +855,11 @@ for name in $CASES; do
 	if [ "$name" = power-idle ]; then
 		net_teardown
 		run_power_case
+		continue
+	fi
+	if [ "$name" = boot ]; then
+		net_teardown
+		run_boot_case
 		continue
 	fi
 	# A tree the previous case deleted is a case that measures nothing and
