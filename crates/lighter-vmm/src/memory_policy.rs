@@ -187,15 +187,15 @@ impl MemoryPolicy {
     }
 }
 
-/// Makes the guest whole before a container starts: the range goes in, and
-/// the call waits for it (`MemControl::plug_all`). The balloon stays where
-/// it is. It used to come back first, because a plugged block needed its
-/// page array from the base and the balloon held the base's free pages;
-/// with guest patch 0024 a block carries its own, and a balloon that stands
-/// through the container's run is what keeps an install's peak where it
-/// was before the range (4168 MiB on the M5 against 5355–6576 with the
-/// balloon let go at the floor). The guest's own release rule brings it
-/// back when running work is short.
+/// Makes the guest whole before a container starts: the balloon is let go
+/// and the range goes in, and the call waits for the range
+/// (`MemControl::plug_all`). The balloon comes back not because the plug
+/// needs it (with guest patch 0024 a block carries its own page array) but
+/// because the base is the kernel's only zone for what does not move —
+/// slab, page tables, the install's own bookkeeping — and a balloon standing
+/// through the run on a 4 GiB guest left the kernel a quarter gigabyte of
+/// it: the M1's installs 50–80% slower than its record. The guest's own
+/// release rule never fired, since it counts the range's free memory too.
 #[derive(Clone)]
 pub struct MakeWhole(Arc<Steering>);
 
@@ -205,6 +205,7 @@ impl MakeWhole {
         if mem.state().plugged_bytes() == mem.state().region_bytes() {
             return;
         }
+        self.0.guest_offers(0, true);
         mem.plug_all();
     }
 }

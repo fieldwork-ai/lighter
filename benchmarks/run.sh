@@ -511,6 +511,20 @@ esac
 
 mkdir -p "$(dirname "$RESULTS")"
 echo "case,rep,ms" > "$RESULTS"
+# What produced the numbers, beside them: a record ran a stale guest agent for
+# five rounds one evening before anyone noticed, because nothing tied the
+# figures to the artifacts. The commit, whether the tree was clean, and the
+# hashes of the guest artifacts this target boots (lighter only).
+{
+	echo "commit=$(git rev-parse --short HEAD 2>/dev/null)$(git diff --quiet 2>/dev/null || echo -dirty)"
+	echo "date=$(date -u +%Y-%m-%dT%H:%MZ)"
+	echo "host=$(hostname -s)"
+	if [ "$TARGET" = lighter ]; then
+		for f in "$KERNEL" guest/out/rootfs.ext4 guest/out/lighter-agent; do
+			[ -f "$f" ] && echo "$(basename "$f")=$(md5 -q "$f" 2>/dev/null || md5sum "$f" | cut -d" " -f1)"
+		done
+	fi
+} > "${RESULTS%.csv}.tree"
 
 # The lockfile is committed, not generated: `npm ci` installs exactly what it
 # says, so every target and every run installs a byte-identical tree. Generating

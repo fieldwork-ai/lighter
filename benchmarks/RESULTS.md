@@ -25,13 +25,13 @@ tree from the Mac into the container.
 
 | case | native | lighter (own disk) | orbstack (own disk) | colima (own disk) | docker-desktop (own disk) | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|---|---|---|
-| npm-install | 6160 | 4782 | 7009 | 8593 | 8608 | 6691 | 8492 | 17788 | 17906 |
-| pnpm-install | 3769 | 1233 | 2033 | 1136 | 2872 | 3908 | 4724 | 25425 | 28343 |
-| yarn-install | 5751 | 4121 | 5084 | 6577 | 11138 | 5726 | 7795 | 22165 | 22580 |
-| ripgrep | 927 | 84 | 102 | 121 | 124 | 92 | 1022 | 6864 | 9841 |
-| find-walk | 357 | 95 | 127 | 176 | 131 | 94 | 595 | 1428 | 1883 |
-| copy-tree | 13554 | 1003 | 1115 | 1876 | 2576 | 3476 | 8707 | 44299 | 33549 |
-| rm-rf | 3655 | 398 | 496 | 551 | 428 | 2711 | 2966 | 8049 | 6557 |
+| npm-install | 6160 | 4653 | 7009 | 8593 | 8608 | 6209 | 8492 | 17788 | 17906 |
+| pnpm-install | 3769 | 1193 | 2033 | 1136 | 2872 | 4041 | 4724 | 25425 | 28343 |
+| yarn-install | 5751 | 4085 | 5084 | 6577 | 11138 | 4858 | 7795 | 22165 | 22580 |
+| ripgrep | 927 | 81 | 102 | 121 | 124 | 81 | 1022 | 6864 | 9841 |
+| find-walk | 357 | 93 | 127 | 176 | 131 | 85 | 595 | 1428 | 1883 |
+| copy-tree | 13554 | 908 | 1115 | 1876 | 2576 | 3539 | 8707 | 44299 | 33549 |
+| rm-rf | 3655 | 379 | 496 | 551 | 428 | 2511 | 2966 | 8049 | 6557 |
 | watch-latency | 2 | — | — | — | — | 2 | — | 1001 | 1000 |
 
 ### What the runtime costs the Mac, MiB
@@ -43,10 +43,10 @@ what a runtime gives back on its own after the work ends.
 
 | reading | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|
-| idle, a minute after start | 289 | 1197 | 11361 | 2111 |
-| peak through an npm install | 4972 | 5498 | 8700 | 9182 |
-| 15 s after it ends | 1178 | 2850 | 8735 | 9187 |
-| 60 s after it ends | 1060 | 2114 | 8735 | 9187 |
+| idle, a minute after start | 349 | 1197 | 11361 | 2111 |
+| peak through an npm install | 1460 | 5498 | 8700 | 9182 |
+| 15 s after it ends | 743 | 2850 | 8735 | 9187 |
+| 60 s after it ends | 741 | 2114 | 8735 | 9187 |
 
 ### The network
 
@@ -58,15 +58,15 @@ a container. `native` is the Mac over loopback where that means anything.
 
 | case | unit | native | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 123.5 | 96.7 | 97.2 | 4.5 | 23.2 |
-| TCP, the Mac to a container | Gbit/s | 129.2 | 93.0 | 52.9 | 3.9 | 14.3 |
-| TCP into a published port | Gbit/s | — | 90.5 | 54.2 | 3.8 | 14.3 |
-| TCP out of a published port | Gbit/s | — | 99.5 | 93.1 | 4.4 | 33.4 |
+| TCP, container to the Mac | Gbit/s | 123.5 | 102.6 | 97.2 | 4.5 | 23.2 |
+| TCP, the Mac to a container | Gbit/s | 129.2 | 90.8 | 52.9 | 3.9 | 14.3 |
+| TCP into a published port | Gbit/s | — | 92.0 | 54.2 | 3.8 | 14.3 |
+| TCP out of a published port | Gbit/s | — | 98.1 | 93.1 | 4.4 | 33.4 |
 | UDP, container to the Mac | Gbit/s | 21.8 | 5.1 | 3.1 | 3.3 | 0.0 |
 | connects to a published port | thousand per second | 26.0 | 17.2 | 16.2 | 15.8 | 17.0 |
 | GET on a published port, median | µs | 40 | 57 | 73 | 224 | 119 |
-| GET on a published port, p99 | µs | 70 | 195 | 119 | 361 | 245 |
-| DNS lookup from a container, median | µs | 2850 | 39 | 251 | 483 | 474 |
+| GET on a published port, p99 | µs | 70 | 185 | 119 | 361 | 245 |
+| DNS lookup from a container, median | µs | 2850 | 38 | 251 | 483 | 474 |
 
 ### What an idle runtime costs
 
@@ -78,9 +78,9 @@ Lower is better throughout.
 
 | reading | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|
-| CPU, ms per second | 7 | 2 | 5 | 25 |
-| wakeups per second | 154 | 99 | 50 | 3748 |
-| package-idle wakeups per second | 3 | 0 | 0 | 0 |
+| CPU, ms per second | 12 | 2 | 5 | 25 |
+| wakeups per second | 374 | 99 | 50 | 3748 |
+| package-idle wakeups per second | 13 | 0 | 0 | 0 |
 | energy impact (top) | — | — | — | — |
 
 ### Starting up
@@ -103,13 +103,13 @@ read it from the table above in milliseconds.
 
 | case | lighter (own disk) | orbstack (own disk) | colima (own disk) | docker-desktop (own disk) | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|---|---|
-| npm-install | 129% | 88% | 72% | 72% | 92% | 73% | 35% | 34% |
-| pnpm-install | 306% | 185% | 332% | 131% | 96% | 80% | 15% | 13% |
-| yarn-install | 140% | 113% | 87% | 52% | 100% | 74% | 26% | 25% |
-| ripgrep | 1104% | 909% | 766% | 748% | 1008% | 91% | 14% | 9% |
-| find-walk | 376% | 281% | 203% | 273% | 380% | 60% | 25% | 19% |
-| copy-tree | 1351% | 1216% | 722% | 526% | 390% | 156% | 31% | 40% |
-| rm-rf | 918% | 737% | 663% | 854% | 135% | 123% | 45% | 56% |
+| npm-install | 132% | 88% | 72% | 72% | 99% | 73% | 35% | 34% |
+| pnpm-install | 316% | 185% | 332% | 131% | 93% | 80% | 15% | 13% |
+| yarn-install | 141% | 113% | 87% | 52% | 118% | 74% | 26% | 25% |
+| ripgrep | 1144% | 909% | 766% | 748% | 1144% | 91% | 14% | 9% |
+| find-walk | 384% | 281% | 203% | 273% | 420% | 60% | 25% | 19% |
+| copy-tree | 1493% | 1216% | 722% | 526% | 383% | 156% | 31% | 40% |
+| rm-rf | 964% | 737% | 663% | 854% | 146% | 123% | 45% | 56% |
 
 ## MacBook Pro (MacBookPro17,1), Apple M1, 8 cores (4P+4E), 8 GB, macOS 26.6.2
 
@@ -122,14 +122,14 @@ tree from the Mac into the container.
 
 | case | native | lighter (own disk) | orbstack (own disk) | colima (own disk) | docker-desktop (own disk) | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|---|---|---|
-| npm-install | 7807 | 8711 | 9669 | 11443 | 12596 | 11625 | 11249 | 23000 | 25456 |
-| pnpm-install | 4377 | 1782 | 2403 | 1575 | 2225 | 6014 | 5908 | — | 45936 |
-| yarn-install | 10436 | 7916 | 7870 | 10805 | 11737 | 10626 | 10430 | 28108 | 35442 |
-| ripgrep | 1209 | 137 | 143 | 171 | 260 | 182 | 1095 | 15364 | 13152 |
-| find-walk | 510 | 125 | 138 | 214 | 152 | 123 | 525 | 3806 | 4097 |
-| copy-tree | 24528 | 3084 | 2488 | 2709 | 6197 | 5282 | 16128 | 59573 | 45900 |
-| rm-rf | 5377 | 606 | 667 | 829 | 592 | 2543 | 3916 | 12446 | 12818 |
-| watch-latency | 2 | — | — | — | — | 3 | 3 | 2 | 12 |
+| npm-install | 7807 | 10673 | 9669 | 11443 | 12596 | 14104 | 11249 | 23000 | 25456 |
+| pnpm-install | 4377 | 1945 | 2403 | 1575 | 2225 | 6994 | 5908 | — | 45936 |
+| yarn-install | 10436 | 7960 | 7870 | 10805 | 11737 | 14626 | 10430 | 28108 | 35442 |
+| ripgrep | 1209 | 157 | 143 | 171 | 260 | 768 | 1095 | 15364 | 13152 |
+| find-walk | 510 | 214 | 138 | 214 | 152 | 157 | 525 | 3806 | 4097 |
+| copy-tree | 24528 | 15699 | 2488 | 2709 | 6197 | 18508 | 16128 | 59573 | 45900 |
+| rm-rf | 5377 | 948 | 667 | 829 | 592 | 3403 | 3916 | 12446 | 12818 |
+| watch-latency | 2 | — | — | — | — | — | 3 | 2 | 12 |
 
 ### What the runtime costs the Mac, MiB
 
@@ -140,10 +140,10 @@ what a runtime gives back on its own after the work ends.
 
 | reading | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|
-| idle, a minute after start | 362 | 733 | 1145 | 1753 |
-| peak through an npm install | 3426 | 4302 | 4364 | 4505 |
-| 15 s after it ends | 624 | 1876 | 4337 | 4473 |
-| 60 s after it ends | 616 | 1480 | 4337 | 4472 |
+| idle, a minute after start | 249 | 733 | 1145 | 1753 |
+| peak through an npm install | 4660 | 4302 | 4364 | 4505 |
+| 15 s after it ends | 972 | 1876 | 4337 | 4473 |
+| 60 s after it ends | 914 | 1480 | 4337 | 4472 |
 
 ### The network
 
@@ -155,15 +155,15 @@ a container. `native` is the Mac over loopback where that means anything.
 
 | case | unit | native | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 117.7 | 57.1 | 64.9 | 4.3 | 13.6 |
-| TCP, the Mac to a container | Gbit/s | 117.0 | 47.0 | 29.2 | 3.2 | 10.1 |
-| TCP into a published port | Gbit/s | — | 45.5 | 29.9 | 3.1 | 10.1 |
-| TCP out of a published port | Gbit/s | — | 54.7 | 67.6 | 3.8 | 22.2 |
+| TCP, container to the Mac | Gbit/s | 117.7 | 56.4 | 64.9 | 4.3 | 13.6 |
+| TCP, the Mac to a container | Gbit/s | 117.0 | 46.7 | 29.2 | 3.2 | 10.1 |
+| TCP into a published port | Gbit/s | — | 44.4 | 29.9 | 3.1 | 10.1 |
+| TCP out of a published port | Gbit/s | — | 55.0 | 67.6 | 3.8 | 22.2 |
 | UDP, container to the Mac | Gbit/s | 24.4 | 5.0 | 3.1 | 2.6 | 0.0 |
-| connects to a published port | thousand per second | 24.9 | 15.0 | 16.4 | 7.9 | 17.7 |
-| GET on a published port, median | µs | 54 | 128 | 127 | 453 | 153 |
-| GET on a published port, p99 | µs | 106 | 284 | 221 | 574 | 372 |
-| DNS lookup from a container, median | µs | 3876 | 130 | 425 | 686 | 758 |
+| connects to a published port | thousand per second | 24.9 | 12.8 | 16.4 | 7.9 | 17.7 |
+| GET on a published port, median | µs | 54 | 130 | 127 | 453 | 153 |
+| GET on a published port, p99 | µs | 106 | 251 | 221 | 574 | 372 |
+| DNS lookup from a container, median | µs | 3876 | 134 | 425 | 686 | 758 |
 
 ### What an idle runtime costs
 
@@ -175,9 +175,9 @@ Lower is better throughout.
 
 | reading | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|
-| CPU, ms per second | 11 | 20 | 11 | 44 |
-| wakeups per second | 135 | 84 | 55 | 1998 |
-| package-idle wakeups per second | 4 | 1 | 1 | 15 |
+| CPU, ms per second | 41 | 20 | 11 | 44 |
+| wakeups per second | 189 | 84 | 55 | 1998 |
+| package-idle wakeups per second | 3 | 1 | 1 | 15 |
 | energy impact (top) | — | — | — | — |
 
 ### Starting up
@@ -187,8 +187,8 @@ the first container has run. Seconds; lower is better.
 
 | reading | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|
-| start until docker answers | 0.5 | 1.2 | 9.8 | 2.7 |
-| start until the first container has run | 0.7 | 1.5 | 10.0 | 3.2 |
+| start until docker answers | 0.4 | 1.2 | 9.8 | 2.7 |
+| start until the first container has run | 0.6 | 1.5 | 10.0 | 3.2 |
 
 ### As a fraction of `native`
 
@@ -200,13 +200,13 @@ read it from the table above in milliseconds.
 
 | case | lighter (own disk) | orbstack (own disk) | colima (own disk) | docker-desktop (own disk) | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|---|---|
-| npm-install | 90% | 81% | 68% | 62% | 67% | 69% | 34% | 31% |
-| pnpm-install | 246% | 182% | 278% | 197% | 73% | 74% | — | 10% |
-| yarn-install | 132% | 133% | 97% | 89% | 98% | 100% | 37% | 29% |
-| ripgrep | 882% | 845% | 707% | 465% | 664% | 110% | 8% | 9% |
-| find-walk | 408% | 370% | 238% | 336% | 415% | 97% | 13% | 12% |
-| copy-tree | 795% | 986% | 905% | 396% | 464% | 152% | 41% | 53% |
-| rm-rf | 887% | 806% | 649% | 908% | 211% | 137% | 43% | 42% |
+| npm-install | 73% | 81% | 68% | 62% | 55% | 69% | 34% | 31% |
+| pnpm-install | 225% | 182% | 278% | 197% | 63% | 74% | — | 10% |
+| yarn-install | 131% | 133% | 97% | 89% | 71% | 100% | 37% | 29% |
+| ripgrep | 770% | 845% | 707% | 465% | 157% | 110% | 8% | 9% |
+| find-walk | 238% | 370% | 238% | 336% | 325% | 97% | 13% | 12% |
+| copy-tree | 156% | 986% | 905% | 396% | 133% | 152% | 41% | 53% |
+| rm-rf | 567% | 806% | 649% | 908% | 158% | 137% | 43% | 42% |
 
 ## What each case does
 
