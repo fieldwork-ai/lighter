@@ -187,14 +187,11 @@ else
 fi
 
 # --- zram ------------------------------------------------------------------
-# Swap into compressed RAM, for the engine's idle pages: dockerd and
-# containerd hold a hundred megabytes between them doing nothing, and the
-# agent's idle trim of the engine's cgroup can move that into zram (a third
-# the size) where a plain trim could only drop its file cache. Containers'
-# own trims stay file-only (the agent says so), so a workload's memory is
-# never swapped behind its back; the kernel reaches for swap otherwise only
-# under real pressure, which a guest sized by virtio-mem rarely sees.
-# `lighter.zram=0` on the command line leaves the guest without swap.
+# Swap into compressed RAM, for a guest with nothing left: the kernel
+# reaches for it only under real pressure (vm.swappiness is zero below), and
+# a guest sized by virtio-mem rarely sees any. The agent's trims never swap:
+# moving dockerd and containerd here at idle was measured at 60 MiB less and
+# a second on the next docker command. `lighter.zram=0` leaves it out.
 if [ -e /sys/block/zram0/disksize ] && ! grep -qw lighter.zram=0 /proc/cmdline; then
 	echo 2G > /sys/block/zram0/disksize 2>/dev/null \
 		&& mkswap /dev/zram0 >/dev/null 2>&1 \

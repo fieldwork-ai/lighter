@@ -377,12 +377,13 @@ fn bound_container_cache() {
             x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
         };
-        // The containers' trim takes file cache only: a workload's memory
-        // is never swapped behind its back. The engine's takes anonymous
-        // pages first, into zram when init set it up: dockerd and containerd
-        // idle at a hundred megabytes between them, and compressed they are
-        // a third of it.
-        for (cgroup, resting, swappiness) in [(containers, floor, 0), (engine, engine_floor, 200)] {
+        // Both trims take file cache only: a workload's memory is never
+        // swapped behind its back, and neither is the engine's — swapping
+        // dockerd and containerd into zram here read 60 MiB less at idle
+        // and cost the next docker command after three quiet seconds their
+        // swap-in, 450–1131 ms for a container start after a suite of
+        // installs. zram stays for a guest with nothing left.
+        for (cgroup, resting, swappiness) in [(containers, floor, 0), (engine, engine_floor, 0)] {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
                 .and_then(|c| c.trim().parse::<u64>().ok())
