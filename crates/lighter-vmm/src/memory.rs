@@ -326,6 +326,20 @@ impl GuestMemory {
     ///
     /// Returns the number of bytes actually released.
     pub fn release(&self, gpa: u64, len: u64) -> Result<u64> {
+        self.release_with(gpa, len, false)
+    }
+
+    /// As `release`, and willing to replace the span's mapping (see below):
+    /// for the balloon's coalesced runs and an unplugged block, which are
+    /// few and large and come when nothing is running. Free page reporting
+    /// hands over thousands of small runs after a trim and stays with
+    /// `release`: replacing each of those took the address map's lock from
+    /// under a container that was starting at the time (552–1131 ms).
+    pub fn release_thoroughly(&self, gpa: u64, len: u64) -> Result<u64> {
+        self.release_with(gpa, len, true)
+    }
+
+    fn release_with(&self, gpa: u64, len: u64, thorough: bool) -> Result<u64> {
         let page = host_page_size();
         let start = gpa.div_ceil(page) * page;
         let end = (gpa + len) / page * page;
@@ -376,7 +390,9 @@ impl GuestMemory {
         // of the call, so no vCPU can see the old pages go.
         // `LIGHTER_RELEASE=reusable|free` are the other two, for the A/B.
         let rc = match release_mode() {
-            ReleaseMode::Remap if unmapped && span >= REMAP_MIN_SPAN && remap_wanted() => {
+            ReleaseMode::Remap
+                if thorough && unmapped && span >= REMAP_MIN_SPAN && remap_wanted() =>
+            {
                 // SAFETY: a fixed anonymous mapping over a span this process
                 // owns, with the second-stage translation withdrawn above.
                 let fresh = unsafe {

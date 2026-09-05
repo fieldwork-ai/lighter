@@ -348,13 +348,13 @@ impl Mem {
                 self.state
                     .plugged
                     .fetch_sub(count as u64 * BLOCK_SIZE, Ordering::Relaxed);
-                let _ = mem.release(addr, count as u64 * BLOCK_SIZE);
+                let _ = mem.release_thoroughly(addr, count as u64 * BLOCK_SIZE);
                 (RESP_ACK, 0)
             }
             REQ_UNPLUG_ALL => {
                 blocks.fill(false);
                 self.state.plugged.store(0, Ordering::Relaxed);
-                let _ = mem.release(self.state.addr, self.state.region);
+                let _ = mem.release_thoroughly(self.state.addr, self.state.region);
                 (RESP_ACK, 0)
             }
             REQ_STATE => {

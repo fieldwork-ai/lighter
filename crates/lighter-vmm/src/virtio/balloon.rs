@@ -196,7 +196,7 @@ impl Balloon {
     fn release_run(&self, mem: &GuestMemory, first: u32, last: u32) -> u64 {
         let gpa = u64::from(first) * BALLOON_PAGE_SIZE;
         let len = (u64::from(last) - u64::from(first) + 1) * BALLOON_PAGE_SIZE;
-        mem.release(gpa, len).unwrap_or(0)
+        mem.release_thoroughly(gpa, len).unwrap_or(0)
     }
 
     /// Handles the free page reporting queue.
