@@ -120,6 +120,20 @@ fn main() -> std::process::ExitCode {
 
     if control {
         std::thread::spawn(bound_container_cache);
+        // The clock, as soon as there is an agent to ask for it: the seed on
+        // the command line is a whole second old before the kernel starts.
+        std::thread::spawn(|| {
+            for attempt in 0..50u32 {
+                match sync_clock_from_host() {
+                    Ok(trip) => {
+                        println!("AGENT clock=set trip_us={} attempt={attempt}", trip / 1000);
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            println!("AGENT clock=unset");
+        });
     }
 
     let listener = match VsockListener::bind(port) {
@@ -1122,12 +1136,11 @@ fn handle_control(line: &str) -> String {
             });
             "ok\n".into()
         }
-        (Some("time"), Some(seconds)) => match seconds.parse::<i64>() {
-            Ok(epoch) => match set_clock(epoch) {
-                Ok(()) => "ok\n".into(),
-                Err(e) => format!("error {e}\n"),
-            },
-            Err(_) => "error not-a-number\n".into(),
+        // The host's nudge after a wake; whatever it used to say after the
+        // word is ignored, the agent asks for the time itself.
+        (Some("time"), _) => match sync_clock_from_host() {
+            Ok(_) => "ok\n".into(),
+            Err(e) => format!("error {e}\n"),
         },
         _ => "error unknown\n".into(),
     }
@@ -1221,18 +1234,57 @@ fn read_kmsg() -> Result<String, std::io::Error> {
 /// from the host at boot and then drifts — and after the Mac sleeps, it does
 /// not so much drift as stop. Everything that checks a certificate breaks, and
 /// the error names the certificate rather than the clock.
-fn set_clock(epoch: i64) -> Result<(), std::io::Error> {
-    let tv = libc::timeval {
-        tv_sec: epoch as libc::time_t,
-        tv_usec: 0,
+///
+/// The clock is asked for, not pushed (the VMM's `clock.rs`): the guest's
+/// monotonic clock is the host's counter and cannot drift, so one accurate
+/// set is enough, and accurate means measured from this side. Three
+/// questions on one connection, the answer with the shortest round trip
+/// kept, and the wallclock set to that answer plus half its trip plus what
+/// the monotonic clock has moved since — microseconds of error where the
+/// pushed whole seconds carried half a second, the boot time and the wake
+/// retries. `set_clock` was `settimeofday` with `tv_usec: 0`.
+const TIME_PORT: u32 = 2382;
+
+fn monotonic_ns() -> i128 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
-    // SAFETY: a correctly-shaped timeval and a null timezone, which is the
-    // documented way to leave the timezone alone.
-    let rc = unsafe { libc::settimeofday(&tv, std::ptr::null()) };
+    // SAFETY: a valid timespec for the call's duration.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
+}
+
+fn sync_clock_from_host() -> Result<i128, std::io::Error> {
+    let fd = vsock::connect(TIME_PORT)?;
+    let mut sock = std::fs::File::from(fd);
+    let mut best: Option<(i128, i128, i128)> = None; // (host ns, at monotonic ns, round trip)
+    for _ in 0..3 {
+        let t1 = monotonic_ns();
+        sock.write_all(&[1])?;
+        let mut reply = [0u8; 12];
+        sock.read_exact(&mut reply)?;
+        let t2 = monotonic_ns();
+        let secs = u64::from_le_bytes(reply[..8].try_into().expect("8 bytes"));
+        let nanos = u32::from_le_bytes(reply[8..].try_into().expect("4 bytes"));
+        let host = secs as i128 * 1_000_000_000 + nanos as i128;
+        let trip = t2 - t1;
+        if best.is_none_or(|(_, _, t)| trip < t) {
+            best = Some((host + trip / 2, t2, trip));
+        }
+    }
+    let (host_at_t2, t2, trip) = best.expect("three rounds");
+    let now = host_at_t2 + (monotonic_ns() - t2);
+    let ts = libc::timespec {
+        tv_sec: (now / 1_000_000_000) as libc::time_t,
+        tv_nsec: (now % 1_000_000_000) as libc::c_long,
+    };
+    // SAFETY: a correctly-shaped timespec for the call's duration.
+    let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(())
+    Ok(trip)
 }
 
 /// Copies between the vsock connection and a unix socket until either ends.
