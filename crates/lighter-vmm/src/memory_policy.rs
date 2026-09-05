@@ -113,6 +113,7 @@ impl MemoryPolicy {
             pulsed: AtomicBool::new(false),
             inflated_for: AtomicU32::new(0),
             pulse_target: AtomicU32::new(0),
+            pulse_held: AtomicU32::new(0),
             level: AtomicU32::new(Pressure::Normal as u32),
             level_pages: AtomicU32::new(0),
             steer_pages: AtomicU32::new(0),
@@ -256,6 +257,13 @@ struct Steering {
     inflated_for: AtomicU32,
     /// The target the count above was made against.
     pulse_target: AtomicU32,
+    /// What the last pulse held, in balloon pages. A later offer of a
+    /// block or more beyond it means the guest has since given up more
+    /// (the first pulse's pressure freed slab and cache that the second
+    /// can take), and the balloon pulses again: after a full suite the M1
+    /// sat at 513 MiB resident with one pulse of 370, against 305 after a
+    /// short one.
+    pulse_held: AtomicU32,
     level: AtomicU32,
     /// What the pressure level asks for, what the compressor asks for, and
     /// what the guest itself offers: the balloon's target is the largest.
@@ -393,6 +401,7 @@ impl Steering {
         }
         if !self.range_out() {
             self.pulsed.store(false, Ordering::Relaxed);
+            self.pulse_held.store(0, Ordering::Relaxed);
             self.inflated_for.store(0, Ordering::Relaxed);
             return;
         }
@@ -413,6 +422,7 @@ impl Steering {
                 "balloon pulsed at the floor; letting it go"
             );
             self.pulsed.store(true, Ordering::Relaxed);
+            self.pulse_held.store(target, Ordering::Relaxed);
             self.guest_offers(0, true);
         }
     }
@@ -514,11 +524,16 @@ fn memory_guest(
                     let taken = steering.guest_sizes(spare_mib, release || need, nothing_runs);
                     if release || need {
                         steering.guest_offers(0, true);
-                    } else if !taken
-                        && steering.range_out()
-                        && !steering.pulsed.load(Ordering::Relaxed)
-                    {
-                        steering.guest_offers(spare_mib, false);
+                    } else if !taken && steering.range_out() {
+                        let held_mib = (u64::from(steering.pulse_held.load(Ordering::Relaxed))
+                            * BALLOON_PAGE_SIZE)
+                            >> 20;
+                        if !steering.pulsed.load(Ordering::Relaxed) {
+                            steering.guest_offers(spare_mib, false);
+                        } else if spare_mib >= held_mib + (BLOCK_SIZE >> 20) {
+                            steering.pulsed.store(false, Ordering::Relaxed);
+                            steering.guest_offers(spare_mib, false);
+                        }
                     }
                 }
                 // The agent went away: whatever it offered is withdrawn.

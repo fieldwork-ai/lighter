@@ -60,6 +60,8 @@ VMM_PID=""
 
 cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
+	# The VMM's log outlives the run directory, because a failure names it.
+	mkdir -p .logs && cp "$LOG" .logs/m6-last-boot.log 2>/dev/null || true
 	rm -rf "$RUN_DIR"
 	rm -f "${ROOTFS:-}"
 }
