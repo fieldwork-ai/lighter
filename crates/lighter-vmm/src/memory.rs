@@ -368,7 +368,7 @@ impl GuestMemory {
         // life of the process: `madvise` walks resident pages, and neither
         // MADV_FREE_REUSABLE nor MADV_FREE touched the compressor's — 620
         // MiB of a 977 MiB footprint after an install suite, none of it in
-        // the guest, and 864 on the next run. So a span of two megabytes or
+        // the guest, and 864 on the next run. So a span of 128 KiB or
         // more has its mapping replaced instead (a fresh anonymous mapping
         // has no pages of any kind): the same suite then read 135 MiB
         // compressed and 517 at the floor, with 254 entries in the address
@@ -476,9 +476,12 @@ enum ReleaseMode {
 }
 
 /// Spans below this are released with `madvise` even in remap mode: each
-/// replaced span is an entry of its own in the process's address map, and
-/// hurried reporting hands over runs down to 128 KiB.
-const REMAP_MIN_SPAN: usize = 2 << 20;
+/// replaced span is an entry of its own in the process's address map. The
+/// line sits at the smallest run hurried reporting hands over, because the
+/// runs under two megabytes were enough to leave the M1's after-install
+/// rows at 922 MiB against 456 with them covered; the balloon's smaller
+/// pieces go the old way.
+const REMAP_MIN_SPAN: usize = 128 << 10;
 
 /// `LIGHTER_RELEASE=reusable|free|remap`, read once.
 fn release_mode() -> ReleaseMode {
