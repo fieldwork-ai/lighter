@@ -187,7 +187,10 @@ def boot_table(results):
 
 
 def amd64_table(results):
-    scale = report.load("lighter-guest", results)
+    # The arm64 reference is lighter's own figure for the same workload: the
+    # own-disk record where the case is an install, the host-timed one where
+    # it is a container start (the own-disk stage does not run that case).
+    scale = report.load("lighter", results) | report.load("lighter-guest", results)
     runtimes = [(name, report.load(f"{key}-amd64", results)) for key, name in RUNTIMES if key != "native"]
     runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _ in report.AMD64_CASES)]
     if not runtimes:

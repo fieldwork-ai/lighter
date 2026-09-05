@@ -252,9 +252,12 @@ const PLUG_ALL_WAIT: std::time::Duration = std::time::Duration::from_millis(1500
 /// How long the size holds after it went up before a quiet guest shrinks.
 /// Thirty seconds held the range in through the whole of a seven-second
 /// install and the fifteen-second reading after it (3179 MiB on the M5
-/// where 538 had read with no hold); ten is past a trivial container's
-/// start-and-quiet and inside that reading.
-const HOLD_AFTER_GROWTH_MS: u64 = 10_000;
+/// where 538 had read with no hold); ten still had the range half in at
+/// that reading (861 against 621 at sixty); five is past a trivial
+/// container's start-and-quiet, and a container every six seconds costs a
+/// plug and an unplug each, about 130 ms of the kernel's time in the
+/// background and 25 ms of the start.
+const HOLD_AFTER_GROWTH_MS: u64 = 5_000;
 /// How long an unplug may stay unfinished before it is given up.
 const STUCK_AFTER_MS: u64 = 60_000;
 

@@ -731,6 +731,9 @@ ts.sort(); print(int(ts[len(ts)//2]*1e6), int(ts[int(len(ts)*0.99)]*1e6))' "$NET
 # `top`'s idle-wakeup and energy-impact columns instead, which need nothing.
 run_power_case() {
 	[ "$TARGET" != native ] || return 0
+	# The network cases' server containers come down first: idle means
+	# nothing running, and a guest with a container up keeps its whole size.
+	net_teardown 2>/dev/null || true
 	printf '==> %s: power-idle (a minute of quiet, then a minute of samples)' "$TARGET"
 	sleep 60
 	local pids pid

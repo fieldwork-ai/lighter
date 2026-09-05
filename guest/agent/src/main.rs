@@ -340,7 +340,13 @@ fn bound_container_cache() {
                 &mut last_offer,
                 total,
                 active,
-                quiet_for >= 3 * TICKS_PER_SEC,
+                // Quiet, or nothing running and the containers three seconds
+                // idle: the quiet rule protects running work from a seesaw,
+                // and with no container there is none to protect — while the
+                // trims and compaction after an install kept the guest's CPU
+                // busy for most of a minute, and the range stayed in for it
+                // (the shrink came 47 s after a seven-second install).
+                quiet_for >= 3 * TICKS_PER_SEC || (running == 0 && idle_for >= 3 * TICKS_PER_SEC),
                 running == 0,
                 dynamic && quiet_for == 0,
             );
@@ -480,7 +486,13 @@ fn offer_memory(
     // reporting could not return in runs, 600 MB at a minute against the
     // record. A thirty-second was tried: 128 MiB left the container that
     // materializes the next case's tree without room to start.
-    let reserve = (total >> 20) / if nothing_runs { 16 } else { 8 };
+    // A quarter, not a sixteenth, with nothing running and a range to
+    // shrink: the unplug migrates what the range held into the base, and a
+    // shrink that left a sixteenth free left the guest under its own need
+    // line while it was still compacting, so the host grew it again and the
+    // range went in and out every six seconds. Free memory in the base costs
+    // the host nothing; the pulse and reporting return it.
+    let reserve = (total >> 20) / if nothing_runs { 4 } else { 8 };
     // Release is its own word: an offer of zero means "nothing more", and
     // the balloon holds what it has. Said as one number, the guest asked
     // for everything back each time inflation dipped it under its line,
@@ -508,7 +520,7 @@ fn offer_memory(
     // guest available asks for more before it is short — available, not
     // free, because the cache it could reclaim is its own working set and
     // reclaiming it is the cost this avoids. The host doubles the guest.
-    let need = busy && avail < (total >> 20) / 4;
+    let need = busy && avail < (total >> 20) / 8;
     let spare = if !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
