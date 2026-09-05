@@ -3,9 +3,12 @@
 #
 # An amd64 image runs, reports the right architecture, and executes a real
 # program rather than just `uname`. On a Mac with Rosetta installed the guest
-# has to have registered Rosetta rather than qemu, the kernel has to have found
-# the per-thread memory-ordering switch Rosetta asks for, and an x86-64
-# multi-threaded program has to see x86's ordering — see `docs/x86-64.md`.
+# has to have registered Rosetta, the kernel has to have found the per-thread
+# memory-ordering switch Rosetta asks for, and an x86-64 multi-threaded program
+# has to see x86's ordering — see `docs/x86-64.md`. On a Mac without it there
+# is no emulator: the guest registers a handler that names the fix, and an
+# amd64 container has to fail with that message rather than "exec format
+# error".
 set -euo pipefail
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -60,10 +63,10 @@ if [ -x "$ROSETTA_DIR/rosetta" ]; then
 	ROSETTA_ARGS=(--share "rosetta:$ROSETTA_DIR")
 	ROSETTA_CMDLINE=" lighter.rosetta"
 else
-	VIA=qemu
+	VIA=hint
 	ROSETTA_ARGS=()
 	ROSETTA_CMDLINE=""
-	note "Rosetta is not installed on this Mac; checking the emulator"
+	note "Rosetta is not installed on this Mac; checking that amd64 says so"
 fi
 
 echo
@@ -119,28 +122,41 @@ docker tag alpine:3.21 lighter-test:amd64 >/dev/null 2>&1 || true
 docker pull --quiet --platform linux/arm64 alpine:3.21 >/dev/null 2>&1 || true
 docker tag alpine:3.21 lighter-test:arm64 >/dev/null 2>&1 || true
 
-arch="$(docker run --rm lighter-test:amd64 uname -m 2>/dev/null || true)"
-if [ "$arch" = "x86_64" ]; then
-	pass "an amd64 container reports $arch"
+if [ "$VIA" = hint ]; then
+	# No Rosetta: the run has to fail, and fail saying what to install.
+	said="$(docker run --rm lighter-test:amd64 uname -m 2>&1 || true)"
+	case "$said" in
+	*"lighter rosetta --install"*)
+		pass "an amd64 container fails naming the fix: ${said%%. *}"
+		;;
+	*)
+		fail "an amd64 container without Rosetta said '${said:-nothing}'"
+		;;
+	esac
 else
-	fail "an amd64 container reported '${arch:-nothing}'"
-fi
+	arch="$(docker run --rm lighter-test:amd64 uname -m 2>/dev/null || true)"
+	if [ "$arch" = "x86_64" ]; then
+		pass "an amd64 container reports $arch"
+	else
+		fail "an amd64 container reported '${arch:-nothing}'"
+	fi
 
-# `uname` is a syscall and would work under a handler that did nothing useful.
-# A real interpreter has to translate an actual program.
-docker pull --quiet --platform linux/amd64 node:24-alpine >/dev/null 2>&1 || true
-answer="$(docker run --rm --platform linux/amd64 node:24-alpine \
-	node -e 'const os=require("os");
-	         let n=0; for (let i=0;i<2e6;i++) n=(n+i*7)%1000003;
-	         console.log(os.arch()+" "+n)' 2>/dev/null || true)"
-case "$answer" in
-"x64 "*)
-	pass "an amd64 Node image ran a real program: $answer"
-	;;
-*)
-	fail "the amd64 Node image produced '${answer:-nothing}'"
-	;;
-esac
+	# `uname` is a syscall and would work under a handler that did nothing
+	# useful. A real interpreter has to translate an actual program.
+	docker pull --quiet --platform linux/amd64 node:24-alpine >/dev/null 2>&1 || true
+	answer="$(docker run --rm --platform linux/amd64 node:24-alpine \
+		node -e 'const os=require("os");
+		         let n=0; for (let i=0;i<2e6;i++) n=(n+i*7)%1000003;
+		         console.log(os.arch()+" "+n)' 2>/dev/null || true)"
+	case "$answer" in
+	"x64 "*)
+		pass "an amd64 Node image ran a real program: $answer"
+		;;
+	*)
+		fail "the amd64 Node image produced '${answer:-nothing}'"
+		;;
+	esac
+fi
 
 # Making sure the native path did not regress while adding the emulated one.
 native="$(docker run --rm lighter-test:arm64 uname -m 2>/dev/null || true)"

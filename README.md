@@ -127,13 +127,13 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 
 | Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 7.81 s | **7.78 s** (100%) | 9.67 s (81%) | 11.44 s (68%) | 12.60 s (62%) |
-| `pnpm install` | 4.38 s | 1.80 s (243%) | 2.40 s (182%) | **1.57 s** (278%) | 2.23 s (197%) |
-| `yarn install` | 10.44 s | 7.89 s (132%) | **7.87 s** (133%) | 10.80 s (97%) | 11.74 s (89%) |
-| `ripgrep` (file read) | 1.21 s | **130 ms** (930%) | 143 ms (845%) | 171 ms (707%) | 260 ms (465%) |
+| `npm ci` | 7.81 s | **8.71 s** (90%) | 9.67 s (81%) | 11.44 s (68%) | 12.60 s (62%) |
+| `pnpm install` | 4.38 s | 1.78 s (246%) | 2.40 s (182%) | **1.57 s** (278%) | 2.23 s (197%) |
+| `yarn install` | 10.44 s | 7.92 s (132%) | **7.87 s** (133%) | 10.80 s (97%) | 11.74 s (89%) |
+| `ripgrep` (file read) | 1.21 s | **137 ms** (882%) | 143 ms (845%) | 171 ms (707%) | 260 ms (465%) |
 | `find` (metadata walk) | 510 ms | **125 ms** (408%) | 138 ms (370%) | 214 ms (238%) | 152 ms (336%) |
-| `cp -a node_modules` | 24.53 s | 3.73 s (658%) | **2.49 s** (986%) | 2.71 s (905%) | 6.20 s (396%) |
-| `rm -rf node_modules` | 5.38 s | 614 ms (876%) | 667 ms (806%) | 829 ms (649%) | **592 ms** (908%) |
+| `cp -a node_modules` | 24.53 s | 3.08 s (795%) | **2.49 s** (986%) | 2.71 s (905%) | 6.20 s (396%) |
+| `rm -rf node_modules` | 5.38 s | 606 ms (887%) | 667 ms (806%) | 829 ms (649%) | **592 ms** (908%) |
 
 | Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
@@ -163,15 +163,15 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 117.7 | 40.4 | **64.9** | 4.3 | 13.6 |
-| TCP, the Mac to a container | Gbit/s | 117.0 | **42.5** | 29.2 | 3.2 | 10.1 |
-| TCP into a published port | Gbit/s | — | **44.1** | 29.9 | 3.1 | 10.1 |
-| TCP out of a published port | Gbit/s | — | 55.2 | **67.6** | 3.8 | 22.2 |
+| TCP, container to the Mac | Gbit/s | 117.7 | 53.8 | **64.9** | 4.3 | 13.6 |
+| TCP, the Mac to a container | Gbit/s | 117.0 | **34.7** | 29.2 | 3.2 | 10.1 |
+| TCP into a published port | Gbit/s | — | **43.1** | 29.9 | 3.1 | 10.1 |
+| TCP out of a published port | Gbit/s | — | 54.6 | **67.6** | 3.8 | 22.2 |
 | UDP, container to the Mac | Gbit/s | 24.4 | **5.0** | 3.1 | 2.6 | 0.0 |
-| connects to a published port | thousand per second | 24.9 | 15.6 | 16.4 | 7.9 | **17.7** |
+| connects to a published port | thousand per second | 24.9 | **19.1** | 16.4 | 7.9 | 17.7 |
 | GET on a published port, median | µs | 54 | 133 | **127** | 453 | 153 |
 | GET on a published port, p99 | µs | 106 | 230 | **221** | 574 | 372 |
-| DNS lookup from a container, median | µs | 3876 | **151** | 425 | 686 | 758 |
+| DNS lookup from a container, median | µs | 3876 | **153** | 425 | 686 | 758 |
 
 #### Idle power
 
@@ -180,7 +180,7 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
 | CPU, ms per second | **10** | 20 | 11 | 44 |
-| Wakeups per second | 102 | 84 | **55** | 1998 |
+| Wakeups per second | 103 | 84 | **55** | 1998 |
 
 #### Starting up
 
@@ -242,7 +242,7 @@ UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP a
 - **Docker and Compose compatibility:** Full support via standard Docker CLI and Compose plugins.
 - **Bidirectional port forwarding:** Published ports appear on `localhost` the moment a container binds them, carried as streams rather than through a proxy.
 - **Native file sharing:** Mount any directory from your Mac with native ownership translation.
-- **x86-64 containers under Rosetta:** `linux/amd64` images run under Apple's Rosetta when the Mac has it (`lighter rosetta --install`), and under `qemu-user` otherwise. [How, and what it costs](docs/x86-64.md).
+- **x86-64 containers under Rosetta:** `linux/amd64` images run under Apple's Rosetta, a one-time download (`lighter rosetta --install`). There is no emulator behind it; without Rosetta an amd64 container fails with that command in its output. [How, and what it costs](docs/x86-64.md).
 - **Lean footprint:** Idles at roughly 0.2% CPU and hands memory back as soon as containers stop.
 
 ## Out of scope

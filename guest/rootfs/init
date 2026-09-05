@@ -231,10 +231,15 @@ CONTAINERD_PID=$!
 # x86-64 header and runs the interpreter against it.
 #
 # The interpreter is Rosetta when the host attached its share (the command
-# line says `lighter.rosetta`), and qemu otherwise. Rosetta runs x86-64 at
-# about two thirds of native speed; qemu at about a tenth. Rosetta asks the
-# kernel for x86 memory ordering on its own threads (PR_SET_MEM_MODEL, kernel
-# patch 0023); nothing here has to.
+# line says `lighter.rosetta`). Rosetta runs x86-64 at about two thirds of
+# native speed and asks the kernel for x86 memory ordering on its own threads
+# (PR_SET_MEM_MODEL, kernel patch 0023); nothing here has to. There is no
+# emulator behind it: qemu ran the same programs at a tenth of native speed,
+# which is slow enough to read as broken, and shipped an emulator in every
+# image for the Macs that had not installed Rosetta. Without the share, the
+# handler is a copy of the agent that says what to install and exits, so an
+# amd64 image fails with the fix in its output rather than "exec format
+# error".
 #
 # The `F` flag is the load-bearing one. Without it the kernel resolves the
 # interpreter path at exec time — inside the container's mount namespace, where
@@ -244,9 +249,9 @@ CONTAINERD_PID=$!
 # binary itself with the caller's credentials, which is what lets a setuid
 # program inside a container behave.
 if mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null; then
-	interpreter=/usr/bin/qemu-x86_64
-	via=qemu
-	flags=FP
+	interpreter=/sbin/lighter-noamd64
+	via=hint
+	flags=F
 	if grep -qw lighter.rosetta /proc/cmdline; then
 		mkdir -p /mnt/rosetta
 		if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null && [ -x /mnt/rosetta/rosetta ]; then

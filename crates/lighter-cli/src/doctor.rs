@@ -68,14 +68,17 @@ pub fn run() -> Vec<Finding> {
             Err(e) => Finding::bad(
                 "rosetta",
                 format!("installed but not usable: {e}"),
-                "amd64 containers run under emulation until lighter is updated for this Rosetta",
+                "amd64 containers will not run until lighter is updated for this Rosetta",
             ),
         }
     } else {
-        // Optional, so not a fault: without it amd64 containers still run.
-        Finding::good(
+        // Not a fault the machine cannot start with (`start` ignores this
+        // finding), but a fault: there is no emulator, so amd64 images fail
+        // until Rosetta is installed.
+        Finding::bad(
             "rosetta",
-            "not installed; amd64 containers run under emulation (`lighter rosetta --install`)",
+            "not installed; amd64 containers will not run",
+            "lighter rosetta --install",
         )
     });
 

@@ -24,6 +24,23 @@ use std::os::unix::net::UnixStream;
 use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
+    // Run under its other name, this is the binfmt handler for x86-64 on a
+    // machine whose Mac has no Rosetta: the kernel hands it every amd64
+    // program with the program's own path as the first argument. Say what
+    // to do and stop, so `docker run --platform linux/amd64 …` prints the
+    // fix instead of "exec format error". `/proc/self/exe` and not argv[0]:
+    // binfmt_misc puts the program's path there, not the interpreter's.
+    if std::fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n == "lighter-noamd64"))
+        .unwrap_or(false)
+    {
+        let program = std::env::args().nth(1).unwrap_or_default();
+        eprintln!(
+            "lighter: {program} is an x86-64 program, and this Mac has no Rosetta to run it. Install it once with `lighter rosetta --install` on the Mac, then `lighter stop` and `lighter start`."
+        );
+        return std::process::ExitCode::from(126);
+    }
     let mut port: u32 = 2375;
     let mut target: Option<String> = None;
     let mut echo = false;

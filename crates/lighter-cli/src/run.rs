@@ -141,7 +141,7 @@ pub fn machine() -> anyhow::Result<()> {
         ));
     }
     // Rosetta rides its own share, mounted by the guest's init at a fixed
-    // place when told; amd64 containers run under qemu otherwise.
+    // place when told; without it amd64 containers fail naming the fix.
     let mut shares = shares;
     if lighter_vmm::rosetta::installed() {
         match lighter_vmm::rosetta::key() {
