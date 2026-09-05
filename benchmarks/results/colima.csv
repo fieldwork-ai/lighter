@@ -57,3 +57,9 @@ net-dns,3,483
 power-cpu-ms-per-s,1,5
 power-wakeups-per-s,1,50
 power-pkg-idle-wakeups-per-s,1,0
+boot-docker,1,12445
+boot-first-container,1,12626
+boot-docker,2,12246
+boot-first-container,2,12442
+boot-docker,3,13310
+boot-first-container,3,13504
