@@ -45,9 +45,6 @@ net-udp,3,3154
 net-connect-rate,1,16265
 net-connect-rate,2,16439
 net-connect-rate,3,16878
-net-http-latency,1,131
-net-http-latency,2,127
-net-http-latency,3,123
 net-dns,1,428
 net-dns,2,414
 net-dns,3,425
@@ -60,3 +57,9 @@ boot-docker,2,1206
 boot-first-container,2,1538
 boot-docker,3,1221
 boot-first-container,3,1566
+net-http-p99,1,307
+net-http-latency,1,130
+net-http-p99,2,221
+net-http-latency,2,127
+net-http-p99,3,189
+net-http-latency,3,121
