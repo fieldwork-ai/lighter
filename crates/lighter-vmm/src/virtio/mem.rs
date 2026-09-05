@@ -226,9 +226,21 @@ impl MemControl {
         if self.state.requested_bytes() != region {
             self.request(region);
         }
+        // The driver's own retry after a plug it could not do (a page array
+        // it could not allocate while the base was still coming back) is
+        // fifty seconds; a configuration change queues its work again at
+        // once, so one is raised every hundred milliseconds of waiting.
         let deadline = std::time::Instant::now() + PLUG_ALL_WAIT;
+        let mut poked = std::time::Instant::now();
         while self.state.plugged_bytes() != region && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
+            if poked.elapsed() >= std::time::Duration::from_millis(100) {
+                self.transport
+                    .lock()
+                    .expect("virtio-mem transport poisoned")
+                    .notify_config_change();
+                poked = std::time::Instant::now();
+            }
         }
     }
 }
@@ -238,7 +250,11 @@ impl MemControl {
 /// way back first.
 const PLUG_ALL_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 /// How long the size holds after it went up before a quiet guest shrinks.
-const HOLD_AFTER_GROWTH_MS: u64 = 30_000;
+/// Thirty seconds held the range in through the whole of a seven-second
+/// install and the fifteen-second reading after it (3179 MiB on the M5
+/// where 538 had read with no hold); ten is past a trivial container's
+/// start-and-quiet and inside that reading.
+const HOLD_AFTER_GROWTH_MS: u64 = 10_000;
 /// How long an unplug may stay unfinished before it is given up.
 const STUCK_AFTER_MS: u64 = 60_000;
 

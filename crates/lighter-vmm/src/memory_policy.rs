@@ -83,6 +83,8 @@ const GUEST_RESERVE_FRACTION: u64 = 16;
 /// The least a range grows by when the guest is short: a small guest
 /// doubles, a tiny one gets this.
 const GROW_STEP_MIN: u64 = 256 << 20;
+/// How long the balloon stands inflated at the floor before it is let go.
+const PULSE_HELD_SECS: u32 = 3;
 
 /// The balloon, and the signals that drive it.
 pub struct MemoryPolicy {
@@ -107,6 +109,8 @@ impl MemoryPolicy {
             ram_bytes,
             mem,
             last_line: Mutex::new((0, false)),
+            pulsed: AtomicBool::new(false),
+            inflated_for: AtomicU32::new(0),
             level: AtomicU32::new(Pressure::Normal as u32),
             level_pages: AtomicU32::new(0),
             steer_pages: AtomicU32::new(0),
@@ -155,6 +159,7 @@ impl MemoryPolicy {
                             );
                         }
                         steering.resize_again();
+                        steering.pulse();
                         let Some(now) = host.sample() else { continue };
                         if let Some(then) = last {
                             let compressed = now.compressed.saturating_sub(then.compressed);
@@ -231,6 +236,15 @@ struct Steering {
     /// ends, and an idle guest sends nothing new: the policy's loop asks
     /// again (`resize_again`).
     last_line: Mutex<(u64, bool)>,
+    /// The balloon has pulsed at the floor: inflated once the range was
+    /// out, for the reclaim its pressure brings, then let go — the pages
+    /// stay released on the host until the guest touches them, and a
+    /// container's plug is not gated on two gigabytes deflating (854 ms
+    /// starts on the M5 with the balloon held). Cleared when the range
+    /// goes in again.
+    pulsed: AtomicBool,
+    /// Seconds the balloon has stood inflated to its target at the floor.
+    inflated_for: AtomicU32,
     level: AtomicU32,
     /// What the pressure level asks for, what the compressor asks for, and
     /// what the guest itself offers: the balloon's target is the largest.
@@ -358,6 +372,37 @@ impl Steering {
             .is_none_or(|m| m.state().plugged_bytes() == 0)
     }
 
+    /// The balloon's pulse at the floor, a second at a time from the policy
+    /// loop: once the range is out and the balloon has stood at its target
+    /// for a few seconds, its pressure has done what it does (the kernel's
+    /// caches and slab given up, the pages released) and it is let go.
+    fn pulse(&self) {
+        if self.mem.is_none() {
+            return;
+        }
+        if !self.range_out() {
+            self.pulsed.store(false, Ordering::Relaxed);
+            self.inflated_for.store(0, Ordering::Relaxed);
+            return;
+        }
+        if self.pulsed.load(Ordering::Relaxed) {
+            return;
+        }
+        let target = self.balloon.target_pages();
+        if target == 0 || self.balloon.actual_pages() < target - target / 8 {
+            self.inflated_for.store(0, Ordering::Relaxed);
+            return;
+        }
+        if self.inflated_for.fetch_add(1, Ordering::Relaxed) + 1 >= PULSE_HELD_SECS {
+            tracing::info!(
+                held_mib = (u64::from(target) * BALLOON_PAGE_SIZE) >> 20,
+                "balloon pulsed at the floor; letting it go"
+            );
+            self.pulsed.store(true, Ordering::Relaxed);
+            self.guest_offers(0, true);
+        }
+    }
+
     /// The guest's last line, applied again: for the shrink a hold deferred.
     fn resize_again(&self) {
         // An unplug the driver has not finished in a minute is one it cannot
@@ -455,7 +500,10 @@ fn memory_guest(
                     let taken = steering.guest_sizes(spare_mib, release || need, nothing_runs);
                     if release || need {
                         steering.guest_offers(0, true);
-                    } else if !taken && steering.range_out() {
+                    } else if !taken
+                        && steering.range_out()
+                        && !steering.pulsed.load(Ordering::Relaxed)
+                    {
                         steering.guest_offers(spare_mib, false);
                     }
                 }
