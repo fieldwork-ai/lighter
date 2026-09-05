@@ -24,6 +24,10 @@ use std::os::unix::net::UnixStream;
 use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
+    // Last to go when the guest runs out of memory: the machine is dead
+    // without the agent, and the OOM killer chose it once by size.
+    let _ = std::fs::write("/proc/self/oom_score_adj", "-1000");
+
     // Run under its other name, this is the binfmt handler for x86-64 on a
     // machine whose Mac has no Rosetta: the kernel hands it every amd64
     // program with the program's own path as the first argument. Say what
@@ -200,16 +204,11 @@ fn main() -> std::process::ExitCode {
 /// one started cold. dockerd makes the cgroup at the first container, which
 /// can be any time, so this simply keeps looking.
 fn bound_container_cache() {
-    let total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            m.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-        })
-        .map(|kb| kb * 1024);
-    let Some(total) = total else { return };
+    let Some(mut total) = mem_total() else { return };
+    // With a virtio-mem range the guest's size is the host's to set, from
+    // the lines this loop sends: they go whatever the size, and `MemTotal`
+    // is read again each tick because it moves.
+    let dynamic = std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem").exists();
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -273,6 +272,9 @@ fn bound_container_cache() {
         // (the trims, the reporting rate at 25 s) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
         std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
+        if dynamic {
+            total = mem_total().unwrap_or(total);
+        }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
             // The engine's cache (image layers) bounded too, at an eighth of
@@ -332,8 +334,16 @@ fn bound_container_cache() {
         // alone: the peak 600 MB better, the minute reading 500 MB worse,
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
-        if total >= balloon_min {
-            offer_memory(&mut memory_stream, &mut last_offer, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
+        if dynamic || total >= balloon_min {
+            offer_memory(
+                &mut memory_stream,
+                &mut last_offer,
+                total,
+                active,
+                quiet_for >= 3 * TICKS_PER_SEC,
+                running == 0,
+                dynamic && quiet_for == 0,
+            );
         }
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
@@ -367,13 +377,21 @@ fn bound_container_cache() {
             x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
         };
-        for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
+        // The containers' trim takes file cache only: a workload's memory
+        // is never swapped behind its back. The engine's takes anonymous
+        // pages first, into zram when init set it up: dockerd and containerd
+        // idle at a hundred megabytes between them, and compressed they are
+        // a third of it.
+        for (cgroup, resting, swappiness) in [(containers, floor, 0), (engine, engine_floor, 200)] {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
                 .and_then(|c| c.trim().parse::<u64>().ok())
                 .unwrap_or(0);
             if current > resting {
-                let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
+                let _ = std::fs::write(
+                    format!("{cgroup}/memory.reclaim"),
+                    format!("{} swappiness={swappiness}", current - resting),
+                );
             }
         }
         // What the trim freed is in pieces the size of the files that held
@@ -442,6 +460,7 @@ fn offer_memory(
     active: bool,
     quiet: bool,
     nothing_runs: bool,
+    busy: bool,
 ) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -484,6 +503,11 @@ fn offer_memory(
     // containers have been idle; the balloon takes only what is already
     // free.
     let release = active && free < reserve / 2;
+    // With a range to grow into, work that has less than a quarter of the
+    // guest available asks for more before it is short — available, not
+    // free, because the cache it could reclaim is its own working set and
+    // reclaiming it is the cost this avoids. The host doubles the guest.
+    let need = busy && avail < (total >> 20) / 4;
     let spare = if !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
@@ -498,7 +522,8 @@ fn offer_memory(
     // Available and free are rounded to 16 MiB: they drift by a page or two
     // on an idle guest and would defeat the comparison.
     let coarse = |v: u64| (v & !15) as u32;
-    for (i, v) in [spare as u32, coarse(avail), coarse(free), u32::from(release)].iter().enumerate() {
+    let flags = u32::from(release) | (u32::from(need) << 1) | (u32::from(nothing_runs) << 2);
+    for (i, v) in [spare as u32, coarse(avail), coarse(free), flags].iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     if *last == Some(bytes) {
@@ -512,6 +537,17 @@ fn offer_memory(
     } else {
         *last = Some(bytes);
     }
+}
+
+/// `MemTotal`, in bytes.
+fn mem_total() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
 }
 
 /// A `key=<n>` on the kernel command line, if given.

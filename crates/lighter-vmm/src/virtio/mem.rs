@@ -62,26 +62,37 @@ const RESP_LEN: usize = 10;
 /// much of it the host has offered, how much the guest holds.
 #[derive(Debug)]
 pub struct MemState {
+    /// RAM the guest booted with, beside the range.
+    base: u64,
     addr: u64,
     region: u64,
     requested: AtomicU64,
     plugged: AtomicU64,
     /// One flag per block, set while the guest holds it.
     blocks: Mutex<Vec<bool>>,
+    /// When the offer last went up, as the process's monotonic
+    /// milliseconds, or `u64::MAX` for never; a shrink waits a while after
+    /// it (`MemControl::held`). The first offer, at boot, is not a growth:
+    /// a container that comes back with the machine keeps it whole by
+    /// running, and a machine with none should reach its floor at once.
+    grown_at: AtomicU64,
 }
 
 impl MemState {
     /// A range of `region` bytes at guest-physical `addr`, both multiples of
-    /// the block size, with `requested` bytes offered to begin with.
-    pub fn new(addr: u64, region: u64, requested: u64) -> MemState {
+    /// the block size, beside `base` bytes of RAM, with `requested` bytes
+    /// offered to begin with.
+    pub fn new(base: u64, addr: u64, region: u64, requested: u64) -> MemState {
         debug_assert_eq!(addr % BLOCK_SIZE, 0);
         debug_assert_eq!(region % BLOCK_SIZE, 0);
         MemState {
+            base,
             addr,
             region,
             requested: AtomicU64::new(Self::round(requested.min(region))),
             plugged: AtomicU64::new(0),
             blocks: Mutex::new(vec![false; (region / BLOCK_SIZE) as usize]),
+            grown_at: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -91,6 +102,20 @@ impl MemState {
 
     pub fn addr(&self) -> u64 {
         self.addr
+    }
+
+    pub fn base_bytes(&self) -> u64 {
+        self.base
+    }
+
+    /// What the guest has right now: the base and what it has plugged.
+    pub fn total_bytes(&self) -> u64 {
+        self.base + self.plugged_bytes()
+    }
+
+    /// Whether the guest holds everything it has been offered.
+    pub fn settled(&self) -> bool {
+        self.plugged_bytes() == self.requested_bytes()
     }
 
     pub fn region_bytes(&self) -> u64 {
@@ -144,7 +169,11 @@ impl MemControl {
     /// offered after rounding; the guest plugs or unplugs towards it in its
     /// own time, and `plugged_bytes` says how far it has got.
     pub fn request(&self, bytes: u64) -> u64 {
+        let before = self.state.requested_bytes();
         let rounded = self.state.set_requested_bytes(bytes);
+        if rounded > before {
+            self.state.grown_at.store(monotonic_ms(), Ordering::Relaxed);
+        }
         self.transport
             .lock()
             .expect("virtio-mem transport poisoned")
@@ -156,6 +185,78 @@ impl MemControl {
         );
         rounded
     }
+
+    /// Whether the offer went up recently enough that it should not come
+    /// down yet. A container that starts and does little leaves the guest
+    /// quiet, and quiet is what a shrink waits for: without this the range
+    /// went in for the start and out again within the same second, nine
+    /// gigabytes each way, on every start of a quiet machine.
+    pub fn held(&self) -> bool {
+        let grown_at = self.state.grown_at.load(Ordering::Relaxed);
+        grown_at != u64::MAX && monotonic_ms().saturating_sub(grown_at) < HOLD_AFTER_GROWTH_MS
+    }
+
+    /// Offers the whole range and waits, briefly, for the guest to hold it.
+    ///
+    /// For the moment before a container starts: what runs in it sizes
+    /// itself from `MemTotal` as it comes up (a JVM's heap is a quarter of
+    /// it by default), so the guest must show its whole size by then. A
+    /// plug lands within tens of milliseconds of the offer; the wait is
+    /// bounded so a guest that cannot plug delays the container by a beat
+    /// rather than for good. Costs two loads when the guest is already full.
+    pub fn plug_all(&self) {
+        let region = self.state.region_bytes();
+        if self.state.plugged_bytes() == region {
+            return;
+        }
+        if self.state.requested_bytes() != region {
+            self.request(region);
+        }
+        let deadline = std::time::Instant::now() + PLUG_ALL_WAIT;
+        while self.state.plugged_bytes() != region && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// How long a container start waits for the guest to plug everything.
+const PLUG_ALL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long the size holds after it went up before a quiet guest shrinks.
+const HOLD_AFTER_GROWTH_MS: u64 = 30_000;
+
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// The base and the range for a guest of `total` bytes.
+///
+/// The base is a quarter of the total and a gigabyte at least, because the
+/// kernel's unmovable allocations (slab, page tables, the plugged blocks'
+/// own page arrays at 1.56% of them, socket buffers) all come from it while
+/// the range is onlined movable, and three movable to one is the kernel's
+/// own default ratio. A larger base costs only its page array at idle; its
+/// free pages are reported and released like any other.
+///
+/// `LIGHTER_VIRTIO_MEM=0` gives the guest everything at boot, as before,
+/// for the A/B; `LIGHTER_VIRTIO_MEM=<MiB>` sets the base by hand.
+pub fn split(total: u64) -> (u64, u64) {
+    let base = match std::env::var("LIGHTER_VIRTIO_MEM")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => return (total, 0),
+        Some(mib) => mib << 20,
+        None => (total / 4).max(1 << 30),
+    };
+    let base = base.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
+    if base >= total {
+        return (total, 0);
+    }
+    (base, total - base)
 }
 
 /// The device: one queue of requests, a configuration space, and the range.
@@ -337,8 +438,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_base_is_a_quarter_and_a_gigabyte_at_least() {
+        // Not through the environment: a parallel test may be reading it.
+        if std::env::var_os("LIGHTER_VIRTIO_MEM").is_some() {
+            return;
+        }
+        assert_eq!(split(12 << 30), (3 << 30, 9 << 30));
+        assert_eq!(split(2 << 30), (1 << 30, 1 << 30));
+        assert_eq!(split(1 << 30), (1 << 30, 0));
+        assert_eq!(split(512 << 20), (512 << 20, 0));
+    }
+
+    #[test]
     fn requested_is_whole_blocks_within_the_range() {
-        let state = MemState::new(1 << 30, 4 * BLOCK_SIZE, 3 * BLOCK_SIZE + 1);
+        let state = MemState::new(1 << 30, 1 << 30, 4 * BLOCK_SIZE, 3 * BLOCK_SIZE + 1);
         assert_eq!(state.requested_bytes(), 3 * BLOCK_SIZE);
         assert_eq!(state.set_requested_bytes(u64::MAX), 4 * BLOCK_SIZE);
         assert_eq!(state.set_requested_bytes(0), 0);
@@ -346,7 +459,12 @@ mod tests {
 
     #[test]
     fn plug_and_unplug_track_the_blocks() {
-        let state = std::sync::Arc::new(MemState::new(1 << 30, 4 * BLOCK_SIZE, 2 * BLOCK_SIZE));
+        let state = std::sync::Arc::new(MemState::new(
+            1 << 30,
+            1 << 30,
+            4 * BLOCK_SIZE,
+            2 * BLOCK_SIZE,
+        ));
         let mut dev = Mem::new(state.clone());
         let mem = GuestMemory::detached();
         let req = |kind: u16, addr: u64, count: u16| {

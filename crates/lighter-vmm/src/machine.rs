@@ -69,6 +69,9 @@ pub enum MachineError {
 }
 
 /// How to build the machine.
+/// The guest port dockerd's API is reached on.
+pub const DOCKER_PORT: u32 = 2375;
+
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
     pub vcpus: u32,
@@ -301,6 +304,7 @@ impl Machine {
                 .map(|mib| mib << 20)
                 .unwrap_or(hotplug.size);
             Arc::new(crate::virtio::mem::MemState::new(
+                config.ram_bytes,
                 hotplug.base,
                 hotplug.size,
                 offered,
@@ -325,6 +329,9 @@ impl Machine {
             bus.register(window, transport.clone())?;
             virtio_devices.push(transport);
         }
+        let mem = mem_state
+            .zip(mem_slot)
+            .map(|(state, slot)| MemControl::new(state, virtio_devices[slot].clone()));
 
         // vsock queues packets from host threads and must be able to deliver
         // them itself; see the note on the waker in the vsock module.
@@ -568,6 +575,7 @@ impl Machine {
             virtio_devices[balloon_slot].clone(),
             config.ram_bytes,
             vsock_state.clone(),
+            mem.clone(),
         ) {
             Ok(policy) => Some(policy),
             Err(why) => {
@@ -688,9 +696,6 @@ impl Machine {
 
         crate::dump::install(virtio_devices.clone(), vsock_state.clone());
 
-        let mem = mem_state
-            .zip(mem_slot)
-            .map(|(state, slot)| MemControl::new(state, virtio_devices[slot].clone()));
         Ok(Machine {
             _vm: vm,
             ctx,
@@ -729,8 +734,25 @@ impl Machine {
         self.vsock.clone()
     }
 
+    /// The Docker API's socket has one thing done to it that no other has:
+    /// a guest with a virtio-mem range is made whole before a container is
+    /// created, started, restarted or built, because what runs in it sizes
+    /// itself from `MemTotal` as it comes up and can take memory faster
+    /// than the guest could ask for more (`MemControl::plug_all`). The
+    /// request line is what is looked for, in each chunk as it passes.
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
-        let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone())?;
+        let inspect: Option<crate::vsock_proxy::Inspector> = match &self.mem {
+            Some(mem) if guest_port == DOCKER_PORT => {
+                let mem = mem.clone();
+                Some(Arc::new(move |bytes: &[u8]| {
+                    if starts_a_container(bytes) {
+                        mem.plug_all();
+                    }
+                }))
+            }
+            _ => None,
+        };
+        let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone(), inspect)?;
         self.proxies.push(proxy);
         Ok(())
     }
@@ -801,4 +823,21 @@ impl Drop for Machine {
         // until that has happened. Counting clones here would just encode how
         // many things legitimately hold one.
     }
+}
+
+/// Whether a chunk of a Docker API stream carries a request that starts a
+/// process in a container: create, start, restart, an exec's start, or a
+/// build (BuildKit runs its steps in containers of its own, reached through
+/// a session).
+fn starts_a_container(bytes: &[u8]) -> bool {
+    const REQUESTS: [&[u8]; 5] = [
+        b"/containers/create",
+        b"/start HTTP/",
+        b"/restart HTTP/",
+        b"/build?",
+        b"/session HTTP/",
+    ];
+    REQUESTS
+        .iter()
+        .any(|needle| bytes.windows(needle.len()).any(|w| w == *needle))
 }

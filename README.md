@@ -234,6 +234,7 @@ The container writable layer and named volumes live on an internal virtual disk 
 
 ### 3. Cooperative memory management
 A guest holding 8 GB of RAM after a heavy build starves the Mac.
+- **A guest that is only as big as it needs to be:** The guest boots with a quarter of its configured memory and a virtio-mem range for the rest, plugged in 128 MiB blocks as the host offers them. A machine running no container shrinks to its base, page arrays included, which is what puts the idle footprint where it is; any container start makes the guest whole again before dockerd sees the request, so what runs inside sees the full `MemTotal` it always did.
 - **Free page reporting:** When memory is freed inside the guest, `CONFIG_PAGE_REPORTING` volunteers those physical pages back to macOS immediately without hypervisor intervention.
 - **Compressor-steered ballooning:** On memory-constrained hosts (like 8 GB M1s), macOS compresses memory before reporting pressure. lighter monitors the host compressor rate: if the Mac begins compressing heavily, the virtio-balloon inflates in aligned 16 KiB host-page compound blocks to safely release host physical memory, deflating once the compressor has quieted.
 

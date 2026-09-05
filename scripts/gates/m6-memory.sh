@@ -168,6 +168,31 @@ else
 fi
 
 # -------------------------------------------------------------------- idle --
+# -------------------------------------------------------------- the range --
+# The guest boots with a base and a virtio-mem range (a quarter of the
+# configured memory and the rest). With nothing running the range comes back
+# out, page arrays and all, and that is the idle floor; a container start
+# makes the guest whole again before dockerd sees the request, so what runs
+# inside sees the configured size.
+echo
+echo "==> The range: out when nothing runs, whole for a container"
+waited=0
+while [ "$(field plugged_mib)" != "0" ] && [ "$waited" -lt 60 ]; do
+	sleep 2
+	waited=$((waited + 2))
+done
+if [ "$(field plugged_mib)" = "0" ]; then
+	pass "the range came out ${waited}s after the last container left; footprint $(footprint) MiB"
+else
+	fail "the range is still $(field plugged_mib) MiB plugged after ${waited}s with nothing running"
+fi
+SEEN_KB="$(docker run --rm alpine:3.21 awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+if [ "${SEEN_KB:-0}" -ge $((8192 * 1024 * 95 / 100)) ]; then
+	pass "a container saw MemTotal $((SEEN_KB / 1024)) MiB of the 8192 configured"
+else
+	fail "a container saw MemTotal $((${SEEN_KB:-0} / 1024)) MiB; the guest was not made whole for it"
+fi
+
 echo
 echo "==> Watching an idle machine for ${IDLE_SECONDS}s"
 # Two samples of cumulative CPU time, which is the only honest way: an instant

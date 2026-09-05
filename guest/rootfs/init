@@ -186,6 +186,22 @@ else
 	echo "INIT data=absent"
 fi
 
+# --- zram ------------------------------------------------------------------
+# Swap into compressed RAM, for the engine's idle pages: dockerd and
+# containerd hold a hundred megabytes between them doing nothing, and the
+# agent's idle trim of the engine's cgroup can move that into zram (a third
+# the size) where a plain trim could only drop its file cache. Containers'
+# own trims stay file-only (the agent says so), so a workload's memory is
+# never swapped behind its back; the kernel reaches for swap otherwise only
+# under real pressure, which a guest sized by virtio-mem rarely sees.
+# `lighter.zram=0` on the command line leaves the guest without swap.
+if [ -e /sys/block/zram0/disksize ] && ! grep -qw lighter.zram=0 /proc/cmdline; then
+	echo 2G > /sys/block/zram0/disksize 2>/dev/null \
+		&& mkswap /dev/zram0 >/dev/null 2>&1 \
+		&& swapon -p 100 /dev/zram0 2>/dev/null \
+		&& echo "INIT zram=on" || echo "INIT zram=off"
+fi
+
 # --- containerd -----------------------------------------------------------
 # Started here, the moment the data disk is there, rather than by dockerd.
 # dockerd's own managed containerd is started and then polled once a second,
@@ -223,8 +239,13 @@ disabled_plugins = ["io.containerd.grpc.v1.cri"]
 TOML
 # A fresh shell rather than a subshell: in a subshell `$$` is still the
 # parent's pid, and the engine ran in the root cgroup for a day.
+# The engine is shielded from the OOM killer (-900; the agent is -1000):
+# a container filling memory faster than the guest can grow had the killer
+# take dockerd, containerd and the agent by their size before it took the
+# writer, and the machine with them. Containers themselves stay at zero.
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	echo -900 > /proc/self/oom_score_adj 2>/dev/null
 	exec containerd \
 		--config /run/containerd.toml \
 		--address /run/containerd/containerd.sock \
@@ -391,6 +412,7 @@ dockerd_debug=""
 grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	echo -900 > /proc/self/oom_score_adj 2>/dev/null
 	exec dockerd $2 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \

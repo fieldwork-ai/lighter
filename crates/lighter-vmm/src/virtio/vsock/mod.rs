@@ -1574,7 +1574,12 @@ impl VirtioDevice for Vsock {
 /// Runs on its own thread per connection. That is a real cost at a thousand
 /// connections and no cost at the dozen a Docker client opens, and it buys a
 /// blocking read with no readiness machinery anywhere.
-pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
+pub fn pump<S: Socket>(
+    shared: Arc<VsockShared>,
+    key: ConnKey,
+    mut socket: S,
+    inspect: Option<crate::vsock_proxy::Inspector>,
+) {
     // Both threads of a stream do the work a user is waiting on, and a
     // thread at default QoS is a thread Apple silicon may put on an
     // efficiency core: the same transfer read 45 Gbit/s one run and 63 the
@@ -1635,6 +1640,9 @@ pub fn pump<S: Socket>(shared: Arc<VsockShared>, key: ConnKey, mut socket: S) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
+        if let Some(inspect) = &inspect {
+            inspect(&buf[..read]);
+        }
         // `send` delivers as it goes; there is nothing to poke afterwards.
         if !shared.send(key, &buf[..read]) {
             break;

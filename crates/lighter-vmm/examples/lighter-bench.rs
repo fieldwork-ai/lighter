@@ -35,18 +35,10 @@ fn main() -> ExitCode {
             "--cpus" => config.vcpus = args.next().and_then(|v| v.parse().ok()).unwrap_or(1),
             "--memory-mib" => {
                 let mib: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(2048);
-                config.ram_bytes = mib << 20;
-                // As the CLI: `LIGHTER_VIRTIO_MEM=<base MiB>` boots with that
-                // much RAM and offers the rest through virtio-mem.
-                if let Some(base) = std::env::var("LIGHTER_VIRTIO_MEM")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|b| b << 20)
-                    .filter(|b| *b < config.ram_bytes)
-                {
-                    config.hotplug_bytes = config.ram_bytes - base;
-                    config.ram_bytes = base;
-                }
+                // As the CLI: a base and a virtio-mem range, unless
+                // `LIGHTER_VIRTIO_MEM=0`.
+                (config.ram_bytes, config.hotplug_bytes) =
+                    lighter_vmm::virtio::mem::split(mib << 20);
             }
             "--disk" => config
                 .disks
@@ -157,7 +149,7 @@ fn main() -> ExitCode {
 
     if !mem_plan.is_empty() {
         let Some(mem) = machine.mem().cloned() else {
-            eprintln!("lighter: --mem-plan needs LIGHTER_VIRTIO_MEM");
+            eprintln!("lighter: --mem-plan needs a virtio-mem range (LIGHTER_VIRTIO_MEM not 0)");
             return ExitCode::from(2);
         };
         let started = std::time::Instant::now();
