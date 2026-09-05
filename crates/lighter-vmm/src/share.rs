@@ -72,6 +72,26 @@ impl Shares {
                 })),
             );
         }
+        // With `LIGHTER_FS_STATS` set, every server's histogram every ten
+        // seconds (`LIGHTER_FS_STATS_EVERY` overrides), as the old device did.
+        if std::env::var_os("LIGHTER_FS_STATS").is_some() {
+            let every = std::env::var("LIGHTER_FS_STATS_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10);
+            let servers: Vec<Arc<lighter_fs::Server>> = by_tag
+                .values()
+                .map(|s| s.lock().expect("share poisoned").server.clone())
+                .collect();
+            std::thread::Builder::new()
+                .name("fs-stats".into())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(every));
+                    for server in &servers {
+                        server.log_stats();
+                    }
+                })?;
+        }
         Ok(Shares {
             by_tag,
             conns: Mutex::new(HashMap::new()),
