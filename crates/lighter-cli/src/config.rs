@@ -80,6 +80,26 @@ pub fn idle_poll_ns(cpus: u32) -> u32 {
     if cpus >= num_cpus() { 50_000 } else { 200_000 }
 }
 
+/// The guest kernel's tick rate, chosen by the same shape of the machine.
+///
+/// Every tick is an exit from the VM, per vCPU, so the rate is a cost where
+/// the vCPUs fill the cores and free where they do not; and what the tick
+/// buys is every wait the kernel counts in jiffies, which is most of what a
+/// container's start and stop still cost. Measured 2026-09-05: on an M5 Pro
+/// with nine vCPUs on eighteen cores, `docker run --rm alpine true` is 70 ms
+/// at 1000 and 112 at 250, and the share installs a fifth faster; on an M1
+/// with eight vCPUs on eight cores, 1000 lost most rows (`docs/worklog.md`).
+/// Two kernels ship, and the one used is the vCPU count against the cores:
+/// at most half of them, 1000. `LIGHTER_KERNEL_HZ` overrides either way.
+pub fn kernel_hz(cpus: u32) -> u32 {
+    match std::env::var("LIGHTER_KERNEL_HZ").ok().as_deref() {
+        Some("1000") => 1000,
+        Some("250") => 250,
+        _ if cpus * 2 <= num_cpus() => 1000,
+        _ => 250,
+    }
+}
+
 pub fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)

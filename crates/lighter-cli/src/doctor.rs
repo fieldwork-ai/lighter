@@ -82,8 +82,29 @@ pub fn run() -> Vec<Finding> {
         )
     });
 
-    findings.push(match paths::kernel() {
-        Ok(path) if path.exists() => Finding::good("guest kernel", path.display().to_string()),
+    // The kernel the next start would boot: the tick rate follows the
+    // configured vCPUs against the Mac's cores (`config::kernel_hz`).
+    let cpus = crate::config::Config::load()
+        .map(|c| c.cpus)
+        .unwrap_or_else(|_| crate::config::Config::default().cpus);
+    let hz = crate::config::kernel_hz(cpus);
+    findings.push(match paths::kernel(hz) {
+        Ok(path) if path.exists() => {
+            let actual = if path.ends_with("Image-hz1000") {
+                1000
+            } else {
+                250
+            };
+            let note = if actual == hz {
+                String::new()
+            } else {
+                format!("; the {hz} Hz image is not installed")
+            };
+            Finding::good(
+                "guest kernel",
+                format!("{} ({actual} Hz for {cpus} vCPUs{note})", path.display()),
+            )
+        }
         Ok(path) => Finding::bad(
             "guest kernel",
             format!("missing at {}", path.display()),

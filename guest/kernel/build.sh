@@ -25,14 +25,30 @@ mkdir -p "$OUT"
 echo "==> Building builder image"
 docker build -q -t "$IMAGE" "$ROOT/guest/kernel" >/dev/null
 
-echo "==> Building kernel (source volume: $VOLUME, jobs: $JOBS)"
-docker run --rm \
-	--name lighter-kbuild \
-	-v "$VOLUME:/build" \
-	-v "$OUT:/out" \
-	-e "JOBS=$JOBS" \
-	-e "KERNEL_VERSION=${KERNEL_VERSION:-6.18.49}" \
-	"$IMAGE"
+# Two kernels from one source, differing in the tick rate alone: `Image` at
+# 250 Hz for a Mac whose vCPUs fill its cores, `Image-hz1000` for one where
+# they leave half of them free (the CLI's `config::kernel_hz`). Each has its
+# own source volume, since a change of HZ rebuilds most of the tree and one
+# volume would rebuild it every time. `LIGHTER_KERNEL_ONLY=250|1000` builds
+# just the one, for iteration.
+build() {
+	local hz="$1" suffix="$2" volume="$3"
+	echo "==> Building kernel at ${hz} Hz (source volume: $volume, jobs: $JOBS)"
+	docker run --rm \
+		--name "lighter-kbuild-$hz" \
+		-v "$volume:/build" \
+		-v "$OUT:/out" \
+		-e "JOBS=$JOBS" \
+		-e "KERNEL_VERSION=${KERNEL_VERSION:-6.18.49}" \
+		-e "KERNEL_HZ=$hz" \
+		-e "KERNEL_IMAGE_SUFFIX=$suffix" \
+		"$IMAGE"
+}
+case "${LIGHTER_KERNEL_ONLY:-both}" in
+	250)  build 250 "" "$VOLUME" ;;
+	1000) build 1000 "-hz1000" "$VOLUME-hz1000" ;;
+	*)    build 250 "" "$VOLUME"; build 1000 "-hz1000" "$VOLUME-hz1000" ;;
+esac
 
 echo
 echo "==> Artifacts in $OUT:"

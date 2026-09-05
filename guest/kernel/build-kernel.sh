@@ -64,6 +64,13 @@ fi
 log "Configuring (defconfig + lighter fragment)"
 make ARCH=arm64 defconfig
 ./scripts/kconfig/merge_config.sh -m -O . .config /config/lighter.config
+# The tick rate is the one option built two ways: `KERNEL_HZ=1000` makes the
+# image the CLI boots where the vCPUs leave cores free (`Image-hz1000`), the
+# fragment's 250 the other. See the fragment's own note on the choice.
+if [ "${KERNEL_HZ:-}" = 1000 ]; then
+	log "Tick rate: 1000 Hz for this image"
+	./scripts/config --file .config --disable HZ_250 --enable HZ_1000 --set-val HZ 1000
+fi
 # merge_config leaves the merged result needing a pass to settle dependencies;
 # olddefconfig takes the default for anything newly reachable rather than
 # prompting, which would hang a non-interactive build.
@@ -118,9 +125,10 @@ mkdir -p "$OUT"
 # Through a temporary name and a rename, so a copy that fails partway (the
 # output directory is the Mac's, through the share) never leaves a truncated
 # Image under the name every machine boots from.
-cat arch/arm64/boot/Image > "$OUT/Image.tmp"
-mv "$OUT/Image.tmp" "$OUT/Image"
-cat .config > "$OUT/kernel.config"
+NAME="Image${KERNEL_IMAGE_SUFFIX:-}"
+cat arch/arm64/boot/Image > "$OUT/$NAME.tmp"
+mv "$OUT/$NAME.tmp" "$OUT/$NAME"
+cat .config > "$OUT/kernel${KERNEL_IMAGE_SUFFIX:-}.config"
 printf '%s\n' "$KERNEL_VERSION" > "$OUT/kernel.version"
 
-log "Done: $(du -h "$OUT/Image" | cut -f1) Image for Linux ${KERNEL_VERSION}"
+log "Done: $(du -h "$OUT/$NAME" | cut -f1) $NAME for Linux ${KERNEL_VERSION}"

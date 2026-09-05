@@ -22,7 +22,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-KERNEL="guest/out/Image"
+KERNEL="${LIGHTER_GATE_KERNEL:-guest/out/Image}"
 INITRAMFS="guest/out/initramfs.cpio.gz"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-90}"
 PROFILE="${PROFILE:-debug}"

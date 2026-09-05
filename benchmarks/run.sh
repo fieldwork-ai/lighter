@@ -393,7 +393,14 @@ bench_memory_mib() {
 }
 
 setup_lighter() {
-	KERNEL="${LIGHTER_BENCH_KERNEL:-guest/out/Image}"
+	# The kernel the CLI would pick for this many vCPUs on this Mac
+	# (`config::kernel_hz`): 1000 Hz where they are at most half the cores,
+	# when that image has been built. `LIGHTER_BENCH_KERNEL` names one outright.
+	KERNEL="guest/out/Image"
+	if [ $(( ${BENCH_CPUS:-8} * 2 )) -le "$(sysctl -n hw.ncpu)" ] && [ -f guest/out/Image-hz1000 ]; then
+		KERNEL="guest/out/Image-hz1000"
+	fi
+	KERNEL="${LIGHTER_BENCH_KERNEL:-$KERNEL}"
 	BIN="target/release/examples/lighter-bench"
 	# Rosetta, when the Mac has it, the way `lighter start` attaches it: the
 	# guest's amd64 path is Rosetta or a message, and `--arch amd64` needs
