@@ -203,6 +203,11 @@ fi
 # live in one the agent can trim (see its bound_container_cache).
 mkdir -p /var/log /run/containerd /sys/fs/cgroup/engine
 echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+# RCU grace periods expedited from here on. A container's start and stop
+# wait on several (cgroups, netfilter rules, namespaces), each a few jiffies
+# at HZ=250; expedited they are microseconds. `docker run --rm alpine true`
+# 150 to 110 ms on the M5, with installs and idle unchanged (2026-09-05).
+echo 1 > /sys/kernel/rcu_expedited 2>/dev/null || true
 cat > /run/containerd.toml <<'TOML'
 version = 2
 disabled_plugins = ["io.containerd.grpc.v1.cri"]
