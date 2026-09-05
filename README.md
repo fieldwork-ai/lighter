@@ -80,11 +80,11 @@ OrbStack, Colima and Docker Desktop were measured on the same machines in the sa
 
 #### Memory footprint
 
-The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: settled before an `npm ci`, at its peak during one, and 15 and 60 seconds after it ends with nothing running. Lower is better throughout.
+The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: idle a minute after a cold start with nothing run on it, at its peak during an `npm ci`, and 15 and 60 seconds after that ends with nothing running. Lower is better throughout.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Settled, before an install | 1131 MiB | **1028 MiB** | 8208 MiB | 9179 MiB |
+| Idle, a minute after start | **635 MiB** | 1197 MiB | 11361 MiB | 2111 MiB |
 | Peak through an npm install | **4168 MiB** | 5498 MiB | 8700 MiB | 9182 MiB |
 | 15 s after it ends | **874 MiB** | 2850 MiB | 8735 MiB | 9187 MiB |
 | 60 s after it ends | **850 MiB** | 2114 MiB | 8735 MiB | 9187 MiB |
@@ -120,8 +120,8 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Start until docker answers | **0.4 s** | 1.1 s | 12.4 s | 2.1 s |
-| Start until the first container has run | **0.5 s** | 1.5 s | 12.6 s | 2.4 s |
+| Start until docker answers | **0.4 s** | 1.5 s | 11.8 s | 2.1 s |
+| Start until the first container has run | **0.6 s** | 1.9 s | 12.0 s | 2.4 s |
 
 ### Apple M1 (8 cores, 8 GB RAM)
 
@@ -148,11 +148,11 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 
 #### Memory footprint
 
-The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: settled before an `npm ci`, at its peak during one, and 15 and 60 seconds after it ends with nothing running. Lower is better throughout.
+The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: idle a minute after a cold start with nothing run on it, at its peak during an `npm ci`, and 15 and 60 seconds after that ends with nothing running. Lower is better throughout.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Settled, before an install | **800 MiB** | 3906 MiB | 4364 MiB | 4505 MiB |
+| Idle, a minute after start | **362 MiB** | 733 MiB | 1145 MiB | 1753 MiB |
 | Peak through an npm install | **3426 MiB** | 4302 MiB | 4364 MiB | 4505 MiB |
 | 15 s after it ends | **624 MiB** | 1876 MiB | 4337 MiB | 4473 MiB |
 | 60 s after it ends | **616 MiB** | 1480 MiB | 4337 MiB | 4472 MiB |
@@ -188,8 +188,8 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Start until docker answers | **0.5 s** | 1.2 s | 10.2 s | 2.7 s |
-| Start until the first container has run | **0.7 s** | 1.5 s | 10.5 s | 2.9 s |
+| Start until docker answers | **0.5 s** | 1.2 s | 9.8 s | 2.7 s |
+| Start until the first container has run | **0.7 s** | 1.5 s | 10.0 s | 3.2 s |
 
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 ## Why it is fast

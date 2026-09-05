@@ -43,7 +43,7 @@ INTRO = """Measured on clean machines against a 1,232-package `package.json` fix
 
 OrbStack, Colima and Docker Desktop were measured on the same machines in the same sessions."""
 
-MEMORY_INTRO = """The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: settled before an `npm ci`, at its peak during one, and 15 and 60 seconds after it ends with nothing running. Lower is better throughout."""
+MEMORY_INTRO = """The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: idle a minute after a cold start with nothing run on it, at its peak during an `npm ci`, and 15 and 60 seconds after that ends with nothing running. Lower is better throughout."""
 
 NETWORK_INTRO = """iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Bold marks the best runtime in each row."""
 

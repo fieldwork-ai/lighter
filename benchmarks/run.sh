@@ -547,12 +547,16 @@ runtime_footprint_mib() {
 run_memory_case() {
 	[ "$TARGET" != native ] || return 0
 	printf '==> %s: memory' "$TARGET"
+	# What the runtime holds at rest is the boot case's reading, a minute
+	# after a cold start; this case is what an install does to it. A reading
+	# taken here would be five seconds after the warm-up's three installs,
+	# before the guest has trimmed anything, and was published as "settled"
+	# for a while.
 	sleep 5
-	local settled peak after15 after60 now
-	settled="$(runtime_footprint_mib)"
+	local peak after15 after60 now
 	REPS=1 run_case npm-install >/dev/null 2>&1 &
 	local install=$!
-	peak="$settled"
+	peak="$(runtime_footprint_mib)"
 	while kill -0 "$install" 2>/dev/null; do
 		now="$(runtime_footprint_mib)"
 		[ "$now" -le "$peak" ] || peak="$now"
@@ -560,8 +564,7 @@ run_memory_case() {
 	done
 	sleep 15; after15="$(runtime_footprint_mib)"
 	sleep 45; after60="$(runtime_footprint_mib)"
-	printf ' settled=%s peak=%s after15s=%s after60s=%s (MiB)\n' "$settled" "$peak" "$after15" "$after60"
-	echo "memory-settled,1,$settled" >> "$RESULTS"
+	printf ' peak=%s after15s=%s after60s=%s (MiB)\n' "$peak" "$after15" "$after60"
 	echo "memory-peak,1,$peak" >> "$RESULTS"
 	echo "memory-after-15s,1,$after15" >> "$RESULTS"
 	echo "memory-after-60s,1,$after60" >> "$RESULTS"
@@ -855,6 +858,23 @@ run_boot_case() {
 		echo "boot-first-container,$rep,$((t2 - t0))" >> "$RESULTS"
 	done
 	printf '\n'
+	# At rest: one more cold start with nothing run on it, and a minute to
+	# settle. This is the memory table's first row; the memory case itself
+	# comes after the warm-up's three installs and cannot read it.
+	boot_stop
+	sleep 2
+	t0=$(now_ms)
+	boot_start
+	if boot_await_docker "$t0"; then
+		wait "$START_PID" 2>/dev/null || true
+		sleep 60
+		[ "$TARGET" != lighter ] || VMM_PID="$(cat "$BOOT_HOME/lighter.pid" 2>/dev/null)"
+		local idle
+		idle="$(runtime_footprint_mib)"
+		[ "$TARGET" != lighter ] || VMM_PID=""
+		echo "==> $TARGET: memory idle=$idle MiB, a minute after a cold start"
+		echo "memory-idle,1,$idle" >> "$RESULTS"
+	fi
 	if [ "$TARGET" = lighter ]; then
 		boot_stop
 		rm -rf "$BOOT_HOME"
