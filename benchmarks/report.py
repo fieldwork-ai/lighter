@@ -77,6 +77,14 @@ POWER_CASES = [
     ("power-energy-x10", "energy impact (top)", 10),
 ]
 
+# How long a runtime takes to become usable from a cold stop: from asking it
+# to start until `docker version` answers, and until the first container has
+# run. Milliseconds in the CSV, seconds in the tables; lower is better.
+BOOT_CASES = [
+    ("boot-docker", "start until docker answers"),
+    ("boot-first-container", "start until the first container has run"),
+]
+
 # Cases the native ratio says nothing useful about. `watch-latency` is the
 # only one: on the Mac a file is visible the moment it is written, so the
 # reference is nearly zero and every ratio against it is a division by noise —
@@ -324,6 +332,31 @@ def render(results, description, _primary):
                     cells.append(f"{int(value)}")
                 else:
                     cells.append(f"{value / scale:.1f}")
+            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    boot_columns = [
+        (name, values)
+        for name, values in columns
+        if name != REFERENCE
+        and not name.endswith("(own disk)")
+        and any(case in values for case, _ in BOOT_CASES)
+    ]
+    if boot_columns:
+        lines += [
+            "### Starting up",
+            "",
+            "From a cold stop: how long until `docker version` answers, and until",
+            "the first container has run. Seconds; lower is better.",
+            "",
+            "| reading | " + " | ".join(name for name, _ in boot_columns) + " |",
+            "|" + "---|" * (len(boot_columns) + 1),
+        ]
+        for case, label in BOOT_CASES:
+            cells = []
+            for _, values in boot_columns:
+                value = values.get(case)
+                cells.append("—" if value is None else f"{value / 1000:.1f}")
             lines.append(f"| {label} | " + " | ".join(cells) + " |")
         lines.append("")
 

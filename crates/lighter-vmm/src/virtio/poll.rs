@@ -207,8 +207,11 @@ fn watch(
     memory: &GuestMemory,
     window: std::time::Duration,
 ) {
-    let mut last_work = std::time::Instant::now();
-    while last_work.elapsed() < window {
+    // The clock is read only on an empty iteration. While every look finds
+    // work there is no quiet to time, and a sample of the egress case had
+    // `Instant::now` at a quarter of this thread's busy samples.
+    let mut idle_since: Option<std::time::Instant> = None;
+    loop {
         let mut found = false;
         for (index, signal) in signals {
             if !signal.has_work(memory) {
@@ -223,10 +226,16 @@ fn watch(
             }
         }
         if found {
-            last_work = std::time::Instant::now();
-        } else {
-            std::hint::spin_loop();
+            idle_since = None;
+            continue;
         }
+        let now = std::time::Instant::now();
+        match idle_since {
+            None => idle_since = Some(now),
+            Some(since) if now.duration_since(since) >= window => return,
+            Some(_) => {}
+        }
+        std::hint::spin_loop();
     }
 }
 
