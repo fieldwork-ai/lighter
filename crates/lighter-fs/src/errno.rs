@@ -26,6 +26,7 @@ pub mod linux {
     pub const ENOTDIR: i32 = 20;
     pub const EISDIR: i32 = 21;
     pub const EINVAL: i32 = 22;
+    pub const ENOTTY: i32 = 25;
     pub const ERANGE: i32 = 34;
     pub const ENAMETOOLONG: i32 = 36;
     pub const ENOSYS: i32 = 38;

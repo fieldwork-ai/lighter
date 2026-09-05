@@ -37,6 +37,11 @@ pub enum RunError {
         #[source]
         source: lighter_hv::HvError,
     },
+    #[error(
+        "the hypervisor accepted but did not apply total store ordering on vCPU {vcpu} \
+         (macOS 15 or later is needed for Rosetta)"
+    )]
+    TsoRefused { vcpu: u64 },
     #[error("vCPU {vcpu} took an unhandled {kind} at pc={pc:#x} (esr={esr:#x}, far={far:#x})")]
     UnhandledException {
         vcpu: u64,

@@ -62,6 +62,23 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("hypervisor entitlement", e.to_string(), "unreadable binary"),
     });
 
+    findings.push(if lighter_vmm::rosetta::installed() {
+        match lighter_vmm::rosetta::key() {
+            Ok(_) => Finding::good("rosetta", "installed; amd64 containers run under Rosetta"),
+            Err(e) => Finding::bad(
+                "rosetta",
+                format!("installed but not usable: {e}"),
+                "amd64 containers run under emulation until lighter is updated for this Rosetta",
+            ),
+        }
+    } else {
+        // Optional, so not a fault: without it amd64 containers still run.
+        Finding::good(
+            "rosetta",
+            "not installed; amd64 containers run under emulation (`lighter rosetta --install`)",
+        )
+    });
+
     findings.push(match paths::kernel() {
         Ok(path) if path.exists() => Finding::good("guest kernel", path.display().to_string()),
         Ok(path) => Finding::bad(

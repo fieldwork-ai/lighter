@@ -89,6 +89,10 @@ pub struct MachineConfig {
     pub run_dir: PathBuf,
     /// Host directories carried into the guest, each on its own device.
     pub shares: Vec<Share>,
+    /// Run every vCPU with the x86-64 memory model (total store ordering),
+    /// which is what Rosetta-translated code assumes. Costs native code a
+    /// little; on only when Rosetta is.
+    pub tso: bool,
 }
 
 impl Default for MachineConfig {
@@ -107,6 +111,7 @@ impl Default for MachineConfig {
             network: false,
             run_dir: std::env::temp_dir().join("lighter"),
             shares: Vec::new(),
+            tso: false,
         }
     }
 }
@@ -562,6 +567,7 @@ impl Machine {
         });
 
         let mut threads = Vec::with_capacity(config.vcpus as usize);
+        let tso = config.tso;
         for index in 0..config.vcpus {
             let vm = vm.clone();
             let ctx = ctx.clone();
@@ -581,7 +587,30 @@ impl Machine {
                     // Release the next core either way, rather than deadlocking
                     // the whole machine behind a failure on this one.
                     ctx.park.finish_creation(index);
-                    let vcpu = created?;
+                    let mut vcpu = created?;
+                    if tso {
+                        // Set once, before the first run; the bit survives
+                        // guest writes to ACTLR_EL1 because the hypervisor
+                        // exposes nothing else of the register. Read back
+                        // rather than trusted: a host that ignored the write
+                        // would run x86-64 code with the wrong memory model.
+                        use lighter_hv::{ACTLR_EL1_TSO, SysReg};
+                        let hv = |source| crate::vcpu::RunError::Hypervisor {
+                            vcpu: u64::from(index),
+                            source,
+                        };
+                        vcpu.set_sys_reg(SysReg::ACTLR_EL1, ACTLR_EL1_TSO)
+                            .map_err(hv)?;
+                        let actual = vcpu.sys_reg(SysReg::ACTLR_EL1).map_err(hv)?;
+                        if actual & ACTLR_EL1_TSO == 0 {
+                            return Err(crate::vcpu::RunError::TsoRefused {
+                                vcpu: u64::from(index),
+                            });
+                        }
+                        if index == 0 {
+                            tracing::info!(actlr = format_args!("{actual:#x}"), "TSO on");
+                        }
+                    }
 
                     // The invariant the ordering exists to guarantee. Checked
                     // here so a violation is named, rather than reaching the

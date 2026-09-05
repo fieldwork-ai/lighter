@@ -498,7 +498,10 @@ impl Fs {
                 ),
             ));
         }
-        let server = Server::new(&share.path)?;
+        let mut server = Server::new(&share.path)?;
+        if share.tag == crate::rosetta::TAG {
+            server.serve_rosetta(crate::rosetta::key()?)?;
+        }
         Ok(Fs {
             tag: share.tag.clone(),
             server: Arc::new(server),

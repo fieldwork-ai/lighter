@@ -485,6 +485,13 @@ fn materialize_stale(
     }
 }
 
+/// What the Rosetta share answers, and for which file. See [`Server::serve_rosetta`].
+struct Rosetta {
+    dev: i64,
+    ino: u64,
+    key: Vec<u8>,
+}
+
 /// A shared directory.
 pub struct Server {
     root: PathBuf,
@@ -509,6 +516,8 @@ pub struct Server {
     open_cache: Arc<OpenCache>,
     /// Opcode counters, off unless asked for.
     stats: Stats,
+    /// Set on the share that carries Rosetta. See [`Server::serve_rosetta`].
+    rosetta: Option<Rosetta>,
     /// The ordered queue that applies acknowledged mutations. See
     /// [`crate::apply`] for the promises it keeps.
     apply: std::sync::Arc<crate::apply::Apply>,
@@ -719,6 +728,7 @@ impl Server {
             notifications: sink,
             open_cache,
             stats: Stats::new(),
+            rosetta: None,
             apply,
             deferred,
             defer_creates: std::env::var("LIGHTER_FS_DEFER_CREATE").as_deref() != Ok("0"),
@@ -987,7 +997,7 @@ impl Server {
             // Everything below is answered by the guest's own fallback path
             // once it knows we do not implement it. Answering ENOSYS is how it
             // learns, and for most of these the kernel then stops asking.
-            op::IOCTL => Err(25), // ENOTTY: no ioctl reaches a passthrough file
+            op::IOCTL => self.ioctl(nodeid, body),
             _ => Err(linux::ENOSYS),
         }
     }
@@ -4327,6 +4337,61 @@ impl Server {
             open.complete.store(true, Ordering::Relaxed);
         }
         Ok(out)
+    }
+
+    /// Makes this share answer for Rosetta.
+    ///
+    /// Rosetta for Linux will only run inside a machine whose file server
+    /// answers a handful of ioctls on the `rosetta` binary itself: two of
+    /// them (`0x22`, `0x25`) with a 69-byte constant, one (`0x23`) with 128
+    /// zero bytes, one (`0x24`) with plain success. The constant is Apple's
+    /// and is not in this program: `key` is read out of the user's own
+    /// installed Rosetta by the caller. Only the binary's inode is answered,
+    /// which is also what Apple's own server does; every other file on the
+    /// share gets ENOTTY as before.
+    pub fn serve_rosetta(&mut self, key: Vec<u8>) -> std::io::Result<()> {
+        let meta = std::fs::metadata(self.root.join("rosetta"))?;
+        use std::os::unix::fs::MetadataExt;
+        self.rosetta = Some(Rosetta {
+            dev: meta.dev() as i64,
+            ino: meta.ino(),
+            key,
+        });
+        Ok(())
+    }
+
+    fn ioctl(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+        let Some(rosetta) = &self.rosetta else {
+            return Err(linux::ENOTTY);
+        };
+        // fuse_ioctl_in: fh, flags, cmd, arg, in_size, out_size.
+        let cmd = get_u32(body, 12).ok_or(linux::EINVAL)?;
+        let out_size = get_u32(body, 28).ok_or(linux::EINVAL)? as usize;
+        let inode = self.inode(nodeid)?;
+        if inode.dev() != rosetta.dev || inode.ino() != rosetta.ino {
+            return Err(linux::ENOTTY);
+        }
+        // Type 'a' (0x61) is Rosetta's; the low byte is the command.
+        if (cmd >> 8) & 0xff != 0x61 {
+            return Err(linux::ENOTTY);
+        }
+        let out: Vec<u8> = match cmd & 0xff {
+            0x22 | 0x25 => rosetta.key.clone(),
+            0x23 => vec![0; 128],
+            0x24 => Vec::new(),
+            _ => return Err(linux::ENOTTY),
+        };
+        if out.len() != out_size {
+            return Err(linux::EINVAL);
+        }
+        // fuse_ioctl_out: result, flags, in_iovs, out_iovs, then the data.
+        // Result 1, because that is what Apple's server returns and what the
+        // binary was observed to accept.
+        let mut reply = Vec::with_capacity(16 + out.len());
+        reply.extend_from_slice(&1i32.to_le_bytes());
+        reply.extend_from_slice(&[0u8; 12]);
+        reply.extend_from_slice(&out);
+        Ok(reply)
     }
 
     fn access(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {

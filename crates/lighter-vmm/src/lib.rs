@@ -44,6 +44,7 @@ pub mod net;
 pub mod psci;
 pub mod qos;
 pub mod reactor;
+pub mod rosetta;
 pub mod smp;
 pub mod sockbuf;
 pub mod streams;

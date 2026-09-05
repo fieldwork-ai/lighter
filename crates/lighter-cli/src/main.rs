@@ -50,6 +50,12 @@ enum Command {
     Status,
     /// Check that this Mac can run lighter, and say what to fix if not.
     Doctor,
+    /// Rosetta for amd64 containers: whether this Mac has it, and installing it.
+    Rosetta {
+        /// Run Apple's installer for Rosetta.
+        #[arg(long)]
+        install: bool,
+    },
     /// Show the machine's log.
     Logs {
         /// Follow the log rather than printing what is there.
@@ -115,6 +121,36 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
                 std::process::ExitCode::FAILURE
             })
         }
+        Command::Rosetta { install } => {
+            use lighter_vmm::rosetta;
+            if install {
+                if rosetta::installed() {
+                    println!("Rosetta is already installed.");
+                } else {
+                    // Apple's own installer; the flag is its, and stands in for
+                    // the agreement its interactive form shows.
+                    let status = std::process::Command::new("/usr/sbin/softwareupdate")
+                        .args(["--install-rosetta", "--agree-to-license"])
+                        .status()
+                        .map_err(|e| anyhow::anyhow!("running softwareupdate: {e}"))?;
+                    if !status.success() || !rosetta::installed() {
+                        anyhow::bail!("Rosetta did not install ({status})");
+                    }
+                    println!(
+                        "Rosetta installed. Restart lighter to run amd64 containers under it."
+                    );
+                }
+            } else if rosetta::installed() {
+                match rosetta::key() {
+                    Ok(_) => println!("installed: amd64 containers run under Rosetta"),
+                    Err(e) => println!("installed but not usable by lighter: {e}"),
+                }
+            } else {
+                println!("not installed: amd64 containers run under emulation");
+                println!("run `lighter rosetta --install` to install it");
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         Command::Logs { follow } => logs(follow),
         Command::Config { cpus, memory, disk } => configure(cpus, memory, disk),
         Command::Resync => {
@@ -149,7 +185,9 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     // this does.
     let blocking: Vec<_> = doctor::run()
         .into_iter()
-        .filter(|f| !f.ok && f.what != "docker context" && f.what != "machine")
+        .filter(|f| {
+            !f.ok && f.what != "docker context" && f.what != "machine" && f.what != "rosetta"
+        })
         .collect();
     if !blocking.is_empty() {
         eprint!("{}", doctor::report(&blocking));
