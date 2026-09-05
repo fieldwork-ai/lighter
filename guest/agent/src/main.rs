@@ -340,13 +340,19 @@ fn bound_container_cache() {
                 &mut last_offer,
                 total,
                 active,
-                // Quiet, or nothing running and the containers three seconds
+                // Quiet, or nothing running and the containers eight seconds
                 // idle: the quiet rule protects running work from a seesaw,
                 // and with no container there is none to protect — while the
                 // trims and compaction after an install kept the guest's CPU
                 // busy for most of a minute, and the range stayed in for it
-                // (the shrink came 47 s after a seven-second install).
-                quiet_for >= 3 * TICKS_PER_SEC || (running == 0 && idle_for >= 3 * TICKS_PER_SEC),
+                // (the shrink came 47 s after a seven-second install). Eight
+                // rather than three: three is the benchmark's gap between
+                // two runs of an install, and a shrink that started in it
+                // had the next run begin as three gigabytes of its
+                // predecessor's cache were being unplugged (the M1's installs
+                // a fifth slower); eight is the second trim's moment, when
+                // the cache is already gone and the unplug is cheap.
+                quiet_for >= 3 * TICKS_PER_SEC || (running == 0 && idle_for >= 8 * TICKS_PER_SEC),
                 running == 0,
                 dynamic && quiet_for == 0,
             );
