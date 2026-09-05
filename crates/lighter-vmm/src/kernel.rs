@@ -7,6 +7,7 @@
 //! nothing between power-on and the kernel's first instruction.
 
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use crate::layout::GuestLayout;
@@ -103,11 +104,72 @@ impl ImageHeader {
     }
 }
 
+/// A file mapped read-only, for copying into the guest.
+///
+/// Not read onto the heap: a 49 MiB kernel read with `fs::read` and dropped
+/// stays in macOS's cache of freed large allocations, dirty, for the life
+/// of the process — 49 MB of a 277 MB idle footprint, seen as an empty
+/// `MALLOC_LARGE` region in `vmmap`. Mapped, its pages are the file's,
+/// clean, and gone when the mapping is.
+struct Mapped {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl Mapped {
+    fn open(path: &Path) -> io::Result<Mapped> {
+        use std::os::fd::AsRawFd;
+        let file = fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Ok(Mapped {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            });
+        }
+        // SAFETY: a read-only private mapping of an open file, checked below.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Mapped { ptr, len })
+    }
+}
+
+impl std::ops::Deref for Mapped {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `ptr` maps `len` readable bytes until `drop`.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            // SAFETY: the mapping made in `open`, unmapped once.
+            unsafe { libc::munmap(self.ptr, self.len) };
+        }
+    }
+}
+
 /// A kernel and optional initramfs, staged into guest memory.
 pub struct KernelLoader<'a> {
-    kernel: Vec<u8>,
+    kernel: Mapped,
     kernel_path: String,
-    initramfs: Option<Vec<u8>>,
+    initramfs: Option<Mapped>,
     layout: &'a GuestLayout,
 }
 
@@ -120,7 +182,7 @@ pub struct InitramfsPlacement {
 
 impl<'a> KernelLoader<'a> {
     pub fn new(layout: &'a GuestLayout, kernel_path: &Path) -> Result<Self> {
-        let kernel = fs::read(kernel_path).map_err(|source| KernelError::Io {
+        let kernel = Mapped::open(kernel_path).map_err(|source| KernelError::Io {
             path: kernel_path.display().to_string(),
             source,
         })?;
@@ -133,7 +195,7 @@ impl<'a> KernelLoader<'a> {
     }
 
     pub fn with_initramfs(mut self, path: &Path) -> Result<Self> {
-        self.initramfs = Some(fs::read(path).map_err(|source| KernelError::Io {
+        self.initramfs = Some(Mapped::open(path).map_err(|source| KernelError::Io {
             path: path.display().to_string(),
             source,
         })?);

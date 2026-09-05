@@ -151,6 +151,11 @@ pub trait VirtioDevice: Send {
         queue::MAX_QUEUE_SIZE
     }
 
+    /// Largest size for one queue, where a device wants them unequal.
+    fn queue_max_size_of(&self, _queue: u16) -> u16 {
+        self.queue_max_size()
+    }
+
     /// Device-specific configuration space.
     fn config_read(&self, offset: u64, data: &mut [u8]) {
         let _ = offset;

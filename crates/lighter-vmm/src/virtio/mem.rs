@@ -234,12 +234,13 @@ fn monotonic_ms() -> u64 {
 
 /// The base and the range for a guest of `total` bytes.
 ///
-/// The base is a quarter of the total and a gigabyte at least, because the
-/// kernel's unmovable allocations (slab, page tables, the plugged blocks'
-/// own page arrays at 1.56% of them, socket buffers) all come from it while
-/// the range is onlined movable, and three movable to one is the kernel's
-/// own default ratio. A larger base costs only its page array at idle; its
-/// free pages are reported and released like any other.
+/// The base is an eighth of the total and a gigabyte at least. The kernel's
+/// unmovable allocations (slab, page tables, the plugged blocks' own page
+/// arrays at 1.56% of them, socket buffers) all come from it while the
+/// range is onlined movable, so it cannot be tiny; but it is paid for at
+/// idle in its page array and the structures the kernel sizes by it, and
+/// a quarter was measured at 58 MiB more than an eighth on a 12 GiB guest
+/// (335 against 277 MiB, M5), for headroom nothing measured has needed.
 ///
 /// `LIGHTER_VIRTIO_MEM=0` gives the guest everything at boot, as before,
 /// for the A/B; `LIGHTER_VIRTIO_MEM=<MiB>` sets the base by hand.
@@ -250,7 +251,7 @@ pub fn split(total: u64) -> (u64, u64) {
     {
         Some(0) => return (total, 0),
         Some(mib) => mib << 20,
-        None => (total / 4).max(1 << 30),
+        None => (total / 8).max(1 << 30),
     };
     let base = base.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
     if base >= total {
@@ -438,12 +439,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_base_is_a_quarter_and_a_gigabyte_at_least() {
+    fn the_base_is_an_eighth_and_a_gigabyte_at_least() {
         // Not through the environment: a parallel test may be reading it.
         if std::env::var_os("LIGHTER_VIRTIO_MEM").is_some() {
             return;
         }
-        assert_eq!(split(12 << 30), (3 << 30, 9 << 30));
+        assert_eq!(split(16 << 30), (2 << 30, 14 << 30));
+        assert_eq!(split(12 << 30), ((1536 << 20), (12 << 30) - (1536 << 20)));
         assert_eq!(split(2 << 30), (1 << 30, 1 << 30));
         assert_eq!(split(1 << 30), (1 << 30, 0));
         assert_eq!(split(512 << 20), (512 << 20, 0));

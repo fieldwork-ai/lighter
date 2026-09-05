@@ -46,6 +46,8 @@ use packet::{GUEST_CID, HDR_LEN, MAX_PAYLOAD, Op, Packet, shutdown};
 pub const RX_QUEUE: u16 = 0;
 pub const TX_QUEUE: u16 = 1;
 pub const EVENT_QUEUE: u16 = 2;
+/// Entries in the receive ring; see `queue_max_size_of`.
+const RX_RING_DEPTH: u16 = 128;
 
 /// Where host-side ephemeral ports start.
 ///
@@ -1493,6 +1495,25 @@ impl VirtioDevice for Vsock {
 
     fn features(&self) -> u64 {
         COMMON_FEATURES
+    }
+
+    /// The receive ring is what the guest keeps posted for the host: one
+    /// 256 KiB buffer per entry (guest patch 0015), allocated and held for
+    /// the machine's life — 64 MB at 256 entries, a fifth of an idle guest,
+    /// and every buffer resident on the Mac once traffic has recycled it.
+    /// Measured on the M5 (two reps of the network cases): 128 entries read
+    /// the same as 256 on every case (egress 104/98 against 101/104 Gbit/s,
+    /// the Mac→container direction 95/97 against 90/97); 64 dipped a few
+    /// percent in that direction. `LIGHTER_VSOCK_RX` sets the depth.
+    fn queue_max_size_of(&self, queue: u16) -> u16 {
+        if queue != RX_QUEUE {
+            return self.queue_max_size();
+        }
+        std::env::var("LIGHTER_VSOCK_RX")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(RX_RING_DEPTH)
+            .clamp(8, self.queue_max_size())
     }
 
     fn queue_count(&self) -> usize {

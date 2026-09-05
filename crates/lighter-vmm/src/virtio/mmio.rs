@@ -185,12 +185,11 @@ impl VirtioMmio {
         memory: Arc<GuestMemory>,
         irq: Arc<dyn IrqLine>,
     ) -> VirtioMmio {
-        let max = device.queue_max_size();
         let signals = (0..device.queue_count())
             .map(|_| Arc::new(QueueSignal::default()))
             .collect();
         let queues = (0..device.queue_count())
-            .map(|_| Virtqueue::new(max))
+            .map(|q| Virtqueue::new(device.queue_max_size_of(q as u16)))
             .collect();
         let interrupt_status = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let line = std::sync::Arc::new(crate::bus::InterruptLine::new(
