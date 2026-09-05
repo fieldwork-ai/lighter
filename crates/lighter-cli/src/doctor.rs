@@ -82,8 +82,7 @@ pub fn run() -> Vec<Finding> {
         )
     });
 
-    // The kernel the next start would boot: the tick rate follows the
-    // configured vCPUs against the Mac's cores (`config::kernel_hz`).
+    // The kernel the next start would boot (`config::kernel_hz`).
     let cpus = crate::config::Config::load()
         .map(|c| c.cpus)
         .unwrap_or_else(|_| crate::config::Config::default().cpus);
@@ -95,14 +94,16 @@ pub fn run() -> Vec<Finding> {
             } else {
                 250
             };
-            let note = if actual == hz {
-                String::new()
-            } else {
+            let note = if actual != hz {
                 format!("; the {hz} Hz image is not installed")
+            } else if actual == 250 {
+                "; LIGHTER_KERNEL_HZ=1000 for the other".to_string()
+            } else {
+                String::new()
             };
             Finding::good(
                 "guest kernel",
-                format!("{} ({actual} Hz for {cpus} vCPUs{note})", path.display()),
+                format!("{} ({actual} Hz{note})", path.display()),
             )
         }
         Ok(path) => Finding::bad(
