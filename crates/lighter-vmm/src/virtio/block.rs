@@ -51,6 +51,41 @@ const MAX_DISCARD_SECTORS: u32 = 1 << 22;
 /// specification allocates.
 const DEVICE_ID: &[u8] = b"lighter-blk";
 
+/// How long the host's side of a flush takes, summarised every hundred when
+/// `LIGHTER_BLK_TRACE` is set: the guest's own flush accounting says how long
+/// a flush took it, and this is the part of that which was ours.
+static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static WRITTEN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn trace_on() -> bool {
+    *TRACE_ON.get_or_init(|| std::env::var_os("LIGHTER_BLK_TRACE").is_some())
+}
+
+fn flush_trace(took: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    if !trace_on() {
+        return;
+    }
+    let us = took.as_micros() as u64;
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = TOTAL_US.fetch_add(us, Ordering::Relaxed) + us;
+    MAX_US.fetch_max(us, Ordering::Relaxed);
+    if n.is_multiple_of(100) {
+        tracing::info!(
+            flushes = n,
+            mean_us = total / n,
+            max_us = MAX_US.swap(0, Ordering::Relaxed),
+            written_kib_per_flush = WRITTEN_BYTES.swap(0, Ordering::Relaxed) / 1024 / 100,
+            writes_per_flush = WRITE_OPS.swap(0, Ordering::Relaxed) / 100,
+            "BLKFLUSH"
+        );
+    }
+}
+
 /// A virtio block device over a sparse host file.
 pub struct Block {
     disk: Arc<Disk>,
@@ -131,16 +166,18 @@ impl Block {
         match request_type {
             T_IN => self.read(sector, body, mem),
             T_OUT => (self.write(sector, body, mem), 0),
-            T_FLUSH => (
-                match self.disk.flush() {
+            T_FLUSH => {
+                let started = std::time::Instant::now();
+                let status = match self.disk.flush() {
                     Ok(()) => S_OK,
                     Err(e) => {
                         tracing::error!(%e, "virtio-blk flush failed");
                         S_IOERR
                     }
-                },
-                0,
-            ),
+                };
+                flush_trace(started.elapsed());
+                (status, 0)
+            }
             T_GET_ID => self.get_id(body, mem),
             T_DISCARD => (self.discard(body, mem, true), 0),
             T_WRITE_ZEROES => (self.discard(body, mem, false), 0),
@@ -193,6 +230,11 @@ impl Block {
         let Some(mut iovs) = Self::spans(body, mem, false) else {
             return S_IOERR;
         };
+        if trace_on() {
+            let bytes: usize = iovs.iter().map(|iov| iov.iov_len).sum();
+            WRITTEN_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+            WRITE_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match self.disk.write_vectored_at(sector * SECTOR_SIZE, &mut iovs) {
             Ok(()) => S_OK,
             Err(_) => S_IOERR,

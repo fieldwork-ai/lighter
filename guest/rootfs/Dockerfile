@@ -5,16 +5,14 @@
 # containerd, runc) is packaged and tested on Alpine and is a genuine
 # build-system project on buildroot. The size difference is tens of megabytes
 # of a sparse disk that punches back to nothing; the time difference is days.
-FROM alpine:3.21 AS rootfs
+FROM alpine:3.22 AS rootfs
 
 # docker-cli is not needed in the guest — the CLI runs on macOS — but dockerd
 # pulls its own runtime deps. e2fsprogs is here for the overlay2 storage driver
 # and for fsck of the data volume on boot.
 #
-# `qemu-x86_64` is what makes `--platform linux/amd64` work. Rosetta would be
-# faster and is not available to us: it refuses to run outside
-# Virtualization.framework, which is a check we are not going to work around.
-# See `docs/x86-64.md`.
+# `qemu-x86_64` is the fallback for `--platform linux/amd64` on a Mac without
+# Rosetta installed; with it, Rosetta is the handler. See `docs/x86-64.md`.
 RUN apk add --no-cache \
 	iproute2 \
 	docker-engine \
