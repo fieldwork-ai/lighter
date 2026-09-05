@@ -22,6 +22,8 @@ Every target runs the same case scripts against the same fixture — a pinned `n
 
 `native` is the reference. It is a hard reference: a shared filesystem at 100% of it is costing nothing at all next to a local disk, which is not a thing shared filesystems normally are.
 
+`--where guest` runs the cases on the runtime's own disk instead of the share, into `<target>-guest.csv`. `--arch amd64` runs them in the x86-64 build of the image (`--platform linux/amd64`, so under Rosetta on Apple silicon), into `<target>-amd64.csv`; the README's x86-64 table is those runs on the own disk. Two cases exist for that table's sake and run under either architecture: `cpu-sha256`, a gigabyte through `sha256sum` with no disk or network in it, and `container-start`, `docker run --rm alpine true` timed from the host.
+
 ## Three rules the harness enforces
 
 **The timing loop runs inside the target.** It used to run outside, around a whole `docker run`, and that measured container startup: a metadata walk costing the filesystem 1,566 requests reported 550ms, of which about 450ms was Docker creating and destroying a container. The native target pays no such cost, so the comparison was not between two filesystems at all. Everything before the first measurement — image pull, container start, a cold page cache — now happens once and is not timed.

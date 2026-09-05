@@ -31,7 +31,7 @@ cd "$ROOT"
 TARGET=""
 LABEL=""
 REPS=3
-CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot"
+CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf cpu-sha256 container-start watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot"
 # Cases that read a package tree rather than making one. They run after the
 # installs, on a tree materialized once by npm — which installer produced it
 # changes what they see, and pnpm in particular builds a farm of symlinks.
@@ -56,6 +56,11 @@ ALLOW_NOISY=0
 # it costs, and without that split every number is a sum of two things and
 # tuning aims at whichever one you guessed.
 WHERE="share"
+# Which architecture the container is. `amd64` runs the same cases in the
+# x86-64 build of the image, `--platform linux/amd64`, which on Apple silicon
+# means under Rosetta (or whatever the runtime substitutes for it): the
+# translator's cost on a real install, beside the native number.
+ARCH="arm64"
 # Which fixture to install.
 #
 #   npm    1,232 packages, 66,213 files, 908 MB — what the published table uses
@@ -81,6 +86,7 @@ while [ $# -gt 0 ]; do
 	--label)  LABEL="$2"; shift 2 ;;
 	--allow-noisy) ALLOW_NOISY=1; shift ;;
 	--where)  WHERE="$2"; shift 2 ;;
+	--arch)   ARCH="$2"; shift 2 ;;
 	--fixture) FIXTURE="$2"; shift 2 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
@@ -100,6 +106,16 @@ RESULTS="benchmarks/results/${LABEL:-$TARGET}.csv"
 # not overwrite the published CSV unless it was asked to by name.
 [ "$FIXTURE" = npm ] || [ -n "$LABEL" ] || RESULTS="benchmarks/results/$TARGET-$FIXTURE.csv"
 [ "$WHERE" = share ] || [ "$WHERE" = guest ] || { echo "--where wants share or guest, got $WHERE" >&2; exit 2; }
+[ "$ARCH" = arm64 ] || [ "$ARCH" = amd64 ] || { echo "--arch wants arm64 or amd64, got $ARCH" >&2; exit 2; }
+# An amd64 run is its own result set too, `<target>-amd64.csv`, whichever
+# disk it ran on; the report's x86-64 table reads it.
+PLATFORM=()
+CACHE_SUFFIX=""
+if [ "$ARCH" = amd64 ]; then
+	PLATFORM=(--platform linux/amd64)
+	CACHE_SUFFIX="-amd64"
+	[ -n "$LABEL" ] || RESULTS="benchmarks/results/$TARGET-amd64.csv"
+fi
 VMM_PID=""
 HELPER_PID=""
 ROOTFS=""
@@ -303,12 +319,16 @@ setup_container() {
 	SHARE_MOUNT="$WORK"
 	DOCKER_ARGS=()
 	[ -n "$ctx" ] && DOCKER_ARGS=(--context "$ctx")
-	docker "${DOCKER_ARGS[@]}" build -q -t "$IMAGE" benchmarks >/dev/null
+	# The x86-64 build of the image under its own tag: a plain build would
+	# replace the native one, and the next native run would measure Rosetta.
+	[ "$ARCH" = arm64 ] || IMAGE="$IMAGE-$ARCH"
+	docker "${DOCKER_ARGS[@]}" build -q ${PLATFORM[@]+"${PLATFORM[@]}"} -t "$IMAGE" benchmarks >/dev/null
 	# The package cache lives on the runtime's own storage, not on the share:
 	# putting it on the share would make every target's cache as slow as its
 	# file sharing, which is a second measurement smuggled into the first.
+	# One set per architecture: npm's cache holds prebuilt binaries by arch.
 	for cache in npm pnpm yarn; do
-		docker "${DOCKER_ARGS[@]}" volume create "lighter-bench-$cache-$TARGET" >/dev/null
+		docker "${DOCKER_ARGS[@]}" volume create "lighter-bench-$cache-$TARGET$CACHE_SUFFIX" >/dev/null
 	done
 	seed_guest_volume
 }
@@ -317,11 +337,11 @@ run_case_container() {
 	local script
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
-	docker "${DOCKER_ARGS[@]}" run --rm \
+	docker "${DOCKER_ARGS[@]}" run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} \
 		-v "$(work_mount)":/work \
-		-v "lighter-bench-npm-$TARGET:/root/.npm" \
-		-v "lighter-bench-pnpm-$TARGET:/root/.local/share/pnpm/store" \
-		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \
+		-v "lighter-bench-npm-$TARGET$CACHE_SUFFIX:/root/.npm" \
+		-v "lighter-bench-pnpm-$TARGET$CACHE_SUFFIX:/root/.local/share/pnpm/store" \
+		-v "lighter-bench-yarn-$TARGET$CACHE_SUFFIX:/usr/local/share/.cache/yarn" \
 		-e WORK=/work \
 		-e "REPS=$REPS" \
 		-e "CASE_TIMEOUT_S=${CASE_TIMEOUT_S:-300}" \
@@ -375,6 +395,11 @@ bench_memory_mib() {
 setup_lighter() {
 	KERNEL="${LIGHTER_BENCH_KERNEL:-guest/out/Image}"
 	BIN="target/release/examples/lighter-bench"
+	# Rosetta, when the Mac has it, the way `lighter start` attaches it: the
+	# guest's amd64 path is Rosetta or a message, and `--arch amd64` needs
+	# the former. Nothing changes for arm64 cases.
+	ROSETTA_DIR=""
+	[ -x /Library/Apple/usr/libexec/oah/RosettaLinux/rosetta ] && ROSETTA_DIR=/Library/Apple/usr/libexec/oah/RosettaLinux
 	[ -f "$KERNEL" ] || ./guest/kernel/build.sh
 	# A private clone, not the master: the master is an artifact, and any
 	# second machine mounting it read-write beside the first — a daily
@@ -415,8 +440,9 @@ setup_lighter() {
 		--docker-ports "$SOCKET" \
 		--share "bench:$WORK" \
 		${LIGHTER_BENCH_DEV_AGENT:+--share "dev:$(dirname "$LIGHTER_BENCH_DEV_AGENT")"} \
+		${ROSETTA_DIR:+--share "rosetta:$ROSETTA_DIR"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")} ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")}${ROSETTA_DIR:+ lighter.rosetta} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
@@ -429,9 +455,10 @@ setup_lighter() {
 	done
 	export DOCKER_HOST="unix://$SOCKET"
 	DOCKER_ARGS=()
-	docker build -q -t "$IMAGE" benchmarks >/dev/null
+	[ "$ARCH" = arm64 ] || IMAGE="$IMAGE-$ARCH"
+	docker build -q ${PLATFORM[@]+"${PLATFORM[@]}"} -t "$IMAGE" benchmarks >/dev/null
 	for cache in npm pnpm yarn; do
-		docker volume create "lighter-bench-$cache-$TARGET" >/dev/null
+		docker volume create "lighter-bench-$cache-$TARGET$CACHE_SUFFIX" >/dev/null
 	done
 	# The share is mounted at a different path inside this guest than the host
 	# path, so the bind mount names the guest path.
@@ -443,11 +470,11 @@ run_case_lighter() {
 	local script
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
-	docker run --rm \
+	docker run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} \
 		-v "$(work_mount)":/work \
-		-v "lighter-bench-npm-$TARGET:/root/.npm" \
-		-v "lighter-bench-pnpm-$TARGET:/root/.local/share/pnpm/store" \
-		-v "lighter-bench-yarn-$TARGET:/usr/local/share/.cache/yarn" \
+		-v "lighter-bench-npm-$TARGET$CACHE_SUFFIX:/root/.npm" \
+		-v "lighter-bench-pnpm-$TARGET$CACHE_SUFFIX:/root/.local/share/pnpm/store" \
+		-v "lighter-bench-yarn-$TARGET$CACHE_SUFFIX:/usr/local/share/.cache/yarn" \
 		-e WORK=/work \
 		-e "REPS=$REPS" \
 		-e "CASE_TIMEOUT_S=${CASE_TIMEOUT_S:-300}" \
@@ -881,6 +908,31 @@ run_boot_case() {
 	fi
 }
 
+# A container's whole life on a running machine: `docker run --rm alpine
+# true`, timed from the host, the way a test suite or a compose stack pays it
+# per container. Under `--arch amd64` the container is the x86-64 image, so
+# the row is also what the translator adds to a start. The image is pulled
+# and run once untimed first.
+run_container_start_case() {
+	[ "$TARGET" != native ] || return 0
+	printf '==> %s: container-start' "$TARGET"
+	dk pull --quiet ${PLATFORM[@]+"${PLATFORM[@]}"} alpine:3.21 >/dev/null 2>&1 || true
+	dk run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} alpine:3.21 true >/dev/null 2>&1 || true
+	local rep t0 t1
+	for rep in $(seq 1 "$REPS"); do
+		t0=$(now_ms)
+		if dk run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} alpine:3.21 true >/dev/null 2>&1; then
+			t1=$(now_ms)
+			printf ' %s' "$((t1 - t0))"
+			echo "container-start,$rep,$((t1 - t0))" >> "$RESULTS"
+		else
+			printf ' failed'
+			echo "container-start,$rep,timeout" >> "$RESULTS"
+		fi
+	done
+	printf '\n'
+}
+
 for name in $CASES; do
 	if [ "$name" = memory ]; then
 		run_memory_case
@@ -895,6 +947,10 @@ for name in $CASES; do
 	if [ "$name" = boot ]; then
 		net_teardown
 		run_boot_case
+		continue
+	fi
+	if [ "$name" = container-start ]; then
+		run_container_start_case
 		continue
 	fi
 	# A tree the previous case deleted is a case that measures nothing and

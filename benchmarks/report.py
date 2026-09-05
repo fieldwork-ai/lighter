@@ -86,6 +86,17 @@ BOOT_CASES = [
     ("boot-first-container", "start until the first container has run"),
 ]
 
+# x86-64 images on an Apple silicon runtime, from `<target>-amd64.csv`: the
+# runs of `run.sh --arch amd64 --where guest`. An install that mostly waits,
+# straight-line computation, and a container's start, so the translator's
+# price shows on each kind of work rather than as one number.
+AMD64_CASES = [
+    ("npm-install", "`npm ci`"),
+    ("pnpm-install", "`pnpm install`"),
+    ("cpu-sha256", "`sha256sum` of 1 GiB"),
+    ("container-start", "container start, `alpine true`"),
+]
+
 # Cases the native ratio says nothing useful about. `watch-latency` is the
 # only one: on the Mac a file is visible the moment it is written, so the
 # reference is nearly zero and every ratio against it is a division by noise —

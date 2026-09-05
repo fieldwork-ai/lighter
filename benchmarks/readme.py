@@ -49,6 +49,8 @@ NETWORK_INTRO = """iperf3 between a container and the Mac in both directions, on
 
 POWER_INTRO = """After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better."""
 
+AMD64_INTRO = """The same runtimes running `linux/amd64` images on their own disk: an install that mostly waits on the disk and the network, straight-line computation (a gigabyte through `sha256sum`), and a container's start, so the translator's price shows on each kind of work. lighter, OrbStack and Docker Desktop run these under Rosetta; Colima was started with `--vz-rosetta`. The first column is lighter's own arm64 number for the same case, for scale. Median of three; lower is better."""
+
 BOOT_INTRO = """From a cold stop, the runtime asked to start the way a person would (`lighter start`, `orb start`, `colima start`, opening Docker Desktop): how long until `docker version` answers, and until the first container has run. Median of three; lower is better."""
 
 
@@ -184,6 +186,30 @@ def boot_table(results):
     return "\n".join(lines)
 
 
+def amd64_table(results):
+    scale = report.load("lighter-guest", results)
+    runtimes = [(name, report.load(f"{key}-amd64", results)) for key, name in RUNTIMES if key != "native"]
+    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _ in report.AMD64_CASES)]
+    if not runtimes:
+        return ""
+    lines = ["| Workload (x86-64 image, own disk) | lighter, arm64" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (2 + len(runtimes)) + "|"]
+    for case, label in report.AMD64_CASES:
+        values = [v.get(case) for _, v in runtimes]
+        present = [v for v in values if v is not None]
+        if not present:
+            continue
+        best = min(present)
+        reference = scale.get(case)
+        cells = [label, "—" if reference is None else ms(reference)]
+        for value in values:
+            cell = "—" if value is None else ms(value)
+            if value == best and len(present) > 1:
+                cell = f"**{cell}**"
+            cells.append(cell)
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def section():
     out = ["## Benchmarks", "", INTRO, ""]
     for results, heading in MACHINES:
@@ -208,6 +234,9 @@ def section():
         boot = boot_table(results)
         if boot:
             out += ["#### Starting up", "", BOOT_INTRO, "", boot, ""]
+        amd64 = amd64_table(results)
+        if amd64:
+            out += ["#### x86-64 images", "", AMD64_INTRO, "", amd64, ""]
     out += ["`benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.", ""]
     return "\n".join(out)
 
