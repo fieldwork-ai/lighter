@@ -108,6 +108,14 @@ struct Conn {
     /// The host end, kept for shutdown. The writer thread holds its own
     /// clone. None until a pump attaches one.
     socket: Option<Box<dyn Closable>>,
+    /// Threads blocked in `wait_progress` on this connection. The transport
+    /// broadcasts the condvar only when a packet touched a connection that
+    /// has one: the memory policy's reader sits in a 100 ms wait on its own
+    /// port for the machine's whole life, and with one count for everyone
+    /// its presence made every batch of somebody else's stream a broadcast
+    /// and a context switch — a fifth of the poller's time at 53 Gbit/s on
+    /// an M1.
+    waiters: u32,
 }
 
 /// What the host end of a connection has to be: readable, writable,
@@ -246,9 +254,13 @@ pub struct VsockShared {
     /// Signalled when credit frees up or a connection changes state, so a
     /// blocked writer wakes without polling.
     progress: Condvar,
-    /// How many threads are waiting on `progress`, so that `progressed` can
-    /// skip the broadcast — a syscall per packet — when nobody is.
+    /// How many threads are waiting on `progress` at all, for the rare
+    /// events that are not about one connection (a reset, a shutdown). The
+    /// packet paths look at the connection's own count instead.
     waiters: std::sync::atomic::AtomicUsize,
+    /// How many of them are senders out of outbox room, which is the one
+    /// condition that delivery into the guest changes for everybody.
+    room_waiters: std::sync::atomic::AtomicUsize,
     /// Pokes the transport to drain the outbox into the guest.
     ///
     /// Set after construction because the transport does not exist yet when the
@@ -303,6 +315,7 @@ impl VsockShared {
             }),
             progress: Condvar::new(),
             waiters: std::sync::atomic::AtomicUsize::new(0),
+            room_waiters: std::sync::atomic::AtomicUsize::new(0),
             waker: Mutex::new(None),
         }
     }
@@ -314,17 +327,33 @@ impl VsockShared {
     /// the count before it decides whether to broadcast.
     fn wait_progress<'a>(
         &self,
-        inner: std::sync::MutexGuard<'a, Inner>,
+        key: ConnKey,
+        want_room: bool,
+        mut inner: std::sync::MutexGuard<'a, Inner>,
         timeout: std::time::Duration,
     ) -> std::sync::MutexGuard<'a, Inner> {
+        if let Some(conn) = inner.conns.get_mut(&key) {
+            conn.waiters += 1;
+        }
         self.waiters
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (guard, _) = self
+        if want_room {
+            self.room_waiters
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let (mut guard, _) = self
             .progress
             .wait_timeout(inner, timeout)
             .expect("vsock state poisoned");
+        if want_room {
+            self.room_waiters
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.waiters
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(conn) = guard.conns.get_mut(&key) {
+            conn.waiters = conn.waiters.saturating_sub(1);
+        }
         guard
     }
 
@@ -362,9 +391,17 @@ impl VsockShared {
     }
 
     /// Something a waiter may care about changed: blocking waiters are
-    /// woken through the condvar, the reactor through its waker.
+    /// woken through the condvar, the reactor through its waker. For
+    /// events that name no connection; the packet paths know whose
+    /// connections they touched and use `progressed_if`.
     fn progressed(&self) {
-        if self.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        self.progressed_if(self.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    /// As `progressed`, broadcasting to blocked threads only if `blocked`
+    /// says a touched connection has one.
+    fn progressed_if(&self, blocked: bool) {
+        if blocked {
             self.progress.notify_all();
         }
         self.stream_pending
@@ -425,6 +462,7 @@ impl VsockShared {
                 unreported: 0,
                 received: 0,
                 socket: Some(Box::new(socket)),
+                waiters: 0,
             },
         );
         let mut request = Packet::control(Op::Request, host_port, guest_port);
@@ -693,7 +731,7 @@ impl VsockShared {
             if ended {
                 return None;
             }
-            inner = self.wait_progress(inner, std::time::Duration::from_millis(100));
+            inner = self.wait_progress(key, false, inner, std::time::Duration::from_millis(100));
         }
         drop(inner);
         self.wake();
@@ -757,7 +795,7 @@ impl VsockShared {
             if remaining.is_zero() {
                 return false;
             }
-            inner = self.wait_progress(inner, remaining);
+            inner = self.wait_progress(key, false, inner, remaining);
         }
     }
 
@@ -791,7 +829,8 @@ impl VsockShared {
                 self.wake();
 
                 let inner = self.lock();
-                let _unused = self.wait_progress(inner, std::time::Duration::from_millis(50));
+                let _unused =
+                    self.wait_progress(key, room == 0, inner, std::time::Duration::from_millis(50));
                 continue;
             }
 
@@ -888,7 +927,7 @@ impl VsockShared {
             if conn.state == State::Closed || conn.guest_done {
                 return None;
             }
-            inner = self.wait_progress(inner, std::time::Duration::from_millis(100));
+            inner = self.wait_progress(key, false, inner, std::time::Duration::from_millis(100));
         }
     }
 
@@ -1140,6 +1179,7 @@ impl Vsock {
                             unreported: 0,
                             received: 0,
                             socket: None,
+                            waiters: 0,
                         };
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
                         inner.conns.insert(key, conn);
@@ -1308,7 +1348,13 @@ impl Vsock {
         }
 
         let mut inner = self.shared.lock();
+        // Whether any packet landed on a connection with a thread blocked
+        // on it, looked up before the packet is handled: a reset removes
+        // the connection, and its waiter is exactly who must hear.
+        let mut blocked = false;
         for (packet, guest) in packets {
+            let key = (packet.dst_port, packet.src_port);
+            blocked |= inner.conns.get(&key).is_some_and(|conn| conn.waiters > 0);
             match guest {
                 Some((head, spans)) => {
                     if !Vsock::handle_guest_rw(&mut inner, &packet, head, spans) {
@@ -1325,8 +1371,9 @@ impl Vsock {
         }
         drop(inner);
         // Credit may have freed up, and a connection may have been
-        // established or torn down; either way somebody may be blocked.
-        self.shared.progressed();
+        // established or torn down; whoever waits on those connections
+        // is woken, and nobody else.
+        self.shared.progressed_if(blocked);
 
         used_any
     }
@@ -1422,7 +1469,14 @@ impl Vsock {
 
         drop(inner);
         if used_any {
-            self.shared.progressed();
+            // Delivery frees outbox room, which is the one thing a blocked
+            // sender may be waiting on that is not its own connection's.
+            let room = self
+                .shared
+                .room_waiters
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0;
+            self.shared.progressed_if(room);
         }
         used_any
     }
