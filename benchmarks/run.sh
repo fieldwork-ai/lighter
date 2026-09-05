@@ -783,6 +783,9 @@ boot_stop() {
 		while pgrep -f 'com.docker.backend' >/dev/null 2>&1 && [ "$waited" -lt 90 ]; do
 			sleep 1; waited=$((waited + 1))
 		done
+		# The app is still tearing down after its backend has gone; an
+		# `open` inside that window is swallowed and it stays down.
+		sleep 5
 		;;
 	esac
 }
@@ -795,12 +798,12 @@ boot_start() {
 	esac
 	START_PID=$!
 }
-# Milliseconds from now until `docker version` answers, or empty after three
-# minutes.
+# Waits until `docker version` answers, or gives up after five minutes (Docker
+# Desktop takes a minute on a good day).
 boot_await_docker() {
 	local t0="$1"
 	while ! dk version >/dev/null 2>&1; do
-		[ $(( $(now_ms) - t0 )) -lt 180000 ] || return 1
+		[ $(( $(now_ms) - t0 )) -lt 300000 ] || return 1
 		sleep 0.05
 	done
 }
@@ -826,7 +829,7 @@ run_boot_case() {
 		t0=$(now_ms)
 		boot_start
 		if ! boot_await_docker "$t0"; then
-			printf ' no measurement: docker did not answer within three minutes'
+			printf ' no measurement: docker did not answer within five minutes'
 			echo "boot-docker,$rep,timeout" >> "$RESULTS"
 			break
 		fi
