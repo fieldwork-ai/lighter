@@ -14,8 +14,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-
-
 /// The card's addresses for the Mac, which the stream host maps to loopback.
 const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);

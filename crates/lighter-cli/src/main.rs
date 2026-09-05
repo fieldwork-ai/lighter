@@ -144,7 +144,9 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
                     Rosetta::NotSupported => anyhow::bail!("this Mac cannot run Rosetta"),
                     Rosetta::NotInstalled => {
                         lighter_vmm::vz::install_rosetta().map_err(|e| anyhow::anyhow!(e))?;
-                        println!("Rosetta installed. Restart lighter to run amd64 containers under it.");
+                        println!(
+                            "Rosetta installed. Restart lighter to run amd64 containers under it."
+                        );
                     }
                 }
                 return Ok(std::process::ExitCode::SUCCESS);
@@ -155,7 +157,9 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
                     println!("not installed: amd64 containers run under emulation");
                     println!("run `lighter rosetta --install` to install it");
                 }
-                Rosetta::NotSupported => println!("not supported on this Mac: amd64 containers run under emulation"),
+                Rosetta::NotSupported => {
+                    println!("not supported on this Mac: amd64 containers run under emulation")
+                }
             }
             Ok(std::process::ExitCode::SUCCESS)
         }

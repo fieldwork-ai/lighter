@@ -23,7 +23,9 @@ use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-use objc2_foundation::{NSArray, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL};
+use objc2_foundation::{
+    NSArray, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL,
+};
 use objc2_virtualization::*;
 
 /// A framework object is bound to a queue, not a thread: holding it anywhere
@@ -156,7 +158,8 @@ pub fn install_rosetta() -> Result<(), String> {
     // SAFETY: a class method; the block outlives the call because the
     // framework copies it.
     unsafe { VZLinuxRosettaDirectoryShare::installRosettaWithCompletionHandler(&block) };
-    rx.recv().map_err(|_| "the installer never answered".to_string())?
+    rx.recv()
+        .map_err(|_| "the installer never answered".to_string())?
 }
 
 /// How the guest's console reaches us.
@@ -196,7 +199,12 @@ pub struct Vm {
 const HELPER_NAME: &str = "com.apple.Virtualization.VirtualMachine";
 
 unsafe extern "C" {
-    fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
+    fn proc_listpids(
+        kind: u32,
+        typeinfo: u32,
+        buffer: *mut libc::c_void,
+        buffersize: libc::c_int,
+    ) -> libc::c_int;
     fn proc_name(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
 }
 
@@ -336,17 +344,18 @@ impl Vm {
             }
 
             if config.rosetta {
-                let share =
-                    VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc())
-                        .map_err(|e| format!("rosetta share: {}", describe(&e)))?;
+                let share = VZLinuxRosettaDirectoryShare::initWithError(
+                    VZLinuxRosettaDirectoryShare::alloc(),
+                )
+                .map_err(|e| format!("rosetta share: {}", describe(&e)))?;
                 let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                     VZVirtioFileSystemDeviceConfiguration::alloc(),
                     &ns("rosetta"),
                 );
                 fs.setShare(Some(&share));
-                vzc.setDirectorySharingDevices(&NSArray::from_retained_slice(&[Retained::into_super(
-                    fs,
-                )]));
+                vzc.setDirectorySharingDevices(&NSArray::from_retained_slice(&[
+                    Retained::into_super(fs),
+                ]));
             }
 
             vzc.validateWithError()
@@ -362,7 +371,9 @@ impl Vm {
             let delegate = Delegate::new(events_tx);
             let vm = Anywhere(vm);
             let delegate = Anywhere(delegate);
-            on(&queue, || vm.0.setDelegate(Some(ProtocolObject::from_ref(&*delegate.0))));
+            on(&queue, || {
+                vm.0.setDelegate(Some(ProtocolObject::from_ref(&*delegate.0)))
+            });
 
             let helpers_before = helper_pids();
             let (started_tx, started_rx) = mpsc::channel::<Result<(), String>>();
@@ -382,7 +393,9 @@ impl Vm {
 
             let balloon = on(&queue, || {
                 vm.0.memoryBalloonDevices().firstObject().map(|d| {
-                    Anywhere(Retained::cast_unchecked::<VZVirtioTraditionalMemoryBalloonDevice>(d))
+                    Anywhere(Retained::cast_unchecked::<
+                        VZVirtioTraditionalMemoryBalloonDevice,
+                    >(d))
                 })
             });
             // The helper that was not there before the start is this
@@ -403,7 +416,9 @@ impl Vm {
                 crate::footprint::set_helper(pid);
                 tracing::debug!(pid, "the framework's helper process");
             } else {
-                tracing::warn!("cannot find the framework's helper process; footprints will miss the guest");
+                tracing::warn!(
+                    "cannot find the framework's helper process; footprints will miss the guest"
+                );
             }
 
             Ok(Vm {
@@ -464,7 +479,9 @@ impl Vm {
             return self.memory_bytes;
         };
         // SAFETY: on the machine's queue.
-        on(&self.queue, || unsafe { balloon.0.targetVirtualMachineMemorySize() })
+        on(&self.queue, || unsafe {
+            balloon.0.targetVirtualMachineMemorySize()
+        })
     }
 
     /// The framework's helper process for this machine, where the guest's

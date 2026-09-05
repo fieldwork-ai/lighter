@@ -170,7 +170,11 @@ impl Machine {
             cmdline: config.cmdline.clone(),
             console: Console {
                 output: dup(1)?,
-                input: if config.interactive { Some(dup(0)?) } else { None },
+                input: if config.interactive {
+                    Some(dup(0)?)
+                } else {
+                    None
+                },
             },
             disks: config.disks.clone(),
             card: vm_card,
@@ -187,14 +191,16 @@ impl Machine {
         }
         let balloon = Arc::new(Balloon::new(vm.clone(), config.ram_bytes));
 
-        let memory_policy =
-            match crate::memory_policy::MemoryPolicy::start(balloon.clone(), config.ram_bytes) {
-                Ok(policy) => Some(policy),
-                Err(why) => {
-                    tracing::warn!(%why, "cannot watch host memory pressure; the guest keeps whatever it takes");
-                    None
-                }
-            };
+        let memory_policy = match crate::memory_policy::MemoryPolicy::start(
+            balloon.clone(),
+            config.ram_bytes,
+        ) {
+            Ok(policy) => Some(policy),
+            Err(why) => {
+                tracing::warn!(%why, "cannot watch host memory pressure; the guest keeps whatever it takes");
+                None
+            }
+        };
 
         let shares = if config.shares.is_empty() {
             None
@@ -215,7 +221,9 @@ impl Machine {
                     network,
                     Hooks {
                         memory: offers,
-                        shares: shares.clone().map(|s| s as Arc<dyn crate::link::ShareTransport>),
+                        shares: shares
+                            .clone()
+                            .map(|s| s as Arc<dyn crate::link::ShareTransport>),
                     },
                 )?;
                 if let Some(shares) = &shares {

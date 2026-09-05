@@ -140,7 +140,6 @@ impl Network {
     pub fn counters(&self) -> Arc<Counters> {
         self.counters.clone()
     }
-
 }
 
 /// Answers a frame the guest transmitted, or drops it.
@@ -543,7 +542,6 @@ fn udp_frame(
     udp[6..8].copy_from_slice(&sum.to_be_bytes());
     ipv4_frame(dst_mac, src, dst, PROTO_UDP, 64, &udp)
 }
-
 
 #[cfg(test)]
 mod tests {

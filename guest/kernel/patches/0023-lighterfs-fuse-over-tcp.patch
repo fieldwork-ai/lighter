@@ -1,18 +1,9 @@
 lighterfs: FUSE over TCP to the host
-
-Under Virtualization.framework the only virtio-fs device is Apple's own
-server, so lighter's file server reaches the guest another way: a few TCP
-connections to the gateway over the card, each carrying FUSE requests and
-replies in the /dev/fuse wire format, with the kernel's FUSE core doing
-everything but the transport. Modelled on virtio_fs.c — the same iqueue
-ops, the same connection and mount lifecycle — with a socket where the
-virtqueue was. Foreground requests are written on the caller's context
-without waiting; anything that cannot go at once, and everything sent
-from atomic context, goes through a sender thread that owns the socket
-until its queue drains. Replies are read straight into the request's
-arguments and pages by one thread per connection. Notifications arrive
-as replies with `unique` zero and are handed to the FUSE core's
-invalidation entry points.
+The submitting task spins for its own reply for a few tens of
+microseconds before it sleeps, taking whole messages off the socket under
+a reader lock it shares with the rx thread; the two wakeups that a reply
+otherwise costs the guest (the rx thread, then the waiter) are more than
+the host takes to answer a metadata request.
 
 --- a/fs/fuse/Kconfig	2026-09-05 01:18:43
 +++ b/fs/fuse/Kconfig	2026-09-05 01:18:43
@@ -38,9 +29,9 @@ invalidation entry points.
  
  fuse-y := trace.o	# put trace.o first so we see ftrace errors sooner
  fuse-y += dev.o dir.o file.o inode.o control.o xattr.o acl.o readdir.o ioctl.o
---- /dev/null	2026-09-05 01:18:43
-+++ b/fs/fuse/lighter_fs.c	2026-09-05 01:18:43
-@@ -0,0 +1,1011 @@
+--- /dev/null	2026-09-05 02:21:26
++++ b/fs/fuse/lighter_fs.c	2026-09-05 02:21:26
+@@ -0,0 +1,1135 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * lighterfs: FUSE over TCP to the host, for lighter's shared directories.
@@ -122,11 +113,24 @@ invalidation entry points.
 +	struct task_struct *tx;
 +	struct bio_vec *tx_bvecs;	/* under send_lock */
 +
++	/* Whoever holds rx_lock reads replies: the rx thread when it wakes,
++	 * or a requester spinning for its own. */
++	struct mutex rx_lock;
++	wait_queue_head_t rx_wait;
++	void (*saved_data_ready)(struct sock *sk);
 +	struct task_struct *rx;
-+	struct bio_vec *rx_bvecs;	/* the rx thread's */
++	struct bio_vec *rx_bvecs;	/* under rx_lock */
 +
 +	struct fuse_dev *fud;
 +};
++
++/* How long a foreground request spins for its own reply before the task
++ * sleeps and the rx thread delivers it: the reply to a metadata request is
++ * back inside this on a quiet host, and the spin costs less than the two
++ * wakeups it saves. Zero restores the wait-only path. */
++static unsigned int poll_usecs = 50;
++module_param(poll_usecs, uint, 0644);
++MODULE_PARM_DESC(poll_usecs, "microseconds a request spins for its reply before sleeping");
 +
 +struct lighterfs {
 +	struct kref ref;
@@ -153,6 +157,8 @@ invalidation entry points.
 +	u16 port;
 +	unsigned int conns;
 +};
++
++static void lighterfs_poll_reply(struct lighterfs_conn *c, struct fuse_req *req);
 +
 +/* -- the wire ------------------------------------------------------------- */
 +
@@ -270,6 +276,7 @@ invalidation entry points.
 +	spin_unlock(&c->lock);
 +	if (c->sock)
 +		kernel_sock_shutdown(c->sock, SHUT_RDWR);
++	wake_up(&c->rx_wait);
 +}
 +
 +static void lighterfs_msg_free(struct lighterfs_msg *m)
@@ -395,6 +402,8 @@ invalidation entry points.
 +		kfree(m);
 +	}
 +	mutex_unlock(&c->send_lock);
++	if (!err)
++		lighterfs_poll_reply(c, req);
 +}
 +
 +static void lighterfs_send_forget(struct fuse_iqueue *fiq,
@@ -611,51 +620,141 @@ invalidation entry points.
 +	}
 +}
 +
++/* A whole message is waiting: its header, and every byte the header says. */
++static bool lighterfs_message_ready(struct lighterfs_conn *c)
++{
++	struct sock *sk = c->sock->sk;
++	struct fuse_out_header oh;
++	struct kvec kv = { .iov_base = &oh, .iov_len = sizeof(oh) };
++	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_PEEK };
++	int n;
++
++	if (skb_queue_empty_lockless(&sk->sk_receive_queue))
++		return false;
++	n = kernel_recvmsg(c->sock, &msg, &kv, 1, sizeof(oh), MSG_DONTWAIT | MSG_PEEK);
++	if (n != sizeof(oh))
++		return false;
++	return tcp_inq(sk) >= (int)oh.len;
++}
++
++/*
++ * Reads and answers one message. Caller holds rx_lock. Returns 1 for a
++ * message handled, 0 for a connection that has closed, or an error.
++ * `done` is set when the message was the reply to `waiting`.
++ */
++static int lighterfs_read_one(struct lighterfs_conn *c, struct fuse_req *waiting,
++			      bool *done)
++{
++	struct fuse_out_header oh;
++	struct fuse_req *req;
++	size_t payload;
++	int err;
++
++	err = lighterfs_recv_exact(c, &oh, sizeof(oh));
++	if (err)
++		return err == -ECONNRESET ? 0 : err;
++	if (oh.len < sizeof(oh))
++		return -EPROTO;
++	payload = oh.len - sizeof(oh);
++	if (oh.unique == 0) {
++		lighterfs_notify(c, oh.error, payload);
++		return 1;
++	}
++	req = lighterfs_take(c, oh.unique);
++	if (!req)
++		/* Answered late, or twice: nothing waits for it. */
++		return lighterfs_discard(c, payload) ?: 1;
++	if (oh.error)
++		err = lighterfs_discard(c, payload);
++	else
++		err = lighterfs_recv_reply(c, req, payload);
++	req->out.h = oh;
++	clear_bit(FR_SENT, &req->flags);
++	if (err)
++		req->out.h.error = -EIO;
++	if (req == waiting)
++		*done = true;
++	fuse_request_end(req);
++	return err ?: 1;
++}
++
++static void lighterfs_data_ready(struct sock *sk)
++{
++	struct lighterfs_conn *c = sk->sk_user_data;
++
++	if (c) {
++		wake_up(&c->rx_wait);
++		if (c->saved_data_ready)
++			c->saved_data_ready(sk);
++	}
++}
++
++static bool lighterfs_readable(struct lighterfs_conn *c)
++{
++	struct sock *sk = c->sock->sk;
++
++	return !skb_queue_empty_lockless(&sk->sk_receive_queue) ||
++	       sk->sk_state != TCP_ESTABLISHED || !c->connected;
++}
++
++/*
++ * The submitting task spins for its own reply. Only whole messages are
++ * taken here (a task may have a signal pending, and a blocking read that
++ * a signal cut short would leave half a message in the stream); anything
++ * partial is the rx thread's.
++ */
++static void lighterfs_poll_reply(struct lighterfs_conn *c, struct fuse_req *req)
++{
++	u64 deadline;
++	bool done = false;
++
++	if (!poll_usecs)
++		return;
++	deadline = ktime_get_ns() + (u64)poll_usecs * NSEC_PER_USEC;
++	while (!test_bit(FR_FINISHED, &req->flags) && ktime_get_ns() < deadline) {
++		if (lighterfs_message_ready(c) && mutex_trylock(&c->rx_lock)) {
++			while (!done && lighterfs_message_ready(c)) {
++				if (lighterfs_read_one(c, req, &done) <= 0)
++					break;
++			}
++			mutex_unlock(&c->rx_lock);
++			if (done)
++				return;
++		}
++		if (need_resched())
++			return;
++		cpu_relax();
++	}
++}
++
 +static int lighterfs_rx_thread(void *data)
 +{
 +	struct lighterfs_conn *c = data;
-+	struct fuse_out_header oh;
 +	int err = 0;
 +
 +	while (!kthread_should_stop()) {
-+		size_t payload;
-+		struct fuse_req *req;
++		wait_event_interruptible(c->rx_wait,
++					 kthread_should_stop() || lighterfs_readable(c));
++		if (kthread_should_stop())
++			break;
++		mutex_lock(&c->rx_lock);
++		/* Everything that is here; a partial message blocks for the rest
++		 * of itself, which a thread with no signals may do. */
++		while (lighterfs_readable(c) && !kthread_should_stop()) {
++			bool done = false;
 +
-+		err = lighterfs_recv_exact(c, &oh, sizeof(oh));
-+		if (err)
-+			break;
-+		if (oh.len < sizeof(oh)) {
-+			err = -EPROTO;
-+			break;
-+		}
-+		payload = oh.len - sizeof(oh);
-+		if (oh.unique == 0) {
-+			lighterfs_notify(c, oh.error, payload);
-+			continue;
-+		}
-+		req = lighterfs_take(c, oh.unique);
-+		if (!req) {
-+			/* Answered late, or twice: nothing waits for it. */
-+			err = lighterfs_discard(c, payload);
-+			if (err)
++			if (skb_queue_empty_lockless(&c->sock->sk->sk_receive_queue))
 +				break;
-+			continue;
++			err = lighterfs_read_one(c, NULL, &done);
++			if (err <= 0)
++				break;
 +		}
-+		if (oh.error) {
-+			err = lighterfs_discard(c, payload);
-+		} else {
-+			err = lighterfs_recv_reply(c, req, payload);
-+		}
-+		req->out.h = oh;
-+		clear_bit(FR_SENT, &req->flags);
-+		if (err) {
-+			req->out.h.error = -EIO;
-+			fuse_request_end(req);
++		mutex_unlock(&c->rx_lock);
++		if (err <= 0 && (err < 0 || !c->connected ||
++				 c->sock->sk->sk_state != TCP_ESTABLISHED))
 +			break;
-+		}
-+		fuse_request_end(req);
 +	}
-+	if (err && err != -ECONNRESET && c->connected)
++	if (err < 0 && err != -ECONNRESET && c->connected)
 +		pr_warn("lighterfs: %s: connection %u lost (%d)\n",
 +			c->fs->tag, c->index, err);
 +	lighterfs_break(c);
@@ -706,6 +805,12 @@ invalidation entry points.
 +	}
 +	c->sock = sock;
 +	c->connected = true;
++	/* Data arriving wakes the rx thread through the socket's callback. */
++	write_lock_bh(&sock->sk->sk_callback_lock);
++	sock->sk->sk_user_data = c;
++	c->saved_data_ready = sock->sk->sk_data_ready;
++	sock->sk->sk_data_ready = lighterfs_data_ready;
++	write_unlock_bh(&sock->sk->sk_callback_lock);
 +	return 0;
 +}
 +
@@ -717,8 +822,16 @@ invalidation entry points.
 +	for (i = 0; i < fs->nconns; i++) {
 +		struct lighterfs_conn *c = &fs->conns[i];
 +
-+		if (c->sock)
++		if (c->sock) {
++			struct sock *sk = c->sock->sk;
++
++			write_lock_bh(&sk->sk_callback_lock);
++			sk->sk_user_data = NULL;
++			if (c->saved_data_ready)
++				sk->sk_data_ready = c->saved_data_ready;
++			write_unlock_bh(&sk->sk_callback_lock);
 +			sock_release(c->sock);
++		}
 +		kfree(c->tx_bvecs);
 +		kfree(c->rx_bvecs);
 +	}
@@ -754,6 +867,8 @@ invalidation entry points.
 +		mutex_init(&c->send_lock);
 +		INIT_LIST_HEAD(&c->tx_queue);
 +		init_waitqueue_head(&c->tx_wait);
++		mutex_init(&c->rx_lock);
++		init_waitqueue_head(&c->rx_wait);
 +	}
 +	for (i = 0; i < nconns; i++) {
 +		err = lighterfs_connect(&fs->conns[i]);

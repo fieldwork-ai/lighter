@@ -76,7 +76,11 @@ pub fn set_helper(pid: i32) {
 }
 
 unsafe extern "C" {
-    fn proc_pid_rusage(pid: libc::c_int, flavor: libc::c_int, buffer: *mut libc::c_void) -> libc::c_int;
+    fn proc_pid_rusage(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        buffer: *mut libc::c_void,
+    ) -> libc::c_int;
 }
 
 const RUSAGE_INFO_V4: libc::c_int = 4;

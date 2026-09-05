@@ -59,11 +59,17 @@ pub fn run() -> Vec<Finding> {
             "the binary is not signed with com.apple.security.virtualization",
             "reinstall lighter, or run `make sign` in a checkout",
         ),
-        Err(e) => Finding::bad("virtualization entitlement", e.to_string(), "unreadable binary"),
+        Err(e) => Finding::bad(
+            "virtualization entitlement",
+            e.to_string(),
+            "unreadable binary",
+        ),
     });
 
     findings.push(match lighter_vmm::vz::rosetta() {
-        lighter_vmm::vz::Rosetta::Installed => Finding::good("rosetta", "installed; amd64 containers run under Rosetta"),
+        lighter_vmm::vz::Rosetta::Installed => {
+            Finding::good("rosetta", "installed; amd64 containers run under Rosetta")
+        }
         lighter_vmm::vz::Rosetta::NotInstalled => Finding::bad(
             "rosetta",
             "not installed; amd64 containers run under emulation",
