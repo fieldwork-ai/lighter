@@ -186,10 +186,10 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 From a cold stop, the runtime asked to start the way a person would (`lighter start`, `orb start`, `colima start`, opening Docker Desktop): how long until `docker version` answers, and until the first container has run. Median of three; lower is better.
 
-| Reading | lighter | OrbStack | Colima |
-|---|---|---|---|
-| Start until docker answers | **0.5 s** | 1.2 s | 10.2 s |
-| Start until the first container has run | **0.7 s** | 1.5 s | 10.5 s |
+| Reading | lighter | OrbStack | Colima | Docker Desktop |
+|---|---|---|---|---|
+| Start until docker answers | **0.5 s** | 1.2 s | 10.2 s | 2.7 s |
+| Start until the first container has run | **0.7 s** | 1.5 s | 10.5 s | 2.9 s |
 
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 ## Why it is fast
