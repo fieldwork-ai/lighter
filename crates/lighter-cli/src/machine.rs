@@ -126,7 +126,15 @@ pub fn stop(wait: Duration) -> anyhow::Result<bool> {
     // image pulled just before a stop was gone at the next start, "layer
     // does not exist". The signal is the fallback for a guest that does not
     // answer, and the kill the fallback for a machine that does not end.
-    let asked = control("poweroff").map(|reply| reply == "ok").unwrap_or(false);
+    // The machine process lets go of dockerd first (SIGUSR1: its port
+    // watcher's event stream), because dockerd gives an active connection
+    // five seconds of grace before exiting, and that stream was the one.
+    // SAFETY: a signal to a process we started.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+    std::thread::sleep(Duration::from_millis(150));
+    let asked = control("poweroff")
+        .map(|reply| reply == "ok")
+        .unwrap_or(false);
     if !asked {
         // SAFETY: a signal to a process we started.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };

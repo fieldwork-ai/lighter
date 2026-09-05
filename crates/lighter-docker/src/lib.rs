@@ -102,20 +102,25 @@ pub struct PortWatcher {
 
 impl PortWatcher {
     /// Starts a thread that reconciles now and on every container event.
-    pub fn start(socket: &Path, mapper: Arc<dyn PortMapper>) -> std::io::Result<()> {
+    ///
+    /// The handle ends the watching: the event stream is dropped and not
+    /// reopened, which is what lets dockerd exit at once when the machine
+    /// is being stopped.
+    pub fn start(socket: &Path, mapper: Arc<dyn PortMapper>) -> std::io::Result<Arc<http::Stop>> {
         let mut watcher = PortWatcher {
             socket: socket.to_path_buf(),
             mapper,
             forwarded: HashSet::new(),
         };
-
+        let stop = http::Stop::new();
+        let handle = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("docker-ports".into())
-            .spawn(move || watcher.run())?;
-        Ok(())
+            .spawn(move || watcher.run(&handle))?;
+        Ok(stop)
     }
 
-    fn run(&mut self) {
+    fn run(&mut self, stop: &http::Stop) {
         // Filters to container events only. URL-encoded because it is a JSON
         // document in a query parameter.
         const EVENTS: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
@@ -134,7 +139,7 @@ impl PortWatcher {
             // flag and acting on it after the call returns looks equivalent and
             // is not: a healthy event stream never returns, so the forwards
             // would only ever be fixed up when Docker went away.
-            let result = http::stream_json(&socket, EVENTS, |event| {
+            let result = http::stream_json(&socket, EVENTS, Some(stop), |event| {
                 let status = event.get("status").and_then(|s| s.as_str()).unwrap_or("");
                 // Only lifecycle transitions can change what is published.
                 // Reconciling on every exec_start would be correct and noisy.
@@ -145,6 +150,9 @@ impl PortWatcher {
 
             if let Err(e) = result {
                 tracing::debug!(%e, "docker event stream ended");
+            }
+            if stop.asked() {
+                return;
             }
 
             // The stream ended: the daemon restarted, the socket went away, or
