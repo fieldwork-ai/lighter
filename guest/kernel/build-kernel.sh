@@ -57,7 +57,11 @@ git clean -qf '*.rej' '*.orig' 2>/dev/null || true
 if [ -d /patches ] && ls /patches/*.patch >/dev/null 2>&1; then
 	for patch in /patches/*.patch; do
 		log "Applying $(basename "$patch")"
-		patch -p1 --batch --silent < "$patch"
+		# --forward: a patch that adds a file leaves it untracked, so it
+		# survives the reset above, and --batch alone then takes the
+		# identical file for a reversed patch and removes it (the M1 lost
+		# 0023's header that way and built nothing).
+		patch -p1 --batch --forward --silent < "$patch"
 	done
 fi
 

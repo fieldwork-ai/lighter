@@ -59,24 +59,24 @@ OrbStack, Colima and Docker Desktop were measured on the same machines in the sa
 
 | Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.16 s | **4.46 s** (138%) | 7.01 s (88%) | 8.59 s (72%) | 8.61 s (72%) |
-| `pnpm install` | 3.77 s | **1.12 s** (337%) | 2.03 s (185%) | 1.14 s (332%) | 2.87 s (131%) |
-| `yarn install` | 5.75 s | **4.02 s** (143%) | 5.08 s (113%) | 6.58 s (87%) | 11.14 s (52%) |
-| `ripgrep` (file read) | 927 ms | **78 ms** (1188%) | 102 ms (909%) | 121 ms (766%) | 124 ms (748%) |
-| `find` (metadata walk) | 357 ms | **98 ms** (364%) | 127 ms (281%) | 176 ms (203%) | 131 ms (273%) |
-| `cp -a node_modules` | 13.55 s | **902 ms** (1503%) | 1.11 s (1216%) | 1.88 s (722%) | 2.58 s (526%) |
-| `rm -rf node_modules` | 3.65 s | **383 ms** (954%) | 496 ms (737%) | 551 ms (663%) | 428 ms (854%) |
+| `npm ci` | 6.16 s | **4.69 s** (131%) | 7.01 s (88%) | 8.59 s (72%) | 8.61 s (72%) |
+| `pnpm install` | 3.77 s | 1.22 s (309%) | 2.03 s (185%) | **1.14 s** (332%) | 2.87 s (131%) |
+| `yarn install` | 5.75 s | **4.12 s** (140%) | 5.08 s (113%) | 6.58 s (87%) | 11.14 s (52%) |
+| `ripgrep` (file read) | 927 ms | **81 ms** (1144%) | 102 ms (909%) | 121 ms (766%) | 124 ms (748%) |
+| `find` (metadata walk) | 357 ms | **95 ms** (376%) | 127 ms (281%) | 176 ms (203%) | 131 ms (273%) |
+| `cp -a node_modules` | 13.55 s | **1.05 s** (1290%) | 1.11 s (1216%) | 1.88 s (722%) | 2.58 s (526%) |
+| `rm -rf node_modules` | 3.65 s | **397 ms** (921%) | 496 ms (737%) | 551 ms (663%) | 428 ms (854%) |
 
 | Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.16 s | **6.41 s** (96%) | 8.49 s (73%) | 17.79 s (35%) | 17.91 s (34%) |
-| `pnpm install` | 3.77 s | **4.06 s** (93%) | 4.72 s (80%) | 25.43 s (15%) | 28.34 s (13%) |
-| `yarn install` | 5.75 s | **5.25 s** (110%) | 7.79 s (74%) | 22.16 s (26%) | 22.58 s (25%) |
-| `ripgrep` (file read) | 927 ms | **89 ms** (1042%) | 1.02 s (91%) | 6.86 s (14%) | 9.84 s (9%) |
-| `find` (metadata walk) | 357 ms | **94 ms** (380%) | 595 ms (60%) | 1.43 s (25%) | 1.88 s (19%) |
-| `cp -a node_modules` | 13.55 s | **3.58 s** (378%) | 8.71 s (156%) | 44.30 s (31%) | 33.55 s (40%) |
-| `rm -rf node_modules` | 3.65 s | **2.71 s** (135%) | 2.97 s (123%) | 8.05 s (45%) | 6.56 s (56%) |
-| Host file edit -> container | 2 ms | **2 ms** | — | 1.00 s | 1.00 s |
+| `npm ci` | 6.16 s | **6.96 s** (89%) | 8.49 s (73%) | 17.79 s (35%) | 17.91 s (34%) |
+| `pnpm install` | 3.77 s | **4.04 s** (93%) | 4.72 s (80%) | 25.43 s (15%) | 28.34 s (13%) |
+| `yarn install` | 5.75 s | **5.57 s** (103%) | 7.79 s (74%) | 22.16 s (26%) | 22.58 s (25%) |
+| `ripgrep` (file read) | 927 ms | **95 ms** (976%) | 1.02 s (91%) | 6.86 s (14%) | 9.84 s (9%) |
+| `find` (metadata walk) | 357 ms | 2.92 s (12%) | **595 ms** (60%) | 1.43 s (25%) | 1.88 s (19%) |
+| `cp -a node_modules` | 13.55 s | **7.49 s** (181%) | 8.71 s (156%) | 44.30 s (31%) | 33.55 s (40%) |
+| `rm -rf node_modules` | 3.65 s | 3.34 s (109%) | **2.97 s** (123%) | 8.05 s (45%) | 6.56 s (56%) |
+| Host file edit -> container | 2 ms | **3 ms** | — | 1.00 s | 1.00 s |
 
 #### Memory footprint
 
@@ -84,10 +84,10 @@ The physical footprint of the runtime's own processes, which is the "Memory" col
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Idle, a minute after start | **635 MiB** | 1197 MiB | 11361 MiB | 2111 MiB |
-| Peak through an npm install | **4168 MiB** | 5498 MiB | 8700 MiB | 9182 MiB |
-| 15 s after it ends | **874 MiB** | 2850 MiB | 8735 MiB | 9187 MiB |
-| 60 s after it ends | **850 MiB** | 2114 MiB | 8735 MiB | 9187 MiB |
+| Idle, a minute after start | **299 MiB** | 1197 MiB | 11361 MiB | 2111 MiB |
+| Peak through an npm install | **3908 MiB** | 5498 MiB | 8700 MiB | 9182 MiB |
+| 15 s after it ends | **694 MiB** | 2850 MiB | 8735 MiB | 9187 MiB |
+| 60 s after it ends | **611 MiB** | 2114 MiB | 8735 MiB | 9187 MiB |
 
 #### The network
 
@@ -95,15 +95,15 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 123.5 | **100.6** | 97.2 | 4.5 | 23.2 |
-| TCP, the Mac to a container | Gbit/s | 129.2 | **95.0** | 52.9 | 3.9 | 14.3 |
-| TCP into a published port | Gbit/s | — | **93.6** | 54.2 | 3.8 | 14.3 |
-| TCP out of a published port | Gbit/s | — | 92.9 | **93.1** | 4.4 | 33.4 |
-| UDP, container to the Mac | Gbit/s | 21.8 | **5.0** | 3.1 | 3.3 | 0.0 |
-| connects to a published port | thousand per second | 26.0 | **17.5** | 16.2 | 15.8 | 17.0 |
-| GET on a published port, median | µs | 40 | **57** | 73 | 224 | 119 |
-| GET on a published port, p99 | µs | 70 | 158 | **119** | 361 | 245 |
-| DNS lookup from a container, median | µs | 2850 | **37** | 251 | 483 | 474 |
+| TCP, container to the Mac | Gbit/s | 123.5 | 13.4 | **97.2** | 4.5 | 23.2 |
+| TCP, the Mac to a container | Gbit/s | 129.2 | 4.7 | **52.9** | 3.9 | 14.3 |
+| TCP into a published port | Gbit/s | — | 5.0 | **54.2** | 3.8 | 14.3 |
+| TCP out of a published port | Gbit/s | — | 11.6 | **93.1** | 4.4 | 33.4 |
+| UDP, container to the Mac | Gbit/s | 21.8 | 0.0 | 3.1 | **3.3** | 0.0 |
+| connects to a published port | thousand per second | 26.0 | **17.2** | 16.2 | 15.8 | 17.0 |
+| GET on a published port, median | µs | 40 | **58** | 73 | 224 | 119 |
+| GET on a published port, p99 | µs | 70 | 168 | **119** | 361 | 245 |
+| DNS lookup from a container, median | µs | 2850 | **38** | 251 | 483 | 474 |
 
 #### Idle power
 
@@ -111,8 +111,8 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| CPU, ms per second | 6 | **2** | 5 | 25 |
-| Wakeups per second | 150 | 99 | **50** | 3748 |
+| CPU, ms per second | 12 | **2** | 5 | 25 |
+| Wakeups per second | 373 | 99 | **50** | 3748 |
 
 #### Starting up
 
@@ -121,7 +121,7 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
 | Start until docker answers | **0.4 s** | 1.5 s | 11.8 s | 2.1 s |
-| Start until the first container has run | **0.6 s** | 1.9 s | 12.0 s | 2.4 s |
+| Start until the first container has run | **0.5 s** | 1.9 s | 12.0 s | 2.4 s |
 
 #### x86-64 images
 
@@ -129,10 +129,10 @@ The same runtimes running `linux/amd64` images on their own disk: an install tha
 
 | Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 4.46 s | **9.28 s** | 13.16 s | 12.71 s | 14.45 s |
-| `pnpm install` | 1.12 s | 2.98 s | 4.44 s | **2.70 s** | 3.89 s |
-| `sha256sum` of 1 GiB | 2.99 s | **4.17 s** | 8.01 s | 4.30 s | 4.44 s |
-| container start, `alpine true` | 181 ms | **155 ms** | 280 ms | 180 ms | 165 ms |
+| `npm ci` | 4.69 s | **9.28 s** | 13.16 s | 12.71 s | 14.45 s |
+| `pnpm install` | 1.22 s | 2.98 s | 4.44 s | **2.70 s** | 3.89 s |
+| `sha256sum` of 1 GiB | — | **4.17 s** | 8.01 s | 4.30 s | 4.44 s |
+| container start, `alpine true` | — | **155 ms** | 280 ms | 180 ms | 165 ms |
 
 ### Apple M1 (8 cores, 8 GB RAM)
 
