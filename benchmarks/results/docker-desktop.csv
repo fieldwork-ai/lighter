@@ -57,3 +57,4 @@ net-dns,3,467
 power-cpu-ms-per-s,1,25
 power-wakeups-per-s,1,3748
 power-pkg-idle-wakeups-per-s,1,0
+boot-docker,0,timeout
