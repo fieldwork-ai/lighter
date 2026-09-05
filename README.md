@@ -95,15 +95,15 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 123.5 | 93.3 | **97.2** | 4.5 | 23.2 |
-| TCP, the Mac to a container | Gbit/s | 129.2 | **82.1** | 52.9 | 3.9 | 14.3 |
-| TCP into a published port | Gbit/s | — | **91.1** | 54.2 | 3.8 | 14.3 |
-| TCP out of a published port | Gbit/s | — | 87.3 | **93.1** | 4.4 | 33.4 |
+| TCP, container to the Mac | Gbit/s | 123.5 | **100.6** | 97.2 | 4.5 | 23.2 |
+| TCP, the Mac to a container | Gbit/s | 129.2 | **95.0** | 52.9 | 3.9 | 14.3 |
+| TCP into a published port | Gbit/s | — | **93.6** | 54.2 | 3.8 | 14.3 |
+| TCP out of a published port | Gbit/s | — | 92.9 | **93.1** | 4.4 | 33.4 |
 | UDP, container to the Mac | Gbit/s | 21.8 | **5.0** | 3.1 | 3.3 | 0.0 |
-| connects to a published port | thousand per second | 26.0 | **17.3** | 16.2 | 15.8 | 17.0 |
-| GET on a published port, median | µs | 40 | **63** | 73 | 224 | 119 |
-| GET on a published port, p99 | µs | 70 | 144 | **119** | 361 | 245 |
-| DNS lookup from a container, median | µs | 2850 | **63** | 251 | 483 | 474 |
+| connects to a published port | thousand per second | 26.0 | **17.5** | 16.2 | 15.8 | 17.0 |
+| GET on a published port, median | µs | 40 | **57** | 73 | 224 | 119 |
+| GET on a published port, p99 | µs | 70 | 158 | **119** | 361 | 245 |
+| DNS lookup from a container, median | µs | 2850 | **37** | 251 | 483 | 474 |
 
 #### Idle power
 
@@ -112,7 +112,7 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
 | CPU, ms per second | 6 | **2** | 5 | 25 |
-| Wakeups per second | 126 | 99 | **50** | 3748 |
+| Wakeups per second | 150 | 99 | **50** | 3748 |
 
 #### Starting up
 
@@ -242,10 +242,10 @@ Every other runtime gives the VM a virtual network card and runs a TCP/IP stack 
 
 lighter does not carry packets across the boundary at all:
 - **One connection, one stream:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which opens a single vsock stream to the host for it. The host side opens an ordinary macOS socket to the destination and copies bytes between the two. The Mac's own kernel terminates the real connection, so VPNs, proxies and the Mac's routing all apply as they would to any Mac process, and there is no TCP/IP stack to maintain in lighter.
-- **Joined in the guest kernel:** The container's socket and its vsock stream are joined by a BPF sockmap, so the data path inside the guest is a kernel-to-kernel copy with no process in the middle. This is where the throughput comes from: 93 Gbit/s out of a container on an M5 Pro, and 82 into one, against 97 and 53 for OrbStack.
+- **Joined in the guest kernel:** The container's socket and its vsock stream are joined by a BPF sockmap, so the data path inside the guest is a kernel-to-kernel copy with no process in the middle. This is where the throughput comes from: 101 Gbit/s out of a container on an M5 Pro, and 95 into one, against 97 and 53 for OrbStack.
 - **Published ports the same way:** A port a container publishes is bound on the Mac by lighter itself, and each accepted connection becomes a stream into the guest, where the kernel's own DNAT hands it to the container. No proxy process inside the VM copies the bytes.
-- **DNS answered on the Mac:** A container's lookups are resolved by the Mac's own resolver, so split DNS from a VPN works and a lookup costs about 60 µs instead of a trip through a virtual network.
-- **Low request latency:** After every event, the host thread that moves bytes keeps polling for a few tens of microseconds before it goes to sleep, so the reply that follows a request is picked up without waiting for the scheduler to wake it. A GET on a published port costs 63 µs on the M5 and 133 µs on an M1, against 73 and 127 for OrbStack.
+- **DNS answered on the Mac:** A container's lookups are resolved by the Mac's own resolver, so split DNS from a VPN works and a lookup costs about 40 µs instead of a trip through a virtual network.
+- **Low request latency:** After every event, the host thread that moves bytes keeps polling for a few tens of microseconds before it goes to sleep, so the reply that follows a request is picked up without waiting for the scheduler to wake it. A GET on a published port costs 57 µs on the M5 and 128 µs on an M1, against 73 and 127 for OrbStack.
 
 UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP and ICMP, still reaches the virtual network card, and lighter answers those itself, in process: there is no network stack and no sidecar behind the card at all.
 
