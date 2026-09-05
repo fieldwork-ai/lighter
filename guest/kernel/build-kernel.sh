@@ -52,15 +52,17 @@ if [ ! -d .git ]; then
 	git -c user.name=lighter -c user.email=build@invalid commit -qm pristine
 fi
 git checkout -q -- .
-git clean -qf '*.rej' '*.orig' 2>/dev/null || true
+# Untracked files the last build's patches created (a header, say) go too,
+# or the patch that creates them cannot apply again; the kernel's own
+# .gitignore keeps the object files, so the build stays incremental.
+git clean -qfd
 
 if [ -d /patches ] && ls /patches/*.patch >/dev/null 2>&1; then
 	for patch in /patches/*.patch; do
 		log "Applying $(basename "$patch")"
-		# --forward: a patch that adds a file leaves it untracked, so it
-		# survives the reset above, and --batch alone then takes the
-		# identical file for a reversed patch and removes it (the M1 lost
-		# 0023's header that way and built nothing).
+		# --forward: an already-applied hunk is skipped and the build
+		# fails, where --batch alone took it for a reversed patch and
+		# undid it (the M1 lost 0023's header that way and built nothing).
 		patch -p1 --batch --forward --silent < "$patch"
 	done
 fi
