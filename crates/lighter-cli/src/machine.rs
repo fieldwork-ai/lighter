@@ -103,7 +103,9 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
                 paths::log_file()?.display()
             );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        // Twenty milliseconds: the machine answers in about a second, and
+        // the poll's granularity is inside every start a person times.
+        std::thread::sleep(Duration::from_millis(20));
     }
     anyhow::bail!(
         "the machine did not answer within {}s; see {}",
@@ -118,8 +120,17 @@ pub fn stop(wait: Duration) -> anyhow::Result<bool> {
         let _ = std::fs::remove_file(paths::pid_file()?);
         return Ok(false);
     };
-    // SAFETY: a signal to a process we started.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    // The guest first: its agent stops the engine, syncs and powers off, and
+    // the machine process ends on its own. A machine killed from outside
+    // loses whatever btrfs had not committed (it commits every 30 s): an
+    // image pulled just before a stop was gone at the next start, "layer
+    // does not exist". The signal is the fallback for a guest that does not
+    // answer, and the kill the fallback for a machine that does not end.
+    let asked = control("poweroff").map(|reply| reply == "ok").unwrap_or(false);
+    if !asked {
+        // SAFETY: a signal to a process we started.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
 
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
@@ -132,6 +143,9 @@ pub fn stop(wait: Duration) -> anyhow::Result<bool> {
     }
     // It has had its chance. A guest that will not shut down cleanly is not a
     // reason to leave a VM running forever.
+    // SAFETY: as above.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    std::thread::sleep(Duration::from_millis(200));
     // SAFETY: as above.
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     let _ = std::fs::remove_file(paths::pid_file()?);

@@ -1091,9 +1091,12 @@ fn handle_control(line: &str) -> String {
         (Some("poweroff"), _) => {
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(100));
+                // What it took is said on the console, because a stop that
+                // waits out the whole allowance is a daemon that did not
+                // answer its signal, and the log is the only place to see it.
                 let _ = std::process::Command::new("/bin/sh")
                     .arg("-c")
-                    .arg("pid=$(pidof dockerd); [ -n \"$pid\" ] && kill $pid; for i in $(seq 1 50); do kill -0 $pid 2>/dev/null || break; sleep 0.1; done; sync; umount /var/lib/docker 2>/dev/null; sync")
+                    .arg("t0=$(cut -d' ' -f1 /proc/uptime); pid=$(pidof dockerd); [ -n \"$pid\" ] && kill $pid; i=0; while [ $i -lt 50 ] && kill -0 $pid 2>/dev/null; do sleep 0.1; i=$((i+1)); done; state=exited; kill -0 $pid 2>/dev/null && state=alive; cpid=$(pidof containerd); [ -n \"$cpid\" ] && kill $cpid; sync; umount /var/lib/docker 2>/dev/null; sync; echo \"INIT poweroff dockerd=$state after=$((i*100))ms took=$(echo $(cut -d' ' -f1 /proc/uptime) $t0 | awk '{printf \"%dms\", ($1-$2)*1000}')\" > /dev/console; [ $i -lt 20 ] || tail -8 /var/log/dockerd.log > /dev/console")
                     .status();
                 unsafe {
                     libc::sync();
