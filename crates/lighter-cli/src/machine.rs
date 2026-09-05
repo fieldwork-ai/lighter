@@ -189,7 +189,9 @@ pub fn control(command: &str) -> anyhow::Result<String> {
 /// memory is charged.
 fn footprint_mib(pid: u32) -> Option<u64> {
     let mut pids = vec![pid.to_string()];
-    if let Ok(helper) = paths::home().and_then(|h| Ok(std::fs::read_to_string(h.join("helper.pid"))?)) {
+    if let Ok(helper) =
+        paths::home().and_then(|h| Ok(std::fs::read_to_string(h.join("helper.pid"))?))
+    {
         let helper = helper.trim();
         if !helper.is_empty() {
             pids.push(helper.to_string());

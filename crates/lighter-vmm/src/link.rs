@@ -67,11 +67,14 @@ fn ring_bytes() -> (usize, usize) {
             .map(|kib| kib.clamp(64, 65_536) << 10)
             .unwrap_or(default)
     };
-    (knob("LIGHTER_LINK_RX_KIB", RX_RING), knob("LIGHTER_LINK_TX_KIB", TX_RING))
+    (
+        knob("LIGHTER_LINK_RX_KIB", RX_RING),
+        knob("LIGHTER_LINK_TX_KIB", TX_RING),
+    )
 }
 /// Listening sockets kept ready per port: each is one connection the guest
 /// can open without a round trip of ours in the way.
-const STREAM_BACKLOG: usize = 32;
+const STREAM_BACKLOG: usize = 64;
 const SMALL_BACKLOG: usize = 2;
 const UDP_HEADER: usize = 7;
 const UDP_KIND_DATA: u8 = 0;
@@ -84,9 +87,9 @@ const FRAMES_PER_TURN: usize = 128;
 pub trait ShareTransport: Send + Sync {
     /// A connection announced `tag`; true to keep it.
     fn open(&self, conn: ConnId, tag: &str) -> bool;
-    /// One whole FUSE request from `conn`. The reply comes back through
-    /// [`Link::share_reply`], on any thread.
-    fn request(&self, conn: ConnId, request: Vec<u8>);
+    /// One whole FUSE request from `conn`. Answered now (the reply returned)
+    /// or later, through [`Link::share_reply`] on any thread.
+    fn request(&self, conn: ConnId, request: Vec<u8>) -> Option<Vec<u8>>;
     /// The connection went away.
     fn close(&self, conn: ConnId);
 }
@@ -119,12 +122,7 @@ pub struct Link {
 
 impl Link {
     /// Takes the host end of the card and starts the thread.
-    pub fn start(
-        card: OwnedFd,
-        mtu: u16,
-        network: Network,
-        hooks: Hooks,
-    ) -> io::Result<Arc<Link>> {
+    pub fn start(card: OwnedFd, mtu: u16, network: Network, hooks: Hooks) -> io::Result<Arc<Link>> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: a pipe into an array of two.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -447,7 +445,7 @@ fn run(link: Arc<Link>, wake_read: RawFd, card: OwnedFd, mtu: u16, network: Netw
         sent: 0,
     };
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC)));
-    config.random_seed = started.elapsed().as_nanos() as u64 ^ 0x6c69_6768_7465_72;
+    config.random_seed = started.elapsed().as_nanos() as u64 ^ 0x006c_6967_6874_6572;
     let mut iface = Interface::new(
         config,
         &mut device,
@@ -457,8 +455,8 @@ fn run(link: Arc<Link>, wake_read: RawFd, card: OwnedFd, mtu: u16, network: Netw
         // The gateway, and the alias the guest reaches the Mac itself by:
         // both answer ARP and echo here, so `ping host.docker.internal`
         // works without a responder rule for it.
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(GATEWAY.into()), 24));
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(HOST_ALIAS.into()), 24));
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24));
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(HOST_ALIAS), 24));
     });
     let mut l = Loop {
         link,
@@ -697,9 +695,7 @@ impl Loop {
                 Some(Seen::Dhcp) | Some(Seen::IcmpLocal) | Some(Seen::IcmpForward) => {
                     if let Some(reply) = self.network.answer(frame) {
                         // SAFETY: a datagram send of a buffer we own.
-                        unsafe {
-                            libc::send(self.card.fd, reply.as_ptr().cast(), reply.len(), 0)
-                        };
+                        unsafe { libc::send(self.card.fd, reply.as_ptr().cast(), reply.len(), 0) };
                     }
                 }
                 _ if frame.len() >= 14
@@ -721,7 +717,8 @@ impl Loop {
         let mut buf = [0u8; 65_536];
         loop {
             // SAFETY: a non-blocking recv into a buffer we own.
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+            let n =
+                unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
             if n <= 0 {
                 break;
             }
@@ -791,6 +788,9 @@ impl Loop {
                 }
             });
         }
+        // Each promoted listener is replaced at once, so a burst of SYNs
+        // within one turn does not run the backlog dry and get resets.
+        let promoted_count = promoted.len();
         for (port, h) in promoted {
             let phase = match port {
                 STREAM_PORT => Phase::AwaitHeader,
@@ -804,6 +804,9 @@ impl Loop {
                 self.udp_flows.insert(h, HashMap::new());
             }
             self.conns.insert(h, Conn::new(phase));
+        }
+        if promoted_count > 0 {
+            self.ensure_listeners();
         }
     }
 
@@ -819,7 +822,7 @@ impl Loop {
             return;
         }
         let mut s = self.new_socket();
-        let remote = IpEndpoint::new(IpAddress::Ipv4(GUEST.into()), guest_port);
+        let remote = IpEndpoint::new(IpAddress::Ipv4(GUEST), guest_port);
         let mut connected = false;
         for _ in 0..8 {
             let local = self.local_port();
@@ -829,7 +832,10 @@ impl Loop {
             }
         }
         if !connected {
-            tracing::debug!(guest_port, "link: no local port for a connection to the guest");
+            tracing::debug!(
+                guest_port,
+                "link: no local port for a connection to the guest"
+            );
             self.spare.push(s);
             return;
         }
@@ -846,7 +852,11 @@ impl Loop {
             Command::Inbound(port, mac) => {
                 let _ = mac.set_nodelay(true);
                 crate::sockbuf::widen(&mac);
-                self.open_to_guest(INBOUND_PORT, OwnedFd::from(mac), Phase::AwaitEstablished(port));
+                self.open_to_guest(
+                    INBOUND_PORT,
+                    OwnedFd::from(mac),
+                    Phase::AwaitEstablished(port),
+                );
             }
             Command::Proxy(guest_port, fd) => {
                 crate::sockbuf::widen(&fd);
@@ -872,7 +882,9 @@ impl Loop {
     /// Small control messages to the guest: into the ring if it fits, else
     /// kept until it does.
     fn queue_to_guest(&mut self, h: SocketHandle, bytes: Vec<u8>) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         if conn.pending_at < conn.pending.len() {
             conn.pending.extend_from_slice(&bytes);
             return;
@@ -886,7 +898,9 @@ impl Loop {
     }
 
     fn flush_pending(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         if conn.pending_at >= conn.pending.len() {
             return;
         }
@@ -924,7 +938,9 @@ impl Loop {
     }
 
     fn progress(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get(&h) else { return };
+        let Some(conn) = self.conns.get(&h) else {
+            return;
+        };
         // A socket that reset or finished under us.
         let closed = !self.sockets.get::<tcp::Socket>(h).is_open();
         match conn.phase {
@@ -1074,33 +1090,50 @@ impl Loop {
 
     /// FUSE requests are framed by the length in their header.
     fn share_progress(&mut self, h: SocketHandle) {
-        let Some(shares) = self.hooks.shares.clone() else { return };
-        let Some(conn) = self.conns.get_mut(&h) else { return };
-        let mut at = 0usize;
-        while conn.partial.len() - at >= 40 {
-            let len = u32::from_le_bytes([
-                conn.partial[at],
-                conn.partial[at + 1],
-                conn.partial[at + 2],
-                conn.partial[at + 3],
-            ]) as usize;
-            if len < 40 {
-                tracing::warn!(len, "a FUSE request shorter than its header; dropping the connection");
-                self.close(h);
+        let Some(shares) = self.hooks.shares.clone() else {
+            return;
+        };
+        let mut requests: Vec<Vec<u8>> = Vec::new();
+        {
+            let Some(conn) = self.conns.get_mut(&h) else {
                 return;
+            };
+            let mut at = 0usize;
+            while conn.partial.len() - at >= 40 {
+                let len = u32::from_le_bytes([
+                    conn.partial[at],
+                    conn.partial[at + 1],
+                    conn.partial[at + 2],
+                    conn.partial[at + 3],
+                ]) as usize;
+                if len < 40 {
+                    tracing::warn!(
+                        len,
+                        "a FUSE request shorter than its header; dropping the connection"
+                    );
+                    self.close(h);
+                    return;
+                }
+                if conn.partial.len() - at < len {
+                    break;
+                }
+                requests.push(conn.partial[at..at + len].to_vec());
+                at += len;
             }
-            if conn.partial.len() - at < len {
-                break;
-            }
-            shares.request(ConnId(h), conn.partial[at..at + len].to_vec());
-            at += len;
+            conn.partial.drain(..at);
         }
-        conn.partial.drain(..at);
+        for request in requests {
+            if let Some(reply) = shares.request(ConnId(h), request) {
+                self.queue_to_guest(h, reply);
+            }
+        }
     }
 
     /// Guest → Mac: straight from the ring to the socket.
     fn pull_from_guest(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         let Some(fd) = conn.fd.as_ref().map(AsRawFd::as_raw_fd) else {
             return;
         };
@@ -1132,7 +1165,9 @@ impl Loop {
                 let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
                 if n < 0 {
                     let e = io::Error::last_os_error();
-                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted {
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted
+                    {
                         (0, Ok(0usize))
                     } else {
                         (0, Err(e))
@@ -1172,7 +1207,9 @@ impl Loop {
 
     /// Mac → guest: straight from the socket into the ring.
     fn readable(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         if !matches!(conn.phase, Phase::Open) {
             return;
         }
@@ -1195,7 +1232,9 @@ impl Loop {
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), want) };
                 if n < 0 {
                     let e = io::Error::last_os_error();
-                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted {
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted
+                    {
                         (0, Ok(None))
                     } else {
                         (0, Err(e))
@@ -1226,7 +1265,9 @@ impl Loop {
 
     /// The guest drained some of the ring: read from the Mac again.
     fn resume_reading(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         if conn.reading || conn.mac_eof {
             return;
         }
@@ -1242,7 +1283,9 @@ impl Loop {
     }
 
     fn writable(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         if matches!(conn.phase, Phase::Connecting) {
             let fd = conn.fd.as_ref().expect("socket").as_raw_fd();
             match connect_result(fd) {
@@ -1266,13 +1309,14 @@ impl Loop {
     }
 
     fn maybe_close(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get(&h) else { return };
+        let Some(conn) = self.conns.get(&h) else {
+            return;
+        };
         let s = self.sockets.get::<tcp::Socket>(h);
         let ring_empty = !s.can_recv();
-        if !s.is_open() && ring_empty {
-            self.close(h);
-        } else if conn.mac_eof && conn.guest_eof && ring_empty && s.state() != tcp::State::Established
-        {
+        let finished = !s.is_open()
+            || (conn.mac_eof && conn.guest_eof && s.state() != tcp::State::Established);
+        if finished && ring_empty {
             self.close(h);
         }
     }
@@ -1314,7 +1358,9 @@ impl Loop {
     // -- DNS ---------------------------------------------------------------
 
     fn dns_progress(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         let mut at = 0usize;
         let mut replies: Vec<(u16, Vec<u8>)> = Vec::new();
         while conn.partial.len() - at >= 4 {
@@ -1341,7 +1387,9 @@ impl Loop {
     // -- UDP ---------------------------------------------------------------
 
     fn udp_progress(&mut self, h: SocketHandle) {
-        let Some(conn) = self.conns.get_mut(&h) else { return };
+        let Some(conn) = self.conns.get_mut(&h) else {
+            return;
+        };
         let mut at = 0usize;
         while conn.partial.len() - at >= UDP_HEADER {
             let hdr = &conn.partial[at..at + UDP_HEADER];
@@ -1356,13 +1404,17 @@ impl Loop {
             let flows = self.udp_flows.entry(h).or_default();
             match kind {
                 UDP_KIND_OPEN => {
-                    let Some(dst) = udp_destination(payload) else { continue };
+                    let Some(dst) = udp_destination(payload) else {
+                        continue;
+                    };
                     let bind: SocketAddr = if dst.is_ipv4() {
                         "0.0.0.0:0".parse().expect("addr")
                     } else {
                         "[::]:0".parse().expect("addr")
                     };
-                    let Ok(socket) = std::net::UdpSocket::bind(bind) else { continue };
+                    let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+                        continue;
+                    };
                     if socket.connect(dst).is_err() || socket.set_nonblocking(true).is_err() {
                         continue;
                     }
@@ -1497,7 +1549,11 @@ fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
                 )
             }
             .to_vec();
-            (libc::AF_INET, bytes, size_of::<libc::sockaddr_in>() as libc::socklen_t)
+            (
+                libc::AF_INET,
+                bytes,
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
         }
         SocketAddr::V6(a) => {
             // SAFETY: a zeroed sockaddr_in6, filled below.
@@ -1514,7 +1570,11 @@ fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
                 )
             }
             .to_vec();
-            (libc::AF_INET6, bytes, size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+            (
+                libc::AF_INET6,
+                bytes,
+                size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
         }
     };
     // SAFETY: socket creation and a non-blocking connect on it.

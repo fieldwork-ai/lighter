@@ -14,8 +14,8 @@
 //!
 //! The guest keeps at least a sixteenth of its RAM whatever is asked.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::balloon::Balloon;
@@ -311,7 +311,11 @@ mod tests {
         let up = steer(0, 64 << 20, 0, cap);
         assert_eq!(up, INFLATE_STEP_BYTES);
         assert_eq!(steer(up, 0, 2, cap), up, "quiet but not for long: held");
-        assert_eq!(steer(up, 1 << 20, 0, cap), up, "a trickle, so no quiet yet: held");
+        assert_eq!(
+            steer(up, 1 << 20, 0, cap),
+            up,
+            "a trickle, so no quiet yet: held"
+        );
         let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, cap);
         assert_eq!(up - down, DEFLATE_STEP_BYTES);
         assert_eq!(steer(cap, 1 << 30, 0, cap), cap, "never past the cap");

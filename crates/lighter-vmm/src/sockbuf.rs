@@ -37,6 +37,22 @@ pub fn widen(socket: &impl AsRawFd) {
     }
 }
 
+/// Sets both buffers of `socket` to `bytes`.
+pub fn widen_to(socket: &impl AsRawFd, bytes: i32) {
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: setsockopt with an int we own on a descriptor the caller holds.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                opt,
+                std::ptr::addr_of!(bytes).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,21 +74,5 @@ mod tests {
         };
         assert_eq!(rc, 0);
         assert!(size >= 256 << 10, "got {size}");
-    }
-}
-
-/// Sets both buffers of `socket` to `bytes`.
-pub fn widen_to(socket: &impl AsRawFd, bytes: i32) {
-    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        // SAFETY: setsockopt with an int we own on a descriptor the caller holds.
-        unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                opt,
-                std::ptr::addr_of!(bytes).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
     }
 }

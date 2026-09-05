@@ -53,10 +53,11 @@ fn main() -> ExitCode {
                 // PATH:GUEST_PORT — a host socket carried to a guest port
                 // over the link (`--vsock` is the old spelling).
                 let spec = args.next().unwrap_or_default();
-                match spec
-                    .rsplit_once(':')
-                    .and_then(|(p, port)| port.parse::<u16>().ok().map(|port| (PathBuf::from(p), port)))
-                {
+                match spec.rsplit_once(':').and_then(|(p, port)| {
+                    port.parse::<u16>()
+                        .ok()
+                        .map(|port| (PathBuf::from(p), port))
+                }) {
                     Some(pair) => sockets.push(pair),
                     None => {
                         eprintln!("--proxy wants PATH:GUEST_PORT, got {spec:?}");

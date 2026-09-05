@@ -14,9 +14,7 @@ use crate::link::Link;
 
 pub struct PortMapper {
     link: Arc<Link>,
-    listeners: std::sync::Mutex<
-        std::collections::HashMap<u16, Arc<std::sync::atomic::AtomicBool>>,
-    >,
+    listeners: std::sync::Mutex<std::collections::HashMap<u16, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl PortMapper {
