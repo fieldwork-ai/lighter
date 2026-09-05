@@ -11,7 +11,7 @@ A release is a signed, notarized tarball on GitHub, a Homebrew formula that poin
 
 ## The version
 
-One number, in the workspace `Cargo.toml`: `version` and the three internal crates' `version` pins beside it. 0.2.0's bump missed the pins, the workspace stopped resolving mid-gate, and m7 and m8 failed for a reason that read as a guest problem. Bump all four, `cargo build`, then run the gates again on the bumped head — the release commit is the one the gates saw.
+One number, in the workspace `Cargo.toml`: `version` and the four internal crates' `version` pins beside it. 0.2.0's bump missed the pins, the workspace stopped resolving mid-gate, and m7 and m8 failed for a reason that read as a guest problem. Bump all four, and the guest agent's own `guest/agent/Cargo.toml` (and its lockfile) beside them, then `cargo build`, `make guest` for the rootfs the agent lives in, and the gates again on the bumped head — the release commit is the one the gates saw.
 
 ## The tarball
 
