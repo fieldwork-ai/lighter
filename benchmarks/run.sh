@@ -779,12 +779,24 @@ boot_stop() {
 		# It answers to either name depending on the version installed.
 		osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
 		osascript -e 'quit app "Docker Desktop"' >/dev/null 2>&1 || true
+		# Quit takes the window and the VM down at once, but the backend
+		# processes (com.docker.backend, com.docker.build, docker-agent)
+		# stay for two to three minutes, and an `open` while any of them
+		# is alive is swallowed: nothing starts, and when they finally
+		# exit the app is simply down. Measured on 4.89: 190 s from Quit to
+		# the last process gone. So: a short grace for the orderly exit,
+		# then the rest of the tree is ended, and the start is timed from
+		# a Mac with no Docker process on it.
 		local waited=0
-		while pgrep -f 'com.docker.backend' >/dev/null 2>&1 && [ "$waited" -lt 90 ]; do
+		while pgrep -f '/Docker.app/' >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
 			sleep 1; waited=$((waited + 1))
 		done
-		# The app is still tearing down after its backend has gone; an
-		# `open` inside that window is swallowed and it stays down.
+		if pgrep -f '/Docker.app/' >/dev/null 2>&1; then
+			pkill -f '/Docker.app/' 2>/dev/null || true
+			sleep 3
+			pkill -9 -f '/Docker.app/' 2>/dev/null || true
+		fi
+		while pgrep -f '/Docker.app/' >/dev/null 2>&1; do sleep 1; done
 		sleep 5
 		;;
 	esac
