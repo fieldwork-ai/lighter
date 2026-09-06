@@ -110,6 +110,7 @@ echo "==> Measuring the share"
 echo
 compare() {
 	local name="$1" floor="$2" ours theirs ratio
+	COMPARE_RATIO=0
 	ours="$(median "$OURS" "$name")"
 	theirs="$(median "$NATIVE" "$name")"
 	if [ -z "$ours" ] || [ -z "$theirs" ] || [ "$ours" -le 0 ]; then
@@ -117,18 +118,20 @@ compare() {
 		return
 	fi
 	ratio="$(awk -v a="$theirs" -v b="$ours" 'BEGIN { printf "%.0f", a / b * 100 }')"
+	COMPARE_RATIO="$ratio"
 	if [ "$ratio" -ge "$floor" ]; then
 		pass "$name: ${ours}ms against ${theirs}ms native — ${ratio}% (floor ${floor}%)"
 	else
 		fail "$name: ${ratio}% of native (${ours}ms against ${theirs}ms), floor ${floor}%"
 	fi
-	echo "$ratio"
 }
 
-RIPGREP_RATIO="$(compare ripgrep "$FLOOR_RIPGREP" | tail -1)"
-WALK_RATIO="$(compare find-walk "$FLOOR_WALK" | tail -1)"
-NPM_RATIO="$(compare npm-install "$FLOOR_NPM" | tail -1)"
-compare copy-tree "$FLOOR_COPY" >/dev/null
+# A command substitution runs compare in a subshell and loses FAILED=1.
+# Keep the checks in this shell so every floor can fail the gate.
+compare ripgrep "$FLOOR_RIPGREP"; RIPGREP_RATIO="$COMPARE_RATIO"
+compare find-walk "$FLOOR_WALK"; WALK_RATIO="$COMPARE_RATIO"
+compare npm-install "$FLOOR_NPM"; NPM_RATIO="$COMPARE_RATIO"
+compare copy-tree "$FLOOR_COPY"
 
 # The property that makes the caching defensible rather than merely fast: an
 # invalidation is pushed to the guest the moment FSEvents reports the change,

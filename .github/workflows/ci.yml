@@ -38,3 +38,5 @@ jobs:
         run: bash scripts/test-benchmark-results.sh
       - name: Idle polling preserves wakeups
         run: python3 scripts/test-idle-poll.py
+      - name: Speed gate rejects failed performance floors
+        run: bash scripts/test-speed-gate.sh
