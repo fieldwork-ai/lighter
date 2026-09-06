@@ -282,24 +282,25 @@ fn monotonic_ms() -> u64 {
 /// more at idle than an eighth (335 against 277); three movable to one is
 /// also the kernel's own default ratio.
 ///
-/// Guests of eight gigabytes and up. On a 4 GiB guest (an 8 GB M1) a
-/// quarter is a gigabyte, and the record's own sequence — three installs,
-/// then `ripgrep` and `cp -a` over the tree on the share — read ripgrep at
-/// 6.8 / 2.1 s / 242 ms and copy-tree at 12.6 / 20.4 / 20.9 s with 5–8 s of
-/// system time a pass (the kernel reclaiming slab node-wide, as the M5 did
-/// at an eighth); with the range off the same read 5.8 s / 185 / 141 ms
-/// and 7.0 / 11.0 / 5.7 s, the shape of the record before the range, and
-/// with a 2 GiB base 7.2 / 4.4 s / 192 ms and 5.9 / 7.4 / 5.3 s. A small
-/// guest keeps the policy that ran before the range: everything at boot,
-/// reporting and the trims (the balloon stays off it too, `memory_policy`),
-/// for 70 MiB more at idle (362 against 293) and its tree cases back. The
-/// 2 GiB base is the follow-up worth measuring for it.
+/// Every size. On a 4 GiB guest (an 8 GB M1) a quarter is a gigabyte, and
+/// with the range's blocks all onlined movable the base held every
+/// unmovable allocation of three package installs — the tree's 200k
+/// dentries and inodes above all — and the kernel reclaimed slab from it on
+/// every pass: the record's tree cases read ripgrep on the share at
+/// 6.8 / 2.1 s / 242 ms and copy-tree at 12.6 / 20.4 / 20.9 s against
+/// 5.8 s / 185 / 141 ms and 7.0 / 11.0 / 5.7 s with no range at all. The
+/// answer is the kernel's own: init sets the hotplug online policy to
+/// `auto-movable` at a ratio of one (`guest/rootfs/init`), so a plugged
+/// block onlines movable only while movable memory is at most equal to
+/// the kernel-usable memory and as ordinary memory otherwise. The same
+/// 4 GiB guest then read 5.8 s / 199 / 146 ms and 6.6 / 8.7 / 7.6 s with
+/// the range on; a 12 GiB guest with a 3 GiB base gets 3 GiB of its range
+/// as kernel memory and the rest movable, and what it gives back at idle
+/// is what it gave before. One rule for every size; a line at eight
+/// gigabytes was measured beside it and dropped the same afternoon.
 ///
 /// `LIGHTER_VIRTIO_MEM=0` gives the guest everything at boot, as before,
 /// for the A/B; `LIGHTER_VIRTIO_MEM=<MiB>` sets the base by hand.
-/// The configured size under which a guest gets no range (see `split`).
-pub const RANGE_MIN_TOTAL: u64 = 8 << 30;
-
 pub fn split(total: u64) -> (u64, u64) {
     let base = match std::env::var("LIGHTER_VIRTIO_MEM")
         .ok()
@@ -307,7 +308,6 @@ pub fn split(total: u64) -> (u64, u64) {
     {
         Some(0) => return (total, 0),
         Some(mib) => mib << 20,
-        None if total < RANGE_MIN_TOTAL => return (total, 0),
         None => (total / 4).max(1 << 30),
     };
     let base = base.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
@@ -496,7 +496,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_base_is_a_quarter_from_eight_gigabytes_and_everything_under() {
+    fn the_base_is_a_quarter_and_a_gigabyte_at_least() {
         // Not through the environment: a parallel test may be reading it.
         if std::env::var_os("LIGHTER_VIRTIO_MEM").is_some() {
             return;
@@ -504,11 +504,9 @@ mod tests {
         assert_eq!(split(16 << 30), (4 << 30, 12 << 30));
         assert_eq!(split(12 << 30), (3 << 30, 9 << 30));
         assert_eq!(split(8 << 30), (2 << 30, 6 << 30));
-        // A small guest keeps the policy from before the range: the tree
-        // cases after three installs ran three to four times slower on a
-        // 4 GiB guest with a gigabyte of base.
-        assert_eq!(split(4 << 30), (4 << 30, 0));
-        assert_eq!(split(2 << 30), (2 << 30, 0));
+        assert_eq!(split(4 << 30), (1 << 30, 3 << 30));
+        assert_eq!(split(2 << 30), (1 << 30, 1 << 30));
+        assert_eq!(split(1 << 30), (1 << 30, 0));
         assert_eq!(split(512 << 20), (512 << 20, 0));
     }
 
