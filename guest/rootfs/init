@@ -250,9 +250,17 @@ echo 1 > /sys/kernel/rcu_expedited 2>/dev/null || true
 # The next-scan interval stays at its default: zero there would spin the
 # thread through a long grace period.
 echo 0 > /sys/module/rcutree/parameters/jiffies_till_first_fqs 2>/dev/null || true
+# containerd 2 splits CRI into three plugins, and with only the gRPC one
+# off the runtime plugin still ran its event monitor's one-second
+# back-off ticker: with Go's sysmon and poller behind each firing, a fifth
+# of the wakeups an idle guest made were a Kubernetes shim in a Docker
+# guest. NRI exists for CRI. The optional plugins beyond these (the
+# cgroup monitor and metrics, tracing, the restart monitor) were measured
+# and cost nothing; the health-check plugin must stay, since dockerd polls
+# it and reconnects in a storm without it.
 cat > /run/containerd.toml <<'TOML'
 version = 2
-disabled_plugins = ["io.containerd.grpc.v1.cri"]
+disabled_plugins = ["io.containerd.grpc.v1.cri", "io.containerd.cri.v1.runtime", "io.containerd.cri.v1.images", "io.containerd.nri.v1.nri"]
 TOML
 # A fresh shell rather than a subshell: in a subshell `$$` is still the
 # parent's pid, and the engine ran in the root cgroup for a day.
@@ -381,6 +389,11 @@ sysctl -q -w net.core.wmem_max=16777216 net.core.rmem_max=16777216 fs.pipe-max-s
 # reporting hands the host, and a third of what the trim freed came back
 # over thirty seconds as compaction worked around them, or not at all.
 echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
+# The per-CPU vm statistics fold once a second by default, a work item on
+# every vCPU whose counters moved: on an idle 9-vCPU guest, 4 of its 38
+# wakeups a second. Once every ten seconds is soon enough for /proc/vmstat;
+# the kernel's own reclaim decisions read the counters directly.
+sysctl -q -w vm.stat_interval=10 2>/dev/null || true
 # TCP inside the guest carries a container's stream to the agent; its
 # windows are what lets that leg run ahead of the vsock leg behind it. The
 # defaults top out at 4 and 6 MB.

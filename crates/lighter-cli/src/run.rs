@@ -168,6 +168,16 @@ pub fn machine() -> anyhow::Result<()> {
     {
         cmdline.push_str(" lighter.nosockmap");
     }
+    // `LIGHTER_CMDLINE_EXTRA`: words appended to the guest's command line,
+    // for an A/B of an agent or kernel knob on a machine run from the CLI
+    // (the benchmark harness has the same).
+    if let Ok(extra) = std::env::var("LIGHTER_CMDLINE_EXTRA") {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(extra);
+        }
+    }
 
     // The configured memory is the guest's maximum: it boots with a base
     // and plugs the rest in as the host offers it (`lighter_vmm::virtio::mem`).

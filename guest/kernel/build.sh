@@ -42,11 +42,16 @@ build() {
 		-e "KERNEL_VERSION=${KERNEL_VERSION:-6.18.49}" \
 		-e "KERNEL_HZ=$hz" \
 		-e "KERNEL_IMAGE_SUFFIX=$suffix" \
+		-e "KERNEL_TRACE=${KERNEL_TRACE:-}" \
 		"$IMAGE"
 }
 case "${LIGHTER_KERNEL_ONLY:-both}" in
 	250)  build 250 "" "$VOLUME" ;;
 	1000) build 1000 "-hz1000" "$VOLUME-hz1000" ;;
+	# `Image-trace`: the 250 Hz kernel with ftrace and its tracepoints, for
+	# finding what wakes an idle guest (timer expiries, work items by
+	# function) — never shipped, never a record's kernel.
+	trace) KERNEL_TRACE=1 build 250 "-trace" "$VOLUME-trace" ;;
 	*)    build 250 "" "$VOLUME"; build 1000 "-hz1000" "$VOLUME-hz1000" ;;
 esac
 

@@ -77,6 +77,15 @@ if [ "${KERNEL_HZ:-}" = 1000 ]; then
 	log "Tick rate: 1000 Hz for this image"
 	./scripts/config --file .config --disable HZ_250 --enable HZ_1000 --set-val HZ 1000
 fi
+# `Image-trace` (KERNEL_TRACE=1): ftrace and the tracepoints, so an idle
+# guest's timer expiries and work items can be read by function; the
+# shipped kernels carry none of it.
+if [ "${KERNEL_TRACE:-}" = 1 ]; then
+	log "Tracing: ftrace and tracepoints in this image"
+	./scripts/config --file .config --enable FTRACE --enable TRACING --enable TRACEPOINTS \
+		--enable ENABLE_DEFAULT_TRACERS --enable DYNAMIC_FTRACE --enable FUNCTION_TRACER \
+		--enable STACKTRACE --enable SCHED_TRACER
+fi
 # merge_config leaves the merged result needing a pass to settle dependencies;
 # olddefconfig takes the default for anything newly reachable rather than
 # prompting, which would hang a non-interactive build.

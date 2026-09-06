@@ -249,6 +249,19 @@ fn bound_container_cache() {
     if always_fast {
         set_reporting(100, 5);
     }
+    // `lighter.reporting_order=<n>`: the smallest order reporting returns at
+    // rest (nine, two megabytes, the kernel's default), for the A/B against
+    // five: under a day-long stack the footprint crept 2.4 MB a minute, and
+    // freed runs under two megabytes that nothing else takes back are one
+    // candidate.
+    let rest_order = cmdline_value("lighter.reporting_order")
+        .map(|o| o as u32)
+        .unwrap_or(9);
+    // The rest settings from the start, not from the first trim: the kernel
+    // boots with proactive compaction at 20.
+    if !always_fast {
+        set_reporting(2000, rest_order);
+    }
     // The engine's cgroup (init puts dockerd there): the image layers it
     // extracted, and whatever else it read, charged where a trim can reach.
     let engine = "/sys/fs/cgroup/engine";
@@ -299,7 +312,7 @@ fn bound_container_cache() {
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
         if hurried && !always_fast && (idle_for == 0 || idle_for >= 25 * TICKS_PER_SEC) {
-            set_reporting(2000, 9);
+            set_reporting(2000, rest_order);
             hurried = false;
         }
         // Two seconds idle: offer the host what is free beyond a reserve,
@@ -593,7 +606,11 @@ fn cmdline_value(key: &str) -> Option<u64> {
 fn set_reporting(delay_ms: u32, order: u32) {
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_delay_ms", delay_ms.to_string());
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_order", order.to_string());
-    let proactiveness = if delay_ms < 2000 { "100" } else { "20" };
+    // At rest, none: the kernel's 20 has kcompactd wake twice a second on an
+    // idle guest to check a fragmentation score nothing is changing (2 of
+    // the 38 wakeups a second an idle guest made). The trims compact
+    // explicitly, and the hurried setting has it at full strength.
+    let proactiveness = if delay_ms < 2000 { "100" } else { "0" };
     let _ = std::fs::write("/proc/sys/vm/compaction_proactiveness", proactiveness);
 }
 
