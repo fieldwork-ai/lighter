@@ -120,7 +120,7 @@ impl Identity {
     }
 }
 
-fn try_lock(file: &File) -> io::Result<bool> {
+pub(crate) fn try_lock(file: &File) -> io::Result<bool> {
     // SAFETY: a live descriptor. Dropping it releases a successfully taken lock.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(true);

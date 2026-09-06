@@ -27,9 +27,98 @@ pub struct Status {
     pub footprint_mib: Option<u64>,
 }
 
-/// The daemon that owns this home, verified with its process generation.
+/// The daemon that owns this home, verified with its process generation;
+/// or a machine started by a lighter before 0.4.0, which holds the home's
+/// lock and wrote only a pid file.
 pub fn running_pid() -> anyhow::Result<Option<u32>> {
-    Ok(crate::instance::Identity::read(&paths::home()?)?.map(|id| id.pid()))
+    if let Some(identity) = crate::instance::Identity::read(&paths::home()?)? {
+        return Ok(Some(identity.pid()));
+    }
+    legacy_pid()
+}
+
+/// A machine from before the identity file: the home's lock held (the old
+/// machine took it for its lifetime too) and its pid file naming a live
+/// process that is a lighter binary. Either alone is not enough to signal
+/// anything — a pid file outlives a killed machine and the number comes
+/// back as some other process — but a held lock is a live machine in this
+/// home, and its pid file is the only name it gave itself. Without this,
+/// the first `lighter stop` after an upgrade said "Stopped." and left the
+/// old machine running, and `lighter start` then waited two minutes on a
+/// lock it could not take.
+fn legacy_pid() -> anyhow::Result<Option<u32>> {
+    let home = paths::home()?;
+    let Ok(text) = std::fs::read_to_string(home.join("lighter.pid")) else {
+        return Ok(None);
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return Ok(None);
+    };
+    let Ok(lock) = std::fs::File::open(home.join("machine.lock")) else {
+        return Ok(None);
+    };
+    if crate::instance::try_lock(&lock)? {
+        // Nobody holds it: the pid file is stale.
+        return Ok(None);
+    }
+    Ok(is_lighter(pid).then_some(pid))
+}
+
+/// Whether the process is a lighter binary, by the path it runs from.
+fn is_lighter(pid: u32) -> bool {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: a buffer of the size the call is told about.
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return false;
+    }
+    let path = String::from_utf8_lossy(&buffer[..len as usize]);
+    std::path::Path::new(path.as_ref())
+        .file_name()
+        .is_some_and(|name| name == "lighter")
+}
+
+/// Stops a machine from before the identity file the way its own `stop`
+/// did: the port watcher let go of dockerd (SIGUSR1), the guest asked to
+/// power off, SIGTERM for a guest that does not answer, SIGKILL for a
+/// machine that does not end; and the files it will not clean up itself
+/// removed here, since that machine's process never did.
+fn stop_legacy(pid: u32, wait: Duration) -> anyhow::Result<bool> {
+    let home = paths::home()?;
+    let alive = |pid: u32| -> bool {
+        // SAFETY: a plain kill(2) with no side effect.
+        let signalable = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        signalable && is_lighter(pid)
+    };
+    // SAFETY: a signal to a lighter process holding this home's lock.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+    std::thread::sleep(Duration::from_millis(150));
+    let asked = control("poweroff")
+        .map(|reply| reply == "ok")
+        .unwrap_or(false);
+    if !asked {
+        // SAFETY: as above.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline && alive(pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if alive(pid) {
+        // SAFETY: as above.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for name in ["lighter.pid", "docker.sock", "control.sock"] {
+        let _ = std::fs::remove_file(home.join(name));
+    }
+    Ok(true)
 }
 
 /// Starts a machine and waits for Docker to answer.
@@ -107,7 +196,10 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
 /// Asks the machine to stop, and waits for it.
 pub fn stop(wait: Duration) -> anyhow::Result<bool> {
     let Some(identity) = crate::instance::Identity::read(&paths::home()?)? else {
-        return Ok(false);
+        return match legacy_pid()? {
+            Some(pid) => stop_legacy(pid, wait),
+            None => Ok(false),
+        };
     };
     // Signal the recorded process generation, not just its PID. The daemon
     // asks its own guest to sync/power off while it still holds the home lock.
