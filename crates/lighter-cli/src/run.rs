@@ -104,6 +104,11 @@ pub fn machine() -> anyhow::Result<()> {
         return Ok(());
     }
     std::mem::forget(lock);
+    // The machine names itself once it holds the lock. `lighter start` wrote
+    // the pid file for the child it spawned, so a machine launchd started at
+    // login had none: `status` said not running and `stop` had nothing to
+    // stop while the VM ran on.
+    std::fs::write(paths::pid_file()?, std::process::id().to_string())?;
 
     let shares = config
         .shares

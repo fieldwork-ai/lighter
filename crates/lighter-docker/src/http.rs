@@ -89,12 +89,24 @@ pub enum Body {
     Length(usize),
 }
 
+/// How long a finite request may wait on the daemon for each read. Without a
+/// bound, a daemon that accepts the connection and then stalls holds
+/// `lighter start` past its own deadline, and `status` and the port
+/// reconciliation with it. The event stream is the one request meant to
+/// wait indefinitely, and passes none.
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Sends a request and returns the connection positioned at the body.
-fn send(socket: &Path, path: &str) -> Result<(BufReader<UnixStream>, Body), HttpError> {
+fn send(
+    socket: &Path,
+    path: &str,
+    read_timeout: Option<std::time::Duration>,
+) -> Result<(BufReader<UnixStream>, Body), HttpError> {
     let mut stream = UnixStream::connect(socket).map_err(|source| HttpError::Connect {
         path: socket.display().to_string(),
         source,
     })?;
+    stream.set_read_timeout(read_timeout)?;
 
     // HTTP/1.1 because the event stream needs a connection that stays open and
     // a server that is allowed to chunk. `Host` is required by 1.1 and ignored
@@ -148,7 +160,7 @@ fn send(socket: &Path, path: &str) -> Result<(BufReader<UnixStream>, Body), Http
 
 /// Fetches a complete JSON document.
 pub fn get_json(socket: &Path, path: &str) -> Result<serde_json::Value, HttpError> {
-    let (mut reader, body) = send(socket, path)?;
+    let (mut reader, body) = send(socket, path, Some(REQUEST_READ_TIMEOUT))?;
     let mut bytes = Vec::new();
     match body {
         Body::Length(len) => {
@@ -174,7 +186,7 @@ pub fn stream_json(
     stop: Option<&Stop>,
     mut on_event: impl FnMut(serde_json::Value),
 ) -> Result<(), HttpError> {
-    let (mut reader, body) = send(socket, path)?;
+    let (mut reader, body) = send(socket, path, None)?;
     if body != Body::Chunked {
         return Err(HttpError::Malformed(
             "an event stream must be chunked".into(),

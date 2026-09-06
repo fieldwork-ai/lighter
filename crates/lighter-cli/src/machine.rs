@@ -39,11 +39,33 @@ pub fn running_pid() -> anyhow::Result<Option<u32>> {
     // Signal zero asks whether we could signal it, without doing so — which is
     // the only way to tell a live process from a stale pid file.
     // SAFETY: a plain kill(2) with no side effect.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        Ok(Some(pid))
-    } else {
-        Ok(None)
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return Ok(None);
     }
+    // Alive, but is it ours? A pid file outlives the machine when the
+    // machine is killed rather than stopped, and the number can come back
+    // as some other process; `stop` would then signal that one.
+    Ok(is_lighter(pid).then_some(pid))
+}
+
+/// Whether the process is a lighter binary, by the path it runs from.
+fn is_lighter(pid: u32) -> bool {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: a buffer of the size the call is told about.
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return false;
+    }
+    let path = String::from_utf8_lossy(&buffer[..len as usize]);
+    std::path::Path::new(path.as_ref())
+        .file_name()
+        .is_some_and(|name| name == "lighter")
 }
 
 /// Starts a machine and waits for Docker to answer.

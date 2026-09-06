@@ -250,48 +250,52 @@ impl GuestMemory {
 
     /// Reads a little-endian primitive from guest memory.
     ///
-    /// Volatile because the guest can be writing the same location; a plain
-    /// read would let the optimizer hoist or duplicate it.
+    /// Volatile where the address allows it, because the guest can be
+    /// writing the same location and a plain read would let the optimizer
+    /// hoist or duplicate it; an unaligned copy where it does not, since the
+    /// guest is not obliged to align what it puts in a buffer (virtio's
+    /// rings are aligned by the specification, a device header is wherever
+    /// the driver's allocation fell), and a typed volatile read of an
+    /// unaligned address is undefined behaviour.
     pub fn read_u32(&self, gpa: u64) -> Result<u32> {
         let region = self.region_for(gpa, 4)?;
-        // SAFETY: bounds checked; read_unaligned tolerates any alignment the
-        // guest chose for its structures.
-        let value = unsafe { ptr::read_volatile(region.host_addr(gpa).cast::<u32>()) };
+        // SAFETY: bounds checked above.
+        let value = unsafe { read_prim(region.host_addr(gpa).cast::<u32>()) };
         Ok(u32::from_le(value))
     }
 
     pub fn write_u32(&self, gpa: u64, value: u32) -> Result<()> {
         let region = self.region_for(gpa, 4)?;
         // SAFETY: bounds checked above.
-        unsafe { ptr::write_volatile(region.host_addr(gpa).cast::<u32>(), value.to_le()) };
+        unsafe { write_prim(region.host_addr(gpa).cast::<u32>(), value.to_le()) };
         Ok(())
     }
 
     pub fn read_u16(&self, gpa: u64) -> Result<u16> {
         let region = self.region_for(gpa, 2)?;
         // SAFETY: bounds checked above.
-        let value = unsafe { ptr::read_volatile(region.host_addr(gpa).cast::<u16>()) };
+        let value = unsafe { read_prim(region.host_addr(gpa).cast::<u16>()) };
         Ok(u16::from_le(value))
     }
 
     pub fn write_u16(&self, gpa: u64, value: u16) -> Result<()> {
         let region = self.region_for(gpa, 2)?;
         // SAFETY: bounds checked above.
-        unsafe { ptr::write_volatile(region.host_addr(gpa).cast::<u16>(), value.to_le()) };
+        unsafe { write_prim(region.host_addr(gpa).cast::<u16>(), value.to_le()) };
         Ok(())
     }
 
     pub fn read_u64(&self, gpa: u64) -> Result<u64> {
         let region = self.region_for(gpa, 8)?;
         // SAFETY: bounds checked above.
-        let value = unsafe { ptr::read_volatile(region.host_addr(gpa).cast::<u64>()) };
+        let value = unsafe { read_prim(region.host_addr(gpa).cast::<u64>()) };
         Ok(u64::from_le(value))
     }
 
     pub fn write_u64(&self, gpa: u64, value: u64) -> Result<()> {
         let region = self.region_for(gpa, 8)?;
         // SAFETY: bounds checked above.
-        unsafe { ptr::write_volatile(region.host_addr(gpa).cast::<u64>(), value.to_le()) };
+        unsafe { write_prim(region.host_addr(gpa).cast::<u64>(), value.to_le()) };
         Ok(())
     }
 
@@ -482,6 +486,35 @@ fn host_page_size() -> u64 {
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if size > 0 { size as u64 } else { 16384 }
     })
+}
+
+/// A primitive read from guest memory at whatever alignment the guest chose:
+/// volatile when the address allows it, an unaligned copy when it does not.
+///
+/// # Safety
+/// `ptr` must be valid for a read of `T` inside a live mapping.
+unsafe fn read_prim<T: Copy>(ptr: *const T) -> T {
+    if (ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
+        // SAFETY: aligned, and valid by the caller's contract.
+        unsafe { ptr::read_volatile(ptr) }
+    } else {
+        // SAFETY: valid by the caller's contract; alignment is not required.
+        unsafe { ptr::read_unaligned(ptr) }
+    }
+}
+
+/// The write to match `read_prim`.
+///
+/// # Safety
+/// `ptr` must be valid for a write of `T` inside a live mapping.
+unsafe fn write_prim<T: Copy>(ptr: *mut T, value: T) {
+    if (ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
+        // SAFETY: aligned, and valid by the caller's contract.
+        unsafe { ptr::write_volatile(ptr, value) }
+    } else {
+        // SAFETY: valid by the caller's contract; alignment is not required.
+        unsafe { ptr::write_unaligned(ptr, value) }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
