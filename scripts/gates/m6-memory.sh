@@ -178,13 +178,20 @@ fi
 # inside sees the configured size.
 echo
 echo "==> The range: out when nothing runs, whole for a container"
+# Not to zero: the range's blocks online by the kernel's auto-movable
+# policy (guest patch 0026), and a block that came up as kernel memory
+# stays plugged for as long as it holds an unmovable page — a few blocks,
+# variable, and plugged is not used: their free pages are reported and
+# their page arrays are 1.5% of them. What must not stay is the range as
+# a whole, so a residue of up to 768 MiB of the 6 GiB is the bound.
+RANGE_RESIDUE_MIB=768
 waited=0
-while [ "$(field plugged_mib)" != "0" ] && [ "$waited" -lt 60 ]; do
+while [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ] && [ "$waited" -lt 60 ]; do
 	sleep 2
 	waited=$((waited + 2))
 done
-if [ "$(field plugged_mib)" = "0" ]; then
-	pass "the range came out ${waited}s after the last container left; footprint $(footprint) MiB"
+if [ "$(field plugged_mib)" -le "$RANGE_RESIDUE_MIB" ]; then
+	pass "the range came out ${waited}s after the last container left ($(field plugged_mib) MiB of kernel-zone blocks left plugged); footprint $(footprint) MiB"
 else
 	fail "the range is still $(field plugged_mib) MiB plugged after ${waited}s with nothing running"
 fi

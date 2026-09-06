@@ -289,10 +289,12 @@ fn monotonic_ms() -> u64 {
 /// every pass: the record's tree cases read ripgrep on the share at
 /// 6.8 / 2.1 s / 242 ms and copy-tree at 12.6 / 20.4 / 20.9 s against
 /// 5.8 s / 185 / 141 ms and 7.0 / 11.0 / 5.7 s with no range at all. The
-/// answer is the kernel's own: init sets the hotplug online policy to
-/// `auto-movable` at a ratio of one (`guest/rootfs/init`), so a plugged
-/// block onlines movable only while movable memory is at most equal to
-/// the kernel-usable memory and as ordinary memory otherwise. The same
+/// answer is the kernel's own: the hotplug online policy `auto-movable`
+/// at a ratio of one, the kernel's default by guest patch 0026 (the host
+/// plugs the range before init runs, so a policy set from init was read
+/// as set and never applied), so a plugged block onlines movable only
+/// while movable memory is at most equal to the kernel-usable memory and
+/// as ordinary memory otherwise. The same
 /// 4 GiB guest then read 5.8 s / 199 / 146 ms and 6.6 / 8.7 / 7.6 s with
 /// the range on; a 12 GiB guest with a 3 GiB base gets 3 GiB of its range
 /// as kernel memory and the rest movable, and what it gives back at idle
