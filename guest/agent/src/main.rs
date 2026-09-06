@@ -250,13 +250,17 @@ fn bound_container_cache() {
         set_reporting(100, 5);
     }
     // `lighter.reporting_order=<n>`: the smallest order reporting returns at
-    // rest (nine, two megabytes, the kernel's default), for the A/B against
-    // five: under a day-long stack the footprint crept 2.4 MB a minute, and
-    // freed runs under two megabytes that nothing else takes back are one
-    // candidate.
+    // rest. Five (128 KiB runs) rather than the kernel's nine (two
+    // megabytes): while containers run, reporting is the only path that
+    // gives the host anything back, and the runs a trim leaves under two
+    // megabytes were 130 MB the Mac kept under the m8 stack for as long as
+    // it ran (order 5 sat at 837–904 MB across half an hour where 9 sat at
+    // 966–1033, both creeping the same 67 MB, which is the cache growing);
+    // the install cases read level and the memory case 120 MiB lower at
+    // rest. The hurried setting after a trim was already five.
     let rest_order = cmdline_value("lighter.reporting_order")
         .map(|o| o as u32)
-        .unwrap_or(9);
+        .unwrap_or(5);
     // The rest settings from the start, not from the first trim: the kernel
     // boots with proactive compaction at 20.
     if !always_fast {
