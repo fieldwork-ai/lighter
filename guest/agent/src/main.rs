@@ -261,11 +261,16 @@ fn bound_container_cache() {
     let rest_order = cmdline_value("lighter.reporting_order")
         .map(|o| o as u32)
         .unwrap_or(5);
+    // The kernel's own order, two megabytes, while the containers work.
+    const CHURN_ORDER: u32 = 9;
     // The rest settings from the start, not from the first trim: the kernel
     // boots with proactive compaction at 20.
     if !always_fast {
         set_reporting(2000, rest_order);
     }
+    let mut at_rest = !always_fast;
+    // Ticks since the containers last used half a core (the rest order's mark).
+    let mut light_for = 0u32;
     // The engine's cgroup (init puts dockerd there): the image layers it
     // extracted, and whatever else it read, charged where a trim can reach.
     let engine = "/sys/fs/cgroup/engine";
@@ -309,6 +314,8 @@ fn bound_container_cache() {
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < step as u64 * 50_000 / TICKS_PER_SEC as u64 { idle_for + step } else { 0 };
+        let heavy = used >= step as u64 * 500_000 / TICKS_PER_SEC as u64;
+        light_for = if heavy { 0 } else { light_for + step };
         // Freed memory goes back at reporting's idle rate for a while after
         // a trim, and at its churn rate again once the containers work or
         // the burst is over (guest kernel patch 0019).
@@ -316,8 +323,30 @@ fn bound_container_cache() {
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
         if hurried && !always_fast && (idle_for == 0 || idle_for >= 25 * TICKS_PER_SEC) {
-            set_reporting(2000, rest_order);
+            set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
             hurried = false;
+            at_rest = !heavy;
+        }
+        // The rest order only at rest. Reporting 128 KiB runs while an
+        // install runs is a treadmill: every two seconds it hands back what
+        // the install just freed, the allocator then prefers pages it has
+        // never touched to the reported ones, and the guest walks through
+        // its whole range. Rest is judged by heavy use, not by the idle
+        // mark above: a day's stack answers health checks every few
+        // seconds, enough container CPU to keep that mark from ever being
+        // reached (ten minutes under the m8 stack never read the rest
+        // order), and nothing like an install, which saturates a core. So
+        // the churn order once the containers have used half a core in a
+        // tick, and the rest order once they have been under that for eight
+        // seconds.
+        if !always_fast && !hurried {
+            if at_rest && heavy {
+                set_reporting(2000, CHURN_ORDER);
+                at_rest = false;
+            } else if !at_rest && light_for >= 8 * TICKS_PER_SEC {
+                set_reporting(2000, rest_order);
+                at_rest = true;
+            }
         }
         // Two seconds idle: offer the host what is free beyond a reserve,
         // through the balloon (`memory_guest` on the host side). What the
