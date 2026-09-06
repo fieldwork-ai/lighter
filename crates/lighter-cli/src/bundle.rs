@@ -81,7 +81,17 @@ pub fn ensure() -> anyhow::Result<PathBuf> {
 /// it that no one sees. `lsregister -f` is what `open` and Finder do on a
 /// bundle's behalf. Best effort, in the background, and remembered in the
 /// home so a start pays nothing for it after the first.
+///
+/// The default home's bundle only. A gate, a benchmark or a debugging
+/// session on its own `LIGHTER_HOME` makes a bundle that is deleted with
+/// it, and every one registered under the same identifier stayed in the
+/// Launch Services database as a dead path: eighty-nine of them, on a
+/// machine whose Activity Monitor showed the daily driver without its
+/// flame.
 fn register(bundle: &Path) {
+    if !crate::paths::is_default_home() {
+        return;
+    }
     let Ok(home) = crate::paths::home() else {
         return;
     };
