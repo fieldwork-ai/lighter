@@ -34,11 +34,6 @@ pub fn docker_socket() -> anyhow::Result<PathBuf> {
     Ok(home()?.join("docker.sock"))
 }
 
-/// The running machine's process id.
-pub fn pid_file() -> anyhow::Result<PathBuf> {
-    Ok(home()?.join("lighter.pid"))
-}
-
 pub fn log_file() -> anyhow::Result<PathBuf> {
     Ok(home()?.join("machine.log"))
 }

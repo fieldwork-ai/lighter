@@ -16,7 +16,7 @@
 //! Linux block and no partial blocks to reason about. The range is mapped
 //! into the guest whole and lazily (`MAP_NORESERVE`, the same as RAM); a
 //! plugged block is one the guest may touch, an unplugged one is released
-//! with the balloon's `MADV_FREE_REUSABLE` path and, with
+//! through the balloon's fresh-mapping release path and, with
 //! `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE` offered, one the guest has promised
 //! not to touch.
 //!

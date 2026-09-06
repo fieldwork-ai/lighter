@@ -13,6 +13,7 @@ mod bundle;
 mod config;
 mod context;
 mod doctor;
+mod instance;
 mod machine;
 mod paths;
 mod run;
@@ -74,7 +75,7 @@ enum Command {
         #[arg(long)]
         disk: Option<u64>,
         /// Who can reach a published port: the network (`lan`, as Docker
-        /// does) or this Mac only (`localhost`).
+        /// does) or loopback (`localhost`); explicit bind addresses take precedence.
         #[arg(long, value_enum)]
         publish: Option<config::Publish>,
     },
@@ -309,7 +310,7 @@ fn configure(
         "  publish    {}",
         match config.publish {
             config::Publish::Lan => "lan (every interface, as Docker does)",
-            config::Publish::Localhost => "localhost (this Mac only)",
+            config::Publish::Localhost => "localhost (wildcard publishes on loopback)",
         }
     );
     for share in &config.shares {

@@ -7,9 +7,9 @@
 //! virtual machines and exactly the thing this project exists to fix.
 //!
 //! `phys_footprint` is the number macOS itself uses for memory pressure and
-//! for what Activity Monitor calls "Memory". Pages handed back with
-//! `MADV_FREE_REUSABLE` leave it immediately, which makes it the honest
-//! measure of whether the balloon and free page reporting are doing anything.
+//! for what Activity Monitor calls "Memory". Released guest pages get fresh
+//! mappings, so freeing them removes their charge and guest reuse restores
+//! it. MADV_FREE_REUSABLE alone cannot maintain that accounting on reuse.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

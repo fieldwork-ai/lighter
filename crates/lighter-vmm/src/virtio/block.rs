@@ -464,10 +464,12 @@ mod tests {
             flags: 0,
             next: 0,
         };
-        assert_eq!(
-            block.execute(&[header], &GuestMemory::detached()),
-            (S_IOERR, 0)
-        );
+        // A valid backed header reaches the old failing slice. An empty
+        // address space would return IOERR earlier even without the fix.
+        let mem = GuestMemory::test_region(0x1000, 0x4000);
+        mem.write_u32(header.addr, T_FLUSH).unwrap();
+        mem.write_u64(header.addr + 8, 0).unwrap();
+        assert_eq!(block.execute(&[header], &mem), (S_IOERR, 0));
     }
 
     /// Discard before the driver negotiated it must be refused rather than

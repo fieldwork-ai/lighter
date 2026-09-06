@@ -164,8 +164,8 @@ fn serve(shared: Arc<VsockShared>, key: ConnKey) {
 /// Where a publish Docker bound on every interface is bound on the Mac.
 ///
 /// `Lan` is what Docker means by `-p 8080:80`: every interface, so another
-/// machine on the network can reach the container. `Localhost` keeps every
-/// publish on loopback, for a machine that must not offer its containers
+/// machine on the network can reach the container. `Localhost` keeps wildcard
+/// publishes on loopback, for a machine that must not offer its containers
 /// to the network it is on. A publish with an address of its own
 /// (`-p 127.0.0.1:8080:80`, `-p 192.168.1.5:8080:80`) is bound as asked
 /// under either.
@@ -190,10 +190,10 @@ pub fn bind_address(addr: IpAddr, scope: Scope) -> IpAddr {
 /// one Docker bound somewhere in particular (`127.0.0.1`, where only its
 /// proxy answers, which is what the proxy is for).
 pub fn guest_address(addr: IpAddr) -> IpAddr {
-    if addr.is_unspecified() {
-        crate::net::GUEST.into()
-    } else {
-        addr
+    match addr {
+        IpAddr::V4(ip) if ip.is_unspecified() => crate::net::GUEST.into(),
+        IpAddr::V6(ip) if ip.is_unspecified() => crate::net::GUEST6.into(),
+        _ => addr,
     }
 }
 
@@ -436,7 +436,9 @@ mod tests {
         let any6: IpAddr = "::".parse().unwrap();
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(guest_address(any4), IpAddr::V4(crate::net::GUEST));
-        assert_eq!(guest_address(any6), IpAddr::V4(crate::net::GUEST));
+        assert_eq!(guest_address(any6), IpAddr::V6(crate::net::GUEST6));
+        let lo6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(guest_address(lo6), lo6);
         assert_eq!(guest_address(lo), lo);
     }
 
