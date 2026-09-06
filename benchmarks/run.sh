@@ -715,59 +715,73 @@ print(int(bps/1e6))' 2>/dev/null || echo ""; }
 # A client in the container for the egress paths; on the Mac for the rest.
 net_client() { dk run --rm "$IMAGE" "$@"; }
 run_net_case() {
-	local name="$1" rep value out
-	# A measurement that fails is a dash in the table, not the end of the
-	# run: the script is `set -e` and a client that could not connect would
-	# otherwise take every case after it down silently.
+	local name="$1" rep value out errors diagnostic
+	# Retain a failed client's diagnostics and finish the remaining cases,
+	# but return a failed benchmark status: a missing sample is not a result.
 	set +e
 	net_setup || { set -e; return 1; }
+	errors="$(mktemp -t lighter-network-error)"
 	printf '==> %s: %s' "$TARGET" "$name"
 	for rep in $(seq 1 "$REPS"); do
-		value=""
+		value="" out=""
+		: > "$errors"
 		case "$name" in
 		net-tcp-egress)
-			[ "$TARGET" = native ] && out="$(iperf3 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)" \
-				|| out="$(net_client iperf3 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)"
+			[ "$TARGET" = native ] && out="$(iperf3 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -J 2>"$errors")" \
+				|| out="$(net_client iperf3 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -J 2>"$errors")"
 			value="$(echo "$out" | iperf_mbits)" ;;
 		net-tcp-egress-r)
-			[ "$TARGET" = native ] && out="$(iperf3 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -R -J 2>/dev/null)" \
-				|| out="$(net_client iperf3 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -R -J 2>/dev/null)"
+			[ "$TARGET" = native ] && out="$(iperf3 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -R -J 2>"$errors")" \
+				|| out="$(net_client iperf3 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -R -J 2>"$errors")"
 			value="$(echo "$out" | iperf_mbits)" ;;
 		net-tcp-port)
-			[ "$TARGET" = native ] || { out="$(iperf3 -c 127.0.0.1 -p "$NET_PUB_PORT" -t 3 -J 2>/dev/null)"; value="$(echo "$out" | iperf_mbits)"; } ;;
+			[ "$TARGET" = native ] || { out="$(iperf3 -c 127.0.0.1 -p "$NET_PUB_PORT" -t 3 -J 2>"$errors")"; value="$(echo "$out" | iperf_mbits)"; } ;;
 		net-tcp-port-r)
-			[ "$TARGET" = native ] || { out="$(iperf3 -c 127.0.0.1 -p "$NET_PUB_PORT" -t 3 -R -J 2>/dev/null)"; value="$(echo "$out" | iperf_mbits)"; } ;;
+			[ "$TARGET" = native ] || { out="$(iperf3 -c 127.0.0.1 -p "$NET_PUB_PORT" -t 3 -R -J 2>"$errors")"; value="$(echo "$out" | iperf_mbits)"; } ;;
 		net-udp)
-			[ "$TARGET" = native ] && out="$(iperf3 -u -b 0 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)" \
-				|| out="$(net_client iperf3 -u -b 0 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -J 2>/dev/null)"
+			[ "$TARGET" = native ] && out="$(iperf3 -u -b 0 -c 127.0.0.1 -p "$NET_HOST_PORT" -t 3 -J 2>"$errors")" \
+				|| out="$(net_client iperf3 -u -b 0 -c "$NET_LAN_IP" -p "$NET_HOST_PORT" -t 3 -J 2>"$errors")"
 			value="$(echo "$out" | iperf_mbits)" ;;
 		net-connect-rate)
 			value="$(python3 -c 'import socket,sys,time
 port=int(sys.argv[1]); n=1000; t=time.perf_counter()
 for _ in range(n):
     s=socket.create_connection(("127.0.0.1", port)); s.close()
-print(int(n/(time.perf_counter()-t)))' "$NET_HTTP_PORT" 2>/dev/null)" ;;
+print(int(n/(time.perf_counter()-t)))' "$NET_HTTP_PORT" 2>"$errors")" ;;
 		net-http-latency)
 			# Two rows from one run: the median, and the tail beside it.
 			out="$(python3 -c 'import http.client,sys,time
 port=int(sys.argv[1]); c=http.client.HTTPConnection("127.0.0.1", port); ts=[]
 for _ in range(2000):
     t=time.perf_counter(); c.request("GET","/"); c.getresponse().read(); ts.append(time.perf_counter()-t)
-ts.sort(); print(int(ts[len(ts)//2]*1e6), int(ts[int(len(ts)*0.99)]*1e6))' "$NET_HTTP_PORT" 2>/dev/null)"
+ts.sort(); print(int(ts[len(ts)//2]*1e6), int(ts[int(len(ts)*0.99)]*1e6))' "$NET_HTTP_PORT" 2>"$errors")"
 			value="${out%% *}"
 			[ -z "$out" ] || echo "net-http-p99,$rep,${out##* }" >> "$RESULTS" ;;
 		net-dns)
 			local script='const dns=require("dns").promises;(async()=>{const ts=[];for(let i=0;i<200;i++){const t=process.hrtime.bigint();await dns.resolve4("example.com");ts.push(Number(process.hrtime.bigint()-t)/1000)}ts.sort((a,b)=>a-b);console.log(Math.round(ts[100]))})()'
-			[ "$TARGET" = native ] && value="$(node -e "$script" 2>/dev/null)" || value="$(net_client node -e "$script" 2>/dev/null)" ;;
+			[ "$TARGET" = native ] && value="$(node -e "$script" 2>"$errors")" || value="$(net_client node -e "$script" 2>"$errors")" ;;
 		esac
 		if [ -n "$value" ]; then
 			printf ' %s' "$value"
 			echo "$name,$rep,$value" >> "$RESULTS"
 		else
 			printf ' —'
+			case "$TARGET:$name" in
+				native:net-tcp-port|native:net-tcp-port-r) ;; # no published port on native
+				*)
+					FAILED=1
+					diagnostic=".logs/network-${LABEL:-$TARGET}-$name-$rep"
+					mkdir -p "$(dirname "$diagnostic")"
+					cp "$errors" "$diagnostic.stderr"
+					printf '%s\n' "$out" > "$diagnostic.stdout"
+					printf '\n    FAILED: %s rep %s produced no measurement\n' "$name" "$rep"
+					sed -n '1,20p' "$errors"
+					;;
+			esac
 		fi
 	done
 	printf '\n'
+	rm -f "$errors"
 	set -e
 }
 
