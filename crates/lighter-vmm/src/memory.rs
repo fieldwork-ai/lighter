@@ -391,7 +391,10 @@ impl GuestMemory {
         // `LIGHTER_RELEASE=reusable|free` are the other two, for the A/B.
         let rc = match release_mode() {
             ReleaseMode::Remap
-                if thorough && unmapped && span >= REMAP_MIN_SPAN && remap_wanted() =>
+                if (thorough || remap_reporting())
+                    && unmapped
+                    && span >= REMAP_MIN_SPAN
+                    && remap_wanted() =>
             {
                 // SAFETY: a fixed anonymous mapping over a span this process
                 // owns, with the second-stage translation withdrawn above.
@@ -499,23 +502,31 @@ enum ReleaseMode {
 /// pieces go the old way.
 const REMAP_MIN_SPAN: usize = 128 << 10;
 
-/// Whether replacing mappings is worth its price right now. A replaced span
-/// is a `mmap` and a fresh VM object where `madvise` was a walk, and after a
-/// trim hurried reporting hands over thousands of runs: a container that
-/// started during that storm took 450–611 ms on the M5 against 150–190.
-/// The price buys nothing unless macOS holds compressed pages of ours, so
-/// the mapping is replaced only while it does (a 48 GB Mac with a 12 GiB
-/// guest rarely compresses; an 8 GB one always). `LIGHTER_RELEASE=remap`
-/// replaces regardless, for the A/B.
+/// Whether a thorough release replaces the span's mapping: always. For a
+/// day it was only while macOS held compressed pages of ours, since that
+/// was the price the replacement was measured against; but `madvise` with
+/// `MADV_FREE_REUSABLE` has a second cost. macOS takes the pages out of the
+/// process's footprint and expects `MADV_FREE_REUSE` before they are used
+/// again, and the guest reuses a page by writing to it, which the host
+/// never sees. So every page the guest took back after a reusable release
+/// stayed out of `phys_footprint`, in `lighter status`, Activity Monitor
+/// and the benchmark's memory table alike: a memory case that read a peak
+/// of 720–774 MiB read 4668–6889 with the replacement for every unplugged
+/// block and balloon run, the same two installs, no slower. A fresh mapping
+/// has no such state. Reporting's runs (`release`, not thorough) still take
+/// the advice: replacing thousands of them after a trim stormed a container
+/// starting at the time, and what they leave uncounted is the smaller part.
+/// `LIGHTER_REMAP_REPORTING=1` replaces those too, for the measurement.
 fn remap_wanted() -> bool {
-    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALWAYS.get_or_init(|| std::env::var("LIGHTER_RELEASE").as_deref() == Ok("remap"))
-        || crate::footprint::compressed() >= REMAP_WHEN_COMPRESSED
+    true
 }
 
-/// Compressed pages of ours above which released spans have their
-/// mappings replaced.
-const REMAP_WHEN_COMPRESSED: u64 = 64 << 20;
+/// Whether reporting's runs are replaced as well (`LIGHTER_REMAP_REPORTING=1`),
+/// to measure what they leave uncounted and what the storm costs.
+fn remap_reporting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LIGHTER_REMAP_REPORTING").as_deref() == Ok("1"))
+}
 
 /// `LIGHTER_RELEASE=reusable|free|remap`, read once.
 fn release_mode() -> ReleaseMode {
