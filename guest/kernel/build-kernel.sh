@@ -134,7 +134,10 @@ fi
 echo "  all ${#required[@]} required options present"
 
 log "Building Image"
-make ARCH=arm64 -j"${JOBS}" Image
+# `LOCALVERSION=` set, even empty: with the automatic local version off,
+# setlocalversion still appends a "+" for a tree with uncommitted changes,
+# which ours always has (the patches), unless the variable is set.
+make ARCH=arm64 LOCALVERSION= -j"${JOBS}" Image
 
 mkdir -p "$OUT"
 # Through a temporary name and a rename, so a copy that fails partway (the
