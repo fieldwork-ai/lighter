@@ -14,6 +14,9 @@
 #   dns, icmp  — what stays on the network device still works
 #   ipv6       — a v6 destination, when the Mac has one
 set -u
+# The connection fixture keeps a thousand sockets open. A shell inherited
+# from a GUI app may have a soft limit of only 256.
+ulimit -n 10240 || { echo "the stream gate needs a 10240-file soft limit" >&2; exit 1; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 LIGHTER="${LIGHTER_BIN:-target/release/lighter}"
@@ -26,6 +29,9 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
 HTTP_PID=""
 HOLD_PID=""
 cleanup() {
+	mkdir -p .logs
+	[ ! -f "$LIGHTER_HOME/machine.log" ] || cp "$LIGHTER_HOME/machine.log" .logs/m3-streams-last-boot.log
+	[ ! -f "$LIGHTER_HOME/http.log" ] || cp "$LIGHTER_HOME/http.log" .logs/m3-streams-last-http.log
 	[ -z "$HTTP_PID" ] || kill "$HTTP_PID" 2>/dev/null
 	[ -z "$HOLD_PID" ] || kill "$HOLD_PID" 2>/dev/null
 	"$LIGHTER" stop >/dev/null 2>&1 || true
@@ -76,11 +82,38 @@ kill "$HALF_PID" 2>/dev/null
 echo "$reply" | grep -q "HTTP/1.0 200" && pass "half-close: the reply arrives after the request side closed" || fail "half-close: got '${reply}'"
 
 # host.docker.internal -> a server on the Mac
-python3 -m http.server 18099 --bind 127.0.0.1 >/dev/null 2>&1 &
+# http.server reverse-resolves its bind address before listening. That
+# blocked for tens of seconds on the M1; this fixture needs no host lookup.
+python3 -u - >"$LIGHTER_HOME/http.log" 2>&1 <<'PY' &
+import socket
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 18099))
+srv.listen(5)
+print("HTTP fixture ready", flush=True)
+while True:
+    c, _ = srv.accept()
+    with c:
+        c.settimeout(5)
+        try:
+            c.recv(4096)
+            c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        except OSError:
+            pass
+PY
 HTTP_PID=$!
-sleep 1
-code="$($D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 10 http://host.docker.internal:18099/ 2>/dev/null)"
-[ "$code" = 200 ] && pass "host.docker.internal reaches a server on the Mac" || fail "host.docker.internal: http_code=${code:-none}"
+for _ in $(seq 1 100); do
+	grep -q 'HTTP fixture ready' "$LIGHTER_HOME/http.log" && break
+	kill -0 "$HTTP_PID" 2>/dev/null || break
+	sleep 0.1
+done
+if grep -q 'HTTP fixture ready' "$LIGHTER_HOME/http.log"; then
+	code="$($D run --rm curlimages/curl:8.11.1 -sS -o /dev/null -w '%{http_code}' --max-time 10 http://host.docker.internal:18099/ 2>"$LIGHTER_HOME/http-client.log")"
+	[ "$code" = 200 ] && pass "host.docker.internal reaches a server on the Mac" || { fail "host.docker.internal: http_code=${code:-none}"; cat "$LIGHTER_HOME/http-client.log"; }
+else
+	fail "the host HTTP fixture did not start"
+	cat "$LIGHTER_HOME/http.log"
+fi
 
 # published: answers while running, gone when stopped
 $D run -d --rm --name m3s-http -p 18098:80 alpine:3.21 sh -c 'while true; do printf "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 80; done' >/dev/null 2>&1
@@ -155,7 +188,18 @@ $D run --rm alpine:3.21 ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && pass "ICMP fro
 route="$($D run --rm alpine:3.21 ip -6 route show default 2>/dev/null)"
 [ -n "$route" ] && pass "a container has a v6 default route" || fail "IPv6: no v6 default route in a container"
 aaaa="$($D run --rm alpine:3.21 nslookup -type=AAAA example.com 2>/dev/null | grep -cE '^Address: .*:.*:')"
-if curl -6 -s -o /dev/null --max-time 5 https://example.com 2>/dev/null; then
+# macOS curl -6 can connect to an IPv4-mapped address (::ffff:...), so its
+# success does not establish a v6 route. Probe a literal v6 destination,
+# as the resolver does; connect on a UDP socket sends no packet.
+if python3 - <<'PY'
+import socket, sys
+try:
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+        s.connect(("2001:4860:4860::8888", 53))
+except OSError:
+    sys.exit(1)
+PY
+then
 	code="$($D run --rm curlimages/curl:8.11.1 -6 -s -o /dev/null -w '%{http_code}' --max-time 15 https://example.com 2>/dev/null)"
 	[ "$code" = 200 ] && pass "IPv6 destination over the stream" || fail "IPv6: http_code=${code:-none}"
 	[ "${aaaa:-0}" -gt 0 ] && pass "AAAA answered on a Mac with a v6 route" || fail "IPv6: no AAAA for example.com"
