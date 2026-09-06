@@ -165,8 +165,8 @@ if [ "$PERCENT" -ge "$RETURN_FRACTION" ]; then
 	pass "gave back ${RETURNED} of ${GREW} MiB (${PERCENT}%) within ${waited}s"
 else
 	fail "only gave back ${RETURNED} of ${GREW} MiB (${PERCENT}%) in ${RECLAIM_WINDOW}s"
-	note "the guest reported $(field reported_mib) MiB of free pages over that time"
-	note "zero there means the guest is not reporting; a large number means macOS kept the pages anyway"
+	note "the guest has reported $(field reported_mib) MiB cumulatively during this run"
+	note "report totals include earlier and repeated pages; compare them with the footprint timeline"
 fi
 
 # -------------------------------------------------------------------- idle --
@@ -202,6 +202,26 @@ else
 	fail "a container saw MemTotal $((${SEEN_KB:-0} / 1024)) MiB; the guest was not made whole for it"
 fi
 
+# The MemTotal probe just plugged the whole range back in. Its growth hold
+# and subsequent unplug are load transitions, not idle CPU. Wait for that
+# observable transition to end before measuring idle, with the same bounded
+# reclaim requirement as above.
+waited=0
+# Reports arrive every two seconds; the last one may still describe the
+# pre-probe state. Require a new report before trusting its plugged size.
+report_before="$(grep -ac 'FOOTPRINT' "$LOG")"
+while { [ "$(grep -ac 'FOOTPRINT' "$LOG")" -le "$report_before" ] \
+	|| [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ]; } && [ "$waited" -lt 60 ]; do
+	sleep 1
+	waited=$((waited + 1))
+done
+if [ "$(grep -ac 'FOOTPRINT' "$LOG")" -le "$report_before" ] \
+	|| [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ]; then
+	fail "range did not settle after the MemTotal probe"
+else
+	pass "range settled after the MemTotal probe (${waited}s)"
+fi
+
 echo
 echo "==> Watching an idle machine for ${IDLE_SECONDS}s"
 # Two samples of cumulative CPU time, which is the only honest way: an instant
@@ -218,7 +238,7 @@ else
 	fail "idle CPU ${IDLE_CPU}% over ${IDLE_SECONDS}s, budget ${MAX_IDLE_CPU}%"
 fi
 note "idle footprint $(footprint) MiB"
-note "guest reported $(field reported_mib) MiB free, balloon holds $(field ballooned_mib) MiB"
+note "guest reports total $(field reported_mib) MiB across this run; balloon currently holds $(field ballooned_mib) MiB"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

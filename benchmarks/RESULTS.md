@@ -6,11 +6,15 @@ Do not edit: regenerate it.
 Every target ran the same case scripts against the same fixture on the same
 machine, with caches warmed by an untimed run first. The figure is the median
 of the repetitions. Each machine is its own section; a number is only ever
-compared with another from the same machine and the same session.
+compared with another from the same machine. Runtime records are refreshed
+independently and may come from different sessions; lighter's recording
+dates, source commits and artifact hashes are in the adjacent .tree files.
+[Measured run-to-run variation](REPEATABILITY.md) records the same-build
+storage baseline and the matched release comparison.
 
 - Node: v24.18.0
 - npm: 11.16.0
-- ripgrep: ripgrep 15.1.0
+- ripgrep: ripgrep 15.2.0 (rev e89fff89ac)
 - pnpm: 11.23.0
 - yarn: 1.22.22
 
@@ -122,13 +126,13 @@ tree from the Mac into the container.
 
 | case | native | lighter (own disk) | orbstack (own disk) | colima (own disk) | docker-desktop (own disk) | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|---|---|---|
-| npm-install | 7807 | 8177 | 9669 | 11443 | 12596 | 11728 | 11249 | 23000 | 25456 |
-| pnpm-install | 4377 | 1810 | 2403 | 1575 | 2225 | 6628 | 5908 | — | 45936 |
-| yarn-install | 10436 | 7953 | 7870 | 10805 | 11737 | 13414 | 10430 | 28108 | 35442 |
-| ripgrep | 1209 | 203 | 143 | 171 | 260 | 180 | 1095 | 15364 | 13152 |
-| find-walk | 510 | 124 | 138 | 214 | 152 | 100 | 525 | 3806 | 4097 |
-| copy-tree | 24528 | 4433 | 2488 | 2709 | 6197 | 5493 | 16128 | 59573 | 45900 |
-| rm-rf | 5377 | 630 | 667 | 829 | 592 | 2695 | 3916 | 12446 | 12818 |
+| npm-install | 7807 | 7625 | 9669 | 11443 | 12596 | 12037 | 11249 | 23000 | 25456 |
+| pnpm-install | 4377 | 1674 | 2403 | 1575 | 2225 | 6417 | 5908 | — | 45936 |
+| yarn-install | 10436 | 7928 | 7870 | 10805 | 11737 | 13110 | 10430 | 28108 | 35442 |
+| ripgrep | 1209 | 144 | 143 | 171 | 260 | 196 | 1095 | 15364 | 13152 |
+| find-walk | 510 | 126 | 138 | 214 | 152 | 122 | 525 | 3806 | 4097 |
+| copy-tree | 24528 | 4465 | 2488 | 2709 | 6197 | 6470 | 16128 | 59573 | 45900 |
+| rm-rf | 5377 | 610 | 667 | 829 | 592 | 2530 | 3916 | 12446 | 12818 |
 | watch-latency | 2 | — | — | — | — | 2 | 3 | 2 | 12 |
 
 ### What the runtime costs the Mac, MiB
@@ -140,10 +144,10 @@ what a runtime gives back on its own after the work ends.
 
 | reading | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|
-| idle, a minute after start | 279 | 733 | 1145 | 1753 |
-| peak through an npm install | 4525 | 4302 | 4364 | 4505 |
-| 15 s after it ends | 947 | 1876 | 4337 | 4473 |
-| 60 s after it ends | 944 | 1480 | 4337 | 4472 |
+| idle, a minute after start | 301 | 733 | 1145 | 1753 |
+| peak through an npm install | 4320 | 4302 | 4364 | 4505 |
+| 15 s after it ends | 1045 | 1876 | 4337 | 4473 |
+| 60 s after it ends | 1038 | 1480 | 4337 | 4472 |
 
 ### The network
 
@@ -155,15 +159,15 @@ a container. `native` is the Mac over loopback where that means anything.
 
 | case | unit | native | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 117.7 | 56.1 | 64.9 | 4.3 | 13.6 |
-| TCP, the Mac to a container | Gbit/s | 117.0 | 46.7 | 29.2 | 3.2 | 10.1 |
-| TCP into a published port | Gbit/s | — | 45.4 | 29.9 | 3.1 | 10.1 |
-| TCP out of a published port | Gbit/s | — | 54.2 | 67.6 | 3.8 | 22.2 |
-| UDP, container to the Mac | Gbit/s | 24.4 | 5.0 | 3.1 | 2.6 | 0.0 |
-| connects to a published port | thousand per second | 24.9 | 14.7 | 16.4 | 7.9 | 17.7 |
+| TCP, container to the Mac | Gbit/s | 117.7 | 57.8 | 64.9 | 4.3 | 13.6 |
+| TCP, the Mac to a container | Gbit/s | 117.0 | 51.2 | 29.2 | 3.2 | 10.1 |
+| TCP into a published port | Gbit/s | — | 49.4 | 29.9 | 3.1 | 10.1 |
+| TCP out of a published port | Gbit/s | — | 55.1 | 67.6 | 3.8 | 22.2 |
+| UDP, container to the Mac | Gbit/s | 24.4 | 4.9 | 3.1 | 2.6 | 0.0 |
+| connects to a published port | thousand per second | 24.9 | 11.0 | 16.4 | 7.9 | 17.7 |
 | GET on a published port, median | µs | 54 | 127 | 127 | 453 | 153 |
-| GET on a published port, p99 | µs | 106 | 216 | 221 | 574 | 372 |
-| DNS lookup from a container, median | µs | 3876 | 130 | 425 | 686 | 758 |
+| GET on a published port, p99 | µs | 106 | 221 | 221 | 574 | 372 |
+| DNS lookup from a container, median | µs | 3876 | 127 | 425 | 686 | 758 |
 
 ### What an idle runtime costs
 
@@ -177,7 +181,7 @@ Lower is better throughout.
 |---|---|---|---|---|
 | CPU, ms per second | 7 | 20 | 11 | 44 |
 | wakeups per second | 58 | 84 | 55 | 1998 |
-| package-idle wakeups per second | 1 | 1 | 1 | 15 |
+| package-idle wakeups per second | 2 | 1 | 1 | 15 |
 | energy impact (top) | — | — | — | — |
 
 ### Starting up
@@ -200,13 +204,13 @@ read it from the table above in milliseconds.
 
 | case | lighter (own disk) | orbstack (own disk) | colima (own disk) | docker-desktop (own disk) | lighter (host share) | orbstack (host share) | colima (host share) | docker-desktop (host share) |
 |---|---|---|---|---|---|---|---|---|
-| npm-install | 95% | 81% | 68% | 62% | 67% | 69% | 34% | 31% |
-| pnpm-install | 242% | 182% | 278% | 197% | 66% | 74% | — | 10% |
-| yarn-install | 131% | 133% | 97% | 89% | 78% | 100% | 37% | 29% |
-| ripgrep | 596% | 845% | 707% | 465% | 672% | 110% | 8% | 9% |
-| find-walk | 411% | 370% | 238% | 336% | 510% | 97% | 13% | 12% |
-| copy-tree | 553% | 986% | 905% | 396% | 447% | 152% | 41% | 53% |
-| rm-rf | 853% | 806% | 649% | 908% | 200% | 137% | 43% | 42% |
+| npm-install | 102% | 81% | 68% | 62% | 65% | 69% | 34% | 31% |
+| pnpm-install | 261% | 182% | 278% | 197% | 68% | 74% | — | 10% |
+| yarn-install | 132% | 133% | 97% | 89% | 80% | 100% | 37% | 29% |
+| ripgrep | 840% | 845% | 707% | 465% | 617% | 110% | 8% | 9% |
+| find-walk | 405% | 370% | 238% | 336% | 418% | 97% | 13% | 12% |
+| copy-tree | 549% | 986% | 905% | 396% | 379% | 152% | 41% | 53% |
+| rm-rf | 881% | 806% | 649% | 908% | 213% | 137% | 43% | 42% |
 
 ## What each case does
 

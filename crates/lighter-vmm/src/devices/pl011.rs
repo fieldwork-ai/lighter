@@ -59,7 +59,7 @@ const RX_CAPACITY: usize = 4096;
 /// The UART's receive side, shared with whatever host thread feeds it.
 #[derive(Debug, Default)]
 pub struct Rx {
-    queue: VecDeque<u8>,
+    queue: VecDeque<u16>,
 }
 
 impl Rx {
@@ -67,7 +67,7 @@ impl Rx {
         if self.queue.len() >= RX_CAPACITY {
             return false;
         }
-        self.queue.push_back(byte);
+        self.queue.push_back(u16::from(byte));
         true
     }
 }
@@ -127,6 +127,18 @@ impl Pl011 {
             self.refresh_interrupt();
         }
         accepted
+    }
+
+    /// A serial BREAK followed by a SysRq key, for opt-in guest diagnostics.
+    pub fn enqueue_sysrq(&mut self, key: u8) -> bool {
+        if self.rx.queue.len() + 2 > RX_CAPACITY {
+            return false;
+        }
+        self.rx.queue.push_back(1 << 10); // UART011_DR_BE
+        self.rx.queue.push_back(u16::from(key));
+        self.ris |= INT_RX;
+        self.refresh_interrupt();
+        true
     }
 
     /// Recomputes the outgoing interrupt from raw status and mask.
@@ -294,6 +306,20 @@ mod tests {
             id |= u32::from_le_bytes(buf) << (8 * i);
         }
         assert_eq!(id & 0x000f_ffff, 0x0004_1011, "amba periphid mismatch");
+    }
+
+    #[test]
+    fn sysrq_preserves_the_break_bit_and_key_order() {
+        let (mut uart, _) = uart();
+        assert!(uart.enqueue_sysrq(b'w'));
+        assert_eq!(uart.read_register(UARTDR), 1 << 10);
+        assert_eq!(uart.read_register(UARTDR), u32::from(b'w'));
+        assert_ne!(uart.read_register(UARTFR) & FR_RXFE, 0);
+        for _ in 0..RX_CAPACITY - 1 {
+            assert!(uart.enqueue_input(b'a'));
+        }
+        assert!(!uart.enqueue_sysrq(b'w'));
+        assert_eq!(uart.rx.queue.len(), RX_CAPACITY - 1);
     }
 
     #[test]

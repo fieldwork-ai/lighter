@@ -28,6 +28,8 @@ pub enum MemoryError {
     OutOfBounds { gpa: u64, len: usize },
     #[error("mmap of {0} bytes failed: {1}")]
     Mmap(usize, io::Error),
+    #[error("allocating owned guest backing failed with Mach status {0}")]
+    OwnedMapping(i32),
     #[error("mapping guest memory into the VM failed: {0}")]
     Map(#[from] lighter_hv::HvError),
     #[error("region at {gpa:#x} overlaps an existing region")]
@@ -56,17 +58,7 @@ impl Mmap {
                 ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                // `LIGHTER_MEM_SHARED=1`: a shared mapping, to measure whether
-                // the host's double charge on host-written guest pages is the
-                // private mapping's.
-                if std::env::var("LIGHTER_MEM_SHARED")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                {
-                    libc::MAP_ANON | libc::MAP_SHARED | libc::MAP_NORESERVE
-                } else {
-                    libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE
-                },
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
@@ -74,11 +66,49 @@ impl Mmap {
         if ptr == libc::MAP_FAILED {
             return Err(MemoryError::Mmap(len, io::Error::last_os_error()));
         }
-        Ok(Mmap {
+        let mapping = Mmap {
             ptr: ptr.cast(),
             len,
-        })
+        };
+        #[cfg(target_os = "macos")]
+        replace_owned_pages(mapping.ptr, len)?;
+        Ok(mapping)
     }
+}
+
+// Owner-accounted objects are charged once even when both the host pmap and
+// Hypervisor.framework map their pages. A single large owned object cannot
+// discard a subrange while its other mappings keep it alive, so each host
+// page gets its own object. Removing one then releases the whole object.
+// VM_FLAGS_PURGABLE creates NONVOLATILE objects; we never make live RAM
+// volatile, reusable, or exempt from the task's memory ledger.
+#[cfg(target_os = "macos")]
+fn replace_owned_pages(ptr: *mut u8, len: usize) -> Result<()> {
+    unsafe extern "C" {
+        fn mach_task_self() -> libc::c_uint;
+        fn mach_vm_allocate(task: libc::c_uint, address: *mut u64, size: u64, flags: i32) -> i32;
+    }
+    const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+    const VM_FLAGS_PURGABLE: i32 = 0x2;
+    let page = host_page_size() as usize;
+    for offset in (0..len).step_by(page) {
+        let mut address = ptr as u64 + offset as u64;
+        // SAFETY: replace only pages in the caller's reserved mapping. The
+        // guest mapping is absent during allocation and reclamation, and
+        // callers retain exclusive ownership of these pages until remapped.
+        let result = unsafe {
+            mach_vm_allocate(
+                mach_task_self(),
+                &mut address,
+                page as u64,
+                VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE,
+            )
+        };
+        if result != 0 {
+            return Err(MemoryError::OwnedMapping(result));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Mmap {
@@ -329,7 +359,7 @@ impl GuestMemory {
     /// Discards the aligned interior of a guest-owned free span. The guest
     /// must keep it unused until the device returns its descriptor.
     ///
-    /// A fresh anonymous mapping is essential, including for ordinary page
+    /// Fresh backing objects are essential, including for ordinary page
     /// reporting and single host pages. MADV_FREE_REUSABLE removes pages from
     /// phys_footprint, but guest reuse never issues MADV_FREE_REUSE: live pages
     /// then remain uncounted. Remapping has no reusable accounting state, and
@@ -364,23 +394,31 @@ impl GuestMemory {
             // the device until completion. Do not discard if unmapping fails.
             unsafe { vm.unmap(start, span)? };
         }
-        // SAFETY: a host-page-aligned subrange of our own anonymous mapping,
-        // with its guest mapping withdrawn. No reusable state is retained.
-        let fresh = unsafe {
-            libc::mmap(
-                addr.cast(),
-                span,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if fresh == libc::MAP_FAILED {
-            // MAP_FIXED may have removed the old mapping before failing.
-            // Continuing could let a device access unmapped host memory.
-            tracing::error!(error = %io::Error::last_os_error(), start, span, "cannot replace released memory");
+        #[cfg(target_os = "macos")]
+        if let Err(error) = replace_owned_pages(addr, span) {
+            // Overwrite may have removed backing before a failed allocation.
+            // No device may acknowledge or reuse a partially replaced range.
+            tracing::error!(%error, start, span, "cannot replace released memory");
             std::process::abort();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // SAFETY: an aligned, exclusively owned subrange with no guest
+            // mapping. Non-Mach hosts retain ordinary anonymous backing.
+            let fresh = unsafe {
+                libc::mmap(
+                    addr.cast(),
+                    span,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if fresh == libc::MAP_FAILED {
+                tracing::error!(error = %io::Error::last_os_error(), start, span, "cannot replace released memory");
+                std::process::abort();
+            }
         }
         if let Some(vm) = &self.vm {
             // SAFETY: the fresh host mapping has the same address/length and
@@ -634,7 +672,15 @@ mod tests {
         };
         touch(1);
         for round in 0..3 {
+            let guest_charged = crate::footprint::bytes();
+            for offset in (0..SIZE).step_by(page) {
+                assert_eq!(mem.read_u64(data + offset as u64).unwrap(), round + 1);
+            }
             let charged = crate::footprint::bytes();
+            assert!(
+                charged.saturating_sub(guest_charged) < 4 << 20,
+                "host reads charged the same guest pages twice: {guest_charged} -> {charged}"
+            );
             // Gaps prevent coalescing: spans below the old 128 KiB threshold
             // must be accounted correctly too, on every reuse cycle.
             let mut spans: Vec<_> = (0..SIZE)
@@ -647,6 +693,11 @@ mod tests {
                 charged.saturating_sub(released) >= SIZE as u64 / 4,
                 "reporting did not release physical pages: {charged} -> {released}"
             );
+            for offset in (page..SIZE).step_by(page * 2) {
+                assert_eq!(mem.read_u64(data + offset as u64).unwrap(), round + 1);
+            }
+            // Reading every discarded page here would itself recharge them.
+            assert_eq!(mem.read_u64(data).unwrap(), 0);
             touch(round + 2);
             let reused = crate::footprint::bytes();
             assert!(

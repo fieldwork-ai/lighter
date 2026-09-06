@@ -1,15 +1,14 @@
-//! How much memory this process is actually costing the Mac.
+//! The memory footprint macOS charges to this process.
 //!
-//! Not resident set size. A VM maps its guest's entire RAM up front, and RSS
-//! counts every page the guest has ever touched whether or not it still wants
-//! it — so a machine configured with 8 GiB that ran one build looks
-//! permanently like 8 GiB, which is exactly the complaint people have about
-//! virtual machines and exactly the thing this project exists to fix.
+//! `phys_footprint` is the ledger behind Activity Monitor's "Memory" column.
+//! It includes charges for compressed pages and is not a count of unique
+//! resident RAM: guest and host mappings can charge the same backing twice.
+//! See docs/memory-accounting-2026-09-06.md and the guest-host-accounting example.
 //!
-//! `phys_footprint` is the number macOS itself uses for memory pressure and
-//! for what Activity Monitor calls "Memory". Released guest pages get fresh
-//! mappings, so freeing them removes their charge and guest reuse restores
-//! it. MADV_FREE_REUSABLE alone cannot maintain that accounting on reuse.
+//! Released guest pages get fresh mappings, so freeing them removes their
+//! charge and guest reuse restores it. MADV_FREE_REUSABLE alone cannot
+//! maintain that accounting on reuse. Owned backing objects per host page
+//! also prevent duplicate charges for access through both mappings.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

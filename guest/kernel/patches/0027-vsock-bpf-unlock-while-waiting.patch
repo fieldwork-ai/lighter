@@ -1,0 +1,68 @@
+vsock/bpf: release the socket lock while waiting for data
+
+A blocking sockmap read held lock_sock across wait_woken. The virtio-vsock
+receive worker needs that same lock to deliver data or shutdown, so both
+wait indefinitely and the shared receive worker stops every vsock channel.
+Captured during published-container churn: lighter-agent in
+vsock_bpf_recvmsg/wait_woken, virtio_transport_rx_work in __lock_sock.
+
+Keep the wait entry installed and the psock reference held, release the
+socket lock for the wait, and reacquire it before inspecting receive state.
+
+--- a/net/vmw_vsock/vsock_bpf.c
++++ b/net/vmw_vsock/vsock_bpf.c
+@@ -28,51 +28,54 @@
+ 	s64 ret;
+ 
+ 	ret = vsock_connectible_has_data(vsk);
+ 	if (ret > 0)
+ 		return true;
+ 
+ 	return vsock_sk_has_data(sk, psock);
+ }
+ 
+ static bool vsock_msg_wait_data(struct sock *sk, struct sk_psock *psock, long timeo)
+ {
+ 	bool ret;
+ 
+ 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+ 
+ 	if (sk->sk_shutdown & RCV_SHUTDOWN)
+ 		return true;
+ 
+ 	if (!timeo)
+ 		return false;
+ 
+ 	add_wait_queue(sk_sleep(sk), &wait);
+ 	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
+ 	ret = vsock_has_data(sk, psock);
+ 	if (!ret) {
++		/* The receive worker needs this lock to deliver data or EOF. */
++		release_sock(sk);
+ 		wait_woken(&wait, TASK_INTERRUPTIBLE, timeo);
++		lock_sock(sk);
+ 		ret = vsock_has_data(sk, psock);
+ 	}
+ 	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
+ 	remove_wait_queue(sk_sleep(sk), &wait);
+ 	return ret;
+ }
+ 
+ static int __vsock_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
+ {
+ 	struct socket *sock = sk->sk_socket;
+ 	int err;
+ 
+ 	if (sk->sk_type == SOCK_STREAM || sk->sk_type == SOCK_SEQPACKET)
+ 		err = __vsock_connectible_recvmsg(sock, msg, len, flags);
+ 	else if (sk->sk_type == SOCK_DGRAM)
+ 		err = __vsock_dgram_recvmsg(sock, msg, len, flags);
+ 	else
+ 		err = -EPROTOTYPE;
+ 
+ 	return err;
+ }
+ 
+ static int vsock_bpf_recvmsg(struct sock *sk, struct msghdr *msg,
+ 			     size_t len, int flags, int *addr_len)
+ {

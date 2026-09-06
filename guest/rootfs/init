@@ -470,6 +470,9 @@ grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
 	echo -900 > /proc/self/oom_score_adj 2>/dev/null
+	# BuildKit workers have no explicit OCI OOM score. Their runtime resets
+	# inherited protection so a large build cannot evict all normal containers.
+	export DOCKER_BUILDKIT_RUNC_COMMAND=/sbin/lighter-build-runc
 	exec dockerd $2 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \

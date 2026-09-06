@@ -23,11 +23,23 @@ match = re.search(
 )
 if not match:
     sys.exit("Cannot find idle_poll in the kernel patch")
+new_side = "\n".join(
+    line[1:] for line in patch.read_text().splitlines()
+    if line.startswith(("+", " ")) and not line.startswith("+++")
+)
+arch = re.search(
+    r"^void __cpuidle arch_cpu_idle\(void\)\n\{.*?^\}",
+    new_side, re.M | re.S,
+)
+if not arch:
+    sys.exit("Cannot find arch_cpu_idle in the kernel patch")
 template = (root / "guest/kernel/tests/idle-poll.c").read_text()
 with tempfile.TemporaryDirectory(prefix="lighter-idle-poll-") as temp:
     source = Path(temp) / "idle-poll.c"
     binary = Path(temp) / "idle-poll"
-    source.write_text(template.replace("@IDLE_POLL@", match.group()))
+    source.write_text(
+        template.replace("@IDLE_POLL@", match.group()).replace("@ARCH_IDLE@", arch.group())
+    )
     subprocess.run(
         shlex.split(os.environ.get("CC", "cc")) + [
             "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Docker's embedded BuildKit omits OCI oomScoreAdj, so its workers inherit
+# the daemon's protection. Reset it at the runtime boundary: builds should
+# compete with containers, while dockerd and containerd remain protected.
+set -eu
+echo 0 > /proc/self/oom_score_adj
+exec runc "$@"

@@ -124,7 +124,7 @@ Kernel releases track upstream Linux LTS point updates, ensuring ongoing securit
 
 Measured on clean machines against a 1,232-package `package.json` fixture (`benchmarks/`). Each figure is the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). The first table is the runtime's own disk, where a container's writable layer and its volumes live; the second is a host share, the Mac's directory bind-mounted into the container. Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
 
-OrbStack, Colima and Docker Desktop were measured on the same machines in the same sessions.
+OrbStack, Colima and Docker Desktop were measured on the same machines. Runtime records are refreshed independently, so their rows can come from different sessions. Recording dates, source commits and artifact hashes for lighter are retained in the `.tree` files beside its CSVs. [Measured run-to-run variation](benchmarks/REPEATABILITY.md) records the same-build storage baseline and the matched release comparison.
 
 ### Apple M5 Pro (18 cores, 48 GB RAM)
 
@@ -151,7 +151,7 @@ OrbStack, Colima and Docker Desktop were measured on the same machines in the sa
 
 #### Memory footprint
 
-The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: idle a minute after a cold start with nothing run on it, at its peak during an `npm ci`, and 15 and 60 seconds after that ends with nothing running. Lower is better throughout, with one reading to take as it is: the peak is what the guest borrows while it works, mostly the install's own page cache, which it may take up to its configured size and hands back within the minute; the idle and after rows are what it keeps.
+The macOS physical-footprint charge for the runtime's own processes, corresponding to Activity Monitor's "Memory" column: idle a minute after a cold start, the peak during an `npm ci`, and 15 and 60 seconds after it ends. Lower is better. This includes compressed-memory charges and is not a count of distinct resident RAM. [Accounting experiments](docs/memory-accounting-2026-09-06.md) reproduce duplicate charges when the host and guest access the same backing pages, so a peak can exceed configured guest RAM. The idle and after rows also include retained guest cache and kernel allocations.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
@@ -209,35 +209,35 @@ The same runtimes running `linux/amd64` images on their own disk: an install tha
 
 | Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 7.81 s | **8.18 s** (95%) | 9.67 s (81%) | 11.44 s (68%) | 12.60 s (62%) |
-| `pnpm install` | 4.38 s | 1.81 s (242%) | 2.40 s (182%) | **1.57 s** (278%) | 2.23 s (197%) |
-| `yarn install` | 10.44 s | 7.95 s (131%) | **7.87 s** (133%) | 10.80 s (97%) | 11.74 s (89%) |
-| `ripgrep` (file read) | 1.21 s | 203 ms (596%) | **143 ms** (845%) | 171 ms (707%) | 260 ms (465%) |
-| `find` (metadata walk) | 510 ms | **124 ms** (411%) | 138 ms (370%) | 214 ms (238%) | 152 ms (336%) |
-| `cp -a node_modules` | 24.53 s | 4.43 s (553%) | **2.49 s** (986%) | 2.71 s (905%) | 6.20 s (396%) |
-| `rm -rf node_modules` | 5.38 s | 630 ms (853%) | 667 ms (806%) | 829 ms (649%) | **592 ms** (908%) |
+| `npm ci` | 7.81 s | **7.62 s** (102%) | 9.67 s (81%) | 11.44 s (68%) | 12.60 s (62%) |
+| `pnpm install` | 4.38 s | 1.67 s (261%) | 2.40 s (182%) | **1.57 s** (278%) | 2.23 s (197%) |
+| `yarn install` | 10.44 s | 7.93 s (132%) | **7.87 s** (133%) | 10.80 s (97%) | 11.74 s (89%) |
+| `ripgrep` (file read) | 1.21 s | 144 ms (840%) | **143 ms** (845%) | 171 ms (707%) | 260 ms (465%) |
+| `find` (metadata walk) | 510 ms | **126 ms** (405%) | 138 ms (370%) | 214 ms (238%) | 152 ms (336%) |
+| `cp -a node_modules` | 24.53 s | 4.46 s (549%) | **2.49 s** (986%) | 2.71 s (905%) | 6.20 s (396%) |
+| `rm -rf node_modules` | 5.38 s | 610 ms (881%) | 667 ms (806%) | 829 ms (649%) | **592 ms** (908%) |
 
 | Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 7.81 s | 11.73 s (67%) | **11.25 s** (69%) | 23.00 s (34%) | 25.46 s (31%) |
-| `pnpm install` | 4.38 s | 6.63 s (66%) | **5.91 s** (74%) | — | 45.94 s (10%) |
-| `yarn install` | 10.44 s | 13.41 s (78%) | **10.43 s** (100%) | 28.11 s (37%) | 35.44 s (29%) |
-| `ripgrep` (file read) | 1.21 s | **180 ms** (672%) | 1.09 s (110%) | 15.36 s (8%) | 13.15 s (9%) |
-| `find` (metadata walk) | 510 ms | **100 ms** (510%) | 525 ms (97%) | 3.81 s (13%) | 4.10 s (12%) |
-| `cp -a node_modules` | 24.53 s | **5.49 s** (447%) | 16.13 s (152%) | 59.57 s (41%) | 45.90 s (53%) |
-| `rm -rf node_modules` | 5.38 s | **2.69 s** (200%) | 3.92 s (137%) | 12.45 s (43%) | 12.82 s (42%) |
+| `npm ci` | 7.81 s | 12.04 s (65%) | **11.25 s** (69%) | 23.00 s (34%) | 25.46 s (31%) |
+| `pnpm install` | 4.38 s | 6.42 s (68%) | **5.91 s** (74%) | — | 45.94 s (10%) |
+| `yarn install` | 10.44 s | 13.11 s (80%) | **10.43 s** (100%) | 28.11 s (37%) | 35.44 s (29%) |
+| `ripgrep` (file read) | 1.21 s | **196 ms** (617%) | 1.09 s (110%) | 15.36 s (8%) | 13.15 s (9%) |
+| `find` (metadata walk) | 510 ms | **122 ms** (418%) | 525 ms (97%) | 3.81 s (13%) | 4.10 s (12%) |
+| `cp -a node_modules` | 24.53 s | **6.47 s** (379%) | 16.13 s (152%) | 59.57 s (41%) | 45.90 s (53%) |
+| `rm -rf node_modules` | 5.38 s | **2.53 s** (213%) | 3.92 s (137%) | 12.45 s (43%) | 12.82 s (42%) |
 | Host file edit -> container | 2 ms | **2 ms** | 3 ms | **2 ms** | 12 ms |
 
 #### Memory footprint
 
-The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: idle a minute after a cold start with nothing run on it, at its peak during an `npm ci`, and 15 and 60 seconds after that ends with nothing running. Lower is better throughout, with one reading to take as it is: the peak is what the guest borrows while it works, mostly the install's own page cache, which it may take up to its configured size and hands back within the minute; the idle and after rows are what it keeps.
+The macOS physical-footprint charge for the runtime's own processes, corresponding to Activity Monitor's "Memory" column: idle a minute after a cold start, the peak during an `npm ci`, and 15 and 60 seconds after it ends. Lower is better. This includes compressed-memory charges and is not a count of distinct resident RAM. [Accounting experiments](docs/memory-accounting-2026-09-06.md) reproduce duplicate charges when the host and guest access the same backing pages, so a peak can exceed configured guest RAM. The idle and after rows also include retained guest cache and kernel allocations.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Idle, a minute after start | **279 MiB** | 733 MiB | 1145 MiB | 1753 MiB |
-| Peak through an npm install | 4525 MiB | **4302 MiB** | 4364 MiB | 4505 MiB |
-| 15 s after it ends | **947 MiB** | 1876 MiB | 4337 MiB | 4473 MiB |
-| 60 s after it ends | **944 MiB** | 1480 MiB | 4337 MiB | 4472 MiB |
+| Idle, a minute after start | **301 MiB** | 733 MiB | 1145 MiB | 1753 MiB |
+| Peak through an npm install | 4320 MiB | **4302 MiB** | 4364 MiB | 4505 MiB |
+| 15 s after it ends | **1045 MiB** | 1876 MiB | 4337 MiB | 4473 MiB |
+| 60 s after it ends | **1038 MiB** | 1480 MiB | 4337 MiB | 4472 MiB |
 
 #### The network
 
@@ -245,15 +245,15 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 117.7 | 56.1 | **64.9** | 4.3 | 13.6 |
-| TCP, the Mac to a container | Gbit/s | 117.0 | **46.7** | 29.2 | 3.2 | 10.1 |
-| TCP into a published port | Gbit/s | — | **45.4** | 29.9 | 3.1 | 10.1 |
-| TCP out of a published port | Gbit/s | — | 54.2 | **67.6** | 3.8 | 22.2 |
-| UDP, container to the Mac | Gbit/s | 24.4 | **5.0** | 3.1 | 2.6 | 0.0 |
-| connects to a published port | thousand per second | 24.9 | 14.7 | 16.4 | 7.9 | **17.7** |
+| TCP, container to the Mac | Gbit/s | 117.7 | 57.8 | **64.9** | 4.3 | 13.6 |
+| TCP, the Mac to a container | Gbit/s | 117.0 | **51.2** | 29.2 | 3.2 | 10.1 |
+| TCP into a published port | Gbit/s | — | **49.4** | 29.9 | 3.1 | 10.1 |
+| TCP out of a published port | Gbit/s | — | 55.1 | **67.6** | 3.8 | 22.2 |
+| UDP, container to the Mac | Gbit/s | 24.4 | **4.9** | 3.1 | 2.6 | 0.0 |
+| connects to a published port | thousand per second | 24.9 | 11.0 | 16.4 | 7.9 | **17.7** |
 | GET on a published port, median | µs | 54 | **127** | **127** | 453 | 153 |
-| GET on a published port, p99 | µs | 106 | **216** | 221 | 574 | 372 |
-| DNS lookup from a container, median | µs | 3876 | **130** | 425 | 686 | 758 |
+| GET on a published port, p99 | µs | 106 | **221** | **221** | 574 | 372 |
+| DNS lookup from a container, median | µs | 3876 | **127** | 425 | 686 | 758 |
 
 #### Idle power
 
@@ -279,10 +279,10 @@ The same runtimes running `linux/amd64` images on their own disk: an install tha
 
 | Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 8.18 s | **17.09 s** | 19.59 s | 19.85 s | 21.94 s |
-| `pnpm install` | 1.81 s | 4.18 s | 4.61 s | **3.78 s** | 4.18 s |
-| `sha256sum` of 1 GiB | 6.28 s | **7.20 s** | 13.09 s | 7.26 s | 7.34 s |
-| container start, `alpine true` | 201 ms | **201 ms** | 302 ms | 211 ms | 232 ms |
+| `npm ci` | 7.62 s | **16.67 s** | 19.59 s | 19.85 s | 21.94 s |
+| `pnpm install` | 1.67 s | 3.79 s | 4.61 s | **3.78 s** | 4.18 s |
+| `sha256sum` of 1 GiB | 6.30 s | **7.16 s** | 13.09 s | 7.26 s | 7.34 s |
+| container start, `alpine true` | 191 ms | **199 ms** | 302 ms | 211 ms | 232 ms |
 
 `benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
 ## What it does

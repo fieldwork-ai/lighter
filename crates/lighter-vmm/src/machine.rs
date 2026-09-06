@@ -694,7 +694,7 @@ impl Machine {
             "machine started"
         );
 
-        crate::dump::install(virtio_devices.clone(), vsock_state.clone());
+        crate::dump::install(virtio_devices.clone(), vsock_state.clone(), uart.clone());
 
         Ok(Machine {
             _vm: vm,

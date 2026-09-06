@@ -45,6 +45,7 @@ use std::sync::Mutex;
 const BPF_MAP_CREATE: libc::c_int = 0;
 const BPF_MAP_LOOKUP_ELEM: libc::c_int = 1;
 const BPF_MAP_UPDATE_ELEM: libc::c_int = 2;
+const BPF_MAP_DELETE_ELEM: libc::c_int = 3;
 const BPF_PROG_LOAD: libc::c_int = 5;
 const BPF_PROG_ATTACH: libc::c_int = 8;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
@@ -205,6 +206,17 @@ fn map_update(map: RawFd, key: &[u8], value: &[u8]) -> io::Result<()> {
     bpf(BPF_MAP_UPDATE_ELEM, &mut attr).map(|_| ())
 }
 
+fn map_delete(map: RawFd, key: &[u8]) -> io::Result<()> {
+    let mut attr = Attr { zero: [0; 128] };
+    attr.elem = MapElem { map_fd: map as u32, _pad: 0,
+        key: key.as_ptr() as u64, value: 0, flags: 0 };
+    match bpf(BPF_MAP_DELETE_ELEM, &mut attr) {
+        Ok(_) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn map_lookup_present(map: RawFd, key: &[u8], value_len: usize) -> bool {
     let value = vec![0u8; value_len];
     let mut attr = Attr { zero: [0; 128] };
@@ -216,6 +228,16 @@ fn map_lookup_present(map: RawFd, key: &[u8], value_len: usize) -> bool {
         flags: 0,
     };
     bpf(BPF_MAP_LOOKUP_ELEM, &mut attr).is_ok()
+}
+
+/// SOCKMAP reports EINVAL for an empty slot, unlike a hash map's ENOENT.
+/// These descriptors are our sockmaps and the slot must be in range.
+fn socket_map_delete(map: RawFd, slot: u32) -> io::Result<()> {
+    assert!(slot < SLOTS);
+    match map_delete(map, &slot.to_ne_bytes()) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        result => result,
+    }
 }
 
 /// Runs the socket's data-ready path now, so bytes queued before it joined
@@ -321,6 +343,13 @@ pub struct Joiner {
     free: Mutex<Vec<u32>>,
 }
 
+pub struct JoinError {
+    pub error: io::Error,
+    /// False if a verdict might already have moved bytes, or cleanup failed.
+    pub can_fallback: bool,
+    pub slots: Option<(u32, u32)>,
+}
+
 impl Joiner {
     pub fn new() -> io::Result<Joiner> {
         let targets = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
@@ -372,26 +401,51 @@ impl Joiner {
 
     /// Joins two sockets: bytes on either go to the other, in the kernel.
     /// Returns the pair's slots, for [`Joiner::part`].
-    pub fn join(&self, a: RawFd, b: RawFd) -> io::Result<(u32, u32)> {
+    pub fn join(&self, a: RawFd, b: RawFd) -> Result<(u32, u32), JoinError> {
         let (slot_a, slot_b) = {
             let mut free = self.free.lock().expect("sockmap slots poisoned");
-            let (Some(x), Some(y)) = (free.pop(), free.pop()) else {
-                return Err(io::Error::other("no free sockmap slots"));
-            };
-            (x, y)
+            if free.len() < 2 {
+                return Err(JoinError { error: io::Error::other("no free sockmap slots"),
+                    can_fallback: true, slots: None });
+            }
+            (free.pop().unwrap(), free.pop().unwrap())
         };
-        let cookie_a = socket_cookie(a)?;
-        let cookie_b = socket_cookie(b)?;
-        // Peers first, so a message arriving as a socket lands in the map
-        // finds where to go.
-        map_update(self.peers.as_raw_fd(), &cookie_a.to_ne_bytes(), &slot_b.to_ne_bytes())?;
-        map_update(self.peers.as_raw_fd(), &cookie_b.to_ne_bytes(), &slot_a.to_ne_bytes())?;
-        let fd_a = (a as u32).to_ne_bytes();
-        let fd_b = (b as u32).to_ne_bytes();
-        map_update(self.targets.as_raw_fd(), &slot_a.to_ne_bytes(), &fd_a)?;
-        map_update(self.targets.as_raw_fd(), &slot_b.to_ne_bytes(), &fd_b)?;
-        map_update(self.attach.as_raw_fd(), &slot_a.to_ne_bytes(), &fd_a)?;
-        map_update(self.attach.as_raw_fd(), &slot_b.to_ne_bytes(), &fd_b)?;
+        let mut cookies = Vec::new();
+        let mut active = false;
+        let setup = (|| -> io::Result<()> {
+            let cookie_a = socket_cookie(a)?;
+            cookies.push(cookie_a);
+            let cookie_b = socket_cookie(b)?;
+            cookies.push(cookie_b);
+            map_update(self.peers.as_raw_fd(), &cookie_a.to_ne_bytes(), &slot_b.to_ne_bytes())?;
+            map_update(self.peers.as_raw_fd(), &cookie_b.to_ne_bytes(), &slot_a.to_ne_bytes())?;
+            let fd_a = (a as u32).to_ne_bytes();
+            let fd_b = (b as u32).to_ne_bytes();
+            map_update(self.targets.as_raw_fd(), &slot_a.to_ne_bytes(), &fd_a)?;
+            map_update(self.targets.as_raw_fd(), &slot_b.to_ne_bytes(), &fd_b)?;
+            map_update(self.attach.as_raw_fd(), &slot_a.to_ne_bytes(), &fd_a)?;
+            active = true;
+            map_update(self.attach.as_raw_fd(), &slot_b.to_ne_bytes(), &fd_b)?;
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            // Even a target-only map installs a psock. Ordinary copying
+            // must never inherit that partial setup after a failed join.
+            let mut clean = true;
+            for map in [self.attach.as_raw_fd(), self.targets.as_raw_fd()] {
+                for slot in [slot_a, slot_b] {
+                    clean &= socket_map_delete(map, slot).is_ok();
+                }
+            }
+            for cookie in cookies {
+                clean &= map_delete(self.peers.as_raw_fd(), &cookie.to_ne_bytes()).is_ok();
+            }
+            // Once a verdict was active, bytes may already have moved.
+            // Close both sockets instead of risking a truncated fallback.
+            // The caller returns the slots only after closing on that path.
+            return Err(JoinError { error, can_fallback: clean && !active,
+                slots: Some((slot_a, slot_b)) });
+        }
         kick(a);
         kick(b);
         Ok((slot_a, slot_b))
@@ -412,4 +466,59 @@ impl Joiner {
     pub fn holds(&self, slot: u32) -> bool {
         map_lookup_present(self.targets.as_raw_fd(), &slot.to_ne_bytes(), 8)
     }
+}
+
+/// Exercise failed verdict attachment against real kernel sockmaps.
+/// The connected first target must be detached before ordinary I/O resumes.
+pub fn check_failed_join() -> io::Result<()> {
+    use std::io::{Read, Write};
+    let joiner = Joiner::new()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
+    let (mut peer, _) = listener.accept()?;
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    // TCP_CLOSE refuses insertion, after the first target has been added.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 { return Err(io::Error::last_os_error()); }
+    let unconnected = unsafe { OwnedFd::from_raw_fd(raw) };
+    let before = joiner.free.lock().unwrap().len();
+    for _ in 0..100 {
+        let failure = match joiner.join(client.as_raw_fd(), unconnected.as_raw_fd()) {
+            Ok(_) => return Err(io::Error::other("unconnected target unexpectedly accepted")),
+            Err(failure) => failure,
+        };
+        if !failure.can_fallback { return Err(io::Error::other("failed preparation did not permit clean fallback")); }
+        if let Some(slots) = failure.slots {
+            for slot in [slots.0, slots.1] {
+                if joiner.holds(slot) || map_lookup_present(joiner.attach.as_raw_fd(), &slot.to_ne_bytes(), 8) {
+                    return Err(io::Error::other("failed join left a socket attached"));
+                }
+            }
+            joiner.release(slots);
+        }
+        if joiner.free.lock().unwrap().len() != before {
+            return Err(io::Error::other("failed join leaked slots"));
+        }
+        client.write_all(b"ok")?;
+        let mut got = [0; 2];
+        peer.read_exact(&mut got)?;
+        if got != *b"ok" { return Err(io::Error::other("fallback lost bytes")); }
+    }
+    // An existing verdict on the second socket makes its attachment fail
+    // with EBUSY, after the first verdict has become active. No data is sent
+    // while this deliberately conflicting configuration exists.
+    let conflicting = Joiner::new()?;
+    map_update(conflicting.attach.as_raw_fd(), &0u32.to_ne_bytes(), &(peer.as_raw_fd() as u32).to_ne_bytes())?;
+    let failure = match joiner.join(client.as_raw_fd(), peer.as_raw_fd()) {
+        Ok(_) => return Err(io::Error::other("conflicting verdict unexpectedly accepted")),
+        Err(failure) => failure,
+    };
+    if failure.can_fallback { return Err(io::Error::other("partly active join permitted unsafe fallback")); }
+    drop(client);
+    drop(peer);
+    drop(unconnected);
+    if let Some(slots) = failure.slots { joiner.release(slots); }
+    if joiner.free.lock().unwrap().len() != before { return Err(io::Error::other("abort leaked slots")); }
+    println!("PASS: 100 failed preparations detach maps, return slots and preserve I/O; partial activation aborts");
+    Ok(())
 }

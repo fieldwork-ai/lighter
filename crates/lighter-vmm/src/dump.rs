@@ -1,5 +1,10 @@
-//! `kill -USR1 <vmm pid>` prints every virtqueue's state and the vsock
+//! `kill -INFO <vmm pid>` prints every virtqueue's state and the vsock
 //! counters to stderr; `kill -USR2` raises every device's interrupt line.
+//! USR1 also dumps in the bench runner, but the CLI reserves it for stopping
+//! its Docker event watcher. INFO remains available in either process.
+//! With `LIGHTER_DEBUG_SYSRQ=w` (blocked tasks) or `t` (all tasks), INFO also
+//! sends a serial SysRq after the host dump. This can wake a stalled guest;
+//! leave it unset when observing the queue state without an injected IRQ.
 //!
 //! It is the one probe that works on a machine whose control channel is the
 //! thing that has stopped answering: a guest asleep on an interrupt it never
@@ -10,6 +15,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::devices::pl011::Pl011;
 use crate::virtio::mmio::VirtioMmio;
 use crate::virtio::vsock::VsockShared;
 
@@ -24,7 +30,17 @@ extern "C" fn on_signal(signal: libc::c_int) {
     }
 }
 
-pub fn install(virtio: Vec<Arc<Mutex<VirtioMmio>>>, vsock: Arc<VsockShared>) {
+pub fn install(
+    virtio: Vec<Arc<Mutex<VirtioMmio>>>,
+    vsock: Arc<VsockShared>,
+    uart: Arc<Mutex<Pl011>>,
+) {
+    // Explicit opt-in: ordinary INFO dumps do not inject a guest interrupt.
+    let sysrq = match std::env::var("LIGHTER_DEBUG_SYSRQ").as_deref() {
+        Ok("w") => Some(b'w'),
+        Ok("t") => Some(b't'),
+        _ => None,
+    };
     let mut fds = [0i32; 2];
     // SAFETY: pipe(2) writes two descriptors into the array we hand it.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -39,6 +55,10 @@ pub fn install(virtio: Vec<Arc<Mutex<VirtioMmio>>>, vsock: Arc<VsockShared>) {
         );
         libc::signal(
             libc::SIGUSR2,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINFO,
             on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
     }
@@ -83,6 +103,14 @@ pub fn install(virtio: Vec<Arc<Mutex<VirtioMmio>>>, vsock: Arc<VsockShared>) {
                     eprintln!("DUMP vsock {line}");
                 }
                 eprintln!("DUMP end");
+                if let Some(key) = sysrq {
+                    match uart.try_lock() {
+                        Ok(mut uart) => {
+                            eprintln!("DUMP sysrq queued={}", uart.enqueue_sysrq(key));
+                        }
+                        Err(_) => eprintln!("DUMP uart locked, no sysrq"),
+                    }
+                }
             }
         });
 }

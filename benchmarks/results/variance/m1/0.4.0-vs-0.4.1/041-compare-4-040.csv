@@ -1,0 +1,10 @@
+case,rep,ms
+find-walk,1,972
+find-walk,2,119
+find-walk,3,119
+copy-tree,1,14726
+copy-tree,2,4259
+copy-tree,3,4242
+rm-rf,1,2639
+rm-rf,2,2746
+rm-rf,3,2650

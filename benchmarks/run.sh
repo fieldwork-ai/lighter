@@ -93,6 +93,16 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$TARGET" ] || { echo "--target is required (native|lighter|colima|orbstack|docker-desktop)" >&2; exit 2; }
 
+FOOTPRINT_BIN="$ROOT/target/benchmarks/task-footprint"
+if [ "$TARGET" != native ]; then
+	case " $CASES " in *" memory "*|*" boot "*)
+		mkdir -p "$(dirname "$FOOTPRINT_BIN")"
+		if [ ! -x "$FOOTPRINT_BIN" ] || [ benchmarks/task-footprint.c -nt "$FOOTPRINT_BIN" ]; then
+			cc -O2 -Wall -Wextra -Werror benchmarks/task-footprint.c -o "$FOOTPRINT_BIN"
+		fi
+	;; esac
+fi
+
 WORK="${LIGHTER_BENCH_WORK:-$HOME/.lighter-bench/$TARGET}"
 # A label lets one target be measured twice under different settings without
 # the second run overwriting the first — which is how the speed gate compares
@@ -555,10 +565,10 @@ esac
 # readings: settled before an install, the peak through one (sampled every
 # second), and fifteen and sixty seconds after it ends with nothing running
 # — the last two being what a runtime gives back on its own. The footprint
-# of a Hypervisor.framework guest reads high (a 2 GiB guest that had touched
-# all its memory read 3.5 GB), and the same accounting applies to every
-# runtime here, so the figures compare with each other and with what a
-# user sees, not with the guest's size.
+# includes compressed-page charges. Read the same task ledger for every
+# runtime, rather than equating guest size or resident bytes with footprint.
+# Anonymous host/guest backing historically duplicated this charge; owned
+# page objects in lighter avoid it while keeping reclaimed reuse charged.
 # The runtime's processes: every one that exists because the runtime is up,
 # which for lighter is the one VMM process.
 runtime_pids() {
@@ -575,14 +585,24 @@ runtime_pids() {
 
 runtime_footprint_mib() {
 	local pids; pids="$(runtime_pids)"
+	[ -n "$pids" ] || { echo "no runtime processes to measure" >&2; return 1; }
 	local total=0 pid mb
 	for pid in $pids; do
+		local bytes
+		if bytes="$("$FOOTPRINT_BIN" "$pid")"; then
+			total=$(( total + bytes / 1048576 ))
+			continue
+		fi
+		# Some other runtimes have helpers owned by another user. Retain
+		# footprint's privileged inspection path when a task-name port is
+		# unavailable, but never turn a failed reading into zero memory.
 		local raw; raw="$(footprint "$pid" 2>&1)"
 		[ -z "${LIGHTER_BENCH_DEBUG_FOOTPRINT:-}" ] || echo "FOOTPRINT pid=$pid $(echo "$raw" | grep -E 'phys_footprint|rror|annot|ailed' | head -2 | tr '\n' ' ')" >&2
 		# `footprint` switches to GB at ten gigabytes; a guest that has just
 		# run the storage cases holds its whole RAM as cache and reads there.
 		mb="$(echo "$raw" | sed -n 's/.*phys_footprint: *\([0-9.]*\) \([MG]\)B.*/\1 \2/p' | head -1 | awk '{v=$1; if ($2=="G") v=v*1024; printf "%d", v}')"
-		total=$(( total + ${mb:-0} ))
+		[ -n "$mb" ] || { echo "cannot read footprint for pid $pid" >&2; return 1; }
+		total=$(( total + mb ))
 	done
 	echo "$total"
 }

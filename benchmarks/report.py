@@ -175,6 +175,8 @@ def main():
         "compared with another from the same machine. Runtime records are refreshed",
         "independently and may come from different sessions; lighter's recording",
         "dates, source commits and artifact hashes are in the adjacent .tree files.",
+        "[Measured run-to-run variation](REPEATABILITY.md) records the same-build",
+        "storage baseline and the matched release comparison.",
         "",
         f"- Node: {tool_version('node', '--version')}",
         f"- npm: {tool_version('npm', '--version')}",
