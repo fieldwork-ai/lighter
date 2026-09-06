@@ -28,6 +28,7 @@ use crate::virtio::balloon::{Balloon, BalloonState};
 use crate::virtio::block::Block;
 use crate::virtio::disk::Disk;
 use crate::virtio::fs::{Fs, Share};
+use crate::virtio::mem::MemControl;
 use crate::virtio::mmio::VirtioMmio;
 use crate::virtio::net::Net;
 use crate::virtio::rng::Rng;
@@ -68,10 +69,18 @@ pub enum MachineError {
 }
 
 /// How to build the machine.
+/// The guest port dockerd's API is reached on.
+pub const DOCKER_PORT: u32 = 2375;
+
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
     pub vcpus: u32,
+    /// RAM the guest boots with. With `hotplug_bytes` this is the base, and
+    /// the rest is plugged in as the host offers it (`virtio::mem`).
     pub ram_bytes: u64,
+    /// Memory beyond `ram_bytes` the guest may plug in, in 128 MiB blocks;
+    /// zero means no virtio-mem device and RAM alone.
+    pub hotplug_bytes: u64,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
     pub cmdline: String,
@@ -100,6 +109,7 @@ impl Default for MachineConfig {
         MachineConfig {
             vcpus: 1,
             ram_bytes: 2 << 30,
+            hotplug_bytes: 0,
             kernel: PathBuf::from("guest/out/Image"),
             initramfs: None,
             // `panic=-1` so a guest that dies exits the VMM instead of sitting
@@ -135,6 +145,8 @@ pub struct Machine {
     virtio: Vec<Arc<Mutex<VirtioMmio>>>,
     disks: Vec<Arc<Disk>>,
     balloon: Arc<BalloonState>,
+    /// The hot-plug range's state, when the machine has one, and its slot.
+    mem: Option<MemControl>,
     /// The card's host side, if the machine has one.
     network: Option<Arc<Network>>,
     vsock: Arc<VsockShared>,
@@ -179,7 +191,12 @@ impl Machine {
         )?);
 
         // 3. The rest of the map, derived from the geometry the GIC reported.
-        let layout = GuestLayout::new(&gic.params(), config.vcpus, config.ram_bytes)?;
+        let layout = GuestLayout::new(
+            &gic.params(),
+            config.vcpus,
+            config.ram_bytes,
+            config.hotplug_bytes,
+        )?;
         tracing::debug!(
             gicd = format_args!("{:#x}..{:#x}", layout.gicd.base, layout.gicd.end()),
             gicr = format_args!("{:#x}..{:#x}", layout.gicr.base, layout.gicr.end()),
@@ -189,6 +206,11 @@ impl Machine {
         // 4. Guest RAM.
         let mut memory = GuestMemory::new(vm.clone());
         memory.add_region(layout.ram.base, layout.ram.size as usize)?;
+        // The hot-plug range is mapped whole and lazily, like RAM: a block the
+        // guest never plugs is never touched and costs nothing.
+        if let Some(hotplug) = layout.hotplug {
+            memory.add_region(hotplug.base, hotplug.size as usize)?;
+        }
         let memory = Arc::new(memory);
 
         // 5. Kernel and initramfs.
@@ -273,6 +295,26 @@ impl Machine {
         virtio.push(Box::new(Rng::from_host()?));
         let balloon_slot = virtio.len();
         virtio.push(Box::new(Balloon::new(balloon_state.clone())));
+        // virtio-mem, when the machine has a range: offered whole to begin
+        // with, or `LIGHTER_MEM_PLUG_MIB` of it, until the policy decides.
+        let mem_state = layout.hotplug.map(|hotplug| {
+            let offered = std::env::var("LIGHTER_MEM_PLUG_MIB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mib| mib << 20)
+                .unwrap_or(hotplug.size);
+            Arc::new(crate::virtio::mem::MemState::new(
+                config.ram_bytes,
+                hotplug.base,
+                hotplug.size,
+                offered,
+            ))
+        });
+        let mem_slot = mem_state.as_ref().map(|state| {
+            let slot = virtio.len();
+            virtio.push(Box::new(crate::virtio::mem::Mem::new(state.clone())));
+            slot
+        });
 
         let virtio_slots = virtio.len();
         let mut virtio_devices = Vec::with_capacity(virtio_slots);
@@ -287,6 +329,9 @@ impl Machine {
             bus.register(window, transport.clone())?;
             virtio_devices.push(transport);
         }
+        let mem = mem_state
+            .zip(mem_slot)
+            .map(|(state, slot)| MemControl::new(state, virtio_devices[slot].clone()));
 
         // vsock queues packets from host threads and must be able to deliver
         // them itself; see the note on the waker in the vsock module.
@@ -530,6 +575,7 @@ impl Machine {
             virtio_devices[balloon_slot].clone(),
             config.ram_bytes,
             vsock_state.clone(),
+            mem.clone(),
         ) {
             Ok(policy) => Some(policy),
             Err(why) => {
@@ -660,6 +706,7 @@ impl Machine {
             virtio: virtio_devices,
             disks,
             balloon: balloon_state,
+            mem,
             network,
             vsock: vsock_state,
             proxies: Vec::new(),
@@ -687,8 +734,25 @@ impl Machine {
         self.vsock.clone()
     }
 
+    /// The Docker API's socket has one thing done to it that no other has:
+    /// a guest with a virtio-mem range is made whole before a container is
+    /// created, started, restarted or built, because what runs in it sizes
+    /// itself from `MemTotal` as it comes up and can take memory faster
+    /// than the guest could ask for more (`MemControl::plug_all`). The
+    /// request line is what is looked for, in each chunk as it passes.
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
-        let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone())?;
+        let inspect: Option<crate::vsock_proxy::Inspector> = match &self._memory_policy {
+            Some(policy) if guest_port == DOCKER_PORT && self.mem.is_some() => {
+                let whole = policy.whole();
+                Some(Arc::new(move |bytes: &[u8]| {
+                    if starts_a_container(bytes) {
+                        whole.call();
+                    }
+                }))
+            }
+            _ => None,
+        };
+        let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone(), inspect)?;
         self.proxies.push(proxy);
         Ok(())
     }
@@ -704,6 +768,11 @@ impl Machine {
     }
 
     /// The balloon's shared state, for the memory policy loop.
+    /// The virtio-mem range, when the machine has one.
+    pub fn mem(&self) -> Option<&MemControl> {
+        self.mem.as_ref()
+    }
+
     pub fn balloon(&self) -> &Arc<BalloonState> {
         &self.balloon
     }
@@ -754,4 +823,21 @@ impl Drop for Machine {
         // until that has happened. Counting clones here would just encode how
         // many things legitimately hold one.
     }
+}
+
+/// Whether a chunk of a Docker API stream carries a request that starts a
+/// process in a container: create, start, restart, an exec's start, or a
+/// build (BuildKit runs its steps in containers of its own, reached through
+/// a session).
+fn starts_a_container(bytes: &[u8]) -> bool {
+    const REQUESTS: [&[u8]; 5] = [
+        b"/containers/create",
+        b"/start HTTP/",
+        b"/restart HTTP/",
+        b"/build?",
+        b"/session HTTP/",
+    ];
+    REQUESTS
+        .iter()
+        .any(|needle| bytes.windows(needle.len()).any(|w| w == *needle))
 }

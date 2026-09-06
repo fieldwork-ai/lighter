@@ -34,6 +34,7 @@ pub fn ensure() -> anyhow::Result<PathBuf> {
     if let Ok(guest) = crate::paths::guest_dir() {
         let shipped = guest.join("lighter.app/Contents/MacOS/lighter");
         if shipped.exists() {
+            register(&guest.join("lighter.app"));
             return Ok(shipped);
         }
     }
@@ -68,7 +69,48 @@ pub fn ensure() -> anyhow::Result<PathBuf> {
         std::fs::rename(&staging, &target)?;
         sign(&source, contents.parent().expect("Contents has a parent"))?;
     }
+    register(contents.parent().expect("Contents has a parent"));
     Ok(target)
+}
+
+/// Tells Launch Services about the bundle, once per bundle path.
+///
+/// Activity Monitor asks Launch Services for a running process's icon, and
+/// Launch Services knows only the bundles it has been shown: one under
+/// `~/.local` or a Homebrew cellar, never opened by Finder, has a flame in
+/// it that no one sees. `lsregister -f` is what `open` and Finder do on a
+/// bundle's behalf. Best effort, in the background, and remembered in the
+/// home so a start pays nothing for it after the first.
+///
+/// The default home's bundle only. A gate, a benchmark or a debugging
+/// session on its own `LIGHTER_HOME` makes a bundle that is deleted with
+/// it, and every one registered under the same identifier stayed in the
+/// Launch Services database as a dead path: eighty-nine of them, on a
+/// machine whose Activity Monitor showed the daily driver without its
+/// flame.
+fn register(bundle: &Path) {
+    if !crate::paths::is_default_home() {
+        return;
+    }
+    let Ok(home) = crate::paths::home() else {
+        return;
+    };
+    let marker = home.join("bundle.registered");
+    let path = bundle.to_string_lossy();
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(path.as_ref()) {
+        return;
+    }
+    let spawned = std::process::Command::new(
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+    )
+    .arg("-f")
+    .arg(bundle)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn();
+    if spawned.is_ok() {
+        let _ = std::fs::write(&marker, path.as_bytes());
+    }
 }
 
 /// Signs the bundle, ad hoc, with the entitlements the source binary was

@@ -34,11 +34,6 @@ pub fn docker_socket() -> anyhow::Result<PathBuf> {
     Ok(home()?.join("docker.sock"))
 }
 
-/// The running machine's process id.
-pub fn pid_file() -> anyhow::Result<PathBuf> {
-    Ok(home()?.join("lighter.pid"))
-}
-
 pub fn log_file() -> anyhow::Result<PathBuf> {
     Ok(home()?.join("machine.log"))
 }
@@ -91,6 +86,8 @@ pub fn guest_dir() -> anyhow::Result<PathBuf> {
     })
 }
 
+/// The guest kernel: one image, at 250 Hz (`docs/architecture.md`, "One
+/// kernel"; a 1000 Hz build was shipped beside it for a day and dropped).
 pub fn kernel() -> anyhow::Result<PathBuf> {
     Ok(guest_dir()?.join("Image"))
 }

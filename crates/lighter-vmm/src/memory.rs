@@ -159,6 +159,21 @@ impl GuestMemory {
         }
     }
 
+    /// Real anonymous memory without a hypervisor mapping, for device tests.
+    #[cfg(test)]
+    pub(crate) fn test_region(gpa: u64, len: usize) -> Self {
+        let backing = Mmap::anonymous(len).unwrap();
+        Self {
+            vm: None,
+            regions: vec![Region {
+                gpa,
+                len,
+                host: backing.ptr,
+                _backing: backing,
+            }],
+        }
+    }
+
     /// Allocates `len` bytes of host RAM and maps it into the guest at `gpa`.
     pub fn add_region(&mut self, gpa: u64, len: usize) -> Result<()> {
         let vm = self.vm.clone().ok_or(MemoryError::Detached)?;
@@ -250,48 +265,52 @@ impl GuestMemory {
 
     /// Reads a little-endian primitive from guest memory.
     ///
-    /// Volatile because the guest can be writing the same location; a plain
-    /// read would let the optimizer hoist or duplicate it.
+    /// Volatile where the address allows it, because the guest can be
+    /// writing the same location and a plain read would let the optimizer
+    /// hoist or duplicate it; volatile bytes where it does not, since the
+    /// guest is not obliged to align what it puts in a buffer (virtio's
+    /// rings are aligned by the specification, a device header is wherever
+    /// the driver's allocation fell), and a typed volatile read of an
+    /// unaligned address is undefined behaviour.
     pub fn read_u32(&self, gpa: u64) -> Result<u32> {
         let region = self.region_for(gpa, 4)?;
-        // SAFETY: bounds checked; read_unaligned tolerates any alignment the
-        // guest chose for its structures.
-        let value = unsafe { ptr::read_volatile(region.host_addr(gpa).cast::<u32>()) };
+        // SAFETY: bounds checked above.
+        let value = unsafe { read_prim(region.host_addr(gpa).cast::<u32>()) };
         Ok(u32::from_le(value))
     }
 
     pub fn write_u32(&self, gpa: u64, value: u32) -> Result<()> {
         let region = self.region_for(gpa, 4)?;
         // SAFETY: bounds checked above.
-        unsafe { ptr::write_volatile(region.host_addr(gpa).cast::<u32>(), value.to_le()) };
+        unsafe { write_prim(region.host_addr(gpa).cast::<u32>(), value.to_le()) };
         Ok(())
     }
 
     pub fn read_u16(&self, gpa: u64) -> Result<u16> {
         let region = self.region_for(gpa, 2)?;
         // SAFETY: bounds checked above.
-        let value = unsafe { ptr::read_volatile(region.host_addr(gpa).cast::<u16>()) };
+        let value = unsafe { read_prim(region.host_addr(gpa).cast::<u16>()) };
         Ok(u16::from_le(value))
     }
 
     pub fn write_u16(&self, gpa: u64, value: u16) -> Result<()> {
         let region = self.region_for(gpa, 2)?;
         // SAFETY: bounds checked above.
-        unsafe { ptr::write_volatile(region.host_addr(gpa).cast::<u16>(), value.to_le()) };
+        unsafe { write_prim(region.host_addr(gpa).cast::<u16>(), value.to_le()) };
         Ok(())
     }
 
     pub fn read_u64(&self, gpa: u64) -> Result<u64> {
         let region = self.region_for(gpa, 8)?;
         // SAFETY: bounds checked above.
-        let value = unsafe { ptr::read_volatile(region.host_addr(gpa).cast::<u64>()) };
+        let value = unsafe { read_prim(region.host_addr(gpa).cast::<u64>()) };
         Ok(u64::from_le(value))
     }
 
     pub fn write_u64(&self, gpa: u64, value: u64) -> Result<()> {
         let region = self.region_for(gpa, 8)?;
         // SAFETY: bounds checked above.
-        unsafe { ptr::write_volatile(region.host_addr(gpa).cast::<u64>(), value.to_le()) };
+        unsafe { write_prim(region.host_addr(gpa).cast::<u64>(), value.to_le()) };
         Ok(())
     }
 
@@ -307,94 +326,122 @@ impl GuestMemory {
         Ok(region.host_addr(gpa))
     }
 
-    /// Returns a span of guest memory to macOS.
+    /// Discards the aligned interior of a guest-owned free span. The guest
+    /// must keep it unused until the device returns its descriptor.
     ///
-    /// This is the mechanism behind "the VM gives memory back": the mapping
-    /// stays, so the guest can touch these addresses again at any time, but the
-    /// physical pages are released and the next access faults in a fresh zero
-    /// page. Both users — the balloon and free page reporting — are telling us
-    /// the guest does not care what is there, which is exactly the contract
-    /// `MADV_FREE_REUSABLE` wants.
-    ///
-    /// # Guest pages are smaller than host pages
-    ///
-    /// The guest reports 4 KiB pages; Apple silicon hosts use 16 KiB ones. A
-    /// release that is not aligned to a *host* page frees nothing at all, so the
-    /// aligned interior is what gets released and the ragged edges are dropped.
-    /// This is why the balloon coalesces runs before calling: one 4 KiB page is
-    /// never releasable, but four contiguous ones are.
-    ///
-    /// Returns the number of bytes actually released.
+    /// A fresh anonymous mapping is essential, including for ordinary page
+    /// reporting and single host pages. MADV_FREE_REUSABLE removes pages from
+    /// phys_footprint, but guest reuse never issues MADV_FREE_REUSE: live pages
+    /// then remain uncounted. Remapping has no reusable accounting state, and
+    /// also releases compressed pages. The next access is a charged zero page.
     pub fn release(&self, gpa: u64, len: u64) -> Result<u64> {
+        let len_usize = usize::try_from(len).map_err(|_| MemoryError::OutOfBounds {
+            gpa,
+            len: usize::MAX,
+        })?;
+        // Validate the original range before alignment; wrapping must never
+        // turn an invalid descriptor into a valid release of unrelated RAM.
+        let region = self.region_for(gpa, len_usize)?;
+        let end = gpa.checked_add(len).ok_or(MemoryError::OutOfBounds {
+            gpa,
+            len: len_usize,
+        })?;
         let page = host_page_size();
-        let start = gpa.div_ceil(page) * page;
-        let end = (gpa + len) / page * page;
+        let start = gpa.checked_add(page - 1).ok_or(MemoryError::OutOfBounds {
+            gpa,
+            len: len_usize,
+        })? / page
+            * page;
+        let end = end / page * page;
         if end <= start {
-            // The span does not cover a whole host page; nothing to release.
             return Ok(0);
         }
-
         let span = (end - start) as usize;
-        let region = self.region_for(start, span)?;
         let addr = region.host_addr(start);
 
-        // The guest is what dirtied these pages, through the second-stage
-        // translation the hypervisor set up — and while that translation
-        // exists, macOS will not take them back. `madvise` returns success and
-        // the process's footprint does not move, which is the most unhelpful
-        // combination of outcomes available.
-        //
-        // So the mapping is withdrawn for the length of the call. That is safe
-        // precisely here and nowhere else: the guest reports free pages
-        // synchronously, having first taken them off its own free lists, and
-        // it waits for this buffer to come back before it releases them again.
-        // There is no moment in between when it could fault on one.
-        //
-        // SAFETY: no vCPU can be executing code that touches this range, for
-        // the reason above.
-        let unmapped = match &self.vm {
-            // SAFETY: no vCPU can be executing code that touches this range,
-            // for the reason above.
-            Some(vm) => unsafe { vm.unmap(start, span) }.is_ok(),
-            None => false,
+        if let Some(vm) = &self.vm {
+            // SAFETY: the guest has handed ownership of this free span to
+            // the device until completion. Do not discard if unmapping fails.
+            unsafe { vm.unmap(start, span)? };
+        }
+        // SAFETY: a host-page-aligned subrange of our own anonymous mapping,
+        // with its guest mapping withdrawn. No reusable state is retained.
+        let fresh = unsafe {
+            libc::mmap(
+                addr.cast(),
+                span,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
         };
-
-        // SAFETY: `addr` is inside a live mapping of at least `span` bytes,
-        // checked above. MADV_FREE_REUSABLE does not unmap: the address stays
-        // valid and reads fault in zeroes, which is what the guest expects of
-        // memory it told us it was not using.
-        let rc = unsafe { libc::madvise(addr.cast(), span, MADV_FREE_REUSABLE) };
-        let released = if rc == 0 {
-            span as u64
-        } else {
-            let err = io::Error::last_os_error();
-            // Not fatal: failing to release memory costs footprint, not
-            // correctness, and killing the guest over it would be worse. Loud,
-            // though — a share of memory that never comes back is the single
-            // thing people notice about running containers in a VM, and a
-            // silent `madvise` failure is how it would happen.
-            tracing::warn!(%err, gpa, len, span, "could not release guest memory to the host");
-            0
-        };
-
-        if unmapped {
-            // Back before anything can want it. A failure here is not
-            // recoverable — the guest would fault on memory it is entitled to
-            // — so it is reported rather than swallowed.
-            // SAFETY: the same range that was just unmapped, restored to the
-            // permissions it had.
-            let restored = match &self.vm {
-                // SAFETY: the same range that was just unmapped, restored to
-                // the permissions it had.
-                Some(vm) => unsafe { vm.map(addr.cast(), start, span, MemoryPerms::RWX) },
-                None => Ok(()),
-            };
-            if let Err(err) = restored {
-                tracing::error!(%err, gpa = start, span, "could not restore a released mapping");
-                return Err(MemoryError::Map(err));
+        if fresh == libc::MAP_FAILED {
+            // MAP_FIXED may have removed the old mapping before failing.
+            // Continuing could let a device access unmapped host memory.
+            tracing::error!(error = %io::Error::last_os_error(), start, span, "cannot replace released memory");
+            std::process::abort();
+        }
+        if let Some(vm) = &self.vm {
+            // SAFETY: the fresh host mapping has the same address/length and
+            // outlives the restored guest mapping just as the original did.
+            if let Err(error) = unsafe { vm.map(addr.cast(), start, span, MemoryPerms::RWX) } {
+                // Device callers may treat an ordinary release error as no
+                // reclaim. They must never return a now-unmapped page to Linux.
+                tracing::error!(%error, start, span, "cannot restore released guest memory");
+                std::process::abort();
             }
         }
-        Ok(released)
+        Ok(span as u64)
+    }
+
+    /// Balloon and virtio-mem use the same accounting-safe release as reporting.
+    pub fn release_thoroughly(&self, gpa: u64, len: u64) -> Result<u64> {
+        self.release(gpa, len)
+    }
+
+    /// Coalesce a reporting request before changing mappings. All its buffers
+    /// remain owned by the host until the entire request completes. Validate
+    /// first, and never merge across separately allocated backing regions.
+    pub(crate) fn release_reported(&self, spans: &mut [(u64, u64)]) -> Result<u64> {
+        for &(gpa, len) in spans.iter() {
+            self.region_for(
+                gpa,
+                usize::try_from(len).map_err(|_| MemoryError::OutOfBounds {
+                    gpa,
+                    len: usize::MAX,
+                })?,
+            )?;
+        }
+        spans.sort_unstable();
+        let mut total = 0;
+        let mut run: Option<(u64, u64)> = None;
+        for &(start, len) in spans.iter() {
+            let end = start.checked_add(len).ok_or(MemoryError::OutOfBounds {
+                gpa: start,
+                len: len as usize,
+            })?;
+            match run {
+                Some((first, last))
+                    if start <= last
+                        && self
+                            .region_for(first, (last.max(end) - first) as usize)
+                            .is_ok() =>
+                {
+                    run = Some((first, last.max(end)));
+                }
+                previous => {
+                    if let Some((first, last)) = previous {
+                        total += self.release(first, last - first)?;
+                    }
+                    run = Some((start, end));
+                }
+            }
+        }
+        if let Some((first, last)) = run {
+            total += self.release(first, last - first)?;
+        }
+        Ok(total)
     }
 }
 
@@ -416,9 +463,6 @@ impl Drop for GuestMemory {
     }
 }
 
-/// macOS: pages can be reused by anyone.
-const MADV_FREE_REUSABLE: libc::c_int = 7;
-
 /// The host's page size, which on Apple silicon is 16 KiB rather than the 4 KiB
 /// the guest uses.
 fn host_page_size() -> u64 {
@@ -431,9 +475,191 @@ fn host_page_size() -> u64 {
     })
 }
 
+/// A primitive read from guest memory at whatever alignment the guest chose:
+/// one volatile access when aligned, volatile bytes otherwise.
+///
+/// # Safety
+/// `ptr` must be valid for a read of `T` inside a live mapping. `T` must
+/// have no padding and accept every bit pattern (only integer callers here).
+unsafe fn read_prim<T: Copy>(ptr: *const T) -> T {
+    if (ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
+        // SAFETY: aligned, and valid by the caller's contract.
+        unsafe { ptr::read_volatile(ptr) }
+    } else {
+        let mut value = std::mem::MaybeUninit::<T>::uninit();
+        for i in 0..std::mem::size_of::<T>() {
+            // SAFETY: byte pointers have alignment one; every byte of this
+            // integer is copied once, without a reference into guest memory.
+            unsafe {
+                value
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(i)
+                    .write(ptr.cast::<u8>().add(i).read_volatile())
+            };
+        }
+        // SAFETY: all bytes initialized and all bit patterns valid for T.
+        unsafe { value.assume_init() }
+    }
+}
+
+/// The write to match `read_prim`.
+///
+/// # Safety
+/// `ptr` must be valid for a write of `T` inside a live mapping; `T` has no padding.
+unsafe fn write_prim<T: Copy>(ptr: *mut T, value: T) {
+    if (ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
+        // SAFETY: aligned, and valid by the caller's contract.
+        unsafe { ptr::write_volatile(ptr, value) }
+    } else {
+        for i in 0..std::mem::size_of::<T>() {
+            // SAFETY: initialized bytes of a padding-free integer, and a
+            // valid destination with byte alignment, per the caller.
+            unsafe {
+                ptr.cast::<u8>()
+                    .add(i)
+                    .write_volatile((&value as *const T).cast::<u8>().add(i).read())
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primitives_work_at_every_alignment_and_stay_in_bounds() {
+        let base = 0x4000_0000;
+        let mem = GuestMemory::test_region(base, 0x4000);
+        for offset in 0..8 {
+            mem.write_u64(base + offset, 0x0123_4567_89ab_cdef).unwrap();
+            assert_eq!(mem.read_u64(base + offset).unwrap(), 0x0123_4567_89ab_cdef);
+            mem.write_u32(base + offset, 0x89ab_cdef).unwrap();
+            assert_eq!(mem.read_u32(base + offset).unwrap(), 0x89ab_cdef);
+            mem.write_u16(base + offset, 0xcdef).unwrap();
+            assert_eq!(mem.read_u16(base + offset).unwrap(), 0xcdef);
+            let mut bytes = [0; 2];
+            mem.read(base + offset, &mut bytes).unwrap();
+            assert_eq!(bytes, [0xef, 0xcd]);
+        }
+        assert!(mem.read_u64(base + 0x4000 - 7).is_err());
+        assert!(mem.write_u32(base + 0x4000 - 3, 0).is_err());
+        assert!(mem.read_u16(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn a_single_reported_host_page_is_zeroed_and_edges_are_preserved() {
+        let base = 0x4000_0000;
+        let page = host_page_size() as usize;
+        let mem = GuestMemory::test_region(base, 3 * page);
+        mem.write(base, &vec![0x5a; 3 * page]).unwrap();
+        assert_eq!(
+            mem.release(base + 1, (3 * page - 2) as u64).unwrap(),
+            page as u64
+        );
+        let mut bytes = vec![0; 3 * page];
+        mem.read(base, &mut bytes).unwrap();
+        assert!(bytes[..page].iter().all(|b| *b == 0x5a));
+        assert!(bytes[page..2 * page].iter().all(|b| *b == 0));
+        assert!(bytes[2 * page..].iter().all(|b| *b == 0x5a));
+        assert!(mem.release(u64::MAX - 3, 8).is_err());
+        assert!(mem.release(base, u64::MAX).is_err());
+        assert_eq!(mem.release(base + 1, (page - 1) as u64).unwrap(), 0);
+    }
+
+    #[test]
+    fn reporting_merges_adjacent_fragments_but_not_gaps() {
+        let base = 0x4000_0000;
+        let page = host_page_size();
+        let mem = GuestMemory::test_region(base, (3 * page) as usize);
+        mem.write(base, &vec![0x5a; (3 * page) as usize]).unwrap();
+        let mut spans = [
+            (base + page / 2, page / 2),
+            (base + 2 * page, page),
+            (base, page / 2),
+        ];
+        assert_eq!(mem.release_reported(&mut spans).unwrap(), 2 * page);
+        assert_eq!(mem.read_u64(base).unwrap(), 0);
+        assert_eq!(mem.read_u64(base + page).unwrap(), 0x5a5a5a5a5a5a5a5a);
+        assert_eq!(mem.read_u64(base + 2 * page).unwrap(), 0);
+        // Validate the whole request before releasing its first valid buffer.
+        mem.write_u64(base, 123).unwrap();
+        assert!(
+            mem.release_reported(&mut [(base, page), (u64::MAX, 2)])
+                .is_err()
+        );
+        assert_eq!(mem.read_u64(base).unwrap(), 123);
+    }
+
+    /// A tiny guest writes pages, reports alternating single host pages, then
+    /// reuses them. This checks real Hypervisor.framework accounting without
+    /// booting Linux, running a workload, or producing benchmark results.
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn reported_pages_are_recharged_after_guest_reuse() {
+        use lighter_hv::{Exception, Exit, Gic, GicLayout, Reg};
+        const BASE: u64 = 0x4000_0000;
+        const SIZE: usize = 32 << 20;
+        let vm = Arc::new(Vm::create().unwrap());
+        let _gic = Gic::create(&vm, GicLayout::default()).unwrap();
+        let mut mem = GuestMemory::new(vm.clone());
+        let page = host_page_size() as usize;
+        mem.add_region(BASE, page).unwrap();
+        let data = BASE + page as u64;
+        mem.add_region(data, SIZE).unwrap();
+        // str x2,[x0]; add x0,x0,#4096; cmp x0,x1; b.lo -12; brk #0
+        let code = [
+            0xf900_0002u32,
+            0x9140_0400,
+            0xeb01_001f,
+            0x54ff_ffa3,
+            0xd420_0000,
+        ];
+        for (i, instruction) in code.into_iter().enumerate() {
+            mem.write_u32(BASE + i as u64 * 4, instruction).unwrap();
+        }
+        let mut vcpu = vm.create_vcpu().unwrap();
+        vcpu.set_trap_debug_exceptions(true).unwrap();
+        let mut touch = |value| {
+            vcpu.set_reg(Reg::Pc, BASE).unwrap();
+            vcpu.set_reg(Reg::Cpsr, lighter_hv::PSTATE_EL1H_DAIF_MASKED)
+                .unwrap();
+            vcpu.set_reg(Reg::X0, data).unwrap();
+            vcpu.set_reg(Reg::X1, data + SIZE as u64).unwrap();
+            vcpu.set_reg(Reg::X2, value).unwrap();
+            assert!(
+                matches!(vcpu.run().unwrap(), Exit::Exception(e) if e.class() == Exception::EC_BRK64)
+            );
+        };
+        touch(1);
+        for round in 0..3 {
+            let charged = crate::footprint::bytes();
+            // Gaps prevent coalescing: spans below the old 128 KiB threshold
+            // must be accounted correctly too, on every reuse cycle.
+            let mut spans: Vec<_> = (0..SIZE)
+                .step_by(page * 2)
+                .map(|offset| (data + offset as u64, page as u64))
+                .collect();
+            assert_eq!(mem.release_reported(&mut spans).unwrap(), SIZE as u64 / 2);
+            let released = crate::footprint::bytes();
+            assert!(
+                charged.saturating_sub(released) >= SIZE as u64 / 4,
+                "reporting did not release physical pages: {charged} -> {released}"
+            );
+            touch(round + 2);
+            let reused = crate::footprint::bytes();
+            assert!(
+                reused.saturating_sub(released) >= SIZE as u64 / 4,
+                "guest reuse was not charged: {released} -> {reused}"
+            );
+            assert!(
+                reused >= charged.saturating_sub(4 << 20),
+                "footprint shrank after reuse: {charged} -> {reused}"
+            );
+        }
+        drop(vcpu);
+    }
 
     /// Region math is the part that silently corrupts a guest when wrong, and
     /// it is testable without a VM, so it is tested without one.

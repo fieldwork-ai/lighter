@@ -19,6 +19,9 @@ use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use lighter_docker::Published;
 
 use crate::virtio::vsock::{Chunk, ConnKey, Gone, Outbound, Status, VsockShared};
 
@@ -43,13 +46,29 @@ enum Phase {
     /// The Mac's socket is connecting; writable means done.
     Connecting,
     /// A host-opened stream (published port) waiting for the guest's accept,
-    /// then owed the port as its first bytes.
-    AwaitEstablished(u16),
+    /// then owed the guest address to dial as its first bytes.
+    AwaitEstablished(SocketAddr),
     Open,
     /// The guest's UDP, every flow multiplexed on this one stream; the
     /// flows' sockets are in `Loop::udp_flows`.
     UdpMux,
+    /// Published UDP ports, the other way round: every flow from a client
+    /// of the Mac to a container, on this one stream to the agent.
+    UdpInbound,
 }
+
+/// A UDP port Docker published, bound on the Mac: its socket, the address
+/// in the guest the agent dials for it, and a flow per client that has
+/// spoken, with when it last did.
+struct UdpPublish {
+    socket: std::net::UdpSocket,
+    dst: SocketAddr,
+    flows: HashMap<SocketAddr, (u32, Instant)>,
+}
+
+/// How long a published port's client may say nothing before its flow is
+/// closed; the agent's own sweep of outbound flows uses the same.
+const UDP_FLOW_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct Stream {
     tcp: Option<TcpStream>,
@@ -84,12 +103,21 @@ struct Counters {
 
 enum Command {
     Outbound(ConnKey),
-    Inbound(u16, TcpStream),
+    /// A connection accepted on a published port, and the address in the
+    /// guest the agent is to dial for it.
+    Inbound(SocketAddr, TcpStream),
     Dns(ConnKey),
     /// A DNS reply resolved off-thread, to go out on its stream.
     DnsReply(ConnKey, u16, Vec<u8>),
     /// The guest's UDP stream (see the agent's udp.rs for the framing).
     Udp(ConnKey),
+    /// The agent's stream for published UDP ports, same framing, flows
+    /// opened from this side.
+    UdpInbound(ConnKey),
+    /// A UDP port Docker published, bound on the Mac, and where in the
+    /// guest the agent dials for it.
+    PublishUdp(Published, std::net::UdpSocket, SocketAddr),
+    WithdrawUdp(Published),
 }
 
 /// The UDP frame: length, flow, kind; then the payload.
@@ -97,6 +125,13 @@ const UDP_HEADER: usize = 7;
 const UDP_KIND_DATA: u8 = 0;
 const UDP_KIND_OPEN: u8 = 1;
 const UDP_KIND_CLOSE: u8 = 2;
+
+/// How much a framed stream (DNS replies, the UDP mux) may hold for a guest
+/// that has stopped granting credit before new frames are dropped whole.
+/// A frame split at the credit boundary and never finished desynchronises
+/// the guest's frame reader for good; a frame dropped whole is a datagram
+/// lost, which both protocols allow.
+const FRAMED_BACKLOG: usize = 1 << 20;
 
 pub struct Reactor {
     shared: Arc<VsockShared>,
@@ -138,12 +173,13 @@ impl Reactor {
         self.wake();
     }
 
-    /// A connection accepted on a published port, to carry into the guest.
-    pub fn carry_inbound(&self, port: u16, mac: TcpStream) {
+    /// A connection accepted on a published port, to carry into the guest,
+    /// where the agent dials `dst`.
+    pub fn carry_inbound(&self, dst: SocketAddr, mac: TcpStream) {
         self.commands
             .lock()
             .expect("reactor commands poisoned")
-            .push(Command::Inbound(port, mac));
+            .push(Command::Inbound(dst, mac));
         self.wake();
     }
 
@@ -154,6 +190,33 @@ impl Reactor {
             .lock()
             .expect("reactor commands poisoned")
             .push(Command::Udp(key));
+        self.wake();
+    }
+
+    /// The agent's stream for published UDP ports.
+    pub fn accept_udp_inbound(&self, key: ConnKey) {
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::UdpInbound(key));
+        self.wake();
+    }
+
+    /// A UDP port Docker published, bound on the Mac: datagrams to it go
+    /// into the guest, to `dst`, and replies come back to their senders.
+    pub fn publish_udp(&self, published: Published, socket: std::net::UdpSocket, dst: SocketAddr) {
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::PublishUdp(published, socket, dst));
+        self.wake();
+    }
+
+    pub fn withdraw_udp(&self, published: Published) {
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::WithdrawUdp(published));
         self.wake();
     }
 
@@ -210,6 +273,64 @@ fn udp_destination(payload: &[u8]) -> Option<SocketAddr> {
     }
 }
 
+/// Sends a framed stream's backlog and then `frames`, as far as credit
+/// allows, keeping whatever the guest could not take in `backlog` from
+/// `at`. New frames on a backlog past `FRAMED_BACKLOG` are dropped whole.
+/// `Err` when the connection is gone.
+fn push_framed(
+    shared: &VsockShared,
+    key: ConnKey,
+    backlog: &mut Vec<u8>,
+    at: &mut usize,
+    frames: Vec<u8>,
+) -> Result<(), Gone> {
+    if *at >= backlog.len() {
+        backlog.clear();
+        *at = 0;
+        if frames.is_empty() {
+            return Ok(());
+        }
+        // Nothing waiting: the frames go as they are, no copy.
+        if let Some(rest) = shared.try_send_owned(key, frames, false)? {
+            *backlog = rest;
+        }
+        return Ok(());
+    }
+    if backlog.len() - *at + frames.len() <= FRAMED_BACKLOG {
+        backlog.extend_from_slice(&frames);
+    } else {
+        tracing::debug!(
+            len = frames.len(),
+            "framed stream: backlog full, frames dropped"
+        );
+    }
+    let n = shared.try_send(key, &backlog[*at..])?;
+    *at += n;
+    if *at >= backlog.len() {
+        backlog.clear();
+        *at = 0;
+    }
+    Ok(())
+}
+
+/// The nineteen-byte header naming `addr`: the inverse of `destination`,
+/// and what an inbound stream opens with so the agent knows where to dial.
+pub(crate) fn header_bytes(addr: SocketAddr) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    match addr.ip() {
+        std::net::IpAddr::V4(a) => {
+            header[0] = 4;
+            header[1..5].copy_from_slice(&a.octets());
+        }
+        std::net::IpAddr::V6(a) => {
+            header[0] = 6;
+            header[1..17].copy_from_slice(&a.octets());
+        }
+    }
+    header[17..19].copy_from_slice(&addr.port().to_be_bytes());
+    header
+}
+
 /// Where the guest's header says to go.
 fn destination(header: &[u8]) -> Option<SocketAddr> {
     let port = u16::from_be_bytes([header[17], header[18]]);
@@ -234,7 +355,32 @@ fn destination(header: &[u8]) -> Option<SocketAddr> {
 
 /// A non-blocking connect: the socket, connecting or connected.
 fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
-    let (family, sockaddr, len): (libc::c_int, Vec<u8>, libc::socklen_t) = match addr {
+    let (family, sockaddr, len) = sockaddr_bytes(addr);
+    // SAFETY: a plain socket(2) call.
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor we own.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    set_nonblocking(fd)?;
+    let _ = stream.set_nodelay(true);
+    crate::sockbuf::widen(&stream);
+    // SAFETY: the sockaddr bytes are a correctly built sockaddr of `len`.
+    let rc = unsafe { libc::connect(fd, sockaddr.as_ptr().cast(), len) };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(e);
+        }
+    }
+    Ok(stream)
+}
+
+/// The address family and the `sockaddr` bytes for a socket address, with
+/// their length, for the libc calls that take one.
+pub(crate) fn sockaddr_bytes(addr: SocketAddr) -> (libc::c_int, Vec<u8>, libc::socklen_t) {
+    match addr {
         SocketAddr::V4(a) => {
             let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             sin.sin_len = size_of::<libc::sockaddr_in>() as u8;
@@ -273,26 +419,7 @@ fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
                 size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             )
         }
-    };
-    // SAFETY: a plain socket(2) call.
-    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
     }
-    // SAFETY: a fresh descriptor we own.
-    let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    set_nonblocking(fd)?;
-    let _ = stream.set_nodelay(true);
-    crate::sockbuf::widen(&stream);
-    // SAFETY: the sockaddr bytes are a correctly built sockaddr of `len`.
-    let rc = unsafe { libc::connect(fd, sockaddr.as_ptr().cast(), len) };
-    if rc < 0 {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINPROGRESS) {
-            return Err(e);
-        }
-    }
-    Ok(stream)
 }
 
 /// After a non-blocking connect signals writable: did it succeed?
@@ -385,6 +512,14 @@ struct Loop {
     /// Per UDP stream, the flows' sockets by the guest's flow id.
     udp_flows: HashMap<ConnKey, HashMap<u32, std::net::UdpSocket>>,
     udp_by_fd: HashMap<RawFd, (ConnKey, u32)>,
+    /// The agent's stream for published UDP ports, once it has dialled.
+    udp_inbound: Option<ConnKey>,
+    udp_published: HashMap<Published, UdpPublish>,
+    udp_published_by_fd: HashMap<RawFd, Published>,
+    /// Each inbound flow's port and client, by the id this side gave it.
+    udp_inbound_flows: HashMap<u32, (Published, SocketAddr)>,
+    udp_inbound_next: u32,
+    udp_inbound_swept: Instant,
 }
 
 fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
@@ -408,6 +543,12 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         counters: Counters::default(),
         udp_flows: HashMap::new(),
         udp_by_fd: HashMap::new(),
+        udp_inbound: None,
+        udp_published: HashMap::new(),
+        udp_published_by_fd: HashMap::new(),
+        udp_inbound_flows: HashMap::new(),
+        udp_inbound_next: 0,
+        udp_inbound_swept: Instant::now(),
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
     // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
@@ -477,6 +618,10 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             let fd = ev.ident as RawFd;
             if fd == wake_read {
                 woken = true;
+                continue;
+            }
+            if let Some(&published) = l.udp_published_by_fd.get(&fd) {
+                l.udp_published_readable(published);
                 continue;
             }
             if let Some(&(key, flow)) = l.udp_by_fd.get(&fd) {
@@ -662,7 +807,51 @@ impl Loop {
                 );
                 self.udp_flows.insert(key, HashMap::new());
             }
-            Command::Inbound(port, mac) => {
+            Command::UdpInbound(key) => {
+                // A second agent stream (the agent restarted) replaces the
+                // first, whose flows died with it.
+                if let Some(old) = self.udp_inbound.take() {
+                    self.close(old);
+                }
+                self.streams.insert(
+                    key,
+                    Stream {
+                        tcp: None,
+                        phase: Phase::UdpInbound,
+                        to_guest: Vec::new(),
+                        to_guest_at: 0,
+                        from_guest: VecDeque::new(),
+                        from_guest_at: 0,
+                        tcp_eof: false,
+                        guest_eof: false,
+                        reading: false,
+                        writing: false,
+                        partial: Vec::new(),
+                    },
+                );
+                self.udp_inbound = Some(key);
+            }
+            Command::PublishUdp(published, socket, dst) => {
+                let fd = socket.as_raw_fd();
+                self.kq.read(fd, true);
+                self.udp_published_by_fd.insert(fd, published);
+                if let Some(old) = self.udp_published.insert(
+                    published,
+                    UdpPublish {
+                        socket,
+                        dst,
+                        flows: HashMap::new(),
+                    },
+                ) {
+                    self.retire_udp_publish(old);
+                }
+            }
+            Command::WithdrawUdp(published) => {
+                if let Some(old) = self.udp_published.remove(&published) {
+                    self.retire_udp_publish(old);
+                }
+            }
+            Command::Inbound(dst, mac) => {
                 let _ = mac.set_nodelay(true);
                 crate::sockbuf::widen(&mac);
                 if set_nonblocking(mac.as_raw_fd()).is_err() {
@@ -676,7 +865,7 @@ impl Loop {
                     key,
                     Stream {
                         tcp: Some(mac),
-                        phase: Phase::AwaitEstablished(port),
+                        phase: Phase::AwaitEstablished(dst),
                         to_guest: Vec::new(),
                         to_guest_at: 0,
                         from_guest: VecDeque::new(),
@@ -692,60 +881,65 @@ impl Loop {
         }
     }
 
-    /// A framed reply onto a DNS stream. A reply that will not fit in the
-    /// guest's credit right now is dropped: DNS retries, and a stalled
-    /// resolver stream must not pile up.
+    /// A framed reply onto a DNS stream: whole, now or when credit returns.
     fn dns_send(&mut self, key: ConnKey, id: u16, reply: &[u8]) {
         let mut frame = Vec::with_capacity(4 + reply.len());
         frame.extend_from_slice(&(reply.len() as u16).to_be_bytes());
         frame.extend_from_slice(&id.to_be_bytes());
         frame.extend_from_slice(reply);
-        let _ = self.shared.try_send(key, &frame);
+        self.queue_framed(key, frame);
+    }
+
+    /// Frames onto a DNS or UDP stream. What credit takes goes now; the
+    /// tail waits in the stream's backlog for the guest's next grant, so
+    /// a frame is never cut and abandoned. A backlog already full drops
+    /// the new frames whole instead.
+    fn queue_framed(&mut self, key: ConnKey, frames: Vec<u8>) {
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
+        let result = push_framed(
+            &self.shared,
+            key,
+            &mut stream.to_guest,
+            &mut stream.to_guest_at,
+            frames,
+        );
+        if result.is_err() {
+            self.close(key);
+        }
+    }
+
+    /// The backlog of a framed stream, tried again.
+    fn flush_framed(&mut self, key: ConnKey) {
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
+        if stream.to_guest_at >= stream.to_guest.len() {
+            return;
+        }
+        let result = push_framed(
+            &self.shared,
+            key,
+            &mut stream.to_guest,
+            &mut stream.to_guest_at,
+            Vec::new(),
+        );
+        if result.is_err() {
+            self.close(key);
+        }
     }
 
     /// Queries off a DNS stream: whole frames answered, a partial one kept.
     /// Frames from the guest's UDP stream: flows opened, datagrams sent,
     /// flows closed.
     fn udp_progress(&mut self, key: ConnKey) {
-        let memory = self.memory.clone();
+        if !self.gather(key) {
+            return;
+        }
         let Some(stream) = self.streams.get_mut(&key) else {
             return;
         };
-        let chunks = match self.shared.try_take_outbound(key) {
-            Outbound::Chunks(c) => c,
-            Outbound::Empty => return,
-            Outbound::Finished | Outbound::Gone => {
-                self.close(key);
-                return;
-            }
-        };
-        let mut heads: Vec<u16> = Vec::new();
-        let mut bytes = 0u32;
-        for chunk in chunks {
-            match chunk {
-                Chunk::Owned(v) => {
-                    bytes += v.len() as u32;
-                    stream.partial.extend_from_slice(&v);
-                }
-                Chunk::Guest { head, spans } => {
-                    if let Some(mem) = &memory {
-                        for (gpa, len) in &spans {
-                            let start = stream.partial.len();
-                            stream.partial.resize(start + len, 0);
-                            let _ = mem.read(*gpa, &mut stream.partial[start..]);
-                            bytes += *len as u32;
-                        }
-                    }
-                    heads.push(head);
-                }
-            }
-        }
-        if !heads.is_empty() {
-            self.shared.complete(heads);
-        }
-        if bytes > 0 {
-            self.shared.acknowledge(key, bytes);
-        }
         let mut at = 0usize;
         while stream.partial.len() - at >= UDP_HEADER {
             let h = &stream.partial[at..at + UDP_HEADER];
@@ -806,8 +1000,8 @@ impl Loop {
         stream.partial.drain(..at);
     }
 
-    /// A flow's socket has datagrams: each framed, the batch to the guest.
-    /// No credit means the batch is dropped, as UDP allows.
+    /// A flow's socket has datagrams: each framed, the batch to the guest,
+    /// whole frames only (`queue_framed`).
     fn udp_readable(&mut self, key: ConnKey, flow: u32) {
         let Some(socket) = self.udp_flows.get(&key).and_then(|f| f.get(&flow)) else {
             return;
@@ -817,6 +1011,12 @@ impl Loop {
         for _ in 0..64 {
             match socket.recv(&mut buf) {
                 Ok(n) => {
+                    if n > u16::MAX as usize {
+                        // Longer than the frame's length field can say; no
+                        // real datagram is, and one that were would arrive
+                        // with a length of zero.
+                        continue;
+                    }
                     batch.extend_from_slice(&(n as u16).to_be_bytes());
                     batch.extend_from_slice(&flow.to_be_bytes());
                     batch.push(UDP_KIND_DATA);
@@ -826,23 +1026,25 @@ impl Loop {
             }
         }
         if !batch.is_empty() {
-            let len = batch.len();
-            let r = self.shared.try_send_owned(key, batch, false);
-            tracing::debug!(flow, len, ok = r.is_ok(), "udp: replies to the guest");
+            tracing::debug!(flow, len = batch.len(), "udp: replies to the guest");
+            self.queue_framed(key, batch);
         }
     }
 
-    fn dns_progress(&mut self, key: ConnKey) {
+    /// What the guest has sent on a framed stream, appended to the
+    /// stream's `partial` and credited: `false` when there was nothing, or
+    /// the stream has ended (and been closed here).
+    fn gather(&mut self, key: ConnKey) -> bool {
         let memory = self.memory.clone();
         let Some(stream) = self.streams.get_mut(&key) else {
-            return;
+            return false;
         };
         let chunks = match self.shared.try_take_outbound(key) {
             Outbound::Chunks(c) => c,
-            Outbound::Empty => return,
+            Outbound::Empty => return false,
             Outbound::Finished | Outbound::Gone => {
                 self.close(key);
-                return;
+                return false;
             }
         };
         let mut heads: Vec<u16> = Vec::new();
@@ -872,6 +1074,152 @@ impl Loop {
         if bytes > 0 {
             self.shared.acknowledge(key, bytes);
         }
+        true
+    }
+
+    /// Frames from the agent's inbound UDP stream: a container's replies,
+    /// each to the client whose flow it names; a flow the agent closed.
+    fn udp_inbound_progress(&mut self, key: ConnKey) {
+        if !self.gather(key) {
+            return;
+        }
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
+        let mut at = 0usize;
+        while stream.partial.len() - at >= UDP_HEADER {
+            let h = &stream.partial[at..at + UDP_HEADER];
+            let len = u16::from_be_bytes([h[0], h[1]]) as usize;
+            let flow = u32::from_be_bytes([h[2], h[3], h[4], h[5]]);
+            let kind = h[6];
+            if stream.partial.len() - at - UDP_HEADER < len {
+                break;
+            }
+            let payload = &stream.partial[at + UDP_HEADER..at + UDP_HEADER + len];
+            at += UDP_HEADER + len;
+            match kind {
+                UDP_KIND_DATA => {
+                    if let Some(&(published, client)) = self.udp_inbound_flows.get(&flow)
+                        && let Some(publish) = self.udp_published.get(&published)
+                    {
+                        // A reply the client's socket cannot take is lost,
+                        // as UDP allows.
+                        let _ = publish.socket.send_to(payload, client);
+                    }
+                }
+                UDP_KIND_CLOSE => {
+                    if let Some((published, client)) = self.udp_inbound_flows.remove(&flow)
+                        && let Some(publish) = self.udp_published.get_mut(&published)
+                    {
+                        publish.flows.remove(&client);
+                    }
+                }
+                _ => {}
+            }
+        }
+        stream.partial.drain(..at);
+    }
+
+    /// A published UDP port has datagrams: each client's flow found or
+    /// opened, each datagram framed, the batch to the agent. Without the
+    /// agent's stream yet, or with the backlog full, they are lost, as UDP
+    /// allows. Flows nobody has used for a minute are closed on the way.
+    fn udp_published_readable(&mut self, published: Published) {
+        let Some(mux) = self.udp_inbound else {
+            // Drain, or the socket stays readable forever.
+            if let Some(publish) = self.udp_published.get(&published) {
+                let mut buf = [0u8; 65536];
+                while publish.socket.recv_from(&mut buf).is_ok() {}
+            }
+            return;
+        };
+        let Some(publish) = self.udp_published.get_mut(&published) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut batch: Vec<u8> = Vec::with_capacity(64 * 1500);
+        let mut buf = [0u8; 65536];
+        for _ in 0..64 {
+            let Ok((n, client)) = publish.socket.recv_from(&mut buf) else {
+                break;
+            };
+            if n > u16::MAX as usize {
+                continue;
+            }
+            let flow = match publish.flows.get_mut(&client) {
+                Some((flow, last)) => {
+                    *last = now;
+                    *flow
+                }
+                None => {
+                    let flow = self.udp_inbound_next;
+                    self.udp_inbound_next = self.udp_inbound_next.wrapping_add(1);
+                    publish.flows.insert(client, (flow, now));
+                    self.udp_inbound_flows.insert(flow, (published, client));
+                    batch.extend_from_slice(&(HEADER_LEN as u16).to_be_bytes());
+                    batch.extend_from_slice(&flow.to_be_bytes());
+                    batch.push(UDP_KIND_OPEN);
+                    batch.extend_from_slice(&header_bytes(publish.dst));
+                    tracing::debug!(flow, %client, %published, "udp: inbound flow opened");
+                    flow
+                }
+            };
+            batch.extend_from_slice(&(n as u16).to_be_bytes());
+            batch.extend_from_slice(&flow.to_be_bytes());
+            batch.push(UDP_KIND_DATA);
+            batch.extend_from_slice(&buf[..n]);
+        }
+        if now.duration_since(self.udp_inbound_swept) >= UDP_FLOW_IDLE {
+            self.udp_inbound_swept = now;
+            for publish in self.udp_published.values_mut() {
+                let stale: Vec<SocketAddr> = publish
+                    .flows
+                    .iter()
+                    .filter(|(_, (_, last))| now.duration_since(*last) >= UDP_FLOW_IDLE)
+                    .map(|(client, _)| *client)
+                    .collect();
+                for client in stale {
+                    if let Some((flow, _)) = publish.flows.remove(&client) {
+                        self.udp_inbound_flows.remove(&flow);
+                        batch.extend_from_slice(&0u16.to_be_bytes());
+                        batch.extend_from_slice(&flow.to_be_bytes());
+                        batch.push(UDP_KIND_CLOSE);
+                    }
+                }
+            }
+        }
+        if !batch.is_empty() {
+            self.queue_framed(mux, batch);
+        }
+    }
+
+    /// A published UDP port withdrawn: its socket forgotten, and every flow
+    /// it had closed on the agent's side too.
+    fn retire_udp_publish(&mut self, publish: UdpPublish) {
+        let fd = publish.socket.as_raw_fd();
+        self.kq.forget(fd);
+        self.udp_published_by_fd.remove(&fd);
+        let mut batch = Vec::new();
+        for (_, (flow, _)) in publish.flows {
+            self.udp_inbound_flows.remove(&flow);
+            batch.extend_from_slice(&0u16.to_be_bytes());
+            batch.extend_from_slice(&flow.to_be_bytes());
+            batch.push(UDP_KIND_CLOSE);
+        }
+        if !batch.is_empty()
+            && let Some(mux) = self.udp_inbound
+        {
+            self.queue_framed(mux, batch);
+        }
+    }
+
+    fn dns_progress(&mut self, key: ConnKey) {
+        if !self.gather(key) {
+            return;
+        }
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
         let mut at = 0usize;
         let mut replies: Vec<(u16, Vec<u8>)> = Vec::new();
         while stream.partial.len() - at >= 4 {
@@ -901,8 +1249,18 @@ impl Loop {
             return;
         };
         match stream.phase {
-            Phase::Dns => self.dns_progress(key),
-            Phase::UdpMux => self.udp_progress(key),
+            Phase::Dns => {
+                self.flush_framed(key);
+                self.dns_progress(key);
+            }
+            Phase::UdpMux => {
+                self.flush_framed(key);
+                self.udp_progress(key);
+            }
+            Phase::UdpInbound => {
+                self.flush_framed(key);
+                self.udp_inbound_progress(key);
+            }
             Phase::AwaitHeader => match self.shared.try_read_outbound(key, HEADER_LEN) {
                 Ok(Some(header)) => {
                     let Some(addr) = destination(&header) else {
@@ -929,15 +1287,23 @@ impl Loop {
                 Err(Gone) => self.close(key),
             },
             Phase::Connecting => {}
-            Phase::AwaitEstablished(port) => match self.shared.status(key) {
-                Status::Established => match self.shared.try_send(key, &port.to_be_bytes()) {
-                    Ok(2) => {
+            Phase::AwaitEstablished(dst) => match self.shared.status(key) {
+                Status::Established => match self.shared.try_send(key, &header_bytes(dst)) {
+                    Ok(HEADER_LEN) => {
                         let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();
                         stream.phase = Phase::Open;
                         stream.reading = true;
                         self.kq.read(fd, true);
                     }
-                    Ok(_) => {}
+                    Ok(0) => {}
+                    // A header the guest's credit cut in two cannot be
+                    // finished without a second copy of its first bytes;
+                    // a fresh connection has its whole window, so this is
+                    // a connection that is wrong, not one that is slow.
+                    Ok(n) => {
+                        tracing::debug!(n, "inbound: the header did not fit the guest's credit");
+                        self.close(key);
+                    }
                     Err(Gone) => self.close(key),
                 },
                 Status::Connecting => {}
@@ -1230,6 +1596,15 @@ impl Loop {
     }
 
     fn close(&mut self, key: ConnKey) {
+        if self.udp_inbound == Some(key) {
+            // The agent's stream is gone, and every inbound flow with it;
+            // the published sockets stay, for the stream that replaces it.
+            self.udp_inbound = None;
+            self.udp_inbound_flows.clear();
+            for publish in self.udp_published.values_mut() {
+                publish.flows.clear();
+            }
+        }
         if let Some(flows) = self.udp_flows.remove(&key) {
             for (_, socket) in flows {
                 let fd = socket.as_raw_fd();
@@ -1270,6 +1645,97 @@ mod tests {
                 destination(&header),
                 Some("127.0.0.1:8080".parse().unwrap())
             );
+        }
+    }
+
+    fn framed_stream(credit: u32) -> (Arc<VsockShared>, ConnKey, std::os::unix::net::UnixStream) {
+        let shared = Arc::new(VsockShared::new());
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let key = shared.open(2380, ours);
+        shared.establish_for_test(key, credit);
+        (shared, key, theirs)
+    }
+
+    fn frames(n: usize, len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for flow in 0..n {
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+            out.extend_from_slice(&(flow as u32).to_be_bytes());
+            out.push(UDP_KIND_DATA);
+            out.extend(std::iter::repeat_n(flow as u8, len));
+        }
+        out
+    }
+
+    /// The bug this guards against: a batch of frames cut at the guest's
+    /// credit and the cut-off tail thrown away, after which the guest's
+    /// frame reader takes payload bytes for a header and never recovers.
+    #[test]
+    fn a_framed_batch_beyond_the_credit_is_finished_when_credit_returns() {
+        let (shared, key, _peer) = framed_stream(100);
+        let batch = frames(3, 50);
+        let mut backlog = Vec::new();
+        let mut at = 0;
+        push_framed(&shared, key, &mut backlog, &mut at, batch.clone()).unwrap();
+        assert_eq!(shared.queued_for_test(key), &batch[..100]);
+        assert_eq!(
+            &backlog[at..],
+            &batch[100..],
+            "the tail is kept, not dropped"
+        );
+
+        shared.drain_for_test(key);
+        push_framed(&shared, key, &mut backlog, &mut at, Vec::new()).unwrap();
+        assert_eq!(
+            shared.queued_for_test(key),
+            &batch[100..],
+            "the rest goes when the guest grants credit again"
+        );
+        assert!(backlog.is_empty() && at == 0);
+    }
+
+    #[test]
+    fn frames_arriving_behind_a_backlog_queue_behind_it_in_order() {
+        let (shared, key, _peer) = framed_stream(10);
+        let first = frames(1, 20);
+        let second = frames(1, 20);
+        let mut backlog = Vec::new();
+        let mut at = 0;
+        push_framed(&shared, key, &mut backlog, &mut at, first.clone()).unwrap();
+        push_framed(&shared, key, &mut backlog, &mut at, second.clone()).unwrap();
+        // Ten bytes of credit at a time, as the guest consumes.
+        let mut seen = shared.queued_for_test(key);
+        for _ in 0..8 {
+            shared.drain_for_test(key);
+            push_framed(&shared, key, &mut backlog, &mut at, Vec::new()).unwrap();
+            seen.extend(shared.queued_for_test(key));
+        }
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        assert_eq!(seen, expected);
+        assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn a_full_backlog_drops_new_frames_whole() {
+        let (shared, key, _peer) = framed_stream(0);
+        let mut backlog = vec![0u8; FRAMED_BACKLOG];
+        let mut at = 0;
+        let before = backlog.len();
+        push_framed(&shared, key, &mut backlog, &mut at, frames(1, 8)).unwrap();
+        assert_eq!(
+            backlog.len(),
+            before,
+            "nothing of the new frame is appended"
+        );
+        assert!(shared.queued_for_test(key).is_empty());
+    }
+
+    #[test]
+    fn a_header_round_trips_through_its_bytes() {
+        for addr in ["192.168.127.2:18098", "[::1]:18097", "[fd6c::2]:53"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert_eq!(destination(&header_bytes(addr)), Some(addr));
         }
     }
 

@@ -196,7 +196,7 @@ impl Balloon {
     fn release_run(&self, mem: &GuestMemory, first: u32, last: u32) -> u64 {
         let gpa = u64::from(first) * BALLOON_PAGE_SIZE;
         let len = (u64::from(last) - u64::from(first) + 1) * BALLOON_PAGE_SIZE;
-        mem.release(gpa, len).unwrap_or(0)
+        mem.release_thoroughly(gpa, len).unwrap_or(0)
     }
 
     /// Handles the free page reporting queue.
@@ -208,12 +208,14 @@ impl Balloon {
         let mut used_any = false;
         while let Some(chain) = queue.pop(mem) {
             let head = chain.head();
-            let mut released = 0u64;
-            let mut offered = 0u64;
-            for desc in chain {
-                offered += u64::from(desc.len);
-                released += mem.release(desc.addr, u64::from(desc.len)).unwrap_or(0);
-            }
+            // Copy the descriptors before releasing any pages, then merge
+            // adjacent buffers while the guest still waits for this request.
+            let mut spans: Vec<_> = chain.map(|desc| (desc.addr, u64::from(desc.len))).collect();
+            let offered: u64 = spans.iter().map(|(_, len)| len).sum();
+            let released = mem.release_reported(&mut spans).unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not release reported pages");
+                0
+            });
             self.state
                 .offered_bytes
                 .fetch_add(offered, Ordering::Relaxed);

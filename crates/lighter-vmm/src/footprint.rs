@@ -7,9 +7,9 @@
 //! virtual machines and exactly the thing this project exists to fix.
 //!
 //! `phys_footprint` is the number macOS itself uses for memory pressure and
-//! for what Activity Monitor calls "Memory". Pages handed back with
-//! `MADV_FREE_REUSABLE` leave it immediately, which makes it the honest
-//! measure of whether the balloon and free page reporting are doing anything.
+//! for what Activity Monitor calls "Memory". Released guest pages get fresh
+//! mappings, so freeing them removes their charge and guest reuse restores
+//! it. MADV_FREE_REUSABLE alone cannot maintain that accounting on reuse.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -61,6 +61,23 @@ unsafe extern "C" {
 }
 
 /// This process's physical footprint, in bytes. Zero if it cannot be read.
+/// What macOS holds compressed of this process, as of the last `sample`:
+/// the release path reads it on every call, so it is a load, not a
+/// `task_info`.
+static COMPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Samples the split and remembers the compressed figure (`compressed`).
+pub fn sample() -> (u64, u64, u64, u64) {
+    let split = self::split();
+    COMPRESSED.store(split.3, std::sync::atomic::Ordering::Relaxed);
+    split
+}
+
+/// The compressed figure from the last `sample`.
+pub fn compressed() -> u64 {
+    COMPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn bytes() -> u64 {
     let mut info = TaskVmInfo::default();
     let mut count = TASK_VM_INFO_COUNT
@@ -79,7 +96,7 @@ pub fn bytes() -> u64 {
 }
 
 /// Resident, internal (anonymous) and reusable bytes, for a trace.
-pub fn split() -> (u64, u64, u64) {
+pub fn split() -> (u64, u64, u64, u64) {
     let mut info = TaskVmInfo::default();
     let mut count = TASK_VM_INFO_COUNT
         .min((std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<u32>()) as libc::c_uint);
@@ -93,9 +110,14 @@ pub fn split() -> (u64, u64, u64) {
         )
     };
     if rc != 0 {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     } else {
-        (info.resident_size, info.internal, info.reusable)
+        (
+            info.resident_size,
+            info.internal,
+            info.reusable,
+            info.compressed,
+        )
     }
 }
 

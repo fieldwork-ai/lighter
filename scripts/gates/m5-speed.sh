@@ -78,8 +78,12 @@ median() {
 		| awk '{ v[NR] = $1 } END { if (NR == 0) print ""; else print v[int((NR + 1) / 2)] }'
 }
 
-NATIVE=benchmarks/results/native.csv
-OURS=benchmarks/results/lighter.csv
+# The gate's own files. `benchmarks/results/native.csv` and `lighter.csv` are
+# the record the README is generated from; a gate that wrote there replaced the
+# record's quiet-machine numbers with its pass numbers, which was found the
+# morning of 0.3.0 with the record freshly committed.
+NATIVE=benchmarks/results/gate-native.csv
+OURS=benchmarks/results/gate-lighter.csv
 
 native_is_fresh() {
 	[ "${REFRESH_NATIVE:-0}" = 1 ] && return 1
@@ -98,10 +102,10 @@ if native_is_fresh; then
 	echo "==> Reusing the native baseline ($(date -r "$NATIVE" '+%Y-%m-%d'); REFRESH_NATIVE=1 to redo it)"
 else
 	echo "==> Measuring macOS itself"
-	./benchmarks/run.sh --target native --reps "$REPS" --cases "$CASES" ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
+	./benchmarks/run.sh --target native --reps "$REPS" --cases "$CASES" --label gate-native ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
 fi
 echo "==> Measuring the share"
-./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
+./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" --label gate-lighter ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
 
 echo
 compare() {

@@ -156,6 +156,20 @@ if [ -b "$DATA_DEV" ]; then
 	echo none > "/sys/block/${DATA_DEV#/dev/}/queue/scheduler" 2>/dev/null
 	if mount -o "$DATA_OPTS" "$DATA_DEV" /mnt/data; then
 		echo "INIT data=mounted"
+		# `lighter.data_warm=<GiB>`: an experiment's knob. btrfs allocates
+		# its block groups on first use, a gigabyte of data at a time with
+		# the chunk, device and free-space trees written for each; a file
+		# preallocated and removed leaves the groups behind, so a first
+		# write onto never-used space costs what a write onto used space
+		# does. Measured against the first-touch cost of the guest's disk.
+		for arg in $(cat /proc/cmdline); do
+			case "$arg" in
+			lighter.data_warm=*)
+				warm="${arg#lighter.data_warm=}"
+				fallocate -l "${warm}G" /mnt/data/.warm 2>/dev/null && rm -f /mnt/data/.warm && sync && echo "INIT data_warm=${warm}G"
+				;;
+			esac
+		done
 		mkdir -p /mnt/data/docker
 		mount --bind /mnt/data/docker /var/lib/docker
 		# The first trim after a mount covers every free block group, so
@@ -186,6 +200,25 @@ else
 	echo "INIT data=absent"
 fi
 
+# --- zram ------------------------------------------------------------------
+# Swap into compressed RAM, for a guest with nothing left: the kernel
+# reaches for it only under real pressure (vm.swappiness is zero below), and
+# a guest sized by virtio-mem rarely sees any. The agent's trims never swap:
+# moving dockerd and containerd here at idle was measured at 60 MiB less and
+# a second on the next docker command. `lighter.zram=0` leaves it out.
+if [ -e /sys/block/zram0/disksize ] && ! grep -qw lighter.zram=0 /proc/cmdline; then
+	echo 2G > /sys/block/zram0/disksize 2>/dev/null \
+		&& mkswap /dev/zram0 >/dev/null 2>&1 \
+		&& swapon -p 100 /dev/zram0 2>/dev/null \
+		&& echo "INIT zram=on" || echo "INIT zram=off"
+	# Swap is for the agent's trims and for a guest with nothing left, not
+	# for the kernel's ordinary reclaim: an install's working set is its
+	# cache, and a kernel that swapped a little of node's heap to keep
+	# more of it read yarn a tenth slower on the M1 and npm on its own
+	# disk half as fast again on the M5.
+	sysctl -q -w vm.swappiness=0 2>/dev/null || true
+fi
+
 # --- containerd -----------------------------------------------------------
 # Started here, the moment the data disk is there, rather than by dockerd.
 # dockerd's own managed containerd is started and then polled once a second,
@@ -208,14 +241,51 @@ echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
 # at HZ=250; expedited they are microseconds. `docker run --rm alpine true`
 # 150 to 110 ms on the M5, with installs and idle unchanged (2026-09-05).
 echo 1 > /sys/kernel/rcu_expedited 2>/dev/null || true
+# Not every wait is a synchronize_rcu: taking a network device down ends in
+# rcu_barrier, twice, and those are normal grace periods whatever the switch
+# above says. The grace-period thread sleeps one jiffy before its first
+# scan for quiescent CPUs; with most vCPUs idle there is nothing to wait
+# for, and told not to it finds them at once. A/B/A on the M5: a container
+# run 150 → 131–140 → 149–158 ms, veth delete 45 → 31 ms, idle unchanged.
+# The next-scan interval stays at its default: zero there would spin the
+# thread through a long grace period.
+echo 0 > /sys/module/rcutree/parameters/jiffies_till_first_fqs 2>/dev/null || true
+# containerd 2 splits CRI into three plugins, and with only the gRPC one
+# off the runtime plugin still ran its event monitor's one-second
+# back-off ticker: with Go's sysmon and poller behind each firing, a fifth
+# of the wakeups an idle guest made were a Kubernetes shim in a Docker
+# guest. NRI exists for CRI. The optional plugins beyond these (the
+# cgroup monitor and metrics, tracing, the restart monitor) were measured
+# and cost nothing; the health-check plugin must stay, since dockerd polls
+# it and reconnects in a storm without it.
+# The garbage collector's scheduler (plugins/gc/scheduler.go) collects once
+# at start-up, then, whenever its timer fires with nothing to collect,
+# re-arms it for its interval and waits again — for the life of the
+# process. The interval after a collection is the average collection time
+# over the pause threshold, 5 ms over 0.02: a quarter of a second. That
+# loop was every one of containerd's idle wakeups (135 in 8 s against 5
+# with it off) and a third of an idle guest's timer interrupts. No
+# start-up delay means no start-up collection, so the loop never arms on a
+# machine that runs nothing; a pause threshold of zero leaves the interval
+# at a second for after the first collection a deletion does trigger. The
+# fix that belongs upstream is the scheduler not re-arming when there is
+# nothing to do.
 cat > /run/containerd.toml <<'TOML'
 version = 2
-disabled_plugins = ["io.containerd.grpc.v1.cri"]
+disabled_plugins = ["io.containerd.grpc.v1.cri", "io.containerd.cri.v1.runtime", "io.containerd.cri.v1.images", "io.containerd.nri.v1.nri"]
+[plugins."io.containerd.gc.v1.scheduler"]
+  startup_delay = "0s"
+  pause_threshold = 0.0
 TOML
 # A fresh shell rather than a subshell: in a subshell `$$` is still the
 # parent's pid, and the engine ran in the root cgroup for a day.
+# The engine is shielded from the OOM killer (-900; the agent is -1000):
+# a container filling memory faster than the guest can grow had the killer
+# take dockerd, containerd and the agent by their size before it took the
+# writer, and the machine with them. Containers themselves stay at zero.
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	echo -900 > /proc/self/oom_score_adj 2>/dev/null
 	exec containerd \
 		--config /run/containerd.toml \
 		--address /run/containerd/containerd.sock \
@@ -231,10 +301,15 @@ CONTAINERD_PID=$!
 # x86-64 header and runs the interpreter against it.
 #
 # The interpreter is Rosetta when the host attached its share (the command
-# line says `lighter.rosetta`), and qemu otherwise. Rosetta runs x86-64 at
-# about two thirds of native speed; qemu at about a tenth. Rosetta asks the
-# kernel for x86 memory ordering on its own threads (PR_SET_MEM_MODEL, kernel
-# patch 0023); nothing here has to.
+# line says `lighter.rosetta`). Rosetta runs x86-64 at about two thirds of
+# native speed and asks the kernel for x86 memory ordering on its own threads
+# (PR_SET_MEM_MODEL, kernel patch 0023); nothing here has to. There is no
+# emulator behind it: qemu ran the same programs at a tenth of native speed,
+# which is slow enough to read as broken, and shipped an emulator in every
+# image for the Macs that had not installed Rosetta. Without the share, the
+# handler is a copy of the agent that says what to install and exits, so an
+# amd64 image fails with the fix in its output rather than "exec format
+# error".
 #
 # The `F` flag is the load-bearing one. Without it the kernel resolves the
 # interpreter path at exec time — inside the container's mount namespace, where
@@ -244,9 +319,9 @@ CONTAINERD_PID=$!
 # binary itself with the caller's credentials, which is what lets a setuid
 # program inside a container behave.
 if mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null; then
-	interpreter=/usr/bin/qemu-x86_64
-	via=qemu
-	flags=FP
+	interpreter=/sbin/lighter-noamd64
+	via=hint
+	flags=F
 	if grep -qw lighter.rosetta /proc/cmdline; then
 		mkdir -p /mnt/rosetta
 		if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null && [ -x /mnt/rosetta/rosetta ]; then
@@ -329,13 +404,32 @@ sysctl -q -w net.core.wmem_max=16777216 net.core.rmem_max=16777216 fs.pipe-max-s
 # reporting hands the host, and a third of what the trim freed came back
 # over thirty seconds as compaction worked around them, or not at all.
 echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
+# The per-CPU vm statistics fold once a second by default, a work item on
+# every vCPU whose counters moved: on an idle 9-vCPU guest, 4 of its 38
+# wakeups a second. Once every ten seconds is soon enough for /proc/vmstat;
+# the kernel's own reclaim decisions read the counters directly.
+sysctl -q -w vm.stat_interval=10 2>/dev/null || true
+# khugepaged scans for pages to collapse every ten seconds and drains every
+# CPU's LRU lists first — nine kworkers woken for a scan of an idle guest
+# that finds nothing. Once a minute is plenty for a machine whose memory
+# turns over between commands anyway.
+echo 60000 > /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs 2>/dev/null || true
 # TCP inside the guest carries a container's stream to the agent; its
 # windows are what lets that leg run ahead of the vsock leg behind it. The
 # defaults top out at 4 and 6 MB.
 sysctl -q -w net.ipv4.tcp_wmem="4096 262144 16777216" net.ipv4.tcp_rmem="4096 1048576 16777216" 2>/dev/null || true
 if [ -e /sys/class/net/eth0 ]; then
+	# IPv6 on the link is static, like the lease with no expiry: no router
+	# advertisements to accept, a forwarding host (dockerd would turn that
+	# on anyway, and a forwarding host ignores advertisements), the
+	# gateway's link-layer address pinned so nothing is solicited.
+	sysctl -q -w net.ipv6.conf.eth0.accept_ra=0 net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 	ip link set eth0 up
 	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok t=$(cut -d' ' -f1 /proc/uptime)" || echo "INIT dhcp=failed"
+	ip -6 addr add fd6c:6967:6874::2/64 dev eth0 nodad 2>/dev/null \
+		&& ip -6 neigh replace fd6c:6967:6874::1 lladdr 5a:94:ef:e4:0c:dd dev eth0 nud permanent 2>/dev/null \
+		&& ip -6 route add default via fd6c:6967:6874::1 dev eth0 2>/dev/null \
+		&& echo "INIT ipv6=ok" || echo "INIT ipv6=failed"
 fi
 
 # --- The engine -----------------------------------------------------------
@@ -377,12 +471,14 @@ dockerd_debug=""
 grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
+	echo -900 > /proc/self/oom_score_adj 2>/dev/null
 	exec dockerd $2 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \
 		--data-root=/var/lib/docker \
 		--storage-driver=overlay2 \
 		--mtu="$1" \
+		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
 		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
 DOCKERD_PID=$!
 
@@ -443,6 +539,7 @@ fi
 	"$AGENT" --tcp-proxy 15201 &
 	"$AGENT" --udp-proxy 15202 &
 	"$AGENT" --inbound 2378 &
+	"$AGENT" --udp-inbound &
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
 	# container and drops loopback nameservers on the way.
@@ -467,15 +564,24 @@ table inet lighter {
 	# header; conntrack answers only for a connected socket). TPROXY hands
 	# the datagram over untouched — the agent's socket is transparent — and
 	# the policy route below is what makes a foreign destination deliverable
-	# locally. DNS and DHCP excepted, as for TCP's redirect.
+	# locally. DHCP excepted (the VMM answers it on the device); DNS is not:
+	# the agent's resolver is on eth0's own address, which is never `oif
+	# eth0`, and a container that names a resolver of its own (`--dns
+	# 8.8.8.8`, `dig @1.1.1.1`) is a flow like any other. With 53 excepted
+	# those datagrams reached the card and were dropped.
 	chain divert {
 		type filter hook prerouting priority mangle; policy accept;
-		meta l4proto udp udp dport != { 53, 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
+		meta l4proto udp udp dport != { 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
+		meta l4proto udp udp dport != { 546, 547 } fib daddr oif "eth0" tproxy ip6 to :15202 meta mark set 0x1 accept
 	}
 }
 EOF
 	ip rule add fwmark 0x1 lookup 100 2>/dev/null
 	ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+	# The same for v6, which needs the kernel's v6 policy routing; a kernel
+	# without it must not take init down with the rule (init is `set -e`).
+	{ ip -6 rule add fwmark 0x1 lookup 100 && ip -6 route add local ::/0 dev lo table 100; } 2>/dev/null \
+		|| echo "INIT ipv6_policy=failed"
 	if nft -f /run/lighter.nft 2>/dev/console; then
 		echo "INIT streams=on"
 	else

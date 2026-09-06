@@ -1,0 +1,77 @@
+sockmap: the backlog's park after EAGAIN backs off
+
+When a redirect's target refuses with EAGAIN the backlog worker parks for a
+jiffy and tries again, and does so for as long as the refusals last. For a
+target that is merely full that is right, and patch 0017's write-space
+callback pulls the timer forward the moment there is room, so the jiffy is
+rarely even waited out. For a target that never drains — a peer gone quiet
+without closing, a socket whose reader has left — it is a worker re-armed
+on every tick until the socket dies: the CPU it runs on never stops its
+tick, which read as one vCPU at 250 timer interrupts a second and the
+Mac's process at 374 wakeups a second where an idle machine reads 150, for
+as long as the connection lived. Caught on the M1 after the benchmark's
+network cases: `kworker/0:0-events` woken 668 times in five seconds, its
+one sampled stack in sk_psock_backlog, CPU0's idle_sleeps frozen while
+idle_calls climbed.
+
+The park now doubles from a jiffy to a quarter of a second while the
+refusals continue and resets on any progress. The write-space callback is
+unchanged, so a flow-controlled stream loses nothing; a dead one costs
+four wakeups a second instead of two hundred and fifty.
+
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -122,6 +122,8 @@ struct sk_psock {
+ 	struct delayed_work		work;
+ 	struct sock			*sk_pair;
+ 	struct rcu_work			rwork;
++	/* lighter: the backlog's next park after EAGAIN, in jiffies. */
++	unsigned int			backlog_park;
+ };
+ 
+ int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -669,6 +669,23 @@ static void sk_psock_skb_state(struct sk_psock *psock,
+ 	spin_unlock_bh(&psock->ingress_lock);
+ }
+ 
++/* lighter: how long the backlog parks after its target refused with
++ * EAGAIN. A jiffy the first time, doubling to a quarter of a second while
++ * the refusals continue; any progress resets it, and the target's
++ * write-space callback pulls the timer forward the moment there is room,
++ * so a stream that is merely flow-controlled loses nothing. Without the
++ * doubling a redirect into a socket that never drains re-armed this worker
++ * on every tick, and held a CPU's tick at HZ for as long as the socket
++ * lived.
++ */
++static unsigned long sk_psock_backlog_park(struct sk_psock *psock)
++{
++	unsigned int park = psock->backlog_park;
++
++	psock->backlog_park = min_t(unsigned int, park ? park * 2 : 2, HZ / 4);
++	return park ? park : 1;
++}
++
+ static void sk_psock_backlog(struct work_struct *work)
+ {
+ 	struct delayed_work *dwork = to_delayed_work(work);
+@@ -726,7 +743,8 @@ static void sk_psock_backlog(struct work_struct *work)
+ 					 * other work that might be here.
+ 					 */
+ 					if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
+-						schedule_delayed_work(&psock->work, 1);
++						schedule_delayed_work(&psock->work,
++								      sk_psock_backlog_park(psock));
+ 					goto end;
+ 				}
+ 				/* Hard errors break pipe and stop xmit. */
+@@ -736,6 +754,7 @@ static void sk_psock_backlog(struct work_struct *work)
+ 			}
+ 			off += ret;
+ 			len -= ret;
++			psock->backlog_park = 0;
+ 		} while (len);
+ 
+ 		/* The entire skb sent, clear state */
+ 

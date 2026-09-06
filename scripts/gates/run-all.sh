@@ -17,6 +17,8 @@ GATES=(
 	"m3  network:m3-network.sh"
 	"m3  vsock:m3-vsock.sh"
 	"m3  docker:m3-docker.sh"
+	"m3  streams:m3-streams.sh"
+	"m3  publish:m3-publish.sh"
 	"m4  filesystem:m4-fs.sh"
 	"m5  speed:m5-speed.sh"
 	"m6  memory:m6-memory.sh"

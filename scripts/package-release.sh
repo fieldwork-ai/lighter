@@ -8,7 +8,7 @@
 #   share/lighter/Image     (guest kernel)
 #   share/lighter/rootfs.ext4 (sparse Alpine rootfs)
 #   share/lighter/entitlements.plist
-#   LICENSE, README.md
+#   LICENSE-MIT, LICENSE-APACHE, README.md
 #
 # The binaries are signed with Apple Developer ID Application and submitted to
 # Apple's notarytool so Gatekeeper accepts them without quarantine blocks.
@@ -110,13 +110,14 @@ echo "==> Signing identity: $IDENTITY"
 echo "==> Building lighter-cli release binary"
 cargo build --release -p lighter-cli
 
+# Both kernels: the CLI picks one by the vCPU count against the Mac's cores.
 for artifact in guest/out/Image guest/out/rootfs.ext4; do
 	[ -f "$artifact" ] || { echo "error: $artifact is missing; run 'make guest'" >&2; exit 1; }
 done
 
 cp target/release/lighter "$STAGE/bin/lighter"
 cp guest/out/Image guest/out/rootfs.ext4 "$STAGE/share/lighter/"
-cp LICENSE README.md "$STAGE/"
+cp LICENSE-MIT LICENSE-APACHE README.md "$STAGE/"
 cp entitlements.plist "$STAGE/share/lighter/"
 # The bundle `lighter start` runs the machine from, shipped rather than
 # built on the user's Mac: Gatekeeper assesses an app bundle at first launch,

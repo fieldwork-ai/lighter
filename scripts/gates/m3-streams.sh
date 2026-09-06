@@ -142,14 +142,29 @@ print(ok)"' 2>/dev/null | tail -1)"
 
 # dns and icmp stay on the network device
 $D run --rm alpine:3.21 nslookup example.com >/dev/null 2>&1 && pass "DNS from a container" || fail "DNS failed"
+# a resolver of the container's own is a UDP flow like any other (port 53
+# was once exempt from the divert, and those datagrams were dropped)
+got="$($D run --rm alpine:3.21 sh -c 'apk add -q bind-tools >/dev/null 2>&1 && dig +time=5 +tries=1 +short @8.8.8.8 example.com A' 2>/dev/null | grep -c '^[0-9]')"
+[ "${got:-0}" -gt 0 ] && pass "UDP to an external resolver (dig @8.8.8.8)" || fail "external resolver over UDP: dig got nothing"
 $D run --rm alpine:3.21 ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && pass "ICMP from a container" || fail "ping failed"
 
-# ipv6, when the Mac has it
+# ipv6: a container has an address and a default route of its own either
+# way; with a v6 route on the Mac a v6 destination is reached over TCP, UDP
+# and ICMP and AAAA is answered, without one AAAA is withheld so nothing
+# tries v6 first.
+route="$($D run --rm alpine:3.21 ip -6 route show default 2>/dev/null)"
+[ -n "$route" ] && pass "a container has a v6 default route" || fail "IPv6: no v6 default route in a container"
+aaaa="$($D run --rm alpine:3.21 nslookup -type=AAAA example.com 2>/dev/null | grep -cE '^Address: .*:.*:')"
 if curl -6 -s -o /dev/null --max-time 5 https://example.com 2>/dev/null; then
 	code="$($D run --rm curlimages/curl:8.11.1 -6 -s -o /dev/null -w '%{http_code}' --max-time 15 https://example.com 2>/dev/null)"
 	[ "$code" = 200 ] && pass "IPv6 destination over the stream" || fail "IPv6: http_code=${code:-none}"
+	[ "${aaaa:-0}" -gt 0 ] && pass "AAAA answered on a Mac with a v6 route" || fail "IPv6: no AAAA for example.com"
+	got="$($D run --rm alpine:3.21 sh -c 'apk add -q bind-tools >/dev/null 2>&1 && dig -6 +time=5 +tries=1 +short @2001:4860:4860::8888 example.com A' 2>/dev/null | grep -c '^[0-9]')"
+	[ "${got:-0}" -gt 0 ] && pass "UDP over IPv6 (dig to a v6 resolver)" || fail "IPv6 UDP: dig over v6 got nothing"
+	$D run --rm alpine:3.21 ping -6 -c 1 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && pass "ICMPv6 from a container" || fail "ping6 failed"
 else
-	echo "  ··   IPv6: the Mac has no v6 route; skipped"
+	echo "  ··   IPv6: the Mac has no v6 route; egress checks skipped"
+	[ "${aaaa:-0}" -eq 0 ] && pass "AAAA withheld on a Mac without a v6 route" || fail "IPv6: AAAA answered with no v6 route on the Mac"
 fi
 
 # nothing on eth0 while all that happened, beyond DNS and ICMP

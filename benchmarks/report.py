@@ -30,11 +30,12 @@ CASES = [
 ]
 
 # The runtime's cost to the Mac, in MiB rather than milliseconds: the
-# physical footprint of its processes as Activity Monitor accounts it, settled
-# before an install, at the peak through one, and fifteen and sixty seconds
-# after it ends. Reported in their own table; `native` has no runtime.
+# physical footprint of its processes as Activity Monitor accounts it, idle a
+# minute after a cold start (the boot case's reading), at the peak through an
+# install, and fifteen and sixty seconds after it ends. Reported in their own
+# table; `native` has no runtime.
 MEMORY_CASES = [
-    ("memory-settled", "settled, before an install"),
+    ("memory-idle", "idle, a minute after start"),
     ("memory-peak", "peak through an npm install"),
     ("memory-after-15s", "15 s after it ends"),
     ("memory-after-60s", "60 s after it ends"),
@@ -83,6 +84,17 @@ POWER_CASES = [
 BOOT_CASES = [
     ("boot-docker", "start until docker answers"),
     ("boot-first-container", "start until the first container has run"),
+]
+
+# x86-64 images on an Apple silicon runtime, from `<target>-amd64.csv`: the
+# runs of `run.sh --arch amd64 --where guest`. An install that mostly waits,
+# straight-line computation, and a container's start, so the translator's
+# price shows on each kind of work rather than as one number.
+AMD64_CASES = [
+    ("npm-install", "`npm ci`"),
+    ("pnpm-install", "`pnpm install`"),
+    ("cpu-sha256", "`sha256sum` of 1 GiB"),
+    ("container-start", "container start, `alpine true`"),
 ]
 
 # Cases the native ratio says nothing useful about. `watch-latency` is the

@@ -15,6 +15,7 @@
 
 mod sockmap;
 mod udp;
+mod udp_inbound;
 mod vsock;
 
 use std::io::{self, Read, Write};
@@ -24,6 +25,27 @@ use std::os::unix::net::UnixStream;
 use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
+    // Last to go when the guest runs out of memory: the machine is dead
+    // without the agent, and the OOM killer chose it once by size.
+    let _ = std::fs::write("/proc/self/oom_score_adj", "-1000");
+
+    // Run under its other name, this is the binfmt handler for x86-64 on a
+    // machine whose Mac has no Rosetta: the kernel hands it every amd64
+    // program with the program's own path as the first argument. Say what
+    // to do and stop, so `docker run --platform linux/amd64 …` prints the
+    // fix instead of "exec format error". `/proc/self/exe` and not argv[0]:
+    // binfmt_misc puts the program's path there, not the interpreter's.
+    if std::fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n == "lighter-noamd64"))
+        .unwrap_or(false)
+    {
+        let program = std::env::args().nth(1).unwrap_or_default();
+        eprintln!(
+            "lighter: {program} is an x86-64 program, and this Mac has no Rosetta to run it. Install it once with `lighter rosetta --install` on the Mac, then `lighter stop` and `lighter start`."
+        );
+        return std::process::ExitCode::from(126);
+    }
     let mut port: u32 = 2375;
     let mut target: Option<String> = None;
     let mut echo = false;
@@ -32,6 +54,7 @@ fn main() -> std::process::ExitCode {
     let mut inbound: Option<u32> = None;
     let mut dns: Option<String> = None;
     let mut udp_proxy: Option<u16> = None;
+    let mut udp_inbound = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -59,6 +82,9 @@ fn main() -> std::process::ExitCode {
             // Takes the UDP datagrams netfilter redirects to it and carries
             // every flow to the host over one vsock stream (see udp.rs).
             "--udp-proxy" => udp_proxy = args.next().and_then(|v| v.parse().ok()),
+            // The other direction for UDP: the host's flows to published
+            // UDP ports arrive on one vsock stream (see udp_inbound.rs).
+            "--udp-inbound" => udp_inbound = true,
             "--bpf-probe" => {
                 sockmap::probe();
                 return std::process::ExitCode::SUCCESS;
@@ -77,18 +103,48 @@ fn main() -> std::process::ExitCode {
         return serve_inbound(port);
     }
     if let Some(port) = udp_proxy {
-        let host = match vsock::connect(udp::UDP_PORT) {
-            Ok(fd) => fd,
+        // One proxy per family, each with its own stream to the host: a
+        // v4 socket and a v6-only socket on the same port, the flows of
+        // each on their own mux.
+        let stream = || match vsock::connect(udp::UDP_PORT) {
+            Ok(fd) => {
+                let _ = vsock::set_buffer(&fd, STREAM_WINDOW);
+                Ok(Fd(fd))
+            }
             Err(e) => {
                 eprintln!("lighter-agent: udp stream to host refused: {e}");
+                Err(e)
+            }
+        };
+        let (Ok(host4), Ok(host6)) = (stream(), stream()) else {
+            return std::process::ExitCode::FAILURE;
+        };
+        std::thread::spawn(move || {
+            if let Err(e) = udp::serve(port, host6, true) {
+                eprintln!("lighter-agent: udp proxy (v6): {e}");
+            }
+        });
+        return match udp::serve(port, host4, false) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("lighter-agent: udp proxy: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if udp_inbound {
+        let host = match vsock::connect(udp_inbound::UDP_INBOUND_PORT) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("lighter-agent: udp inbound stream to host refused: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         };
         let _ = vsock::set_buffer(&host, STREAM_WINDOW);
-        return match udp::serve(port, Fd(host)) {
+        return match udp_inbound::serve(Fd(host)) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("lighter-agent: udp proxy: {e}");
+                eprintln!("lighter-agent: udp inbound: {e}");
                 std::process::ExitCode::FAILURE
             }
         };
@@ -103,6 +159,20 @@ fn main() -> std::process::ExitCode {
 
     if control {
         std::thread::spawn(bound_container_cache);
+        // The clock, as soon as there is an agent to ask for it: the seed on
+        // the command line is a whole second old before the kernel starts.
+        std::thread::spawn(|| {
+            for attempt in 0..50u32 {
+                match sync_clock_from_host() {
+                    Ok(trip) => {
+                        println!("AGENT clock=set trip_us={} attempt={attempt}", trip / 1000);
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            println!("AGENT clock=unset");
+        });
     }
 
     let listener = match VsockListener::bind(port) {
@@ -169,16 +239,11 @@ fn main() -> std::process::ExitCode {
 /// one started cold. dockerd makes the cgroup at the first container, which
 /// can be any time, so this simply keeps looking.
 fn bound_container_cache() {
-    let total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            m.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-        })
-        .map(|kb| kb * 1024);
-    let Some(total) = total else { return };
+    let Some(mut total) = mem_total() else { return };
+    // With a virtio-mem range the guest's size is the host's to set, from
+    // the lines this loop sends: they go whatever the size, and `MemTotal`
+    // is read again each tick because it moves.
+    let dynamic = std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem").exists();
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -219,6 +284,28 @@ fn bound_container_cache() {
     if always_fast {
         set_reporting(100, 5);
     }
+    // `lighter.reporting_order=<n>`: the smallest order reporting returns at
+    // rest. Five (128 KiB runs) rather than the kernel's nine (two
+    // megabytes): while containers run, reporting is the only path that
+    // gives the host anything back, and the runs a trim leaves under two
+    // megabytes were 130 MB the Mac kept under the m8 stack for as long as
+    // it ran (order 5 sat at 837–904 MB across half an hour where 9 sat at
+    // 966–1033, both creeping the same 67 MB, which is the cache growing);
+    // the install cases read level and the memory case 120 MiB lower at
+    // rest. The hurried setting after a trim was already five.
+    let rest_order = cmdline_value("lighter.reporting_order")
+        .map(|o| o as u32)
+        .unwrap_or(5);
+    // The kernel's own order, two megabytes, while the containers work.
+    const CHURN_ORDER: u32 = 9;
+    // The rest settings from the start, not from the first trim: the kernel
+    // boots with proactive compaction at 20.
+    if !always_fast {
+        set_reporting(2000, rest_order);
+    }
+    let mut at_rest = !always_fast;
+    // Ticks since the containers last used half a core (the rest order's mark).
+    let mut light_for = 0u32;
     // The engine's cgroup (init puts dockerd there): the image layers it
     // extracted, and whatever else it read, charged where a trim can reach.
     let engine = "/sys/fs/cgroup/engine";
@@ -228,6 +315,12 @@ fn bound_container_cache() {
     let mut last_offer: Option<[u8; 16]> = None;
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
+    // Whether a trim has left reporting hurried, so the restore below is a
+    // latch and not a mark: once the counter steps by four it can pass 25 s
+    // without landing on it, and did — a guest that had trimmed sat idle
+    // with reporting at 100 ms and compaction at full strength until its
+    // next container.
+    let mut hurried = always_fast;
     // Quarter-second ticks: the offer to the host waits for two seconds of
     // idle, and a one-second tick put the first offer three seconds after
     // the last container stopped — past the moment anything looking at the
@@ -242,6 +335,9 @@ fn bound_container_cache() {
         // (the trims, the reporting rate at 25 s) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
         std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
+        if dynamic {
+            total = mem_total().unwrap_or(total);
+        }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
             // The engine's cache (image layers) bounded too, at an eighth of
@@ -253,14 +349,39 @@ fn bound_container_cache() {
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < step as u64 * 50_000 / TICKS_PER_SEC as u64 { idle_for + step } else { 0 };
+        let heavy = used >= step as u64 * 500_000 / TICKS_PER_SEC as u64;
+        light_for = if heavy { 0 } else { light_for + step };
         // Freed memory goes back at reporting's idle rate for a while after
         // a trim, and at its churn rate again once the containers work or
         // the burst is over (guest kernel patch 0019).
         // `lighter.reporting=fast` on the command line keeps reporting
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
-        if (idle_for == 0 || idle_for == 25 * TICKS_PER_SEC) && !always_fast {
-            set_reporting(2000, 9);
+        if hurried && !always_fast && (idle_for == 0 || idle_for >= 25 * TICKS_PER_SEC) {
+            set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
+            hurried = false;
+            at_rest = !heavy;
+        }
+        // The rest order only at rest. Reporting 128 KiB runs while an
+        // install runs is a treadmill: every two seconds it hands back what
+        // the install just freed, the allocator then prefers pages it has
+        // never touched to the reported ones, and the guest walks through
+        // its whole range. Rest is judged by heavy use, not by the idle
+        // mark above: a day's stack answers health checks every few
+        // seconds, enough container CPU to keep that mark from ever being
+        // reached (ten minutes under the m8 stack never read the rest
+        // order), and nothing like an install, which saturates a core. So
+        // the churn order once the containers have used half a core in a
+        // tick, and the rest order once they have been under that for eight
+        // seconds.
+        if !always_fast && !hurried {
+            if at_rest && heavy {
+                set_reporting(2000, CHURN_ORDER);
+                at_rest = false;
+            } else if !at_rest && light_for >= 8 * TICKS_PER_SEC {
+                set_reporting(2000, rest_order);
+                at_rest = true;
+            }
         }
         // Two seconds idle: offer the host what is free beyond a reserve,
         // through the balloon (`memory_guest` on the host side). What the
@@ -301,8 +422,28 @@ fn bound_container_cache() {
         // alone: the peak 600 MB better, the minute reading 500 MB worse,
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
-        if total >= balloon_min {
-            offer_memory(&mut memory_stream, &mut last_offer, total, active, quiet_for >= 3 * TICKS_PER_SEC, running == 0);
+        if dynamic || total >= balloon_min {
+            offer_memory(
+                &mut memory_stream,
+                &mut last_offer,
+                total,
+                active,
+                // Quiet, or nothing running and the containers eight seconds
+                // idle: the quiet rule protects running work from a seesaw,
+                // and with no container there is none to protect — while the
+                // trims and compaction after an install kept the guest's CPU
+                // busy for most of a minute, and the range stayed in for it
+                // (the shrink came 47 s after a seven-second install). Eight
+                // rather than three: three is the benchmark's gap between
+                // two runs of an install, and a shrink that started in it
+                // had the next run begin as three gigabytes of its
+                // predecessor's cache were being unplugged (the M1's installs
+                // a fifth slower); eight is the second trim's moment, when
+                // the cache is already gone and the unplug is cheap.
+                quiet_for >= 3 * TICKS_PER_SEC || (running == 0 && idle_for >= 8 * TICKS_PER_SEC),
+                running == 0,
+                dynamic && quiet_for == 0,
+            );
         }
         // Two passes, five and ten seconds idle: the containers down to a
         // sixty-fourth of RAM (their warmest pages) and the engine to
@@ -336,13 +477,22 @@ fn bound_container_cache() {
             x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
             _ => continue,
         };
-        for (cgroup, resting) in [(containers, floor), (engine, engine_floor)] {
+        // Both trims take file cache only: a workload's memory is never
+        // swapped behind its back, and neither is the engine's — swapping
+        // dockerd and containerd into zram here read 60 MiB less at idle
+        // and cost the next docker command after three quiet seconds their
+        // swap-in, 450–1131 ms for a container start after a suite of
+        // installs. zram stays for a guest with nothing left.
+        for (cgroup, resting, swappiness) in [(containers, floor, 0), (engine, engine_floor, 0)] {
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
                 .and_then(|c| c.trim().parse::<u64>().ok())
                 .unwrap_or(0);
             if current > resting {
-                let _ = std::fs::write(format!("{cgroup}/memory.reclaim"), (current - resting).to_string());
+                let _ = std::fs::write(
+                    format!("{cgroup}/memory.reclaim"),
+                    format!("{} swappiness={swappiness}", current - resting),
+                );
             }
         }
         // What the trim freed is in pieces the size of the files that held
@@ -352,6 +502,7 @@ fn bound_container_cache() {
         // into reportable runs, as before the balloon. On a 4 GiB guest the
         // reserve alone read 600 MB more at a minute without this.
         set_reporting(100, 5);
+        hurried = true;
         compact_until_reportable();
     }
 }
@@ -411,6 +562,7 @@ fn offer_memory(
     active: bool,
     quiet: bool,
     nothing_runs: bool,
+    busy: bool,
 ) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -429,7 +581,13 @@ fn offer_memory(
     // reporting could not return in runs, 600 MB at a minute against the
     // record. A thirty-second was tried: 128 MiB left the container that
     // materializes the next case's tree without room to start.
-    let reserve = (total >> 20) / if nothing_runs { 16 } else { 8 };
+    // A quarter, not a sixteenth, with nothing running and a range to
+    // shrink: the unplug migrates what the range held into the base, and a
+    // shrink that left a sixteenth free left the guest under its own need
+    // line while it was still compacting, so the host grew it again and the
+    // range went in and out every six seconds. Free memory in the base costs
+    // the host nothing; the pulse and reporting return it.
+    let reserve = (total >> 20) / if nothing_runs { 4 } else { 8 };
     // Release is its own word: an offer of zero means "nothing more", and
     // the balloon holds what it has. Said as one number, the guest asked
     // for everything back each time inflation dipped it under its line,
@@ -453,6 +611,11 @@ fn offer_memory(
     // containers have been idle; the balloon takes only what is already
     // free.
     let release = active && free < reserve / 2;
+    // With a range to grow into, work that has less than a quarter of the
+    // guest available asks for more before it is short — available, not
+    // free, because the cache it could reclaim is its own working set and
+    // reclaiming it is the cost this avoids. The host doubles the guest.
+    let need = busy && avail < (total >> 20) / 8;
     let spare = if !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
@@ -467,7 +630,8 @@ fn offer_memory(
     // Available and free are rounded to 16 MiB: they drift by a page or two
     // on an idle guest and would defeat the comparison.
     let coarse = |v: u64| (v & !15) as u32;
-    for (i, v) in [spare as u32, coarse(avail), coarse(free), u32::from(release)].iter().enumerate() {
+    let flags = u32::from(release) | (u32::from(need) << 1) | (u32::from(nothing_runs) << 2);
+    for (i, v) in [spare as u32, coarse(avail), coarse(free), flags].iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     if *last == Some(bytes) {
@@ -481,6 +645,17 @@ fn offer_memory(
     } else {
         *last = Some(bytes);
     }
+}
+
+/// `MemTotal`, in bytes.
+fn mem_total() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
 }
 
 /// A `key=<n>` on the kernel command line, if given.
@@ -499,7 +674,11 @@ fn cmdline_value(key: &str) -> Option<u64> {
 fn set_reporting(delay_ms: u32, order: u32) {
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_delay_ms", delay_ms.to_string());
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_order", order.to_string());
-    let proactiveness = if delay_ms < 2000 { "100" } else { "20" };
+    // At rest, none: the kernel's 20 has kcompactd wake twice a second on an
+    // idle guest to check a fragmentation score nothing is changing (2 of
+    // the 38 wakeups a second an idle guest made). The trims compact
+    // explicitly, and the hurried setting has it at full strength.
+    let proactiveness = if delay_ms < 2000 { "100" } else { "0" };
     let _ = std::fs::write("/proc/sys/vm/compaction_proactiveness", proactiveness);
 }
 
@@ -549,6 +728,27 @@ fn container_cpu_usec(cgroup: &str) -> u64 {
 
 /// The host's vsock port for outbound streams.
 const STREAM_PORT: u32 = 2377;
+
+/// A joined socket's peer is a container. One removed while a connection
+/// stands never answers again, and nothing tells the socket so: its unsent
+/// bytes retransmit until TCP's own limit, a quarter of an hour, and for
+/// all of it the redirect into it is a backlog worker retrying (guest
+/// kernel patch 0025 for what each retry costs). Data unacknowledged for
+/// thirty seconds ends the connection instead. A peer alive and merely not
+/// reading keeps acknowledging the probes and is not touched.
+fn ends_with_its_peer(tcp: &std::net::TcpStream) {
+    let ms: libc::c_uint = 30_000;
+    // SAFETY: a live socket descriptor; the option value is the size given.
+    unsafe {
+        libc::setsockopt(
+            tcp.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            &ms as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of_val(&ms) as libc::socklen_t,
+        );
+    }
+}
 
 /// The kernel-side join for streams, if this kernel and this boot allow
 /// it (`lighter.nosockmap` on the command line keeps the copying path).
@@ -779,6 +979,7 @@ fn forward_outbound(tcp: std::net::TcpStream) {
         return;
     }
     let _ = tcp.set_nodelay(true);
+    ends_with_its_peer(&tcp);
     let (tcp, host_read, mut host_write) = match joiner() {
         Some(j) => match joined(j, tcp, host_read, host_write) {
             Ok(()) => return,
@@ -886,13 +1087,11 @@ fn serve_dns(addr: &str) -> std::process::ExitCode {
     }
 }
 
-/// The address Docker publishes ports on inside this guest: eth0's, which
-/// the VMM leases by DHCP. Loopback would not do — with no userland proxy a
-/// published port is a DNAT rule, and Docker's rule exempts loopback.
-const PUBLISHED_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 2);
-
-/// Answers the host's inbound streams: two bytes of port, then bytes both
-/// ways to whatever Docker has on that port.
+/// Answers the host's inbound streams: nineteen bytes naming the address
+/// Docker published on in this guest (the host knows: eth0's for a publish
+/// on every interface, the address itself for one bound somewhere in
+/// particular, where only Docker's proxy answers), then bytes both ways to
+/// whatever Docker has there.
 fn serve_inbound(port: u32) -> std::process::ExitCode {
     let listener = match VsockListener::bind(port) {
         Ok(l) => l,
@@ -912,19 +1111,22 @@ fn serve_inbound(port: u32) -> std::process::ExitCode {
 fn forward_inbound(host: OwnedFd) {
     let mut host_read = Fd(host);
     let Ok(host_write) = host_read.try_clone() else { return };
-    let mut header = [0u8; 2];
+    let mut header = [0u8; 19];
     if host_read.read_exact(&mut header).is_err() {
         return;
     }
-    let port = u16::from_be_bytes(header);
-    let mut tcp = match std::net::TcpStream::connect((PUBLISHED_ADDR, port)) {
+    let Some(dst) = udp::destination_from(&header) else {
+        return;
+    };
+    let mut tcp = match std::net::TcpStream::connect(dst) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("lighter-agent: inbound to {PUBLISHED_ADDR}:{port} refused: {e}");
+            eprintln!("lighter-agent: inbound to {dst} refused: {e}");
             return;
         }
     };
     let _ = tcp.set_nodelay(true);
+    ends_with_its_peer(&tcp);
     // Whatever followed the header in the same packet is carried by hand
     // before the join. The join hands sockmap whole socket buffers, and a
     // buffer the header was read out of still holds the header: joined as
@@ -1105,12 +1307,11 @@ fn handle_control(line: &str) -> String {
             });
             "ok\n".into()
         }
-        (Some("time"), Some(seconds)) => match seconds.parse::<i64>() {
-            Ok(epoch) => match set_clock(epoch) {
-                Ok(()) => "ok\n".into(),
-                Err(e) => format!("error {e}\n"),
-            },
-            Err(_) => "error not-a-number\n".into(),
+        // The host's nudge after a wake; whatever it used to say after the
+        // word is ignored, the agent asks for the time itself.
+        (Some("time"), _) => match sync_clock_from_host() {
+            Ok(_) => "ok\n".into(),
+            Err(e) => format!("error {e}\n"),
         },
         _ => "error unknown\n".into(),
     }
@@ -1204,18 +1405,57 @@ fn read_kmsg() -> Result<String, std::io::Error> {
 /// from the host at boot and then drifts — and after the Mac sleeps, it does
 /// not so much drift as stop. Everything that checks a certificate breaks, and
 /// the error names the certificate rather than the clock.
-fn set_clock(epoch: i64) -> Result<(), std::io::Error> {
-    let tv = libc::timeval {
-        tv_sec: epoch as libc::time_t,
-        tv_usec: 0,
+///
+/// The clock is asked for, not pushed (the VMM's `clock.rs`): the guest's
+/// monotonic clock is the host's counter and cannot drift, so one accurate
+/// set is enough, and accurate means measured from this side. Three
+/// questions on one connection, the answer with the shortest round trip
+/// kept, and the wallclock set to that answer plus half its trip plus what
+/// the monotonic clock has moved since — microseconds of error where the
+/// pushed whole seconds carried half a second, the boot time and the wake
+/// retries. `set_clock` was `settimeofday` with `tv_usec: 0`.
+const TIME_PORT: u32 = 2382;
+
+fn monotonic_ns() -> i128 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
-    // SAFETY: a correctly-shaped timeval and a null timezone, which is the
-    // documented way to leave the timezone alone.
-    let rc = unsafe { libc::settimeofday(&tv, std::ptr::null()) };
+    // SAFETY: a valid timespec for the call's duration.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
+}
+
+fn sync_clock_from_host() -> Result<i128, std::io::Error> {
+    let fd = vsock::connect(TIME_PORT)?;
+    let mut sock = std::fs::File::from(fd);
+    let mut best: Option<(i128, i128, i128)> = None; // (host ns, at monotonic ns, round trip)
+    for _ in 0..3 {
+        let t1 = monotonic_ns();
+        sock.write_all(&[1])?;
+        let mut reply = [0u8; 12];
+        sock.read_exact(&mut reply)?;
+        let t2 = monotonic_ns();
+        let secs = u64::from_le_bytes(reply[..8].try_into().expect("8 bytes"));
+        let nanos = u32::from_le_bytes(reply[8..].try_into().expect("4 bytes"));
+        let host = secs as i128 * 1_000_000_000 + nanos as i128;
+        let trip = t2 - t1;
+        if best.is_none_or(|(_, _, t)| trip < t) {
+            best = Some((host + trip / 2, t2, trip));
+        }
+    }
+    let (host_at_t2, t2, trip) = best.expect("three rounds");
+    let now = host_at_t2 + (monotonic_ns() - t2);
+    let ts = libc::timespec {
+        tv_sec: (now / 1_000_000_000) as libc::time_t,
+        tv_nsec: (now % 1_000_000_000) as libc::c_long,
+    };
+    // SAFETY: a correctly-shaped timespec for the call's duration.
+    let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(())
+    Ok(trip)
 }
 
 /// Copies between the vsock connection and a unix socket until either ends.

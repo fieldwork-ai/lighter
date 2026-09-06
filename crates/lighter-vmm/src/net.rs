@@ -18,7 +18,7 @@
 //! moves: the guest's routes, the gates, `host.docker.internal`.
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +35,16 @@ pub const GUEST: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
 pub const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
 const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
+/// The link's IPv6 addresses: a unique-local prefix of lighter's own, the
+/// gateway and the guest. The guest's init gives eth0 its address, the
+/// gateway's link-layer address and a default route statically, as the
+/// lease has no expiry, so the card sends no router advertisements; it
+/// answers neighbour solicitations for the gateway and echo to it, and
+/// forwards echo elsewhere. Docker's containers get the sibling prefix
+/// `fd6c:6967:6874:d0c::/64`.
+pub const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd6c, 0x6967, 0x6874, 0, 0, 0, 0, 1);
+pub const GUEST6: Ipv6Addr = Ipv6Addr::new(0xfd6c, 0x6967, 0x6874, 0, 0, 0, 0, 2);
+
 /// The guest's MAC, which the device advertises and the lease is keyed on.
 pub const GUEST_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 /// The gateway's, which is what the guest's ARP table holds for `.1`.
@@ -47,6 +57,12 @@ const PROTO_ICMP: u8 = 1;
 const PROTO_UDP: u8 = 17;
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
+const PROTO_HOPOPTS: u8 = 0;
+const PROTO_ICMPV6: u8 = 58;
+const ICMP6_ECHO_REQUEST: u8 = 128;
+const ICMP6_ECHO_REPLY: u8 = 129;
+const ICMP6_NEIGHBOUR_SOLICIT: u8 = 135;
+const ICMP6_NEIGHBOUR_ADVERT: u8 = 136;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -74,6 +90,14 @@ pub struct Counters {
     pub icmp_local: AtomicU64,
     pub icmp_forwarded: AtomicU64,
     pub icmp_replied: AtomicU64,
+    /// Neighbour solicitations for the gateway, answered.
+    pub ndp: AtomicU64,
+    pub icmp6_local: AtomicU64,
+    pub icmp6_forwarded: AtomicU64,
+    pub icmp6_replied: AtomicU64,
+    /// What a v6 host says to a link nobody listens on: multicast listener
+    /// reports, duplicate address detection. Taken, not dropped.
+    pub ipv6_housekeeping: AtomicU64,
     pub dropped: AtomicU64,
 }
 
@@ -87,17 +111,27 @@ pub struct Network {
     /// kernel refused, in which case `ping` from a container reaches the
     /// gateway and nothing beyond it.
     icmp: Option<Arc<OwnedFd>>,
+    /// The same for ICMPv6; its replies come back without an IP header,
+    /// the source from `recvfrom`.
+    icmp6: Option<Arc<OwnedFd>>,
     counters: Arc<Counters>,
 }
 
 impl Network {
-    /// Opens the ICMP socket; the rest of the card needs nothing from the
+    /// Opens the ICMP sockets; the rest of the card needs nothing from the
     /// host at all.
     pub fn start(mtu: u16) -> Result<Network, NetError> {
-        let icmp = match icmp_socket() {
+        let icmp = match icmp_socket(libc::AF_INET) {
             Ok(fd) => Some(Arc::new(fd)),
             Err(e) => {
                 tracing::warn!(%e, "no ICMP socket; ping from a container stops at the gateway");
+                None
+            }
+        };
+        let icmp6 = match icmp_socket(libc::AF_INET6) {
+            Ok(fd) => Some(Arc::new(fd)),
+            Err(e) => {
+                tracing::warn!(%e, "no ICMPv6 socket; ping6 from a container stops at the gateway");
                 None
             }
         };
@@ -111,6 +145,7 @@ impl Network {
             outbox: Outbox::new(),
             mtu,
             icmp,
+            icmp6,
             counters: Arc::new(Counters::default()),
         })
     }
@@ -145,6 +180,7 @@ impl Network {
         let outbox = self.outbox.clone();
         let responder = Responder {
             icmp: self.icmp.clone(),
+            icmp6: self.icmp6.clone(),
             counters: self.counters.clone(),
         };
         let deliver_inbox = inbox.clone();
@@ -174,6 +210,8 @@ impl Network {
         if let Some(icmp) = &self.icmp {
             let icmp = icmp.clone();
             let counters = self.counters.clone();
+            let inbox = inbox.clone();
+            let wake_rx = wake_rx.clone();
             std::thread::Builder::new()
                 .name("net-icmp".into())
                 .spawn(move || {
@@ -201,6 +239,51 @@ impl Network {
                     tracing::debug!("ICMP reader stopped");
                 })?;
         }
+        if let Some(icmp6) = &self.icmp6 {
+            let icmp6 = icmp6.clone();
+            let counters = self.counters.clone();
+            let inbox = inbox.clone();
+            let wake_rx = wake_rx.clone();
+            std::thread::Builder::new()
+                .name("net-icmp6".into())
+                .spawn(move || {
+                    let mut buf = vec![0u8; 65_536];
+                    loop {
+                        // SAFETY: zeroed is a valid sockaddr_in6 to fill.
+                        let mut from: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                        let mut from_len =
+                            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+                        // SAFETY: a read into a buffer we own, of its length,
+                        // and an address of the length given.
+                        let n = unsafe {
+                            libc::recvfrom(
+                                icmp6.as_raw_fd(),
+                                buf.as_mut_ptr().cast(),
+                                buf.len(),
+                                0,
+                                (&mut from as *mut libc::sockaddr_in6).cast(),
+                                &mut from_len,
+                            )
+                        };
+                        if n <= 0 {
+                            if n < 0
+                                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            break;
+                        }
+                        let src = Ipv6Addr::from(from.sin6_addr.s6_addr);
+                        if let Some(frame) = echo6_reply_frame(src, &buf[..n as usize]) {
+                            counters.icmp6_replied.fetch_add(1, Ordering::Relaxed);
+                            if Net::enqueue_received(&inbox, frame) {
+                                wake_rx();
+                            }
+                        }
+                    }
+                    tracing::debug!("ICMPv6 reader stopped");
+                })?;
+        }
         Ok(())
     }
 }
@@ -214,6 +297,7 @@ impl Drop for Network {
 /// Answers a frame the guest transmitted, or drops it.
 struct Responder {
     icmp: Option<Arc<OwnedFd>>,
+    icmp6: Option<Arc<OwnedFd>>,
     counters: Arc<Counters>,
 }
 
@@ -238,6 +322,30 @@ impl Responder {
                 {
                     self.counters.icmp_forwarded.fetch_add(1, Ordering::Relaxed);
                 }
+                None
+            }
+            Some(Seen::NeighbourSolicit) => {
+                self.counters.ndp.fetch_add(1, Ordering::Relaxed);
+                neighbour_advertisement(frame)
+            }
+            Some(Seen::Icmp6Local) => {
+                self.counters.icmp6_local.fetch_add(1, Ordering::Relaxed);
+                echo6_reply_local(frame)
+            }
+            Some(Seen::Icmp6Forward) => {
+                if let Some(icmp6) = &self.icmp6
+                    && forward_echo6(icmp6.as_raw_fd(), frame)
+                {
+                    self.counters
+                        .icmp6_forwarded
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Some(Seen::Ipv6Housekeeping) => {
+                self.counters
+                    .ipv6_housekeeping
+                    .fetch_add(1, Ordering::Relaxed);
                 None
             }
             None => {
@@ -266,6 +374,16 @@ enum Seen {
     IcmpLocal,
     /// Echo to anywhere else: sent on the host's ICMP socket.
     IcmpForward,
+    /// A neighbour solicitation for the v6 gateway: answered here.
+    NeighbourSolicit,
+    /// ICMPv6 echo to the v6 gateway: answered here.
+    Icmp6Local,
+    /// ICMPv6 echo to anywhere else: sent on the host's ICMPv6 socket.
+    Icmp6Forward,
+    /// What a v6 host says to its link unprompted (multicast listener
+    /// reports, duplicate address detection, a solicitation for anything
+    /// but the gateway): heard, unanswered.
+    Ipv6Housekeeping,
 }
 
 fn ethertype(frame: &[u8]) -> Option<u16> {
@@ -339,7 +457,37 @@ fn classify(frame: &[u8]) -> Option<Seen> {
                 _ => None,
             }
         }
-        ETHERTYPE_IPV6 => None,
+        ETHERTYPE_IPV6 => {
+            let packet = ipv6(frame)?;
+            match packet[6] {
+                // Multicast listener reports ride a hop-by-hop header, the
+                // only thing on this link that does.
+                PROTO_HOPOPTS => Some(Seen::Ipv6Housekeeping),
+                PROTO_ICMPV6 => {
+                    let icmp = packet.get(40..)?;
+                    match *icmp.first()? {
+                        ICMP6_NEIGHBOUR_SOLICIT => {
+                            let target = ipv6_at(icmp, 8)?;
+                            Some(if target == GATEWAY6 {
+                                Seen::NeighbourSolicit
+                            } else {
+                                Seen::Ipv6Housekeeping
+                            })
+                        }
+                        ICMP6_ECHO_REQUEST => Some(if ipv6_dst(packet) == GATEWAY6 {
+                            Seen::Icmp6Local
+                        } else {
+                            Seen::Icmp6Forward
+                        }),
+                        // MLD queries and reports, router solicitations,
+                        // neighbour advertisements.
+                        130..=133 | 136 | 143 => Some(Seen::Ipv6Housekeeping),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -524,14 +672,175 @@ fn echo_reply_frame(datagram: &[u8]) -> Option<Vec<u8>> {
     Some(ipv4_frame(GUEST_MAC, src, GUEST, PROTO_ICMP, 64, icmp))
 }
 
-fn icmp_socket() -> io::Result<OwnedFd> {
+/// An unprivileged ICMP socket of the family: `SOCK_DGRAM` over
+/// `IPPROTO_ICMP` or `IPPROTO_ICMPV6`, which macOS opens for any process.
+fn icmp_socket(family: libc::c_int) -> io::Result<OwnedFd> {
+    let proto = if family == libc::AF_INET6 {
+        libc::IPPROTO_ICMPV6
+    } else {
+        libc::IPPROTO_ICMP
+    };
     // SAFETY: a socket call with constant arguments.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+    let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM, proto) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the descriptor is ours and open.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+// --- IPv6 --------------------------------------------------------------------
+
+/// The IPv6 packet in a frame, if it is one with a whole header.
+fn ipv6(frame: &[u8]) -> Option<&[u8]> {
+    let packet = frame.get(14..)?;
+    (packet.len() >= 40 && packet[0] >> 4 == 6).then_some(packet)
+}
+
+fn ipv6_at(bytes: &[u8], at: usize) -> Option<Ipv6Addr> {
+    let octets: [u8; 16] = bytes.get(at..at + 16)?.try_into().ok()?;
+    Some(Ipv6Addr::from(octets))
+}
+
+fn ipv6_src(packet: &[u8]) -> Ipv6Addr {
+    ipv6_at(packet, 8).expect("a whole header")
+}
+
+fn ipv6_dst(packet: &[u8]) -> Ipv6Addr {
+    ipv6_at(packet, 24).expect("a whole header")
+}
+
+/// The ICMPv6 checksum: over the pseudo-header (both addresses, the
+/// message length, the next header) and the message.
+fn icmp6_checksum(src: Ipv6Addr, dst: Ipv6Addr, icmp: &[u8]) -> u16 {
+    let mut pseudo = Vec::with_capacity(40 + icmp.len());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, PROTO_ICMPV6]);
+    pseudo.extend_from_slice(icmp);
+    checksum(&pseudo)
+}
+
+/// An Ethernet frame from the gateway carrying one IPv6 packet.
+fn ipv6_frame(
+    dst_mac: [u8; 6],
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next: u8,
+    hop_limit: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(14 + 40 + payload.len());
+    out.extend_from_slice(&dst_mac);
+    out.extend_from_slice(&GATEWAY_MAC);
+    out.extend_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+    out.extend_from_slice(&[0x60, 0, 0, 0]);
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.push(next);
+    out.push(hop_limit);
+    out.extend_from_slice(&src.octets());
+    out.extend_from_slice(&dst.octets());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// An ICMPv6 message from the gateway to `dst`, its checksum filled in.
+fn icmp6_frame(dst_mac: [u8; 6], dst: Ipv6Addr, hop_limit: u8, mut icmp: Vec<u8>) -> Vec<u8> {
+    icmp[2] = 0;
+    icmp[3] = 0;
+    let sum = icmp6_checksum(GATEWAY6, dst, &icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    ipv6_frame(dst_mac, GATEWAY6, dst, PROTO_ICMPV6, hop_limit, &icmp)
+}
+
+/// The gateway's answer to a neighbour solicitation for it: a solicited
+/// advertisement with the router and override flags, carrying its
+/// link-layer address, hop limit 255 as the protocol requires.
+fn neighbour_advertisement(frame: &[u8]) -> Option<Vec<u8>> {
+    let packet = ipv6(frame)?;
+    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
+    let src = ipv6_src(packet);
+    // A solicitation from the unspecified address is duplicate address
+    // detection for the gateway's own address, which nothing on this link
+    // may take; answered to all nodes as the protocol says.
+    let (dst, dst_mac) = if src.is_unspecified() {
+        (
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+            [0x33, 0x33, 0, 0, 0, 1],
+        )
+    } else {
+        (src, src_mac)
+    };
+    let mut na = vec![ICMP6_NEIGHBOUR_ADVERT, 0, 0, 0];
+    // Router, solicited (unless for DAD), override.
+    na.push(if src.is_unspecified() { 0xa0 } else { 0xe0 });
+    na.extend_from_slice(&[0, 0, 0]);
+    na.extend_from_slice(&GATEWAY6.octets());
+    // Target link-layer address option.
+    na.extend_from_slice(&[2, 1]);
+    na.extend_from_slice(&GATEWAY_MAC);
+    Some(icmp6_frame(dst_mac, dst, 255, na))
+}
+
+/// ICMPv6 echo to the gateway itself: the request turned around.
+fn echo6_reply_local(frame: &[u8]) -> Option<Vec<u8>> {
+    let packet = ipv6(frame)?;
+    let icmp = packet.get(40..)?;
+    if icmp.len() < 8 {
+        return None;
+    }
+    let mut reply = icmp.to_vec();
+    reply[0] = ICMP6_ECHO_REPLY;
+    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
+    Some(icmp6_frame(src_mac, ipv6_src(packet), 64, reply))
+}
+
+/// Sends the guest's ICMPv6 echo request out of the host's socket to the
+/// address the guest named; the kernel fills the header and the checksum.
+fn forward_echo6(fd: libc::c_int, frame: &[u8]) -> bool {
+    let Some(packet) = ipv6(frame) else {
+        return false;
+    };
+    let Some(icmp) = packet.get(40..) else {
+        return false;
+    };
+    if icmp.len() < 8 {
+        return false;
+    }
+    let dst = ipv6_dst(packet);
+    // SAFETY: zeroed is a valid sockaddr_in6 to fill.
+    let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    addr.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+    addr.sin6_family = libc::AF_INET6 as u8;
+    addr.sin6_addr.s6_addr = dst.octets();
+    // SAFETY: the buffer and the address are valid for the call's duration.
+    let n = unsafe {
+        libc::sendto(
+            fd,
+            icmp.as_ptr().cast(),
+            icmp.len(),
+            0,
+            (&addr as *const libc::sockaddr_in6).cast(),
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    n == icmp.len() as isize
+}
+
+/// A reply read off the host's ICMPv6 socket, as the frame the guest sees:
+/// no IP header on this family, the answering host is `src`, the
+/// destination becomes the guest, and the checksum is redone for it.
+fn echo6_reply_frame(src: Ipv6Addr, icmp: &[u8]) -> Option<Vec<u8>> {
+    if icmp.len() < 8 || icmp[0] != ICMP6_ECHO_REPLY {
+        return None;
+    }
+    let mut reply = icmp.to_vec();
+    reply[2] = 0;
+    reply[3] = 0;
+    let sum = icmp6_checksum(src, GUEST6, &reply);
+    reply[2..4].copy_from_slice(&sum.to_be_bytes());
+    Some(ipv6_frame(GUEST_MAC, src, GUEST6, PROTO_ICMPV6, 64, &reply))
 }
 
 // --- frames ------------------------------------------------------------------
@@ -827,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn what_has_a_stream_is_dropped_and_ipv6_is_ignored() {
+    fn what_has_a_stream_is_dropped_in_either_family() {
         let tcp = guest_ipv4(Ipv4Addr::new(93, 184, 216, 34), 6, &[0; 20]);
         assert_eq!(classify(&tcp), None);
         let udp = guest_ipv4(
@@ -836,14 +1145,110 @@ mod tests {
             &[0, 53, 0, 53, 0, 8, 0, 0],
         );
         assert_eq!(classify(&udp), None, "UDP that is not DHCP");
-        let v6 = eth(
-            [0x33, 0x33, 0, 0, 0, 2],
-            GUEST_MAC,
-            ETHERTYPE_IPV6,
-            &[0x60; 48],
-        );
-        assert_eq!(classify(&v6), None);
+        let tcp6 = guest_ipv6("2606:4700::1111".parse().unwrap(), 6, 64, &[0; 20]);
+        assert_eq!(classify(&tcp6), None, "TCP over v6 escaping the redirect");
         assert_eq!(classify(&[0u8; 10]), None, "a runt");
+    }
+
+    fn guest_ipv6(dst: Ipv6Addr, next: u8, hop_limit: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = ipv6_frame(GATEWAY_MAC, GUEST6, dst, next, hop_limit, payload);
+        f[6..12].copy_from_slice(&GUEST_MAC);
+        f
+    }
+
+    fn icmp6_from_guest(dst: Ipv6Addr, mut icmp: Vec<u8>) -> Vec<u8> {
+        let sum = icmp6_checksum(GUEST6, dst, &icmp);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+        guest_ipv6(dst, PROTO_ICMPV6, 255, &icmp)
+    }
+
+    /// The guest asks who has the v6 gateway; the card says it does, with
+    /// its link-layer address, and the checksum a receiver will verify.
+    #[test]
+    fn a_neighbour_solicitation_for_the_gateway_is_advertised() {
+        let mut ns = vec![ICMP6_NEIGHBOUR_SOLICIT, 0, 0, 0, 0, 0, 0, 0];
+        ns.extend_from_slice(&GATEWAY6.octets());
+        ns.extend_from_slice(&[1, 1]);
+        ns.extend_from_slice(&GUEST_MAC);
+        let solicited = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 1);
+        let frame = icmp6_from_guest(solicited, ns);
+        assert_eq!(classify(&frame), Some(Seen::NeighbourSolicit));
+        let reply = neighbour_advertisement(&frame).expect("an advertisement");
+        assert_eq!(&reply[0..6], &GUEST_MAC, "to the asker");
+        let packet = ipv6(&reply).unwrap();
+        assert_eq!(packet[7], 255, "hop limit 255 or the guest discards it");
+        assert_eq!(ipv6_src(packet), GATEWAY6);
+        assert_eq!(ipv6_dst(packet), GUEST6);
+        let icmp = &packet[40..];
+        assert_eq!(icmp[0], ICMP6_NEIGHBOUR_ADVERT);
+        assert_eq!(icmp[4], 0xe0, "router, solicited, override");
+        assert_eq!(ipv6_at(icmp, 8), Some(GATEWAY6));
+        assert_eq!(&icmp[24..26], &[2, 1]);
+        assert_eq!(&icmp[26..32], &GATEWAY_MAC);
+        assert_eq!(icmp6_checksum(GATEWAY6, GUEST6, icmp), 0, "verifies");
+    }
+
+    #[test]
+    fn a_solicitation_for_another_address_is_housekeeping() {
+        let mut ns = vec![ICMP6_NEIGHBOUR_SOLICIT, 0, 0, 0, 0, 0, 0, 0];
+        ns.extend_from_slice(&GUEST6.octets());
+        let frame = icmp6_from_guest(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 2), ns);
+        assert_eq!(classify(&frame), Some(Seen::Ipv6Housekeeping));
+    }
+
+    /// A multicast listener report carries a hop-by-hop header first.
+    #[test]
+    fn a_listener_report_is_housekeeping_not_a_drop() {
+        let mut payload = vec![PROTO_ICMPV6, 0, 5, 2, 0, 0, 1, 0];
+        payload.extend_from_slice(&[143, 0, 0, 0, 0, 0, 0, 1]);
+        let frame = guest_ipv6(
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16),
+            PROTO_HOPOPTS,
+            1,
+            &payload,
+        );
+        assert_eq!(classify(&frame), Some(Seen::Ipv6Housekeeping));
+    }
+
+    #[test]
+    fn echo_to_the_v6_gateway_is_answered_and_elsewhere_forwarded() {
+        let mut echo = vec![ICMP6_ECHO_REQUEST, 0, 0, 0, 0x12, 0x34, 0, 1];
+        echo.extend_from_slice(b"hello");
+        let local = icmp6_from_guest(GATEWAY6, echo.clone());
+        assert_eq!(classify(&local), Some(Seen::Icmp6Local));
+        let reply = echo6_reply_local(&local).expect("a reply");
+        let packet = ipv6(&reply).unwrap();
+        assert_eq!(ipv6_src(packet), GATEWAY6);
+        assert_eq!(ipv6_dst(packet), GUEST6);
+        let icmp = &packet[40..];
+        assert_eq!(icmp[0], ICMP6_ECHO_REPLY);
+        assert_eq!(
+            &icmp[4..8],
+            &[0x12, 0x34, 0, 1],
+            "identifier and sequence kept"
+        );
+        assert_eq!(&icmp[8..], b"hello");
+        assert_eq!(icmp6_checksum(GATEWAY6, GUEST6, icmp), 0);
+
+        let far = icmp6_from_guest("2606:4700::1111".parse().unwrap(), echo);
+        assert_eq!(classify(&far), Some(Seen::Icmp6Forward));
+    }
+
+    /// What the host's socket hands back has no IP header and was addressed
+    /// to the Mac; the frame the guest sees is addressed to the guest, with
+    /// the checksum redone for that.
+    #[test]
+    fn a_forwarded_v6_reply_is_readdressed_to_the_guest() {
+        let answerer: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+        let mut reply = vec![ICMP6_ECHO_REPLY, 0, 0xab, 0xcd, 0x12, 0x34, 0, 1];
+        reply.extend_from_slice(b"hello");
+        let frame = echo6_reply_frame(answerer, &reply).expect("a frame");
+        assert_eq!(&frame[0..6], &GUEST_MAC);
+        let packet = ipv6(&frame).unwrap();
+        assert_eq!(ipv6_src(packet), answerer);
+        assert_eq!(ipv6_dst(packet), GUEST6);
+        assert_eq!(icmp6_checksum(answerer, GUEST6, &packet[40..]), 0);
+        assert!(echo6_reply_frame(answerer, &[ICMP6_ECHO_REQUEST; 8]).is_none());
     }
 
     #[test]

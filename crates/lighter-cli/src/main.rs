@@ -13,6 +13,7 @@ mod bundle;
 mod config;
 mod context;
 mod doctor;
+mod instance;
 mod machine;
 mod paths;
 mod run;
@@ -73,6 +74,10 @@ enum Command {
         /// Size of the disk images and volumes live on, in GiB.
         #[arg(long)]
         disk: Option<u64>,
+        /// Who can reach a published port: the network (`lan`, as Docker
+        /// does) or loopback (`localhost`); explicit bind addresses take precedence.
+        #[arg(long, value_enum)]
+        publish: Option<config::Publish>,
     },
     /// Put the guest's clock right.
     ///
@@ -152,7 +157,12 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             Ok(std::process::ExitCode::SUCCESS)
         }
         Command::Logs { follow } => logs(follow),
-        Command::Config { cpus, memory, disk } => configure(cpus, memory, disk),
+        Command::Config {
+            cpus,
+            memory,
+            disk,
+            publish,
+        } => configure(cpus, memory, disk, publish),
         Command::Resync => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -273,9 +283,10 @@ fn configure(
     cpus: Option<u32>,
     memory: Option<u64>,
     disk: Option<u64>,
+    publish: Option<config::Publish>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let mut config = config::Config::load()?;
-    let changed = cpus.is_some() || memory.is_some() || disk.is_some();
+    let changed = cpus.is_some() || memory.is_some() || disk.is_some() || publish.is_some();
     if let Some(cpus) = cpus {
         config.cpus = cpus;
     }
@@ -285,6 +296,9 @@ fn configure(
     if let Some(disk) = disk {
         config.disk_gib = disk;
     }
+    if let Some(publish) = publish {
+        config.publish = publish;
+    }
     if changed {
         config.save()?;
         println!("Saved. Restart for it to take effect: `lighter restart`");
@@ -292,6 +306,13 @@ fn configure(
     println!("  cpus       {}", config.cpus);
     println!("  memory     {} MiB", config.memory_mib);
     println!("  disk       {} GiB", config.disk_gib);
+    println!(
+        "  publish    {}",
+        match config.publish {
+            config::Publish::Lan => "lan (every interface, as Docker does)",
+            config::Publish::Localhost => "localhost (wildcard publishes on loopback)",
+        }
+    );
     for share in &config.shares {
         println!("  share      {share}");
     }

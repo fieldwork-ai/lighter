@@ -230,6 +230,11 @@ struct Holding {
     /// Held nodeids, oldest first: what the cap and the settler walk.
     order: std::sync::Mutex<std::collections::VecDeque<u64>>,
     bytes: AtomicUsize,
+    /// Signalled when a create is held (and at stop): the settler parks on
+    /// it while nothing is held. It polled every 25 ms instead, and two
+    /// shares' settlers were 80 wakeups a second on a machine doing
+    /// nothing — more than half of what the Mac counted against it.
+    wake: std::sync::Condvar,
 }
 
 /// Writes all of `data` at `offset`.
@@ -696,6 +701,12 @@ impl Server {
                 .name("fs-settler".into())
                 .spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
+                        {
+                            let mut map = holding.map.lock().expect("held creates poisoned");
+                            while map.is_empty() && !stop.load(Ordering::Relaxed) {
+                                map = holding.wake.wait(map).expect("held creates poisoned");
+                            }
+                        }
                         std::thread::sleep(HOLD_GRACE / 2);
                         if holding
                             .map
@@ -3674,6 +3685,7 @@ impl Server {
                 .lock()
                 .expect("held creates poisoned")
                 .insert(nodeid, held);
+            self.deferred.wake.notify_one();
             let over = {
                 let mut order = self.deferred.order.lock().expect("held order poisoned");
                 order.push_back(nodeid);
@@ -4551,6 +4563,12 @@ fn write_error(sink: &mut dyn Sink, unique: u64, code: i32) -> usize {
 impl Drop for Server {
     fn drop(&mut self) {
         self.settler_stop.store(true, Ordering::Relaxed);
+        // Under the map's lock, so the settler is either before its check of
+        // the flag or already waiting: a notify between the two is lost.
+        {
+            let _map = self.deferred.map.lock().expect("held creates poisoned");
+            self.deferred.wake.notify_all();
+        }
         if let Some(handle) = self.settler.lock().expect("settler poisoned").take() {
             let _ = handle.join();
         }

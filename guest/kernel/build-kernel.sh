@@ -52,18 +52,40 @@ if [ ! -d .git ]; then
 	git -c user.name=lighter -c user.email=build@invalid commit -qm pristine
 fi
 git checkout -q -- .
-git clean -qf '*.rej' '*.orig' 2>/dev/null || true
+# Untracked files the last build's patches created (a header, say) go too,
+# or the patch that creates them cannot apply again; the kernel's own
+# .gitignore keeps the object files, so the build stays incremental.
+git clean -qfd
 
 if [ -d /patches ] && ls /patches/*.patch >/dev/null 2>&1; then
 	for patch in /patches/*.patch; do
 		log "Applying $(basename "$patch")"
-		patch -p1 --batch --silent < "$patch"
+		# --forward: an already-applied hunk is skipped and the build
+		# fails, where --batch alone took it for a reversed patch and
+		# undid it (the M1 lost 0023's header that way and built nothing).
+		patch -p1 --batch --forward --silent < "$patch"
 	done
 fi
 
 log "Configuring (defconfig + lighter fragment)"
 make ARCH=arm64 defconfig
 ./scripts/kconfig/merge_config.sh -m -O . .config /config/lighter.config
+# The tick rate is the one option built two ways: `KERNEL_HZ=1000` makes the
+# image the CLI boots where the vCPUs leave cores free (`Image-hz1000`), the
+# fragment's 250 the other. See the fragment's own note on the choice.
+if [ "${KERNEL_HZ:-}" = 1000 ]; then
+	log "Tick rate: 1000 Hz for this image"
+	./scripts/config --file .config --disable HZ_250 --enable HZ_1000 --set-val HZ 1000
+fi
+# `Image-trace` (KERNEL_TRACE=1): ftrace and the tracepoints, so an idle
+# guest's timer expiries and work items can be read by function; the
+# shipped kernels carry none of it.
+if [ "${KERNEL_TRACE:-}" = 1 ]; then
+	log "Tracing: ftrace and tracepoints in this image"
+	./scripts/config --file .config --enable FTRACE --enable TRACING --enable TRACEPOINTS \
+		--enable ENABLE_DEFAULT_TRACERS --enable DYNAMIC_FTRACE --enable FUNCTION_TRACER \
+		--enable STACKTRACE --enable SCHED_TRACER
+fi
 # merge_config leaves the merged result needing a pass to settle dependencies;
 # olddefconfig takes the default for anything newly reachable rather than
 # prompting, which would hang a non-interactive build.
@@ -112,15 +134,19 @@ fi
 echo "  all ${#required[@]} required options present"
 
 log "Building Image"
-make ARCH=arm64 -j"${JOBS}" Image
+# `LOCALVERSION=` set, even empty: with the automatic local version off,
+# setlocalversion still appends a "+" for a tree with uncommitted changes,
+# which ours always has (the patches), unless the variable is set.
+make ARCH=arm64 LOCALVERSION= -j"${JOBS}" Image
 
 mkdir -p "$OUT"
 # Through a temporary name and a rename, so a copy that fails partway (the
 # output directory is the Mac's, through the share) never leaves a truncated
 # Image under the name every machine boots from.
-cat arch/arm64/boot/Image > "$OUT/Image.tmp"
-mv "$OUT/Image.tmp" "$OUT/Image"
-cat .config > "$OUT/kernel.config"
+NAME="Image${KERNEL_IMAGE_SUFFIX:-}"
+cat arch/arm64/boot/Image > "$OUT/$NAME.tmp"
+mv "$OUT/$NAME.tmp" "$OUT/$NAME"
+cat .config > "$OUT/kernel${KERNEL_IMAGE_SUFFIX:-}.config"
 printf '%s\n' "$KERNEL_VERSION" > "$OUT/kernel.version"
 
-log "Done: $(du -h "$OUT/Image" | cut -f1) Image for Linux ${KERNEL_VERSION}"
+log "Done: $(du -h "$OUT/$NAME" | cut -f1) $NAME for Linux ${KERNEL_VERSION}"

@@ -20,7 +20,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-KERNEL="guest/out/Image"
+KERNEL="${LIGHTER_GATE_KERNEL:-guest/out/Image}"
 # A private clone, not the master: the master is an artifact, and any second
 # machine mounting it read-write beside the first corrupts both.
 ROOTFS_MASTER="guest/out/rootfs.ext4"
@@ -60,6 +60,8 @@ VMM_PID=""
 
 cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
+	# The VMM's log outlives the run directory, because a failure names it.
+	mkdir -p .logs && cp "$LOG" .logs/m6-last-boot.log 2>/dev/null || true
 	rm -rf "$RUN_DIR"
 	rm -f "${ROOTFS:-}"
 }
@@ -168,6 +170,38 @@ else
 fi
 
 # -------------------------------------------------------------------- idle --
+# -------------------------------------------------------------- the range --
+# The guest boots with a base and a virtio-mem range (a quarter of the
+# configured memory and the rest). With nothing running the range comes back
+# out, page arrays and all, and that is the idle floor; a container start
+# makes the guest whole again before dockerd sees the request, so what runs
+# inside sees the configured size.
+echo
+echo "==> The range: out when nothing runs, whole for a container"
+# Not to zero: the range's blocks online by the kernel's auto-movable
+# policy (guest patch 0026), and a block that came up as kernel memory
+# stays plugged for as long as it holds an unmovable page — a few blocks,
+# variable, and plugged is not used: their free pages are reported and
+# their page arrays are 1.5% of them. What must not stay is the range as
+# a whole, so a residue of up to 768 MiB of the 6 GiB is the bound.
+RANGE_RESIDUE_MIB=768
+waited=0
+while [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ] && [ "$waited" -lt 60 ]; do
+	sleep 2
+	waited=$((waited + 2))
+done
+if [ "$(field plugged_mib)" -le "$RANGE_RESIDUE_MIB" ]; then
+	pass "the range came out ${waited}s after the last container left ($(field plugged_mib) MiB of kernel-zone blocks left plugged); footprint $(footprint) MiB"
+else
+	fail "the range is still $(field plugged_mib) MiB plugged after ${waited}s with nothing running"
+fi
+SEEN_KB="$(docker run --rm alpine:3.21 awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+if [ "${SEEN_KB:-0}" -ge $((8192 * 1024 * 95 / 100)) ]; then
+	pass "a container saw MemTotal $((SEEN_KB / 1024)) MiB of the 8192 configured"
+else
+	fail "a container saw MemTotal $((${SEEN_KB:-0} / 1024)) MiB; the guest was not made whole for it"
+fi
+
 echo
 echo "==> Watching an idle machine for ${IDLE_SECONDS}s"
 # Two samples of cumulative CPU time, which is the only honest way: an instant

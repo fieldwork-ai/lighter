@@ -10,6 +10,7 @@ pub mod balloon;
 pub mod block;
 pub mod disk;
 pub mod fs;
+pub mod mem;
 pub mod mmio;
 pub mod net;
 pub mod poll;
@@ -29,6 +30,8 @@ pub mod device_type {
     pub const CONSOLE: u32 = 3;
     pub const RNG: u32 = 4;
     pub const BALLOON: u32 = 5;
+    /// virtio-mem (`mem.rs`).
+    pub const MEM: u32 = 24;
     pub const VSOCK: u32 = 19;
     pub const FS: u32 = 26;
 }
@@ -146,6 +149,11 @@ pub trait VirtioDevice: Send {
     /// Largest size for each queue.
     fn queue_max_size(&self) -> u16 {
         queue::MAX_QUEUE_SIZE
+    }
+
+    /// Largest size for one queue, where a device wants them unequal.
+    fn queue_max_size_of(&self, _queue: u16) -> u16 {
+        self.queue_max_size()
     }
 
     /// Device-specific configuration space.

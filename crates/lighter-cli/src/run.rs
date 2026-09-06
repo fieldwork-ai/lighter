@@ -77,33 +77,10 @@ pub fn machine() -> anyhow::Result<()> {
     let home = paths::home()?;
     std::fs::create_dir_all(&home)?;
 
-    // Exactly one machine per home directory, enforced with a lock held for
-    // the life of the process. Without this, `lighter install` while a
-    // machine was already running had launchd start a second one — which
-    // unlinked the first one's network sockets while failing to start, on a
-    // KeepAlive loop, every few seconds. The guest kept its established
-    // connections, so the breakage was maximally confusing: image pulls
-    // worked and every new port forward died. The second copy exits
-    // SUCCESSFULLY on purpose: launchd only restarts an unsuccessful exit,
-    // so answering "already running" politely is what ends the loop.
-    let lock_path = home.join("machine.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    // SAFETY: a valid descriptor, held (leaked) for the process lifetime.
-    if unsafe {
-        libc::flock(
-            std::os::fd::AsRawFd::as_raw_fd(&lock),
-            libc::LOCK_EX | libc::LOCK_NB,
-        )
-    } != 0
-    {
+    let Some(mut instance) = crate::instance::Instance::acquire(&home)? else {
         eprintln!("lighter is already running; this copy has nothing to do");
         return Ok(());
-    }
-    std::mem::forget(lock);
+    };
 
     let shares = config
         .shares
@@ -117,11 +94,19 @@ pub fn machine() -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>();
 
-    // The guest is told where to mount each share, and what time it is. It has
-    // no real-time clock, so without the second one every TLS handshake fails
-    // with a complaint about a certificate.
-    let mut cmdline =
-        String::from("console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t");
+    // The guest is told where to mount each share, and roughly what time it
+    // is. It has no real-time clock, so without the second one every TLS
+    // handshake fails with a complaint about a certificate. Whole seconds,
+    // read here before the kernel starts: the seed for init, which the agent
+    // replaces with an answer it asks the VMM for and corrects for the trip
+    // (`lighter_vmm::clock`) as soon as it runs.
+    // `psi=0`: nothing in the guest reads pressure stall information (the
+    // host's memory pressure is macOS's own), and its averaging work woke a
+    // CPU every two seconds on an idle machine, on top of its accounting on
+    // every context switch.
+    let mut cmdline = String::from(
+        "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t psi=0",
+    );
     cmdline.push_str(&format!(
         " idle.poll_ns={}",
         crate::config::idle_poll_ns(config.cpus)
@@ -141,7 +126,7 @@ pub fn machine() -> anyhow::Result<()> {
         ));
     }
     // Rosetta rides its own share, mounted by the guest's init at a fixed
-    // place when told; amd64 containers run under qemu otherwise.
+    // place when told; without it amd64 containers fail naming the fix.
     let mut shares = shares;
     if lighter_vmm::rosetta::installed() {
         match lighter_vmm::rosetta::key() {
@@ -165,10 +150,24 @@ pub fn machine() -> anyhow::Result<()> {
     {
         cmdline.push_str(" lighter.nosockmap");
     }
+    // `LIGHTER_CMDLINE_EXTRA`: words appended to the guest's command line,
+    // for an A/B of an agent or kernel knob on a machine run from the CLI
+    // (the benchmark harness has the same).
+    if let Ok(extra) = std::env::var("LIGHTER_CMDLINE_EXTRA") {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(extra);
+        }
+    }
 
+    // The configured memory is the guest's maximum: it boots with a base
+    // and plugs the rest in as the host offers it (`lighter_vmm::virtio::mem`).
+    let (ram_bytes, hotplug_bytes) = lighter_vmm::virtio::mem::split(config.memory_mib << 20);
     let machine_config = MachineConfig {
         vcpus: config.cpus,
-        ram_bytes: config.memory_mib << 20,
+        ram_bytes,
+        hotplug_bytes,
         kernel: paths::kernel()?,
         initramfs: None,
         cmdline,
@@ -190,7 +189,11 @@ pub fn machine() -> anyhow::Result<()> {
 
     // Ports a container publishes appear on the Mac, for as long as the
     // container is running and no longer, through a stream into the guest.
-    let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+    let scope = match config.publish {
+        crate::config::Publish::Lan => lighter_vmm::streams::Scope::Lan,
+        crate::config::Publish::Localhost => lighter_vmm::streams::Scope::Localhost,
+    };
+    let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock(), scope);
     let ports = lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
 
     // A Mac that slept wakes with a guest whose clock did not.
@@ -201,9 +204,10 @@ pub fn machine() -> anyhow::Result<()> {
     // SIGUSR1 is `lighter stop` saying the guest is about to be powered off:
     // the event stream into dockerd is dropped, so that dockerd, asked to
     // stop a moment later, does not sit out its five-second grace on it.
-    // SIGTERM is the same command's fallback, and a machine that ignored it
-    // would have to be killed — which is a guest that never unmounts its disk.
-    install_signal_handler(ports);
+    // SIGTERM asks this process to power off its own guest. The caller
+    // signals an audit token, so it cannot accidentally stop a replacement.
+    install_signal_handler(ports)?;
+    instance.publish()?;
 
     let reason = machine.wait()?;
     tracing::info!(?reason, "machine stopped");
@@ -229,21 +233,21 @@ impl Observer for Resync {
     }
 }
 
-/// Sets the guest's clock to now, retrying while the agent comes back.
+/// Has the guest set its clock again, retrying while the agent comes back.
 ///
 /// The same work `lighter resync` does, and deliberately the same code: a
 /// recovery path that only runs when the lid opens is one nobody can test.
+/// The time itself is not in the message: the agent asks the VMM for it and
+/// corrects for the trip (`lighter_vmm::clock`), so a retry that lands five
+/// seconds after this was called is as accurate as the first attempt. It
+/// used to carry whole seconds read once, before the retries.
 pub fn resync_clock() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     // The agent may take a moment to be reachable after a wake, so this is
     // retried rather than attempted once.
     for attempt in 0..20 {
-        match machine::control(&format!("time {now}")) {
+        match machine::control("time") {
             Ok(reply) if reply == "ok" => {
-                tracing::info!(epoch = now, attempt, "guest clock resynchronised");
+                tracing::info!(attempt, "guest clock resynchronised");
                 return;
             }
             Ok(reply) => tracing::debug!(%reply, "guest declined the time"),
@@ -259,25 +263,54 @@ pub fn resync_clock() {
 static PREPARE_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 /// Asks the machine to stop when the process is asked to.
-fn install_signal_handler(ports: Arc<lighter_docker::http::Stop>) {
+fn install_signal_handler(ports: Arc<lighter_docker::http::Stop>) -> std::io::Result<()> {
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: a pipe for the self-pipe pattern; both ends are ours.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
-        PREPARE_PIPE.store(fds[1], Ordering::SeqCst);
-        let read_end = fds[0];
-        let _ = std::thread::Builder::new()
-            .name("prepare-stop".into())
-            .spawn(move || {
-                let mut byte = [0u8; 1];
-                // SAFETY: a blocking read on our own pipe.
-                while unsafe { libc::read(read_end, byte.as_mut_ptr().cast(), 1) } == 1 {
-                    ports.stop();
-                    tracing::info!("stop announced; the port watcher let go of docker");
-                }
-            });
+    // SAFETY: storage for the two descriptors returned by pipe.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: installing handlers for SIGUSR1, SIGTERM and SIGINT. The
-    // handlers do nothing but write a byte to a pipe, or exit — see below.
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: both descriptors were just created and each gets one owner.
+    let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    // A signal storm must not block inside its handler on a full pipe.
+    if unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::thread::Builder::new()
+        .name("prepare-stop".into())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                // SAFETY: our pipe and one writable byte.
+                let n = unsafe { libc::read(reader.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                if n != 1 {
+                    break;
+                }
+                ports.stop();
+                if STOP_REQUESTED.load(Ordering::Acquire) {
+                    // This process still owns the home lock. Its control socket
+                    // cannot belong to a replacement VM while this request runs.
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let asked = machine::control("poweroff").is_ok_and(|reply| reply == "ok");
+                    if !asked {
+                        // No clean guest shutdown is possible. Exit successfully
+                        // because this was an explicit stop, not a crash for
+                        // launchd to restart.
+                        unsafe { libc::_exit(0) };
+                    }
+                    break;
+                }
+            }
+        })?;
+    PREPARE_PIPE.store(writer.as_raw_fd(), Ordering::SeqCst);
+    std::mem::forget(writer); // used by the handlers until process exit
+    // SAFETY: handlers only set an atomic flag and perform a nonblocking write.
     unsafe {
         libc::signal(
             libc::SIGUSR1,
@@ -289,25 +322,20 @@ fn install_signal_handler(ports: Arc<lighter_docker::http::Stop>) {
         );
         libc::signal(libc::SIGINT, handle_stop as *const () as libc::sighandler_t);
     }
+    Ok(())
 }
+
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_prepare_stop(_signal: libc::c_int) {
     let fd = PREPARE_PIPE.load(Ordering::SeqCst);
     if fd >= 0 {
-        // SAFETY: `write` is async-signal-safe; one byte to our own pipe.
+        // SAFETY: nonblocking write; an existing queued byte also wakes the reader.
         unsafe { libc::write(fd, b"s".as_ptr().cast(), 1) };
     }
 }
 
-/// The whole handler: ask the process to end.
-///
-/// Deliberately not "stop the machine tidily". A signal handler may call
-/// almost nothing, and a VM shutdown involves locks, threads and the
-/// hypervisor. `_exit` drops the machine the way a crash would — which the
-/// guest survives, because its disk is journalled and the one thing that must
-/// not be lost, a container's `fsync`, has already reached the Mac by then.
-extern "C" fn handle_stop(_signal: libc::c_int) {
-    // SAFETY: `_exit` is async-signal-safe, which is the whole reason it is
-    // what this handler does.
-    unsafe { libc::_exit(0) };
+extern "C" fn handle_stop(signal: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::Release);
+    handle_prepare_stop(signal);
 }

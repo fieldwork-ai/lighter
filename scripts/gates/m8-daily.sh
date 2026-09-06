@@ -11,9 +11,10 @@
 #
 # The gate cannot suspend the Mac — it would take the session with it. What a
 # sleep actually does to a guest is stop its clock, so that is what is done
-# here: the clock is skewed by an hour through the same control channel the
-# host uses, and then the same recovery path that `IOKit`'s wake notification
-# triggers is run. Everything is exercised except IOKit's delivery of the
+# here: the clock is put an hour back from inside the guest (a privileged
+# container may), and then the same recovery path that `IOKit`'s wake
+# notification triggers is run. It used to be skewed through the control
+# channel's `time` verb, which now carries no time: the agent asks the host. Everything is exercised except IOKit's delivery of the
 # event itself, which is one function call and cannot be faked convincingly.
 set -euo pipefail
 
@@ -172,7 +173,7 @@ echo
 echo "==> What a closed lid does"
 # Exactly what a suspend does to a guest with no real-time clock.
 skewed=$(( $(date +%s) - 3600 ))
-printf 'time %s\n' "$skewed" | nc -U "$LIGHTER_HOME/control.sock" -w 2 >/dev/null 2>&1 || true
+docker run --rm --privileged alpine:3.21 date -u -s "@$skewed" >/dev/null 2>&1 || true
 guest_hour() { docker run --rm alpine:3.21 date -u +%s 2>/dev/null; }
 before="$(guest_hour)"
 drift=$(( $(date -u +%s) - ${before:-0} ))

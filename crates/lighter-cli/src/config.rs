@@ -20,6 +20,21 @@ pub struct Config {
     pub disk_gib: u64,
     /// Directories from the Mac the guest can see, at the same paths.
     pub shares: Vec<String>,
+    /// Where a port a container publishes on every interface is bound on
+    /// the Mac: the network (`lan`, as Docker does) or loopback only.
+    pub publish: Publish,
+}
+
+/// Who can reach a published port: `-p 8080:80` on every interface of the
+/// Mac (`Lan`, Docker's meaning), or on loopback only (`Localhost`). A
+/// publish with its own address (`-p 127.0.0.1:8080:80`) is bound as
+/// asked under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Publish {
+    #[default]
+    Lan,
+    Localhost,
 }
 
 impl Default for Config {
@@ -40,6 +55,7 @@ impl Default for Config {
             // and a low ceiling is the only way to make btrfs slow.
             disk_gib: free_disk_gib().max(64),
             shares: vec![home_directory()],
+            publish: Publish::Lan,
         }
     }
 }
@@ -149,11 +165,19 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 32,
             shares: vec!["/tmp".into()],
+            publish: Publish::Localhost,
         };
         let bytes = serde_json::to_vec(&config).unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains(r#""publish":"localhost""#),
+            "the scope is written as a word a person can read and type"
+        );
         let back: Config = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.cpus, 3);
         assert_eq!(back.shares, vec!["/tmp".to_string()]);
+        assert_eq!(back.publish, Publish::Localhost);
     }
 
     /// A file written by an older version must still load, or an upgrade
@@ -163,5 +187,6 @@ mod tests {
         let back: Config = serde_json::from_str(r#"{"cpus": 3}"#).unwrap();
         assert_eq!(back.cpus, 3);
         assert_eq!(back.disk_gib, Config::default().disk_gib);
+        assert_eq!(back.publish, Publish::Lan);
     }
 }

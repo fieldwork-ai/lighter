@@ -152,6 +152,13 @@ impl Block {
             tracing::warn!("virtio-blk request header is malformed");
             return (S_IOERR, 0);
         }
+        // A header alone has no status descriptor to answer into, and the
+        // body slice below would run from 1 to 0: a panic, and in a release
+        // build the whole machine, for one malformed request.
+        if descriptors.len() < 2 {
+            tracing::warn!("virtio-blk request has no status descriptor");
+            return (S_IOERR, 0);
+        }
 
         let Ok(request_type) = mem.read_u32(header.addr) else {
             return (S_IOERR, 0);
@@ -443,6 +450,26 @@ mod tests {
         assert_eq!(single.features() & F_MQ, 0);
         single.config_read(34, &mut num_queues);
         assert_eq!(u16::from_le_bytes(num_queues), 1);
+    }
+
+    /// A request that is only a header has no status descriptor to answer
+    /// into: refused, not sliced from 1 to 0 (which panicked, and in a
+    /// release build took the machine with it).
+    #[test]
+    fn a_header_alone_is_refused() {
+        let mut block = Block::new(disk(), 1);
+        let header = Descriptor {
+            addr: 0x1000,
+            len: HEADER_LEN as u32,
+            flags: 0,
+            next: 0,
+        };
+        // A valid backed header reaches the old failing slice. An empty
+        // address space would return IOERR earlier even without the fix.
+        let mem = GuestMemory::test_region(0x1000, 0x4000);
+        mem.write_u32(header.addr, T_FLUSH).unwrap();
+        mem.write_u64(header.addr + 8, 0).unwrap();
+        assert_eq!(block.execute(&[header], &mem), (S_IOERR, 0));
     }
 
     /// Discard before the driver negotiated it must be refused rather than
