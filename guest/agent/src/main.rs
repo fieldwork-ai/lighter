@@ -258,6 +258,12 @@ fn bound_container_cache() {
     let mut last_offer: Option<[u8; 16]> = None;
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
+    // Whether a trim has left reporting hurried, so the restore below is a
+    // latch and not a mark: once the counter steps by four it can pass 25 s
+    // without landing on it, and did — a guest that had trimmed sat idle
+    // with reporting at 100 ms and compaction at full strength until its
+    // next container.
+    let mut hurried = always_fast;
     // Quarter-second ticks: the offer to the host waits for two seconds of
     // idle, and a one-second tick put the first offer three seconds after
     // the last container stopped — past the moment anything looking at the
@@ -292,8 +298,9 @@ fn bound_container_cache() {
         // `lighter.reporting=fast` on the command line keeps reporting
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
-        if (idle_for == 0 || idle_for == 25 * TICKS_PER_SEC) && !always_fast {
+        if hurried && !always_fast && (idle_for == 0 || idle_for >= 25 * TICKS_PER_SEC) {
             set_reporting(2000, 9);
+            hurried = false;
         }
         // Two seconds idle: offer the host what is free beyond a reserve,
         // through the balloon (`memory_guest` on the host side). What the
@@ -414,6 +421,7 @@ fn bound_container_cache() {
         // into reportable runs, as before the balloon. On a 4 GiB guest the
         // reserve alone read 600 MB more at a minute without this.
         set_reporting(100, 5);
+        hurried = true;
         compact_until_reportable();
     }
 }
@@ -635,6 +643,27 @@ fn container_cpu_usec(cgroup: &str) -> u64 {
 
 /// The host's vsock port for outbound streams.
 const STREAM_PORT: u32 = 2377;
+
+/// A joined socket's peer is a container. One removed while a connection
+/// stands never answers again, and nothing tells the socket so: its unsent
+/// bytes retransmit until TCP's own limit, a quarter of an hour, and for
+/// all of it the redirect into it is a backlog worker retrying (guest
+/// kernel patch 0025 for what each retry costs). Data unacknowledged for
+/// thirty seconds ends the connection instead. A peer alive and merely not
+/// reading keeps acknowledging the probes and is not touched.
+fn ends_with_its_peer(tcp: &std::net::TcpStream) {
+    let ms: libc::c_uint = 30_000;
+    // SAFETY: a live socket descriptor; the option value is the size given.
+    unsafe {
+        libc::setsockopt(
+            tcp.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            &ms as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of_val(&ms) as libc::socklen_t,
+        );
+    }
+}
 
 /// The kernel-side join for streams, if this kernel and this boot allow
 /// it (`lighter.nosockmap` on the command line keeps the copying path).
@@ -865,6 +894,7 @@ fn forward_outbound(tcp: std::net::TcpStream) {
         return;
     }
     let _ = tcp.set_nodelay(true);
+    ends_with_its_peer(&tcp);
     let (tcp, host_read, mut host_write) = match joiner() {
         Some(j) => match joined(j, tcp, host_read, host_write) {
             Ok(()) => return,
@@ -1011,6 +1041,7 @@ fn forward_inbound(host: OwnedFd) {
         }
     };
     let _ = tcp.set_nodelay(true);
+    ends_with_its_peer(&tcp);
     // Whatever followed the header in the same packet is carried by hand
     // before the join. The join hands sockmap whole socket buffers, and a
     // buffer the header was read out of still holds the header: joined as
