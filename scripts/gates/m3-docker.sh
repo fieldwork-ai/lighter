@@ -183,6 +183,39 @@ sleep 5
 
 docker compose -f "$COMPOSE" down -v --timeout 10 >/dev/null 2>&1 && pass "compose down cleaned up" || fail "compose down failed"
 
+# A container's own firewall: nftables with connection tracking, logging,
+# rate limits, rejects and NAT, loaded in a privileged container's
+# namespace. This kernel has no modules, so an expression it was not
+# built with is "No such file or directory" at the first rule that uses
+# it — which is how a sandbox's ruleset failed at `ct state` while
+# Docker's own rules, through iptables-nft's compat path, never asked.
+nft_out="$(docker run --rm --privileged alpine:3.21 sh -c 'apk add -q nftables >/dev/null 2>&1 && nft -f - <<"EOF" && echo NFT-OK
+table inet sandbox {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		ct state established,related accept
+		ct state invalid drop
+		iif lo accept
+		tcp dport 22 ct state new limit rate 5/minute log prefix "ssh " accept
+		counter reject with icmpx type admin-prohibited
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+		meta mark set 0x1 ct mark set meta mark
+	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		tcp dport 8080 dnat ip to 10.0.0.2:80
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "eth0" masquerade
+	}
+}
+EOF' 2>&1)"
+echo "$nft_out" | grep -q NFT-OK && pass "a container loads an nftables firewall (ct state, log, limit, reject, dnat, masquerade)" || fail "nftables in a container: $(echo "$nft_out" | grep -m1 -i "error\|No such" || echo "$nft_out" | tail -1)"
+
 for signature in "Kernel panic" "Internal error: Oops" "INIT dockerd=exited"; do
 	if grep -qF "$signature" "$LOG"; then
 		fail "guest reported: $signature"
