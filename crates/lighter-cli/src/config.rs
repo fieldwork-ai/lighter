@@ -46,8 +46,9 @@ impl Default for Config {
             // in this category.
             cpus: (num_cpus() / 2).max(2),
             // A quarter of physical memory. The guest gives back what it does
-            // not use — see the balloon — so this is a ceiling and not a
-            // reservation, and being generous costs nothing when idle.
+            // not use — see the balloon — so resident pages grow on demand.
+            // Backing-object metadata and initialization still scale with
+            // this ceiling, even while the guest is idle.
             memory_mib: (physical_memory_mib() / 4).clamp(2048, 16384),
             // What the Mac has free when the machine is made, which is what
             // a sparse image could ever hold anyway, and is what OrbStack

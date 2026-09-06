@@ -148,6 +148,13 @@ r="$(udp_echo ::1 64 18096)"
 [ "$r" = ok ] && pass "IPv6-only UDP publish reaches an IPv6-only service" || fail "IPv6-only UDP: $r"
 $D rm -f m3p-udp6 >/dev/null 2>&1
 
+echo "==> HTTP immediately after connection bursts"
+if python3 scripts/test-publish-burst.py --docker-host "unix://$LIGHTER_HOME/docker.sock"; then
+	pass "connection bursts preserve HTTP on all-interface and loopback publishes"
+else
+	fail "published connection burst; evidence is retained under .logs/lighter-burst-*"
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
 	if [ "$SKIPPED" -gt 0 ]; then echo "m3-publish: all checks passed ($SKIPPED skipped)"; else echo "m3-publish: all checks passed"; fi

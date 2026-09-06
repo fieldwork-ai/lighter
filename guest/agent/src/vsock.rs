@@ -142,8 +142,12 @@ impl VsockListener {
             return Err(io::Error::last_os_error());
         }
 
+        // Host accepts can arrive faster than the agent starts handlers.
+        // A full vsock accept queue sends a reset, even for a real request
+        // immediately after a burst of probes. Match Linux's somaxconn
+        // default so that the queue can absorb that burst.
         // SAFETY: `raw` is bound and owned.
-        if unsafe { libc::listen(raw, 128) } < 0 {
+        if unsafe { libc::listen(raw, 4096) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(VsockListener { fd })

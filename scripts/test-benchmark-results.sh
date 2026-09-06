@@ -56,9 +56,11 @@ run_case() {
 }
 run_memory_case
 if [ "$MODE" = complete ]; then
-	[ "$FAILED" = 0 ] && [ "$(wc -l < "$RESULTS")" -eq 3 ]
+	[ "$FAILED" = 0 ]
+	[ "$(wc -l < "$RESULTS")" -eq 3 ]
 else
-	[ "$FAILED" = 1 ] && [ ! -s "$RESULTS" ]
+	[ "$FAILED" = 1 ]
+	[ ! -s "$RESULTS" ]
 	[ -s .logs/case-memory-test-memory.out ]
 fi
 SH
@@ -66,4 +68,36 @@ for mode in complete failed timedout; do
 	(cd "$WORK"; MODE="$mode" bash memory.sh > "memory-$mode.log" 2>&1) \
 		|| { cat "$WORK/memory-$mode.log"; exit 1; }
 done
-echo 'benchmark results: complete accepted; partial, failed and timed-out cases rejected, including the memory workload'
+# A failed HTTP client must not silently disappear from the network medians.
+sed -n '/^run_net_case() {/,/^}/p' "$ROOT/benchmarks/run.sh" > "$WORK/network.sh"
+cat >> "$WORK/network.sh" <<'SH'
+set -euo pipefail
+TARGET=lighter LABEL=network-test FAILED=0 REPS=3
+RESULTS=network.csv
+NET_HTTP_PORT=12345
+: > "$RESULTS"
+net_setup() { :; }
+python3() {
+	if [ "$MODE" = complete ]; then echo '100 200'; else
+		echo 'ConnectionResetError: synthetic network failure' >&2; return 7
+	fi
+}
+run_net_case net-http-latency
+if [ "$MODE" = complete ]; then
+	[ "$FAILED" = 0 ]
+	[ "$(wc -l < "$RESULTS")" -eq 6 ]
+else
+	[ "$FAILED" = 1 ]
+	[ ! -s "$RESULTS" ]
+	grep -q 'ConnectionResetError' .logs/network-network-test-net-http-latency-1.stderr
+fi
+# Native has no published port; that deliberate omission remains supported.
+TARGET=native FAILED=0
+run_net_case net-tcp-port
+[ "$FAILED" = 0 ]
+SH
+for mode in complete failed; do
+	(cd "$WORK"; MODE="$mode" bash network.sh > "network-$mode.log" 2>&1) \
+		|| { cat "$WORK/network-$mode.log"; exit 1; }
+done
+echo 'benchmark results: complete accepted; failed storage, memory and network cases rejected with diagnostics'

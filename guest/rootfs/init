@@ -21,6 +21,12 @@ set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 
+# The kernel's initial 1024/4096 descriptor limits are too small for a
+# connection burst through the agent and Docker's splice-pipe proxy. Set
+# both limits before any engine or agent inherits them; descriptors are
+# allocated on demand, not reserved by raising this ceiling.
+ulimit -n 65536 || echo "INIT nofile=65536 failed"
+
 # No `busybox --install -s` here, and it matters. Alpine already ships every
 # applet symlink, and busybox resolves its own path through /proc/self/exe —
 # which is not mounted yet at this point in init. Without it, the install
