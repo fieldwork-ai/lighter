@@ -118,11 +118,37 @@ struct Flows {
     next: u32,
 }
 
+/// Appends one frame. A payload longer than the length field can say is
+/// left out whole: sent, it would arrive as a frame of length zero followed
+/// by 65536 bytes the peer reads as headers.
 pub fn frame(out: &mut Vec<u8>, flow: u32, kind: u8, payload: &[u8]) {
+    if payload.len() > u16::MAX as usize {
+        return;
+    }
     out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     out.extend_from_slice(&flow.to_be_bytes());
     out.push(kind);
     out.extend_from_slice(payload);
+}
+
+/// The address in nineteen destination bytes: family, sixteen address
+/// bytes, port. The inverse of `destination_bytes`; also the header an
+/// inbound TCP stream opens with.
+pub fn destination_from(b: &[u8]) -> Option<SocketAddr> {
+    if b.len() < 19 {
+        return None;
+    }
+    let port = u16::from_be_bytes([b[17], b[18]]);
+    let ip: IpAddr = match b[0] {
+        4 => Ipv4Addr::new(b[1], b[2], b[3], b[4]).into(),
+        6 => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&b[1..17]);
+            std::net::Ipv6Addr::from(o).into()
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, port))
 }
 
 fn destination_bytes(dst: SocketAddr) -> [u8; 19] {

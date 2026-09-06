@@ -179,7 +179,10 @@ fn main() -> ExitCode {
             eprintln!("lighter: --docker-ports needs --net");
             return ExitCode::from(2);
         }
-        let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+        let mapper = lighter_vmm::streams::PortMapper::new(
+            machine.vsock(),
+            lighter_vmm::streams::Scope::Lan,
+        );
         if let Err(e) = lighter_docker::PortWatcher::start(socket, mapper) {
             eprintln!("lighter: cannot watch docker ports: {e}");
             return ExitCode::FAILURE;

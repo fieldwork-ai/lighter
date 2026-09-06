@@ -15,6 +15,7 @@
 
 mod sockmap;
 mod udp;
+mod udp_inbound;
 mod vsock;
 
 use std::io::{self, Read, Write};
@@ -53,6 +54,7 @@ fn main() -> std::process::ExitCode {
     let mut inbound: Option<u32> = None;
     let mut dns: Option<String> = None;
     let mut udp_proxy: Option<u16> = None;
+    let mut udp_inbound = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -80,6 +82,9 @@ fn main() -> std::process::ExitCode {
             // Takes the UDP datagrams netfilter redirects to it and carries
             // every flow to the host over one vsock stream (see udp.rs).
             "--udp-proxy" => udp_proxy = args.next().and_then(|v| v.parse().ok()),
+            // The other direction for UDP: the host's flows to published
+            // UDP ports arrive on one vsock stream (see udp_inbound.rs).
+            "--udp-inbound" => udp_inbound = true,
             "--bpf-probe" => {
                 sockmap::probe();
                 return std::process::ExitCode::SUCCESS;
@@ -110,6 +115,23 @@ fn main() -> std::process::ExitCode {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("lighter-agent: udp proxy: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if udp_inbound {
+        let host = match vsock::connect(udp_inbound::UDP_INBOUND_PORT) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("lighter-agent: udp inbound stream to host refused: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let _ = vsock::set_buffer(&host, STREAM_WINDOW);
+        return match udp_inbound::serve(Fd(host)) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("lighter-agent: udp inbound: {e}");
                 std::process::ExitCode::FAILURE
             }
         };
@@ -1052,13 +1074,11 @@ fn serve_dns(addr: &str) -> std::process::ExitCode {
     }
 }
 
-/// The address Docker publishes ports on inside this guest: eth0's, which
-/// the VMM leases by DHCP. Loopback would not do — with no userland proxy a
-/// published port is a DNAT rule, and Docker's rule exempts loopback.
-const PUBLISHED_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 2);
-
-/// Answers the host's inbound streams: two bytes of port, then bytes both
-/// ways to whatever Docker has on that port.
+/// Answers the host's inbound streams: nineteen bytes naming the address
+/// Docker published on in this guest (the host knows: eth0's for a publish
+/// on every interface, the address itself for one bound somewhere in
+/// particular, where only Docker's proxy answers), then bytes both ways to
+/// whatever Docker has there.
 fn serve_inbound(port: u32) -> std::process::ExitCode {
     let listener = match VsockListener::bind(port) {
         Ok(l) => l,
@@ -1078,15 +1098,17 @@ fn serve_inbound(port: u32) -> std::process::ExitCode {
 fn forward_inbound(host: OwnedFd) {
     let mut host_read = Fd(host);
     let Ok(host_write) = host_read.try_clone() else { return };
-    let mut header = [0u8; 2];
+    let mut header = [0u8; 19];
     if host_read.read_exact(&mut header).is_err() {
         return;
     }
-    let port = u16::from_be_bytes(header);
-    let mut tcp = match std::net::TcpStream::connect((PUBLISHED_ADDR, port)) {
+    let Some(dst) = udp::destination_from(&header) else {
+        return;
+    };
+    let mut tcp = match std::net::TcpStream::connect(dst) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("lighter-agent: inbound to {PUBLISHED_ADDR}:{port} refused: {e}");
+            eprintln!("lighter-agent: inbound to {dst} refused: {e}");
             return;
         }
     };

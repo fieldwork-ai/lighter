@@ -446,6 +446,46 @@ impl VsockShared {
     ///
     /// Returns our port, which identifies the connection for the rest of its
     /// life. The REQUEST is only queued here: the guest answers on its own
+    /// A connection the guest has answered with `buf_alloc` bytes of credit,
+    /// for tests that drive the reactor's send paths without a guest.
+    #[cfg(test)]
+    pub(crate) fn establish_for_test(&self, key: ConnKey, buf_alloc: u32) {
+        let mut response = Packet::control(Op::Response, key.1, key.0);
+        response.buf_alloc = buf_alloc;
+        let mut inner = self.lock();
+        Vsock::handle(&mut inner, response);
+    }
+
+    /// Every payload byte queued for `key`, in order, for tests.
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(&self, key: ConnKey) -> Vec<u8> {
+        let inner = self.lock();
+        inner
+            .outbox
+            .iter()
+            .filter(|p| p.op == Op::Rw && p.src_port == key.0 && p.dst_port == key.1)
+            .flat_map(|p| p.payload.iter().copied())
+            .collect()
+    }
+
+    /// Drains the outbox as a guest would have, granting the credit back.
+    #[cfg(test)]
+    pub(crate) fn drain_for_test(&self, key: ConnKey) {
+        let mut inner = self.lock();
+        let sent: u32 = inner
+            .outbox
+            .iter()
+            .filter(|p| p.op == Op::Rw && p.src_port == key.0 && p.dst_port == key.1)
+            .map(|p| p.payload.len() as u32)
+            .sum();
+        inner.outbox.clear();
+        let (peer_buf_alloc, peer_fwd_cnt, _, _) = inner.conns[&key].credit.counters();
+        let mut update = Packet::control(Op::CreditUpdate, key.1, key.0);
+        update.buf_alloc = peer_buf_alloc;
+        update.fwd_cnt = peer_fwd_cnt.wrapping_add(sent);
+        Vsock::handle(&mut inner, update);
+    }
+
     /// schedule, and [`VsockShared::await_established`] is where that is waited
     /// for.
     pub fn open<S: Socket>(&self, guest_port: u32, socket: S) -> ConnKey {

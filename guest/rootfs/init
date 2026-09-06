@@ -529,6 +529,7 @@ fi
 	"$AGENT" --tcp-proxy 15201 &
 	"$AGENT" --udp-proxy 15202 &
 	"$AGENT" --inbound 2378 &
+	"$AGENT" --udp-inbound &
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
 	# container and drops loopback nameservers on the way.

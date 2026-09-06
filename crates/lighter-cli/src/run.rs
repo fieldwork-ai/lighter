@@ -217,7 +217,11 @@ pub fn machine() -> anyhow::Result<()> {
 
     // Ports a container publishes appear on the Mac, for as long as the
     // container is running and no longer, through a stream into the guest.
-    let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock());
+    let scope = match config.publish {
+        crate::config::Publish::Lan => lighter_vmm::streams::Scope::Lan,
+        crate::config::Publish::Localhost => lighter_vmm::streams::Scope::Localhost,
+    };
+    let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock(), scope);
     let ports = lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
 
     // A Mac that slept wakes with a guest whose clock did not.
