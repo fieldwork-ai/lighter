@@ -85,6 +85,12 @@ fn main() -> std::process::ExitCode {
             // The other direction for UDP: the host's flows to published
             // UDP ports arrive on one vsock stream (see udp_inbound.rs).
             "--udp-inbound" => udp_inbound = true,
+            "--bpf-rollback-test" => {
+                return match sockmap::check_failed_join() {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(error) => { eprintln!("sockmap rollback: {error}"); std::process::ExitCode::FAILURE }
+                };
+            }
             "--bpf-probe" => {
                 sockmap::probe();
                 return std::process::ExitCode::SUCCESS;
@@ -815,7 +821,25 @@ fn joined(
     }
     let slots = match joiner.join(t, h) {
         Ok(slots) => slots,
-        Err(_) => return Err((tcp, host_read, host_write)),
+        Err(failure) => {
+            // A peer can close between polling and map insertion. Those
+            // ordinary copying fallbacks must not produce a log per request.
+            static FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if count.is_power_of_two() || !failure.can_fallback {
+                eprintln!("lighter-agent: sockmap join failed (count={count}, copying={}): {}",
+                    failure.can_fallback, failure.error);
+            }
+            if failure.can_fallback {
+                if let Some(slots) = failure.slots { joiner.release(slots); }
+                return Err((tcp, host_read, host_write));
+            }
+            drop(tcp);
+            drop(host_read);
+            drop(host_write);
+            if let Some(slots) = failure.slots { joiner.release(slots); }
+            return Ok(());
+        }
     };
     // A socket reports HUP once both its directions are shut: its peer's
     // end seen, and its own sent by the kernel behind the redirected bytes.

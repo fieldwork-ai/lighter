@@ -1,0 +1,12 @@
+099b91c04c3664d6c81ec86d8ba207555a5395be
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+hw.model: MacBookPro17,1
+hw.memsize: 8589934592
+hw.ncpu: 8
+cpus=8 memory_mib=4096 disk_gib=128 repetitions=3 runs=5
+cases=npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf
+3c4c4641c9993c755d2e341449a1a22ae209ccd603569cb54504c902134b3204  guest/out/Image
+583181b524e70d9fd6c65ef15794591c86e02f3aebc7f482d36f02052cb5e415  guest/out/rootfs.ext4
+ce2ad928b39343dc69f3775088fdeff97d38d7b79824a88db2ff80d870efb7ea  guest/out/lighter-agent

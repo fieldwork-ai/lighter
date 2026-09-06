@@ -25,6 +25,10 @@ Clear polling and test NEED_RESCHED together before WFI: the waker may
 have suppressed its IPI just before polling timed out, or work may already
 be pending at polling entry. In either case sleeping loses that wakeup.
 
+After polling with interrupts enabled, return through the generic idle loop
+before WFI so it can reprogram timers queued by an interrupt. A per-CPU
+flag skips polling on the next iteration after a timeout.
+
 --- a/arch/arm64/include/asm/thread_info.h
 +++ b/arch/arm64/include/asm/thread_info.h
 @@ -71,6 +71,7 @@
@@ -57,7 +61,7 @@ be pending at polling entry. In either case sleeping loses that wakeup.
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +38,95 @@
+@@ -33,13 +38,107 @@
  }
  
  /*
@@ -83,6 +87,7 @@ be pending at polling entry. In either case sleeping loses that wakeup.
 +module_param_named(poll_grow_start_ns, idle_poll_grow_start_ns, uint, 0644);
 +
 +static DEFINE_PER_CPU(u32, idle_poll_limit_ns);
++static DEFINE_PER_CPU(bool, idle_poll_halt_next);
 +
 +static void __cpuidle idle_poll_adjust(u64 block_ns)
 +{
@@ -141,10 +146,21 @@ be pending at polling entry. In either case sleeping loses that wakeup.
 +		return;
 +	}
 +
-+	if (idle_poll(&start)) {
-+		idle_poll_adjust(local_clock_noinstr() - start);
++	if (__this_cpu_read(idle_poll_limit_ns) &&
++	    !__this_cpu_read(idle_poll_halt_next)) {
++		bool woke = idle_poll(&start);
++
++		__this_cpu_write(idle_poll_halt_next, !woke);
++		if (woke)
++			idle_poll_adjust(local_clock_noinstr() - start);
++		/* Polling enabled IRQs: an interrupt may have queued a timer
++		 * without setting NEED_RESCHED. Return through do_idle() to
++		 * reprogram the stopped tick before the next iteration's WFI.
++		 */
 +		return;
 +	}
++	__this_cpu_write(idle_poll_halt_next, false);
++	start = local_clock_noinstr();
 +
  	/*
  	 * This should do all the clock switching and wait for interrupt

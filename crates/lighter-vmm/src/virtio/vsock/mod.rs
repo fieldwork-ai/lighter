@@ -791,6 +791,9 @@ impl VsockShared {
     pub fn complete(&self, heads: impl IntoIterator<Item = u16>) {
         let mut inner = self.lock();
         inner.done.extend(heads);
+        if inner.done.is_empty() {
+            return;
+        }
         // Returned on the next look at either ring, which the credit update
         // or the guest's next packet brings; a wake per batch was a guest
         // interrupt for every few hundred kilobytes. A pile of them is
@@ -806,13 +809,15 @@ impl VsockShared {
         // thirty-two others done behind it: a daily driver sat with 51
         // chains taken and none returned, the guest's every socket out of
         // send memory, bulk data over the Docker socket dead while `docker
-        // ps` answered. So the deliverer's wait is bounded while anything
-        // is done (`has_done`); a chain goes back within a millisecond
-        // whatever the others are doing.
+        // ps` answered. Wake the delivery thread even below the thresholds:
+        // it may already be parked after observing an empty done queue, so
+        // its bounded wait for existing completions cannot help a new one.
         let pile = inner.done.len() >= 32 || inner.done.len() >= inner.held;
         drop(inner);
         if pile {
             self.wake();
+        } else {
+            self.wake_deferred();
         }
     }
 
@@ -976,7 +981,13 @@ impl VsockShared {
     /// Every connection's state on one line each, for `LIGHTER_STREAM_TRACE`.
     pub fn trace_lines(&self) -> Vec<String> {
         let inner = self.lock();
-        inner
+        let mut lines = vec![format!(
+            "vsock queues held={} completed={:?} outbox={}",
+            inner.held,
+            inner.done,
+            inner.outbox.len()
+        )];
+        lines.extend(inner
             .conns
             .iter()
             .map(|(key, conn)| {
@@ -1000,7 +1011,8 @@ impl VsockShared {
                     conn.guest_done
                 )
             })
-            .collect()
+        );
+        lines
     }
 
     /// Records that `bytes` reached the host application, freeing the guest to
@@ -1664,19 +1676,24 @@ pub fn pump<S: Socket>(
             let _done = done_tx;
             let memory = shared.memory();
             while let Some(chunks) = shared.take_outbound(key) {
-                if write_all_chunks(&mut socket, &chunks, memory.as_deref()).is_err() {
-                    break;
-                }
-                // Only now are the bytes the host application's, so only
-                // now may the guest be told it has room for more — and
-                // only now may the guest have its buffers back.
+                let written = write_all_chunks(&mut socket, &chunks, memory.as_deref());
+                // The write no longer borrows these buffers, including on
+                // error. Dropping a failed batch without completing its
+                // heads leaks guest skbs and can block socket teardown.
                 let bytes: usize = chunks.iter().map(Chunk::len).sum();
                 shared.complete(chunks.iter().filter_map(|c| match c {
                     Chunk::Guest { head, .. } => Some(*head),
                     Chunk::Owned(_) => None,
                 }));
-                shared.acknowledge(key, bytes as u32);
                 shared.recycle(chunks);
+                if written.is_err() {
+                    // Wake the other pump thread even if the peer keeps
+                    // its write side open after refusing our response.
+                    let _ = Socket::shutdown(&socket, std::net::Shutdown::Both);
+                    break;
+                }
+                // Credit only bytes delivered successfully to the peer.
+                shared.acknowledge(key, bytes as u32);
             }
             let _ = socket.flush();
             // The guest will send no more, so the host peer is owed an
@@ -1765,6 +1782,54 @@ pub fn write_all_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_completion_wakes_a_parked_deliverer() {
+        let shared = VsockShared::new();
+        shared.lock().held = 2;
+        let (wake, woken) = std::sync::mpsc::channel();
+        shared.set_deferred_waker(move || {
+            wake.send(()).unwrap();
+        });
+        // The delivery thread parked while there were no completions.
+        // Another stream still holds a buffer, so neither batching threshold
+        // fires. This completion must itself arrange a look at the ring.
+        shared.complete([7]);
+        assert!(woken.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_failed_pump_write_returns_the_guest_buffers() {
+        let shared = Arc::new(VsockShared::new());
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let key = shared.open(2375, socket.try_clone().unwrap());
+        {
+            let mut inner = shared.lock();
+            let conn = inner.conns.get_mut(&key).unwrap();
+            conn.state = State::Established;
+            // No guest memory is installed, so writing this batch fails
+            // deterministically before touching the span. The pump must
+            // return ownership even when none of the bytes were delivered.
+            conn.outbound.push_back(Chunk::Guest {
+                head: 7,
+                spans: vec![(0x4000_0000, 40)],
+            });
+            inner.held = 1;
+        }
+        drop(peer);
+        let worker_shared = shared.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            pump(worker_shared, key, socket, None);
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let inner = shared.lock();
+        assert_eq!(inner.done.iter().copied().collect::<Vec<_>>(), [7]);
+        assert_eq!(inner.conns[&key].credit.fwd_cnt(), 0);
+    }
 
     fn flat(chunks: Option<Vec<Chunk>>) -> Option<Vec<u8>> {
         chunks.map(|c| {

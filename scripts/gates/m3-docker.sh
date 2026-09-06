@@ -125,6 +125,29 @@ else
 fi
 
 echo
+echo "==> Checking build worker OOM isolation"
+mkdir -p "$RUN_DIR/oom-build"
+cat >"$RUN_DIR/oom-build/Dockerfile" <<'DOCKERFILE'
+FROM alpine:3.21
+RUN test "$(cat /proc/self/oom_score_adj)" = 0
+DOCKERFILE
+if scripts/capped.sh 120 docker build --no-cache --progress=plain -t lighter-gate-oom-score \
+	"$RUN_DIR/oom-build" >"$RUN_DIR/build-oom-score.log" 2>&1; then
+	pass "BuildKit workers do not inherit daemon OOM protection"
+else
+	fail "BuildKit worker OOM score"
+	tail -15 "$RUN_DIR/build-oom-score.log"
+fi
+if docker run --rm --pid=host alpine:3.21 sh -c '
+	for name in dockerd containerd; do
+		pid=$(pidof "$name") || exit 1
+		[ "$(cat /proc/$pid/oom_score_adj)" = -900 ] || exit 1
+	done'; then
+	pass "Docker and containerd retain their OOM protection"
+else
+	fail "engine OOM protection"
+fi
+
 echo "==> Bringing up a Fieldwork-shaped stack"
 if docker compose -f "$COMPOSE" up -d --wait --wait-timeout 300 >/dev/null 2>&1; then
 	pass "compose up: all services reported healthy"

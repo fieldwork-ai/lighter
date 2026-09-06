@@ -45,6 +45,24 @@ echo "==> Booting with streams"
 for _ in $(seq 1 60); do $D info >/dev/null 2>&1 && break; sleep 1; done
 $D info >/dev/null 2>&1 || { fail "machine did not come up"; exit 1; }
 grep -q "INIT streams=on" "$LIGHTER_HOME/machine.log" && pass "the guest installed its redirect" || fail "guest: $(grep -o 'INIT streams=.*' "$LIGHTER_HOME/machine.log" || echo 'no streams line')"
+if python3 - <<'PY'
+import os, socket, sys
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+    control.settimeout(15)
+    control.connect(os.path.join(os.environ['LIGHTER_HOME'], 'control.sock'))
+    control.sendall(b'sh /sbin/lighter-agent --bpf-rollback-test\n')
+    response = b''
+    while not response.endswith(b'--end--\n'):
+        chunk = control.recv(65536)
+        if not chunk:
+            break
+        response += chunk
+    print(response.decode(errors='replace'))
+    sys.exit(0 if b'PASS:' in response and response.endswith(b'exit=0\n--end--\n') else 1)
+PY
+then pass "failed sockmap joins clean up and preserve fallback I/O"
+else fail "sockmap rollback regression"
+fi
 $D pull -q curlimages/curl:8.11.1 >/dev/null 2>&1
 $D pull -q alpine:3.21 >/dev/null 2>&1
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1)"

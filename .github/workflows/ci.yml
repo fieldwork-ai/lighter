@@ -36,7 +36,11 @@ jobs:
         run: bash scripts/test-install.sh
       - name: Benchmark rejects incomplete results
         run: bash scripts/test-benchmark-results.sh
+      - name: Task footprint measures actual allocations
+        run: python3 scripts/test-task-footprint.py
       - name: Idle polling preserves wakeups
         run: python3 scripts/test-idle-poll.py
+      - name: Check vsock blocking receive lock handling
+        run: python3 scripts/test-vsock-wait.py
       - name: Speed gate rejects failed performance floors
         run: bash scripts/test-speed-gate.sh
