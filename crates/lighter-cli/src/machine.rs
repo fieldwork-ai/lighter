@@ -206,17 +206,28 @@ pub fn control(command: &str) -> anyhow::Result<String> {
     Ok(reply.trim().to_string())
 }
 
-/// The machine's physical footprint, as macOS accounts it.
+/// The machine's physical footprint, as macOS accounts it: `phys_footprint`,
+/// the number Activity Monitor shows and memory pressure is decided from.
+/// The resident set size read twice that on a machine running a day's
+/// stack (2.7 GB against 1.3), since it counts the guest's pages the Mac
+/// has already taken back.
 fn footprint_mib(pid: u32) -> Option<u64> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let kib: u64 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()?;
-    Some(kib / 1024)
+    // SAFETY: `rusage_info_v2` is plain data of the size the kernel is told
+    // to fill, and the pid is a process this user owns.
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            info.as_mut_ptr() as *mut libc::rusage_info_t,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so the structure is filled.
+    let info = unsafe { info.assume_init() };
+    Some(info.ri_phys_footprint >> 20)
 }
 
 /// The vsock ports the machine serves, and where they appear on the Mac.
