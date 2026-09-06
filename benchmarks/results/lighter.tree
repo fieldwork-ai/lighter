@@ -1,6 +1,6 @@
-commit=6bd8563
-date=2026-09-06T02:40Z
+commit=c3c46f0
+date=2026-09-06T04:27Z
 host=NicksFWMBP
-Image=566aa5e64918a42152cef966e3c4f739
-rootfs.ext4=b0a00f1ab8074c9de2fd8ba9da0d9b52
-lighter-agent=a30fa76d1acd5ccb45c0b418b316f261
+Image=4de35c26f490b97e290ac230eedbc225
+rootfs.ext4=8484407b8c12dfca3e2138a50213f640
+lighter-agent=7f4928be10212ff7ce62c3dfdfb9896b
