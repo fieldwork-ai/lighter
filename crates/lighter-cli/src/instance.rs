@@ -59,6 +59,57 @@ impl Identity {
         })
     }
 
+    /// Authenticate the server of an already-connected home socket. The kernel
+    /// supplies its process generation, including for pre-identity daemons.
+    pub fn peer(home: &Path, stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
+        let mut token = [0u32; 8];
+        let mut len = std::mem::size_of_val(&token) as libc::socklen_t;
+        // SAFETY: LOCAL_PEERTOKEN (sys/un.h) fills the eight-word audit token.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                0x006,
+                token.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len as usize != std::mem::size_of_val(&token)
+            || token[5] == 0
+            || token[5] > i32::MAX as u32
+        {
+            return Err(io::Error::other("invalid control socket peer token"));
+        }
+        let home = home.canonicalize()?;
+        let meta = home.metadata()?;
+        Ok(Self {
+            token,
+            home,
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+
+    pub fn executable(&self) -> io::Result<PathBuf> {
+        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: a complete token and a correctly sized output buffer.
+        let n = unsafe {
+            proc_pidpath_audittoken(&self.token, path.as_mut_ptr().cast(), path.len() as u32)
+        };
+        if n <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        path.truncate(n as usize);
+        if let Some(end) = path.iter().position(|b| *b == 0) {
+            path.truncate(end);
+        }
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::ffi::OsString::from_vec(path).into())
+    }
+
     pub fn pid(&self) -> u32 {
         self.token[5]
     }

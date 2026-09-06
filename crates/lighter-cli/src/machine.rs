@@ -34,90 +34,81 @@ pub fn running_pid() -> anyhow::Result<Option<u32>> {
     if let Some(identity) = crate::instance::Identity::read(&paths::home()?)? {
         return Ok(Some(identity.pid()));
     }
-    legacy_pid()
+    Ok(legacy_machine(&paths::home()?)?.map(|machine| machine.identity.pid()))
 }
 
-/// A machine from before the identity file: the home's lock held (the old
-/// machine took it for its lifetime too) and its pid file naming a live
-/// process that is a lighter binary. Either alone is not enough to signal
-/// anything — a pid file outlives a killed machine and the number comes
-/// back as some other process — but a held lock is a live machine in this
-/// home, and its pid file is the only name it gave itself. Without this,
-/// the first `lighter stop` after an upgrade said "Stopped." and left the
-/// old machine running, and `lighter start` then waited two minutes on a
-/// lock it could not take.
-fn legacy_pid() -> anyhow::Result<Option<u32>> {
-    let home = paths::home()?;
+struct LegacyMachine {
+    identity: crate::instance::Identity,
+    control: UnixStream,
+}
+
+/// The PID file is only a hint. Authenticate the process serving this home's
+/// control socket and retain that connection across shutdown: reconnecting
+/// could send poweroff to a successor after the old daemon exits.
+fn legacy_machine(home: &Path) -> anyhow::Result<Option<LegacyMachine>> {
     let Ok(text) = std::fs::read_to_string(home.join("lighter.pid")) else {
         return Ok(None);
     };
     let Ok(pid) = text.trim().parse::<u32>() else {
         return Ok(None);
     };
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Ok(None);
+    }
     let Ok(lock) = std::fs::File::open(home.join("machine.lock")) else {
         return Ok(None);
     };
     if crate::instance::try_lock(&lock)? {
-        // Nobody holds it: the pid file is stale.
         return Ok(None);
     }
-    Ok(is_lighter(pid).then_some(pid))
-}
-
-/// Whether the process is a lighter binary, by the path it runs from.
-fn is_lighter(pid: u32) -> bool {
-    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: a buffer of the size the call is told about.
-    let len = unsafe {
-        libc::proc_pidpath(
-            pid as libc::c_int,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-        )
-    };
-    if len <= 0 {
-        return false;
+    // Fail explicitly if a locked legacy home cannot be authenticated. Never
+    // fall back to kill(pid), even when the socket is unavailable.
+    let control = UnixStream::connect(home.join("control.sock"))?;
+    let identity = crate::instance::Identity::peer(home, &control)?;
+    if identity.pid() != pid {
+        anyhow::bail!("legacy PID file does not match the control socket owner");
     }
-    let path = String::from_utf8_lossy(&buffer[..len as usize]);
-    std::path::Path::new(path.as_ref())
+    if identity
+        .executable()?
         .file_name()
-        .is_some_and(|name| name == "lighter")
+        .is_none_or(|name| name != "lighter")
+    {
+        anyhow::bail!("legacy control socket owner is not a lighter executable");
+    }
+    Ok(Some(LegacyMachine { identity, control }))
 }
 
-/// Stops a machine from before the identity file the way its own `stop`
-/// did: the port watcher let go of dockerd (SIGUSR1), the guest asked to
-/// power off, SIGTERM for a guest that does not answer, SIGKILL for a
-/// machine that does not end; and the files it will not clean up itself
-/// removed here, since that machine's process never did.
-fn stop_legacy(pid: u32, wait: Duration) -> anyhow::Result<bool> {
-    let home = paths::home()?;
-    let alive = |pid: u32| -> bool {
-        // SAFETY: a plain kill(2) with no side effect.
-        let signalable = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-        signalable && is_lighter(pid)
-    };
-    // SAFETY: a signal to a lighter process holding this home's lock.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+fn stop_legacy(mut machine: LegacyMachine, wait: Duration) -> anyhow::Result<bool> {
+    let identity = &machine.identity;
+    if !identity.signal(libc::SIGUSR1)? {
+        return Ok(false);
+    }
     std::thread::sleep(Duration::from_millis(150));
-    let asked = control("poweroff")
+    let asked = control_on(&mut machine.control, "poweroff")
         .map(|reply| reply == "ok")
         .unwrap_or(false);
     if !asked {
-        // SAFETY: as above.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        identity.signal(libc::SIGTERM)?;
     }
     let deadline = Instant::now() + wait;
-    while Instant::now() < deadline && alive(pid) {
+    while Instant::now() < deadline && identity.alive()? {
         std::thread::sleep(Duration::from_millis(100));
     }
-    if alive(pid) {
-        // SAFETY: as above.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-        std::thread::sleep(Duration::from_millis(200));
+    if identity.alive()? {
+        identity.signal(libc::SIGKILL)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while identity.alive()? {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "legacy machine {} has not exited after SIGKILL",
+                    identity.pid()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
-    for name in ["lighter.pid", "docker.sock", "control.sock"] {
-        let _ = std::fs::remove_file(home.join(name));
-    }
+    // Leave files alone. A successor may already own this home. The next
+    // daemon clears stale PID state and socket paths under its lifetime lock.
     Ok(true)
 }
 
@@ -196,8 +187,8 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
 /// Asks the machine to stop, and waits for it.
 pub fn stop(wait: Duration) -> anyhow::Result<bool> {
     let Some(identity) = crate::instance::Identity::read(&paths::home()?)? else {
-        return match legacy_pid()? {
-            Some(pid) => stop_legacy(pid, wait),
+        return match legacy_machine(&paths::home()?)? {
+            Some(machine) => stop_legacy(machine, wait),
             None => Ok(false),
         };
     };
@@ -266,6 +257,10 @@ fn docker_version_until(socket: &Path, deadline: Instant) -> anyhow::Result<Stri
 pub fn control(command: &str) -> anyhow::Result<String> {
     let socket = paths::home()?.join("control.sock");
     let mut stream = UnixStream::connect(&socket)?;
+    control_on(&mut stream, command)
+}
+
+fn control_on(stream: &mut UnixStream, command: &str) -> anyhow::Result<String> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(format!("{command}\n").as_bytes())?;
@@ -273,7 +268,7 @@ pub fn control(command: &str) -> anyhow::Result<String> {
     // open for another command, so reading to EOF waits for something that is
     // never coming and fails with EAGAIN when the timeout expires.
     let mut reply = String::new();
-    std::io::BufReader::new(&stream).read_line(&mut reply)?;
+    std::io::BufReader::new(stream).read_line(&mut reply)?;
     Ok(reply.trim().to_string())
 }
 
@@ -307,4 +302,103 @@ pub fn sockets() -> anyhow::Result<Vec<(std::path::PathBuf, u32)>> {
         (paths::docker_socket()?, DOCKER_PORT),
         (paths::home()?.join("control.sock"), CONTROL_PORT),
     ])
+}
+
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn legacy_child() {
+        let Some(home) = std::env::var_os("LIGHTER_TEST_LEGACY_HOME") else {
+            return;
+        };
+        let home = Path::new(&home);
+        let _owner = crate::instance::Instance::acquire(home).unwrap().unwrap();
+        // A pre-identity daemon only publishes a numeric PID.
+        std::fs::write(home.join("lighter.pid"), std::process::id().to_string()).unwrap();
+        // SAFETY: the test daemon needs the old watcher's SIGUSR1 semantics.
+        unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+        }
+        let listener = UnixListener::bind(home.join("control.sock")).unwrap();
+        for connection in listener.incoming() {
+            let mut stream = connection.unwrap();
+            let mut line = String::new();
+            if std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap()
+                == 0
+            {
+                continue;
+            }
+            assert_eq!(line, "poweroff\n");
+            stream.write_all(b"ok\n").unwrap();
+            break;
+        }
+    }
+
+    #[test]
+    fn legacy_peer_is_authenticated_and_shutdown_keeps_replacement_paths() {
+        let home = std::env::temp_dir().join(format!("lighter-legacy-{}", std::process::id()));
+        std::fs::create_dir(&home).unwrap();
+        struct Fixture {
+            home: std::path::PathBuf,
+            child: std::process::Child,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.home);
+            }
+        }
+        // proc_pidpath must report the shipped executable's basename.
+        let exe = home.join("lighter");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let child = std::process::Command::new(&exe)
+            .args(["--exact", "machine::legacy_tests::legacy_child"])
+            .env("LIGHTER_TEST_LEGACY_HOME", &home)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut fixture = Fixture {
+            home: home.clone(),
+            child,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !home.join("control.sock").exists() {
+            assert!(Instant::now() < deadline, "legacy daemon did not bind");
+            assert!(fixture.child.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A held home lock cannot make an unrelated PID authoritative.
+        std::fs::write(home.join("lighter.pid"), std::process::id().to_string()).unwrap();
+        assert!(legacy_machine(&home).is_err());
+        assert!(fixture.child.try_wait().unwrap().is_none());
+        std::fs::write(home.join("lighter.pid"), fixture.child.id().to_string()).unwrap();
+        let machine = legacy_machine(&home).unwrap().unwrap();
+        assert_eq!(machine.identity.pid(), fixture.child.id());
+        // Replace the endpoint after authentication. Shutdown must use the
+        // original connection and must never unlink the replacement's state.
+        std::fs::remove_file(home.join("control.sock")).unwrap();
+        let replacement = UnixListener::bind(home.join("control.sock")).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        let docker = UnixListener::bind(home.join("docker.sock")).unwrap();
+        std::fs::write(home.join("lighter.pid"), "replacement").unwrap();
+        assert!(stop_legacy(machine, Duration::from_secs(2)).unwrap());
+        assert!(fixture.child.wait().unwrap().success());
+        assert!(home.join("control.sock").exists());
+        assert!(home.join("docker.sock").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("lighter.pid")).unwrap(),
+            "replacement"
+        );
+        assert_eq!(
+            replacement.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop((replacement, docker));
+    }
 }
