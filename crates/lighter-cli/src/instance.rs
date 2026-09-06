@@ -245,7 +245,11 @@ impl Drop for Instance {
                 let _ = std::fs::remove_file(self.home.join(name));
             }
         }
-        // The lock is released after cleanup, so this cannot remove a successor.
+        // Release after cleanup, so this cannot remove a successor. Closing
+        // alone can leave flock held by a concurrent spawn's inherited file
+        // description until it reaches exec, despite close-on-exec being set.
+        // SAFETY: this instance still owns the open, locked descriptor.
+        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -284,9 +288,13 @@ mod tests {
         );
         assert!(Instance::acquire(&home.0).unwrap().is_none());
         assert!(home.0.join("machine.identity").exists());
+        // A concurrent spawn can inherit this open-file description until
+        // exec closes it. Model that window without relying on scheduling.
+        let inherited = owner._lock.try_clone().unwrap();
         drop(owner);
         assert!(Identity::read(&home.0).unwrap().is_none());
         assert!(Instance::acquire(&home.0).unwrap().is_some());
+        drop(inherited);
     }
 
     #[test]

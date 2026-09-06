@@ -41,7 +41,7 @@ RUNTIMES = [
 
 INTRO = """Measured on clean machines against a 1,232-package `package.json` fixture (`benchmarks/`). Each figure is the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). The first table is the runtime's own disk, where a container's writable layer and its volumes live; the second is a host share, the Mac's directory bind-mounted into the container. Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
 
-OrbStack, Colima and Docker Desktop were measured on the same machines in the same sessions."""
+OrbStack, Colima and Docker Desktop were measured on the same machines. Runtime records are refreshed independently, so their rows can come from different sessions. Recording dates, source commits and artifact hashes for lighter are retained in the `.tree` files beside its CSVs."""
 
 MEMORY_INTRO = """The physical footprint of the runtime's own processes, which is the "Memory" column in Activity Monitor: idle a minute after a cold start with nothing run on it, at its peak during an `npm ci`, and 15 and 60 seconds after that ends with nothing running. Lower is better throughout, with one reading to take as it is: the peak is what the guest borrows while it works, mostly the install's own page cache, which it may take up to its configured size and hands back within the minute; the idle and after rows are what it keeps."""
 

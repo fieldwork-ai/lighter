@@ -109,8 +109,11 @@ echo "==> Signing identity: $IDENTITY"
 # --- build -------------------------------------------------------------------
 echo "==> Building lighter-cli release binary"
 cargo build --release -p lighter-cli
+# The checkout can be the user's daily-driver wrapper target. Building
+# strips its entitlement; keep it runnable even if notarization later fails.
+./scripts/sign.sh target/release/lighter >/dev/null
 
-# Both kernels: the CLI picks one by the vCPU count against the Mac's cores.
+# The one guest kernel and root filesystem shipped with this build.
 for artifact in guest/out/Image guest/out/rootfs.ext4; do
 	[ -f "$artifact" ] || { echo "error: $artifact is missing; run 'make guest'" >&2; exit 1; }
 done
@@ -149,7 +152,9 @@ codesign --verify --verbose=2 "$STAGE/bin/lighter"
 codesign --verify --verbose=2 --deep "$APP"
 
 # --- notarize ----------------------------------------------------------------
-if [ -z "$SKIP_NOTARIZE" ] && [ -f "$WORK/AuthKey.p8" ] && [ -n "${APPLE_API_KEY_ID:-}" ]; then
+if [ -z "$SKIP_NOTARIZE" ]; then
+	[ -f "$WORK/AuthKey.p8" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] \
+		|| { echo "error: notarization credentials are missing" >&2; exit 1; }
 	echo "==> Submitting binaries to Apple Notary Service"
 	ZIP="$WORK/notarize.zip"
 	mkdir -p "$WORK/notarize"
@@ -159,11 +164,21 @@ if [ -z "$SKIP_NOTARIZE" ] && [ -f "$WORK/AuthKey.p8" ] && [ -n "${APPLE_API_KEY
 		--key "$WORK/AuthKey.p8" \
 		--key-id "$APPLE_API_KEY_ID" \
 		--issuer "$APPLE_API_ISSUER" \
-		--wait
+		--wait --timeout 30m --output-format json > "$WORK/notarization.json"
+	python3 - "$WORK/notarization.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    result = json.load(f)
+print(f"    Notarization {result.get('id')}: {result.get('status')}")
+if result.get("status") != "Accepted":
+    raise SystemExit("error: Apple did not accept this release")
+PY
 	echo "==> Notarization accepted by Apple"
-	spctl --assess --type execute --verbose=4 "$APP" || true
+	xcrun stapler staple "$APP"
+	xcrun stapler validate "$APP"
+	spctl --assess --type execute --verbose=4 "$APP"
 else
-	echo "==> Skipping notarization (--skip-notarize or missing API keys)"
+	echo "==> Skipping notarization (--skip-notarize)"
 fi
 
 # --- packing -----------------------------------------------------------------

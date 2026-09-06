@@ -21,6 +21,10 @@ spinning within a few rounds. The upstream arm64 haltpoll series is not in
 entry rather than a cpuidle driver, because the guest has no cpuidle
 driver and needs none.
 
+Clear polling and test NEED_RESCHED together before WFI: the waker may
+have suppressed its IPI just before polling timed out, or work may already
+be pending at polling entry. In either case sleeping loses that wakeup.
+
 --- a/arch/arm64/include/asm/thread_info.h
 +++ b/arch/arm64/include/asm/thread_info.h
 @@ -71,6 +71,7 @@
@@ -99,7 +103,6 @@ driver and needs none.
 +static bool __cpuidle idle_poll(u64 *start)
 +{
 +	u32 limit = __this_cpu_read(idle_poll_limit_ns);
-+	bool woke = false;
 +
 +	*start = local_clock_noinstr();
 +	if (!limit)
@@ -117,12 +120,13 @@ driver and needs none.
 +			if (local_clock_noinstr() - *start > limit)
 +				goto out;
 +		}
-+		woke = true;
 +	}
 +out:
-+	current_clr_polling();
 +	raw_local_irq_disable();
-+	return woke;
++	/* A waker observing polling sends no IPI. Clear, order, then test
++	 * NEED_RESCHED so work arriving at the deadline also prevents WFI.
++	 */
++	return current_clr_polling_and_test();
 +}
 +
 +/*

@@ -89,8 +89,13 @@ elif mkdir -p "$HOME/.local/bin" 2>/dev/null && [ -w "$HOME/.local/bin" ]; then
 fi
 
 if [ -n "$TARGET_BIN" ]; then
-	ln -sf "$BIN" "$TARGET_BIN"
-	log "Linked $BIN -> $TARGET_BIN"
+	if [ -e "$TARGET_BIN" ] && [ ! -L "$TARGET_BIN" ]; then
+		warn "Leaving existing $TARGET_BIN unchanged (it is not a symlink)."
+		TARGET_BIN="$BIN"
+	else
+		ln -sfn "$BIN" "$TARGET_BIN"
+		log "Linked $BIN -> $TARGET_BIN"
+	fi
 else
 	TARGET_BIN="$BIN"
 	warn "Could not write to /usr/local/bin or ~/.local/bin."
@@ -117,10 +122,10 @@ else
 fi
 
 echo "Start the daemon:"
-echo "  lighter start"
+echo "  \"$TARGET_BIN\" start"
 echo
 echo "Or start automatically on login:"
-echo "  lighter install"
+echo "  \"$TARGET_BIN\" install"
 echo
 echo "Point your Docker CLI at lighter:"
 echo "  docker ps"
