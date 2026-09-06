@@ -83,6 +83,19 @@ const GUEST_RESERVE_FRACTION: u64 = 16;
 /// The least a range grows by when the guest is short: a small guest
 /// doubles, a tiny one gets this.
 const GROW_STEP_MIN: u64 = 256 << 20;
+/// Below this configured size the guest's offers do not go to the balloon;
+/// the range and reporting are the policy, as they were before the range
+/// (the agent's own `lighter.balloonmin` line, eight gigabytes). The range
+/// made the agent send its memory line on every guest, since the line is
+/// also what sizes the range, and the offer on it reached the balloon on a
+/// 4 GiB guest where the agent had kept it off: standing through the next
+/// container's run, the balloon left the page cache of three installs no
+/// room, and a `ripgrep` over the tree read the M1's share at 4.5–7.3 s on
+/// every repetition against 140–260 ms once warm (system time 6.5–9.6 s a
+/// pass inside the guest, and "Out of puff! Can't get 4 pages" in its log),
+/// with `cp -a` of the tree at 14–22 s against 5. A 12 GiB guest has the
+/// room and gains on every reading, which is why the line is where it is.
+const BALLOON_MIN_BYTES: u64 = 8 << 30;
 
 /// The balloon, and the signals that drive it.
 pub struct MemoryPolicy {
@@ -461,7 +474,10 @@ fn memory_guest(
                     let taken = steering.guest_sizes(spare_mib, release || need, nothing_runs);
                     if release || need {
                         steering.guest_offers(0, true);
-                    } else if !taken && steering.range_out() {
+                    } else if !taken
+                        && steering.range_out()
+                        && steering.total_bytes() >= BALLOON_MIN_BYTES
+                    {
                         steering.guest_offers(spare_mib, false);
                     }
                 }
