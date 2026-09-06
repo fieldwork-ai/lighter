@@ -409,6 +409,11 @@ echo 1 > /proc/sys/vm/defrag_mode 2>/dev/null || true
 # wakeups a second. Once every ten seconds is soon enough for /proc/vmstat;
 # the kernel's own reclaim decisions read the counters directly.
 sysctl -q -w vm.stat_interval=10 2>/dev/null || true
+# khugepaged scans for pages to collapse every ten seconds and drains every
+# CPU's LRU lists first — nine kworkers woken for a scan of an idle guest
+# that finds nothing. Once a minute is plenty for a machine whose memory
+# turns over between commands anyway.
+echo 60000 > /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs 2>/dev/null || true
 # TCP inside the guest carries a container's stream to the agent; its
 # windows are what lets that leg run ahead of the vsock leg behind it. The
 # defaults top out at 4 and 6 MB.

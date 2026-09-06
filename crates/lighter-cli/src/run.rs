@@ -123,8 +123,13 @@ pub fn machine() -> anyhow::Result<()> {
     // read here before the kernel starts: the seed for init, which the agent
     // replaces with an answer it asks the VMM for and corrects for the trip
     // (`lighter_vmm::clock`) as soon as it runs.
-    let mut cmdline =
-        String::from("console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t");
+    // `psi=0`: nothing in the guest reads pressure stall information (the
+    // host's memory pressure is macOS's own), and its averaging work woke a
+    // CPU every two seconds on an idle machine, on top of its accounting on
+    // every context switch.
+    let mut cmdline = String::from(
+        "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t psi=0",
+    );
     cmdline.push_str(&format!(
         " idle.poll_ns={}",
         crate::config::idle_poll_ns(config.cpus)
