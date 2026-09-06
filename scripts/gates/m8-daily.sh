@@ -222,6 +222,17 @@ else
 fi
 
 echo
+echo "==> Starting without a local Docker CLI"
+if PATH=/usr/bin:/bin:/usr/sbin:/sbin "$LIGHTER" start >"$LIGHTER_HOME/no-docker.log" 2>&1 \
+	&& [ "$(curl -fsS --max-time 10 --unix-socket "$LIGHTER_HOME/docker.sock" http://localhost/_ping)" = OK ]; then
+	pass "the machine starts and serves its API without docker on PATH"
+else
+	fail "start requires a local Docker CLI"
+	tail -10 "$LIGHTER_HOME/no-docker.log" | sed 's/^/    /'
+fi
+"$LIGHTER" stop >/dev/null 2>&1 || fail "the machine without a local CLI did not stop"
+
+echo
 if [ "$FAILED" -eq 0 ]; then
 	printf '\033[32mmilestone 8 gate passed\033[0m — a day of work, and a night of sleep.\n'
 	exit 0

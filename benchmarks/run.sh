@@ -121,6 +121,7 @@ HELPER_PID=""
 ROOTFS=""
 RUN_DIR=""
 CASE_OUT=""
+FAILED=0
 
 # Milliseconds since the epoch, from a runtime every target already needs.
 # macOS `date` has no %N, and the shell has no sub-second clock at all.
@@ -596,7 +597,8 @@ run_memory_case() {
 	# for a while.
 	sleep 5
 	local peak after15 after60 now
-	REPS=1 run_case npm-install >/dev/null 2>&1 &
+	CASE_OUT="$(mktemp -t lighter-memory-case)"
+	REPS=1 run_case npm-install >"$CASE_OUT" 2>&1 &
 	local install=$!
 	peak="$(runtime_footprint_mib)"
 	while kill -0 "$install" 2>/dev/null; do
@@ -604,6 +606,22 @@ run_memory_case() {
 		[ "$now" -le "$peak" ] || peak="$now"
 		sleep 1
 	done
+	local case_status=0
+	wait "$install" || case_status=$?
+	if [ "$case_status" -ne 0 ] \
+		|| [ "$(grep -c '^TIME_MS [0-9]' "$CASE_OUT" || true)" -ne 1 ] \
+		|| grep -q '^TIME_MS TIMEOUT ' "$CASE_OUT"; then
+		FAILED=1
+		printf '\n    FAILED: memory workload did not complete (exit %s)\n' "$case_status"
+		head -20 "$CASE_OUT" | sed 's/^/      /'
+		mkdir -p .logs
+		cp "$CASE_OUT" ".logs/case-${LABEL:-$TARGET}-memory.out"
+		rm -f "$CASE_OUT"
+		CASE_OUT=""
+		return
+	fi
+	rm -f "$CASE_OUT"
+	CASE_OUT=""
 	sleep 15; after15="$(runtime_footprint_mib)"
 	sleep 45; after60="$(runtime_footprint_mib)"
 	printf ' peak=%s after15s=%s after60s=%s (MiB)\n' "$peak" "$after15" "$after60"
@@ -1017,12 +1035,15 @@ for name in $CASES; do
 		( exec </dev/null >/dev/null 2>&1; sleep "${LIGHTER_BENCH_SAMPLE_AFTER_S:-150}"; kill -0 "$case_pid" 2>/dev/null && { mkdir -p .logs; sample "$VMM_PID" 8 -mayDie -file ".logs/stall-$TARGET-$name.txt"; } ) &
 		sampler_pid=$!
 	fi
-	wait "$case_pid" 2>/dev/null || true
+	case_status=0
+	wait "$case_pid" 2>/dev/null || case_status=$?
 	pkill -P "$watchdog_pid" 2>/dev/null || true
-	kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null || true
+	kill "$watchdog_pid" 2>/dev/null || true
+	wait "$watchdog_pid" 2>/dev/null || true
 	if [ -n "$sampler_pid" ]; then
 		pkill -P "$sampler_pid" 2>/dev/null || true
-		kill "$sampler_pid" 2>/dev/null; wait "$sampler_pid" 2>/dev/null || true
+		kill "$sampler_pid" 2>/dev/null || true
+		wait "$sampler_pid" 2>/dev/null || true
 	fi
 	while read -r ms; do
 		rep=$((rep + 1))
@@ -1056,9 +1077,20 @@ for name in $CASES; do
 			printf '  <- implausible; the fixture was probably missing'
 		fi
 	fi
-	# The case's whole output, for a run that produced fewer measurements
-	# than repetitions: a repetition that failed is otherwise invisible.
-	[ -z "${LIGHTER_BENCH_KEEP_OUTPUT:-}" ] || cp "$CASE_OUT" ".logs/case-$TARGET-$name.out" 2>/dev/null || true
+	# A partial run is not a record. Preserve its error even if earlier
+	# repetitions succeeded; otherwise the median silently drops failures.
+	if [ "$case_status" -ne 0 ] || [ "$rep" -ne "$REPS" ] \
+		|| grep -q '^TIME_MS TIMEOUT ' "$CASE_OUT"; then
+		FAILED=1
+		printf '\n    FAILED: %s produced %s/%s measurements (exit %s)\n' "$name" "$rep" "$REPS" "$case_status"
+		head -20 "$CASE_OUT" | sed 's/^/      /'
+		[ "$(wc -l < "$CASE_OUT")" -le 20 ] || tail -20 "$CASE_OUT" | sed 's/^/      /'
+		mkdir -p .logs
+		cp "$CASE_OUT" ".logs/case-${LABEL:-$TARGET}-$name.out"
+	elif [ -n "${LIGHTER_BENCH_KEEP_OUTPUT:-}" ]; then
+		mkdir -p .logs
+		cp "$CASE_OUT" ".logs/case-${LABEL:-$TARGET}-$name.out"
+	fi
 	rm -f "$CASE_OUT"
 	printf '\n'
 	if [ -n "$HELPER_PID" ]; then kill "$HELPER_PID" 2>/dev/null || true; HELPER_PID=""; fi
@@ -1067,3 +1099,4 @@ net_teardown
 
 echo
 echo "==> results in $RESULTS"
+exit "$FAILED"

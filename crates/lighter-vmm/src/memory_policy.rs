@@ -12,11 +12,10 @@
 //! macOS compressing and swapping a guest's pages, which is far more expensive
 //! than the guest simply not having them.
 //!
-//! So the policy is short: watch what the system watches, and translate.
-//! macOS's own three pressure levels are the input, because reacting to the
-//! same signal the kernel reacts to means reacting at the same moment — rather
-//! than on a timer, or on a guess about what "low memory" means on a machine
-//! whose size we do not know.
+//! macOS's three pressure levels set a minimum target. A periodic sample of
+//! compression activity provides gentler steering before those levels rise.
+//! Both targets follow the guest's currently plugged memory, not just the
+//! size it had when the last pressure notification arrived.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,15 +59,16 @@ const CRITICAL_FRACTION: u64 = 2; // a half
 /// 0014 has the balloon inflate in host-page units. So the compressor is
 /// the signal (pages being compressed is the exact cost this exists to
 /// avoid), and the balloon target rises a small step each second while
-/// the host is compressing and eases a smaller step each second once it
-/// has stopped and has free memory again: prompt on the way up, gradual on
-/// the way down, so the guest's cache cannot refill the host into the same
-/// corner every other second. The pressure level keeps its say as a
-/// minimum. On a 48 GB Mac the compressor never moves and the target
-/// stays at zero.
+/// the host is compressing and eases by the same step once compression
+/// has stopped for five seconds. The quiet interval keeps the guest's
+/// cache from immediately refilling the host. The pressure level remains a
+/// minimum. The step scales with the memory currently plugged into the
+/// guest: a fixed 32 MiB step takes 96 seconds to reach the steering cap
+/// on a 24 GiB guest, during which the host can swap gigabytes of cache.
+/// At one 256th per poll it takes at most 32 seconds at any guest size.
 const COMPRESSING_BYTES_PER_POLL: u64 = 64 << 20;
-const INFLATE_STEP_BYTES: u64 = 32 << 20;
-const DEFLATE_STEP_BYTES: u64 = 32 << 20;
+const STEP_MIN_BYTES: u64 = 32 << 20;
+const STEP_FRACTION: u64 = 256;
 /// The steering never asks for more than this share of guest RAM; the
 /// pressure levels may.
 const STEER_CAP_FRACTION: u64 = 8;
@@ -253,11 +253,6 @@ impl Steering {
             .map_or(self.ram_bytes, |m| m.state().total_bytes())
     }
 
-    fn cap_pages(&self) -> u32 {
-        (self.total_bytes() / STEER_CAP_FRACTION / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX))
-            as u32
-    }
-
     /// The guest's memory line, with a range to size: `need` (work is short
     /// of memory) doubles what the guest has, up to the range, in one offer
     /// — a plug lands in tens of milliseconds and the next line says
@@ -310,11 +305,13 @@ impl Steering {
 
     fn steer(&self, compressed: u64, quiet_for: u32) {
         let before = self.steer_pages.load(Ordering::Relaxed);
-        let after = steer(before, compressed, quiet_for, self.cap_pages());
+        let after = steer(before, compressed, quiet_for, self.total_bytes());
         if after != before {
             self.steer_pages.store(after, Ordering::Relaxed);
-            self.apply();
         }
+        // A range resize also changes the pressure-level floor, even if
+        // the host remains at the same pressure level and steering is held.
+        self.apply();
     }
 
     /// The guest says it can spare `spare_mib` beyond what the balloon
@@ -390,9 +387,9 @@ impl Steering {
     }
 
     fn apply(&self) {
-        let pages = self
-            .level_pages
-            .load(Ordering::Relaxed)
+        let level_pages = pressure_pages(self.level.load(Ordering::Relaxed), self.total_bytes());
+        self.level_pages.store(level_pages, Ordering::Relaxed);
+        let pages = level_pages
             .max(self.steer_pages.load(Ordering::Relaxed))
             .max(self.guest_pages.load(Ordering::Relaxed));
         let before = self.balloon.target_pages();
@@ -474,20 +471,24 @@ fn memory_guest(
 }
 
 /// The steering rule, as arithmetic: a step up while the host compresses,
-/// a smaller step down once it has been quiet for a few seconds, and
+/// a step down once it has been quiet for a few seconds, and
 /// nothing in between. Quiet, not free: an 8 GB Mac shows a few hundred
 /// megabytes free at the best of times, and a deflate that waited for more
 /// left the balloon inflated through the install after the big one, which
 /// then paid for the cache it did not have.
 const QUIET_POLLS_BEFORE_DEFLATE: u32 = 5;
 
-fn steer(pages: u32, compressed: u64, quiet_for: u32, cap: u32) -> u32 {
+fn steer(pages: u32, compressed: u64, quiet_for: u32, total_bytes: u64) -> u32 {
+    let as_pages = |bytes: u64| (bytes / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX)) as u32;
+    let cap = as_pages(total_bytes / STEER_CAP_FRACTION);
+    let step = as_pages((total_bytes / STEP_FRACTION).max(STEP_MIN_BYTES));
+    // An idle guest can unplug most of its range between polls. A target
+    // sized for the old guest must not keep reclaiming from its small base.
+    let pages = pages.min(cap);
     if compressed >= COMPRESSING_BYTES_PER_POLL {
-        pages
-            .saturating_add((INFLATE_STEP_BYTES / BALLOON_PAGE_SIZE) as u32)
-            .min(cap)
+        pages.saturating_add(step).min(cap)
     } else if quiet_for >= QUIET_POLLS_BEFORE_DEFLATE {
-        pages.saturating_sub((DEFLATE_STEP_BYTES / BALLOON_PAGE_SIZE) as u32)
+        pages.saturating_sub(step)
     } else {
         pages
     }
@@ -496,24 +497,26 @@ fn steer(pages: u32, compressed: u64, quiet_for: u32, cap: u32) -> u32 {
 /// The pressure-level half of the policy.
 struct Levels(Arc<Steering>);
 
+fn pressure_pages(level: u32, total_bytes: u64) -> u32 {
+    let bytes = match level {
+        level if level == Pressure::Warn as u32 => total_bytes / WARN_FRACTION,
+        level if level == Pressure::Critical as u32 => total_bytes / CRITICAL_FRACTION,
+        _ => 0,
+    };
+    (bytes / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX)) as u32
+}
+
 impl Observer for Levels {
     fn pressure(&self, level: Pressure) {
         let steering = &self.0;
-        let wanted_bytes = match level {
-            Pressure::Normal => 0,
-            Pressure::Warn => steering.total_bytes() / WARN_FRACTION,
-            Pressure::Critical => steering.total_bytes() / CRITICAL_FRACTION,
-        };
-        let pages = (wanted_bytes / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX)) as u32;
-        steering.level.store(level as u32, Ordering::Relaxed);
-        if pages == steering.level_pages.swap(pages, Ordering::Relaxed) {
-            return;
+        let previous = steering.level.swap(level as u32, Ordering::Relaxed);
+        if previous != level as u32 {
+            tracing::info!(
+                pressure = ?level,
+                reclaim_mib = (u64::from(pressure_pages(level as u32, steering.total_bytes())) * BALLOON_PAGE_SIZE) >> 20,
+                "host memory pressure changed"
+            );
         }
-        tracing::info!(
-            pressure = ?level,
-            reclaim_mib = wanted_bytes / (1 << 20),
-            "host memory pressure changed"
-        );
         steering.apply();
     }
 }
@@ -620,24 +623,117 @@ mod tests {
         assert!(pages(ram / CRITICAL_FRACTION) <= u64::from(u32::MAX));
     }
 
-    /// The steering rule: a step up while compressing, a smaller step down
+    /// The steering rule: a step up while compressing, a step down
     /// once quiet for long enough, and a hold in between; never past the
     /// cap or below zero.
     #[test]
     fn steering_steps_up_while_compressing_and_eases_when_quiet() {
+        let total = 4 << 30;
         let cap = ((512u64 << 20) / BALLOON_PAGE_SIZE) as u32;
-        let up = steer(0, 64 << 20, 0, cap);
-        assert_eq!(u64::from(up) * BALLOON_PAGE_SIZE, INFLATE_STEP_BYTES);
-        assert_eq!(steer(up, 0, 2, cap), up, "quiet but not for long: held");
+        let up = steer(0, 64 << 20, 0, total);
+        assert_eq!(u64::from(up) * BALLOON_PAGE_SIZE, 32 << 20);
+        assert_eq!(steer(up, 0, 2, total), up, "quiet but not for long: held");
         assert_eq!(
-            steer(up, 1 << 20, 0, cap),
+            steer(up, 1 << 20, 0, total),
             up,
             "a trickle, so no quiet yet: held"
         );
-        let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, cap);
-        assert_eq!(u64::from(up - down) * BALLOON_PAGE_SIZE, DEFLATE_STEP_BYTES);
-        assert_eq!(steer(cap, 1 << 30, 0, cap), cap, "never past the cap");
-        assert_eq!(steer(1, 0, 30, cap), 0, "never below zero");
+        let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, total);
+        assert_eq!(u64::from(up - down) * BALLOON_PAGE_SIZE, 32 << 20);
+        assert_eq!(steer(cap, 1 << 30, 0, total), cap, "never past the cap");
+        assert_eq!(steer(1, 0, 30, total), 0, "never below zero");
+    }
+
+    #[test]
+    fn large_guests_reach_the_cap_within_32_polls_and_recover() {
+        for gib in [8, 12, 24, 48, 128] {
+            let total = gib << 30;
+            let mut pages = 0;
+            for _ in 0..32 {
+                pages = steer(pages, 64 << 20, 0, total);
+            }
+            assert_eq!(u64::from(pages) * BALLOON_PAGE_SIZE, total / 8);
+            for _ in 0..32 {
+                pages = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total);
+            }
+            assert_eq!(pages, 0);
+        }
+        assert_eq!(
+            u64::from(steer(0, 64 << 20, 0, 24 << 30)) * BALLOON_PAGE_SIZE,
+            96 << 20
+        );
+    }
+
+    #[test]
+    fn unplugging_the_range_bounds_an_existing_steering_target() {
+        let old_target = ((3u64 << 30) / BALLOON_PAGE_SIZE) as u32;
+        // No compression and not quiet long enough: the old rule held the
+        // entire 3 GiB target after a 24 GiB guest shrank to its 6 GiB base.
+        assert_eq!(
+            u64::from(steer(old_target, 0, 1, 6 << 30)) * BALLOON_PAGE_SIZE,
+            768 << 20
+        );
+        assert_eq!(steer(u32::MAX, u64::MAX, 0, 0), 0);
+    }
+
+    #[test]
+    fn pressure_floors_follow_the_plugged_memory() {
+        for (level, divisor) in [(Pressure::Warn, 4), (Pressure::Critical, 2)] {
+            for total in [24 << 30, 1 << 30, 8 << 30] {
+                assert_eq!(
+                    u64::from(pressure_pages(level as u32, total)) * BALLOON_PAGE_SIZE,
+                    total / divisor
+                );
+            }
+        }
+        assert_eq!(pressure_pages(Pressure::Normal as u32, 24 << 30), 0);
+    }
+
+    #[test]
+    fn a_resize_updates_the_device_without_a_new_pressure_event() {
+        use crate::bus::MmioDevice;
+        use crate::irq::NullIrq;
+        use crate::memory::GuestMemory;
+        use crate::virtio::balloon::Balloon;
+
+        let balloon = Arc::new(BalloonState::default());
+        let transport = Arc::new(Mutex::new(VirtioMmio::new(
+            Box::new(Balloon::new(balloon.clone())),
+            Arc::new(GuestMemory::detached()),
+            Arc::new(NullIrq),
+        )));
+        let mut steering = Steering {
+            balloon,
+            transport: transport.clone(),
+            ram_bytes: 24 << 30,
+            mem: None,
+            last_line: Mutex::new((0, false)),
+            level: AtomicU32::new(Pressure::Warn as u32),
+            level_pages: AtomicU32::new(((6u64 << 30) / BALLOON_PAGE_SIZE) as u32),
+            steer_pages: AtomicU32::new(0),
+            guest_pages: AtomicU32::new(0),
+        };
+        // The preceding warning event has already reached the device.
+        steering.apply();
+        // Change total_bytes without changing the pressure level or the
+        // compressor target, as a range resize does between policy polls.
+        for (gib, expected_mib) in [(24, 6144), (6, 1536), (24, 6144)] {
+            steering.ram_bytes = gib << 30;
+            steering.steer(0, 0);
+            let mut config = [0; 4];
+            transport.lock().unwrap().read(0x100, &mut config);
+            assert_eq!(
+                u64::from(u32::from_le_bytes(config)) * BALLOON_PAGE_SIZE,
+                expected_mib << 20
+            );
+        }
+        let mut generation = [0; 4];
+        transport.lock().unwrap().read(0xfc, &mut generation);
+        assert_eq!(
+            u32::from_le_bytes(generation),
+            3,
+            "each change notified the guest"
+        );
     }
 
     /// The statistics struct is the kernel's, integer for integer.

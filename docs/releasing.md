@@ -16,10 +16,10 @@ One number, in the workspace `Cargo.toml`: `version` and the four internal crate
 ## The tarball
 
 ```
-scripts/package-release.sh 0.4.0
+scripts/package-release.sh 0.4.1
 ```
 
-Builds release, signs `lighter` with the Developer ID Application identity and the hypervisor entitlement (`cargo build --release` alone strips it, which is what `make sign PROFILE=release` is for during development), submits to `notarytool`, and packs `dist/lighter-<version>-arm64.tar.gz` with the kernel, the rootfs and the entitlements. `--skip-notarize` is for checking the packaging, not for shipping. The tarball must come from the head the gates passed: 0.2.0's first tarball was built one commit early and withdrawn.
+Builds release, signs `lighter` with the Developer ID Application identity and the hypervisor entitlement (`cargo build --release` alone strips it, which is what `make sign PROFILE=release` is for during development), submits to `notarytool`, and packs `dist/lighter-<version>-arm64.tar.gz` with the kernel, the rootfs and the entitlements. `--skip-notarize` is for checking the packaging, not for shipping. The packager restores the checkout binary's development entitlement immediately after building, requires an explicit Accepted notarization status, staples and validates the app ticket, and checks Gatekeeper before packing. Missing notarization credentials are an error unless `--skip-notarize` was explicitly requested. The tarball must come from the head the gates passed: 0.2.0's first tarball was built one commit early and withdrawn.
 
 Then, by hand:
 

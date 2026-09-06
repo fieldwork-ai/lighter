@@ -193,10 +193,16 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     // Checked before starting rather than after failing: a missing kernel
     // produces a machine that exits immediately, and the log says less than
     // this does.
-    let blocking: Vec<_> = doctor::run()
+    let findings = doctor::run();
+    let docker_available = findings.iter().any(|f| f.what == "docker client" && f.ok);
+    let blocking: Vec<_> = findings
         .into_iter()
         .filter(|f| {
-            !f.ok && f.what != "docker context" && f.what != "machine" && f.what != "rosetta"
+            !f.ok
+                && !matches!(
+                    f.what.as_str(),
+                    "docker client" | "docker context" | "machine" | "rosetta"
+                )
         })
         .collect();
     if !blocking.is_empty() {
@@ -212,12 +218,12 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     let socket = paths::docker_socket()?;
     let version = machine::docker_version(&socket)?;
     println!("Docker {version}");
-    if paths::is_default_home() {
+    if paths::is_default_home() && docker_available {
         context::install(&socket)?;
         println!("Running as pid {pid}; the docker CLI now points at it.");
     } else {
         println!(
-            "Running as pid {pid}; custom home, context untouched — use DOCKER_HOST=unix://{}",
+            "Running as pid {pid}; use DOCKER_HOST=unix://{}",
             socket.display()
         );
     }
