@@ -258,9 +258,24 @@ echo 0 > /sys/module/rcutree/parameters/jiffies_till_first_fqs 2>/dev/null || tr
 # cgroup monitor and metrics, tracing, the restart monitor) were measured
 # and cost nothing; the health-check plugin must stay, since dockerd polls
 # it and reconnects in a storm without it.
+# The garbage collector's scheduler (plugins/gc/scheduler.go) collects once
+# at start-up, then, whenever its timer fires with nothing to collect,
+# re-arms it for its interval and waits again — for the life of the
+# process. The interval after a collection is the average collection time
+# over the pause threshold, 5 ms over 0.02: a quarter of a second. That
+# loop was every one of containerd's idle wakeups (135 in 8 s against 5
+# with it off) and a third of an idle guest's timer interrupts. No
+# start-up delay means no start-up collection, so the loop never arms on a
+# machine that runs nothing; a pause threshold of zero leaves the interval
+# at a second for after the first collection a deletion does trigger. The
+# fix that belongs upstream is the scheduler not re-arming when there is
+# nothing to do.
 cat > /run/containerd.toml <<'TOML'
 version = 2
 disabled_plugins = ["io.containerd.grpc.v1.cri", "io.containerd.cri.v1.runtime", "io.containerd.cri.v1.images", "io.containerd.nri.v1.nri"]
+[plugins."io.containerd.gc.v1.scheduler"]
+  startup_delay = "0s"
+  pause_threshold = 0.0
 TOML
 # A fresh shell rather than a subshell: in a subshell `$$` is still the
 # parent's pid, and the engine ran in the root cgroup for a day.
