@@ -27,45 +27,9 @@ pub struct Status {
     pub footprint_mib: Option<u64>,
 }
 
-/// The process id in the pid file, if it names something alive.
+/// The daemon that owns this home, verified with its process generation.
 pub fn running_pid() -> anyhow::Result<Option<u32>> {
-    let path = paths::pid_file()?;
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
-    };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        return Ok(None);
-    };
-    // Signal zero asks whether we could signal it, without doing so — which is
-    // the only way to tell a live process from a stale pid file.
-    // SAFETY: a plain kill(2) with no side effect.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-        return Ok(None);
-    }
-    // Alive, but is it ours? A pid file outlives the machine when the
-    // machine is killed rather than stopped, and the number can come back
-    // as some other process; `stop` would then signal that one.
-    Ok(is_lighter(pid).then_some(pid))
-}
-
-/// Whether the process is a lighter binary, by the path it runs from.
-fn is_lighter(pid: u32) -> bool {
-    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: a buffer of the size the call is told about.
-    let len = unsafe {
-        libc::proc_pidpath(
-            pid as libc::c_int,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-        )
-    };
-    if len <= 0 {
-        return false;
-    }
-    let path = String::from_utf8_lossy(&buffer[..len as usize]);
-    std::path::Path::new(path.as_ref())
-        .file_name()
-        .is_some_and(|name| name == "lighter")
+    Ok(crate::instance::Identity::read(&paths::home()?)?.map(|id| id.pid()))
 }
 
 /// Starts a machine and waits for Docker to answer.
@@ -78,10 +42,6 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
     std::fs::create_dir_all(&home)?;
     let socket = paths::docker_socket()?;
     let log = paths::log_file()?;
-    // A socket left behind by a machine that was killed rather than stopped
-    // would make the Docker CLI hang against nothing.
-    let _ = std::fs::remove_file(&socket);
-
     // From the bundle, not from wherever the CLI binary happens to sit:
     // that is what gives the process a name and the flame in Activity
     // Monitor. The guest directory is resolved here and passed down,
@@ -91,7 +51,10 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
     let mut command = std::process::Command::new(exe);
     command.arg("run");
     command.env("LIGHTER_GUEST_DIR", &guest);
-    let log_file = std::fs::File::create(&log)?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)?;
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file.try_clone()?))
@@ -109,25 +72,30 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
         });
     }
 
-    let child = command.spawn()?;
-    let pid = child.id();
-    std::fs::write(paths::pid_file()?, pid.to_string())?;
-
+    let mut child = command.spawn()?;
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
-        if docker_version(&socket).is_ok() {
-            return Ok(pid);
+        if let Some(identity) = crate::instance::Identity::read(&home)?
+            && docker_version_until(
+                &socket,
+                deadline.min(Instant::now() + Duration::from_secs(1)),
+            )
+            .is_ok()
+            && identity.alive()?
+        {
+            // launchd may have won the lock; return the actual owner, never
+            // publish the PID of the losing child into its state directory.
+            return Ok(identity.pid());
         }
-        // SAFETY: a plain kill(2) with no side effect.
-        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        if let Some(status) = child.try_wait()? {
             anyhow::bail!(
-                "the machine exited during start; see {}",
-                paths::log_file()?.display()
+                "the machine exited during start ({status}); see {}",
+                log.display()
             );
         }
-        // Twenty milliseconds: the machine answers in about a second, and
-        // the poll's granularity is inside every start a person times.
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
     anyhow::bail!(
         "the machine did not answer within {}s; see {}",
@@ -138,48 +106,33 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
 
 /// Asks the machine to stop, and waits for it.
 pub fn stop(wait: Duration) -> anyhow::Result<bool> {
-    let Some(pid) = running_pid()? else {
-        let _ = std::fs::remove_file(paths::pid_file()?);
+    let Some(identity) = crate::instance::Identity::read(&paths::home()?)? else {
         return Ok(false);
     };
-    // The guest first: its agent stops the engine, syncs and powers off, and
-    // the machine process ends on its own. A machine killed from outside
-    // loses whatever btrfs had not committed (it commits every 30 s): an
-    // image pulled just before a stop was gone at the next start, "layer
-    // does not exist". The signal is the fallback for a guest that does not
-    // answer, and the kill the fallback for a machine that does not end.
-    // The machine process lets go of dockerd first (SIGUSR1: its port
-    // watcher's event stream), because dockerd gives an active connection
-    // five seconds of grace before exiting, and that stream was the one.
-    // SAFETY: a signal to a process we started.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
-    std::thread::sleep(Duration::from_millis(150));
-    let asked = control("poweroff")
-        .map(|reply| reply == "ok")
-        .unwrap_or(false);
-    if !asked {
-        // SAFETY: a signal to a process we started.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    // Signal the recorded process generation, not just its PID. The daemon
+    // asks its own guest to sync/power off while it still holds the home lock.
+    if !identity.signal(libc::SIGTERM)? {
+        return Ok(false);
     }
-
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
-        if running_pid()?.is_none() {
-            let _ = std::fs::remove_file(paths::pid_file()?);
-            let _ = std::fs::remove_file(paths::docker_socket()?);
+        if !identity.alive()? {
             return Ok(true);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
-    // It has had its chance. A guest that will not shut down cleanly is not a
-    // reason to leave a VM running forever.
-    // SAFETY: as above.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    std::thread::sleep(Duration::from_millis(200));
-    // SAFETY: as above.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    let _ = std::fs::remove_file(paths::pid_file()?);
-    let _ = std::fs::remove_file(paths::docker_socket()?);
+    identity.signal(libc::SIGKILL)?;
+    let killed_by = Instant::now() + Duration::from_secs(5);
+    while identity.alive()? {
+        if Instant::now() >= killed_by {
+            anyhow::bail!("machine {} has not exited after SIGKILL", identity.pid());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Never unlink state from this process: launchd may already have started
+    // a successor. The owner cleans up, or the next owner does under its lock.
     Ok(true)
 }
 
@@ -203,8 +156,11 @@ pub fn status() -> anyhow::Result<Status> {
 /// hand-rolled client. The first version here spoke HTTP/1.0, which dockerd
 /// answers with a 500 — a detail worth exactly one discovery.
 pub fn docker_version(socket: &Path) -> anyhow::Result<String> {
-    let value =
-        lighter_docker::http::get_json(socket, "/version").map_err(|e| anyhow::anyhow!("{e}"))?;
+    docker_version_until(socket, Instant::now() + Duration::from_secs(5))
+}
+
+fn docker_version_until(socket: &Path, deadline: Instant) -> anyhow::Result<String> {
+    let value = lighter_docker::http::get_json_until(socket, "/version", deadline)?;
     let version = value
         .get("Version")
         .and_then(|v| v.as_str())
@@ -219,6 +175,7 @@ pub fn control(command: &str) -> anyhow::Result<String> {
     let socket = paths::home()?.join("control.sock");
     let mut stream = UnixStream::connect(&socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(format!("{command}\n").as_bytes())?;
     // One line, not to end of file. The agent answers and keeps the connection
     // open for another command, so reading to EOF waits for something that is

@@ -94,17 +94,17 @@ code="$(wait_http http://127.0.0.1:18098/)"
 $D rm -f m3p-again >/dev/null 2>&1
 
 # udp: an echo on a published UDP port
-$D run -d --rm --name m3p-udp -p 18094:9/udp alpine/socat:1.8.0.0 UDP4-RECVFROM:9,fork EXEC:cat >/dev/null 2>&1
+$D run -d --rm --name m3p-udp -p 18094:9/udp alpine/socat:1.8.0.0 UDP6-RECVFROM:9,ipv6only=0,fork EXEC:cat >/dev/null 2>&1
 sleep 2
 udp_echo() { # host size -> "ok" or a reason
-	python3 - "$1" "$2" <<'PY'
+	python3 - "$1" "$2" "${3:-18094}" <<'PY'
 import socket, sys, os
-host, size = sys.argv[1], int(sys.argv[2])
+host, size, port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 fam = socket.AF_INET6 if ":" in host else socket.AF_INET
 s = socket.socket(fam, socket.SOCK_DGRAM); s.settimeout(5)
 payload = os.urandom(size)
 try:
-    s.sendto(payload, (host, 18094))
+    s.sendto(payload, (host, port))
     got, _ = s.recvfrom(65536)
     print("ok" if got == payload else f"mismatch: {len(got)} bytes back for {size}")
 except Exception as e:
@@ -138,6 +138,15 @@ PY
 $D rm -f m3p-udp >/dev/null 2>&1; sleep 2
 r="$(udp_echo 127.0.0.1 64)"
 case "$r" in ok) fail "udp: the port still echoes after the container stopped" ;; *) pass "udp: the port is closed with the container ($r)" ;; esac
+
+# A v6 wildcard publication with NO v4 sibling must dial a v6 guest
+# destination. Merely accepting v6 on the Mac and dialing the guest's v4
+# interface would pass the dual-stack checks above but fails this service.
+$D run -d --rm --name m3p-udp6 -p '[::]:18096:9/udp' alpine/socat:1.8.0.0 UDP6-RECVFROM:9,ipv6only=1,fork EXEC:cat >/dev/null 2>&1
+sleep 2
+r="$(udp_echo ::1 64 18096)"
+[ "$r" = ok ] && pass "IPv6-only UDP publish reaches an IPv6-only service" || fail "IPv6-only UDP: $r"
+$D rm -f m3p-udp6 >/dev/null 2>&1
 
 echo
 if [ "$FAILED" -eq 0 ]; then
