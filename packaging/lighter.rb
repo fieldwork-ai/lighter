@@ -14,7 +14,7 @@ class Lighter < Formula
   homepage "https://github.com/fieldwork-ai/lighter"
   url "https://github.com/fieldwork-ai/lighter/releases/download/v0.3.0/lighter-0.3.0-arm64.tar.gz"
   sha256 "efac26746b3466c2fbee11caad203ce0a2fbb7db433135c8ef1a73e300242f4e"
-  license "MIT"
+  license any_of: ["MIT", "Apache-2.0"]
 
   # Apple Silicon only, and not by omission: there is no Intel path and there
   # will not be one.
@@ -26,7 +26,7 @@ class Lighter < Formula
   def install
     bin.install "bin/lighter"
     pkgshare.install Dir["share/lighter/*"]
-    prefix.install "LICENSE", "README.md"
+    prefix.install "LICENSE-MIT", "LICENSE-APACHE", "README.md"
   end
 
   def post_install

@@ -9,7 +9,7 @@
 #   share/lighter/Image-hz1000 (the same at 1000 Hz, for Macs with cores to spare)
 #   share/lighter/rootfs.ext4 (sparse Alpine rootfs)
 #   share/lighter/entitlements.plist
-#   LICENSE, README.md
+#   LICENSE-MIT, LICENSE-APACHE, README.md
 #
 # The binaries are signed with Apple Developer ID Application and submitted to
 # Apple's notarytool so Gatekeeper accepts them without quarantine blocks.
@@ -118,7 +118,7 @@ done
 
 cp target/release/lighter "$STAGE/bin/lighter"
 cp guest/out/Image guest/out/Image-hz1000 guest/out/rootfs.ext4 "$STAGE/share/lighter/"
-cp LICENSE README.md "$STAGE/"
+cp LICENSE-MIT LICENSE-APACHE README.md "$STAGE/"
 cp entitlements.plist "$STAGE/share/lighter/"
 # The bundle `lighter start` runs the machine from, shipped rather than
 # built on the user's Mac: Gatekeeper assesses an app bundle at first launch,

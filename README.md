@@ -2,9 +2,9 @@
 
 The fastest Docker runtime for macOS, open-source.
 
-lighter is a virtual machine monitor built directly on `Hypervisor.framework` in Rust, implementing its own vCPU loop, GICv3 interrupt controller, virtio device models, and guest Linux kernel. Built from scratch to be the fastest way to run containers on a Mac, lighter is an open-source, MIT-licensed competitor to OrbStack and Docker Desktop.
+lighter is a virtual machine monitor built directly on `Hypervisor.framework` in Rust, implementing its own vCPU loop, GICv3 interrupt controller, virtio device models, and guest Linux kernel. Built from scratch to be the fastest way to run containers on a Mac, lighter is an open-source competitor to OrbStack and Docker Desktop, licensed MIT or Apache 2.0 at your option.
 
-**MIT licensed. No commercial subscriptions, no paid tiers, no "free during beta", and no telemetry.**
+**MIT or Apache 2.0 licensed, your choice. No commercial subscriptions, no paid tiers, no "free during beta", and no telemetry.**
 
 Apple Silicon, macOS 15 (Sequoia) or later.
 
@@ -326,4 +326,4 @@ Milestone gates (`make gates`) boot real test VMs to verify end-to-end functiona
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option, as Rust projects conventionally are. Unless you say otherwise, a contribution you submit for inclusion is licensed the same way, without further terms.
