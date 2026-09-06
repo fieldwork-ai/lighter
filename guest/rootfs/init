@@ -419,8 +419,17 @@ echo 60000 > /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs
 # defaults top out at 4 and 6 MB.
 sysctl -q -w net.ipv4.tcp_wmem="4096 262144 16777216" net.ipv4.tcp_rmem="4096 1048576 16777216" 2>/dev/null || true
 if [ -e /sys/class/net/eth0 ]; then
+	# IPv6 on the link is static, like the lease with no expiry: no router
+	# advertisements to accept, a forwarding host (dockerd would turn that
+	# on anyway, and a forwarding host ignores advertisements), the
+	# gateway's link-layer address pinned so nothing is solicited.
+	sysctl -q -w net.ipv6.conf.eth0.accept_ra=0 net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 	ip link set eth0 up
 	udhcpc -i eth0 -n -q -t 8 -T 2 >/dev/null 2>&1 && echo "INIT dhcp=ok t=$(cut -d' ' -f1 /proc/uptime)" || echo "INIT dhcp=failed"
+	ip -6 addr add fd6c:6967:6874::2/64 dev eth0 nodad 2>/dev/null \
+		&& ip -6 neigh replace fd6c:6967:6874::1 lladdr 5a:94:ef:e4:0c:dd dev eth0 nud permanent 2>/dev/null \
+		&& ip -6 route add default via fd6c:6967:6874::1 dev eth0 2>/dev/null \
+		&& echo "INIT ipv6=ok" || echo "INIT ipv6=failed"
 fi
 
 # --- The engine -----------------------------------------------------------
@@ -469,6 +478,7 @@ sh -c '
 		--data-root=/var/lib/docker \
 		--storage-driver=overlay2 \
 		--mtu="$1" \
+		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
 		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
 DOCKERD_PID=$!
 
@@ -554,15 +564,24 @@ table inet lighter {
 	# header; conntrack answers only for a connected socket). TPROXY hands
 	# the datagram over untouched — the agent's socket is transparent — and
 	# the policy route below is what makes a foreign destination deliverable
-	# locally. DNS and DHCP excepted, as for TCP's redirect.
+	# locally. DHCP excepted (the VMM answers it on the device); DNS is not:
+	# the agent's resolver is on eth0's own address, which is never `oif
+	# eth0`, and a container that names a resolver of its own (`--dns
+	# 8.8.8.8`, `dig @1.1.1.1`) is a flow like any other. With 53 excepted
+	# those datagrams reached the card and were dropped.
 	chain divert {
 		type filter hook prerouting priority mangle; policy accept;
-		meta l4proto udp udp dport != { 53, 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
+		meta l4proto udp udp dport != { 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
+		meta l4proto udp udp dport != { 546, 547 } fib daddr oif "eth0" tproxy ip6 to :15202 meta mark set 0x1 accept
 	}
 }
 EOF
 	ip rule add fwmark 0x1 lookup 100 2>/dev/null
 	ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+	# The same for v6, which needs the kernel's v6 policy routing; a kernel
+	# without it must not take init down with the rule (init is `set -e`).
+	{ ip -6 rule add fwmark 0x1 lookup 100 && ip -6 route add local ::/0 dev lo table 100; } 2>/dev/null \
+		|| echo "INIT ipv6_policy=failed"
 	if nft -f /run/lighter.nft 2>/dev/console; then
 		echo "INIT streams=on"
 	else

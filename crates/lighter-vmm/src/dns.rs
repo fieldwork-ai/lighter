@@ -252,19 +252,71 @@ fn resolve(name: &str, want_v6: bool) -> Result<Vec<IpAddr>, ()> {
         return Ok(local);
     }
     let addrs = (name, 0u16).to_socket_addrs().map_err(|_| ())?;
+    Ok(family_of(addrs.map(|a| a.ip()), want_v6, host_has_v6()))
+}
+
+/// The addresses of one family, each once; and none over v6 while the Mac
+/// has no v6 route, so a container never tries an address the stream
+/// could not reach before falling back to one it could.
+fn family_of(addrs: impl Iterator<Item = IpAddr>, want_v6: bool, v6_route: bool) -> Vec<IpAddr> {
+    if want_v6 && !v6_route {
+        return Vec::new();
+    }
     let mut out: Vec<IpAddr> = Vec::new();
-    for a in addrs {
-        let ip = a.ip();
+    for ip in addrs {
         if ip.is_ipv6() == want_v6 && !out.contains(&ip) {
             out.push(ip);
         }
     }
-    Ok(out)
+    out
+}
+
+/// Whether the Mac has a route to the IPv6 internet: asked of the kernel by
+/// connecting a datagram socket (no packet is sent), remembered for as long
+/// as an answer is, so a network change is noticed within seconds.
+fn host_has_v6() -> bool {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, up)) = *last
+        && at.elapsed() < std::time::Duration::from_secs(10)
+    {
+        return up;
+    }
+    let up = std::net::UdpSocket::bind("[::]:0")
+        .and_then(|s| s.connect("[2001:4860:4860::8888]:53"))
+        .is_ok();
+    *last = Some((std::time::Instant::now(), up));
+    up
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name with both families answers only in the family asked, once
+    /// per address; and AAAA is empty on a Mac with no v6 route, so the
+    /// container's first attempt is one the stream can carry.
+    #[test]
+    fn aaaa_is_answered_only_where_the_mac_can_route_it() {
+        let addrs: Vec<IpAddr> = vec![
+            "93.184.216.34".parse().unwrap(),
+            "2606:2800:21f:cb07:6820:80da:af6b:8b2c".parse().unwrap(),
+            "93.184.216.34".parse().unwrap(),
+        ];
+        assert_eq!(
+            family_of(addrs.iter().copied(), false, false),
+            vec!["93.184.216.34".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            family_of(addrs.iter().copied(), true, true),
+            vec![
+                "2606:2800:21f:cb07:6820:80da:af6b:8b2c"
+                    .parse::<IpAddr>()
+                    .unwrap()
+            ]
+        );
+        assert!(family_of(addrs.iter().copied(), true, false).is_empty());
+    }
 
     fn query_for(name: &str, qtype: u16) -> Vec<u8> {
         let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];

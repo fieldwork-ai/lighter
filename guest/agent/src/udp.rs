@@ -46,14 +46,17 @@ struct Flow {
 }
 
 const IP_TRANSPARENT: libc::c_int = 19;
+const IPV6_TRANSPARENT: libc::c_int = 75;
+const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
+const IPV6_ORIGDSTADDR: libc::c_int = 74;
 
-fn transparent(fd: i32) -> std::io::Result<()> {
+/// Marks a socket transparent for its family: bindable to an address that
+/// is not the host's, and the one TPROXY may deliver to.
+fn transparent(fd: i32, v6: bool) -> std::io::Result<()> {
     let one: libc::c_int = 1;
+    let (level, option) = if v6 { (libc::SOL_IPV6, IPV6_TRANSPARENT) } else { (libc::SOL_IP, IP_TRANSPARENT) };
     // SAFETY: a live socket and an int-sized option value.
-    if unsafe {
-        libc::setsockopt(fd, libc::SOL_IP, IP_TRANSPARENT, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t)
-    } < 0
-    {
+    if unsafe { libc::setsockopt(fd, level, option, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -68,7 +71,7 @@ fn bound_reply_socket(dst: SocketAddr) -> Option<UdpSocket> {
     }
     // SAFETY: a fresh descriptor we own.
     let socket: UdpSocket = unsafe { <UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-    transparent(fd).ok()?;
+    transparent(fd, dst.is_ipv6()).ok()?;
     let one: libc::c_int = 1;
     // SAFETY: as above; the port may be one a local service also holds.
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t) };
@@ -167,19 +170,27 @@ fn destination_bytes(dst: SocketAddr) -> [u8; 19] {
     b
 }
 
-pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
+/// One family's proxy: a transparent socket on `port` (v6-only for v6, so
+/// the two families' sockets share the port), its own stream to the host.
+pub fn serve(port: u16, host: crate::Fd, v6: bool) -> std::io::Result<()> {
     // Transparent before bind: what TPROXY diverts is delivered to it
     // whatever the destination says.
     // SAFETY: plain socket creation.
-    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    let raw = unsafe { libc::socket(if v6 { libc::AF_INET6 } else { libc::AF_INET }, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: a fresh descriptor we own.
     let socket: UdpSocket = unsafe { <UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(raw) };
-    transparent(raw)?;
-    let sa = sockaddr_of(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port));
-    // SAFETY: a sockaddr_in in a buffer of its size.
+    transparent(raw, v6)?;
+    let one: libc::c_int = 1;
+    if v6 {
+        // SAFETY: a live socket and an int-sized option value.
+        unsafe { libc::setsockopt(raw, libc::SOL_IPV6, libc::IPV6_V6ONLY, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t) };
+    }
+    let any: IpAddr = if v6 { std::net::Ipv6Addr::UNSPECIFIED.into() } else { Ipv4Addr::UNSPECIFIED.into() };
+    let sa = sockaddr_of(SocketAddr::new(any, port));
+    // SAFETY: a sockaddr of the family in a buffer of its size.
     if unsafe { libc::bind(raw, sa.0.as_ptr().cast(), sa.1) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -194,18 +205,9 @@ pub fn serve(port: u16, host: crate::Fd) -> std::io::Result<()> {
     // assigns does not survive into routing: every datagram counted as
     // "no port". dockerd turns it on at start; off again here, and in init.
     let _ = std::fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "0");
-    let one: libc::c_int = 1;
+    let (level, option) = if v6 { (libc::SOL_IPV6, IPV6_RECVORIGDSTADDR) } else { (libc::SOL_IP, libc::IP_RECVORIGDSTADDR) };
     // SAFETY: a live socket and an int-sized option value.
-    if unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_IP,
-            libc::IP_RECVORIGDSTADDR,
-            std::ptr::addr_of!(one).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    } < 0
-    {
+    if unsafe { libc::setsockopt(fd, level, option, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let flows = Arc::new(Mutex::new(Flows::default()));
@@ -353,7 +355,7 @@ fn sockaddr_from(raw: &[u8], len: libc::socklen_t) -> Option<SocketAddr> {
 }
 
 /// The destination the datagram was sent to before netfilter redirected it,
-/// from the `IP_ORIGDSTADDR` control message.
+/// from the `IP_ORIGDSTADDR` or `IPV6_ORIGDSTADDR` control message.
 fn original_destination(msg: &libc::msghdr) -> Option<SocketAddr> {
     // SAFETY: CMSG_FIRSTHDR/NXTHDR walk the control buffer the kernel filled,
     // bounded by msg_controllen.
@@ -363,6 +365,10 @@ fn original_destination(msg: &libc::msghdr) -> Option<SocketAddr> {
             if (*c).cmsg_level == libc::SOL_IP && (*c).cmsg_type == libc::IP_ORIGDSTADDR {
                 let a: libc::sockaddr_in = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast());
                 return Some(SocketAddr::new(Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)).into(), u16::from_be(a.sin_port)));
+            }
+            if (*c).cmsg_level == libc::SOL_IPV6 && (*c).cmsg_type == IPV6_ORIGDSTADDR {
+                let a: libc::sockaddr_in6 = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast());
+                return Some(SocketAddr::new(std::net::Ipv6Addr::from(a.sin6_addr.s6_addr).into(), u16::from_be(a.sin6_port)));
             }
             c = libc::CMSG_NXTHDR(msg, c);
         }

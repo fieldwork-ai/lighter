@@ -264,6 +264,7 @@ UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP a
 
 - **Docker and Compose compatibility:** Full support via standard Docker CLI and Compose plugins.
 - **Bidirectional port forwarding:** Published ports appear on the Mac the moment a container binds them, TCP and UDP, over IPv4 and IPv6, carried as streams rather than through a proxy. A publish binds where Docker's would: `-p 8080:80` on every interface, so another machine on your network can reach it; `-p 127.0.0.1:8080:80` on loopback only. `lighter config --publish localhost` keeps every publish on loopback on a Mac that should not offer its containers to the network it is on.
+- **IPv6 in containers:** Every container has an IPv6 address and route, and reaches v6 destinations over TCP, UDP and ICMP exactly when your Mac can. On a network without IPv6, names resolve to IPv4 only, so nothing waits on an address that cannot be reached.
 - **Native file sharing:** Mount any directory from your Mac with native ownership translation.
 - **x86-64 containers under Rosetta:** `linux/amd64` images run under Apple's Rosetta, a one-time download (`lighter rosetta --install`). There is no emulator behind it; without Rosetta an amd64 container fails with that command in its output. [How, and what it costs](docs/x86-64.md).
 - **Lean footprint:** Idles at roughly 0.2% CPU and hands memory back as soon as containers stop.

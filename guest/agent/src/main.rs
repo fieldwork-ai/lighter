@@ -103,15 +103,28 @@ fn main() -> std::process::ExitCode {
         return serve_inbound(port);
     }
     if let Some(port) = udp_proxy {
-        let host = match vsock::connect(udp::UDP_PORT) {
-            Ok(fd) => fd,
+        // One proxy per family, each with its own stream to the host: a
+        // v4 socket and a v6-only socket on the same port, the flows of
+        // each on their own mux.
+        let stream = || match vsock::connect(udp::UDP_PORT) {
+            Ok(fd) => {
+                let _ = vsock::set_buffer(&fd, STREAM_WINDOW);
+                Ok(Fd(fd))
+            }
             Err(e) => {
                 eprintln!("lighter-agent: udp stream to host refused: {e}");
-                return std::process::ExitCode::FAILURE;
+                Err(e)
             }
         };
-        let _ = vsock::set_buffer(&host, STREAM_WINDOW);
-        return match udp::serve(port, Fd(host)) {
+        let (Ok(host4), Ok(host6)) = (stream(), stream()) else {
+            return std::process::ExitCode::FAILURE;
+        };
+        std::thread::spawn(move || {
+            if let Err(e) = udp::serve(port, host6, true) {
+                eprintln!("lighter-agent: udp proxy (v6): {e}");
+            }
+        });
+        return match udp::serve(port, host4, false) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("lighter-agent: udp proxy: {e}");
