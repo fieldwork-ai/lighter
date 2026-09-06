@@ -82,30 +82,8 @@ pub fn run() -> Vec<Finding> {
         )
     });
 
-    // The kernel the next start would boot (`config::kernel_hz`).
-    let cpus = crate::config::Config::load()
-        .map(|c| c.cpus)
-        .unwrap_or_else(|_| crate::config::Config::default().cpus);
-    let hz = crate::config::kernel_hz(cpus);
-    findings.push(match paths::kernel(hz) {
-        Ok(path) if path.exists() => {
-            let actual = if path.ends_with("Image-hz1000") {
-                1000
-            } else {
-                250
-            };
-            let note = if actual != hz {
-                format!("; the {hz} Hz image is not installed")
-            } else if actual == 250 {
-                "; LIGHTER_KERNEL_HZ=1000 for the other".to_string()
-            } else {
-                String::new()
-            };
-            Finding::good(
-                "guest kernel",
-                format!("{} ({actual} Hz{note})", path.display()),
-            )
-        }
+    findings.push(match paths::kernel() {
+        Ok(path) if path.exists() => Finding::good("guest kernel", path.display().to_string()),
         Ok(path) => Finding::bad(
             "guest kernel",
             format!("missing at {}", path.display()),

@@ -393,8 +393,7 @@ bench_memory_mib() {
 }
 
 setup_lighter() {
-	# The kernel the CLI boots by default (`config::kernel_hz`): 250 Hz.
-	# `LIGHTER_BENCH_KERNEL=guest/out/Image-hz1000` measures the other.
+	# The kernel the CLI boots: `LIGHTER_BENCH_KERNEL` measures another build.
 	KERNEL="${LIGHTER_BENCH_KERNEL:-guest/out/Image}"
 	BIN="target/release/examples/lighter-bench"
 	# Rosetta, when the Mac has it, the way `lighter start` attaches it: the

@@ -86,18 +86,10 @@ pub fn guest_dir() -> anyhow::Result<PathBuf> {
     })
 }
 
-/// The kernel for a tick rate (`config::kernel_hz`): `Image` is 250 Hz,
-/// `Image-hz1000` the other. An install with only the one image, or a
-/// checkout that built only the one, gets it whatever was asked.
-pub fn kernel(hz: u32) -> anyhow::Result<PathBuf> {
-    let dir = guest_dir()?;
-    if hz == 1000 {
-        let fast = dir.join("Image-hz1000");
-        if fast.exists() {
-            return Ok(fast);
-        }
-    }
-    Ok(dir.join("Image"))
+/// The guest kernel: one image, at 250 Hz (`docs/architecture.md`, "One
+/// kernel"; a 1000 Hz build was shipped beside it for a day and dropped).
+pub fn kernel() -> anyhow::Result<PathBuf> {
+    Ok(guest_dir()?.join("Image"))
 }
 
 pub fn rootfs() -> anyhow::Result<PathBuf> {

@@ -5,8 +5,7 @@
 #
 # Produces dist/lighter-<version>-arm64.tar.gz containing:
 #   bin/lighter             (Developer ID signed with hypervisor entitlement)
-#   share/lighter/Image     (guest kernel, 250 Hz)
-#   share/lighter/Image-hz1000 (the same at 1000 Hz, for Macs with cores to spare)
+#   share/lighter/Image     (guest kernel)
 #   share/lighter/rootfs.ext4 (sparse Alpine rootfs)
 #   share/lighter/entitlements.plist
 #   LICENSE-MIT, LICENSE-APACHE, README.md
@@ -112,12 +111,12 @@ echo "==> Building lighter-cli release binary"
 cargo build --release -p lighter-cli
 
 # Both kernels: the CLI picks one by the vCPU count against the Mac's cores.
-for artifact in guest/out/Image guest/out/Image-hz1000 guest/out/rootfs.ext4; do
+for artifact in guest/out/Image guest/out/rootfs.ext4; do
 	[ -f "$artifact" ] || { echo "error: $artifact is missing; run 'make guest'" >&2; exit 1; }
 done
 
 cp target/release/lighter "$STAGE/bin/lighter"
-cp guest/out/Image guest/out/Image-hz1000 guest/out/rootfs.ext4 "$STAGE/share/lighter/"
+cp guest/out/Image guest/out/rootfs.ext4 "$STAGE/share/lighter/"
 cp LICENSE-MIT LICENSE-APACHE README.md "$STAGE/"
 cp entitlements.plist "$STAGE/share/lighter/"
 # The bundle `lighter start` runs the machine from, shipped rather than

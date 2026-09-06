@@ -168,7 +168,7 @@ pub fn machine() -> anyhow::Result<()> {
         vcpus: config.cpus,
         ram_bytes,
         hotplug_bytes,
-        kernel: paths::kernel(crate::config::kernel_hz(config.cpus))?,
+        kernel: paths::kernel()?,
         initramfs: None,
         cmdline,
         interactive: false,
