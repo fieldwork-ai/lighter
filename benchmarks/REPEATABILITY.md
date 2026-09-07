@@ -103,3 +103,7 @@ The observed fresh-run CVs range from 0.7% for removal to 11.4% for ripgrep.
 Use the relevant case and protocol, rather than a single project-wide noise
 percentage, when interpreting a change. This baseline covers share storage;
 it establishes no variance threshold for networking, memory, boot or amd64.
+
+## Final 0.4.1 measurements
+
+The [final release comparison](RELEASE-0.4.1.md) records full suites on both Macs at runtime `38bfab4`, alternating 0.4.0/new/new/0.4.0 runs, and a separate warmed HTTP check. That runtime includes later memory-accounting and connection-burst fixes. The five-run baseline above is retained as measured; it is not a newly established noise threshold for every final-runtime case, either host, or every older version. The final comparison reports startup and metadata-walk costs as well as unstable search/copy observations.

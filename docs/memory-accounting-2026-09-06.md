@@ -2,8 +2,7 @@
 
 **Release requirement:** 0.4.1 must fix the duplicate memory charge. Documenting
 it is not sufficient. The fix must preserve physical reclamation of partial
-ranges and account for pages correctly when the guest reuses them. Release
-qualification and publication remain blocked until this is demonstrated.
+ranges and account for pages correctly when the guest reuses them. The experiments below check each of these requirements.
 
 The daily M5 VM is configured for **24 GiB (24576 MiB)** and sixteen vCPUs.
 The initial captures below used 0.4.0, PID 4788, without restarting or
@@ -126,7 +125,7 @@ The previously diagnosed `MADV_FREE_REUSABLE` path fails to restore the charge
 when the guest reuses pages. A valid fix must preserve coherent contents,
 discard surrendered partial ranges, and charge newly reused pages correctly.
 
-## Candidate: one owned object per host page
+## 0.4.1: one owned object per host page
 
 The candidate uses `mach_vm_allocate` with `VM_FLAGS_PURGABLE` to create
 **nonvolatile** owned objects. Ownership accounts for each physical page once
@@ -165,7 +164,7 @@ for 4 GiB on M1 took 0.227 s and increased global wired pages by about 55.7 MiB.
 On M5, 1,572,864 objects for 24 GiB took 1.004 s and increased global wired pages
 by about 230 MiB. These are separate kernel allocations; the probe did not
 map them into a VM or touch guest RAM. Kernel zones may retain freed metadata
-for reuse. Startup and full workload benchmarks must assess this tradeoff.
+for reuse. The [release measurements](../benchmarks/RELEASE-0.4.1.md) record the startup cost and full workload results for this tradeoff.
 
 ## Smaller configurations and build OOM priority
 
@@ -215,13 +214,31 @@ The memory setting is a guest RAM ceiling. Host allocations and kernel mapping
 metadata add overhead; these observed peaks do not establish an absolute cap
 on every possible host-process allocation.
 
+## Final runtime build checks
+
+The frozen runtime candidate `38bfab4`, including the published-connection burst fix, repeated the same local application build at all three sizes. These runs retained the daily data and sixteen vCPUs, sampled the task ledger every 200 ms and checked the task lifetime peak. No region-walking sampler, registry push, asset upload or deployment ran. The lifetime peak catches peaks between periodic samples.
+
+| Configured guest RAM | Lifetime process peak | Build outcome | Footprint after 120 s | Docker health |
+|---|---:|---|---:|---|
+| 24,576 MiB | 21,517.25 MiB | completed after 58.98 s | 4,314.82 MiB | responsive |
+| 12,288 MiB | 12,256.34 MiB | ResourceExhausted after 23.78 s | 3,019.06 MiB | responsive |
+| 8,192 MiB | 8,157.50 MiB | ResourceExhausted after 20.31 s | 3,028.87 MiB | responsive |
+
+All three lifetime peaks stayed below their configured guest sizes. The 24 GiB run included up to 12,331.80 MiB of compressed-memory charge; the smaller runs did not require host compression. The 12 and 8 GiB results verify bounded observations and recovery under guest OOM, not successful builds at those sizes. The original 24 GiB configuration was restored byte-for-byte afterward.
+
+Private raw evidence is `.logs/041/app-memory-build-owned-burstfixed-{24576,12288,8192}m/`, with the summary in `.logs/041/memory-matrix-burst-fixed-results.json`. These application-specific captures are not release assets.
+
 ## Status
 
-The candidate removes duplicate accounting and preserves actual partial
-reclamation in the controlled tests on both Macs. The large application builds exercise
-compressed memory, and the smaller configurations verify bounds and recovery
-when the build cannot fit. Full hardware qualification and release benchmarks
-remain outstanding; it is not yet a qualified release.
+Runtime `38bfab4` removes duplicate accounting and preserves actual partial
+reclamation in controlled tests on both Macs. The application builds exercise
+compressed memory and recovery when the workload cannot fit. All twelve hardware
+gates, 316 workspace tests and 15 signed hypervisor tests passed on each Mac.
+Complete host-share, guest-disk and amd64 records also passed on both machines.
+The [release measurements](../benchmarks/RELEASE-0.4.1.md) retain timings,
+source/artifact stamps, matched comparisons and the costs of the allocation strategy.
+These observations do not turn the guest RAM setting into an absolute cap on
+all host allocations.
 
 Apple's public [Hypervisor mapping contract](https://developer.apple.com/documentation/hypervisor/hv_vm_map(_:_:_:_:))
 describes the host allocation backing guest RAM. The open-source

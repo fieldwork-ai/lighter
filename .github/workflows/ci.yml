@@ -26,7 +26,11 @@ jobs:
       - name: Tests
         # The hypervisor-backed tests are marked `#[ignore]` and skipped here;
         # `make test-hv` runs them where there is a hypervisor to talk to.
-        run: cargo test --all
+        # Filesystem tests construct tables without starting the server, which
+        # normally raises this limit. A fresh macOS shell can default to 256.
+        run: |
+          ulimit -S -n 10240
+          cargo test --all
       - name: Shell scripts parse
         run: |
           for script in scripts/*.sh scripts/gates/*.sh benchmarks/*.sh guest/*/build.sh; do
