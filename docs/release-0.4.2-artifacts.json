@@ -1,0 +1,18 @@
+{
+  "candidate_sha256": "9b55fab118c497a4fc8d5cd3b19829773537a4326e9ee0bdd8c95e3cbcb3daaa",
+  "final_sha256": "3f5a02bc8b3b44ae5afb51ee10fed249af1f01c17137d9d483170553c2a966d7",
+  "guest": {
+    "share/lighter/Image": "efab066a9e13748e4ef71c507774eccb54822fefba1f067566a124f0b193a5be",
+    "share/lighter/rootfs.ext4": "25bf396e5727881cf1903ede9824afd9ada5ce4afc04defd3cee6eca2a266117",
+    "share/lighter/kernel.version": "ca25e5b95574dc33d64bc8cde1d1d04f52dc7d2ffce9cbac79358915618aae67"
+  },
+  "code_without_signatures": {
+    "bin/lighter": "c9c9a9af1a36066271e3094f181f3d851d313de7d713fe87801e900813c1d4dc",
+    "share/lighter/lighter.app/Contents/MacOS/lighter": "c9c9a9af1a36066271e3094f181f3d851d313de7d713fe87801e900813c1d4dc"
+  },
+  "source": "eb93bf92c11fd9b7cf48186fa1e24bedb4ee897b",
+  "bootstrap_sha256": "049dabdd6f8db531bc4b8b33eb0517eadb7dfe98f4e9f8fd1f8ff7e061bd21bc",
+  "notarization_id": "3f30e8e7-e924-4442-86ef-1c522d93788c",
+  "qualified_source": "cc717e79d5e2a53e5fd46d1e0cc0399698daa67a",
+  "runtime_source": "7d2123d0db883b7e8c6d3301ec29e4c17fbe1964"
+}

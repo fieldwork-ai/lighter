@@ -83,17 +83,34 @@ limits guest memory rather than all host-process overhead.
 
 ## Final packaging and publication
 
-The qualified candidate was signed, notarized and stapled; Apple accepted
-submission `031cf666-214d-4602-a77e-811d8a9ed83e`. Its archive SHA256 is
-`9b55fab118c497a4fc8d5cd3b19829773537a4326e9ee0bdd8c95e3cbcb3daaa`.
+The final package was built from
+`eb93bf92c11fd9b7cf48186fa1e24bedb4ee897b`, after the measurement records.
+Apple accepted notarization submission
+`3f30e8e7-e924-4442-86ef-1c522d93788c`; the app was stapled and both ticket
+validation and Gatekeeper assessment passed.
 
-Final packaging will include the completed benchmark README. The final archive
-and standalone bootstrap hashes, notarization receipt, runtime-equivalence
-check and exact-archive smoke results will replace this paragraph after that
-step. No 0.4.2 tag or public release has been created.
+- Archive SHA256: `3f5a02bc8b3b44ae5afb51ee10fed249af1f01c17137d9d483170553c2a966d7`
+- Signed bootstrap SHA256: `049dabdd6f8db531bc4b8b33eb0517eadb7dfe98f4e9f8fd1f8ff7e061bd21bc`
 
-Publication follows the main PR merge: attach the archive and signed bootstrap,
-verify the public downloads, then make the matching tap PR ready to merge.
-The M5 daily VM remains on released 0.4.1 at 16 GiB until the final release is
-ready to install. Temporary signing material is removed after final packaging
-and verification.
+The final CLI and app executable, after removing signatures from temporary
+copies, are byte-identical to the qualified candidate. Kernel, rootfs and
+kernel-version hashes also match. [Artifact verification metadata](release-0.4.2-artifacts.json)
+retains those hashes and the packaged source.
+
+The exact final archive passed fresh VM startup, doctor, arm64 and amd64
+containers, published TCP/UDP, guest IPv6 route, shutdown and real 0.4.1
+migration on M1. Final Homebrew reinstall, repeated postinstall, CLI byte
+comparison, manifest verification, Gatekeeper and direct-update refusal pass.
+M5 verifies the final signatures, staple and code/payload equivalence; its
+previous candidate migration and activation tests cover the identical code.
+No further M5 VM test is claimed while competing VM work is active.
+
+The release and tap PR remain unpublished pending the main PR merge. Merge
+and publication must be coordinated: publish the prepared archive and signed
+bootstrap immediately after merging, since the new installer requires a
+bootstrap asset that 0.4.1 did not provide. Verify public download hashes, then
+make the matching tap PR ready to merge. Never replace published asset bytes.
+
+The M5 daily VM remains on released 0.4.1 at 16 GiB. All three task-created
+signing credential cache files were removed after final verification, and the
+original user keychain search list was restored.
