@@ -1,0 +1,7 @@
+using docker due to KIND_EXPERIMENTAL_PROVIDER
+Exporting logs for cluster "lighter-multi" to:
+.logs/kind-m5/multi-cluster-logs
+using docker due to KIND_EXPERIMENTAL_PROVIDER
+Deleting cluster "lighter-multi" ...
+Deleted nodes: ["lighter-multi-control-plane" "lighter-multi-worker"]
+Stopped.

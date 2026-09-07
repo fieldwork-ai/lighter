@@ -1,0 +1,24 @@
+{
+  "status": "NOT QUALIFIED",
+  "host": "M5; other work and VMs active; not a controlled benchmark",
+  "lighter": "0.4.2 staged signed candidate",
+  "archive_sha256": "3f5a02bc8b3b44ae5afb51ee10fed249af1f01c17137d9d483170553c2a966d7",
+  "source": "25435c6a38ab21169ab656dfde0c041f8c905397",
+  "kind": "v0.33.0",
+  "kind_sha256": "0c8c7dbe5e23594a198b786c4bc13dacc101fa6196b0cb0b23a1ca44e61f4b4f",
+  "kubernetes": "v1.35.8",
+  "node_image": "kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0",
+  "kubectl_sha256": "b8be50ae0c6665b646fb009f904a52cad30806deee19ab3b4fe5af2d68bd82eb",
+  "guest_kernel": "6.18.49-lighter",
+  "guest_docker": "28.3.3",
+  "host_docker": "29.6.1",
+  "vm_cpus": 4,
+  "vm_memory_mib": 6144,
+  "vm_disk_gib": 64,
+  "samples": 162,
+  "vm_peak_sampled_footprint_mib": 3730.23,
+  "fseventsd_pids": [
+    72096
+  ],
+  "fseventsd_peak_sampled_rss_mib": 11.91
+}

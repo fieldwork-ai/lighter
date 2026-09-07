@@ -1,0 +1,10 @@
+lighter-kind-qualified
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+100    23  100    23    0     0  17490      0 --:--:-- --:--:-- --:--:-- 23000
+lighter-kind-qualified
+using docker due to KIND_EXPERIMENTAL_PROVIDER
+Deleting cluster "lighter-qualification" ...
+Deleted nodes: ["lighter-qualification-control-plane"]

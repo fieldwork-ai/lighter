@@ -1,5 +1,12 @@
 # 0.4.2 qualification
 
+**Publication hold, 2026-09-07:** subsequent kind qualification reproduced
+ordinary Docker commands losing their output during vsock teardown. The release
+PR is back in draft. The staged artifacts below remain unchanged, but prior
+passing checks do not cover this newly reproduced failure. See the
+[kind investigation](kind-qualification-2026-09-07.md) for the deterministic
+regression, captured traces and separate Kubernetes kernel limitation.
+
 0.4.2 records installation ownership and adds explicit release updates. Direct
 installations can check and download updates, with optional daily background
 downloads. Activation requires an explicit upgrade; a running VM requires

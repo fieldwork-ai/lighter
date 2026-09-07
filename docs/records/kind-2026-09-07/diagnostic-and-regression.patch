@@ -1,0 +1,36 @@
+diff --git a/crates/lighter-vmm/src/virtio/vsock/mod.rs b/crates/lighter-vmm/src/virtio/vsock/mod.rs
+index 54b4416..a8cb909 100644
+--- a/crates/lighter-vmm/src/virtio/vsock/mod.rs
++++ b/crates/lighter-vmm/src/virtio/vsock/mod.rs
+@@ -1166,6 +1166,9 @@ impl Vsock {
+                     return;
+                 }
+ 
++                if std::env::var_os("LIGHTER_VSOCK_DIAG").is_some() {
++                    eprintln!("VSOCK_FULL_CLOSE key={key:?} flags={} outbound={} received={} counters={:?}", packet.flags, conn.outbound.iter().map(Chunk::len).sum::<usize>(), conn.received, conn.credit.counters());
++                }
+                 conn.state = State::Closed;
+                 if let Some(socket) = &conn.socket {
+                     socket.close();
+@@ -1904,6 +1907,21 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn a_full_shutdown_preserves_queued_response_bytes() {
++        let (shared, port, _peer) = shared_with_connection();
++        let mut inner = shared.lock();
++        Vsock::handle(&mut inner, Packet::control(Op::Response, 2375, port.0));
++        let mut data = Packet::control(Op::Rw, 2375, port.0);
++        data.payload = b"final-output".to_vec();
++        Vsock::handle(&mut inner, data);
++        let mut full = Packet::control(Op::Shutdown, 2375, port.0);
++        full.flags = shutdown::BOTH;
++        Vsock::handle(&mut inner, full);
++        drop(inner);
++        assert_eq!(flat(shared.take_outbound(port)).as_deref(), Some(&b"final-output"[..]));
++    }
++
+     #[test]
+     fn a_full_shutdown_closes_the_connection() {
+         let (shared, port, _peer) = shared_with_connection();

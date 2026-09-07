@@ -1,0 +1,27 @@
+   Compiling lighter-fs v0.4.2 (/Users/nick/git/lighter/.logs/kind-m5/source/crates/lighter-fs)
+   Compiling lighter-hv v0.4.2 (/Users/nick/git/lighter/.logs/kind-m5/source/crates/lighter-hv)
+   Compiling lighter-docker v0.4.2 (/Users/nick/git/lighter/.logs/kind-m5/source/crates/lighter-docker)
+   Compiling lighter-vmm v0.4.2 (/Users/nick/git/lighter/.logs/kind-m5/source/crates/lighter-vmm)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.36s
+     Running unittests src/lib.rs (target/debug/deps/lighter_vmm-4a57bdac4401c6b0)
+
+running 1 test
+test virtio::vsock::tests::a_full_shutdown_preserves_queued_response_bytes ... FAILED
+
+failures:
+
+---- virtio::vsock::tests::a_full_shutdown_preserves_queued_response_bytes stdout ----
+
+thread 'virtio::vsock::tests::a_full_shutdown_preserves_queued_response_bytes' (175333129) panicked at crates/lighter-vmm/src/virtio/vsock/mod.rs:1922:9:
+assertion `left == right` failed
+  left: None
+ right: Some([102, 105, 110, 97, 108, 45, 111, 117, 116, 112, 117, 116])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    virtio::vsock::tests::a_full_shutdown_preserves_queued_response_bytes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 183 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p lighter-vmm --lib`
