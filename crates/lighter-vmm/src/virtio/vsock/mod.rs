@@ -140,7 +140,15 @@ impl Socket for UnixStream {
         UnixStream::try_clone(self)
     }
     fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        UnixStream::shutdown(self, how)
+        if how == std::net::Shutdown::Both {
+            // Darwin returns ENOTCONN from SHUT_RDWR when receive is already
+            // shut, without shutting the remaining write direction.
+            let write = UnixStream::shutdown(self, std::net::Shutdown::Write);
+            let read = UnixStream::shutdown(self, std::net::Shutdown::Read);
+            write.and(read)
+        } else {
+            UnixStream::shutdown(self, how)
+        }
     }
 }
 
@@ -149,7 +157,13 @@ impl Socket for std::net::TcpStream {
         std::net::TcpStream::try_clone(self)
     }
     fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        std::net::TcpStream::shutdown(self, how)
+        if how == std::net::Shutdown::Both {
+            let write = std::net::TcpStream::shutdown(self, std::net::Shutdown::Write);
+            let read = std::net::TcpStream::shutdown(self, std::net::Shutdown::Read);
+            write.and(read)
+        } else {
+            std::net::TcpStream::shutdown(self, how)
+        }
     }
 }
 
@@ -1700,15 +1714,63 @@ impl VirtioDevice for Vsock {
     }
 }
 
+/// Reads a stream without sleeping inside Darwin's blocking `recv` path.
+///
+/// A peer shutdown racing that path can leave the reader asleep with EOF
+/// already set. This reproduces with plain Unix socket pairs on macOS 26.6.2,
+/// independently of the VM. A per-call nonblocking receive followed by a
+/// readiness wait observes EOF without a timeout or periodic wakeup. It also
+/// leaves the cloned writer's blocking mode unchanged.
+fn read_host_socket(socket: &impl Socket, buf: &mut [u8]) -> std::io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        // SAFETY: the socket stays owned and buf is writable for its length.
+        let n = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+        let mut event = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: event is one initialized pollfd, live for the entire wait.
+        if unsafe { libc::poll(&mut event, 1, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        // Receive again for data, EOF or the socket error, including after
+        // an interrupted wait. Another reader may have consumed readiness.
+    }
+}
+
 /// Proxies a host socket over an open vsock connection until either end closes.
 ///
 /// Runs on its own thread per connection. That is a real cost at a thousand
 /// connections and no cost at the dozen a Docker client opens, and it buys a
-/// blocking read with no readiness machinery anywhere.
+/// blocking readiness waits with no periodic polling.
 pub fn pump<S: Socket>(
     shared: Arc<VsockShared>,
     key: ConnKey,
-    mut socket: S,
+    socket: S,
     inspect: Option<crate::vsock_proxy::Inspector>,
 ) {
     // Both threads of a stream do the work a user is waiting on, and a
@@ -1767,7 +1829,7 @@ pub fn pump<S: Socket>(
     let mut buf = vec![0u8; 1 << 20];
     let mut host_closed = false;
     loop {
-        let read = match socket.read(&mut buf) {
+        let read = match read_host_socket(&socket, &mut buf) {
             Ok(0) => {
                 host_closed = true;
                 break;
@@ -1843,6 +1905,80 @@ pub fn write_all_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_read_waits_for_data_then_observes_half_close() {
+        let (ours, mut peer) = UnixStream::pair().unwrap();
+        let writer = ours.try_clone().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut buf = [0; 7];
+            loop {
+                let n = read_host_socket(&ours, &mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buf[..n]);
+            }
+            done_tx.send(output).unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        peer.write_all(b"buffered input before EOF").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            b"buffered input before EOF"
+        );
+        reader.join().unwrap();
+        // The receive helper must not make duplicated writers nonblocking.
+        // SAFETY: writer owns a live descriptor; F_GETFL takes no extra argument.
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn host_read_is_cancelled_by_local_receive_shutdown() {
+        let (ours, _peer) = UnixStream::pair().unwrap();
+        let cancel = ours.try_clone().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            done_tx.send(read_host_socket(&ours, &mut [0])).unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        cancel.shutdown(std::net::Shutdown::Read).unwrap();
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn abort_after_peer_half_close_still_closes_our_write_direction() {
+        let (ours, mut peer) = UnixStream::pair().unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(read_host_socket(&ours, &mut [0]).unwrap(), 0);
+        // ENOTCONN for an already closed half is harmless, but the other
+        // direction must be attempted too, while ours is still held open.
+        let _ = Socket::shutdown(&ours, std::net::Shutdown::Both);
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
 
     #[test]
     fn a_partial_completion_wakes_a_parked_deliverer() {
