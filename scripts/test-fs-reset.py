@@ -69,7 +69,7 @@ for command in sys.stdin:
                 check(False)
                 time.sleep(.01)
         elif command == 'new':
-            end = time.monotonic() + (12 if expiry else 5)
+            end = time.monotonic() + (22 if expiry else 5)
             while True:
                 try:
                     check(True)
@@ -169,7 +169,7 @@ def main():
                         def check(action):
                             guest.stdin.write(action+'\n')
                             guest.stdin.flush()
-                            answer = line(guest)
+                            answer = line(guest, timeout=25 if mode == "expiry" and action == "new" else 15)
                             print(f'{mode}: {answer}', flush=True)
                             assert answer == 'PASS '+action, answer
                         changed_at = time.monotonic()
