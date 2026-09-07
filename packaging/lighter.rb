@@ -5,8 +5,7 @@
 # entitlement, and it is the entitlement that makes this work at all.
 #
 # Release binaries carry a notarized Developer ID signature and the hypervisor
-# entitlement. post_install verifies the signature and only signs ad hoc if it
-# is missing or invalid.
+# entitlement. post_install verifies signatures without modifying the signed payload.
 class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
@@ -32,10 +31,10 @@ class Lighter < Formula
     require "digest"
     require "json"
     managed_prefix = prefix.parent.realpath.to_s
-    (pkgshare/"installation.json").write JSON.pretty_generate(
+    File.write(pkgshare/"installation.json", JSON.pretty_generate(
       schema: 1, method: "homebrew", prefix: managed_prefix,
       id: Digest::SHA256.hexdigest(managed_prefix)[0, 24]
-    )
+    ))
     system "/usr/bin/codesign", "--verify", "--strict", bin/"lighter"
     system "/usr/bin/codesign", "--verify", "--strict", "--deep", pkgshare/"lighter.app"
   end
