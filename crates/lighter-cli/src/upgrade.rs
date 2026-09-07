@@ -152,7 +152,7 @@ fn login_enabled(prefix: &Path) -> anyhow::Result<bool> {
     let exe =
         crate::service::configured_executable()?.context("login service has no executable")?;
     ensure!(
-        exe.starts_with(prefix),
+        exe.canonicalize()?.starts_with(prefix),
         "login service belongs to a different installation; resolve it before upgrading"
     );
     Ok(true)
@@ -256,7 +256,7 @@ fn legacy(prefix: &Path) -> anyhow::Result<Option<PathBuf>> {
     // Adoption is explicit, but it must still not consume a source wrapper or
     // unrelated executable merely because it occupies the default directory.
     let requirement = format!(
-        "=anchor apple generic and certificate leaf[subject.OU] = \"{}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
+        "=anchor apple generic and identifier \"lighter\" and certificate leaf[subject.OU] = \"{}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
         release::TEAM
     );
     let output = Command::new("/usr/bin/codesign")
@@ -291,6 +291,25 @@ fn legacy(prefix: &Path) -> anyhow::Result<Option<PathBuf>> {
 }
 
 pub fn install(source: &Path, prefix: &Path, restart: bool) -> anyhow::Result<()> {
+    install_selected(source, prefix, restart, None)
+}
+
+fn unchanged_selection(prefix: &Path, expected: Option<&Path>) -> anyhow::Result<()> {
+    if let Some(expected) = expected {
+        ensure!(
+            prefix.join("current").canonicalize()? == expected,
+            "another installer changed the selected release; retry from the current executable"
+        );
+    }
+    Ok(())
+}
+
+fn install_selected(
+    source: &Path,
+    prefix: &Path,
+    restart: bool,
+    expected: Option<&Path>,
+) -> anyhow::Result<()> {
     let manifest = release::verify(source)?;
     fs::create_dir_all(prefix)?;
     let prefix = prefix.canonicalize()?;
@@ -303,6 +322,10 @@ pub fn install(source: &Path, prefix: &Path, restart: bool) -> anyhow::Result<()
     let _operation = updates::Lock::acquire(&prefix.join(".installer"))?;
     recover(&prefix)?;
     let lease = SelectionLease::acquire(&prefix, true)?;
+    // The download may have taken minutes. A separate installer can select a
+    // newer generation meanwhile; validate under both activation locks so
+    // this in-flight command cannot replace that newer selection.
+    unchanged_selection(&prefix, expected)?;
     let running = crate::machine::running_pid()?.is_some();
     if running {
         // Do not stop a daily VM belonging to a different installation.
@@ -423,7 +446,7 @@ pub fn run(restart: bool) -> anyhow::Result<()> {
         updates::fetch(&i, true)?
     };
     if let Some(root) = root {
-        install(&root, &i.ownership.prefix, restart)?;
+        install_selected(&root, &i.ownership.prefix, restart, Some(&i.root))?;
     }
     Ok(())
 }
@@ -452,6 +475,23 @@ mod tests {
                 version
             );
         }
+    }
+    #[test]
+    fn an_in_flight_update_cannot_replace_a_newer_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().canonicalize().unwrap();
+        let original = prefix.join("releases/0.4.2");
+        let newer = prefix.join("releases/0.4.4");
+        fs::create_dir_all(&original).unwrap();
+        fs::create_dir_all(&newer).unwrap();
+        select(&prefix, &original).unwrap();
+        let observed = prefix.join("current").canonicalize().unwrap();
+        // An installer wins while the original updater is downloading 0.4.3.
+        select(&prefix, &newer).unwrap();
+        let _lease = SelectionLease::acquire(&prefix, true).unwrap();
+        assert!(unchanged_selection(&prefix, Some(&observed)).is_err());
+        assert_eq!(prefix.join("current").canonicalize().unwrap(), newer);
+        assert!(unchanged_selection(&prefix, Some(&newer)).is_ok());
     }
     #[test]
     fn activation_excludes_concurrent_start() {

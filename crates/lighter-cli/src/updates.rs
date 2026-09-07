@@ -105,7 +105,7 @@ fn save(i: &SelfInstallation, value: &State) -> anyhow::Result<()> {
 }
 fn due(s: &State, time: u64) -> bool {
     s.automatic
-        && time.saturating_sub(s.checked) >= 86400
+        && (s.error.is_some() || time.saturating_sub(s.checked) >= 86400)
         && time.saturating_sub(s.attempted) >= 3600
 }
 
@@ -407,6 +407,13 @@ mod tests {
         assert!(!due(&s, 103600));
         assert!(due(&s, 186400));
         assert!(!due(&s, 1));
+        // Metadata succeeded but the archive download failed. The successful
+        // metadata timestamp must not postpone the download retry for a day.
+        s.error = Some("download failed".into());
+        assert!(!due(&s, 103599));
+        assert!(due(&s, 103600));
+        s.error = None;
+        assert!(!due(&s, 103600));
     }
     #[test]
     fn release_origin_and_channel_are_checked() {
