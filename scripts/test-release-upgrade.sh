@@ -40,6 +40,8 @@ grep -q -- '--restart' "$WORK/refused.log" || { cat "$WORK/refused.log" >&2; exi
 sed "s|/usr/local/bin|$WORK/path|g" "$ROOT/scripts/install.sh" > "$WORK/install.sh"
 LIGHTER_VERSION=0.4.2 LIGHTER_TARBALL_URL="file://$NEW" LIGHTER_BOOTSTRAP_URL="file://$BOOTSTRAP" GITHUB_TOKEN= bash "$WORK/install.sh" --restart > "$WORK/install.log" 2>&1
 "$L" status
+"$L" doctor
+[ "$("${D[@]}" run --rm --platform linux/amd64 alpine:3.21 uname -m)" = x86_64 ]
 [ "$("${D[@]}" run --rm -v migration-data:/data alpine:3.21 cat /data/value)" = preserved ]
 [ "$("${D[@]}" inspect -f '{{.State.Running}}' migration-container)" = true ]
 cmp "$WORK/config-before.json" "$PREFIX/config.json"
