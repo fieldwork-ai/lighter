@@ -68,6 +68,26 @@ lighter stop        # Cleanly shut down the machine
 
 ---
 
+## Kubernetes
+
+Run local Kubernetes clusters with kind on Lighter 0.5.0:
+
+```sh
+brew install kind kubectl
+lighter start
+docker context use lighter
+KIND_EXPERIMENTAL_PROVIDER=docker kind create cluster --name dev \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 \
+  --wait 180s
+kubectl --context kind-dev get nodes
+```
+
+Use ordinary kind, kubectl and Helm commands for local development. The
+[setup guide and tested scope](docs/kubernetes.md) cover the pinned version
+matrix, local images, ports, Mac files, persistent volumes and restart behavior.
+
+---
+
 ## Why it is fast
 
 The performance of containers on macOS comes down to five bottlenecks: the shared filesystem, virtual disk I/O, memory management, the network, and the time between asking for a container and having one.

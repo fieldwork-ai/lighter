@@ -41,6 +41,38 @@ now explicitly fsyncs before inspecting the Mac. Both failed attempts remain
 in private raw logs and are excluded from the passing record. These are
 functional tests, not benchmark results.
 
+## Expanded functional qualification
+
+All seven kind configurations pass on each host: one and two nodes with
+Kubernetes 1.35.8, 1.36.4 and 1.37.0 using iptables, plus two nodes on 1.37.0
+using nftables. These cover traffic, DNS, local images, Mac shares, Helm,
+persistent volumes, VM restart and deletion. Selected inputs and results are
+in [M1 records](records/0.5.0/kind-m1/) and
+[M5 records](records/0.5.0/kind-m5/).
+
+Mixed Kubernetes, ordinary Docker and Docker-build memory pressure passes on
+the M5 at 8, 12 and 16 GiB. Observed physical-footprint peaks were 8082, 12010
+and 15549 MiB respectively; 74%, 71% and 76% of the workload growth returned
+within the recovery window. These are sampled workload results, not a
+universal guarantee that host overhead cannot exceed the guest configuration.
+[Inputs, samples and assertions](records/0.5.0/memory/).
+
+**Additional runtime fix awaiting final qualification:** expanded concurrent
+stream testing found intermittent stdin hangs on both hosts (3/820 M1 checks
+and 1/820 M5 checks). Instrumentation and standalone C socket-pair tests isolate
+a macOS blocking-read EOF race. The host now receives with `MSG_DONTWAIT` and
+waits for readiness only on EAGAIN, without periodic timers. It also shuts both
+socket directions separately on abort because Darwin may skip write shutdown
+when `SHUT_RDWR` finds receive already closed. The readiness C probe passes
+100,000 exchanges per host; the diagnostic Lighter build passes 1000 mixed
+stdin commands on M1. [Diagnosis and raw reproducer evidence](records/0.5.0/socket-eof/).
+Final stress, kind, memory and hardware qualification must be repeated against
+the resulting runtime before release benchmarks.
+
+The update lifecycle suite also passes with the 0.5.0 development build:
+pending downloads remain inactive, explicit activation preserves data and
+configuration, and automatic-download preferences persist.
+
 ## Remaining release gates
 
 1. Qualify one and two nodes on M1 and M5 with pinned Kubernetes 1.35.8, 1.36.4

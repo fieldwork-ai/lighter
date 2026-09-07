@@ -1,0 +1,17 @@
+{
+  "passed": true,
+  "configured_mib": 8192,
+  "allocations_mib": {
+    "pod": 2048,
+    "docker": 2457,
+    "build": 1228
+  },
+  "baseline_mib": 3634.022674560547,
+  "peak_mib": 8081.994331359863,
+  "host_excess_mib": 0,
+  "best_recovery_mib": 4792.60311126709,
+  "returned_fraction": 0.7395261197459524,
+  "samples": 144,
+  "sampling_interval_s": 0.5,
+  "host_overhead_budget_mib": 1024
+}

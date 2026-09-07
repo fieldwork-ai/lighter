@@ -31,6 +31,7 @@ def main():
     ap.add_argument(
         "--proxy-mode", choices=["iptables", "nftables"], default="iptables"
     )
+    ap.add_argument("--memory-pressure", action="store_true")
     a = ap.parse_args()
     home = Path(os.environ.get("LIGHTER_HOME", "")).resolve()
     if (
@@ -182,6 +183,8 @@ def main():
     guest = Path(os.environ["LIGHTER_GUEST_DIR"])
     metadata = dict(
         lighter=base_version.strip(),
+        lighter_sha256=digest(Path(a.lighter)),
+        source=cmd(["git", "rev-parse", "HEAD"]).stdout.strip(),
         kind=cmd([a.kind, "version"]).stdout.strip(),
         kubectl=json.loads(
             cmd([a.kubectl, "version", "--client", "-o", "json"]).stdout
@@ -564,6 +567,23 @@ http.server.ThreadingHTTPServer(("0.0.0.0",8080),Handler).serve_forever()
                 140,
             ),
         )
+        if a.memory_pressure:
+            from kind_pressure import qualify
+
+            checked(
+                "mixed Docker/build/Kubernetes memory pressure",
+                lambda: qualify(
+                    home=home,
+                    out=out,
+                    cmd=cmd,
+                    k=k,
+                    image=image,
+                    base_image=a.base_image,
+                    node=node,
+                    namespace=ns,
+                    service_check=service_check,
+                ),
+            )
         old = json.loads(k("-n", ns, "get", "pods", "-l", "app=web", "-o", "json"))[
             "items"
         ][0]["metadata"]["uid"]

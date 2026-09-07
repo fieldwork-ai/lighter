@@ -1,6 +1,6 @@
 # Installing and updating Lighter
 
-Lighter 0.4.2 records which installer owns each installation. `lighter doctor`
+Lighter 0.5.0 records which installer owns each installation. `lighter doctor`
 and `lighter status` identify its location and show installed and running
 versions separately. Installing new files does not change a running VM.
 
@@ -13,7 +13,7 @@ To migrate from 0.4.1, rerun the official installer. Stop the VM first, or pass
 curl -fsSL https://raw.githubusercontent.com/fieldwork-ai/lighter/main/scripts/install.sh | bash -s -- --restart
 ```
 
-Once 0.4.2 is installed:
+Once 0.5.0 is installed:
 
 ```sh
 lighter update check
@@ -69,7 +69,7 @@ lighter restart
 
 Lighter can check for updates, but its direct updater and background downloader
 will not replace Homebrew files. Existing Homebrew receipts identify older
-installations; 0.4.2's formula also records ownership explicitly. Startup paths
+installations; 0.5.0's formula also records ownership explicitly. Startup paths
 are refreshed when a registered installation starts after an upgrade.
 
 Source builds and unmarked manual installations receive guidance rather than
@@ -81,7 +81,8 @@ not share upgrade authority.
 
 ## Kernel policy
 
-0.4.2 retains Linux 6.18.49. Future kernel and guest updates arrive as part of a
+0.5.0 retains Linux 6.18.49 and rebuilds it with the kernel match required by
+kind's default Service networking. Future kernel and guest updates arrive as part of a
 qualified Lighter release, together with the matching host runtime. There is no
 independent kernel auto-updater. The current supported release data format is
 unchanged; unsupported format epochs are rejected before activation.

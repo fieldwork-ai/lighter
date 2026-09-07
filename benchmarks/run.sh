@@ -405,8 +405,8 @@ bench_memory_mib() {
 
 setup_lighter() {
 	# The kernel the CLI boots: `LIGHTER_BENCH_KERNEL` measures another build.
-	KERNEL="${LIGHTER_BENCH_KERNEL:-guest/out/Image}"
-	BIN="target/release/examples/lighter-bench"
+	KERNEL="${LIGHTER_BENCH_KERNEL:-${LIGHTER_BENCH_GUEST_DIR:-guest/out}/Image}"
+	BIN="${LIGHTER_BENCH_BIN:-target/release/examples/lighter-bench}"
 	# Rosetta, when the Mac has it, the way `lighter start` attaches it: the
 	# guest's amd64 path is Rosetta or a message, and `--arch amd64` needs
 	# the former. Nothing changes for arm64 cases.
@@ -416,13 +416,17 @@ setup_lighter() {
 	# A private clone, not the master: the master is an artifact, and any
 	# second machine mounting it read-write beside the first — a daily
 	# driver, another gate — corrupts both. clonefile makes the copy free.
-	ROOTFS_MASTER="guest/out/rootfs.ext4"
+	ROOTFS_MASTER="${LIGHTER_BENCH_GUEST_DIR:-guest/out}/rootfs.ext4"
 	[ -f "$ROOTFS_MASTER" ] || ./guest/rootfs/build.sh
 	ROOTFS="$(mktemp -t lighter-rootfs).ext4"
 	cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 	# Release, because a debug VMM is measuring the compiler.
-	cargo build --release --example lighter-bench -p lighter-vmm
-	./scripts/sign.sh "$BIN" >/dev/null
+	if [ -z "${LIGHTER_BENCH_BIN:-}" ]; then
+		cargo build --release --example lighter-bench -p lighter-vmm
+		./scripts/sign.sh "$BIN" >/dev/null
+	else
+		[ -x "$BIN" ] && [ -n "${LIGHTER_BENCH_SOURCE_SHA:-}" ] || { echo 'external benchmark binary needs its source SHA' >&2; exit 1; }
+	fi
 
 	# Let fseventsd finish with any VMM that died on this share moments
 	# ago — the previous run's, typically — before a new stream opens on
@@ -530,8 +534,13 @@ echo "case,rep,ms" > "$RESULTS"
 	echo "date=$(date -u +%Y-%m-%dT%H:%MZ)"
 	echo "host=$(hostname -s)"
 	if [ "$TARGET" = lighter ]; then
-		for f in "$KERNEL" guest/out/rootfs.ext4 guest/out/lighter-agent; do
-			[ -f "$f" ] && echo "$(basename "$f")=$(md5 -q "$f" 2>/dev/null || md5sum "$f" | cut -d" " -f1)"
+		echo "runtime_source=${LIGHTER_BENCH_SOURCE_SHA:-$(git rev-parse HEAD)}"
+		echo "cpus=${BENCH_CPUS:-8} memory_mib=$(bench_memory_mib) disk_gib=$(bench_disk_gib)"
+		for f in "$BIN" "$KERNEL" "$ROOTFS_MASTER" "${LIGHTER_BENCH_GUEST_DIR:-guest/out}/lighter-agent"; do
+			if [ -f "$f" ]; then
+				echo "$(basename "$f")=$(md5 -q "$f" 2>/dev/null || md5sum "$f" | cut -d" " -f1)"
+				echo "$(basename "$f").sha256=$(shasum -a 256 "$f" | awk '{print $1}')"
+			fi
 		done
 	fi
 } > "${RESULTS%.csv}.tree"
@@ -925,6 +934,17 @@ run_boot_case() {
 		cargo build --release -p lighter-cli >/dev/null 2>&1
 		./scripts/sign.sh "$LIGHTER_CLI" >/dev/null
 		BOOT_HOME="$(mktemp -d -t lighter-boot-home)"
+		# Use the same explicit resource profile as the other cases.
+		LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" config --cpus "${BENCH_CPUS:-8}" --memory "$(bench_memory_mib)" --disk "$(bench_disk_gib)" >/dev/null
+		# The CLI daemonizes. Register its exact private executable before start
+		# so the continuous guard can distinguish it from a daily VM.
+		if [ -n "${LIGHTER_BENCH_OWNER_FILE:-}" ]; then
+			python3 - "$LIGHTER_BENCH_OWNER_FILE" "$BOOT_HOME/lighter.app/Contents/MacOS/lighter" <<'PYOWNER'
+import json, pathlib, sys
+with open(sys.argv[1], 'a') as out:
+    out.write(json.dumps(str(pathlib.Path(sys.argv[2]).resolve()))+'\n')
+PYOWNER
+		fi
 		# The benchmark machine goes first: two of our machines on one Mac is
 		# not the measurement.
 		if [ -n "$VMM_PID" ]; then

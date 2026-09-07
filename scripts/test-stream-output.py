@@ -175,17 +175,20 @@ http.server.ThreadingHTTPServer(("0.0.0.0",8080),H).serve_forever()
                 for fn in [docker_task, http_task]
                 for i in range(a.reps * 4)
             }
-            futures.update({
-                pool.submit(backpressure_task, i): ("backpressure_task", i)
-                for i in range(pressure_reps)
-            })
+            futures.update(
+                {
+                    pool.submit(backpressure_task, i): ("backpressure_task", i)
+                    for i in range(pressure_reps)
+                }
+            )
             for f in cf.as_completed(futures):
                 try:
                     row = f.result()
                 except Exception as e:
                     kind, iteration = futures[f]
-                    row = dict(kind=kind, iteration=iteration, passed=False,
-                               error=repr(e))
+                    row = dict(
+                        kind=kind, iteration=iteration, passed=False, error=repr(e)
+                    )
                 out.write(json.dumps(row) + "\n")
                 out.flush()
                 if not row["passed"]:
