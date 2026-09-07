@@ -1,27 +1,14 @@
-//! Watching the host for changes, so the guest can be allowed to cache.
+//! Host filesystem changes used to invalidate guest caches.
 //!
-//! # Why a filesystem this fast needs a watcher
+//! The observer maps ordinary paths to inode and name invalidations. Loss of
+//! event detail requests a complete share reset; a moved watch root also
+//! selects conservative cache leases until the VM restarts.
 //!
-//! Caching in the guest is the only way to make a shared directory quick: with
-//! nothing cached, resolving one six-component path costs six round trips, and
-//! `npm ci` resolves millions of them. Caching is also the only way to make it
-//! wrong, because the host can change a file the guest believes it knows.
-//!
-//! Every other implementation resolves that with a fixed timeout and lives with
-//! the window. We can do better, because macOS will tell us: FSEvents reports a
-//! host-side change within milliseconds, and a directory the host is touching
-//! gets zero cache validity while a directory it is not gets a generous one.
-//! The result is exact coherence exactly when it matters — while you are
-//! editing — and full speed the rest of the time.
-//!
-//! # What we cannot do, and why the design is shaped around it
-//!
-//! FUSE has a reverse channel for invalidating what the guest already cached.
-//! virtio-fs does not carry it: Linux's driver (6.12) has a high-priority queue
-//! and request queues and nothing else, so a notification has nowhere to go.
-//! Invalidation is therefore *pull*, not push — the guest asks again when the
-//! validity we handed out expires, and all we control is that number. Which
-//! makes the number the entire policy, and this module the thing that sets it.
+//! FSEvents coalesces changes and can deliver them late under load. Its
+//! requested latency is not a delivery deadline. The cache policy therefore
+//! caps leases independently of notifications. IgnoreSelf suppresses writes
+//! made by this process on behalf of the guest, avoiding invalidation of the
+//! guest's own package-install cache.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -187,6 +174,7 @@ impl Watcher {
     /// `latency` is how long FSEvents may coalesce events before delivering
     /// them. It is the floor on how quickly the guest can be told to stop
     /// trusting its cache, so it is set small and paid for in wakeups.
+    /// Service backlog can delay delivery beyond this coalescing interval.
     pub fn start(
         root: &Path,
         latency: std::time::Duration,
