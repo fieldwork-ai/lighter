@@ -69,15 +69,15 @@ impl Timings {
     /// Notifications normally withdraw these answers promptly, but FSEvents
     /// can deliver them tens of seconds late under filesystem load. Negotiating
     /// a notification queue is not proof that the host event service is keeping
-    /// up. Ten seconds bounds the leases independently of event delivery;
+    /// up. Twenty seconds bounds the leases independently of event delivery;
     /// expiry revalidates names and attributes through ordinary FUSE requests.
     /// It does not refresh an existing mmap without an invalidation, nor force
     /// a data-cache drop for a host edit preserving both size and mtime.
     pub const PUSHED: Timings = Timings {
-        attr: Duration::from_secs(10),
-        entry_file: Duration::from_secs(10),
-        entry_dir: Duration::from_secs(10),
-        negative: Duration::from_secs(10),
+        attr: Duration::from_secs(20),
+        entry_file: Duration::from_secs(20),
+        entry_dir: Duration::from_secs(20),
+        negative: Duration::from_secs(20),
         cooldown: Duration::from_millis(2000),
     };
 
