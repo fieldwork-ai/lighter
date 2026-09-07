@@ -1,0 +1,6 @@
+==> Another virtual machine is running:
+      Colima or Lima (limactl hostagent)
+
+    Stop it and run again, or pass --allow-noisy to measure anyway.
+    A second hypervisor moves the ratio between the native and guest
+    figures, which is the only thing this suite reports.

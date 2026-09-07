@@ -59,8 +59,9 @@ succeeded.
 The first complete M1 suite is the prespecified primary record. Two subsequent
 full suites measure repeatability and exercise filesystem-daemon recovery,
 without restarting the daemon. Each suite includes host-share, guest-disk and
-amd64 stages. A ten-minute observation follows the final suite. M5 timings are
-excluded because that machine is busy.
+amd64 stages. A ten-minute observation follows the final suite. The user later made M5 available, but two attempts were invalidated when
+other VMs started during measurement; neither supplies a release performance
+record. The daily VM was restored with its original 16 GiB configuration.
 
 All nine benchmark stages and the ten-minute daemon observation passed.
 [The full report](../benchmarks/RELEASE-0.4.2.md) retains every sample and
@@ -68,6 +69,12 @@ workload-specific variation. Across 726 valid observations, the same daemon
 PID peaked at 6.09 MiB and ended at 4.72 MiB. Post-suite CPU had a median of
 0.0% and maximum of 0.3%. There were no monitoring errors. The fresh-daemon 0.4.1 baseline and the previously published
 0.4.1 record are both retained, alongside all new repetitions and outliers.
+
+A subsequent alternating M1 package-install comparison (0.4.1 / 0.4.2 /
+0.4.2 / 0.4.1) completed all four arms. Comparing geometric means of the two
+arm medians per version gives npm −1.15%, pnpm −2.71% and yarn +2.49%. The
+larger apparent slowdown did not reproduce consistently. All samples and
+limits are retained in [the follow-up report](../benchmarks/RELEASE-0.4.2-ABBA.md).
 
 A successful soak does not establish a fix for the historical `fseventsd`
 incident: its original trigger remains unreproduced. macOS task footprint

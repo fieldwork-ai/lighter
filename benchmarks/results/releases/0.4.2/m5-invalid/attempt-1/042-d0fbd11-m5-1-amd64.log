@@ -1,0 +1,7 @@
+==> Another virtual machine is running:
+      a lighter machine (stop it with `lighter stop`)
+
+    Stop it and run again, or pass --allow-noisy to measure anyway.
+    A second hypervisor moves the ratio between the native and guest
+    figures, which is the only thing this suite reports.
+scripts/capped.sh: line 24:   272 Terminated: 15          sleep "$cap"
