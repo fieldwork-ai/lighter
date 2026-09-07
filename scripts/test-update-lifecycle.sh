@@ -7,10 +7,12 @@ cd "$ROOT"
 WORK="$(mktemp -d /tmp/lighter-update.XXXXXX)"
 PREFIX="$WORK/install"
 RELEASE="$PREFIX/releases/0.4.2"
-export HOME="$WORK/user" LIGHTER_HOME="$WORK/machine"
-mkdir -p "$HOME" "$LIGHTER_HOME" "$RELEASE/bin" "$RELEASE/share/lighter"
+export HOME="$WORK/user"
+unset LIGHTER_HOME LIGHTER_GUEST_DIR
+MACHINE_HOME="$HOME/.lighter"
+mkdir -p "$HOME" "$MACHINE_HOME" "$RELEASE/bin" "$RELEASE/share/lighter"
 L="$PREFIX/bin/lighter"
-cleanup() { result=$?; if [ "$result" -ne 0 ] && [ -f "$LIGHTER_HOME/machine.log" ]; then cat "$LIGHTER_HOME/machine.log" >&2; fi; [ ! -x "$L" ] || "$L" stop >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+cleanup() { result=$?; if [ "$result" -ne 0 ] && [ -f "$MACHINE_HOME/machine.log" ]; then cat "$MACHINE_HOME/machine.log" >&2; fi; [ ! -x "$L" ] || "$L" stop >/dev/null 2>&1 || true; [ ! -x "$L" ] || "$L" update auto-download off >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 cp -c target/release/lighter "$RELEASE/bin/lighter"
 cp -c guest/out/Image guest/out/rootfs.ext4 guest/out/kernel.version "$RELEASE/share/lighter/"
@@ -29,12 +31,12 @@ import hashlib,json,pathlib,os,sys
 p=pathlib.Path(sys.argv[1]).resolve(); root=p/'releases/0.4.2'
 identity=hashlib.sha256(str(p).encode()).hexdigest()[:24]
 (root/'share/lighter/installation.json').write_text(json.dumps(dict(schema=1,method='script',id=identity,prefix=str(p))))
-pathlib.Path(os.environ['LIGHTER_HOME'],'config.json').write_text(json.dumps(dict(cpus=2,memory_mib=2048,disk_gib=64,shares=[],publish='localhost')))
+pathlib.Path(str(pathlib.Path(os.environ['HOME'],'.lighter')),'config.json').write_text(json.dumps(dict(cpus=2,memory_mib=2048,disk_gib=64,shares=[],publish='localhost')))
 state=pathlib.Path(os.environ['HOME'],'Library/Application Support/lighter/updates',identity);state.mkdir(parents=True)
-(state/'state.json').write_text(json.dumps(dict(automatic=True,available='0.4.3',downloaded='0.4.3')))
+(state/'state.json').write_text(json.dumps(dict(automatic=False,available='0.4.3',downloaded='0.4.3',checked=__import__('time').time().__int__(),attempted=__import__('time').time().__int__())))
 PY
 "$L" start --timeout 120
-D=(docker -H "unix://$LIGHTER_HOME/docker.sock")
+D=(docker -H "unix://$MACHINE_HOME/docker.sock")
 "${D[@]}" run --rm -v update-persistence:/data alpine:3.21 sh -c 'echo persistent > /data/value'
 "${D[@]}" run -d --name update-survivor --restart always alpine:3.21 sleep 3600 >/dev/null
 "$L" restart
@@ -44,10 +46,15 @@ D=(docker -H "unix://$LIGHTER_HOME/docker.sock")
 "$L" status
 python3 - <<'PY'
 import json,os,pathlib
-identity=json.loads(pathlib.Path(os.environ['LIGHTER_HOME'],'machine.identity').read_text())
+identity=json.loads(pathlib.Path(str(pathlib.Path(os.environ['HOME'],'.lighter')),'machine.identity').read_text())
 assert identity['release_version']=='0.4.2',identity
 assert identity['kernel_version']=='6.18.49',identity
 PY
 "$L" stop
 [ "$(readlink "$PREFIX/current")" = releases/0.4.2 ]
+"$L" update auto-download on
+"$L" update poll
+[ "$(readlink "$PREFIX/current")" = releases/0.4.2 ]
+"$L" update auto-download off
+[ -z "$(find "$HOME/Library/LaunchAgents" -name 'dev.lighter.updates.*.plist' -print)" ]
 echo 'update lifecycle: pending release never activated; restart preserved volume/container/config; running versions verified'

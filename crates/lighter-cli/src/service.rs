@@ -19,6 +19,10 @@ pub fn plist_path() -> anyhow::Result<PathBuf> {
 
 /// Writes the agent and loads it.
 pub fn install() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        paths::is_default_home(),
+        "login registration is only supported for the default VM home"
+    );
     // The bundled copy, for the same reason `lighter start` uses it: a
     // process launchd starts from the bundle carries a name and an icon.
     let mut exe = crate::bundle::ensure()?;
@@ -78,6 +82,8 @@ fn register(exe: &std::path::Path, guest: &std::path::Path, start: bool) -> anyh
     </array>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>{home}</string>
         <key>LIGHTER_GUEST_DIR</key>
         <string>{guest}</string>
     </dict>
@@ -97,6 +103,7 @@ fn register(exe: &std::path::Path, guest: &std::path::Path, start: bool) -> anyh
 </dict>
 </plist>
 "#,
+        home = crate::updates::xml(&std::env::var("HOME")?),
         exe = crate::updates::xml(&exe.to_string_lossy()),
         guest = crate::updates::xml(&guest.to_string_lossy()),
         log = crate::updates::xml(&log.to_string_lossy()),

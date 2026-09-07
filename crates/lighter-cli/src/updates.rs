@@ -347,10 +347,11 @@ fn configure_agent(i: &SelfInstallation, enabled: bool) -> anyhow::Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
     let exe = xml(&i.ownership.prefix.join("bin/lighter").to_string_lossy());
     let log = xml(&state_dir(i)?.join("updates.log").to_string_lossy());
+    let agent_home = xml(&home.to_string_lossy());
     fs::write(
         &path,
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{exe}</string><string>update</string><string>poll</string></array><key>StartInterval</key><integer>3600</integer><key>RunAtLoad</key><true/><key>ProcessType</key><string>Background</string><key>LowPriorityIO</key><true/><key>StandardOutPath</key><string>{log}</string><key>StandardErrorPath</key><string>{log}</string></dict></plist>"#
+            r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{exe}</string><string>update</string><string>poll</string></array><key>EnvironmentVariables</key><dict><key>HOME</key><string>{agent_home}</string></dict><key>StartInterval</key><integer>3600</integer><key>RunAtLoad</key><true/><key>ProcessType</key><string>Background</string><key>LowPriorityIO</key><true/><key>StandardOutPath</key><string>{log}</string><key>StandardErrorPath</key><string>{log}</string></dict></plist>"#
         ),
     )?;
     let output = Command::new("/bin/launchctl")
