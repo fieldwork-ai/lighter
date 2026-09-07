@@ -93,7 +93,7 @@ fn checked(command: &mut Command) -> anyhow::Result<()> {
 pub fn verify(root: &Path) -> anyhow::Result<Manifest> {
     let app = root.join("share/lighter/lighter.app");
     let requirement = format!(
-        "anchor apple generic and identifier \"dev.lighter.machine\" and certificate leaf[subject.OU] = \"{TEAM}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+        "=anchor apple generic and identifier \"dev.lighter.machine\" and certificate leaf[subject.OU] = \"{TEAM}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
     );
     checked(
         Command::new("/usr/bin/codesign")

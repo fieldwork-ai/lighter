@@ -256,7 +256,7 @@ fn legacy(prefix: &Path) -> anyhow::Result<Option<PathBuf>> {
     // Adoption is explicit, but it must still not consume a source wrapper or
     // unrelated executable merely because it occupies the default directory.
     let requirement = format!(
-        "anchor apple generic and certificate leaf[subject.OU] = \"{}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
+        "=anchor apple generic and certificate leaf[subject.OU] = \"{}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
         release::TEAM
     );
     let output = Command::new("/usr/bin/codesign")
@@ -308,7 +308,7 @@ pub fn install(source: &Path, prefix: &Path, restart: bool) -> anyhow::Result<()
         // Do not stop a daily VM belonging to a different installation.
         let identity = crate::instance::Identity::read(&crate::paths::home()?)?.context("cannot establish running VM ownership; stop it manually before adopting this installation")?;
         ensure!(
-            identity.executable()?.starts_with(&prefix),
+            identity.executable()?.canonicalize()?.starts_with(&prefix),
             "running VM belongs to another installation; stop it explicitly first"
         );
         ensure!(

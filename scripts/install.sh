@@ -86,7 +86,7 @@ if [ -n "${GITHUB_TOKEN:-}" ] && [ -z "${LIGHTER_BOOTSTRAP_URL:-}" ]; then
 fi
 curl -fL --progress-bar --connect-timeout 15 --max-time 900 --max-filesize 2147483648 ${DOWNLOAD_HEADERS[@]+"${DOWNLOAD_HEADERS[@]}"} "$BOOTSTRAP_URL" -o "$BOOTSTRAP" || err "failed to download signed installer helper (requires lighter 0.4.2 or later)"
 chmod +x "$BOOTSTRAP"
-/usr/bin/codesign --verify --strict -R 'anchor apple generic and identifier "lighter" and certificate leaf[subject.OU] = "N7N6BNF95K" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' "$BOOTSTRAP" || err "installer helper signature is invalid"
+/usr/bin/codesign --verify --strict -R '=anchor apple generic and identifier "lighter" and certificate leaf[subject.OU] = "N7N6BNF95K" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' "$BOOTSTRAP" || err "installer helper signature is invalid"
 "$BOOTSTRAP" install-archive --archive "$TARBALL" --prefix "$INSTALL_DIR" ${RESTART[@]+"${RESTART[@]}"}
 
 # 4. Symlink to PATH

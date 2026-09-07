@@ -206,7 +206,10 @@ TAR_ARGS=("-czf" "$TARBALL" "-C" "$WORK/stage" "lighter-$VERSION")
 if tar --help 2>&1 | grep -q -- '--sparse'; then
 	TAR_ARGS=("--sparse" "${TAR_ARGS[@]}")
 fi
-tar "${TAR_ARGS[@]}"
+# Extended attributes are not release payloads. AppleDouble sidecars create
+# extra archive roots for non-libarchive readers; the stapled ticket is an
+# ordinary Contents/CodeResources file and remains in the archive.
+COPYFILE_DISABLE=1 tar "${TAR_ARGS[@]}"
 
 SIZE="$(du -h "$TARBALL" | cut -f1)"
 SHA="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
