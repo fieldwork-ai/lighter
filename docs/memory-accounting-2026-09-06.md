@@ -254,3 +254,9 @@ describes the host allocation backing guest RAM. The open-source
 and [memory object ownership rules](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/vm/vm_object.c)
 help interpret these experiments; public XNU source alone does not expose the
 entire AppleHV implementation.
+
+## Guest demand versus compression steering
+
+A later 12 GiB app-build run exposed a separate reclamation problem. With guest available memory and swap exhausted, the balloon continued inflating and deflating while the host compression heuristic retained a target. Direct reclaim scanned about 127 million pages over a 19-second sample. The build had progressed but remained under pressure after 800 seconds. Unbinding the balloon driver in that diagnostic VM was followed by an out-of-memory build failure 8.59 seconds later. Because the driver was removed, that run is excluded from release qualification.
+
+Guest demand now withdraws compression-only steering and prevents its next poll from restoring the target. A healthy guest starts a fresh ramp; a disconnected agent also suspends speculative reclamation. Actual macOS warning and critical pressure targets remain effective. A regression test checks the target exposed through the virtio device across demand, repeated compression polls, all three host pressure levels and recovery. The real-build correction is being validated with the balloon driver attached throughout; the intervention alone does not prove a complete fix.
