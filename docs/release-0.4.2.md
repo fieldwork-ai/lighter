@@ -105,8 +105,8 @@ M5 verifies the final signatures, staple and code/payload equivalence; its
 previous candidate migration and activation tests cover the identical code.
 No further M5 VM test is claimed while competing VM work is active.
 
-The release and tap PR remain unpublished pending the main PR merge. Merge
-and publication must be coordinated: publish the prepared archive and signed
+The release remains unpublished and the tap PR stays in draft pending the
+main PR merge. Merge and publication must be coordinated: publish the prepared archive and signed
 bootstrap immediately after merging, since the new installer requires a
 bootstrap asset that 0.4.1 did not provide. Verify public download hashes, then
 make the matching tap PR ready to merge. Never replace published asset bytes.
