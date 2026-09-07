@@ -100,6 +100,9 @@ struct Conn {
     /// The guest has half-closed: it will send nothing further, but it is still
     /// willing to receive. The host is owed an EOF once `outbound` drains.
     guest_done: bool,
+    /// The guest no longer accepts host bytes. A full shutdown must still
+    /// drain every received byte, including batches held by a writer.
+    guest_receive_closed: bool,
     /// Bytes consumed since the guest was last told. A credit update per
     /// batch written was a packet, a transport lock and a guest interrupt
     /// for every few hundred kilobytes; the guest only needs to hear when
@@ -155,11 +158,16 @@ impl Socket for std::net::TcpStream {
 /// kind it is; a guest-opened connection has none until its pump starts.
 trait Closable: Send {
     fn close(&self);
+    fn stop_reading(&self);
 }
 
 impl<S: Socket> Closable for S {
     fn close(&self) {
         let _ = Socket::shutdown(self, std::net::Shutdown::Both);
+    }
+
+    fn stop_reading(&self) {
+        let _ = Socket::shutdown(self, std::net::Shutdown::Read);
     }
 }
 
@@ -501,6 +509,7 @@ impl VsockShared {
                 credit: Credit::new(),
                 outbound: VecDeque::new(),
                 guest_done: false,
+                guest_receive_closed: false,
                 unreported: 0,
                 received: 0,
                 socket: Some(Box::new(socket)),
@@ -530,8 +539,19 @@ impl VsockShared {
     /// Gives a connection the socket its pump will use, for closing.
     fn attach<S: Socket>(&self, key: ConnKey, socket: S) {
         if let Some(conn) = self.lock().conns.get_mut(&key) {
+            if conn.guest_receive_closed {
+                let _ = Socket::shutdown(&socket, std::net::Shutdown::Read);
+            }
             conn.socket = Some(Box::new(socket));
         }
+    }
+
+    /// A receive half-close stops host input without discarding guest output.
+    pub fn guest_receive_closed(&self, key: ConnKey) -> bool {
+        self.lock()
+            .conns
+            .get(&key)
+            .is_some_and(|c| c.guest_receive_closed)
     }
 
     /// The connection's state as a reactor wants it.
@@ -552,6 +572,9 @@ impl VsockShared {
         let Some(conn) = inner.conns.get(&key) else {
             return Err(Gone);
         };
+        if conn.guest_receive_closed {
+            return Err(Gone);
+        }
         if conn.state != State::Established {
             return if conn.state == State::Connecting {
                 Ok(0)
@@ -617,6 +640,9 @@ impl VsockShared {
         let Some(conn) = inner.conns.get(&key) else {
             return Err(Gone);
         };
+        if conn.guest_receive_closed {
+            return Err(Gone);
+        }
         if conn.state != State::Established {
             return if conn.state == State::Connecting {
                 Ok(Some(data))
@@ -859,7 +885,7 @@ impl VsockShared {
             let Some(conn) = inner.conns.get(&key) else {
                 return false;
             };
-            if conn.state != State::Established {
+            if conn.state != State::Established || conn.guest_receive_closed {
                 return false;
             }
 
@@ -925,7 +951,7 @@ impl VsockShared {
     /// matters. Sending a full close here instead loses the reply.
     pub fn shutdown_write(&self, key: ConnKey) {
         let mut inner = self.lock();
-        if !inner.conns.contains_key(&key) {
+        if inner.conns.get(&key).is_none_or(|c| c.guest_receive_closed) {
             return;
         }
         let (host_port, guest_port) = key;
@@ -952,6 +978,9 @@ impl VsockShared {
         inner.outbox.push_back(packet);
         if let Some(conn) = inner.conns.get_mut(&key) {
             conn.state = State::Closed;
+            if let Some(socket) = &conn.socket {
+                socket.close();
+            }
         }
         drop(inner);
         self.progressed();
@@ -1023,6 +1052,13 @@ impl VsockShared {
             return;
         };
         conn.credit.consumed(bytes);
+        if conn.guest_done && conn.guest_receive_closed && conn.received == conn.credit.fwd_cnt() {
+            Vsock::finish_shutdown(&mut inner, key);
+            drop(inner);
+            self.progressed();
+            self.wake();
+            return;
+        }
         conn.unreported = conn.unreported.saturating_add(bytes);
         // A quarter of the window at a time: the guest always has at least
         // three quarters in hand, and a small transfer that never reaches the
@@ -1161,21 +1197,19 @@ impl Vsock {
                 // owed an EOF, which the writer thread delivers once it has
                 // drained what is already buffered — but the other direction
                 // stays open.
-                if packet.flags & shutdown::RCV == 0 && packet.flags & shutdown::SEND != 0 {
-                    conn.guest_done = true;
-                    return;
+                conn.guest_done |= packet.flags & shutdown::SEND != 0;
+                conn.guest_receive_closed |= packet.flags & shutdown::RCV != 0;
+                if conn.guest_receive_closed {
+                    if let Some(socket) = &conn.socket {
+                        socket.stop_reading();
+                    }
+                    // Queued host input is no longer accepted by the guest.
+                    // Sending it after SHUTDOWN_RCV can provoke an early reset.
+                    inner.outbox.retain(|p| {
+                        !(p.src_port == key.0 && p.dst_port == key.1 && p.op == Op::Rw)
+                    });
                 }
-
-                conn.state = State::Closed;
-                if let Some(socket) = &conn.socket {
-                    socket.close();
-                }
-                let mut rst = Packet::control(Op::Rst, host_port, packet.src_port);
-                rst.buf_alloc = credit::BUF_ALLOC;
-                inner.outbox.push_back(rst);
-                if let Some(conn) = inner.conns.remove(&key) {
-                    Vsock::retire(inner, conn);
-                }
+                Self::finish_shutdown(inner, key);
             }
 
             Op::Rw => {
@@ -1230,6 +1264,7 @@ impl Vsock {
                             credit: Credit::new(),
                             outbound: VecDeque::new(),
                             guest_done: false,
+                            guest_receive_closed: false,
                             unreported: 0,
                             received: 0,
                             socket: None,
@@ -1256,8 +1291,31 @@ impl Vsock {
         }
     }
 
-    /// Returns to the guest any chains a departing connection still held.
+    /// A graceful close is acknowledged only after writers have delivered all
+    /// bytes. An empty queue alone is insufficient: a batch may be in flight.
+    fn finish_shutdown(inner: &mut Inner, key: ConnKey) {
+        let Some(conn) = inner.conns.get(&key) else {
+            return;
+        };
+        if !conn.guest_done || !conn.guest_receive_closed || conn.received != conn.credit.fwd_cnt()
+        {
+            return;
+        }
+        let mut rst = Packet::control(Op::Rst, key.0, key.1);
+        rst.buf_alloc = credit::BUF_ALLOC;
+        rst.fwd_cnt = conn.credit.fwd_cnt();
+        inner.outbox.push_back(rst);
+        if let Some(conn) = inner.conns.remove(&key) {
+            Self::retire(inner, conn);
+        }
+    }
+
+    /// Returns queued chains on teardown. In-flight chains remain owned by
+    /// their writer and are completed there, including after a reset.
     fn retire(inner: &mut Inner, conn: Conn) {
+        if let Some(socket) = &conn.socket {
+            socket.close();
+        }
         for chunk in conn.outbound {
             if let Chunk::Guest { head, .. } = chunk {
                 inner.done.push_back(head);
@@ -1723,6 +1781,9 @@ pub fn pump<S: Socket>(
         }
         // `send` delivers as it goes; there is nothing to poke afterwards.
         if !shared.send(key, &buf[..read]) {
+            // A guest receive half-close ends only this direction. Its final
+            // response may still be queued or in the writer's current batch.
+            host_closed = shared.guest_receive_closed(key);
             break;
         }
     }
@@ -1915,6 +1976,97 @@ mod tests {
         Vsock::handle(&mut inner, full);
 
         assert!(!inner.conns.contains_key(&port));
+    }
+
+    #[test]
+    fn full_shutdown_drains_queued_and_inflight_responses_before_reset() {
+        for take_before_close in [false, true] {
+            let (shared, key, mut peer) = shared_with_connection();
+            shared.establish_for_test(key, 4096);
+            let mut data = Packet::control(Op::Rw, key.1, key.0);
+            data.payload = b"final-output".to_vec();
+            Vsock::handle(&mut shared.lock(), data);
+            let mut taken = None;
+            if take_before_close {
+                taken = Some(shared.try_take_outbound(key));
+            }
+            let mut full = Packet::control(Op::Shutdown, key.1, key.0);
+            full.flags = shutdown::BOTH;
+            Vsock::handle(&mut shared.lock(), full);
+            assert!(shared.lock().conns.contains_key(&key));
+            assert!(!shared.lock().outbox.iter().any(|p| p.op == Op::Rst));
+            let chunks = match taken.unwrap_or_else(|| shared.try_take_outbound(key)) {
+                Outbound::Chunks(chunks) => chunks,
+                _ => panic!("graceful close discarded the response"),
+            };
+            assert_eq!(flat(Some(chunks)).unwrap(), b"final-output");
+            // Taking a batch does not mean it reached the host. Partial
+            // completion must also keep the socket open and defer the reset.
+            shared.acknowledge(key, 5);
+            assert!(shared.lock().conns.contains_key(&key));
+            peer.set_nonblocking(true).unwrap();
+            assert_eq!(
+                peer.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            shared.acknowledge(key, 7);
+            assert!(!shared.lock().conns.contains_key(&key));
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            assert_eq!(
+                shared
+                    .lock()
+                    .outbox
+                    .iter()
+                    .filter(|p| p.op == Op::Rst)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn receive_half_close_stops_input_but_keeps_output_until_send_close() {
+        let (shared, key, _peer) = shared_with_connection();
+        shared.establish_for_test(key, 4096);
+        assert_eq!(shared.try_send(key, b"queued input").unwrap(), 12);
+        let mut half = Packet::control(Op::Shutdown, key.1, key.0);
+        half.flags = shutdown::RCV;
+        Vsock::handle(&mut shared.lock(), half);
+        assert!(shared.try_send(key, b"late input").is_err());
+        assert!(shared.queued_for_test(key).is_empty());
+        shared.shutdown_write(key);
+        assert!(!shared.lock().outbox.iter().any(|p| p.op == Op::Shutdown));
+        assert!(matches!(shared.try_take_outbound(key), Outbound::Empty));
+        let mut data = Packet::control(Op::Rw, key.1, key.0);
+        data.payload = b"response".to_vec();
+        Vsock::handle(&mut shared.lock(), data);
+        assert_eq!(flat(shared.take_outbound(key)).unwrap(), b"response");
+        shared.acknowledge(key, 8);
+        assert!(shared.lock().conns.contains_key(&key));
+        let mut done = Packet::control(Op::Shutdown, key.1, key.0);
+        done.flags = shutdown::SEND;
+        Vsock::handle(&mut shared.lock(), done);
+        assert!(!shared.lock().conns.contains_key(&key));
+    }
+
+    #[test]
+    fn reset_returns_queued_guest_buffers_but_not_a_writers_live_batch() {
+        let (shared, key, _peer) = shared_with_connection();
+        shared.establish_for_test(key, 4096);
+        let packet = Packet::control(Op::Rw, key.1, key.0);
+        Vsock::handle_guest_rw(&mut shared.lock(), &packet, 11, vec![(0x4000, 4)]);
+        let in_flight = shared.take_outbound(key).unwrap();
+        Vsock::handle_guest_rw(&mut shared.lock(), &packet, 12, vec![(0x5000, 4)]);
+        Vsock::handle(&mut shared.lock(), Packet::control(Op::Rst, key.1, key.0));
+        assert_eq!(shared.lock().done.iter().copied().collect::<Vec<_>>(), [12]);
+        shared.complete(in_flight.into_iter().filter_map(|chunk| match chunk {
+            Chunk::Guest { head, .. } => Some(head),
+            _ => None,
+        }));
+        assert_eq!(
+            shared.lock().done.iter().copied().collect::<Vec<_>>(),
+            [12, 11]
+        );
     }
 
     /// Once the guest has half-closed and the buffer is empty there is nothing

@@ -2,7 +2,9 @@
 # Real, notarized archive migration under an isolated HOME and PATH target.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OLD="${1:?0.4.1 archive}" NEW="${2:?0.4.2 archive}" BOOTSTRAP="${3:?signed 0.4.2 bootstrap}"
+OLD="${1:?0.4.1 archive}" NEW="${2:?new release archive}" BOOTSTRAP="${3:?signed new release bootstrap}"
+VERSION="$("$BOOTSTRAP" --version | awk '{print $2}')"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid bootstrap version" >&2; exit 1; }
 WORK="$(mktemp -d /tmp/lighter-migrate.XXXXXX)"
 export HOME="$WORK/u"
 export DOCKER_CONFIG="$HOME/.docker"
@@ -38,23 +40,23 @@ grep -q -- '--restart' "$WORK/refused.log" || { cat "$WORK/refused.log" >&2; exi
 [ "$(cat "$PREFIX/lighter.pid")" = "$original_pid" ]
 # Execute the real installer, redirecting only the system PATH target.
 sed "s|/usr/local/bin|$WORK/path|g" "$ROOT/scripts/install.sh" > "$WORK/install.sh"
-LIGHTER_VERSION=0.4.2 LIGHTER_TARBALL_URL="file://$NEW" LIGHTER_BOOTSTRAP_URL="file://$BOOTSTRAP" GITHUB_TOKEN= bash "$WORK/install.sh" --restart > "$WORK/install.log" 2>&1
+LIGHTER_VERSION="$VERSION" LIGHTER_TARBALL_URL="file://$NEW" LIGHTER_BOOTSTRAP_URL="file://$BOOTSTRAP" GITHUB_TOKEN= bash "$WORK/install.sh" --restart > "$WORK/install.log" 2>&1
 "$L" status
 "$L" doctor
 [ "$("${D[@]}" run --rm --platform linux/amd64 alpine:3.21 uname -m)" = x86_64 ]
 [ "$("${D[@]}" run --rm -v migration-data:/data alpine:3.21 cat /data/value)" = preserved ]
 [ "$("${D[@]}" inspect -f '{{.State.Running}}' migration-container)" = true ]
 cmp "$WORK/config-before.json" "$PREFIX/config.json"
-[ "$(readlink "$PREFIX/current")" = releases/0.4.2 ]
+[ "$(readlink "$PREFIX/current")" = "releases/$VERSION" ]
 [ ! -e "$PREFIX/upgrade.json" ]
-python3 - "$PREFIX" <<'PY'
+python3 - "$PREFIX" "$VERSION" <<'PY'
 import pathlib,json,sys
 root=pathlib.Path(sys.argv[1])
 identity=json.loads((root/'machine.identity').read_text())
-assert identity['release_version']=='0.4.2', identity
+assert identity['release_version']==sys.argv[2], identity
 assert identity['kernel_version']=='6.18.49', identity
 assert json.loads((root/'share/lighter/installation.json').read_text())['method']=='script'
 assert any((root/'releases').glob('legacy-*'))
 PY
 "$L" stop
-echo 'release upgrade: real installer verified; 0.4.1 -> 0.4.2 preserved running container, named volume and configuration; explicit restart enforced'
+echo "release upgrade: real installer verified; 0.4.1 -> $VERSION preserved running container, named volume and configuration; explicit restart enforced"
