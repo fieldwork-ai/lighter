@@ -10,6 +10,9 @@ use std::process::ExitCode;
 use lighter_vmm::virtio::fs::Share;
 use lighter_vmm::{Machine, MachineConfig, StopReason};
 
+#[path = "support/fs_reset.rs"]
+mod fs_reset;
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -116,6 +119,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(root) = std::env::var_os("LIGHTER_TEST_FS_RESET") {
+        fs_reset::start(PathBuf::from(root), machine.filesystem_notifications());
+    }
     if config.network
         && let Err(e) = lighter_vmm::streams::start(machine.vsock())
     {

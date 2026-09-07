@@ -91,6 +91,8 @@ So the descriptor is treated as a cache of where the file lives, never as the fi
 
 **How long the guest may cache depends on whether it can be corrected.**
 
+Complete correction includes recovery when FSEvents loses individual paths or the notification queue fills. The guest negotiates a complete cache-reset feature: a dentry epoch withdraws cached names, a request-version barrier refreshes attributes and open-file data, and existing mappings are invalidated explicitly. Older kernels use conservative timeouts. A lost watch root keeps conservative timeouts until restart. [The event-loss investigation](filesystem-event-loss-2026-09-07.md) records the reproduction and hardware checks.
+
 If the notification channel is live, timeouts are seconds and staleness is however long FSEvents takes to notice. If it is not — an unpatched kernel, or one that declined the feature — they fall back to a hundred milliseconds and the share is merely slower. Nothing has to be configured, and there is no combination of guest and host that is fast and wrong. Host changes also include a previous server's: fseventsd delivers a killed VMM's final writes into the stream of the one that boots next on the same share, seconds late, and a withdrawn entry can land between a guest's `unlink`s and its `rmdir`. The guest then forgets the directory's inode and looks the name up again — so an inode whose names are still promises (a queued create, a queued removal) outlives the guest's memory of it, like a pending inode does, and the lookup finds it rather than a second inode that never heard of those promises.
 
 ## Memory goes back four ways

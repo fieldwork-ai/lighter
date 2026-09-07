@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -164,7 +164,9 @@ pub struct Policy {
     /// Whether the guest negotiated the notification queue *and* the watcher is
     /// running. Both are required: a channel with nothing to send on it is no
     /// better than no channel.
-    pushing: AtomicBool,
+    /// 0: conservative; 1: complete notifications; 2: watch root lost.
+    /// State 2 is permanent, including if negotiation races the root change.
+    pushing: AtomicU8,
     /// Keyed by host identity rather than by path, because the hot path already
     /// has `(dev, ino)` in hand and would otherwise need an `F_GETPATH` per
     /// lookup to ask this question.
@@ -187,7 +189,7 @@ impl Policy {
         Policy {
             polled,
             pushed,
-            pushing: AtomicBool::new(false),
+            pushing: AtomicU8::new(0),
             hot: RwLock::new(HashMap::new()),
             hot_count: AtomicUsize::new(0),
             writing: Mutex::new(()),
@@ -202,8 +204,13 @@ impl Policy {
 
     /// Records whether invalidations can now reach the guest.
     pub fn set_pushing(&self, pushing: bool) {
-        let was = self.pushing.swap(pushing, Ordering::Release);
-        if was != pushing {
+        let next = u8::from(pushing);
+        let previous = self
+            .pushing
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state != 2).then_some(next)
+            });
+        if previous.is_ok_and(|was| was != next) {
             tracing::info!(
                 invalidation = if pushing { "push" } else { "timeout only" },
                 attr_ms = self.timings().attr.as_millis(),
@@ -213,8 +220,13 @@ impl Policy {
         }
     }
 
+    fn lose_watch(&self) {
+        self.pushing.store(2, Ordering::Release);
+        tracing::warn!("filesystem watch root changed; caching conservatively until restart");
+    }
+
     pub fn timings(&self) -> &Timings {
-        if self.pushing.load(Ordering::Acquire) {
+        if self.pushing.load(Ordering::Acquire) == 1 {
             &self.pushed
         } else {
             &self.polled
@@ -313,6 +325,13 @@ impl Invalidator {
 }
 
 impl crate::fsevents::Observer for Invalidator {
+    fn rescan(&self, _path: &Path, root_changed: bool) {
+        if root_changed {
+            self.policy.lose_watch();
+        }
+        self.sink.push(crate::notify::Notification::Reset);
+    }
+
     fn changed(&self, path: &Path) {
         // The object itself may already be gone — a delete is exactly what the
         // guest most needs to stop caching — so the parent is handled whether
@@ -347,6 +366,19 @@ impl crate::fsevents::Observer for Invalidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lost_watch_cannot_be_reenabled_by_late_feature_negotiation() {
+        let p = Policy::new(Timings::POLLED, Timings::PUSHED);
+        p.set_pushing(true);
+        assert_eq!(p.timings().attr, Timings::PUSHED.attr);
+        p.lose_watch();
+        p.set_pushing(true);
+        assert_eq!(p.timings().attr, Timings::POLLED.attr);
+        p.set_pushing(false);
+        p.set_pushing(true);
+        assert_eq!(p.timings().attr, Timings::POLLED.attr);
+    }
 
     fn policy(cooldown_ms: u64) -> Policy {
         Policy::fixed(Timings {

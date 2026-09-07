@@ -97,6 +97,8 @@ fn is_request_queue(index: u16) -> bool {
 /// virtio-fs driver (`guest/kernel/patches/`), and it is what lets the server
 /// hand out cache lifetimes measured in seconds instead of milliseconds.
 const VIRTIO_FS_F_NOTIFICATION: u64 = 1 << 0;
+/// Global invalidation also refreshes attributes and open-file contents.
+const VIRTIO_FS_F_CACHE_RESET: u64 = 1 << 1;
 
 /// Longest mount tag the config space can hold.
 pub const TAG_LEN: usize = 36;
@@ -481,6 +483,7 @@ pub struct Fs {
     memory: Option<Arc<GuestMemory>>,
     /// Whether the guest negotiated the notification queue.
     notifications: bool,
+    cache_reset: bool,
     /// When a request may be served on the vCPU thread rather than handed to a
     /// worker.
     inline: Inline,
@@ -508,6 +511,7 @@ impl Fs {
             pool: None,
             memory: None,
             notifications: false,
+            cache_reset: false,
             inline: Inline::from_env(),
             waker: Arc::new(Mutex::new(None)),
         })
@@ -638,7 +642,7 @@ impl VirtioDevice for Fs {
     }
 
     fn features(&self) -> u64 {
-        COMMON_FEATURES | VIRTIO_FS_F_NOTIFICATION
+        COMMON_FEATURES | VIRTIO_FS_F_NOTIFICATION | VIRTIO_FS_F_CACHE_RESET
     }
 
     fn ack_features(&mut self, features: u64) {
@@ -647,6 +651,7 @@ impl VirtioDevice for Fs {
         // with a partial answer at least once; the set is only final at
         // DRIVER_OK, which is where the decision is made.
         self.notifications = features & VIRTIO_FS_F_NOTIFICATION != 0;
+        self.cache_reset = features & VIRTIO_FS_F_CACHE_RESET != 0;
     }
 
     fn queue_count(&self) -> usize {
@@ -675,11 +680,12 @@ impl VirtioDevice for Fs {
         self.memory = Some(mem.clone());
         // What the guest accepted decides how long the server will let it cache
         // anything, because a lifetime we cannot withdraw has to be short.
-        self.server.set_push_invalidation(self.notifications);
-        if !self.notifications {
+        self.server
+            .set_push_invalidation(self.notifications && self.cache_reset);
+        if !self.notifications || !self.cache_reset {
             tracing::info!(
                 tag = %self.tag,
-                "guest declined the notification queue; caching conservatively"
+                "guest lacks complete cache invalidation; caching conservatively"
             );
         }
         // A histogram on an interval, when asked for. Tuning a filesystem
