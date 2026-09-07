@@ -52,6 +52,9 @@ def main():
         BENCH_DISK_GIB="128",
         LIGHTER_BENCH_KEEP_OUTPUT="1",
         LIGHTER_BENCH_SOURCE_SHA=a.runtime_source,
+        BENCH_TOOLS_PATH=str(ROOT / ".logs/050/tools/native/bin"),
+        BENCH_REQUIRE_PINNED_TOOLS="1",
+        LIGHTER_BENCH_IMAGE_DIR=str(ROOT / ".logs/050/benchmark-images"),
     )
     for name in [
         "LIGHTER_HOME",
@@ -218,6 +221,9 @@ def main():
             "guest/out/rootfs.ext4",
             "target/release/examples/lighter-bench",
             "target/release/lighter",
+            ".logs/050/benchmark-images/arm64.tar",
+            ".logs/050/benchmark-images/amd64.tar",
+            ".logs/050/benchmark-images/manifest.json",
         ]:
             expected_artifacts[str(ROOT / name)] = digest(ROOT / name)
         (out / "environment.json").write_text(
@@ -238,6 +244,10 @@ def main():
                     quiet="six samples 10s apart, aggregate machine CPU <=5%; cap 15m",
                     repetitions=3,
                     attempt=a.attempt,
+                    tools=json.loads((ROOT / "benchmarks/toolchain.json").read_text()),
+                    benchmark_images=json.loads(
+                        (ROOT / ".logs/050/benchmark-images/manifest.json").read_text()
+                    ),
                 ),
                 indent=2,
             )

@@ -92,6 +92,19 @@ while [ $# -gt 0 ]; do
 	esac
 done
 [ -n "$TARGET" ] || { echo "--target is required (native|lighter|colima|orbstack|docker-desktop)" >&2; exit 2; }
+if [ -n "${BENCH_TOOLS_PATH:-}" ]; then
+	export PATH="$BENCH_TOOLS_PATH:$PATH"
+fi
+if [ "${BENCH_REQUIRE_PINNED_TOOLS:-0}" = 1 ]; then
+	python3 - "$ROOT/benchmarks/toolchain.json" <<'PYTOOLS'
+import json, pathlib, subprocess, sys
+expected = json.loads(pathlib.Path(sys.argv[1]).read_text())
+for tool in ['node', 'npm', 'pnpm', 'yarn']:
+    actual = subprocess.check_output([tool, '--version'], text=True).strip()
+    if actual != expected[tool]:
+        raise SystemExit(f'{tool}: expected {expected[tool]}, got {actual}; run scripts/records/prepare-benchmark-tools.sh')
+PYTOOLS
+fi
 
 FOOTPRINT_BIN="$ROOT/target/benchmarks/task-footprint"
 if [ "$TARGET" != native ]; then
@@ -329,6 +342,25 @@ docker_context() {
 	esac
 }
 
+prepare_benchmark_image() {
+	if [ -n "${LIGHTER_BENCH_IMAGE_DIR:-}" ]; then
+		python3 - "$LIGHTER_BENCH_IMAGE_DIR" "$ARCH" <<'PYIMAGE'
+import hashlib, json, pathlib, sys
+root, arch = pathlib.Path(sys.argv[1]), sys.argv[2]
+expected = json.loads((root/'manifest.json').read_text())[arch]['archive_sha256']
+with (root/f'{arch}.tar').open('rb') as source:
+    assert hashlib.file_digest(source, 'sha256').hexdigest() == expected
+PYIMAGE
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} load -i "$LIGHTER_BENCH_IMAGE_DIR/$ARCH.tar" >/dev/null
+		local expected actual
+		expected="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]]["image_id"])' "$LIGHTER_BENCH_IMAGE_DIR/manifest.json" "$ARCH")"
+		actual="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{.Id}}' "$IMAGE")"
+		[ "$actual" = "$expected" ] || { echo 'benchmark image identity mismatch' >&2; exit 1; }
+	else
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} build -q ${PLATFORM[@]+"${PLATFORM[@]}"} -t "$IMAGE" benchmarks >/dev/null
+	fi
+}
+
 setup_container() {
 	local ctx; ctx="$(docker_context)"
 	SHARE_MOUNT="$WORK"
@@ -337,7 +369,7 @@ setup_container() {
 	# The x86-64 build of the image under its own tag: a plain build would
 	# replace the native one, and the next native run would measure Rosetta.
 	[ "$ARCH" = arm64 ] || IMAGE="$IMAGE-$ARCH"
-	docker "${DOCKER_ARGS[@]}" build -q ${PLATFORM[@]+"${PLATFORM[@]}"} -t "$IMAGE" benchmarks >/dev/null
+	prepare_benchmark_image
 	# The package cache lives on the runtime's own storage, not on the share:
 	# putting it on the share would make every target's cache as slow as its
 	# file sharing, which is a second measurement smuggled into the first.
@@ -476,7 +508,7 @@ setup_lighter() {
 	export DOCKER_HOST="unix://$SOCKET"
 	DOCKER_ARGS=()
 	[ "$ARCH" = arm64 ] || IMAGE="$IMAGE-$ARCH"
-	docker build -q ${PLATFORM[@]+"${PLATFORM[@]}"} -t "$IMAGE" benchmarks >/dev/null
+	prepare_benchmark_image
 	for cache in npm pnpm yarn; do
 		docker volume create "lighter-bench-$cache-$TARGET$CACHE_SUFFIX" >/dev/null
 	done
@@ -537,6 +569,10 @@ echo "case,rep,ms" > "$RESULTS"
 	echo "commit=$(git rev-parse --short HEAD 2>/dev/null)$(git diff --quiet 2>/dev/null || echo -dirty)"
 	echo "date=$(date -u +%Y-%m-%dT%H:%MZ)"
 	echo "host=$(hostname -s)"
+	for tool in node npm pnpm yarn; do echo "host.$tool=$($tool --version 2>/dev/null | head -1)"; done
+	if [ "$TARGET" != native ]; then
+		echo "image_id=$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{.Id}}' "$IMAGE")"
+	fi
 	if [ "$TARGET" = lighter ]; then
 		echo "runtime_source=${LIGHTER_BENCH_SOURCE_SHA:-$(git rev-parse HEAD)}"
 		echo "cpus=${BENCH_CPUS:-8} memory_mib=$(bench_memory_mib) disk_gib=$(bench_disk_gib)"

@@ -56,6 +56,15 @@ own disk and hard-links out of it, which it cannot do across a device boundary
 
 ## How to measure, and what can be measured
 
+Release records use the versions in `toolchain.json` for both native and
+container workloads. Prepare the private native tools with
+`bash scripts/records/prepare-benchmark-tools.sh`, then set
+`BENCH_TOOLS_PATH="$PWD/.logs/050/tools/native/bin"` and
+`BENCH_REQUIRE_PINNED_TOOLS=1`. This preserves the Mac's globally installed tools.
+Controlled release runs also load identical prebuilt arm64/amd64 image archives
+through `LIGHTER_BENCH_IMAGE_DIR`; each archive hash and loaded image ID is
+verified, and the native tool versions and image ID accompany each CSV.
+
 Three instruments, and picking the wrong one is how an afternoon disappears.
 
 | | resolves | costs | use it for |
