@@ -139,7 +139,11 @@ def main():
                     args = sp.check_output(
                         ["ps", "-p", str(pid), "-o", "args="], text=True
                     )
-                    legitimate |= str(a.lima_instance.resolve()) in shlex.split(args)
+                    legitimate |= a.lima_instance.resolve() in {
+                        Path(argument).resolve()
+                        for argument in shlex.split(args)
+                        if argument.startswith("/")
+                    }
                 if (
                     kind == a.target == "lighter"
                     and str(Path(process["command"]).resolve()) in paths

@@ -52,6 +52,13 @@ done
 # did, stopping the machine the person at the keyboard was using.
 export LIGHTER_HOME="$(mktemp -d -t lighter-m8-home)"
 export DOCKER_HOST="unix://$LIGHTER_HOME/docker.sock"
+if [ -n "${LIGHTER_BENCH_OWNER_FILE:-}" ]; then
+	python3 - "$LIGHTER_BENCH_OWNER_FILE" "$LIGHTER_HOME/lighter.app/Contents/MacOS/lighter" <<'PYOWNER'
+import json, sys
+with open(sys.argv[1], 'a') as f:
+    f.write(json.dumps(sys.argv[2]) + '\n')
+PYOWNER
+fi
 
 cleanup() {
 	docker compose -f "$COMPOSE" down -v --timeout 10 >/dev/null 2>&1 || true
