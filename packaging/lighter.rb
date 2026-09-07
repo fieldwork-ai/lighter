@@ -4,16 +4,14 @@
 # will not take a formula that installs a binary needing a code-signing
 # entitlement, and it is the entitlement that makes this work at all.
 #
-# The install signs the binary ad-hoc with `com.apple.security.hypervisor`.
-# That is not a workaround — it is how Apple intends an unsigned local build to
-# get the entitlement, and the same thing `make sign` does in a checkout.
-# Without it every start fails with `HV_DENIED`, which says nothing about
-# signing.
+# Release binaries carry a notarized Developer ID signature and the hypervisor
+# entitlement. post_install verifies the signature and only signs ad hoc if it
+# is missing or invalid.
 class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
-  url "https://github.com/fieldwork-ai/lighter/releases/download/v0.4.0/lighter-0.4.0-arm64.tar.gz"
-  sha256 "a094d444a3a63a2e86881cf3bc759e06239d62fa3ad372356831c6a97d5f705b"
+  url "https://github.com/fieldwork-ai/lighter/releases/download/v0.4.1/lighter-0.4.1-arm64.tar.gz"
+  sha256 "799e48bccc412e3f1a4e1f7701417d3e7abc69886783192f48d8db0ce347a9b1"
   license any_of: ["MIT", "Apache-2.0"]
 
   # Apple Silicon only, and not by omission: there is no Intel path and there
