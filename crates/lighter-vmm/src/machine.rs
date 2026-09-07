@@ -150,6 +150,7 @@ pub struct Machine {
     /// The card's host side, if the machine has one.
     network: Option<Arc<Network>>,
     vsock: Arc<VsockShared>,
+    filesystem_notifications: Vec<Arc<lighter_fs::notify::Sink>>,
     /// Socket proxies, held because dropping one unlinks its socket.
     proxies: Vec<VsockProxy>,
     /// Held for the machine's lifetime: dropping it ends the subscription to
@@ -291,6 +292,10 @@ impl Machine {
             share_wakers.push((virtio.len(), fs.waker(), fs.notifications()));
             virtio.push(Box::new(fs));
         }
+        let filesystem_notifications = share_wakers
+            .iter()
+            .map(|(_, _, sink)| sink.clone())
+            .collect();
 
         virtio.push(Box::new(Rng::from_host()?));
         let balloon_slot = virtio.len();
@@ -697,6 +702,7 @@ impl Machine {
         crate::dump::install(virtio_devices.clone(), vsock_state.clone(), uart.clone());
 
         Ok(Machine {
+            filesystem_notifications,
             _vm: vm,
             ctx,
             threads,
@@ -732,6 +738,11 @@ impl Machine {
     /// The vsock state, for host-side listeners.
     pub fn vsock(&self) -> Arc<VsockShared> {
         self.vsock.clone()
+    }
+
+    /// Share invalidators, for cache resynchronization and coherence probes.
+    pub fn filesystem_notifications(&self) -> Vec<Arc<lighter_fs::notify::Sink>> {
+        self.filesystem_notifications.clone()
     }
 
     /// The Docker API's socket has one thing done to it that no other has:

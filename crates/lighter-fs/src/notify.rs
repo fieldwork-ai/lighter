@@ -34,20 +34,24 @@ use std::sync::{Arc, Mutex};
 mod code {
     pub const INVAL_INODE: i32 = 2;
     pub const INVAL_ENTRY: i32 = 3;
+    pub const INC_EPOCH: i32 = 8;
 }
 
 /// How many messages may wait for the guest to supply buffers.
 ///
 /// Generous, because a `git checkout` on the host produces a burst and the
 /// guest drains at its own pace — but bounded, because the producer is an
-/// event stream we do not control. Overflow costs coherence, which is why the
-/// timeout stays finite even when the channel is live: a message we had to drop
-/// self-heals when the entry expires.
+/// event stream we do not control. Overflow replaces the backlog with a global
+/// reset, so memory stays bounded without leaving cached data stale.
 const BACKLOG: usize = 16 * 1024;
 
 /// Something the guest should stop believing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notification {
+    /// Withdraw all cached names, attributes and contents after event loss.
+    /// The guest negotiates the stronger cache-reset interpretation of
+    /// FUSE_NOTIFY_INC_EPOCH separately from individual notifications.
+    Reset,
     /// A name in a directory: it may have appeared, vanished, or come to mean
     /// a different file.
     Entry { parent: u64, name: Vec<u8> },
@@ -65,6 +69,7 @@ impl Notification {
     pub fn encode(&self) -> Vec<u8> {
         let mut body = Vec::with_capacity(64);
         let code = match self {
+            Notification::Reset => code::INC_EPOCH,
             Notification::Entry { parent, name } => {
                 body.extend_from_slice(&parent.to_le_bytes());
                 body.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -102,6 +107,7 @@ impl Notification {
 /// and nowhere else.
 /// Invalidations pushed since start; diagnostics.
 pub static PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct Sink {
@@ -126,12 +132,22 @@ impl Sink {
         PUSHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut pending = self.pending.lock().expect("notify sink poisoned");
-            if pending.len() >= BACKLOG {
-                // The oldest goes, not the newest: a stale invalidation is
-                // worth less than a fresh one, and the guest's own timeout is
-                // the backstop for whichever is lost.
-                pending.pop_front();
-                *self.dropped.lock().expect("notify sink poisoned") += 1;
+            if notification == Notification::Reset || pending.len() >= BACKLOG {
+                let resets = RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if resets.is_power_of_two() {
+                    tracing::warn!(
+                        resets,
+                        backlog = pending.len(),
+                        "filesystem event detail lost; resetting guest caches"
+                    );
+                }
+                // A global reset subsumes every earlier invalidation. Never
+                // silently drop one and leave five minutes of stale data.
+                *self.dropped.lock().expect("notify sink poisoned") += pending.len() as u64;
+                pending.clear();
+                if notification != Notification::Reset {
+                    pending.push_back(Notification::Reset.encode());
+                }
             }
             pending.push_back(notification.encode());
         }
@@ -247,15 +263,34 @@ mod tests {
         for nodeid in 0..(BACKLOG as u64 + 500) {
             sink.push(Notification::Inode { nodeid });
         }
-        assert_eq!(sink.len(), BACKLOG);
-        assert_eq!(sink.dropped(), 500);
-        // The oldest went, so the newest is still there to be delivered.
+        assert_eq!(sink.len(), 501);
+        assert_eq!(sink.dropped(), BACKLOG as u64);
+        // The reset covers every older message; later changes still follow it.
         let front = sink.take().unwrap();
+        assert_eq!(front, Notification::Reset.encode());
+        for nodeid in BACKLOG as u64..BACKLOG as u64 + 500 {
+            assert_eq!(
+                sink.take().unwrap(),
+                Notification::Inode { nodeid }.encode()
+            );
+        }
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn a_reset_withdraws_earlier_messages_but_preserves_later_changes() {
+        let sink = Sink::new();
+        sink.push(Notification::Inode { nodeid: 1 });
+        sink.push(Notification::Reset);
+        sink.push(Notification::Inode { nodeid: 2 });
+        let reset = sink.take().unwrap();
+        assert_eq!(reset.len(), 16);
+        assert_eq!(i32::from_le_bytes(reset[4..8].try_into().unwrap()), 8);
         assert_eq!(
-            u64::from_le_bytes(front[16..24].try_into().unwrap()),
-            500,
-            "the oldest messages should be the ones dropped"
+            sink.take().unwrap(),
+            Notification::Inode { nodeid: 2 }.encode()
         );
+        assert!(sink.is_empty());
     }
 
     #[test]

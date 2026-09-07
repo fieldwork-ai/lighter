@@ -109,6 +109,8 @@ unsafe extern "C" {
 /// What a watcher does with each changed path.
 pub trait Observer: Send + Sync {
     fn changed(&self, path: &Path);
+    /// Individual paths are no longer a complete account of the changes.
+    fn rescan(&self, path: &Path, root_changed: bool);
 }
 
 /// A running FSEvents stream.
@@ -133,7 +135,7 @@ extern "C" fn on_events(
     info: *mut c_void,
     num_events: usize,
     event_paths: *mut c_void,
-    _event_flags: *const u32,
+    event_flags: *const u32,
     _event_ids: *const u64,
 ) {
     if info.is_null() || num_events == 0 {
@@ -148,6 +150,13 @@ extern "C" fn on_events(
     // With kFSEventStreamCreateFlagUseCFTypes unset, the paths arrive as a
     // plain C array of C strings, which is simpler to walk than a CFArray.
     let paths = event_paths as *const *const i8;
+    // A root change anywhere in this batch means the original watch path may
+    // no longer cover the share, even if a dropped-events flag came first.
+    // SAFETY: FSEvents supplies one flag word per event.
+    let root_changed = unsafe { std::slice::from_raw_parts(event_flags, num_events) }
+        .iter()
+        .any(|flags| flags & 0x20 != 0);
+    let mut rescanned = false;
     for index in 0..num_events {
         // SAFETY: FSEvents guarantees `num_events` valid entries.
         let raw = unsafe { *paths.add(index) };
@@ -158,6 +167,16 @@ extern "C" fn on_events(
         // the duration of this callback.
         let bytes = unsafe { std::ffi::CStr::from_ptr(raw) }.to_bytes();
         let path = Path::new(std::str::from_utf8(bytes).unwrap_or(""));
+        // MustScanSubDirs, UserDropped, KernelDropped, EventIdsWrapped and
+        // RootChanged all invalidate the assumption that every changed file
+        // has its own event. A directory notification alone cannot withdraw
+        // the cached contents or negative dentries below it.
+        // SAFETY: FSEvents supplies one flag word per event.
+        let flags = unsafe { *event_flags.add(index) };
+        if flags & 0x2f != 0 && !rescanned {
+            observer.rescan(path, root_changed);
+            rescanned = true;
+        }
         observer.changed(path);
     }
 }
@@ -314,9 +333,52 @@ mod tests {
 
     struct Collector(Arc<Mutex<Vec<std::path::PathBuf>>>);
 
+    #[test]
+    fn lost_event_detail_requests_one_rescan_per_callback() {
+        struct Events(Arc<Mutex<Vec<&'static str>>>);
+        impl Observer for Events {
+            fn changed(&self, _: &Path) {
+                self.0.lock().unwrap().push("changed");
+            }
+            fn rescan(&self, _: &Path, root_changed: bool) {
+                self.0.lock().unwrap().push(if root_changed {
+                    "root-changed"
+                } else {
+                    "rescan"
+                });
+            }
+        }
+        for flag in [1, 2, 4, 8, 32, 0x1000, 0x10] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let observer: Box<dyn Observer> = Box::new(Events(seen.clone()));
+            let path = c"/test/share";
+            let mut paths = [path.as_ptr(), path.as_ptr()];
+            let flags = [flag, flag];
+            on_events(
+                std::ptr::null_mut(),
+                &observer as *const Box<dyn Observer> as *mut c_void,
+                paths.len(),
+                paths.as_mut_ptr().cast(),
+                flags.as_ptr(),
+                std::ptr::null(),
+            );
+            let expected = if flag == 32 {
+                vec!["root-changed", "changed", "changed"]
+            } else if flag & 0x2f != 0 {
+                vec!["rescan", "changed", "changed"]
+            } else {
+                vec!["changed", "changed"]
+            };
+            assert_eq!(*seen.lock().unwrap(), expected, "flags={flag}");
+        }
+    }
+
     impl Observer for Collector {
         fn changed(&self, path: &Path) {
             self.0.lock().unwrap().push(path.to_path_buf());
+        }
+        fn rescan(&self, path: &Path, _root_changed: bool) {
+            self.changed(path);
         }
     }
 

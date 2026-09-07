@@ -330,6 +330,13 @@ else
 fi
 
 # ------------------------------------------------------------------- checks --
+echo "==> Recovering from lost filesystem notifications"
+if python3 scripts/test-fs-reset.py --bin "$BIN" --kernel "$KERNEL"; then
+	pass "cache reset and queue overflow refresh names, open files and mappings"
+else
+	fail "cache-loss recovery failed; see .logs/fs-reset"
+fi
+
 for signature in "Kernel panic" "Internal error: Oops" "Unable to handle kernel"; do
 	if grep -qF "$signature" "$LOG"; then
 		fail "guest reported: $signature"

@@ -1116,6 +1116,17 @@ for name in $CASES; do
 	if [ "$case_status" -ne 0 ] || [ "$rep" -ne "$REPS" ] \
 		|| grep -q '^TIME_MS TIMEOUT ' "$CASE_OUT"; then
 		FAILED=1
+		if [ "$name" = watch-latency ]; then
+			mkdir -p .logs
+			{
+				if kill -0 "$HELPER_PID" 2>/dev/null; then echo "helper=alive"; else echo "helper=exited"; fi
+				printf 'host_request='; head -c 128 "$WORK/request" 2>/dev/null || true; echo
+				printf 'host_reply='; head -c 128 "$WORK/reply" 2>/dev/null || true; echo
+			} > ".logs/case-$LABEL-watch-latency-state.txt"
+			if [ -f "${BOOT_LOG:-}" ]; then
+				cp "$BOOT_LOG" ".logs/case-$LABEL-watch-latency-boot.log"
+			fi
+		fi
 		printf '\n    FAILED: %s produced %s/%s measurements (exit %s)\n' "$name" "$rep" "$REPS" "$case_status"
 		head -20 "$CASE_OUT" | sed 's/^/      /'
 		[ "$(wc -l < "$CASE_OUT")" -le 20 ] || tail -20 "$CASE_OUT" | sed 's/^/      /'

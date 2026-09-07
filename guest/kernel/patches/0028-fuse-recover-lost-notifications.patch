@@ -1,0 +1,215 @@
+virtio-fs: recover complete cache coherence after lost notifications
+
+FSEvents can replace individual paths with MustScanSubDirs/UserDropped.
+An inode-only invalidation of that directory leaves descendants cached for
+minutes. A bounded host notification queue can lose the same information.
+
+Negotiate complete cache reset separately from individual notifications.
+Use INC_EPOCH for all positive/negative dentries, and a request-version
+barrier for attributes and file contents, including open descriptors.
+Replies that started before the reset remain expired. Invalidate mapped
+pages immediately because userspace loads bypass revalidation. Ordinary
+reads drop cached pages on refresh even if size and mtime stayed the same.
+The host falls back to short timeouts with older guest kernels.
+
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -139,6 +139,9 @@
+ 
+ 	/** Version of last attribute change */
+ 	u64 attr_version;
++
++	/** Attribute-request version last used to refresh the page cache. */
++	u64 cache_version;
+ 
+ 	union {
+ 		/* read/write io cache (regular file only) */
+@@ -953,6 +956,9 @@
+ 	/** Version counter for attribute changes */
+ 	atomic64_t attr_version;
+ 
++	/** Requests older than this must refresh after a global cache reset. */
++	atomic64_t cache_reset_version;
++
+ 	/** Version counter for evict inode */
+ 	atomic64_t evict_ctr;
+ 
+@@ -1087,6 +1093,15 @@
+ {
+ 	return atomic64_read(&fc->attr_version);
+ }
++
++static inline bool fuse_cache_expired(struct inode *inode)
++{
++	return READ_ONCE(get_fuse_inode(inode)->cache_version) <
++		atomic64_read(&get_fuse_conn(inode)->cache_reset_version);
++}
++
++/* Called with fc->killsb held, like the individual reverse invalidations. */
++void fuse_reverse_inval_all(struct fuse_conn *fc);
+ 
+ static inline u64 fuse_get_evict_ctr(struct fuse_conn *fc)
+ {
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/dax.h>
+ #include <linux/pagemap.h>
++#include <linux/iversion.h>
+ #include <linux/slab.h>
+ #include <linux/file.h>
+ #include <linux/seq_file.h>
+@@ -342,6 +343,7 @@
+ 	u32 cache_mask;
+ 	loff_t oldsize;
+ 	struct timespec64 old_mtime;
++	bool reset;
+ 
+ 	spin_lock(&fi->lock);
+ 	/*
+@@ -368,6 +370,10 @@
+ 		return;
+ 	}
+ 
++	reset = fuse_cache_expired(inode);
++	/* Keep the request's starting version, not the response-time version.
++	 * A response racing a reset must remain expired on the next access. */
++	fi->cache_version = attr_version;
+ 	old_mtime = inode_get_mtime(inode);
+ 	fuse_change_attributes_common(inode, attr, sx, attr_valid, cache_mask,
+ 				      evict_ctr);
+@@ -382,8 +388,11 @@
+ 		i_size_write(inode, attr->size);
+ 	spin_unlock(&fi->lock);
+ 
++	if (reset && S_ISDIR(inode->i_mode))
++		inode_inc_iversion(inode);
++
+ 	if (!cache_mask && S_ISREG(inode->i_mode)) {
+-		bool inval = false;
++		bool inval = reset;
+ 
+ 		if (oldsize != attr->size) {
+ 			truncate_pagecache(inode, attr->size);
+@@ -591,6 +600,54 @@
+ 	}
+ 	iput(inode);
+ 	return 0;
++}
++
++/* Withdraw all dentries and cached attributes without scanning host paths.
++ * Open files revalidate on their next read. Existing mmaps need their PTEs
++ * invalidated now, since userspace loads otherwise bypass FUSE entirely.
++ * The pinned-inode traversal follows fs/drop_caches.c: hold the current
++ * inode while dropping s_inode_list_lock, and release the previous pin only
++ * after acquiring the next one. No allocation proportional to the cache.
++ */
++void fuse_reverse_inval_all(struct fuse_conn *fc)
++{
++	struct fuse_mount *fm;
++
++	lockdep_assert_held(&fc->killsb);
++	atomic64_set(&fc->cache_reset_version,
++		    atomic64_inc_return(&fc->attr_version));
++	atomic_inc(&fc->epoch);
++	list_for_each_entry(fm, &fc->mounts, fc_entry) {
++		struct super_block *sb = fm->sb;
++		struct inode *inode, *toput = NULL;
++
++		if (!sb)
++			continue;
++		spin_lock(&sb->s_inode_list_lock);
++		list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
++			spin_lock(&inode->i_lock);
++			if ((inode->i_state & (I_FREEING | I_WILL_FREE | I_NEW)) ||
++			    (!mapping_mapped(inode->i_mapping) && !need_resched())) {
++				spin_unlock(&inode->i_lock);
++				continue;
++			}
++			__iget(inode);
++			spin_unlock(&inode->i_lock);
++			spin_unlock(&sb->s_inode_list_lock);
++			if (mapping_mapped(inode->i_mapping)) {
++				/* Refresh size too: an existing mmap of a host-truncated
++				 * file must fault with SIGBUS, not serve zero-filled pages. */
++				fuse_update_attributes(inode, NULL, STATX_BASIC_STATS);
++				invalidate_inode_pages2(inode->i_mapping);
++			}
++			iput(toput);
++			toput = inode;
++			cond_resched();
++			spin_lock(&sb->s_inode_list_lock);
++		}
++		spin_unlock(&sb->s_inode_list_lock);
++		iput(toput);
++	}
+ }
+ 
+ void fuse_try_prune_one_inode(struct fuse_conn *fc, u64 nodeid)
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1446,7 +1446,8 @@
+ 	else if (request_mask & inval_mask & ~cache_mask)
+ 		sync = true;
+ 	else
+-		sync = time_before64(fi->i_time, get_jiffies_64());
++		sync = (time_before64(fi->i_time, get_jiffies_64()) ||
++		     fuse_cache_expired(inode));
+ 
+ 	if (sync) {
+ 		forget_all_cached_acls(inode);
+@@ -1667,7 +1668,8 @@
+ 		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
+ 
+ 		if (perm_mask & READ_ONCE(fi->inval_mask) ||
+-		    time_before64(fi->i_time, get_jiffies_64())) {
++		    (time_before64(fi->i_time, get_jiffies_64()) ||
++		     fuse_cache_expired(inode))) {
+ 			refreshed = true;
+ 
+ 			err = fuse_perm_getattr(inode, mask);
+@@ -2235,7 +2237,8 @@
+ 		allowed |= ATTR_MTIME;
+ 	if (ia_valid & ~allowed)
+ 		return false;
+-	if (time_before64(fi->i_time, get_jiffies_64()))
++	if ((time_before64(fi->i_time, get_jiffies_64()) ||
++		     fuse_cache_expired(inode)))
+ 		return false;
+ 	if ((ia_valid & ATTR_MODE) && attr->ia_mode != inode->i_mode)
+ 		return false;
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -51,6 +51,8 @@
+ 
+ /* The device can push FUSE notifications to the driver. */
+ #define VIRTIO_FS_F_NOTIFICATION 0
++/* INC_EPOCH also withdraws attributes and open-file / mmap contents. */
++#define VIRTIO_FS_F_CACHE_RESET 1
+ 
+ /*
+  * How long a task will spin for its own reply before going to sleep.
+@@ -985,6 +987,10 @@
+ 	plen = oh.len - sizeof(oh);
+ 
+ 	switch (oh.error) {
++	case FUSE_NOTIFY_INC_EPOCH:
++		if (plen == 0)
++			fuse_reverse_inval_all(fc);
++		break;
+ 	case FUSE_NOTIFY_INVAL_INODE: {
+ 		struct fuse_notify_inval_inode_out out;
+ 
+@@ -1448,6 +1454,7 @@
+ 
+ static const unsigned int feature_table[] = {
+ 	VIRTIO_FS_F_NOTIFICATION,
++	VIRTIO_FS_F_CACHE_RESET,
+ };
+ 
+ static struct virtio_driver virtio_fs_driver = {
