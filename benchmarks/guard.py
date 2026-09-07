@@ -101,6 +101,7 @@ def main():
 
         def sample(phase):
             table = processes()
+            allowed.intersection_update(table)
             paths = {
                 str(Path(json.loads(line)).resolve())
                 for line in owner_path.read_text().splitlines()

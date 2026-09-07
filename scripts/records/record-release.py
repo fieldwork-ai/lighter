@@ -80,6 +80,8 @@ def main():
 
     def run(label, cases, options=(), extra=None, target="lighter"):
         frozen()
+        if monitor is not None and monitor.poll() is not None:
+            raise RuntimeError("host observer exited before " + label)
         phase.write_text(label + "\n")
         result = ROOT / "benchmarks/results" / f"{label}.csv"
         if result.exists():
@@ -113,6 +115,8 @@ def main():
         (ROOT / "benchmarks/RESULTS.md").write_bytes(report)
         if p.returncode:
             raise RuntimeError("invalid or failed stage " + label)
+        if monitor is not None and monitor.poll() is not None:
+            raise RuntimeError("host observer exited during " + label)
         rows = list(csv.DictReader(result.open()))
         counts = Counter(row["case"] for row in rows)
         for case in cases.split():
@@ -162,6 +166,19 @@ def main():
         frozen()
         # Build once before quiet-host checks; no runtime source mutation after here.
         with (out / "build.log").open("w") as log:
+            (ROOT / "target/benchmarks").mkdir(parents=True, exist_ok=True)
+            sp.run(
+                [
+                    "cc",
+                    "-O2",
+                    "benchmarks/task-footprint.c",
+                    "-o",
+                    "target/benchmarks/task-footprint",
+                ],
+                stdout=log,
+                stderr=sp.STDOUT,
+                check=True,
+            )
             sp.run(
                 [
                     "cargo",
