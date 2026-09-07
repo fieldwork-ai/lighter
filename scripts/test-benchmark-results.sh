@@ -4,7 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d -t lighter-bench-test)"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/benchmarks/cases" "$WORK/benchmarks/fixtures/npm" "$WORK/home"
+mkdir -p "$WORK/benchmarks/cases" "$WORK/benchmarks/fixtures/npm" "$WORK/home" "$WORK/bin"
+# These synthetic JavaScript cases test result handling, not file searching.
+# Satisfy the native target's tool check without depending on a host ripgrep
+# installation; fail if a fixture unexpectedly tries to execute it.
+printf '#!/bin/sh\necho "unexpected ripgrep invocation in synthetic case" >&2\nexit 99\n' > "$WORK/bin/rg"
+chmod +x "$WORK/bin/rg"
 cp "$ROOT/benchmarks/run.sh" "$WORK/benchmarks/run.sh"
 for file in package.json package-lock.json pnpm-lock.yaml yarn.lock; do
 	: > "$WORK/benchmarks/fixtures/npm/$file"
@@ -26,7 +31,7 @@ console.log('TIME_MS 10\nTIME_MS TIMEOUT 1s\nTIME_MS 30');
 JS
 for name in complete partial failed timedout; do
 	rc=0
-	HOME="$WORK/home" LIGHTER_BENCH_WORK="$WORK/run" bash "$WORK/benchmarks/run.sh" \
+	PATH="$WORK/bin:$PATH" HOME="$WORK/home" LIGHTER_BENCH_WORK="$WORK/run" bash "$WORK/benchmarks/run.sh" \
 		--target native --allow-noisy --label "$name" --cases "$name" --reps 3 > "$WORK/$name.log" 2>&1 || rc=$?
 	if [ "$name" = complete ]; then
 		[ "$rc" -eq 0 ] || { cat "$WORK/$name.log"; exit 1; }
