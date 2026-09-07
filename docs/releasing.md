@@ -5,6 +5,7 @@ A release is a signed, notarized tarball on GitHub, a Homebrew formula that poin
 ## Before
 
 - The full gate set green on the exact head you will ship: `scripts/gates/run-all.sh` (m1–m8). On a machine where a daily driver runs beside it, `LIGHTER_BENCH_ALLOW_NOISY=1` lets m5 measure; its numbers are not the record then, only the pass. The gates write their measurements to `benchmarks/results/gate-*.csv`, which git ignores; check `git status` under `benchmarks/results/` before the release commit all the same.
+- Set `ulimit -S -n 10240` in the qualification shell before testing. Concurrent filesystem tests construct tables directly, while production raises the descriptor limit when starting the server; a fresh macOS shell at 256 descriptors cannot run this test workload. CI uses the same preparation.
 - The CI commands themselves, verbatim, not the local habit: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`. 0.2.0's `dev` was red on five clippy warnings a local run had tolerated.
 - The daily driver up on the same build for a working day (`make install` or the tarball), because the gates do not cover a Mac that sleeps and wakes, a VPN that changes the resolver, or a week of images.
 - The README's numbers regenerated from the record CSVs, never typed: `python3 benchmarks/readme.py --write`. The record is a quiet machine; the M1's comes from `scripts/provision-bench-host.sh`'s host and a runner like `~/remote-record3.sh` there.

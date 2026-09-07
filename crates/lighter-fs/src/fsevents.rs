@@ -340,6 +340,29 @@ mod tests {
         false
     }
 
+    // Stream startup is asynchronous. Prove that a control event is being
+    // delivered before testing a later change; a fixed sleep can lose the
+    // only control write before the stream is ready on a loaded host.
+    fn wait_until_ready(root: &Path, seen: &Arc<Mutex<Vec<std::path::PathBuf>>>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                std::process::Command::new("/usr/bin/touch")
+                    .arg(root.join("ready"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            if wait_for(seen, "ready", Duration::from_millis(100)) {
+                return;
+            }
+        }
+        panic!(
+            "FSEvents did not become ready; observed {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
     /// The claim the whole caching policy rests on: a change made on the host,
     /// by something that is not us, is reported quickly enough to be useful as
     /// an invalidation signal.
@@ -354,10 +377,7 @@ mod tests {
         )
         .expect("FSEvents should start on any Mac");
 
-        // The stream is asynchronous: a write issued before it is genuinely
-        // running is not reported, and that is a race the test would lose on a
-        // loaded machine rather than a wrong one.
-        std::thread::sleep(Duration::from_millis(300));
+        wait_until_ready(&root, &seen);
         // Another process, because our own writes are deliberately invisible.
         assert!(
             std::process::Command::new("/usr/bin/touch")
@@ -421,7 +441,7 @@ mod tests {
         )
         .expect("FSEvents should start on any Mac");
 
-        std::thread::sleep(Duration::from_millis(300));
+        wait_until_ready(&root, &seen);
         for index in 0..50 {
             std::fs::write(root.join(format!("ours-{index}")), b"x").unwrap();
         }
