@@ -15,7 +15,9 @@
 //! macOS's three pressure levels set a minimum target. A periodic sample of
 //! compression activity provides gentler steering before those levels rise.
 //! Both targets follow the guest's currently plugged memory, not just the
-//! size it had when the last pressure notification arrived.
+//! size it had when the last pressure notification arrived. Guest demand vetoes
+//! compression-only steering so it cannot compete with deflate-on-OOM; actual
+//! macOS pressure retains its floor.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -109,7 +111,8 @@ impl MemoryPolicy {
             last_line: Mutex::new((0, false)),
             level: AtomicU32::new(Pressure::Normal as u32),
             level_pages: AtomicU32::new(0),
-            steer_pages: AtomicU32::new(0),
+            compression: Mutex::new(CompressionState::default()),
+            apply_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
         });
         memory_guest(vsock, steering.clone())?;
@@ -122,8 +125,10 @@ impl MemoryPolicy {
             .and_then(|v| v.parse::<u64>().ok())
         {
             steering
-                .steer_pages
-                .store(((mib << 20) / BALLOON_PAGE_SIZE) as u32, Ordering::Relaxed);
+                .compression
+                .lock()
+                .expect("compression policy poisoned")
+                .pages = ((mib << 20) / BALLOON_PAGE_SIZE) as u32;
             steering.apply();
         }
         if steering_enabled() {
@@ -153,7 +158,7 @@ impl MemoryPolicy {
                                 compressed >> 20,
                                 steering.balloon.reported_bytes() >> 20,
                                 steering.balloon.offered_bytes() >> 20,
-                                (steering.steer_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20,
+                                (steering.compression.lock().expect("compression policy poisoned").pages as u64 * BALLOON_PAGE_SIZE) >> 20,
                                 (steering.level_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20
                             );
                         }
@@ -224,6 +229,12 @@ fn steering_enabled() -> bool {
         .is_none_or(|v| v != "0")
 }
 
+#[derive(Default)]
+struct CompressionState {
+    pages: u32,
+    guest_needs_memory: bool,
+}
+
 struct Steering {
     balloon: Arc<BalloonState>,
     transport: Arc<Mutex<VirtioMmio>>,
@@ -241,7 +252,11 @@ struct Steering {
     /// What the pressure level asks for, what the compressor asks for, and
     /// what the guest itself offers: the balloon's target is the largest.
     level_pages: AtomicU32,
-    steer_pages: AtomicU32,
+    // Keep the heuristic target and its guest-pressure veto together: a
+    // compression poll must not restore a target withdrawn concurrently.
+    compression: Mutex<CompressionState>,
+    // Publish targets in the same order they are computed from current state.
+    apply_lock: Mutex<()>,
     guest_pages: AtomicU32,
 }
 
@@ -304,14 +319,45 @@ impl Steering {
     }
 
     fn steer(&self, compressed: u64, quiet_for: u32) {
-        let before = self.steer_pages.load(Ordering::Relaxed);
-        let after = steer(before, compressed, quiet_for, self.total_bytes());
-        if after != before {
-            self.steer_pages.store(after, Ordering::Relaxed);
+        {
+            let mut state = self
+                .compression
+                .lock()
+                .expect("compression policy poisoned");
+            state.pages = if state.guest_needs_memory {
+                0
+            } else {
+                steer(state.pages, compressed, quiet_for, self.total_bytes())
+            };
         }
-        // A range resize also changes the pressure-level floor, even if
-        // the host remains at the same pressure level and steering is held.
+        // A resize still changes the explicit host-pressure floor.
         self.apply();
+    }
+
+    /// Compression alone is a heuristic, not an instruction to take memory
+    /// from a guest already trying to reclaim or return its balloon. Otherwise
+    /// deflate-on-OOM and renewed inflation can keep recycling the same pages
+    /// while an oversized build makes little progress. Real host pressure
+    /// retains its separate floor.
+    fn guest_demand(&self, needs_memory: bool) {
+        let changed = {
+            let mut state = self
+                .compression
+                .lock()
+                .expect("compression policy poisoned");
+            let changed = state.guest_needs_memory != needs_memory;
+            if changed {
+                state.guest_needs_memory = needs_memory;
+                // Recovery starts a fresh ramp; never restore a pre-pressure
+                // target just because the guest has become healthy again.
+                state.pages = 0;
+            }
+            changed
+        };
+        if changed {
+            tracing::debug!(needs_memory, "guest demand updated compression steering");
+            self.apply();
+        }
     }
 
     /// The guest says it can spare `spare_mib` beyond what the balloon
@@ -387,10 +433,19 @@ impl Steering {
     }
 
     fn apply(&self) {
+        let _apply = self
+            .apply_lock
+            .lock()
+            .expect("memory policy apply poisoned");
         let level_pages = pressure_pages(self.level.load(Ordering::Relaxed), self.total_bytes());
         self.level_pages.store(level_pages, Ordering::Relaxed);
         let pages = level_pages
-            .max(self.steer_pages.load(Ordering::Relaxed))
+            .max(
+                self.compression
+                    .lock()
+                    .expect("compression policy poisoned")
+                    .pages,
+            )
             .max(self.guest_pages.load(Ordering::Relaxed));
         let before = self.balloon.target_pages();
         if pages == before {
@@ -455,6 +510,7 @@ fn memory_guest(
                     // do not migrate (guest patch 0014), and one inflated
                     // into a movable block pins that block in for good — m6
                     // read 128 MiB stuck and the driver retrying at 2.5% CPU.
+                    steering.guest_demand(release || need);
                     let taken = steering.guest_sizes(spare_mib, release || need, nothing_runs);
                     if release || need {
                         steering.guest_offers(0, true);
@@ -462,7 +518,9 @@ fn memory_guest(
                         steering.guest_offers(spare_mib, false);
                     }
                 }
-                // The agent went away: whatever it offered is withdrawn.
+                // Without current guest feedback, stop speculative reclamation
+                // and withdraw its offers. Explicit host-pressure floors remain.
+                steering.guest_demand(true);
                 steering.guest_offers(0, true);
             }
         })
@@ -710,7 +768,8 @@ mod tests {
             last_line: Mutex::new((0, false)),
             level: AtomicU32::new(Pressure::Warn as u32),
             level_pages: AtomicU32::new(((6u64 << 30) / BALLOON_PAGE_SIZE) as u32),
-            steer_pages: AtomicU32::new(0),
+            compression: Mutex::new(CompressionState::default()),
+            apply_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
         };
         // The preceding warning event has already reached the device.
@@ -734,6 +793,73 @@ mod tests {
             3,
             "each change notified the guest"
         );
+    }
+
+    #[test]
+    fn guest_need_vetoes_compression_without_disabling_host_pressure() {
+        use crate::bus::MmioDevice;
+        use crate::irq::NullIrq;
+        use crate::memory::GuestMemory;
+        use crate::virtio::balloon::Balloon;
+
+        let balloon = Arc::new(BalloonState::default());
+        let transport = Arc::new(Mutex::new(VirtioMmio::new(
+            Box::new(Balloon::new(balloon.clone())),
+            Arc::new(GuestMemory::detached()),
+            Arc::new(NullIrq),
+        )));
+        let steering = Steering {
+            balloon,
+            transport: transport.clone(),
+            ram_bytes: 12 << 30,
+            mem: None,
+            last_line: Mutex::new((0, false)),
+            level: AtomicU32::new(Pressure::Normal as u32),
+            level_pages: AtomicU32::new(0),
+            compression: Mutex::new(CompressionState::default()),
+            apply_lock: Mutex::new(()),
+            guest_pages: AtomicU32::new(0),
+        };
+        let target_mib = || {
+            let mut config = [0; 4];
+            transport.lock().unwrap().read(0x100, &mut config);
+            (u64::from(u32::from_le_bytes(config)) * BALLOON_PAGE_SIZE) >> 20
+        };
+        for _ in 0..32 {
+            steering.steer(64 << 20, 0);
+        }
+        assert_eq!(target_mib(), 1536);
+        steering.guest_demand(true);
+        assert_eq!(
+            target_mib(),
+            0,
+            "withdraw the speculative target immediately"
+        );
+        for _ in 0..64 {
+            steering.steer(u64::MAX, 0);
+            assert_eq!(
+                target_mib(),
+                0,
+                "compression must not refill it under guest pressure"
+            );
+        }
+        for (level, expected) in [
+            (Pressure::Warn, 3072),
+            (Pressure::Critical, 6144),
+            (Pressure::Normal, 0),
+        ] {
+            steering.level.store(level as u32, Ordering::Relaxed);
+            steering.apply();
+            assert_eq!(
+                target_mib(),
+                expected,
+                "real host pressure retains its floor"
+            );
+        }
+        steering.guest_demand(false);
+        assert_eq!(target_mib(), 0, "no stale target after recovery");
+        steering.steer(64 << 20, 0);
+        assert_eq!(target_mib(), 48, "recovery starts with one new step");
     }
 
     /// The statistics struct is the kernel's, integer for integer.
