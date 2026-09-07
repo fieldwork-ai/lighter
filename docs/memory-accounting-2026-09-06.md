@@ -228,7 +228,7 @@ All three lifetime peaks stayed below their configured guest sizes. The 24 GiB r
 
 Private raw evidence is `.logs/041/app-memory-build-owned-burstfixed-{24576,12288,8192}m/`, with the summary in `.logs/041/memory-matrix-burst-fixed-results.json`. These application-specific captures are not release assets.
 
-## Final runtime and post-OOM recovery checks
+## Pre-lease runtime and post-OOM recovery checks
 
 Runtime `5f3223e` adds filesystem event-loss recovery and retains the same owned-memory allocation and reclamation strategy. The complete daily application-build matrix was repeated with the original daily data and sixteen vCPUs. The task ledger was sampled every 200 ms, including its lifetime peak; guest memory and OOM state were captured separately. No registry push, asset upload or deployment ran.
 
@@ -244,9 +244,9 @@ A second pair of 12 and 8 GiB tests went beyond an engine health query: after th
 
 Configuration was restored byte-for-byte to the original 24 GiB after both sets of tests. The private captures are `.logs/041/app-memory-build-owned-eventreset-{24576,12288,8192}m/` and `.logs/041/app-memory-build-owned-recovery-{12288,8192}m/`, summarized in `memory-matrix-event-reset-results.json` and `memory-matrix-recovery-results.json` under `.logs/041/`. Application-specific captures are not release assets.
 
-## Status
+## Earlier qualification
 
-Runtime `5f3223e` removes duplicate accounting and preserves actual partial reclamation in controlled tests on both Macs. Application builds exercise compressed memory and recovery when the workload cannot fit. All twelve hardware gates, 319 workspace tests and 15 signed hypervisor tests passed on each Mac. The [release measurements](../benchmarks/RELEASE-0.4.1.md) retain timings, source/artifact stamps, matched comparisons and the costs of the allocation strategy. These observations do not turn the guest RAM setting into an absolute cap on all host allocations.
+Runtime `5f3223e` removes duplicate accounting and preserves actual partial reclamation in controlled tests on both Macs. Application builds exercise compressed memory and recovery when the workload cannot fit. All twelve hardware gates, 319 workspace tests and 15 signed hypervisor tests passed on each Mac. The [preceding release measurements](../benchmarks/RELEASE-0.4.1-5f3223e.md) retain timings, source/artifact stamps, matched comparisons and the costs of the allocation strategy. These observations do not turn the guest RAM setting into an absolute cap on all host allocations.
 
 Apple's public [Hypervisor mapping contract](https://developer.apple.com/documentation/hypervisor/hv_vm_map(_:_:_:_:))
 describes the host allocation backing guest RAM. The open-source
@@ -259,4 +259,22 @@ entire AppleHV implementation.
 
 A later 12 GiB app-build run exposed a separate reclamation problem. With guest available memory and swap exhausted, the balloon continued inflating and deflating while the host compression heuristic retained a target. Direct reclaim scanned about 127 million pages over a 19-second sample. The build had progressed but remained under pressure after 800 seconds. Unbinding the balloon driver in that diagnostic VM was followed by an out-of-memory build failure 8.59 seconds later. Because the driver was removed, that run is excluded from release qualification.
 
-Guest demand now withdraws compression-only steering and prevents its next poll from restoring the target. A healthy guest starts a fresh ramp; a disconnected agent also suspends speculative reclamation. Actual macOS warning and critical pressure targets remain effective. A regression test checks the target exposed through the virtio device across demand, repeated compression polls, all three host pressure levels and recovery. The real-build correction is being validated with the balloon driver attached throughout; the intervention alone does not prove a complete fix.
+Guest demand now withdraws compression-only steering and prevents its next poll from restoring the target. A healthy guest starts a fresh ramp; a disconnected agent also suspends speculative reclamation. Actual macOS warning and critical pressure targets remain effective. A regression test checks the target exposed through the virtio device across demand, repeated compression polls, all three host pressure levels and recovery. The driver-attached validation below exercises the correction; the intervention alone did not establish a complete fix.
+
+## Twenty-second leases and guest-aware reclamation
+
+Runtime `297f6226c54c5c33f99dd391440146cf8df70baa` repeats the actual application build at 24, 12 and 8 GiB with the original daily data and sixteen vCPUs. All runs kept the balloon driver attached, used ordinary memory-policy settings without diagnostic tracing, and made no registry push or deployment. The sampler records task lifetime peaks as well as periodic footprint readings.
+
+| Configured guest RAM | Lifetime process peak | Build outcome | Footprint after 120 s | Same-VM recovery |
+|---|---:|---|---:|---|
+| 24,576 MiB | 21,628.34 MiB | completed after 65.57 s | 4,745.29 MiB | container and fresh build passed |
+| 12,288 MiB | 12,246.22 MiB | ResourceExhausted after 24.70 s | 3,069.43 MiB | container and fresh build passed |
+| 8,192 MiB | 8,155.40 MiB | ResourceExhausted after 14.93 s | 3,086.31 MiB | container and fresh build passed |
+
+Each VM completed a new Alpine container and a fresh uncached Docker build after the application attempt, without restarting. Build-worker OOM priority was zero. The 12 and 8 GiB rows prove recovery after a build that does not fit; they do not claim that this application builds successfully at those sizes. All observed lifetime peaks stayed below their respective settings. The setting remains a guest-RAM ceiling with additional host allocations, not a universal hard cap on total process footprint.
+
+The maximum compressed-memory charge was 17,646.11 MiB at 24 GiB, 3,599.78 MiB at 12 GiB and zero at 8 GiB. It is already part of task footprint. The 12 GiB build failed after 24.70 seconds; a preceding policy-only diagnostic with the driver attached failed after 24.48 seconds and likewise recovered. Neither reproduced the prior 800-second balloon/reclaim cycle. The unit regression establishes that guest demand withdraws and vetoes the compression target; these two real workloads do not establish a universal bound on OOM completion time.
+
+The original 24 GiB configuration and developer wrapper were verified byte-identical after the matrix. Private evidence: `.logs/041/app-memory-build-owned-demand20-{24576,12288,8192}m/` and `.logs/041/memory-matrix-demand20-results.json`. The earlier intervened twelve-GiB run is labelled diagnostic and excluded from qualification.
+
+The separate full M1 benchmark configured 4,096 MiB of guest RAM and recorded a 4,098 MiB process-footprint peak. This small observed excess is another reason not to describe configured guest RAM as an absolute process-footprint cap: the VMM also has host allocations. It does not resemble the prior multi-gigabyte duplicate charge, and the independent host/guest alias and physical-reclamation tests remain the evidence for that correction.

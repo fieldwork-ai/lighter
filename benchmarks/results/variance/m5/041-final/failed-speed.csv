@@ -1,0 +1,16 @@
+case,rep,ms
+npm-install,1,6201
+npm-install,2,6273
+npm-install,3,6316
+ripgrep,1,1922
+ripgrep,2,87
+ripgrep,3,78
+find-walk,1,95
+find-walk,2,89
+find-walk,3,90
+copy-tree,1,3421
+copy-tree,2,2995
+copy-tree,3,3178
+watch-latency,1,20004
+watch-latency,2,525
+watch-latency,3,2
