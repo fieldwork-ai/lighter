@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 # Homebrew formula for lighter.
 #
 # Lives in a tap (fieldwork-ai/homebrew-tap) rather than homebrew-core: core
@@ -27,18 +29,24 @@ class Lighter < Formula
     prefix.install "LICENSE-MIT", "LICENSE-APACHE", "README.md"
   end
 
+  # Ownership includes a digest of the final canonical Cellar path.
+  # rubocop:disable FormulaAudit/InstallSteps
   def post_install
     # Brew owns upgrades; the CLI must never replace this keg itself.
     require "digest"
     require "json"
     managed_prefix = prefix.parent.realpath.to_s
-    File.write(pkgshare/"installation.json", JSON.pretty_generate(
-      schema: 1, method: "homebrew", prefix: managed_prefix,
-      id: Digest::SHA256.hexdigest(managed_prefix)[0, 24]
-    ))
+    metadata = {
+      schema: 1,
+      method: "homebrew",
+      prefix: managed_prefix,
+      id:     Digest::SHA256.hexdigest(managed_prefix)[0, 24],
+    }
+    File.write(pkgshare/"installation.json", JSON.pretty_generate(metadata))
     system "/usr/bin/codesign", "--verify", "--strict", bin/"lighter"
     system "/usr/bin/codesign", "--verify", "--strict", "--deep", pkgshare/"lighter.app"
   end
+  # rubocop:enable FormulaAudit/InstallSteps
 
   def caveats
     <<~EOS
