@@ -214,7 +214,7 @@ The memory setting is a guest RAM ceiling. Host allocations and kernel mapping
 metadata add overhead; these observed peaks do not establish an absolute cap
 on every possible host-process allocation.
 
-## Final runtime build checks
+## Pre-filesystem-recovery build checks
 
 The frozen runtime candidate `38bfab4`, including the published-connection burst fix, repeated the same local application build at all three sizes. These runs retained the daily data and sixteen vCPUs, sampled the task ledger every 200 ms and checked the task lifetime peak. No region-walking sampler, registry push, asset upload or deployment ran. The lifetime peak catches peaks between periodic samples.
 
@@ -228,17 +228,25 @@ All three lifetime peaks stayed below their configured guest sizes. The 24 GiB r
 
 Private raw evidence is `.logs/041/app-memory-build-owned-burstfixed-{24576,12288,8192}m/`, with the summary in `.logs/041/memory-matrix-burst-fixed-results.json`. These application-specific captures are not release assets.
 
+## Final runtime and post-OOM recovery checks
+
+Runtime `5f3223e` adds filesystem event-loss recovery and retains the same owned-memory allocation and reclamation strategy. The complete daily application-build matrix was repeated with the original daily data and sixteen vCPUs. The task ledger was sampled every 200 ms, including its lifetime peak; guest memory and OOM state were captured separately. No registry push, asset upload or deployment ran.
+
+| Configured guest RAM | Lifetime process peak | Build outcome | Footprint after 120 s | Docker health |
+|---|---:|---|---:|---|
+| 24,576 MiB | 21,420.08 MiB | completed after 58.08 s | 4,569.31 MiB | responsive |
+| 12,288 MiB | 12,198.27 MiB | ResourceExhausted after 24.96 s | 3,244.70 MiB | responsive |
+| 8,192 MiB | 8,156.78 MiB | ResourceExhausted after 14.88 s | 3,122.88 MiB | responsive |
+
+All lifetime peaks remained below the configured RAM. The maximum compressed-memory charge was 16,007.59 MiB at 24 GiB and 644.59 MiB at 12 GiB; the 8 GiB run required no host compression. This is included in the footprint, not an extra quantity to add to it. The 12 and 8 GiB rows are OOM/recovery checks, not successful application builds.
+
+A second pair of 12 and 8 GiB tests went beyond an engine health query: after the oversized build failed, each running VM successfully started and removed an Alpine container and completed a fresh uncached Docker build, **without restarting the VM**. The build worker's OOM score adjustment was zero. Those process peaks were 12,070.05 and 8,156.95 MiB, respectively. The oversized build failed after 141.88 and 14.74 seconds; host compression reached 3,352.58 MiB in the 12 GiB run. These differing times describe these runs, not a guaranteed OOM-response deadline. After 30 seconds idle, footprints were 2,737.86 and 3,003.43 MiB.
+
+Configuration was restored byte-for-byte to the original 24 GiB after both sets of tests. The private captures are `.logs/041/app-memory-build-owned-eventreset-{24576,12288,8192}m/` and `.logs/041/app-memory-build-owned-recovery-{12288,8192}m/`, summarized in `memory-matrix-event-reset-results.json` and `memory-matrix-recovery-results.json` under `.logs/041/`. Application-specific captures are not release assets.
+
 ## Status
 
-Runtime `38bfab4` removes duplicate accounting and preserves actual partial
-reclamation in controlled tests on both Macs. The application builds exercise
-compressed memory and recovery when the workload cannot fit. All twelve hardware
-gates, 316 workspace tests and 15 signed hypervisor tests passed on each Mac.
-Complete host-share, guest-disk and amd64 records also passed on both machines.
-The [release measurements](../benchmarks/RELEASE-0.4.1.md) retain timings,
-source/artifact stamps, matched comparisons and the costs of the allocation strategy.
-These observations do not turn the guest RAM setting into an absolute cap on
-all host allocations.
+Runtime `5f3223e` removes duplicate accounting and preserves actual partial reclamation in controlled tests on both Macs. Application builds exercise compressed memory and recovery when the workload cannot fit. All twelve hardware gates, 319 workspace tests and 15 signed hypervisor tests passed on each Mac. The [release measurements](../benchmarks/RELEASE-0.4.1.md) retain timings, source/artifact stamps, matched comparisons and the costs of the allocation strategy. These observations do not turn the guest RAM setting into an absolute cap on all host allocations.
 
 Apple's public [Hypervisor mapping contract](https://developer.apple.com/documentation/hypervisor/hv_vm_map(_:_:_:_:))
 describes the host allocation backing guest RAM. The open-source

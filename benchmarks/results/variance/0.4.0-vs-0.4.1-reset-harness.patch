@@ -1,0 +1,50 @@
+--- a/benchmarks/run.sh
++++ b/benchmarks/run.sh
+@@ -406,7 +406,7 @@
+ setup_lighter() {
+ 	# The kernel the CLI boots: `LIGHTER_BENCH_KERNEL` measures another build.
+ 	KERNEL="${LIGHTER_BENCH_KERNEL:-guest/out/Image}"
+-	BIN="target/release/examples/lighter-bench"
++	BIN="${COMPARE_BIN:?}"
+ 	# Rosetta, when the Mac has it, the way `lighter start` attaches it: the
+ 	# guest's amd64 path is Rosetta or a message, and `--arch amd64` needs
+ 	# the former. Nothing changes for arm64 cases.
+@@ -416,12 +416,12 @@
+ 	# A private clone, not the master: the master is an artifact, and any
+ 	# second machine mounting it read-write beside the first — a daily
+ 	# driver, another gate — corrupts both. clonefile makes the copy free.
+-	ROOTFS_MASTER="guest/out/rootfs.ext4"
++	ROOTFS_MASTER="${COMPARE_GUEST_DIR:?}/rootfs.ext4"
+ 	[ -f "$ROOTFS_MASTER" ] || ./guest/rootfs/build.sh
+ 	ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+ 	cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
+ 	# Release, because a debug VMM is measuring the compiler.
+-	cargo build --release --example lighter-bench -p lighter-vmm
++	: # Use the prebuilt version selected for this comparison.
+ 	./scripts/sign.sh "$BIN" >/dev/null
+ 
+ 	# Let fseventsd finish with any VMM that died on this share moments
+@@ -526,11 +526,12 @@
+ # figures to the artifacts. The commit, whether the tree was clean, and the
+ # hashes of the guest artifacts this target boots (lighter only).
+ {
+-	echo "commit=$(git rev-parse --short HEAD 2>/dev/null)$(git diff --quiet 2>/dev/null || echo -dirty)"
++	echo "commit=${COMPARE_SHA:?}"
++	echo "harness_commit=5f3223e4a00073b5a32572b1187b418cb441b9be"
+ 	echo "date=$(date -u +%Y-%m-%dT%H:%MZ)"
+ 	echo "host=$(hostname -s)"
+ 	if [ "$TARGET" = lighter ]; then
+-		for f in "$KERNEL" guest/out/rootfs.ext4 guest/out/lighter-agent; do
++		for f in "$KERNEL" "$COMPARE_GUEST_DIR/rootfs.ext4" "$COMPARE_GUEST_DIR/lighter-agent"; do
+ 			[ -f "$f" ] && echo "$(basename "$f")=$(md5 -q "$f" 2>/dev/null || md5sum "$f" | cut -d" " -f1)"
+ 		done
+ 	fi
+@@ -869,7 +870,7 @@
+ # machine, so the CLI's own work (doctor, the rootfs clone, waiting for the
+ # engine) is inside the number as the others' is inside theirs.
+ BOOT_HOME=""
+-LIGHTER_CLI="target/release/lighter"
++LIGHTER_CLI="${COMPARE_CLI:?}"
+ boot_stop() {
+ 	case "$TARGET" in
+ 	lighter) LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" stop >/dev/null 2>&1 || true ;;

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Prove cache-loss recovery for names, open files and existing mmaps.
 
-The benchmark VMM's test writer mutates files in its own process, so FSEvents
-IgnoreSelf suppresses individual notifications. A control phase first proves
-that the guest still has stale data; only then is a reset or overflow injected.
+The benchmark VMM creates and mutates fixtures in its own process, so FSEvents
+IgnoreSelf suppresses their individual notifications. Control files stay outside
+the watched share. The probe disables the hot-directory cache cooldown so
+setup events cannot give its initial lookups zero validity. A control phase
+still proves one second of stale data before a reset or overflow is injected.
 """
 import argparse
 import os
@@ -113,14 +115,9 @@ def main():
             root = Path(tmp)
             share = root/'share'
             share.mkdir()
-            (share/'dir').mkdir()
-            for name, contents in [('content','before!'), ('mapped','mappedA'),
-                                   ('empty',''), ('gone','gone'), ('renamed','rename'),
-                                   ('truncated', 'x' * 4096)]:
-                (share/name).write_text(contents)
-            (share/'probe.py').write_text(GUEST)
             run('cp', '-c', 'guest/out/rootfs.ext4', str(root/'rootfs.ext4'))
-            env = dict(os.environ, LIGHTER_TEST_FS_RESET=str(share))
+            env = dict(os.environ, LIGHTER_TEST_FS_RESET=str(root),
+                       LIGHTER_FS_COOLDOWN_MS="0")
             socket = root/'docker.sock'
             docker = ['docker', '-H', f'unix://{socket}']
             command = [args.bin, '--kernel', args.kernel, '--disk', str(root/'rootfs.ext4'),
@@ -141,19 +138,20 @@ def main():
                     wait_for(ready)
                     with (logs/f'{mode}-pull.log').open('w') as pull:
                         run(*docker, 'pull', 'python:3.13-alpine', stdout=pull, stderr=subprocess.STDOUT, timeout=180)
+                    def host(action):
+                        (root/'command').write_text(action)
+                        def acknowledged():
+                            answer = (root/'ack').read_text() if (root/'ack').exists() else ''
+                            if answer.startswith('ERROR'):
+                                raise RuntimeError(answer)
+                            return answer == action
+                        wait_for(acknowledged, 30)
+                    host('prepare')
                     with (logs/f'{mode}-guest.err').open('w') as err:
                         guest = subprocess.Popen(docker + ['run', '--rm', '-i', '-v',
-                            '/mnt/probe:/work', 'python:3.13-alpine', 'python', '-u', '/work/probe.py'],
+                            '/mnt/probe:/work', 'python:3.13-alpine', 'python', '-u', '-c', GUEST],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True)
                         assert line(guest) == 'READY', 'guest did not cache the fixtures'
-                        def host(action):
-                            (share/'command').write_text(action)
-                            def acknowledged():
-                                answer = (share/'ack').read_text() if (share/'ack').exists() else ''
-                                if answer.startswith('ERROR'):
-                                    raise RuntimeError(answer)
-                                return answer == action
-                            wait_for(acknowledged, 30)
                         def check(action):
                             guest.stdin.write(action+'\n')
                             guest.stdin.flush()
@@ -166,7 +164,7 @@ def main():
                         check('new')
                         guest.stdin.close()
                         assert guest.wait(timeout=15) == 0
-                        (share/'command').write_text('stop')
+                        (root/'command').write_text('stop')
                 finally:
                     if guest is not None and guest.poll() is None:
                         guest.kill()

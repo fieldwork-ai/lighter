@@ -16,7 +16,7 @@ pub fn start(root: PathBuf, sinks: Vec<Arc<Sink>>) {
                 break;
             }
             if !command.is_empty() && command != last {
-                let result = apply(&root, &sinks, command.trim());
+                let result = apply(&root.join("share"), &sinks, command.trim());
                 let reply = match result {
                     Ok(()) => command.clone(),
                     Err(error) => format!("ERROR {command}: {error}"),
@@ -31,6 +31,19 @@ pub fn start(root: PathBuf, sinks: Vec<Arc<Sink>>) {
 
 fn apply(root: &std::path::Path, sinks: &[Arc<Sink>], command: &str) -> std::io::Result<()> {
     match command {
+        "prepare" => {
+            std::fs::create_dir_all(root.join("dir"))?;
+            for (name, contents) in [
+                ("content", "before!"),
+                ("mapped", "mappedA"),
+                ("empty", ""),
+                ("gone", "gone"),
+                ("renamed", "rename"),
+            ] {
+                std::fs::write(root.join(name), contents)?;
+            }
+            std::fs::write(root.join("truncated"), vec![b'x'; 4096])?;
+        }
         "mutate" => {
             for (name, contents) in [("content", "after!!"), ("mapped", "mappedB")] {
                 let path = root.join(name);
