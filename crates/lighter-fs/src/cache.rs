@@ -1,36 +1,16 @@
-//! How long the guest may believe what we told it.
+//! Cache leases and host-change activity.
 //!
-//! # The one number that matters
+//! LOOKUP and GETATTR replies let the guest cache names and attributes. When
+//! the guest supports our notification queue and complete cache resets,
+//! FSEvents can withdraw those answers before their leases expire. The host
+//! event service can be delayed, so even that profile has a finite backstop.
 //!
-//! Everything the guest caches, it caches because we handed it a validity in a
-//! LOOKUP or GETATTR reply. There is no way to take it back — virtio-fs has no
-//! reverse channel — so that number is simultaneously the whole performance
-//! story and the whole coherence story. Set it to zero and every path component
-//! of every syscall is a round trip. Set it to a minute and a file edited on the
-//! Mac is stale in the container for a minute.
-//!
-//! # Making the number depend on what the host is doing
-//!
-//! A fixed timeout has to be short enough for the worst case, which means it is
-//! short all the time. We can do better because macOS tells us where the changes
-//! are: [`crate::fsevents`] reports a host-side write within milliseconds, and
-//! `kFSEventStreamCreateFlagIgnoreSelf` means it reports *only* changes we did
-//! not make — so the guest's own furious writing during a package install does
-//! not count as host activity and does not poison its own cache.
-//!
-//! A directory the host has touched recently therefore gets zero validity, and
-//! everything else gets the configured timeout. While you are editing, the
-//! container sees each save on its next look; while you are not, it runs at
-//! cache speed.
-//!
-//! # Why directories are trusted longer than files
-//!
-//! Resolving `node_modules/@babel/core/lib/index.js` is five lookups, four of
-//! them directories. Directory *entries* change far more rarely than file
-//! contents — a package tree's shape is fixed once installed — so they are
-//! given a longer validity than files, which is most of the speed for very
-//! little of the risk. Attributes, which is where a file's size and mtime live,
-//! are always on the short timeout.
+//! A directory recently changed by the host gets zero validity during its
+//! cooldown. IgnoreSelf keeps the guest's own package installs from making
+//! every directory appear externally active. A guest without complete reset
+//! support receives the shorter polled leases; a failed watcher disables
+//! caching. Lease expiry revalidates names and attributes, while existing
+//! mmaps and same-size/same-mtime content changes still need invalidation.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -84,23 +64,20 @@ impl Timings {
         cooldown: Duration::from_millis(2000),
     };
 
-    /// What may be promised when the guest *can* be corrected.
+    /// Cache leases when the guest can receive invalidations.
     ///
-    /// Five minutes is not the staleness — with the notification channel live
-    /// that is however long FSEvents takes to notice, which is milliseconds. It
-    /// is the backstop: notifications are queued in a bounded buffer, and a
-    /// message dropped because the guest was slow has to expire on its own
-    /// eventually. Long enough to be worth having, short enough that nothing
-    /// stays wrong for a working day. It was thirty seconds, and a package
-    /// install paid for that: pnpm stats every store file it imports, the
-    /// store was written more than thirty seconds earlier, and each stat was
-    /// a GETATTR — sixty thousand an install, one round trip each. A missing
-    /// name is still only promised for thirty seconds.
+    /// Notifications normally withdraw these answers promptly, but FSEvents
+    /// can deliver them tens of seconds late under filesystem load. Negotiating
+    /// a notification queue is not proof that the host event service is keeping
+    /// up. Ten seconds bounds the leases independently of event delivery;
+    /// expiry revalidates names and attributes through ordinary FUSE requests.
+    /// It does not refresh an existing mmap without an invalidation, nor force
+    /// a data-cache drop for a host edit preserving both size and mtime.
     pub const PUSHED: Timings = Timings {
-        attr: Duration::from_secs(300),
-        entry_file: Duration::from_secs(300),
-        entry_dir: Duration::from_secs(300),
-        negative: Duration::from_secs(30),
+        attr: Duration::from_secs(10),
+        entry_file: Duration::from_secs(10),
+        entry_dir: Duration::from_secs(10),
+        negative: Duration::from_secs(10),
         cooldown: Duration::from_millis(2000),
     };
 

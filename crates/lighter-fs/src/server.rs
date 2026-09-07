@@ -7,17 +7,14 @@
 //! the two systems in ways that are invisible until something behaves
 //! plausibly and wrongly.
 //!
-//! # Coherence, and what we deliberately do not cache
+//! # Coherence
 //!
-//! Attribute and entry timeouts are zero and `FOPEN_KEEP_CACHE` is never set,
-//! so the guest revalidates on every path resolution and drops a file's page
-//! cache whenever it is opened. That is the strictest useful setting: a host
-//! edit is visible to the guest at its next `open`, and a guest write is
-//! visible to the host as soon as the guest's own page cache is flushed.
-//!
-//! It is also slow, and making it fast without making it wrong is the whole of
-//! the next milestone. The caching goes in *above* this file, driven by host
-//! change notifications; nothing here should ever be tempted to guess.
+//! The cache policy selects name and attribute leases, shortened to zero for
+//! recently changed host directories. With the guest notification extension,
+//! ordinary host changes invalidate individual entries and lost event detail
+//! invalidates the entire share. Leases still expire independently of event
+//! delivery. Without a working watcher, caching is disabled. Guest writes
+//! reach the host when the guest page cache is flushed.
 //!
 //! # Identity
 //!

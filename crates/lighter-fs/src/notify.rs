@@ -142,7 +142,7 @@ impl Sink {
                     );
                 }
                 // A global reset subsumes every earlier invalidation. Never
-                // silently drop one and leave five minutes of stale data.
+                // silently drop one and leave stale data until lease expiry.
                 *self.dropped.lock().expect("notify sink poisoned") += pending.len() as u64;
                 pending.clear();
                 if notification != Notification::Reset {

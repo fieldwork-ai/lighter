@@ -2,7 +2,7 @@
 //! these writes from FSEvents. The gate can therefore prove that a global
 //! reset, rather than an ordinary per-file notification, restores coherence.
 
-use lighter_fs::notify::{Notification, RESETS, Sink};
+use lighter_fs::notify::{Notification, PUSHED, RESETS, Sink};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,13 +10,35 @@ use std::sync::atomic::Ordering;
 pub fn start(root: PathBuf, sinks: Vec<Arc<Sink>>) {
     std::thread::spawn(move || {
         let mut last = String::new();
+        let mut before_mutation = None;
         loop {
             let command = std::fs::read_to_string(root.join("command")).unwrap_or_default();
             if command == "stop" {
                 break;
             }
             if !command.is_empty() && command != last {
-                let result = apply(&root.join("share"), &sinks, command.trim());
+                let result = match command.trim() {
+                    "mutate-quiet" => {
+                        if sinks.iter().any(|sink| !sink.is_empty()) {
+                            Err(std::io::Error::other(
+                                "notifications pending before expiry probe",
+                            ))
+                        } else {
+                            before_mutation = Some(PUSHED.load(Ordering::SeqCst));
+                            apply(&root.join("share"), &sinks, "mutate")
+                        }
+                    }
+                    "assert-quiet" => {
+                        if before_mutation == Some(PUSHED.load(Ordering::SeqCst)) {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::other(
+                                "expiry probe received an invalidation",
+                            ))
+                        }
+                    }
+                    action => apply(&root.join("share"), &sinks, action),
+                };
                 let reply = match result {
                     Ok(()) => command.clone(),
                     Err(error) => format!("ERROR {command}: {error}"),

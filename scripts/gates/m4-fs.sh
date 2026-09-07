@@ -332,7 +332,7 @@ fi
 # ------------------------------------------------------------------- checks --
 echo "==> Recovering from lost filesystem notifications"
 if python3 scripts/test-fs-reset.py --bin "$BIN" --kernel "$KERNEL"; then
-	pass "cache reset and queue overflow refresh names, open files and mappings"
+	pass "cache reset, queue overflow and independent expiry recover shared files"
 else
 	fail "cache-loss recovery failed; see .logs/fs-reset"
 fi
