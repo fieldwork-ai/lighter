@@ -143,14 +143,22 @@ pub fn suspend() -> anyhow::Result<()> {
     let _ = std::process::Command::new("/bin/launchctl")
         .args(["bootout", &target])
         .output()?;
-    let check = std::process::Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .output()?;
-    anyhow::ensure!(
-        !check.status.success(),
-        "launchd did not unload the running service"
-    );
-    Ok(())
+    // bootout can return while launchd is still reaping the gracefully
+    // stopping VM. Do not mistake that transient registration for failure.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let check = std::process::Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .output()?;
+        if !check.status.success() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "launchd did not unload the running service within 30 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 pub fn configured_executable() -> anyhow::Result<Option<PathBuf>> {
