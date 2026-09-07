@@ -31,7 +31,15 @@ def main():
     ap.add_argument("--source", required=True)
     ap.add_argument("--runtime-source", required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument(
+        "--attempt",
+        type=int,
+        default=1,
+        help="unique attempt number; retain earlier invalid records",
+    )
     a = ap.parse_args()
+    if a.attempt < 1:
+        ap.error("attempt must be positive")
     os.chdir(ROOT)
     out = a.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -229,6 +237,7 @@ def main():
                     primary="first valid full suite",
                     quiet="six samples 10s apart, aggregate machine CPU <=5%; cap 15m",
                     repetitions=3,
+                    attempt=a.attempt,
                 ),
                 indent=2,
             )
@@ -238,7 +247,7 @@ def main():
         monitor = sp.Popen(
             ["python3", "scripts/records/monitor-host.py", str(out)], env=env
         )
-        prefix = f"050-{a.source[:7]}-{a.machine}"
+        prefix = f"050-{a.source[:7]}-{a.machine}-a{a.attempt}"
         for suite in range(1, 4):
             for stage, cases, options in [
                 ("share", SHARE, ()),

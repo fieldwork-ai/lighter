@@ -317,6 +317,10 @@ run_case_native() {
 # Every container target is the same command against a different daemon; only
 # the context changes, which is exactly the point of comparing them.
 docker_context() {
+	if [ -n "${BENCH_DOCKER_CONTEXT:-}" ]; then
+		echo "$BENCH_DOCKER_CONTEXT"
+		return
+	fi
 	case "$TARGET" in
 	colima)         echo "colima" ;;
 	orbstack)       echo "orbstack" ;;
@@ -883,7 +887,7 @@ boot_stop() {
 	case "$TARGET" in
 	lighter) LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" stop >/dev/null 2>&1 || true ;;
 	orbstack) orb stop >/dev/null 2>&1 || true ;;
-	colima) colima stop >/dev/null 2>&1 || true ;;
+	colima) colima stop "${BENCH_COLIMA_PROFILE:-default}" >/dev/null 2>&1 || true ;;
 	docker-desktop)
 		# It answers to either name depending on the version installed.
 		osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
@@ -914,7 +918,7 @@ boot_start() {
 	case "$TARGET" in
 	lighter) LIGHTER_HOME="$BOOT_HOME" LIGHTER_GUEST_DIR="${LIGHTER_GUEST_DIR:-guest/out}" "$LIGHTER_CLI" start >/dev/null 2>&1 & ;;
 	orbstack) orb start >/dev/null 2>&1 & ;;
-	colima) colima start >/dev/null 2>&1 & ;;
+	colima) colima start "${BENCH_COLIMA_PROFILE:-default}" --activate=false >/dev/null 2>&1 & ;;
 	docker-desktop) open -a Docker 2>/dev/null || open -a "Docker Desktop" 2>/dev/null; sleep 0.1 & ;;
 	esac
 	START_PID=$!

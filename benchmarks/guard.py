@@ -77,6 +77,18 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--allow-pid", type=int, action="append", default=[])
     ap.add_argument(
+        "--allow-program",
+        type=Path,
+        action="append",
+        default=[],
+        help="exact executable path belonging to the selected competitor",
+    )
+    ap.add_argument(
+        "--lima-instance",
+        type=Path,
+        help="exact Lima instance directory for the selected Colima profile",
+    )
+    ap.add_argument(
         "--target",
         choices=["lighter", "native", "colima", "orbstack", "docker-desktop"],
         required=True,
@@ -94,6 +106,7 @@ def main():
     owner_path = Path(owner_handle.name)
     owner_handle.close()
     allowed = set(a.allow_pid)
+    programs = {str(path.resolve()) for path in a.allow_program}
     # Keep a PID once its ancestry establishes ownership: some VM helpers daemonize.
     owned = set()
     failure = None
@@ -113,6 +126,20 @@ def main():
                 if not kind:
                     continue
                 legitimate = descendant(pid, allowed | owned, table)
+                if (
+                    kind == a.target
+                    and str(Path(process["command"]).resolve()) in programs
+                ):
+                    legitimate = True
+                if a.target == "colima" and kind == "lima" and a.lima_instance:
+                    # A restarted Colima VM has a fresh hostagent PID. Match its
+                    # instance argument, not every process named limactl.
+                    import shlex
+
+                    args = sp.check_output(
+                        ["ps", "-p", str(pid), "-o", "args="], text=True
+                    )
+                    legitimate |= str(a.lima_instance.resolve()) in shlex.split(args)
                 if (
                     kind == a.target == "lighter"
                     and str(Path(process["command"]).resolve()) in paths
