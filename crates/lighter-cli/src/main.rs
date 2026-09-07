@@ -13,11 +13,15 @@ mod bundle;
 mod config;
 mod context;
 mod doctor;
+mod installation;
 mod instance;
 mod machine;
 mod paths;
+mod release;
 mod run;
 mod service;
+mod updates;
+mod upgrade;
 
 use std::time::Duration;
 
@@ -88,6 +92,37 @@ enum Command {
     Install,
     /// Stop starting lighter when you log in.
     Uninstall,
+    /// Check for and download stable releases without changing the running VM.
+    Update {
+        #[command(subcommand)]
+        action: updates::Action,
+    },
+    /// Activate a verified release (direct installations only).
+    Upgrade {
+        /// Explicitly allow stopping and restarting a running VM.
+        #[arg(long)]
+        restart: bool,
+    },
+    #[command(hide = true)]
+    AdoptRelease {
+        #[arg(long)]
+        source: std::path::PathBuf,
+        #[arg(long)]
+        prefix: std::path::PathBuf,
+        #[arg(long)]
+        restart: bool,
+    },
+    #[command(hide = true)]
+    ServiceRefresh,
+    #[command(hide = true)]
+    InstallArchive {
+        #[arg(long)]
+        archive: std::path::PathBuf,
+        #[arg(long)]
+        prefix: std::path::PathBuf,
+        #[arg(long)]
+        restart: bool,
+    },
     /// Become the machine. Not for typing; `start` runs this.
     #[command(hide = true)]
     Run,
@@ -95,6 +130,16 @@ enum Command {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    if !matches!(
+        &cli.command,
+        Command::Run
+            | Command::Update { .. }
+            | Command::AdoptRelease { .. }
+            | Command::ServiceRefresh
+            | Command::InstallArchive { .. }
+    ) {
+        updates::notice();
+    }
     match dispatch(cli.command) {
         Ok(code) => code,
         Err(error) => {
@@ -106,6 +151,38 @@ fn main() -> std::process::ExitCode {
 
 fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
     match command {
+        Command::InstallArchive {
+            archive,
+            prefix,
+            restart,
+        } => {
+            let temp = tempfile::tempdir()?;
+            let source = release::extract(&archive, temp.path())?;
+            upgrade::install(&source, &prefix, restart)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Command::Update { action } => {
+            updates::run(action)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Command::Upgrade { restart } => {
+            upgrade::run(restart)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Command::AdoptRelease {
+            source,
+            prefix,
+            restart,
+        } => {
+            upgrade::install(&source, &prefix, restart)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Command::ServiceRefresh => {
+            let root = installation::payload(&std::env::current_exe()?)
+                .ok_or_else(|| anyhow::anyhow!("not a packaged release"))?;
+            service::refresh_at(&root, false)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         Command::Run => {
             run::machine()?;
             Ok(std::process::ExitCode::SUCCESS)
@@ -247,6 +324,7 @@ fn stop() -> anyhow::Result<std::process::ExitCode> {
 
 fn status() -> anyhow::Result<std::process::ExitCode> {
     let status = machine::status()?;
+    print!("{}", installation::version_report());
     if !status.running {
         println!("lighter is not running.");
         return Ok(std::process::ExitCode::from(1));

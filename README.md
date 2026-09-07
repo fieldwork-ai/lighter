@@ -31,6 +31,12 @@ Running containers on macOS has traditionally forced a compromise between heavy,
 curl -fsSL https://raw.githubusercontent.com/fieldwork-ai/lighter/main/scripts/install.sh | sh
 ```
 
+Updates are explicit: `lighter upgrade` applies a verified release, and a
+running VM requires `lighter upgrade --restart`. Direct installations can
+opt into background downloads with `lighter update auto-download on`;
+downloads never activate themselves. Homebrew installations stay managed by
+Brew. [Installation ownership, migration and update behaviour](docs/updates.md).
+
 ### Or via Homebrew
 
 ```bash

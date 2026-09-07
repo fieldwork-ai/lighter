@@ -109,6 +109,8 @@ echo "==> Signing identity: $IDENTITY"
 # --- build -------------------------------------------------------------------
 echo "==> Building lighter-cli release binary"
 cargo build --release -p lighter-cli
+built_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "lighter-cli"))')"
+[ "$built_version" = "$VERSION" ] || { echo "error: requested version differs from workspace version"; exit 1; }
 # The checkout can be the user's daily-driver wrapper target. Building
 # strips its entitlement; keep it runnable even if notarization later fails.
 ./scripts/sign.sh target/release/lighter >/dev/null
@@ -119,7 +121,7 @@ for artifact in guest/out/Image guest/out/rootfs.ext4; do
 done
 
 cp target/release/lighter "$STAGE/bin/lighter"
-cp guest/out/Image guest/out/rootfs.ext4 "$STAGE/share/lighter/"
+cp guest/out/Image guest/out/rootfs.ext4 guest/out/kernel.version "$STAGE/share/lighter/"
 cp LICENSE-MIT LICENSE-APACHE README.md "$STAGE/"
 cp entitlements.plist "$STAGE/share/lighter/"
 # The bundle `lighter start` runs the machine from, shipped rather than
@@ -139,6 +141,20 @@ codesign --sign "$IDENTITY" \
 	--options runtime \
 	--timestamp \
 	"$STAGE/bin/lighter"
+
+# Seal hashes of the external CLI and guest payload inside the signed app.
+python3 - "$STAGE" "$VERSION" <<'PYMANIFEST'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = {}
+for name in ('bin/lighter', 'share/lighter/Image', 'share/lighter/rootfs.ext4', 'share/lighter/kernel.version'):
+    with (root/name).open('rb') as f:
+        files[name] = hashlib.file_digest(f, 'sha256').hexdigest()
+manifest = dict(schema=1, version=sys.argv[2], kernel_version=(root/'share/lighter/kernel.version').read_text().strip(), data_epoch=1, files=files)
+(root/'share/lighter/lighter.app/Contents/Resources/release.json').write_text(json.dumps(manifest, indent=2)+'\n')
+PYMANIFEST
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist"
 
 codesign --sign "$IDENTITY" \
 	--entitlements entitlements.plist \
@@ -184,6 +200,7 @@ fi
 # --- packing -----------------------------------------------------------------
 echo "==> Packing release tarball"
 mkdir -p dist
+cp "$STAGE/bin/lighter" "dist/lighter-$VERSION-arm64"
 TARBALL="dist/lighter-$VERSION-arm64.tar.gz"
 TAR_ARGS=("-czf" "$TARBALL" "-C" "$WORK/stage" "lighter-$VERSION")
 if tar --help 2>&1 | grep -q -- '--sparse'; then

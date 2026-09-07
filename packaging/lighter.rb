@@ -28,13 +28,16 @@ class Lighter < Formula
   end
 
   def post_install
-    # Verify the signature; if unsigned or stripped, sign ad-hoc with the hypervisor entitlement.
-    unless quiet_system("/usr/bin/codesign", "--verify", bin/"lighter")
-      system "/usr/bin/codesign", "--force", "--sign", "-",
-             "--entitlements", pkgshare/"entitlements.plist",
-             "--options", "runtime",
-             bin/"lighter"
-    end
+    # Brew owns upgrades; the CLI must never replace this keg itself.
+    require "digest"
+    require "json"
+    managed_prefix = prefix.parent.realpath.to_s
+    (pkgshare/"installation.json").write JSON.pretty_generate(
+      schema: 1, method: "homebrew", prefix: managed_prefix,
+      id: Digest::SHA256.hexdigest(managed_prefix)[0, 24]
+    )
+    system "/usr/bin/codesign", "--verify", "--strict", bin/"lighter"
+    system "/usr/bin/codesign", "--verify", "--strict", "--deep", pkgshare/"lighter.app"
   end
 
   def caveats

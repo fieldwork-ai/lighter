@@ -7,6 +7,9 @@
 #   - Apple Silicon Mac (arm64)
 #   - macOS 15 (Sequoia) or later
 set -euo pipefail
+RESTART=()
+if [ "${1:-}" = --restart ]; then RESTART=(--restart); shift; fi
+[ "$#" -eq 0 ] || { echo 'usage: install.sh [--restart]' >&2; exit 2; }
 
 log() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -66,16 +69,25 @@ TARBALL="$WORK/lighter.tar.gz"
 log "Downloading $URL"
 DOWNLOAD_HEADERS=()
 [ -n "${GITHUB_TOKEN:-}" ] && DOWNLOAD_HEADERS=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream")
-curl -fL --progress-bar ${DOWNLOAD_HEADERS[@]+"${DOWNLOAD_HEADERS[@]}"} "$URL" -o "$TARBALL" || err "failed to download release archive from $URL"
+curl -fL --progress-bar --connect-timeout 15 --max-time 900 --max-filesize 2147483648 ${DOWNLOAD_HEADERS[@]+"${DOWNLOAD_HEADERS[@]}"} "$URL" -o "$TARBALL" || err "failed to download release archive from $URL"
 
 INSTALL_DIR="${LIGHTER_INSTALL_DIR:-$HOME/.lighter}"
 mkdir -p "$INSTALL_DIR"
 
-log "Extracting into $INSTALL_DIR"
-tar -xzf "$TARBALL" --strip-components=1 -C "$INSTALL_DIR"
-
-# Clean any quarantine attributes inherited from download
-xattr -dr com.apple.quarantine "$INSTALL_DIR/bin" "$INSTALL_DIR/share" 2>/dev/null || true
+# Fetch a separately signed bootstrap CLI; do not extract an untrusted tarball
+# in the shell. The verified helper checks paths, the sealed release manifest,
+# Developer ID and notarization before changing an installation.
+BOOTSTRAP="$WORK/lighter"
+BOOTSTRAP_URL="${LIGHTER_BOOTSTRAP_URL:-https://github.com/$REPO/releases/download/v$VERSION/lighter-$VERSION-arm64}"
+if [ -n "${GITHUB_TOKEN:-}" ] && [ -z "${LIGHTER_BOOTSTRAP_URL:-}" ]; then
+    BOOTSTRAP_ID="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/releases/tags/v$VERSION" 2>/dev/null \
+        | tr -d '\n' | grep -oE '"id": *[0-9]+,[^}]*"name": *"lighter-'"$VERSION"'-arm64"' | head -1 | grep -oE '[0-9]+' | head -1 || true)"
+    [ -n "$BOOTSTRAP_ID" ] && BOOTSTRAP_URL="https://api.github.com/repos/$REPO/releases/assets/$BOOTSTRAP_ID"
+fi
+curl -fL --progress-bar --connect-timeout 15 --max-time 900 --max-filesize 2147483648 ${DOWNLOAD_HEADERS[@]+"${DOWNLOAD_HEADERS[@]}"} "$BOOTSTRAP_URL" -o "$BOOTSTRAP" || err "failed to download signed installer helper (requires lighter 0.4.2 or later)"
+chmod +x "$BOOTSTRAP"
+/usr/bin/codesign --verify --strict -R 'anchor apple generic and identifier "lighter" and certificate leaf[subject.OU] = "N7N6BNF95K" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' "$BOOTSTRAP" || err "installer helper signature is invalid"
+"$BOOTSTRAP" install-archive --archive "$TARBALL" --prefix "$INSTALL_DIR" ${RESTART[@]+"${RESTART[@]}"}
 
 # 4. Symlink to PATH
 BIN="$INSTALL_DIR/bin/lighter"

@@ -28,6 +28,10 @@ pub struct Identity {
     home: PathBuf,
     device: u64,
     inode: u64,
+    #[serde(default)]
+    pub release_version: Option<String>,
+    #[serde(default)]
+    pub kernel_version: Option<String>,
 }
 
 impl Identity {
@@ -56,6 +60,8 @@ impl Identity {
             home,
             device: meta.dev(),
             inode: meta.ino(),
+            release_version: None,
+            kernel_version: None,
         })
     }
 
@@ -90,6 +96,8 @@ impl Identity {
             home,
             device: meta.dev(),
             inode: meta.ino(),
+            release_version: None,
+            kernel_version: None,
         })
     }
 
@@ -223,7 +231,12 @@ impl Instance {
 
     /// Publish only after signal handling is installed, including on launchd.
     pub fn publish(&mut self) -> io::Result<()> {
-        let identity = Identity::current(&self.home)?;
+        let mut identity = Identity::current(&self.home)?;
+        identity.release_version = Some(env!("CARGO_PKG_VERSION").to_owned());
+        identity.kernel_version = crate::paths::guest_dir()
+            .ok()
+            .and_then(|guest| std::fs::read_to_string(guest.join("kernel.version")).ok())
+            .map(|v| v.trim().to_owned());
         let staging = self.home.join(".machine.identity.next");
         std::fs::write(&staging, serde_json::to_vec(&identity)?)?;
         std::fs::write(self.home.join("lighter.pid"), identity.pid().to_string())?;

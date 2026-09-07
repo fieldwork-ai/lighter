@@ -36,7 +36,14 @@ fn private_rootfs() -> anyhow::Result<std::path::PathBuf> {
     // on the two times never refreshed it — a daily driver ran a rootfs
     // three builds old while every benchmark VM booted the current one.
     let stamp = paths::home()?.join("rootfs.ext4.from");
-    let current = {
+    let current = if let Some(root) = crate::installation::payload(&std::env::current_exe()?)
+        && let Ok(manifest) = crate::release::read(&root)
+        && std::env::var_os("LIGHTER_GUEST_DIR").is_none_or(|p| {
+            std::path::PathBuf::from(p).canonicalize().ok()
+                == root.join("share/lighter").canonicalize().ok()
+        }) {
+        format!("sha256:{}", manifest.files["share/lighter/rootfs.ext4"])
+    } else {
         let meta = std::fs::metadata(&master)?;
         format!("{:?} {}", meta.modified()?, meta.len())
     };
@@ -77,6 +84,7 @@ pub fn machine() -> anyhow::Result<()> {
     let home = paths::home()?;
     std::fs::create_dir_all(&home)?;
 
+    let selection_lease = crate::upgrade::start_lease()?;
     let Some(mut instance) = crate::instance::Instance::acquire(&home)? else {
         eprintln!("lighter is already running; this copy has nothing to do");
         return Ok(());
@@ -208,6 +216,7 @@ pub fn machine() -> anyhow::Result<()> {
     // signals an audit token, so it cannot accidentally stop a replacement.
     install_signal_handler(ports)?;
     instance.publish()?;
+    drop(selection_lease);
 
     let reason = machine.wait()?;
     tracing::info!(?reason, "machine stopped");
