@@ -17,15 +17,18 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Docker Des
 | Metric / Feature | lighter | OrbStack | Docker Desktop | Colima |
 |---|---|---|---|---|
 | **License** | **MIT / Apache 2.0** | Proprietary | Proprietary | Apache 2.0 |
-| **Commercial use** | **Free forever** | $8–$20 / user / mo | $5–$24 / user / mo | Free |
+| **Commercial use** | **Free forever** | $8–$10 / user / mo | $5–$24 / user / mo | Free |
 | **Telemetry** | **Zero** | Yes | Yes | None |
-| **GUI bloat** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
+| **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
+| **Cold start (to container)** | **1.8 s** | 1.4 s | 2.1 s | 9.0 s |
 | **Idle memory** | **365 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
 | **Memory 15s after heavy build** | **936 MiB** | 2,776 MiB | 10,145 MiB | 10,145 MiB |
-| **Host share file read (`ripgrep`)** | **91 ms** | 1,000 ms | — | 3,020 ms |
+| **`npm ci` (own disk)** | **4.61 s** | 6.83 s | 7.96 s | 7.56 s |
+| **`npm ci` (host share)** | **6.30 s** | 8.53 s | — | 17.89 s |
 | **Host share copy (`cp -a`)** | **3.59 s** | 9.58 s | — | 41.95 s |
 | **Container DNS resolution** | **37 µs** | 262 µs | 513 µs | 481 µs |
-| **x86-64 Rosetta `sha256sum`** | **4.22 s** | 7.92 s | 4.39 s | 4.26 s |
+| **Kubernetes support** | **kind, kubectl, Helm** | Built-in | Built-in | k3s |
+| **x86-64 Rosetta (`sha256sum`)** | **4.22 s** | 7.92 s | 4.39 s | 4.26 s |
 
 ---
 
@@ -77,7 +80,7 @@ Direct installations can opt into background update downloads with `lighter upda
 
 All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On host-shared filesystems, lighter runs `ripgrep` **11x faster than OrbStack**, completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
+On host-shared filesystems, lighter runs `npm ci` in **6.30 s** (faster than native APFS, outperforming OrbStack's 8.53 s), completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
@@ -226,7 +229,7 @@ Kernel releases track upstream Linux LTS point updates, ensuring ongoing securit
 
 - **Docker CLI & Compose compatibility:** Works seamlessly as a registered Docker context with existing `docker`, `docker compose`, and third-party developer tooling.
 - **x86-64 containers under Rosetta:** Run `linux/amd64` images on Apple Silicon with near-native performance via Apple Rosetta (`lighter rosetta --install`). See [x86-64 architecture and performance](docs/x86-64.md).
-- **Local Kubernetes with kind:** Spin up single-node and multi-node arm64 Kubernetes clusters with standard `kind`, `kubectl`, and `helm` commands. See the [Kubernetes guide](docs/kubernetes.md).
+- **Local Kubernetes with kind:** Spin up single-node and multi-node arm64 Kubernetes clusters with standard `kind`, `kubectl`, and `helm` commands without control-plane overhead when idle. See the [Kubernetes guide](docs/kubernetes.md).
 - **Bidirectional port forwarding & IPv6:** Published ports (`-p 8080:80` or `-p 127.0.0.1:8080:80`) bind directly on the Mac. Full IPv6 routing is supported whenever the host network supports it.
 - **Native file sharing:** Mount host directories into containers with automatic UID/GID ownership translation and real-time cache synchronization.
 - **Headless background operation:** Runs as a lean terminal daemon or background `launchd` service with zero menu bar clutter and virtually zero idle CPU usage (~0.2%).
