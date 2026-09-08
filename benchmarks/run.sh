@@ -92,6 +92,14 @@ while [ $# -gt 0 ]; do
 	esac
 done
 [ -n "$TARGET" ] || { echo "--target is required (native|lighter|colima|orbstack|docker-desktop)" >&2; exit 2; }
+# A focused repeat can retain the full suite's cache preparation without
+# measuring unrelated package managers again. Selected cases always warm.
+for warm in ${BENCH_EXTRA_WARM_CASES:-}; do
+	case "$warm" in
+		npm-install|pnpm-install|yarn-install) ;;
+		*) echo "unsupported extra warm-up: $warm" >&2; exit 2 ;;
+	esac
+done
 if [ -n "${BENCH_TOOLS_PATH:-}" ]; then
 	export PATH="$BENCH_TOOLS_PATH:$PATH"
 fi
@@ -588,6 +596,7 @@ echo "case,rep,ms" > "$RESULTS"
 	echo "date=$(date -u +%Y-%m-%dT%H:%MZ)"
 	echo "host=$(hostname -s)"
 	for tool in node npm pnpm yarn; do echo "host.$tool=$($tool --version 2>/dev/null | head -1)"; done
+	echo "extra_warm_cases=${BENCH_EXTRA_WARM_CASES:-}"
 	if [ "$TARGET" != native ]; then
 		echo "image_id=$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{.Id}}' "$IMAGE")"
 	fi
@@ -616,7 +625,7 @@ echo "==> $TARGET: warming caches (not timed)"
 # Each package manager populates its own cache once. An install that downloads
 # is measuring the network, and the three do not share a cache.
 for warm in npm-install pnpm-install yarn-install; do
-	case " $CASES " in
+	case " $CASES ${BENCH_EXTRA_WARM_CASES:-} " in
 	*" $warm "*)
 		mkdir -p .logs
 		if ! REPS=1 run_case "$warm" > ".logs/warmup-${LABEL:-$TARGET}-$warm.out" 2>&1; then
