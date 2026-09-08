@@ -30,6 +30,13 @@ Every target runs the same case scripts against the same fixture — a pinned `n
 
 **Warm-up is attempted outside the timing loop.** Each target has its own package cache on its own storage. The 0.5.0 recording protocol attempted untimed package installations but ignored warm-up and per-repetition setup statuses. Three successful measured repetitions are required for each valid case; the first can still contain a colder access. Retained measured-case diagnostics do not retroactively verify the discarded warm-up output.
 
+The current harness retains warm-up/setup failures and rejects the affected run.
+By default, a focused package case warms only its own cache. To retain the full
+suite's combined cache preparation while measuring only npm, use
+`BENCH_EXTRA_WARM_CASES='pnpm-install yarn-install'` with `--cases npm-install`.
+These extra cases run only during untimed preparation and are recorded in the
+`.tree` metadata; they do not add measured repetitions.
+
 **The median is reported.** Not the mean, which one scheduling hiccup drags around, and not the best, which is a claim about the machine being idle.
 
 ## The cases

@@ -63,6 +63,21 @@ PATH="$WORK/bin:$PATH" HOME="$WORK/home" LIGHTER_BENCH_WORK="$WORK/run" bash "$W
 [ "$rc" -ne 0 ]
 grep -q 'FAILED: npm-install warm-up' "$WORK/warmfailed.log"
 grep -q 'synthetic warmup failure' "$WORK/.logs/warmup-warmfailed-npm-install.out"
+# Extra warm-up cases prepare caches but must not add timed observations.
+for name in npm-install pnpm-install yarn-install; do
+	cat > "$WORK/benchmarks/cases/$name.js" <<'JS'
+for (let rep = 0; rep < Number(process.env.REPS); rep++) console.log('TIME_MS 10');
+JS
+done
+PATH="$WORK/bin:$PATH" HOME="$WORK/home" LIGHTER_BENCH_WORK="$WORK/run" \
+ BENCH_EXTRA_WARM_CASES='pnpm-install yarn-install' bash "$WORK/benchmarks/run.sh" \
+ --target native --allow-noisy --label extra-warm --cases npm-install --reps 2 > "$WORK/extra-warm.log" 2>&1
+for name in npm-install pnpm-install yarn-install; do
+	grep -q '^TIME_MS 10$' "$WORK/.logs/warmup-extra-warm-$name.out"
+done
+[ "$(grep -c '^npm-install,' "$WORK/benchmarks/results/extra-warm.csv")" -eq 2 ]
+! grep -qE '^(pnpm|yarn)-install,' "$WORK/benchmarks/results/extra-warm.csv"
+grep -q '^extra_warm_cases=pnpm-install yarn-install$' "$WORK/benchmarks/results/extra-warm.tree"
 # Memory has its own background workload and must also retain its status.
 # Extract that function from the real harness, mocking only time, footprint
 # and the workload so these failure paths do not need a VM or minute waits.
