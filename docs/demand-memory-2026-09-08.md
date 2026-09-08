@@ -159,3 +159,27 @@ or a speedup. It shows the earlier historical slowdown was not reproduced in
 this matched screening of the hybrid candidate. Copying is a first observation
 on a newly materialized tree, not the median of the earlier full-suite repeats.
 The final full suite remains required.
+
+### Hybrid startup contention
+
+[Three interleaved M1 cold starts per mode](records/0.5.1/hybrid/m1-boot/)
+at 16 GiB and 8 CPUs measured Docker-ready medians of 2,502 ms for 0.5.0,
+621 ms for pure demand and 844 ms for hybrid `11ddb88`. Hybrid's 36% penalty
+over pure demand exceeds the investigation threshold. The 0.5.0 observations
+were 1,769, 2,502 and 2,645 ms; this spread remains visible in the records.
+An earlier attempt with a respawned media-analysis process was invalidated
+before selecting these results. No full hybrid suite has been started.
+
+A [separate utility-priority trial](records/0.5.1/hybrid/m1-utility-trial/)
+measured 849 ms at ordinary priority and 774 ms at utility priority, three
+interleaved cold starts each. This modest reduction does not close the gap
+to pure demand. The priority change was removed rather than selected for release.
+
+A diagnostic one-second sample of the ordinary preparation worker found 364
+of 702 stack samples in allocation, 265 in hypervisor mapping (including 41
+waiting for its internal lock), and 72 in `task_self_trap`. This is a stack
+sample distribution, not an attribution of Docker startup latency. Inspection
+found that our Rust FFI called `mach_task_self()` for every backing page,
+whereas Apple's `mach/mach_init.h` defines that C spelling as the cached
+`mach_task_self_` value. Using the same cached port removes one unnecessary
+kernel trap per page without changing ownership, preparation or reclamation.
