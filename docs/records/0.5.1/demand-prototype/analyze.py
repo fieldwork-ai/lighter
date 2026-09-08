@@ -1,10 +1,19 @@
 from pathlib import Path
-import argparse,json,statistics as st,math
+import argparse,json,statistics as st,math,hashlib
 p=argparse.ArgumentParser();p.add_argument('record',type=Path);p.add_argument('--out',type=Path,required=True);a=p.parse_args()
-env=json.loads((a.record/'environment.json').read_text());assert (a.record/'exit-code').read_text().strip()=='0';arms=[];images=[];profiles=[]
+env=json.loads((a.record/'environment.json').read_text())
+artifacts={Path(k).name:v for k,v in env['artifacts'].items()}
+patches=[(name,sha) for name,sha in artifacts.items() if name.endswith('.patch')];assert len(patches)==1
+patch=a.record/'source.patch'
+if not patch.exists():patch=a.record.parent/patches[0][0]
+assert hashlib.sha256(patch.read_bytes()).hexdigest()==patches[0][1]
+assert (a.record/'exit-code').read_text().strip()=='0';arms=[];images=[];profiles=[]
 for i,mode in enumerate(env['order'],1):
  d=a.record/f'{i}-{mode}';assert (d/'exit-code').read_text().strip()=='0';r=json.loads((d/'results.json').read_text());assert len(r)==3
- e=json.loads((d/'environment.json').read_text());assert e['mode']==mode and e['saved_container'] and not e['timing'];profiles.append([e[k] for k in ['cli_sha256','payload','cpus','memory_mib','disk_gib']]);images.append(json.loads((d/'16384-image.json').read_text())['Id'])
+ e=json.loads((d/'environment.json').read_text())
+ assert e['cli_sha256']==artifacts['lighter'] and all(sha==artifacts[name] for name,sha in e['payload'].items())
+ assert e['cpus']==env['profile']['cpus'] and e['memory_mib']==[env['profile']['memory_mib']]
+ assert e['mode']==mode and e['saved_container'] and not e['timing'];profiles.append([e[k] for k in ['cli_sha256','payload','cpus','memory_mib','disk_gib']]);images.append(json.loads((d/'16384-image.json').read_text())['Id'])
  guard=[json.loads(s) for s in (a.record/f'{i}-{mode}-guard.jsonl').read_text().splitlines()];assert all(not row.get('unexpected') for row in guard)
  quiet=[row for row in guard if row.get('phase')=='quiet'];assert len(quiet)>=6 and all(row['machine_cpu_percent']<=5 for row in quiet[-6:])
  metrics={}

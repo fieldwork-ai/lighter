@@ -52,6 +52,9 @@ kind suite including restart/persistence. An earlier hotplug-only variant
 also passed 820 Docker/HTTP stream checks. A first 16 GiB attempt failed the
 disk-space preflight before starting a VM; its logs are retained separately.
 
+[All eleven M5 functional gates](records/0.5.1/demand-prototype/m5-correctness/)
+pass at 57456cf, excluding the speed gate as instructed. The 3 GiB ballast
+check reaches a 3,573 MiB footprint and returns to 269 MiB within five seconds.
 343 workspace tests and 22 signed hardware tests pass. Hardware coverage includes
 sparse device access, four simultaneous guest CPUs, instruction retry, partial
 reclamation, reuse without duplicate accounting, and injected allocation/map

@@ -1,0 +1,57 @@
+[
+  {
+    "gate": "m1-boot",
+    "returncode": 0,
+    "elapsed_seconds": 32.57983087503817
+  },
+  {
+    "gate": "m2-devices",
+    "returncode": 0,
+    "elapsed_seconds": 4.2485748330364
+  },
+  {
+    "gate": "m3-network",
+    "returncode": 0,
+    "elapsed_seconds": 3.236482457956299
+  },
+  {
+    "gate": "m3-vsock",
+    "returncode": 0,
+    "elapsed_seconds": 39.46643333300017
+  },
+  {
+    "gate": "m3-docker",
+    "returncode": 0,
+    "elapsed_seconds": 37.98403995798435
+  },
+  {
+    "gate": "m3-streams",
+    "returncode": 0,
+    "elapsed_seconds": 36.26463795895688
+  },
+  {
+    "gate": "m3-publish",
+    "returncode": 0,
+    "elapsed_seconds": 36.574947334011085
+  },
+  {
+    "gate": "m4-fs",
+    "returncode": 0,
+    "elapsed_seconds": 45.212508084019646
+  },
+  {
+    "gate": "m6-memory",
+    "returncode": 0,
+    "elapsed_seconds": 162.03143558406737
+  },
+  {
+    "gate": "m7-amd64",
+    "returncode": 0,
+    "elapsed_seconds": 14.170146208023652
+  },
+  {
+    "gate": "m8-daily",
+    "returncode": 0,
+    "elapsed_seconds": 39.6960346250562
+  }
+]
