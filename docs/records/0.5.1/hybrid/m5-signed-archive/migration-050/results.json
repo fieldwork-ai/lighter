@@ -1,0 +1,11 @@
+{
+  "old_version": "0.5.0",
+  "new_version": "0.5.1",
+  "old_memory_kib": 4084676,
+  "new_memory_kib": 4084676,
+  "configuration_preserved": true,
+  "volume_preserved": true,
+  "restart_policy_preserved": true,
+  "explicit_restart_enforced": true,
+  "amd64": true
+}

@@ -1,0 +1,10 @@
+{
+  "source": "710bba37dcdf60a3a05ed847af25fa348abac40d",
+  "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+  "artifacts": {
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/target/release/lighter": "bdc30394cd3d4700fc42e9bee19430824118032104d5c14e7731367ff3e4ade6",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/guest/out/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71"
+  },
+  "scope": "Shared-host M5 correctness check, no quiet preflight; original reclamation and idle-CPU thresholds unchanged; selected runtime, 8 GiB guest RAM, 3 GiB ballast, 120-second idle sample."
+}

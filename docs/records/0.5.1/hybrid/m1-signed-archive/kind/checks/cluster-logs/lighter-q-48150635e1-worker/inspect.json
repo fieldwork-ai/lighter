@@ -1,0 +1,245 @@
+[
+    {
+        "Id": "de23775c84561346069a1e7a84d684f364e8ba96ddacafe078616014a8dc2d7b",
+        "Created": "2026-09-08T22:52:42.928639214Z",
+        "Path": "/usr/local/bin/entrypoint",
+        "Args": [
+            "/sbin/init"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 709,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-09-08T22:54:11.103346625Z",
+            "FinishedAt": "2026-09-08T22:54:10.9145425Z"
+        },
+        "Image": "sha256:86f6d9851d9b6d698db3f706fd503d257caae3ab79b944432894faf109513656",
+        "ResolvConfPath": "/var/lib/docker/containers/de23775c84561346069a1e7a84d684f364e8ba96ddacafe078616014a8dc2d7b/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/de23775c84561346069a1e7a84d684f364e8ba96ddacafe078616014a8dc2d7b/hostname",
+        "HostsPath": "/var/lib/docker/containers/de23775c84561346069a1e7a84d684f364e8ba96ddacafe078616014a8dc2d7b/hosts",
+        "LogPath": "/var/lib/docker/containers/de23775c84561346069a1e7a84d684f364e8ba96ddacafe078616014a8dc2d7b/de23775c84561346069a1e7a84d684f364e8ba96ddacafe078616014a8dc2d7b-json.log",
+        "Name": "/lighter-q-48150635e1-worker",
+        "RestartCount": 0,
+        "Driver": "overlay2",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "/dev/mapper:/dev/mapper",
+                "$HOME/lighter/.logs/051/hybrid-final/m1-archive-a1/kind/checks/share:/host-fixture",
+                "/lib/modules:/lib/modules:ro"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "kind",
+            "PortBindings": {},
+            "RestartPolicy": {
+                "Name": "on-failure",
+                "MaximumRetryCount": 1
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": [],
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": null,
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": true,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": [
+                "seccomp=unconfined",
+                "apparmor=unconfined",
+                "label=disable"
+            ],
+            "Tmpfs": {
+                "/run": "",
+                "/tmp": ""
+            },
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": [],
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": [],
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": null,
+            "ReadonlyPaths": null,
+            "Init": false
+        },
+        "GraphDriver": {
+            "Data": {
+                "ID": "de23775c84561346069a1e7a84d684f364e8ba96ddacafe078616014a8dc2d7b",
+                "LowerDir": "/var/lib/docker/overlay2/98d5e9c85181e9406754f8360bc614d5b062af508c5da1c661c2759dfe00cc7b-init/diff:/var/lib/docker/overlay2/2c90e4abee7c0cd16fde5a61bce2a24fb4c5fb6bd1f33594e25f7508e64467ee/diff:/var/lib/docker/overlay2/6dc69fee0760e372b7ff3c34741d7cb95942085b7cff9806f438f717f49436ca/diff",
+                "MergedDir": "/var/lib/docker/overlay2/98d5e9c85181e9406754f8360bc614d5b062af508c5da1c661c2759dfe00cc7b/merged",
+                "UpperDir": "/var/lib/docker/overlay2/98d5e9c85181e9406754f8360bc614d5b062af508c5da1c661c2759dfe00cc7b/diff",
+                "WorkDir": "/var/lib/docker/overlay2/98d5e9c85181e9406754f8360bc614d5b062af508c5da1c661c2759dfe00cc7b/work"
+            },
+            "Name": "overlay2"
+        },
+        "Mounts": [
+            {
+                "Type": "bind",
+                "Source": "$HOME/lighter/.logs/051/hybrid-final/m1-archive-a1/kind/checks/share",
+                "Destination": "/host-fixture",
+                "Mode": "",
+                "RW": true,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "bind",
+                "Source": "/lib/modules",
+                "Destination": "/lib/modules",
+                "Mode": "ro",
+                "RW": false,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "volume",
+                "Name": "30e884d064bf4845ad842dd295d4c19cf0c335245589f46625c780ed47d2fac2",
+                "Source": "/var/lib/docker/volumes/30e884d064bf4845ad842dd295d4c19cf0c335245589f46625c780ed47d2fac2/_data",
+                "Destination": "/var",
+                "Driver": "local",
+                "Mode": "",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "bind",
+                "Source": "/dev/mapper",
+                "Destination": "/dev/mapper",
+                "Mode": "",
+                "RW": true,
+                "Propagation": "rprivate"
+            }
+        ],
+        "Config": {
+            "Hostname": "lighter-q-48150635e1-worker",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "Tty": true,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "KIND_EXPERIMENTAL_CONTAINERD_SNAPSHOTTER",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "container=docker",
+                "HTTP_PROXY=",
+                "HTTPS_PROXY=",
+                "NO_PROXY="
+            ],
+            "Cmd": null,
+            "Image": "kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5",
+            "Volumes": {
+                "/var": {}
+            },
+            "WorkingDir": "/",
+            "Entrypoint": [
+                "/usr/local/bin/entrypoint",
+                "/sbin/init"
+            ],
+            "OnBuild": null,
+            "Labels": {
+                "io.x-k8s.kind.cluster": "lighter-q-48150635e1",
+                "io.x-k8s.kind.role": "worker"
+            },
+            "StopSignal": "SIGRTMIN+3"
+        },
+        "NetworkSettings": {
+            "Bridge": "",
+            "SandboxID": "cedc5ddda4d2baa4461a0e04a0adabc9b2f919f88be0ca466f3a4bd6800bd6cb",
+            "SandboxKey": "/var/run/docker/netns/cedc5ddda4d2",
+            "Ports": {},
+            "HairpinMode": false,
+            "LinkLocalIPv6Address": "",
+            "LinkLocalIPv6PrefixLen": 0,
+            "SecondaryIPAddresses": null,
+            "SecondaryIPv6Addresses": null,
+            "EndpointID": "",
+            "Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "MacAddress": "",
+            "Networks": {
+                "kind": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": null,
+                    "MacAddress": "56:9d:45:b9:ff:cf",
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "6c2ca48c4f05d7354a39d962e474a94388f9079c4d222b8713180f6fb3f79b5a",
+                    "EndpointID": "5dca348248bf43ccf1b4e376f272ec7481ee69e2705769fc141f42b069da60b9",
+                    "Gateway": "172.18.0.1",
+                    "IPAddress": "172.18.0.3",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "fc00:f853:ccd:e793::1",
+                    "GlobalIPv6Address": "fc00:f853:ccd:e793::3",
+                    "GlobalIPv6PrefixLen": 64,
+                    "DNSNames": [
+                        "lighter-q-48150635e1-worker",
+                        "de23775c8456"
+                    ]
+                }
+            }
+        }
+    }
+]

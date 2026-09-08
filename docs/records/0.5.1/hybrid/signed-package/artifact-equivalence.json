@@ -1,0 +1,36 @@
+{
+  "archive_sha256": "414ba7f95f9cde1b895d7aa5982d9d5791882359b49b06c6ad2682454092169b",
+  "bootstrap_sha256": "1ae3bbc7bef22197645b6258fdc6b957df180ec542d856405404bf8396f8db7b",
+  "qualification_source": "e0f4b16b6d1dde9a01b1c2fee03f97222101de04",
+  "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+  "guest": {
+    "Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71"
+  },
+  "unsigned_code": {
+    "bin/lighter": "6be5872b1ffb614783bd17676cad63dc2b2fd52d0744c6b3f39c988a1b6b7e6c",
+    "share/lighter/lighter.app/Contents/MacOS/lighter": "6be5872b1ffb614783bd17676cad63dc2b2fd52d0744c6b3f39c988a1b6b7e6c"
+  },
+  "signing_mapping": {
+    "qualified": {
+      "signed_vmsize": 540672,
+      "signed_filesize": 540560,
+      "unsigned_filesize": 514472,
+      "canonical_vmsize": 524288
+    },
+    "bin/lighter": {
+      "signed_vmsize": 557056,
+      "signed_filesize": 540688,
+      "unsigned_filesize": 514472,
+      "canonical_vmsize": 524288
+    },
+    "share/lighter/lighter.app/Contents/MacOS/lighter": {
+      "signed_vmsize": 557056,
+      "signed_filesize": 540720,
+      "unsigned_filesize": 514472,
+      "canonical_vmsize": 524288
+    }
+  },
+  "equivalence_method": "Remove signatures; verify original LINKEDIT vmsize equals 16 KiB-rounded signed filesize; normalize only that derived field to the unsigned filesize; require every remaining byte to match.",
+  "release_source": "11e7ec0f2fd1f3d442f7989027ddef8099b9d36e"
+}

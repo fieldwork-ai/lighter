@@ -1,0 +1,168 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "Namespace",
+      "metadata": {
+        "name": "qualification"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "data",
+        "namespace": "qualification"
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "resources": {
+          "requests": {
+            "storage": "64Mi"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "web",
+        "namespace": "qualification"
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app": "web"
+          }
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "web"
+            }
+          },
+          "spec": {
+            "nodeSelector": {
+              "kubernetes.io/hostname": "lighter-q-541b841572-worker"
+            },
+            "tolerations": [
+              {
+                "operator": "Exists"
+              }
+            ],
+            "containers": [
+              {
+                "name": "web",
+                "image": "lighter-q-541b841572:local",
+                "imagePullPolicy": "Never",
+                "resources": {
+                  "requests": {
+                    "cpu": "10m",
+                    "memory": "32Mi"
+                  },
+                  "limits": {
+                    "memory": "128Mi"
+                  }
+                },
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/",
+                    "port": 8080
+                  },
+                  "periodSeconds": 1
+                },
+                "volumeMounts": [
+                  {
+                    "name": "data",
+                    "mountPath": "/data"
+                  },
+                  {
+                    "name": "mac",
+                    "mountPath": "/mac"
+                  }
+                ]
+              }
+            ],
+            "volumes": [
+              {
+                "name": "data",
+                "persistentVolumeClaim": {
+                  "claimName": "data"
+                }
+              },
+              {
+                "name": "mac",
+                "hostPath": {
+                  "path": "/host-fixture",
+                  "type": "Directory"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "web",
+        "namespace": "qualification"
+      },
+      "spec": {
+        "type": "NodePort",
+        "selector": {
+          "app": "web"
+        },
+        "ports": [
+          {
+            "name": "http",
+            "port": 80,
+            "targetPort": 8080,
+            "nodePort": 30080
+          },
+          {
+            "name": "udp",
+            "port": 8081,
+            "targetPort": 8081,
+            "nodePort": 30081,
+            "protocol": "UDP"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "name": "client",
+        "namespace": "qualification"
+      },
+      "spec": {
+        "nodeName": "lighter-q-541b841572-control-plane",
+        "tolerations": [
+          {
+            "operator": "Exists"
+          }
+        ],
+        "containers": [
+          {
+            "name": "client",
+            "image": "lighter-q-541b841572:local",
+            "imagePullPolicy": "Never",
+            "command": [
+              "sleep",
+              "7200"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

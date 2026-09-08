@@ -1,0 +1,32 @@
+[
+  {
+    "stage": "fresh-smoke",
+    "exit_code": 0,
+    "seconds": 17.82
+  },
+  {
+    "stage": "migration-050",
+    "exit_code": 0,
+    "seconds": 51.04
+  },
+  {
+    "stage": "migration-041",
+    "exit_code": 0,
+    "seconds": 37.44
+  },
+  {
+    "stage": "activation-rollback",
+    "exit_code": 0,
+    "seconds": 95.27
+  },
+  {
+    "stage": "development-update-lifecycle",
+    "exit_code": 0,
+    "seconds": 15.61
+  },
+  {
+    "stage": "signed-kind",
+    "exit_code": 0,
+    "seconds": 132.91
+  }
+]

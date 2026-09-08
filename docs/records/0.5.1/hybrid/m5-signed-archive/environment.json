@@ -1,0 +1,15 @@
+{
+  "host": "m5",
+  "artifacts": {
+    "$HOME/git/lighter/dist/lighter-0.5.1-arm64.tar.gz": "414ba7f95f9cde1b895d7aa5982d9d5791882359b49b06c6ad2682454092169b",
+    "$HOME/git/lighter/dist/lighter-0.5.1-arm64": "1ae3bbc7bef22197645b6258fdc6b957df180ec542d856405404bf8396f8db7b",
+    "$HOME/git/lighter/dist/lighter-0.4.1-arm64.tar.gz": "2f14375ef2ea1e065de856de39cb00c84489ff208e350333d31d5717861e3a9b",
+    "$HOME/git/lighter/dist/lighter-0.5.0-arm64.tar.gz": "4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52",
+    "$HOME/git/lighter/.logs/051/hybrid-final-helpers/fixtures/future-good.tar.gz": "ae6c5c8ea3bc3c20ed95902b0e6bb525d9cb37bb6e045e7135299f92a6055855",
+    "$HOME/git/lighter/.logs/051/hybrid-final-helpers/fixtures/future-bad.tar.gz": "11147fa7c6a5c803d9ec32bea20ee55778e2501a8f9a06200ad2ae2284d23183"
+  },
+  "daily_before": {
+    "config.json": "9c2f68f4b74f4c99affcbddbd837d8034834dad1a7f3fdb1aec0adca03757efa"
+  },
+  "source": "11e7ec0f2fd1f3d442f7989027ddef8099b9d36e"
+}
