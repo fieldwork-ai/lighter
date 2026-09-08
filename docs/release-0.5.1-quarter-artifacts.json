@@ -1,6 +1,6 @@
 {
   "version": "0.5.1",
-  "publication": "Qualified unpublished candidate; stable publication follows dev-to-main review and merge.",
+  "publication": "Superseded quarter-RAM candidate. Do not publish these assets as the final hybrid release.",
   "runtime_source": "67d787b5910e0dd68b7564d4716fe3b7b0126d1d",
   "build_source": "dc94d5abf3f4537a12619654eae4322bbcf39151",
   "packaging_source": "e5452e24e19c5c454702531bd18ce4331d64da42",

@@ -11,11 +11,13 @@ startup experiments. [Every observation and historical comparison](../benchmarks
 and [the design, trade-offs and functional checks](demand-memory-2026-09-08.md)
 remain available.
 
-A focused M5 old/new copy/deletion comparison is in progress because those
-full-suite medians exceed the historical 0.5.0 record. The fresh full suite
-remains the selected primary; interrupted attempts and shared-host diagnostics
-are retained separately. The earlier M1 focused package follow-ups did not
-reproduce a consistent slowdown.
+The focused M5 copy slowdown did not reproduce. Deletion's retained sample
+measured 3,015 versus 2,830 ms (+6.5% by median), but its version effect remains
+inconclusive against substantial host/workload variation. The full hybrid suite
+spans 2,642–3,662 ms for deletion. Noise is plausible; a small version effect
+has not been isolated or excluded. This is not labelled an established
+regression or an accepted performance cost. The original full suite remains
+the primary, and later informal repetitions are excluded.
 
 Final hybrid archives still need to be built, signed, notarized and checked
 through fresh installation, migration, rollback, kind and Homebrew. Both PRs

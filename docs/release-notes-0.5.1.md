@@ -16,7 +16,9 @@ Release qualification includes one full benchmark suite on each of M1 and
 M5, with three repetitions per timed case. The README uses the new M5 Lighter
 measurements alongside the retained 0.5.0-release competitor measurements.
 See the performance report for all observations, workload differences and
-focused follow-ups; there is no blanket workload speedup claim.
+focused follow-ups; there is no blanket workload speedup claim. A focused host-share deletion
+sample was 6.5% higher than 0.5.0; substantial run variation leaves that small
+version difference inconclusive.
 
 The benchmark harness now retains Docker startup failures and stops its
 private VM even when a warm-up fails. Release archives use portable regular
