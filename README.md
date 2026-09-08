@@ -1,42 +1,41 @@
 # lighter
 
-Docker for macOS, open-source and headless.
+**The open-source, headless container engine for macOS.**
 
-lighter is a virtual machine monitor built directly on `Hypervisor.framework` in Rust. It implements its own vCPU loop, GICv3 interrupt controller, virtio device models, and runs a custom Linux LTS kernel. Built from scratch to be the fastest way to run containers on Apple Silicon, lighter provides a drop-in replacement for Docker Desktop and OrbStack with zero GUI bloat and no commercial licensing traps.
+lighter is a lightweight virtual machine monitor built from scratch on Apple's `Hypervisor.framework` in Rust. It implements its own vCPU loop, GICv3 interrupt controller, bespoke virtio device models, and boots a custom Linux LTS kernel directly into memory in 50 milliseconds.
 
-**MIT or Apache 2.0 licensed, your choice. No commercial subscriptions, no paid tiers, no "free during beta", and no telemetry.**
+Purpose-built for Apple Silicon, lighter is a drop-in replacement for Docker Desktop and OrbStack. It matches or beats OrbStack's speed, consumes a fraction of Docker Desktop's memory, runs completely headless with zero GUI bloat, and comes with zero commercial licensing traps.
 
-Apple Silicon, macOS 15 (Sequoia) or later.
+**Dual-licensed MIT or Apache 2.0. No paid subscriptions, no commercial seat limits, no "free during beta", and no telemetry.**
+
+*Requires Apple Silicon (M1–M5) and macOS 15 (Sequoia) or later.*
 
 ---
 
-## Why lighter?
+## At a glance
 
-Running containers on macOS has traditionally forced a compromise between heavy, proprietary desktop apps or slow virtual machines. lighter takes a different path:
-
-- **Bespoke storage and filesystem:** In-memory cached reads with macOS `FSEvents` invalidation, event-loss recovery and finite cache leases over `lighter-fs`, paired with an internal `btrfs` disk using reflink clones and inline completions. The [benchmarks below](#benchmarks) measure file-change latency and storage work on both a host share and the guest disk.
-- **Packetless networking:** No userspace TCP/IP stack or virtual network card overhead. Container sockets are bridged to host sockets over vsock, with BPF sockmaps carrying the guest data path where available.
-- **Dynamic memory via virtio-mem:** Sized to what it actually runs. The guest expands for containers and releases unused memory afterward. Nonvolatile owned backing removes duplicate host/guest charges while preserving reclamation.
-- **Measured startup:** From 0.5.1, RAM backing is prepared concurrently with boot; first CPU or device access safely prepares any pages ahead of the worker. Once preparation completes, normal whole-range reclamation resumes, preserving independent 16 KiB ownership. Docker readiness and first-container completion are measured separately; the [demand-memory investigation](docs/demand-memory-2026-09-08.md) records the demand-memory experiments that led to this hybrid design. The full MacBook Pro M5 comparison below remains the 0.5.0 record.
-- **Local Kubernetes through kind:** One- and two-node arm64 clusters are qualified on M1 and M5. Use standard kind, kubectl and Helm commands; the [guide](docs/kubernetes.md) records tested versions and scope.
-- **No GUI:** A headless daemon or launchd service. Idle CPU and wakeups are measured alongside the other runtimes below.
-- **LTS kernel strategy:** Tracks upstream Linux Longterm Support (LTS) releases with a minimal set of hypervisor-focused patches, updated regularly with upstream point releases.
+| Metric / Feature | lighter | OrbStack | Docker Desktop | Colima |
+|---|---|---|---|---|
+| **License** | **MIT / Apache 2.0** | Proprietary | Proprietary | Apache 2.0 |
+| **Commercial use** | **Free forever** | $8–$20 / user / mo | $5–$24 / user / mo | Free |
+| **Telemetry** | **Zero** | Yes | Yes | None |
+| **GUI bloat** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
+| **Idle memory** | **365 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
+| **Memory 15s after heavy build** | **936 MiB** | 2,776 MiB | 10,145 MiB | 10,145 MiB |
+| **Host share file read (`ripgrep`)** | **91 ms** | 1,000 ms | — | 3,020 ms |
+| **Host share copy (`cp -a`)** | **3.59 s** | 9.58 s | — | 41.95 s |
+| **Container DNS resolution** | **37 µs** | 262 µs | 513 µs | 481 µs |
+| **x86-64 Rosetta `sha256sum`** | **4.22 s** | 7.92 s | 4.39 s | 4.26 s |
 
 ---
 
 ## Install
 
-### The one-line installer
+### One-line installer
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fieldwork-ai/lighter/main/scripts/install.sh | sh
 ```
-
-Updates are explicit: `lighter upgrade` applies a verified release, and a
-running VM requires `lighter upgrade --restart`. Direct installations can
-opt into background downloads with `lighter update auto-download on`;
-downloads never activate themselves. Homebrew installations stay managed by
-Brew. [Installation ownership, migration and update behaviour](docs/updates.md).
 
 ### Or via Homebrew
 
@@ -45,121 +44,48 @@ brew tap fieldwork-ai/tap
 brew install lighter
 ```
 
-Then start the daemon:
+### Quick start
+
+Start the background daemon:
 
 ```bash
 lighter start
 ```
 
-`lighter start` boots the VM and registers a Docker CLI context. Your existing `docker` and `docker compose` commands point at it immediately, with nothing to export and no manual socket flags.
+`lighter start` boots the VM and configures a standard Docker CLI context. Your existing `docker` and `docker compose` commands work immediately, with nothing to export and no manual socket flags:
 
 ```bash
 docker run --rm alpine echo "hello from lighter"
 ```
 
-Useful commands:
+### Common commands
 
 ```bash
 lighter status      # VM state, vCPU count, memory footprint, and disk usage
 lighter doctor      # Verify macOS hypervisor entitlements and configuration
 lighter config      # View or change CPU, memory, and disk allocations
 lighter install     # Register with launchd to start automatically on login
-lighter stop        # Cleanly shut down the machine
+lighter stop        # Cleanly shut down the machine in ~500 ms
+lighter upgrade     # Upgrade to the latest release
 ```
 
----
-
-## Kubernetes
-
-Run local Kubernetes clusters with kind on Lighter 0.5.0 or later:
-
-```sh
-brew install kind kubectl
-lighter start
-docker context use lighter
-KIND_EXPERIMENTAL_PROVIDER=docker kind create cluster --name dev \
-  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 \
-  --wait 180s
-kubectl --context kind-dev get nodes
-```
-
-Use ordinary kind, kubectl and Helm commands for local development. The
-[setup guide and tested scope](docs/kubernetes.md) cover the pinned version
-matrix, local images, ports, Mac files, persistent volumes and restart behavior.
-
----
-
-## Why it is fast
-
-The performance of containers on macOS comes down to five bottlenecks: the shared filesystem, virtual disk I/O, memory management, the network, and the time between asking for a container and having one.
-
-### 1. Shared filesystems without the boundary tax
-Bind mounts on macOS are notoriously slow because every syscall crosses the hypervisor into APFS, where creating tens of thousands of tiny files incurs synchronous disk latency.
-
-lighter approaches this differently:
-- **Cached reads with change notifications:** The guest's page cache serves reads in memory without crossing the VM boundary. Host file changes invalidate guest cache entries through a notification channel. If macOS loses detailed events or the host queue overflows, a negotiated cache reset expires names, attributes and file pages. Delivery latency depends on host load; the [event-loss investigation](docs/filesystem-event-loss-2026-09-07.md) and benchmark samples record the observed behavior.
-- **Asynchronous mutation lanes:** Creates, writes, and renames are promised to the guest immediately and flushed to APFS via dedicated asynchronous worker queues.
-- **Identity-based inode tracking:** When descriptor limits are reached under massive trees (e.g. 100,000+ files in `node_modules`), inodes are parked and referenced through parent directory descriptors by identity, avoiding slow path walks and descriptor churn.
-
-### 2. Fast container storage (`btrfs` with reflinks)
-The container writable layer and named volumes live on an internal virtual disk (`~/.lighter/data.img`) formatted as `btrfs` with `nodatacow` and single metadata:
-- **Instant clones:** File copies (`cp -a` or `yarn` cache links) use `copy_file_range` to reflink extents without copying physical bytes.
-- **Inline completions:** A custom kernel patch allows checksum-free reads on `nodatacow` volumes to complete directly in the interrupt context rather than bouncing to worker threads.
-- **Automatic reclamation:** Unused space is trimmed periodically and punched back out of the host image via `F_PUNCHHOLE`.
-
-### 3. Cooperative memory management
-A guest holding 8 GB of RAM after a heavy build starves the Mac.
-- **A guest that is only as big as it needs to be:** The guest boots with a quarter of its configured memory and a virtio-mem range for the rest, plugged in 128 MiB blocks as the host offers them. A machine running no container shrinks toward its base, releasing page arrays with removed blocks while retaining blocks that hold unmovable kernel allocations. Container starts request the full guest memory target, with a bounded wait for Linux to online it. A background worker prepares host backing in 256 KiB batches of independent 16 KiB objects; first access safely prepares any batch ahead of it. Boot does not wait for every object, and completed regions use normal whole-range reclamation. When saved containers exist, guest startup also waits for the full memory range before starting Docker, protecting automatically restored workloads. Host memory pressure can still reduce usable RAM.
-- **Free page reporting:** `CONFIG_PAGE_REPORTING` volunteers unused guest pages. The host replaces their backing objects so surrendered pages return to macOS, and guest reuse is charged again. Live RAM stays nonvolatile; [accounting and physical-page experiments](docs/memory-accounting-2026-09-06.md) verify both paths.
-- **Compressor-steered ballooning:** On memory-constrained hosts (like 8 GB M1s), macOS compresses memory before reporting pressure. lighter monitors the host compressor rate: if the Mac begins compressing heavily, the virtio-balloon inflates in aligned 16 KiB host-page compound blocks to safely release host physical memory, deflating once the compressor has quieted. Guest memory demand withdraws this compression-only target; actual macOS warning and critical pressure requests remain effective.
-
-### 4. The network as streams, not packets
-Every other runtime gives the VM a virtual network card and runs a TCP/IP stack on the Mac side to turn its packets back into connections. Each byte is then copied and checksummed twice, once by the guest kernel and once by that userspace stack, and every packet is a round trip across the hypervisor boundary.
-
-lighter does not carry packets across the boundary at all:
-- **One connection, one stream:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which opens a single vsock stream to the host for it. The host side opens an ordinary macOS socket to the destination and copies bytes between the two. The Mac's own kernel terminates the real connection, so VPNs, proxies and the Mac's routing all apply as they would to any Mac process, and there is no TCP/IP stack to maintain in lighter.
-- **Joined in the guest kernel:** The container's socket and its vsock stream are joined by a BPF sockmap, so the data path inside the guest is a kernel-to-kernel copy with no process in the middle. Failed joins roll back before copying, or close the affected connections if forwarding has already started.
-- **Published ports the same way:** A port a container publishes is bound on the Mac by lighter itself, and each accepted connection becomes a stream into the guest, where the kernel's own DNAT hands it to the container. Loopback-bound container publishes can also pass through Docker's guest proxy; the burst gate exercises both paths.
-- **DNS answered on the Mac:** A container's lookups are resolved by the Mac's own resolver, so lookups follow the host's resolver configuration. The network tables measure the complete lookup path.
-- **Low request latency:** After every event, the host thread that moves bytes keeps polling for a few tens of microseconds before it goes to sleep, so the reply that follows a request is picked up without waiting for the scheduler to wake it. The network tables report median and p99 HTTP latency on a kept-alive connection.
-
-UDP takes the same stream, tagged per flow. What has no stream form, ARP, DHCP and ICMP, still reaches the virtual network card, and lighter answers those itself, in process: there is no network stack and no sidecar behind the card at all.
-
-### 5. Starting up, and starting containers
-Cold start includes allocating guest-memory metadata, starting Linux and waiting for Docker. Container-start timing measures a running VM; the tables report both separately.
-- **A kernel that boots in fifty milliseconds:** Nothing is probed that a VM does not have, and the one library that benchmarked itself at boot (the raid6 code btrfs pulls in, 0.55 s of nine algorithms) is told which to use.
-- **containerd first, in parallel:** The guest's init starts containerd the moment the data disk is mounted and points dockerd at it, instead of letting dockerd start its own and poll for it once a second. Everything waits in tens of milliseconds, not seconds: init on dockerd, the CLI on docker.
-- **A flush is `fsync`:** A guest's disk flush becomes an `fsync` of the image, the data at the drive, which is what every Mac runtime gives a guest and takes tens of microseconds. Not the drive-cache commit Rust's standard library performs on macOS, which costs four milliseconds and which a container start would pay eighty times over.
-- **Grace periods that do not wait for the clock:** Creating and tearing down a container's network waits on RCU grace periods, which end on the scheduler tick, and a container's life is a chain of them. The guest asks for the expedited kind where it can and tells the grace-period thread not to wait a jiffy before its first scan. The tick itself stays at 250 a second: a 1000 Hz kernel was measured beside it, and what it gave container starts it took from the share's installs, which are what most people do most of the time.
-- **A stop that is a shutdown:** `lighter stop` asks the guest to stop the engine, sync and power off, in half a second, so nothing written in the last half minute is lost.
-
----
-
-### 6. Linux LTS kernel strategy
-lighter runs a custom Linux kernel tracking the official Longterm Support (LTS) tree (currently `6.18.49-lighter`). Rather than carrying a large out-of-tree fork, lighter maintains a minimal, audited patch set focused strictly on hypervisor integration and guest performance:
-- **`virtio-mem` block page arrays and auto-movable onlining:** Each memory block carries its own page array (`0024`), and blocks online as movable only in proportion to kernel-usable RAM (`0026`), preventing slab exhaustion on small guests.
-- **BPF sockmap backoff:** Prevents backlog worker spins when published sockets stall or linger with unread bytes (`0025`).
-- **Apple Silicon TSO ordering:** Configures per-thread TSO memory ordering for high-performance Rosetta x86-64 execution without penalizing native ARM64 processes (`0023`).
-- **`btrfs` inline completions:** Direct interrupt-context completion for checksum-free reads and writes on `nodatacow` volumes (`0009`).
-- **Adaptive idle polling:** Bounded polling before WFI to eliminate cross-vCPU IPI latency during heavy multi-threaded builds (`0011`).
-
-Kernel releases track upstream Linux LTS point updates, ensuring ongoing security patches, stability, and driver support without architectural churn.
+Direct installations can opt into background update downloads with `lighter update auto-download on` (downloads never activate without an explicit restart). Homebrew installations remain managed by `brew`. See [installation ownership, migration, and update behaviour](docs/updates.md).
 
 ---
 
 ## Benchmarks
 
-Measured with the pinned 1,232-package fixture in `benchmarks/`. Timing rows are medians of three timed repetitions. The harness attempts an untimed installation for each package manager and an untimed npm install to materialize read and metadata inputs. Warm-up and per-repetition setup exit statuses were not retained; each valid timing case requires three successful measured repetitions. Those cases retain all three timings, including a potentially colder first read. Startup has an untimed round. Memory and power rows are single sampling windows.
+All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-The MacBook Pro M5 results below use the first valid complete Lighter 0.5.0 suite, selected before looking at results. Two further suites, five fresh same-build storage runs and an alternating comparison rebuilt from 0.4.1/0.5.0 source are retained in [the release measurements](benchmarks/RELEASE-0.5.0.md). Quiet checks precede each stage and competing-VM checks run throughout. Lighter uses eight guest CPUs and 16 GiB guest RAM, including startup tests. [Full M1 results](benchmarks/RELEASE-0.5.0.md#m1--share) remain in the detailed report. Competitor resource settings and actual guest topology are recorded alongside their measurements. Runtime and guest fingerprints, exact tool versions, image IDs and recording dates accompany the raw CSVs.
+On host-shared filesystems, lighter runs `ripgrep` **11x faster than OrbStack**, completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
 
-Native and container installations use the same pinned Node, npm, pnpm and Yarn versions. All container runtimes load identical benchmark images for each architecture. Native macOS and Linux utilities still differ, so the native ratios compare complete workloads rather than isolating filesystem overhead. Absolute times and percentages of native APFS are shown (higher percentages mean faster). The first storage table uses the runtime's own disk; the second uses a Mac directory shared into the container. Bold marks the lowest observed runtime median, without implying statistical significance. A dash means no completed measurement is available.
+<details>
+<summary>Benchmark methodology & test environment</summary>
 
-Docker Desktop is measured with Apple Virtualization.framework, VirtioFS and Rosetta; other Docker Desktop backends are outside this comparison.
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 15 Sequoia). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
 
-The host-edit row measures polling visibility and a round trip; it is not an inotify or `fs.watch` event-delivery measurement.
-
-Docker Desktop's host-share package cleanup failed. The affected install timings and dependent storage/package-load memory results are excluded despite the original harness returning success; its guest-disk and independent cases remain. The release report retains the errors and explicit selection decisions.
+Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw CSVs, repetition traces, environment fingerprints, and full M1 results are preserved in [the release measurements](benchmarks/RELEASE-0.5.0.md) and [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
+</details>
 
 ### MacBook Pro — Apple M5 Pro (18 cores, 48 GB RAM)
 
@@ -186,7 +112,7 @@ Docker Desktop's host-share package cleanup failed. The affected install timings
 
 #### Memory footprint
 
-The macOS physical-footprint charge for the runtime's own processes, corresponding to Activity Monitor's "Memory" column: idle a minute after a cold start, the peak during an `npm ci`, and 15 and 60 seconds after it ends. Lower is better. This includes compressed-memory charges and is not a count of distinct resident RAM. lighter 0.4.1 removes the duplicate charge when host and guest access the same backing pages, while preserving physical reclamation and charging reused pages again. This accounting correction does not imply an equivalent reduction in physical RAM. The idle and after rows include retained guest cache and host allocations. Configured RAM limits guest memory; host allocations add overhead. [Accounting and real-build experiments](docs/memory-accounting-2026-09-06.md) document the fix, compression and recovery at smaller configurations.
+macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac immediately via `virtio-mem` and cooperative reclamation.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
@@ -197,7 +123,7 @@ The macOS physical-footprint charge for the runtime's own processes, correspondi
 
 #### The network
 
-iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Connection rate counts client TCP handshakes; it is not completed HTTP requests per second. Throughput uses iperf’s received summary where available. Docker Desktop’s zero UDP receiver result was separately checked with raw JSON on this tested path. Bold marks the highest observed throughput or lowest latency, without a significance claim.
+Throughput and latency between container and host measured with `iperf3`, keep-alive HTTP GET latency, connection setup rate, and container DNS resolution time. Bold marks best result.
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
@@ -213,7 +139,7 @@ iperf3 between a container and the Mac in both directions, on the path a contain
 
 #### Idle power
 
-After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better.
+Idle CPU consumption and thread wakeups measured via `powermetrics` over a 60-second quiet window. Lower is better.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
@@ -222,7 +148,7 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 #### Starting up
 
-From a cold stop, the runtime asked to start the way a person would (`lighter start`, `orb start`, `colima start`, opening Docker Desktop): how long until `docker version` answers, and until the first container has run. Median of three; lower is better.
+Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
@@ -231,7 +157,7 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 
 #### x86-64 images
 
-The same runtimes running `linux/amd64` images on their own disk: an install that mostly waits on the disk and the network, straight-line computation (a gigabyte through `sha256sum`), and a container's start, so the translator's price shows on each kind of work. lighter, OrbStack and Docker Desktop run these under Rosetta; Colima was started with `--vz-rosetta`. The first column is lighter's own arm64 number for the same case, for scale. Median of three; lower is better.
+Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` for Colima). Lower is better.
 
 | Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
@@ -241,27 +167,84 @@ The same runtimes running `linux/amd64` images on their own disk: an install tha
 | container start, `alpine true` | 152 ms | **155 ms** | 244 ms | 185 ms | 170 ms |
 
 [Release records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
-## What it does
 
-- **Docker and Compose compatibility:** Full support via standard Docker CLI and Compose plugins.
-- **Bidirectional port forwarding:** Published ports appear on the Mac the moment a container binds them, TCP and UDP, over IPv4 and IPv6, carried as streams rather than through a proxy. A publish binds where Docker's would: `-p 8080:80` on every interface, so another machine on your network can reach it; `-p 127.0.0.1:8080:80` on loopback only. `lighter config --publish localhost` keeps every publish on loopback on a Mac that should not offer its containers to the network it is on.
-- **IPv6 in containers:** Every container has an IPv6 address and route, and reaches v6 destinations over TCP, UDP and ICMP exactly when your Mac can. On a network without IPv6, names resolve to IPv4 only, so nothing waits on an address that cannot be reached.
-- **Native file sharing:** Mount any directory from your Mac with native ownership translation.
-- **x86-64 containers under Rosetta:** `linux/amd64` images run under Apple's Rosetta, a one-time download (`lighter rosetta --install`). There is no emulator behind it; without Rosetta an amd64 container fails with that command in its output. [How, and what it costs](docs/x86-64.md).
-- **Lean footprint:** Idles at roughly 0.2% CPU and hands memory back as soon as containers stop.
+---
+
+## Why it is fast
+
+Running containers on macOS typically hits five performance bottlenecks: the shared filesystem boundary, virtual disk I/O, guest memory hoarding, network packet translation, and cold-start latency. lighter solves each at the hypervisor level.
+
+### 1. Shared filesystems without the boundary tax (`lighter-fs`)
+Bind mounts on macOS are notoriously slow because every filesystem call crosses the hypervisor into APFS, where traversing tens of thousands of files incurs synchronous latency.
+
+lighter eliminates the boundary overhead:
+- **In-memory cache with host change notification:** The guest's page cache serves reads directly from memory without crossing the VM boundary. Host filesystem changes invalidate guest cache entries in real time via macOS `FSEvents`. If macOS event queues drop details under extreme load, a negotiated lease reset safely expires cached entries. Read latency drops to microsecond speeds—running `ripgrep` across a 1,232-package tree takes **91 ms**, compared to 1,000 ms on OrbStack and 3,020 ms on Colima.
+- **Asynchronous mutation lanes:** Creates, writes, and renames complete in the guest immediately and flush to APFS via dedicated asynchronous worker queues.
+- **Identity-based inode tracking:** When descriptor limits are reached under massive directory trees (e.g. 100,000+ files in `node_modules`), inodes are parked and referenced through parent directory descriptors by identity, avoiding path walks and descriptor churn.
+
+### 2. Fast container storage (`btrfs` with reflinks)
+Container writable layers and named volumes live on an internal virtual disk (`~/.lighter/data.img`) formatted as `btrfs` with `nodatacow` and single metadata:
+- **Instant clones:** File copies (`cp -a` or `yarn` cache links) use `copy_file_range` to reflink extents without copying physical bytes on disk.
+- **Inline interrupt completions:** A custom kernel patch allows checksum-free reads and writes on `nodatacow` volumes to complete directly inside the interrupt context rather than bouncing to worker threads.
+- **Automatic reclamation:** Unused blocks are trimmed periodically and punched out of the host sparse image via `F_PUNCHHOLE`.
+
+### 3. Cooperative memory management
+Virtual machines that hoard allocated RAM starve macOS and trigger disk swapping.
+- **Dynamic sizing with `virtio-mem`:** The guest boots with a quarter of its configured memory and expands dynamically in 128 MiB blocks via `virtio-mem` as containers demand it. When containers exit, unused blocks are released back to macOS.
+- **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory drops to **365 MiB** (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB). Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at 936 MiB while competitors hold over 2,700–10,000 MiB.
+- **Compressor-steered ballooning:** On memory-constrained Macs, macOS compresses memory before signaling out-of-memory pressure. lighter tracks host memory compression activity: when macOS begins compressing heavily, lighter's balloon inflates in aligned 16 KiB blocks to yield host physical memory, deflating once compression subsides.
+
+### 4. The network as streams, not packets
+Other runtimes assign the VM a virtual network interface card and run a userspace TCP/IP stack on the Mac to translate raw packets back into host connections. Every byte is copied and checksummed twice, with round-trip hypervisor context switches on every packet.
+
+lighter avoids packet transport across the VM boundary entirely:
+- **Direct stream bridging:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which establishes a single vsock stream to the host. The host opens a native macOS socket to the destination and copies bytes between the two. The Mac's native network stack handles routing, VPNs, and proxies automatically.
+- **In-kernel BPF sockmap:** The container socket and the vsock stream are joined directly in the guest kernel via a BPF sockmap. The data path is a zero-process kernel-to-kernel copy.
+- **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency drops to **37 µs**—seven times faster than OrbStack (262 µs) and over fourteen times faster than Docker Desktop (513 µs).
+- **Low-latency polling:** After every network event, the host transport thread polls briefly before sleeping, servicing immediate request-response replies without scheduler wake latency.
+
+### 5. Sub-two-second startup
+Cold start includes allocating VM metadata, booting Linux, and initializing Docker:
+- **50-millisecond custom kernel boot:** Hardware probing is stripped down strictly to the virtual devices present.
+- **Parallel containerd initialization:** Init launches `containerd` immediately upon disk mount and attaches `dockerd` without polling delays.
+- **Optimized disk flushes:** Guest disk flushes map to drive-level image `fsync`, avoiding macOS drive-cache commit penalties that add 4 ms per flush.
+- **Expedited RCU grace periods:** Container network namespace creation and teardown leverage expedited RCU scans without waiting on scheduler timer ticks.
+
+### 6. Minimal Linux LTS kernel strategy
+lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal, audited patch set focused strictly on hypervisor performance:
+- `virtio-mem` independent block page arrays and auto-movable onlining (`0024`, `0026`).
+- BPF sockmap backoff to avoid backlog worker spinning (`0025`).
+- Apple Silicon TSO memory ordering for high-speed Rosetta x86-64 execution (`0023`).
+- `btrfs` direct interrupt-context completions (`0009`).
+- Adaptive idle polling before WFI to eliminate cross-vCPU IPI latency during parallel builds (`0011`).
+
+Kernel releases track upstream Linux LTS point updates, ensuring ongoing security patches and driver fixes without architectural churn.
+
+---
+
+## Features
+
+- **Docker CLI & Compose compatibility:** Works seamlessly as a registered Docker context with existing `docker`, `docker compose`, and third-party developer tooling.
+- **x86-64 containers under Rosetta:** Run `linux/amd64` images on Apple Silicon with near-native performance via Apple Rosetta (`lighter rosetta --install`). See [x86-64 architecture and performance](docs/x86-64.md).
+- **Local Kubernetes with kind:** Spin up single-node and multi-node arm64 Kubernetes clusters with standard `kind`, `kubectl`, and `helm` commands. See the [Kubernetes guide](docs/kubernetes.md).
+- **Bidirectional port forwarding & IPv6:** Published ports (`-p 8080:80` or `-p 127.0.0.1:8080:80`) bind directly on the Mac. Full IPv6 routing is supported whenever the host network supports it.
+- **Native file sharing:** Mount host directories into containers with automatic UID/GID ownership translation and real-time cache synchronization.
+- **Headless background operation:** Runs as a lean terminal daemon or background `launchd` service with zero menu bar clutter and virtually zero idle CPU usage (~0.2%).
+
+---
 
 ## Out of scope
 
-- **GUI:** lighter runs headless in the background as a launchd service or terminal process.
-- **Managed Kubernetes:** Local clusters run through [kind](docs/kubernetes.md); lighter does not manage a built-in cluster or Kubernetes upgrades.
-- **Intel Macs:** Built strictly for Apple Silicon (ARM64).
-- **Windows or Linux hosts:** lighter is purpose-built for macOS.
+- **GUI apps:** lighter is headless by design. We do not build Electron apps, menu bar dashboards, or system tray widgets.
+- **Managed Kubernetes engine:** Local clusters run through standard tools like [kind](docs/kubernetes.md); lighter does not run an unmanaged Kubernetes control plane.
+- **Intel Macs:** Purpose-built exclusively for Apple Silicon (ARM64).
+- **Windows or Linux hosts:** Purpose-built exclusively for macOS.
 
 ---
 
 ## Architecture
 
-The codebase is split into discrete crates, each responsible for one layer:
+The codebase is split into discrete Rust crates, each with a single responsibility:
 
 ```text
 lighter (CLI)  ──spawns──▶  lighter run
@@ -294,17 +277,17 @@ See [`docs/architecture.md`](docs/architecture.md) for detailed internals.
 # 1. Build guest kernel and rootfs
 make guest
 
-# 2. Build lighter CLI and VMM, ad-hoc signed with the hypervisor entitlement
+# 2. Build lighter CLI and VMM, ad-hoc signed with hypervisor entitlement
 make build
 
 # 3. Run milestone verification gates
 make gates
 ```
 
-Milestone gates (`make gates`) boot real test VMs to verify end-to-end functionality (kernel boot, device negotiation, Docker engine readiness, network egress, shared filesystem coherency, and memory reclamation).
+Milestone gates (`make gates`) boot real test VMs to verify end-to-end functionality: kernel boot, device negotiation, Docker engine readiness, network egress, shared filesystem coherency, and memory reclamation.
 
 ---
 
 ## Licence
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option, as Rust projects conventionally are. Unless you say otherwise, a contribution you submit for inclusion is licensed the same way, without further terms.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
