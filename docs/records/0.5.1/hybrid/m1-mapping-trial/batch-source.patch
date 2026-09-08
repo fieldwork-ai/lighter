@@ -1,0 +1,173 @@
+diff --git a/crates/lighter-vmm/src/memory.rs b/crates/lighter-vmm/src/memory.rs
+index 0200c8d4..c51d6a25 100644
+--- a/crates/lighter-vmm/src/memory.rs
++++ b/crates/lighter-vmm/src/memory.rs
+@@ -96,12 +96,17 @@ impl Mmap {
+ #[cfg(target_os = "macos")]
+ fn replace_owned_pages(ptr: *mut u8, len: usize) -> Result<()> {
+     unsafe extern "C" {
+-        fn mach_task_self() -> libc::c_uint;
++        static mach_task_self_: libc::c_uint;
+         fn mach_vm_allocate(task: libc::c_uint, address: *mut u64, size: u64, flags: i32) -> i32;
+     }
+     const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+     const VM_FLAGS_PURGABLE: i32 = 0x2;
+     let page = host_page_size() as usize;
++    // Match mach_task_self() in mach/mach_init.h: libSystem caches the task
++    // port. Calling the similarly named function takes a kernel trap for
++    // every page instead. libSystem initializes this before our threads run.
++    // SAFETY: reading libSystem's initialized current-process task port.
++    let task = unsafe { mach_task_self_ };
+     for offset in (0..len).step_by(page) {
+         let mut address = ptr as u64 + offset as u64;
+         // SAFETY: replace only pages in the caller's reserved mapping. The
+@@ -109,7 +114,7 @@ fn replace_owned_pages(ptr: *mut u8, len: usize) -> Result<()> {
+         // callers retain exclusive ownership of these pages until remapped.
+         let result = unsafe {
+             mach_vm_allocate(
+-                mach_task_self(),
++                task,
+                 &mut address,
+                 page as u64,
+                 VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE,
+@@ -151,10 +156,15 @@ struct Deferred {
+ // Preparation batches do not change allocation ownership: every backing
+ // object remains one host page. Striped locks bound metadata for large VMs.
+ const DEMAND_CHUNK: usize = 256 << 10;
++const DEMAND_LOCKS: usize = 64;
++// Combine worker mappings without increasing foreground fault granularity.
++const BACKGROUND_CHUNKS: usize = 8;
++const _: () = assert!(DEMAND_LOCKS.is_multiple_of(BACKGROUND_CHUNKS));
+ #[cfg(test)]
+ std::thread_local! {
+     static DEMAND_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+     static RELEASE_SPANS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
++    static PREPARE_SPANS: std::cell::RefCell<Vec<(u64, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+ }
+ #[derive(Debug)]
+ struct Demand {
+@@ -319,7 +329,7 @@ impl GuestMemory {
+             ready: (0..len.div_ceil(DEMAND_CHUNK))
+                 .map(|_| AtomicBool::new(false))
+                 .collect(),
+-            locks: (0..64).map(|_| Mutex::new(())).collect(),
++            locks: (0..DEMAND_LOCKS).map(|_| Mutex::new(())).collect(),
+             complete: AtomicBool::new(false),
+         });
+         Ok(())
+@@ -336,8 +346,16 @@ impl GuestMemory {
+         if demand.ready[index].load(Ordering::Acquire) {
+             return Ok(false);
+         }
+-        let offset = index * DEMAND_CHUNK;
+-        let len = DEMAND_CHUNK.min(region.len - offset);
++        self.prepare_demand_span(region, index, index + 1)?;
++        Ok(true)
++    }
++
++    /// Caller holds every chunk's preparation lock and has checked that none
++    /// is ready. Never replace a published chunk, even after reclamation.
++    fn prepare_demand_span(&self, region: &Region, first: usize, end: usize) -> Result<usize> {
++        let demand = region.demand.as_ref().expect("demand region");
++        let offset = first * DEMAND_CHUNK;
++        let len = (end * DEMAND_CHUNK).min(region.len) - offset;
+         let gpa = region.gpa + offset as u64;
+         let address = region.host_addr(gpa);
+         // No CPU or device can access this chunk before publication. A later
+@@ -360,6 +378,8 @@ impl GuestMemory {
+             unsafe {
+                 vm.map(address.cast(), gpa, len, MemoryPerms::RWX)?;
+             }
++            #[cfg(test)]
++            PREPARE_SPANS.with(|spans| spans.borrow_mut().push((gpa, len)));
+             Ok(())
+         };
+         if let Err(error) = prepare() {
+@@ -369,8 +389,10 @@ impl GuestMemory {
+             tracing::error!(%error, gpa, len, "cannot prepare demand memory");
+             std::process::abort();
+         }
+-        demand.ready[index].store(true, Ordering::Release);
+-        Ok(true)
++        for ready in &demand.ready[first..end] {
++            ready.store(true, Ordering::Release);
++        }
++        Ok(len)
+     }
+ 
+     /// Finish demand regions without waiting for guest accesses. Publication
+@@ -386,12 +408,32 @@ impl GuestMemory {
+             }
+             let started = std::time::Instant::now();
+             let mut worker_bytes = 0;
+-            for index in 0..demand.ready.len() {
++            for first in (0..demand.ready.len()).step_by(BACKGROUND_CHUNKS) {
+                 if shutdown.load(Ordering::Acquire) {
+                     return Ok(());
+                 }
+-                if self.prepare_demand_chunk(region, index)? {
+-                    worker_bytes += DEMAND_CHUNK.min(region.len - index * DEMAND_CHUNK);
++                let end = (first + BACKGROUND_CHUNKS).min(demand.ready.len());
++                // Aligned batches never wrap the stripe array, so locks are
++                // always acquired in ascending order. Foreground preparation
++                // and reclamation each hold only one of these locks at a time.
++                let _locks: [_; BACKGROUND_CHUNKS] = std::array::from_fn(|slot| {
++                    (first + slot < end).then(|| {
++                        demand.locks[(first + slot) % DEMAND_LOCKS]
++                            .lock()
++                            .expect("demand backing poisoned")
++                    })
++                });
++                let mut index = first;
++                while index < end {
++                    if demand.ready[index].load(Ordering::Acquire) {
++                        index += 1;
++                        continue;
++                    }
++                    let start = index;
++                    while index < end && !demand.ready[index].load(Ordering::Acquire) {
++                        index += 1;
++                    }
++                    worker_bytes += self.prepare_demand_span(region, start, index)?;
+                 }
+             }
+             // A ready flag can be observed just before its preparer unlocks.
+@@ -1001,6 +1043,38 @@ mod tests {
+         guest_accounting_and_reuse(3);
+     }
+ 
++    #[test]
++    #[ignore = "requires a signed test binary and Hypervisor.framework"]
++    fn hybrid_mapping_batches_skip_live_chunks_and_include_partial_tails() {
++        let vm = Arc::new(Vm::create().unwrap());
++        let mut mem = GuestMemory::new(vm);
++        let base = 0x4000_0000;
++        let page = host_page_size() as usize;
++        let batch = BACKGROUND_CHUNKS * DEMAND_CHUNK;
++        mem.reserve_demand_region(base, 2 * batch + page).unwrap();
++        let live = base + 3 * DEMAND_CHUNK as u64;
++        PREPARE_SPANS.with(|spans| spans.borrow_mut().clear());
++        mem.write_u64(live, 0xfeed).unwrap();
++        PREPARE_SPANS.with(|spans| {
++            assert_eq!(*spans.borrow(), vec![(live, DEMAND_CHUNK)]);
++            spans.borrow_mut().clear();
++        });
++        mem.prepare_remaining(&AtomicBool::new(false)).unwrap();
++        PREPARE_SPANS.with(|spans| {
++            assert_eq!(
++                *spans.borrow(),
++                vec![
++                    (base, 3 * DEMAND_CHUNK),
++                    (base + 4 * DEMAND_CHUNK as u64, 4 * DEMAND_CHUNK),
++                    (base + batch as u64, batch),
++                    (base + 2 * batch as u64, page),
++                ]
++            );
++        });
++        assert_eq!(mem.read_u64(live).unwrap(), 0xfeed);
++        assert_eq!(mem.read_u64(base + 2 * batch as u64).unwrap(), 0);
++    }
++
+     #[test]
+     #[ignore = "requires a signed test binary and Hypervisor.framework"]
+     fn hybrid_preparation_preserves_live_data_and_restores_whole_range_release() {
