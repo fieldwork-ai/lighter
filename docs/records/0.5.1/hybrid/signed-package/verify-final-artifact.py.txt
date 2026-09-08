@@ -1,0 +1,51 @@
+"""Verify final release bytes against the exact qualified executable/payload."""
+import argparse,hashlib,json,pathlib,shutil,struct,subprocess as sp,tempfile
+p=argparse.ArgumentParser();p.add_argument('--archive',type=pathlib.Path,required=True);p.add_argument('--bootstrap',type=pathlib.Path,required=True);p.add_argument('--qualified-cli',type=pathlib.Path,required=True);p.add_argument('--record-environment',type=pathlib.Path,required=True);p.add_argument('--output',type=pathlib.Path,required=True);a=p.parse_args()
+def digest(path):
+ with path.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
+def linkedit(path):
+ data=path.read_bytes()
+ assert struct.unpack_from('<II',data)==(0xfeedfacf,0x100000c), 'expected arm64 Mach-O'
+ offset=32; found=[]
+ for _ in range(struct.unpack_from('<I',data,16)[0]):
+  command,size=struct.unpack_from('<II',data,offset)
+  assert size>=8 and offset+size<=len(data)
+  if command==0x19 and data[offset+8:offset+24].rstrip(b'\0')==b'__LINKEDIT':
+   vmaddr,vmsize,fileoff,filesize=struct.unpack_from('<QQQQ',data,offset+24)
+   assert struct.unpack_from('<iiI',data,offset+56)==(1,1,0)
+   found.append(dict(offset=offset,vmsize=vmsize,filesize=filesize,fileoff=fileoff))
+  offset+=size
+ assert len(found)==1
+ return found[0]
+def strip_and_normalize(path):
+ original=linkedit(path)
+ rounded=lambda size:(size+16383)//16384*16384
+ assert original['vmsize']==rounded(original['filesize']), 'unexpected signed LINKEDIT mapping'
+ sp.run(['codesign','--remove-signature',str(path)],check=True)
+ unsigned=linkedit(path)
+ assert unsigned['offset']==original['offset'] and unsigned['fileoff']==original['fileoff']
+ assert unsigned['vmsize']==original['vmsize'], 'unexpected signature-removal mapping change'
+ data=bytearray(path.read_bytes())
+ # codesign retains the signed mapping size. Normalize only this derived,
+ # read-only LINKEDIT field; every other remaining byte must match.
+ struct.pack_into('<Q',data,unsigned['offset']+32,rounded(unsigned['filesize']))
+ path.write_bytes(data)
+ return dict(signed_vmsize=original['vmsize'],signed_filesize=original['filesize'],unsigned_filesize=unsigned['filesize'],canonical_vmsize=rounded(unsigned['filesize']))
+env=json.loads(a.record_environment.read_text());original_cli=env['cli_sha256'];assert digest(a.qualified_cli)==original_cli
+result=dict(archive_sha256=digest(a.archive),bootstrap_sha256=digest(a.bootstrap),qualification_source=env['source'],runtime_source=env['runtime_source'],guest={},unsigned_code={},signing_mapping={},equivalence_method='Remove signatures; verify original LINKEDIT vmsize equals 16 KiB-rounded signed filesize; normalize only that derived field to the unsigned filesize; require every remaining byte to match.')
+with tempfile.TemporaryDirectory(prefix='lighter-051-equivalence-') as temp:
+ work=pathlib.Path(temp);sp.run(['tar','-xzf',str(a.archive.resolve()),'-C',temp],check=True);root=work/'lighter-0.5.1';app=root/'share/lighter/lighter.app'
+ req='=anchor apple generic and identifier "dev.lighter.machine" and certificate leaf[subject.OU] = "N7N6BNF95K" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+ sp.run(['codesign','--verify','--strict','--deep','-R',req,str(app)],check=True)
+ sp.run(['codesign','--verify','--strict',str(root/'bin/lighter')],check=True)
+ sp.run(['spctl','--assess','--type','execute',str(app)],check=True)
+ sp.run(['xcrun','stapler','validate',str(app)],check=True)
+ manifest=json.loads((app/'Contents/Resources/release.json').read_text());assert manifest['version']=='0.5.1';assert manifest['kernel_version']=='6.18.49';assert manifest['data_epoch']==1
+ for name,sha in manifest['files'].items():assert digest(root/name)==sha,name
+ assert digest(a.bootstrap)==digest(root/'bin/lighter')
+ for name in ['Image','rootfs.ext4']:
+  sha=digest(root/'share/lighter'/name);assert sha==env['payload'][name];result['guest'][name]=sha
+ qualified=work/'qualified';shutil.copyfile(a.qualified_cli,qualified);result['signing_mapping']['qualified']=strip_and_normalize(qualified)
+ for name in ['bin/lighter','share/lighter/lighter.app/Contents/MacOS/lighter']:
+  result['signing_mapping'][name]=strip_and_normalize(root/name);sha=digest(root/name);assert sha==digest(qualified),name;result['unsigned_code'][name]=sha
+result['release_source']=sp.check_output(['git','rev-parse','HEAD'],text=True).strip();a.output.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2));print('PASS: signed final code and guest payload equal the qualified runtime')
