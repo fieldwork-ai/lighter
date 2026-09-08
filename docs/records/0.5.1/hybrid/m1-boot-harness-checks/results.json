@@ -1,0 +1,12 @@
+[
+  {
+    "mode": "failure",
+    "exit_code": 125,
+    "expected": 125
+  },
+  {
+    "mode": "success",
+    "exit_code": 0,
+    "expected": 0
+  }
+]

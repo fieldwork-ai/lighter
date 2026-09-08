@@ -1,0 +1,5 @@
+{
+  "scope": "Harness correctness only; no quiet-host preflight and not a performance record.",
+  "failure": "Injected Docker exit 125 must retain stderr and stop private VM.",
+  "success": "One cold repetition plus untimed warm-up and idle check on real M1."
+}
