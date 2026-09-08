@@ -20,7 +20,7 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Docker Des
 | **Commercial use** | **Free forever** | $8–$10 / user / mo | $5–$24 / user / mo | Free |
 | **Telemetry** | **Zero** | Yes | Yes | None |
 | **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
-| **Cold start (to container)** | **1.8 s** | 1.4 s | 2.1 s | 9.0 s |
+| **Cold start (to container, M5)** | 1.8 s (0.5.0) | 1.4 s | 2.1 s | 9.0 s |
 | **Idle memory** | **365 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
 | **Memory 15s after heavy build** | **936 MiB** | 2,776 MiB | 10,145 MiB | 10,145 MiB |
 | **`npm ci` (own disk)** | **4.61 s** | 6.83 s | 7.96 s | 7.56 s |
@@ -29,6 +29,8 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Docker Des
 | **Container DNS resolution** | **37 µs** | 262 µs | 513 µs | 481 µs |
 | **Kubernetes support** | **kind, kubectl, Helm** | Built-in | Built-in | k3s |
 | **x86-64 Rosetta (`sha256sum`)** | **4.22 s** | 7.92 s | 4.39 s | 4.26 s |
+
+**0.5.1 candidate startup:** **905 ms to the first container** on M1 with 4 GiB RAM; **812 ms to Docker** in the separate 16 GiB test. Medians of three. The M5 comparison above remains the 0.5.0 record until the new M5 run. [Measurements and methodology](docs/demand-memory-2026-09-08.md).
 
 ---
 
@@ -77,6 +79,8 @@ Direct installations can opt into background update downloads with `lighter upda
 ---
 
 ## Benchmarks
+
+These M5 comparison tables retain the **0.5.0** release measurements; the 0.5.1 candidate has not yet completed its M5 benchmark run.
 
 All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
@@ -151,7 +155,9 @@ Idle CPU consumption and thread wakeups measured via `powermetrics` over a 60-se
 
 #### Starting up
 
-Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better.
+Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better. These are the **0.5.0 M5 comparison** results.
+
+The **0.5.1 hybrid candidate** measured **720 ms to Docker / 905 ms to the first container** on M1 with 4 GiB RAM (medians of three). A separate 16 GiB M1 test measured **812 ms to Docker**. [Current startup qualification](docs/demand-memory-2026-09-08.md) records the different profiles; these timings do not replace the M5 table.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
@@ -206,8 +212,10 @@ lighter avoids packet transport across the VM boundary entirely:
 - **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency drops to **37 µs**—seven times faster than OrbStack (262 µs) and over fourteen times faster than Docker Desktop (513 µs).
 - **Low-latency polling:** After every network event, the host transport thread polls briefly before sleeping, servicing immediate request-response replies without scheduler wake latency.
 
-### 5. Sub-two-second startup
-Cold start includes allocating VM metadata, booting Linux, and initializing Docker:
+### 5. Boot overlaps memory preparation
+The 0.5.1 candidate starts the guest while a worker prepares the remaining RAM backing. At 16 GiB on M1, Docker answers in **812 ms** and preparation finishes around **1.61 s**; Docker readiness does not wait for completion. [Controlled measurements](docs/demand-memory-2026-09-08.md).
+
+- **Hybrid RAM preparation:** Memory is prepared on first access when needed, while one worker finishes the backing concurrently. Completed regions resume whole-range reclamation.
 - **50-millisecond custom kernel boot:** Hardware probing is stripped down strictly to the virtual devices present.
 - **Parallel containerd initialization:** Init launches `containerd` immediately upon disk mount and attaches `dockerd` without polling delays.
 - **Optimized disk flushes:** Guest disk flushes map to drive-level image `fsync`, avoiding macOS drive-cache commit penalties that add 4 ms per flush.

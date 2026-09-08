@@ -38,7 +38,9 @@ RUNTIMES = [
     ("docker-desktop", "Docker Desktop"),
 ]
 
-INTRO = """All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
+INTRO = """These M5 comparison tables retain the **0.5.0** release measurements; the 0.5.1 candidate has not yet completed its M5 benchmark run.
+
+All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
 On host-shared filesystems, lighter runs `npm ci` in **6.30 s** (faster than native APFS, outperforming OrbStack's 8.53 s), completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
 
@@ -58,7 +60,9 @@ POWER_INTRO = """Idle CPU consumption and thread wakeups measured via `powermetr
 
 AMD64_INTRO = """Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` for Colima). Lower is better."""
 
-BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better."""
+BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better. These are the **0.5.0 M5 comparison** results.
+
+The **0.5.1 hybrid candidate** measured **720 ms to Docker / 905 ms to the first container** on M1 with 4 GiB RAM (medians of three). A separate 16 GiB M1 test measured **812 ms to Docker**. [Current startup qualification](docs/demand-memory-2026-09-08.md) records the different profiles; these timings do not replace the M5 table."""
 
 
 def ms(value):
