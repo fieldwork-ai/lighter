@@ -1,0 +1,18 @@
+[
+  {
+    "memory_mib": 16384,
+    "metric": "docker_ms",
+    "median_ms": 653.672041,
+    "min_ms": 653.672041,
+    "max_ms": 653.672041,
+    "cv_percent": null
+  },
+  {
+    "memory_mib": 16384,
+    "metric": "first_container_ms",
+    "median_ms": 833.374166,
+    "min_ms": 833.374166,
+    "max_ms": 833.374166,
+    "cv_percent": null
+  }
+]
