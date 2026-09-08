@@ -1,7 +1,10 @@
 # 0.5.1 release qualification
 
-Status: built, signed, notarized and qualified candidate, ready for dev → main
-review. Stable publication follows merge; the final artifact bytes are frozen.
+Status: publication on hold while the [demand-backed RAM prototype](demand-memory-2026-09-08.md)
+is evaluated. The dev → main PR is draft. This report records the earlier
+built, signed, notarized and qualified candidate; its artifact bytes remain
+frozen and do not include the demand-backed implementation. A new runtime
+requires new release qualification and notarization.
 
 Lighter now starts Linux from its existing quarter-RAM base while a worker
 prepares the remaining backing in 128 MiB steps. Independent 16 KiB owned

@@ -38,8 +38,9 @@ Order: background, demand, full demand, full demand, demand, background.
 An earlier hotplug-only prototype also passed ABBA and BAAB, reducing Docker
 readiness by 41.0% and 42.4% respectively. These comparisons are against the
 background mode in the same executable, not a final signed release comparison.
-Local raw records and artifact hashes: `.logs/051/demand/m1-latency-a1` and
-`m1-latency-a3`; summaries: `analysis-a1` and `analysis-a3`.
+[Raw repetitions, per-arm variance, guards and artifact hashes](records/0.5.1/demand-prototype/)
+retain both experiments, including their exact source patches against dff2632.
+The recorder itself does not enforce quiet; the outer guard records do.
 
 ## Correctness and remaining qualification
 

@@ -1,0 +1,24 @@
+{"time": 1788872139.687646, "phase": "preflight", "machine_cpu_percent": 3.725, "vms": [], "unexpected": []}
+{"time": 1788872139.708522, "phase": "quiet", "machine_cpu_percent": 3.725, "vms": [], "unexpected": []}
+{"time": 1788872149.784301, "phase": "quiet", "machine_cpu_percent": 3.3875, "vms": [], "unexpected": []}
+{"time": 1788872159.859137, "phase": "quiet", "machine_cpu_percent": 3.075, "vms": [], "unexpected": []}
+{"time": 1788872169.936216, "phase": "quiet", "machine_cpu_percent": 3.7874999999999996, "vms": [], "unexpected": []}
+{"time": 1788872180.010682, "phase": "quiet", "machine_cpu_percent": 3.1625, "vms": [], "unexpected": []}
+{"time": 1788872190.0881321, "phase": "quiet", "machine_cpu_percent": 3.1125000000000003, "vms": [], "unexpected": []}
+{"time": 1788872190.117214, "phase": "running", "machine_cpu_percent": 3.1125000000000003, "vms": [], "unexpected": []}
+{"time": 1788872191.150029, "phase": "running", "machine_cpu_percent": 15.0125, "vms": [], "unexpected": []}
+{"time": 1788872192.176682, "phase": "running", "machine_cpu_percent": 18.8, "vms": [{"pid": 10295, "parent": 1, "cpu": 124.5, "command": "/private/tmp/lighter-boot-record-t8b77m8_/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788872193.252645, "phase": "running", "machine_cpu_percent": 6.025, "vms": [{"pid": 10295, "parent": 1, "cpu": 24.2, "command": "/private/tmp/lighter-boot-record-t8b77m8_/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788872194.2790499, "phase": "running", "machine_cpu_percent": 11.862499999999999, "vms": [{"pid": 10295, "parent": 1, "cpu": 80.3, "command": "/private/tmp/lighter-boot-record-t8b77m8_/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788872195.351864, "phase": "running", "machine_cpu_percent": 1.7625, "vms": [], "unexpected": []}
+{"time": 1788872196.4283361, "phase": "running", "machine_cpu_percent": 2.5500000000000003, "vms": [], "unexpected": []}
+{"time": 1788872197.4582558, "phase": "running", "machine_cpu_percent": 20.375, "vms": [{"pid": 10313, "parent": 10308, "cpu": 129.6, "command": "/private/tmp/lighter-boot-record-t8b77m8_/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788872198.535915, "phase": "running", "machine_cpu_percent": 2.1, "vms": [], "unexpected": []}
+{"time": 1788872199.609749, "phase": "running", "machine_cpu_percent": 3.475, "vms": [], "unexpected": []}
+{"time": 1788872200.638031, "phase": "running", "machine_cpu_percent": 12.8875, "vms": [{"pid": 10331, "parent": 10326, "cpu": 71.5, "command": "/private/tmp/lighter-boot-record-t8b77m8_/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788872201.67694, "phase": "running", "machine_cpu_percent": 3.625, "vms": [], "unexpected": []}
+{"time": 1788872202.7513459, "phase": "running", "machine_cpu_percent": 2.6, "vms": [], "unexpected": []}
+{"time": 1788872203.792267, "phase": "running", "machine_cpu_percent": 3.9875, "vms": [{"pid": 10349, "parent": 10344, "cpu": 0.0, "command": "/private/tmp/lighter-boot-record-t8b77m8_/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788872204.869889, "phase": "running", "machine_cpu_percent": 11.8, "vms": [{"pid": 10349, "parent": 1, "cpu": 71.5, "command": "/private/tmp/lighter-boot-record-t8b77m8_/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788872205.945394, "phase": "finished", "machine_cpu_percent": 3.9875, "vms": [], "unexpected": []}
+{"result": "complete", "error": null, "exit_code": 0}
