@@ -40,7 +40,7 @@ RUNTIMES = [
 
 INTRO = """All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On host-shared filesystems, lighter runs `ripgrep` **11x faster than OrbStack**, completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
+On host-shared filesystems, lighter runs `npm ci` in **6.30 s** (faster than native APFS, outperforming OrbStack's 8.53 s), completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
