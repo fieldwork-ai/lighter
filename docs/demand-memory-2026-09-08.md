@@ -183,3 +183,10 @@ found that our Rust FFI called `mach_task_self()` for every backing page,
 whereas Apple's `mach/mach_init.h` defines that C spelling as the cached
 `mach_task_self_` value. Using the same cached port removes one unnecessary
 kernel trap per page without changing ownership, preparation or reclamation.
+
+The [cached-port comparison](records/0.5.1/hybrid/m1-cached-task/) measured
+Docker-ready medians of 832 ms before and 839 ms after (+0.8%), while background
+completion fell from 1,737 to 1,605 ms (−7.6%). There are three interleaved cold
+starts per version. Removing redundant calls saves preparation work but does
+not resolve foreground startup contention. All 343 workspace and 24 signed
+hypervisor tests pass with this change.
