@@ -1,5 +1,7 @@
 {
   "lighter": "lighter 0.5.0",
+  "lighter_sha256": "f044fd21dd37838b4faf7ad8cd68bcbdfc60a9458a14b0e13b350509952a6257",
+  "source": "79c293c738e1e90d1acb88eaafcca25b23e19a58",
   "kind": "kind v0.33.0 go1.26.7 darwin/arm64",
   "kubectl": {
     "clientVersion": {
@@ -28,7 +30,7 @@
     "memory_mib": 16384,
     "disk_gib": 64,
     "shares": [
-      "/Users/nick/git/lighter"
+      "<repo>"
     ],
     "publish": "localhost"
   },

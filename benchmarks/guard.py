@@ -125,6 +125,7 @@ def main():
                 kind = vm_kind(process)
                 if not kind:
                     continue
+                vanished = False
                 legitimate = descendant(pid, allowed | owned, table)
                 if (
                     kind == a.target
@@ -139,11 +140,89 @@ def main():
                     args = sp.check_output(
                         ["ps", "-p", str(pid), "-o", "args="], text=True
                     )
-                    legitimate |= a.lima_instance.resolve() in {
+                    instance = a.lima_instance.resolve()
+                    arguments = shlex.split(args)
+                    # Lima 2.1 passes a name and a --pidfile, not the directory.
+                    if "--pidfile" in arguments:
+                        pidfile = Path(
+                            arguments[arguments.index("--pidfile") + 1]
+                        ).resolve()
+                        legitimate |= (
+                            pidfile == instance / "ha.pid"
+                            and pidfile.is_file()
+                            and pidfile.read_text().strip() == str(pid)
+                        )
+                    legitimate |= instance in {
                         Path(argument).resolve()
-                        for argument in shlex.split(args)
+                        for argument in arguments
                         if argument.startswith("/")
                     }
+                if (
+                    a.target == "colima"
+                    and kind == "hypervisor"
+                    and a.lima_instance
+                    and not legitimate
+                ):
+                    # Apple's XPC VM is reparented to launchd before sampling.
+                    # Attribute a fresh PID only by its open, exact instance disk.
+                    disk = a.lima_instance.resolve() / "disk"
+                    opened = sp.run(
+                        ["lsof", "-a", "-p", str(pid), "-Fn"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if (
+                        opened.returncode == 0
+                        and "n" + str(disk) in opened.stdout.splitlines()
+                    ):
+                        legitimate = True
+                        process["ownership_evidence"] = str(disk)
+                if (
+                    a.target in {"orbstack", "docker-desktop"}
+                    and kind == "hypervisor"
+                    and not legitimate
+                ):
+                    # Apple re-parents XPC services to launchd. Its responsibility
+                    # API retains the launching application's identity. Require
+                    # the responsible PID to be live and its exact executable to
+                    # match this selected target's explicit program allow-list.
+                    import ctypes
+
+                    try:
+                        get_owner = ctypes.CDLL(
+                            "/usr/lib/libSystem.B.dylib", use_errno=True
+                        ).responsibility_get_pid_responsible_for_pid
+                        get_owner.argtypes = [ctypes.c_int]
+                        get_owner.restype = ctypes.c_int
+                        owner = get_owner(pid)
+                        process["responsibility_probe"] = {
+                            "pid": owner,
+                            "errno": ctypes.get_errno() if owner < 0 else 0,
+                        }
+                        parent = table.get(owner)
+                        if (
+                            parent
+                            and vm_kind(parent) == a.target
+                            and str(Path(parent["command"]).resolve()) in programs
+                        ):
+                            legitimate = True
+                            process["ownership_evidence"] = {
+                                "responsible_pid": owner,
+                                "responsible_program": parent["command"],
+                            }
+                    except (AttributeError, OSError):
+                        pass  # An unavailable API must not authorize the VM.
+                    if not legitimate:
+                        # A startup XPC can exit between ps and responsibility
+                        # lookup. Keep that observation, but do not describe an
+                        # already-exited snapshot entry as a running competitor.
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            vanished = True
+                            process["exited_before_ownership_check"] = True
+                        except PermissionError:
+                            pass  # A live inaccessible process remains invalid.
                 if (
                     kind == a.target == "lighter"
                     and str(Path(process["command"]).resolve()) in paths
@@ -157,7 +236,7 @@ def main():
                     legitimate = True
                 if legitimate:
                     owned.add(pid)
-                else:
+                elif not vanished:
                     bad.append(pid)
                 machines.append(dict(process, kind=kind, allowed=legitimate))
             # Remove dead owners so a recycled PID cannot grant future permission.

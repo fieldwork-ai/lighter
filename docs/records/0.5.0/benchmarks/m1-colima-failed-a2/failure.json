@@ -1,0 +1,4 @@
+{
+  "status": "failed; never select this as a complete suite",
+  "reason": "The repeat host-share attempt again failed pnpm after one of three timed repetitions. The failed attempt was stopped early through its owned guard. All timings, including the completed pnpm repetition, remain diagnostic and are excluded from the primary comparison."
+}

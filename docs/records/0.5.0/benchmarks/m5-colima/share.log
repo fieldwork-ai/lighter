@@ -1,0 +1,26 @@
+==> colima: warming caches (not timed)
+==> colima: npm-install 17900 17816 17885  (cpu ms: user=9370 sys=9800 user=9450 sys=9630 user=9280 sys=9850)
+==> colima: pnpm-install 26219 25633 25954  (cpu ms: user=3370 sys=4740 user=3180 sys=4210 user=3320 sys=4310)
+==> colima: yarn-install 22808 22821 22778  (cpu ms: user=9280 sys=13290 user=9510 sys=13370 user=9330 sys=13440)
+==> colima: materializing the package tree
+==> colima: ripgrep 3109 3017 3022  (cpu ms: user=660 sys=2390 user=690 sys=2250 user=700 sys=2250)
+==> colima: find-walk 1460 1464 1486  (cpu ms: user=70 sys=320 user=60 sys=340 user=70 sys=350)
+==> colima: copy-tree 42584 41952 41745  (cpu ms: user=2160 sys=6410 user=2180 sys=7770 user=2280 sys=7690)
+==> colima: rm-rf 8312 8378 8442  (cpu ms: user=2230 sys=8010 user=2250 sys=7880 user=2160 sys=7980)
+==> colima: cpu-sha256 3105 3112 3101  (cpu ms: user=4940 sys=530 user=4980 sys=510 user=4960 sys=530)
+==> colima: container-start 190 176 197
+==> colima: watch-latency 1002 1 2
+==> colima: memory peak=10054 after15s=10145 after60s=10149 (MiB)
+==> colima: net-tcp-egress 4516 4515 4628
+==> colima: net-tcp-egress-r 3980 3829 4004
+==> colima: net-tcp-port 3888 3789 3927
+==> colima: net-tcp-port-r 4286 4176 4216
+==> colima: net-udp 3392 3069 2931
+==> colima: net-connect-rate 19990 16050 15821
+==> colima: net-http-latency 227 229 230
+==> colima: net-dns 451 481 519
+==> colima: power-idle (a minute of quiet, then a minute of samples) cpu=4 ms/s wakeups=41/s pkg-idle-wakeups=0/s (powermetrics)
+==> colima: boot (a cold stop, then a start, 3 times; untimed round first) 8744/8918 8854/9042 8804/9040
+==> colima: memory idle=1302 MiB, a minute after a cold start
+
+==> results in benchmarks/results/050-1b0caab-m5-colima-a3-share.csv

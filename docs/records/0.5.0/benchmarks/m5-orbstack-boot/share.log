@@ -1,0 +1,5 @@
+==> orbstack: warming caches (not timed)
+==> orbstack: boot (a cold stop, then a start, 3 times; untimed round first) 1143/1408 1154/1430 1139/1413
+==> orbstack: memory idle=936 MiB, a minute after a cold start
+
+==> results in benchmarks/results/050-1b0caab-m5-orbstack-a4-share.csv

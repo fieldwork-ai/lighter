@@ -1,0 +1,12 @@
+{
+  "utc": "2026-09-08T03:42:25.002799+00:00",
+  "phase": "amd64 quiet preflight",
+  "reason": "Display sleep triggered idle maintenance; restore user-active state while the separately recorded wallpaper pause remains",
+  "command": [
+    "caffeinate",
+    "-u",
+    "-t",
+    "2"
+  ],
+  "exit_code": 0
+}

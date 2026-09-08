@@ -1,0 +1,4 @@
+134f4c9910c1a1e958867b35961f048fc663f1c54cb709343523a4128878aabf  target/release/lighter
+d8812abbc357890afb1f59be1400ce1fd736e637173087514aa0011d15720e73  target/release/examples/lighter-bench
+0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da  guest/out/Image
+84cad61484b67dec2875c4bd8a812377e4ce76157dd0c78e5ab14c45d4505b44  guest/out/rootfs.ext4

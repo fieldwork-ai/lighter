@@ -1,0 +1,11 @@
+==> lighter: warming caches (not timed)
+==> lighter: npm-install 11626 12212 12328  (cpu ms: user=11650 sys=14920 user=12910 sys=16340 user=12770 sys=16400)
+==> lighter: pnpm-install 7673 6123 6719  (cpu ms: user=6180 sys=16050 user=5470 sys=12390 user=5570 sys=14630)
+==> lighter: yarn-install 13302 10920 11163  (cpu ms: user=11680 sys=25260 user=10950 sys=18440 user=11460 sys=17860)
+==> lighter: materializing the package tree
+==> lighter: ripgrep 6039 259 129  (cpu ms: user=700 sys=9230 user=470 sys=740 user=400 sys=580)
+==> lighter: find-walk 132 122 123  (cpu ms: user=60 sys=70 user=50 sys=100 user=60 sys=70)
+==> lighter: copy-tree 7606 9078 8314  (cpu ms: user=1050 sys=3880 user=1070 sys=5870 user=1090 sys=6140)
+==> lighter: rm-rf 2816 2818 2780  (cpu ms: user=1140 sys=5760 user=1140 sys=6050 user=1150 sys=6500)
+
+==> results in benchmarks/results/050-1b0caab-m1-baab-a3-2-041.csv

@@ -1,0 +1,22 @@
+[
+  {
+    "label": "050-1b0caab-m1-baab-a3-1-050",
+    "version": "050",
+    "csv_sha256": "9b6e8b6095f6a5525a7e1008b78a6d89f4c263a76a5ad1c0f4c67b72f8e299f9"
+  },
+  {
+    "label": "050-1b0caab-m1-baab-a3-2-041",
+    "version": "041",
+    "csv_sha256": "de08a0c485d9c1e4ffd5bc40c78a6cd1cdb21047f0e3560a9386f170ba9367dc"
+  },
+  {
+    "label": "050-1b0caab-m1-baab-a3-3-041",
+    "version": "041",
+    "csv_sha256": "847ba6033178dfe89f12794631110a7be7101e935e5d18c6dfe1381f956240c1"
+  },
+  {
+    "label": "050-1b0caab-m1-baab-a3-4-050",
+    "version": "050",
+    "csv_sha256": "a464506cc49b7cc603e20950863a0a854968176d6efa6a2d558a160e52d3f2e8"
+  }
+]

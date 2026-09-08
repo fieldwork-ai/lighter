@@ -1,0 +1,11 @@
+{
+  "utc": "2026-09-08T03:38:25.375776+00:00",
+  "phase": "amd64 quiet preflight; no timings started",
+  "reason": "WindowServer and loginwindow animation prevent quiet preflight; put display to sleep without changing persistent power settings",
+  "command": [
+    "pmset",
+    "displaysleepnow"
+  ],
+  "exit_code": 0,
+  "output": ""
+}

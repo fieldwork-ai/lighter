@@ -12,10 +12,10 @@
 #
 # # Rules this script exists to enforce
 #
-# **The caches are warmed, and the warming is not timed.** An npm install that
-# downloads is measuring the network. Each target gets its own package cache on
-# its own storage, warmed by an untimed run, so the timed run is filesystem work
-# and nothing else.
+# **Warm-up is attempted outside the measured repetitions.** Each target gets
+# package caches on its own storage. Warm-up and setup failures reject the run;
+# their output is retained. Keep all measured repetitions: native and container
+# timings can still include cache/order effects.
 #
 # **The median is reported, not the mean or the best.** The best run is a
 # claim about the machine being idle; the mean is dragged around by one
@@ -586,8 +586,8 @@ echo "case,rep,ms" > "$RESULTS"
 } > "${RESULTS%.csv}.tree"
 
 # The lockfile is committed, not generated: `npm ci` installs exactly what it
-# says, so every target and every run installs a byte-identical tree. Generating
-# it here would make the benchmark depend on whatever npm resolved that morning.
+# says; platform-specific installation steps can still differ. Generating it
+# here would make the benchmark depend on whatever npm resolved that morning.
 [ -f "benchmarks/fixtures/$FIXTURE/package-lock.json" ] || {
 	echo "benchmarks/fixtures/$FIXTURE/package-lock.json is missing; regenerate it with" >&2
 	echo "  (cd benchmarks/fixtures/$FIXTURE && npm install --package-lock-only)" >&2
@@ -599,13 +599,25 @@ echo "==> $TARGET: warming caches (not timed)"
 # is measuring the network, and the three do not share a cache.
 for warm in npm-install pnpm-install yarn-install; do
 	case " $CASES " in
-	*" $warm "*) REPS=1 run_case "$warm" >/dev/null 2>&1 || true ;;
+	*" $warm "*)
+		mkdir -p .logs
+		if ! REPS=1 run_case "$warm" > ".logs/warmup-${LABEL:-$TARGET}-$warm.out" 2>&1; then
+			printf '    FAILED: %s warm-up did not complete\n' "$warm"
+			FAILED=1
+		fi
+		;;
 	esac
 done
 # `rm-rf` and `copy-tree` need a tree to work on, whichever installs ran.
 case " $CASES " in
 *rm-rf*|*copy-tree*|*ripgrep*|*find-walk*)
-	[ -d "$WORK/npm/node_modules" ] || REPS=1 run_case npm-install >/dev/null 2>&1 || true
+	if [ ! -d "$WORK/npm/node_modules" ]; then
+		mkdir -p .logs
+		if ! REPS=1 run_case npm-install > ".logs/warmup-${LABEL:-$TARGET}-tree.out" 2>&1; then
+			echo '    FAILED: initial package-tree materialization'
+			FAILED=1
+		fi
+	fi
 	;;
 esac
 
@@ -621,15 +633,20 @@ esac
 # The runtime's processes: every one that exists because the runtime is up,
 # which for lighter is the one VMM process.
 runtime_pids() {
-	case "$TARGET" in
-	lighter)        echo "$VMM_PID" ;;
-	orbstack)       pgrep -f 'OrbStack' | tr '\n' ' ' ;;
-	colima)         pgrep -f 'limactl|lima-driver|com.apple.Virtualization.VirtualMachine|virtiofsd' | tr '\n' ' ' ;;
-	# Its VM is Virtualization.framework's own XPC service, not a docker
-	# process: without it the reading was the app's 300 MiB and never the
-	# guest's gigabytes.
-	docker-desktop) pgrep -f 'com.docker|com.apple.Virtualization.VirtualMachine' | tr '\n' ' ' ;;
-	esac
+	if [ "$TARGET" = lighter ]; then echo "$VMM_PID"; return; fi
+	# Match executable names, never command arguments: the supervisor's
+	# explicit app allow-list contains those names too.
+	ps -axo pid=,comm= | awk -v target="$TARGET" '
+	{
+		pid=$1; command=$0
+		sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command)
+		matched=0
+		if (target=="orbstack") matched=(command ~ /\/OrbStack\.app\/Contents\//)
+		if (target=="colima") matched=(command ~ /\/(limactl|lima-driver|virtiofsd)$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
+		if (target=="docker-desktop") matched=(command ~ /\/com\.docker[^\/]*$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
+		if (matched) printf "%s ", pid
+	}
+	END { print "" }'
 }
 
 runtime_footprint_mib() {
@@ -677,6 +694,8 @@ run_memory_case() {
 	done
 	local case_status=0
 	wait "$install" || case_status=$?
+	mkdir -p .logs
+	cp "$CASE_OUT" ".logs/case-${LABEL:-$TARGET}-memory.out"
 	if [ "$case_status" -ne 0 ] \
 		|| [ "$(grep -c '^TIME_MS [0-9]' "$CASE_OUT" || true)" -ne 1 ] \
 		|| grep -q '^TIME_MS TIMEOUT ' "$CASE_OUT"; then
@@ -755,11 +774,15 @@ net_teardown() {
 	[ "$TARGET" = native ] || dk rm -f "lighter-bench-net-$TARGET" "lighter-bench-http-$TARGET" >/dev/null 2>&1 || true
 	NET_READY=0
 }
-# iperf3's JSON, reduced to the receiver's Mbit/s (the sender's for UDP,
-# where the receiver's figure is after loss, and loss is its own number).
-iperf_mbits() { python3 -c 'import json,sys
-d=json.load(sys.stdin); e=d["end"]
-bps=(e.get("sum_received") or e.get("sum") or {}).get("bits_per_second", 0)
+# Reduce iperf3's received summary (or combined summary) to Mbit/s.
+# Missing/error output must not become a fabricated zero measurement.
+iperf_mbits() { python3 -c 'import json,sys,math
+d=json.load(sys.stdin)
+if d.get("error"): raise ValueError(d["error"])
+e=d["end"]; row=e.get("sum_received") or e.get("sum")
+if not isinstance(row,dict): raise ValueError("missing throughput summary")
+bps=row["bits_per_second"]
+if not isinstance(bps,(int,float)) or not math.isfinite(bps) or bps<0: raise ValueError("invalid throughput")
 print(int(bps/1e6))' 2>/dev/null || echo ""; }
 # A client in the container for the egress paths; on the Mac for the rest.
 net_client() { dk run --rm "$IMAGE" "$@"; }
@@ -809,6 +832,14 @@ ts.sort(); print(int(ts[len(ts)//2]*1e6), int(ts[int(len(ts)*0.99)]*1e6))' "$NET
 		net-dns)
 			local script='const dns=require("dns").promises;(async()=>{const ts=[];for(let i=0;i<200;i++){const t=process.hrtime.bigint();await dns.resolve4("example.com");ts.push(Number(process.hrtime.bigint()-t)/1000)}ts.sort((a,b)=>a-b);console.log(Math.round(ts[100]))})()'
 			[ "$TARGET" = native ] && value="$(node -e "$script" 2>"$errors")" || value="$(net_client node -e "$script" 2>"$errors")" ;;
+		esac
+		case "$name" in
+			net-tcp-*|net-udp)
+				diagnostic=".logs/network-${LABEL:-$TARGET}-$name-$rep"
+				mkdir -p "$(dirname "$diagnostic")"
+				printf '%s\n' "$out" > "$diagnostic.stdout"
+				cp "$errors" "$diagnostic.stderr"
+				;;
 		esac
 		if [ -n "$value" ]; then
 			printf ' %s' "$value"
@@ -925,27 +956,17 @@ boot_stop() {
 	orbstack) orb stop >/dev/null 2>&1 || true ;;
 	colima) colima stop "${BENCH_COLIMA_PROFILE:-default}" >/dev/null 2>&1 || true ;;
 	docker-desktop)
-		# It answers to either name depending on the version installed.
-		osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
-		osascript -e 'quit app "Docker Desktop"' >/dev/null 2>&1 || true
-		# Quit takes the window and the VM down at once, but the backend
-		# processes (com.docker.backend, com.docker.build, docker-agent)
-		# stay for two to three minutes, and an `open` while any of them
-		# is alive is swallowed: nothing starts, and when they finally
-		# exit the app is simply down. Measured on 4.89: 190 s from Quit to
-		# the last process gone. So: a short grace for the orderly exit,
-		# then the rest of the tree is ended, and the start is timed from
-		# a Mac with no Docker process on it.
+		# Wait for Docker Desktop's own graceful shutdown. Broad pkill -f
+		# also matches the guard's --allow-program paths and kills supervision.
+		docker desktop stop --timeout 300 >/dev/null 2>&1
 		local waited=0
-		while pgrep -f '/Docker.app/' >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
+		while ps -axo comm= | awk '/\/Docker.app\// { found=1 } END { exit !found }' >/dev/null 2>&1 && [ "$waited" -lt 300 ]; do
 			sleep 1; waited=$((waited + 1))
 		done
-		if pgrep -f '/Docker.app/' >/dev/null 2>&1; then
-			pkill -f '/Docker.app/' 2>/dev/null || true
-			sleep 3
-			pkill -9 -f '/Docker.app/' 2>/dev/null || true
+		if ps -axo comm= | awk '/\/Docker.app\// { found=1 } END { exit !found }' >/dev/null 2>&1; then
+			echo "Docker Desktop processes did not exit after graceful stop" >&2
+			return 1
 		fi
-		while pgrep -f '/Docker.app/' >/dev/null 2>&1; do sleep 1; done
 		sleep 5
 		;;
 	esac
@@ -1089,7 +1110,12 @@ for name in $CASES; do
 	*" $name "*)
 		if [ "$materialized" -eq 0 ] || [ ! -d "$WORK/npm/node_modules" ]; then
 			printf '==> %s: materializing the package tree\n' "$TARGET"
-			REPS=1 run_case npm-install >/dev/null 2>&1 || true
+			mkdir -p .logs
+			if ! REPS=1 run_case npm-install > ".logs/materialize-${LABEL:-$TARGET}-$name.out" 2>&1; then
+				printf '    FAILED: %s package-tree materialization\n' "$name"
+				FAILED=1
+				continue
+			fi
 			materialized=1
 		fi
 		;;

@@ -1,0 +1,11 @@
+{
+  "050-1b0caab-m1-colima-a1-share.csv": "66458bb69d3f00749f2bcd9f1d4c4d5697cab79da6ec216c2c407836134b087b",
+  "050-1b0caab-m1-colima-a1-share.tree": "b186ff98bcbcea66af670ca5e56cbbb6afd142e9a808583cd2ff27830cfd0f06",
+  "daemon.jsonl.gz": "5be9cba4f4a3d1d9553f6461f05e3461dc01cca89736b4107d62516b114530b6",
+  "environment.json": "30bcb6418c5956578e5555070ef128f70e916f2ec96dd88564f45406f7e8dc9b",
+  "exit-code": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+  "raw-result-origins.json": "0ea7a00057f2a723f592770dd242f66abbe94220838327a1b21e12eebcd0ea3f",
+  "share-guard.jsonl.gz": "30062b8ead01ce65443f0216d5d0140e80284f105cd35e77562879cc4d867e19",
+  "share.log": "199f364672b1e32fbdcdcb988190a7370f02c0550f7f42fe0b389708d43a88eb",
+  "failure.json": "ac3e11c896ad555c8039d5e00d329fb3ecc1b92fdaec2bab4bd24fd361c06a10"
+}

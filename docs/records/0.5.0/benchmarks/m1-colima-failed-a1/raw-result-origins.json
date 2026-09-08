@@ -1,0 +1,10 @@
+{
+  "050-1b0caab-m1-colima-a1-share.csv": {
+    "source": "benchmarks/results/050-1b0caab-m1-colima-a1-share.csv",
+    "sha256": "66458bb69d3f00749f2bcd9f1d4c4d5697cab79da6ec216c2c407836134b087b"
+  },
+  "050-1b0caab-m1-colima-a1-share.tree": {
+    "source": "benchmarks/results/050-1b0caab-m1-colima-a1-share.tree",
+    "sha256": "b186ff98bcbcea66af670ca5e56cbbb6afd142e9a808583cd2ff27830cfd0f06"
+  }
+}

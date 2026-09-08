@@ -6,9 +6,9 @@
 // creating and destroying a container. The native target pays no such cost, so
 // the comparison was not between two filesystems at all.
 //
-// So the loop lives inside the target now, and everything before the first
-// measurement — image pull, container start, a cold page cache — happens once
-// and is not timed. Node does the timing because it is the one runtime every
+// The loop lives inside the target, excluding image loading and that
+// container startup. Cache state can still vary between repetitions.
+// Node does the timing because it is the one runtime every
 // target already needs, `date` has no sub-second form on macOS, and spawning a
 // clock process per measurement would cost more than several of the cases.
 
@@ -43,11 +43,9 @@ const body = `${work}/cases/${name}.sh`;
 
 for (let rep = 0; rep < reps; rep++) {
   if (fs.existsSync(setup)) {
-    // A failing setup is not a failing measurement: most of them are a `rm -rf`
-    // of something that may not be there yet.
-    try {
-      sh(setup);
-    } catch {}
+    // rm -rf already tolerates a missing path. Any other setup failure or
+    // timeout leaves unknown inputs and must reject this case before timing.
+    sh(setup, limitS * 1000);
   }
   const started = process.hrtime.bigint();
   try {

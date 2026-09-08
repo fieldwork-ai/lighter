@@ -11,6 +11,7 @@ mkdir -p "$WORK/benchmarks/cases" "$WORK/benchmarks/fixtures/npm" "$WORK/home" "
 printf '#!/bin/sh\necho "unexpected ripgrep invocation in synthetic case" >&2\nexit 99\n' > "$WORK/bin/rg"
 chmod +x "$WORK/bin/rg"
 cp "$ROOT/benchmarks/run.sh" "$WORK/benchmarks/run.sh"
+cp "$ROOT/benchmarks/cases/runner.js" "$WORK/benchmarks/cases/runner.js"
 for file in package.json package-lock.json pnpm-lock.yaml yarn.lock; do
 	: > "$WORK/benchmarks/fixtures/npm/$file"
 done
@@ -29,7 +30,16 @@ JS
 cat > "$WORK/benchmarks/cases/timedout.js" <<'JS'
 console.log('TIME_MS 10\nTIME_MS TIMEOUT 1s\nTIME_MS 30');
 JS
-for name in complete partial failed timedout; do
+cat > "$WORK/benchmarks/cases/setupfailed.setup.sh" <<'SH'
+#!/bin/sh
+echo 'synthetic setup failure' >&2
+exit 9
+SH
+cat > "$WORK/benchmarks/cases/setupfailed.sh" <<'SH'
+#!/bin/sh
+echo 'BODY_MUST_NOT_RUN'
+SH
+for name in complete partial failed timedout setupfailed; do
 	rc=0
 	PATH="$WORK/bin:$PATH" HOME="$WORK/home" LIGHTER_BENCH_WORK="$WORK/run" bash "$WORK/benchmarks/run.sh" \
 		--target native --allow-noisy --label "$name" --cases "$name" --reps 3 > "$WORK/$name.log" 2>&1 || rc=$?
@@ -41,6 +51,18 @@ for name in complete partial failed timedout; do
 		[ -s "$WORK/.logs/case-$name-$name.out" ]
 	fi
 done
+! grep -q '^BODY_MUST_NOT_RUN$' "$WORK/.logs/case-setupfailed-setupfailed.out"
+# Warm-up failure must survive successful timed repetitions.
+cat > "$WORK/benchmarks/cases/npm-install.js" <<'JS'
+if (process.env.REPS === '1') { console.error('synthetic warmup failure'); process.exit(9); }
+console.log('TIME_MS 10\nTIME_MS 20\nTIME_MS 30');
+JS
+rc=0
+PATH="$WORK/bin:$PATH" HOME="$WORK/home" LIGHTER_BENCH_WORK="$WORK/run" bash "$WORK/benchmarks/run.sh" \
+ --target native --allow-noisy --label warmfailed --cases npm-install --reps 3 > "$WORK/warmfailed.log" 2>&1 || rc=$?
+[ "$rc" -ne 0 ]
+grep -q 'FAILED: npm-install warm-up' "$WORK/warmfailed.log"
+grep -q 'synthetic warmup failure' "$WORK/.logs/warmup-warmfailed-npm-install.out"
 # Memory has its own background workload and must also retain its status.
 # Extract that function from the real harness, mocking only time, footprint
 # and the workload so these failure paths do not need a VM or minute waits.
@@ -105,4 +127,40 @@ for mode in complete failed; do
 	(cd "$WORK"; MODE="$mode" bash network.sh > "network-$mode.log" 2>&1) \
 		|| { cat "$WORK/network-$mode.log"; exit 1; }
 done
-echo 'benchmark results: complete accepted; failed storage, memory and network cases rejected with diagnostics'
+# A missing iperf summary must fail; a genuine measured zero remains valid.
+sed -n '/^iperf_mbits() {/,/^# A client/p' "$ROOT/benchmarks/run.sh" > "$WORK/iperf.sh"
+cat >> "$WORK/iperf.sh" <<'SH'
+set -euo pipefail
+[ "$(printf '%s' '{"end":{"sum_received":{"bits_per_second":42000000}}}' | iperf_mbits)" = 42 ]
+[ "$(printf '%s' '{"end":{"sum":{"bits_per_second":0}}}' | iperf_mbits)" = 0 ]
+for value in '{"end":{}}' '{"end":{"sum":{}}}' '{"error":"send failed","end":{"sum":{"bits_per_second":123}}}' '{"end":{"sum":{"bits_per_second":-1}}}' '{"end":{"sum":{"bits_per_second":NaN}}}' 'not json'; do
+ [ -z "$(printf '%s' "$value" | iperf_mbits)" ]
+done
+SH
+bash "$WORK/iperf.sh"
+# Runtime accounting must not include a supervisor just because its arguments
+# mention allowed app paths. Feed executable-only process rows through the
+# actual selector and reject use of the old argument-matching command.
+sed -n '/^runtime_pids() {/,/^}/p' "$ROOT/benchmarks/run.sh" > "$WORK/pids.sh"
+cat >> "$WORK/pids.sh" <<'SH'
+set -euo pipefail
+pgrep() { echo 'argument matching must not select runtime PIDs' >&2; return 99; }
+ps() {
+ [ "$*" = '-axo pid=,comm=' ]
+ cat <<'ROWS'
+ 101 /Applications/OrbStack.app/Contents/MacOS/OrbStack
+ 102 /opt/homebrew/bin/limactl
+ 103 /System/Library/com.apple.Virtualization.VirtualMachine
+ 104 /Applications/Docker.app/Contents/MacOS/com.docker.backend
+ 105 /Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper
+ 106 /opt/homebrew/bin/python3
+ 107 /usr/bin/grep
+ROWS
+}
+TARGET=orbstack; [ "$(runtime_pids)" = '101 105 ' ]
+TARGET=colima; [ "$(runtime_pids)" = '102 103 ' ]
+TARGET=docker-desktop; [ "$(runtime_pids)" = '103 104 ' ]
+TARGET=lighter VMM_PID=108; [ "$(runtime_pids)" = '108' ]
+SH
+bash "$WORK/pids.sh"
+echo 'benchmark results: failures rejected; runtime accounting excludes supervisor arguments'

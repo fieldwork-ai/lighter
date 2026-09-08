@@ -1,0 +1,14 @@
+==> colima: warming caches (not timed)
+==> colima: npm-install 7695 7407 7560  (cpu ms: user=7570 sys=6480 user=7450 sys=6520 user=7480 sys=6640)
+==> colima: pnpm-install 1062 1058 985  (cpu ms: user=2000 sys=1950 user=2040 sys=1700 user=1890 sys=1600)
+==> colima: yarn-install 6200 6005 5926  (cpu ms: user=5570 sys=5840 user=5530 sys=6060 user=5520 sys=6150)
+==> colima: materializing the package tree
+==> colima: ripgrep 127 108 115  (cpu ms: user=240 sys=600 user=240 sys=500 user=250 sys=510)
+==> colima: materializing the package tree
+==> colima: find-walk 185 186 180  (cpu ms: user=40 sys=150 user=50 sys=170 user=30 sys=170)
+==> colima: materializing the package tree
+==> colima: copy-tree 1418 1350 1235  (cpu ms: user=380 sys=1030 user=430 sys=1340 user=320 sys=1340)
+==> colima: materializing the package tree
+==> colima: rm-rf 488 488 508  (cpu ms: user=340 sys=1530 user=340 sys=1410 user=350 sys=1440)
+
+==> results in benchmarks/results/050-1b0caab-m5-colima-a3-guest.csv

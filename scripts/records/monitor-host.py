@@ -85,6 +85,9 @@ def main():
                     footprint_mib=mib(row[3]),
                     compressed_mib=mib(row[4]),
                 )
+                if entry["cpu_percent"] < 0:
+                    # Preserve the raw value and the independent memory reading.
+                    entry["cpu_error"] = "top reported a negative CPU percentage"
                 host = processes()
                 machines = []
                 for process in host.values():

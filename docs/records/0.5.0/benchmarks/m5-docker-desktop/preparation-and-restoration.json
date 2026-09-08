@@ -1,0 +1,15 @@
+{
+  "application_version": "4.89.0",
+  "application_build": "238018",
+  "benchmark_settings": {
+    "cpus": 8,
+    "memory_mib": 16384,
+    "backend": "Apple Virtualization.framework",
+    "file_sharing": "VirtioFS",
+    "rosetta": true
+  },
+  "original_running_containers": 0,
+  "restoration_commands": 7,
+  "all_restoration_commands_succeeded": true,
+  "left_stopped": true
+}

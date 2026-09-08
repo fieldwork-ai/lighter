@@ -2,6 +2,7 @@
 # Exercise activation with privately signed future fixtures, never public tags.
 # Arguments: current archive, future archive, signed nonbooting archive, helper.
 set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CURRENT="${1:?current archive}" FUTURE="${2:?future archive}" BROKEN="${3:?nonbooting archive}" HELPER="${4:?signed current helper}"
 LOGIN="${LIGHTER_TEST_LOGIN:-0}"
 if [ "$LOGIN" = 1 ]; then
@@ -23,7 +24,7 @@ cleanup() {
   launchctl bootout "gui/$(id -u)/dev.lighter.machine" >/dev/null 2>&1 || true
  fi
  [ ! -x "$L" ] || "$L" stop >/dev/null 2>&1 || true
- rm -rf "$WORK"
+ python3 "$ROOT/scripts/records/unregister-test-bundles.py" "$WORK" || true; rm -rf "$WORK"
 }
 trap cleanup EXIT
 mkdir -p "$PREFIX"

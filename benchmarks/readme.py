@@ -39,13 +39,11 @@ RUNTIMES = [
     ("docker-desktop", "Docker Desktop"),
 ]
 
-INTRO = """Measured against a 1,232-package `package.json` fixture (`benchmarks/`). Timing figures are the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). The first table is the runtime's own disk, where a container's writable layer and its volumes live; the second is a host share, the Mac's directory bind-mounted into the container. Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
-
-OrbStack, Colima and Docker Desktop were measured on the same machines. The final lighter M5 record was observed under variable filesystem-daemon/background load; its small differences do not establish performance changes. M1 provides the controlled release comparison. Runtime records are refreshed independently, so their rows can come from different sessions. Recording dates, source commits and artifact hashes for lighter are retained in the `.tree` files beside its CSVs. [Measured run-to-run variation](benchmarks/REPEATABILITY.md) records the same-build storage baseline. [0.4.2 measurements](benchmarks/RELEASE-0.4.2.md) retain three consecutive full M1 suites and filesystem-daemon monitoring; an [alternating install comparison](benchmarks/RELEASE-0.4.2-ABBA.md) did not consistently reproduce the apparent cross-session slowdown. Later M5 attempts were invalidated by competing VMs and excluded. [0.4.1 measurements](benchmarks/RELEASE-0.4.1.md) retain the preceding release records and controlled cache-profile comparisons."""
+INTRO = "Measured with the pinned 1,232-package fixture in `benchmarks/`. Timing rows are medians of three timed repetitions. The harness attempts an untimed installation for each package manager and an untimed npm install to materialize read and metadata inputs. Warm-up and per-repetition setup exit statuses were not retained; each valid timing case requires three successful measured repetitions. Those cases retain all three timings, including a potentially colder first read. Startup has an untimed round. Memory and power rows are single sampling windows.\n\nEach host's Lighter 0.5.0 record is its first valid complete suite, selected before looking at results. Two further suites, five fresh same-build storage runs and an alternating comparison rebuilt from 0.4.1/0.5.0 source are retained in [the release measurements](benchmarks/RELEASE-0.5.0.md). Quiet checks precede each stage and competing-VM checks run throughout. Lighter uses eight guest CPUs on both hosts, with 4 GiB guest RAM on M1 and 16 GiB on M5. Competitor resource settings and actual guest topology are recorded alongside their measurements. Runtime and guest fingerprints, exact tool versions, image IDs and recording dates accompany the raw CSVs.\n\nNative and container installations use the same pinned Node, npm, pnpm and Yarn versions. All container runtimes load identical benchmark images for each architecture. Native macOS and Linux utilities still differ, so the native ratios compare complete workloads rather than isolating filesystem overhead. Absolute times and percentages of native APFS are shown (higher percentages mean faster). The first storage table uses the runtime's own disk; the second uses a Mac directory shared into the container. Bold marks the lowest observed runtime median, without implying statistical significance. A dash means no completed measurement is available.\n\nColima on M1 repeatedly failed the host-share `pnpm install` case with `EMFILE` (too many open files). That cell is unavailable; its other complete cases come from the first share attempt, and its guest-disk cases were recorded separately. The release record retains the failed attempts and diagnostics. Docker Desktop is measured with Apple Virtualization.framework, VirtioFS and Rosetta; other Docker Desktop backends are outside this comparison.\n\nThe host-edit row measures polling visibility and a round trip; it is not an inotify or `fs.watch` event-delivery measurement.\n\nDocker Desktop's host-share package cleanup failed on both hosts. The affected install timings and dependent storage/package-load memory results are excluded despite the original harness returning success; its guest-disk and independent cases remain. The release report retains the errors and explicit selection decisions."
 
 MEMORY_INTRO = """The macOS physical-footprint charge for the runtime's own processes, corresponding to Activity Monitor's "Memory" column: idle a minute after a cold start, the peak during an `npm ci`, and 15 and 60 seconds after it ends. Lower is better. This includes compressed-memory charges and is not a count of distinct resident RAM. lighter 0.4.1 removes the duplicate charge when host and guest access the same backing pages, while preserving physical reclamation and charging reused pages again. This accounting correction does not imply an equivalent reduction in physical RAM. The idle and after rows include retained guest cache and host allocations. Configured RAM limits guest memory; host allocations add overhead. [Accounting and real-build experiments](docs/memory-accounting-2026-09-06.md) document the fix, compression and recovery at smaller configurations."""
 
-NETWORK_INTRO = """iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Connection rate counts client TCP handshakes; it is not completed HTTP requests per second. Bold marks the best runtime in each row."""
+NETWORK_INTRO = """iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Connection rate counts client TCP handshakes; it is not completed HTTP requests per second. Throughput uses iperf’s received summary where available. Docker Desktop’s zero UDP receiver result was separately checked with raw JSON on this tested path. Bold marks the highest observed throughput or lowest latency, without a significance claim."""
 
 POWER_INTRO = """After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better."""
 
@@ -67,11 +65,17 @@ def storage_table(results, where):
     figure with its fraction of native."""
     suffix = "" if where == "share" else "-guest"
     native = report.load("native", results)
-    runtimes = [(key, name, report.load(f"{key}{suffix}", results)) for key, name in RUNTIMES]
+    runtimes = [
+        (key, name, report.load(f"{key}{suffix}", results)) for key, name in RUNTIMES
+    ]
     runtimes = [(key, name, values) for key, name, values in runtimes if values]
     if not runtimes:
         return ""
-    head = "| Workload (" + ("host share" if where == "share" else "own disk") + ") | native APFS"
+    head = (
+        "| Workload ("
+        + ("host share" if where == "share" else "own disk")
+        + ") | native APFS"
+    )
     head += "".join(f" | {name}" for _, name, _ in runtimes) + " |"
     lines = [head, "|---" * (2 + len(runtimes)) + "|"]
     for case, label in STORAGE:
@@ -99,10 +103,15 @@ def storage_table(results, where):
 
 def memory_table(results):
     runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _ in report.MEMORY_CASES)]
+    runtimes = [
+        (name, v) for name, v in runtimes if any(c in v for c, _ in report.MEMORY_CASES)
+    ]
     if not runtimes:
         return ""
-    lines = ["| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (1 + len(runtimes)) + "|"]
+    lines = [
+        "| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |",
+        "|---" * (1 + len(runtimes)) + "|",
+    ]
     for case, label in report.MEMORY_CASES:
         values = [v.get(case) for _, v in runtimes]
         present = [v for v in values if v is not None]
@@ -122,10 +131,17 @@ def memory_table(results):
 def network_table(results):
     native = report.load("native", results)
     runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _, _, _, _ in report.NETWORK_CASES)]
+    runtimes = [
+        (name, v)
+        for name, v in runtimes
+        if any(c in v for c, _, _, _, _ in report.NETWORK_CASES)
+    ]
     if not runtimes:
         return ""
-    lines = ["| Case | unit | native" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (3 + len(runtimes)) + "|"]
+    lines = [
+        "| Case | unit | native" + "".join(f" | {name}" for name, _ in runtimes) + " |",
+        "|---" * (3 + len(runtimes)) + "|",
+    ]
     for case, label, unit, direction, divisor in report.NETWORK_CASES:
         values = [v.get(case) for _, v in runtimes]
         present = [v for v in values if v is not None]
@@ -144,10 +160,17 @@ def network_table(results):
 
 def power_table(results):
     runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _, _ in report.POWER_CASES)]
+    runtimes = [
+        (name, v)
+        for name, v in runtimes
+        if any(c in v for c, _, _ in report.POWER_CASES)
+    ]
     if not runtimes:
         return ""
-    lines = ["| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (1 + len(runtimes)) + "|"]
+    lines = [
+        "| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |",
+        "|---" * (1 + len(runtimes)) + "|",
+    ]
     for case, label, scale in report.POWER_CASES[:2]:
         values = [v.get(case) for _, v in runtimes]
         present = [v for v in values if v is not None]
@@ -166,10 +189,15 @@ def power_table(results):
 
 def boot_table(results):
     runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _ in report.BOOT_CASES)]
+    runtimes = [
+        (name, v) for name, v in runtimes if any(c in v for c, _ in report.BOOT_CASES)
+    ]
     if not runtimes:
         return ""
-    lines = ["| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (1 + len(runtimes)) + "|"]
+    lines = [
+        "| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |",
+        "|---" * (1 + len(runtimes)) + "|",
+    ]
     for case, label in report.BOOT_CASES:
         values = [v.get(case) for _, v in runtimes]
         present = [v for v in values if v is not None]
@@ -191,11 +219,22 @@ def amd64_table(results):
     # own-disk record where the case is an install, the host-timed one where
     # it is a container start (the own-disk stage does not run that case).
     scale = report.load("lighter", results) | report.load("lighter-guest", results)
-    runtimes = [(name, report.load(f"{key}-amd64", results)) for key, name in RUNTIMES if key != "native"]
-    runtimes = [(name, v) for name, v in runtimes if any(c in v for c, _ in report.AMD64_CASES)]
+    runtimes = [
+        (name, report.load(f"{key}-amd64", results))
+        for key, name in RUNTIMES
+        if key != "native"
+    ]
+    runtimes = [
+        (name, v) for name, v in runtimes if any(c in v for c, _ in report.AMD64_CASES)
+    ]
     if not runtimes:
         return ""
-    lines = ["| Workload (x86-64 image, own disk) | lighter, arm64" + "".join(f" | {name}" for name, _ in runtimes) + " |", "|---" * (2 + len(runtimes)) + "|"]
+    lines = [
+        "| Workload (x86-64 image, own disk) | lighter, arm64"
+        + "".join(f" | {name}" for name, _ in runtimes)
+        + " |",
+        "|---" * (2 + len(runtimes)) + "|",
+    ]
     for case, label in report.AMD64_CASES:
         values = [v.get(case) for _, v in runtimes]
         present = [v for v in values if v is not None]
@@ -240,7 +279,10 @@ def section():
         amd64 = amd64_table(results)
         if amd64:
             out += ["#### x86-64 images", "", AMD64_INTRO, "", amd64, ""]
-    out += ["`benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.", ""]
+    out += [
+        "[Release records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.",
+        "",
+    ]
     return "\n".join(out)
 
 

@@ -6,12 +6,12 @@
     "docker": 4915,
     "build": 2457
   },
-  "baseline_mib": 4002.025146484375,
-  "peak_mib": 15549.297477722168,
+  "baseline_mib": 4011.540542602539,
+  "peak_mib": 15531.6254196167,
   "host_excess_mib": 0,
-  "best_recovery_mib": 6721.420555114746,
-  "returned_fraction": 0.764498893710696,
-  "samples": 158,
+  "best_recovery_mib": 7136.702217102051,
+  "returned_fraction": 0.7287206033754928,
+  "samples": 156,
   "sampling_interval_s": 0.5,
   "host_overhead_budget_mib": 1024
 }

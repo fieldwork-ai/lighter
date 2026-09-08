@@ -19,7 +19,7 @@ cleanup() {
     [ ! -f "$PREFIX/machine.log" ] || tail -35 "$PREFIX/machine.log" >&2
   fi
   [ ! -x "$L" ] || "$L" stop >/dev/null 2>&1 || true
-  rm -rf "$WORK"
+  python3 "$ROOT/scripts/records/unregister-test-bundles.py" "$WORK" || true; rm -rf "$WORK"
 }
 trap cleanup EXIT
 [ "$(shasum -a 256 "$OLD" | awk '{print $1}')" = 2f14375ef2ea1e065de856de39cb00c84489ff208e350333d31d5717861e3a9b ]

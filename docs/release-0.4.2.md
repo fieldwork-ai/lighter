@@ -1,4 +1,9 @@
-# 0.4.2 qualification
+# 0.4.2 qualification — unpublished, superseded
+
+**Superseded by [0.5.0](release-0.5.0.md).** Version 0.4.2 was never published.
+Its private draft release was removed, and its archived candidate is retained
+only as historical evidence and a migration-test input. Artifact hashes and
+checks below describe that candidate, not an available public release.
 
 **Publication hold, 2026-09-07:** subsequent kind qualification reproduced
 ordinary Docker commands losing their output during vsock teardown. The release
@@ -112,11 +117,9 @@ M5 verifies the final signatures, staple and code/payload equivalence; its
 previous candidate migration and activation tests cover the identical code.
 No further M5 VM test is claimed while competing VM work is active.
 
-The release remains unpublished and the tap PR stays in draft pending the
-main PR merge. Merge and publication must be coordinated: publish the prepared archive and signed
-bootstrap immediately after merging, since the new installer requires a
-bootstrap asset that 0.4.1 did not provide. Verify public download hashes, then
-make the matching tap PR ready to merge. Never replace published asset bytes.
+The historical publication plan was not executed. This candidate remains
+unpublished and is superseded by 0.5.0; the existing PRs now concern 0.5.0.
+Do not publish the 0.4.2 candidate or use its checksum in the current formula.
 
 The M5 daily VM remains on released 0.4.1 at 16 GiB. All three task-created
 signing credential cache files were removed after final verification, and the

@@ -1,0 +1,18 @@
+{
+  "original_supervisor_exit_code": 0,
+  "status": "partial after post-run setup audit",
+  "reason": "Measured npm/pnpm/yarn setup rm failed with Directory not empty. Exclude affected installations plus dependent package-tree storage and package-load memory whose setup output was not retained.",
+  "excluded_cases": [
+    "npm-install",
+    "pnpm-install",
+    "yarn-install",
+    "ripgrep",
+    "find-walk",
+    "copy-tree",
+    "rm-rf",
+    "memory-peak",
+    "memory-after-15s",
+    "memory-after-60s"
+  ],
+  "evidence": "../m5-case-output/diagnostic-audit.json"
+}

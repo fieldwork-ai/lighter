@@ -1,0 +1,27 @@
+    Finished `release` profile [optimized] target(s) in 0.13s
+==> lighter: warming caches (not timed)
+==> lighter: npm-install 11479 12039 11511  (cpu ms: user=11630 sys=14140 user=12610 sys=15750 user=12150 sys=15080)
+==> lighter: pnpm-install 7095 5667 6486  (cpu ms: user=5640 sys=15260 user=4750 sys=12210 user=5220 sys=14460)
+==> lighter: yarn-install 12716 10269 10050  (cpu ms: user=11090 sys=22760 user=10780 sys=16650 user=10500 sys=15980)
+==> lighter: materializing the package tree
+==> lighter: ripgrep 6642 217 130  (cpu ms: user=680 sys=9220 user=360 sys=570 user=360 sys=620)
+==> lighter: find-walk 131 128 126  (cpu ms: user=30 sys=100 user=40 sys=100 user=50 sys=90)
+==> lighter: copy-tree 7753 10057 6335  (cpu ms: user=1050 sys=3530 user=1150 sys=5850 user=1120 sys=5770)
+==> lighter: rm-rf 2632 2646 2587  (cpu ms: user=1070 sys=5820 user=1050 sys=6110 user=1110 sys=5660)
+==> lighter: cpu-sha256 6299 6290 6302  (cpu ms: user=9030 sys=580 user=8970 sys=610 user=9020 sys=710)
+==> lighter: container-start 187 174 185
+==> lighter: watch-latency 480 2 2
+==> lighter: memory peak=4252 after15s=797 after60s=799 (MiB)
+==> lighter: net-tcp-egress 55829 57013 56573
+==> lighter: net-tcp-egress-r 48803 51127 49378
+==> lighter: net-tcp-port 46090 48243 48333
+==> lighter: net-tcp-port-r 54099 53899 54758
+==> lighter: net-udp 4798 4869 4871
+==> lighter: net-connect-rate 10281 13767 23794
+==> lighter: net-http-latency 164 131 127
+==> lighter: net-dns 134 149 125
+==> lighter: power-idle (a minute of quiet, then a minute of samples) cpu=6 ms/s wakeups=54/s pkg-idle-wakeups=1/s (powermetrics)
+==> lighter: boot (a cold stop, then a start, 3 times; untimed round first) 826/994 859/1045 916/1112
+==> lighter: memory idle=261 MiB, a minute after a cold start
+
+==> results in benchmarks/results/050-1b0caab-m1-a1-3-share.csv

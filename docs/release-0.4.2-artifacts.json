@@ -14,5 +14,6 @@
   "bootstrap_sha256": "049dabdd6f8db531bc4b8b33eb0517eadb7dfe98f4e9f8fd1f8ff7e061bd21bc",
   "notarization_id": "3f30e8e7-e924-4442-86ef-1c522d93788c",
   "qualified_source": "cc717e79d5e2a53e5fd46d1e0cc0399698daa67a",
-  "runtime_source": "7d2123d0db883b7e8c6d3301ec29e4c17fbe1964"
+  "runtime_source": "7d2123d0db883b7e8c6d3301ec29e4c17fbe1964",
+  "publication": "Never published; superseded by 0.5.0. Private artifact retained for migration testing."
 }

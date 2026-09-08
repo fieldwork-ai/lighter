@@ -1,0 +1,27 @@
+{
+  "source": "1b0caabf34fbe359f11cd47cc87ce45dc8583682",
+  "runtime_source": "66897086c3702b75d79cb6fcfed7736842b80780",
+  "baseline_source": "62c92de86b0e564371f2df8016c800193ff33abd",
+  "order": [
+    "050",
+    "041",
+    "041",
+    "050"
+  ],
+  "reason": "first M5 ABBA copy-tree elapsed time +7.56% with five-fresh-run CV5.00%; reversed order tests reproducibility; original results remain unchanged",
+  "parent_record": "<repo>/.logs/050/records-1b0caab-m5-a1",
+  "profile": {
+    "BENCH_CPUS": "8",
+    "BENCH_MEMORY_MIB": "16384",
+    "BENCH_DISK_GIB": "128"
+  },
+  "artifacts": {
+    "<repo>/guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "<repo>/guest/out/rootfs.ext4": "84cad61484b67dec2875c4bd8a812377e4ce76157dd0c78e5ab14c45d4505b44",
+    "<repo>/target/release/examples/lighter-bench": "9650c082089c4cf99347522ae084b008fc2674a20186bde4ff770e8bdf537896",
+    "<repo>/target/release/lighter": "f044fd21dd37838b4faf7ad8cd68bcbdfc60a9458a14b0e13b350509952a6257",
+    "<repo>/.logs/050/benchmark-images/arm64.tar": "5495a5bb8a43d7fa401a7a185ee97fb90842ec60b3bbc8c1aaf7f53e13fa1452",
+    "<repo>/.logs/050/benchmark-images/amd64.tar": "bf6795387ff04b9719c00249d03adf578e26eb6e46627cc398f08957bda82dbc",
+    "<repo>/.logs/050/benchmark-images/manifest.json": "64540d3e6ffb0ff232f478bda13e551ef09782ea85a2f96f5c4f17d0c85698cc"
+  }
+}

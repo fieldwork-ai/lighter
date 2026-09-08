@@ -14,7 +14,7 @@ unset LIGHTER_HOME LIGHTER_GUEST_DIR
 MACHINE_HOME="$HOME/.lighter"
 mkdir -p "$HOME" "$MACHINE_HOME" "$RELEASE/bin" "$RELEASE/share/lighter"
 L="$PREFIX/bin/lighter"
-cleanup() { result=$?; if [ "$result" -ne 0 ] && [ -f "$MACHINE_HOME/machine.log" ]; then cat "$MACHINE_HOME/machine.log" >&2; fi; [ ! -x "$L" ] || "$L" stop >/dev/null 2>&1 || true; [ ! -x "$L" ] || "$L" update auto-download off >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+cleanup() { result=$?; if [ "$result" -ne 0 ] && [ -f "$MACHINE_HOME/machine.log" ]; then cat "$MACHINE_HOME/machine.log" >&2; fi; [ ! -x "$L" ] || "$L" stop >/dev/null 2>&1 || true; [ ! -x "$L" ] || "$L" update auto-download off >/dev/null 2>&1 || true; python3 "$ROOT/scripts/records/unregister-test-bundles.py" "$WORK" || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 cp -c target/release/lighter "$RELEASE/bin/lighter"
 cp -c guest/out/Image guest/out/rootfs.ext4 guest/out/kernel.version "$RELEASE/share/lighter/"

@@ -1,0 +1,8 @@
+{
+  "daemon.jsonl.gz": "7ade47ac7a1371ef00f733aa0b78f38993b7e8bb541b471fe6e34b9c1cda3fe2",
+  "environment.json": "8a5561df007c44fd6a7610b0fc19c57d74c3b3428131e783d4d8820c684c0627",
+  "exit-code": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+  "share-guard.jsonl.gz": "c8728efdd60531f597515b5d06b13759d23af6e6ecd9524ec5e95e6dfdab4c3e",
+  "share.log": "bc0b9ab409e987f5995768f2fd5c6dbc5895d0747e32271a256cb55e15bb196e",
+  "failure.json": "4b2150eda90bd70b88d71ba8ce9e8a72563f1ded4b1ecda8525f4af17776cb66"
+}
