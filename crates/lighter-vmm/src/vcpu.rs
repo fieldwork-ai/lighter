@@ -58,6 +58,8 @@ pub enum RunError {
     },
     #[error("the hypervisor could not determine why vCPU {vcpu} exited")]
     UnknownExit { vcpu: u64 },
+    #[error("cannot prepare demand RAM: {0}")]
+    DemandMemory(#[from] crate::memory::MemoryError),
     #[error(
         "core {expected} was given vCPU id {actual}: the framework hands out ids \
          in call order and the GIC assigns redistributors by id, so a mismatch \
@@ -69,6 +71,7 @@ pub enum RunError {
 /// Shared state every vCPU thread needs.
 pub struct RunContext {
     pub bus: MmioBus,
+    pub memory: Arc<crate::memory::GuestMemory>,
     pub park: Arc<CpuPark>,
     pub shutdown: Arc<AtomicBool>,
     /// Every running core's cross-thread handle.
@@ -233,6 +236,11 @@ impl VcpuRunner {
     }
 
     fn handle_exception(&mut self, exception: Exception) -> Result<Option<StopReason>, RunError> {
+        if self.ctx.memory.resolve_demand_fault(exception)? {
+            // Retry the instruction, including page-table walks and atomics.
+            // Unlike MMIO emulation, the PC must not advance.
+            return Ok(None);
+        }
         match exception.class() {
             Exception::EC_DATA_ABORT_LOWER_EL => {
                 self.handle_mmio(exception)?;

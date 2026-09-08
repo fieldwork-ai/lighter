@@ -208,12 +208,20 @@ impl Machine {
 
         // 4. Guest RAM.
         let mut memory = GuestMemory::new(vm.clone());
-        memory.add_region(layout.ram.base, layout.ram.size as usize)?;
+        let demand_ram = std::env::var("LIGHTER_DEMAND_RAM").as_deref() == Ok("1");
+        let demand_base = demand_ram && std::env::var("LIGHTER_DEMAND_BASE").as_deref() == Ok("1");
+        if demand_base {
+            memory.reserve_demand_region(layout.ram.base, layout.ram.size as usize)?;
+        } else {
+            memory.add_region(layout.ram.base, layout.ram.size as usize)?;
+        }
         let background_ram = std::env::var("LIGHTER_BACKGROUND_RAM").as_deref() != Ok("0");
         // Background preparation keeps the unused range unmapped
         // until each block has correctly accounted backing.
         if let Some(hotplug) = layout.hotplug {
-            if background_ram {
+            if demand_ram {
+                memory.reserve_demand_region(hotplug.base, hotplug.size as usize)?;
+            } else if background_ram {
                 memory.reserve_region(hotplug.base, hotplug.size as usize)?;
             } else {
                 memory.add_region(hotplug.base, hotplug.size as usize)?;
@@ -323,7 +331,9 @@ impl Machine {
                 hotplug.size,
                 offered,
             ));
-            if background_ram {
+            // Demand RAM is safe to offer immediately: both CPU faults and
+            // device accesses prepare backing before they complete the access.
+            if background_ram && !demand_ram {
                 state.defer_backing();
             }
             state
@@ -608,7 +618,7 @@ impl Machine {
         // 7. The device tree describes the machine built above, from the same
         //    layout rather than a parallel description of it.
         let mut cmdline = config.cmdline.clone();
-        if background_ram && layout.hotplug.is_some() {
+        if (background_ram || demand_ram) && layout.hotplug.is_some() {
             // Every caller, including the benchmark VMM, gives guest init the
             // full startup target before Docker can restore saved containers.
             cmdline.push_str(&format!(
@@ -634,6 +644,7 @@ impl Machine {
         //    hv_vcpu_create binds to the calling thread.
         let ctx = Arc::new(RunContext {
             bus,
+            memory: memory.clone(),
             park: Arc::new(CpuPark::new(config.vcpus)),
             shutdown: shutdown.clone(),
             handles: Mutex::new(Vec::with_capacity(config.vcpus as usize)),
@@ -723,7 +734,7 @@ impl Machine {
 
         crate::dump::install(virtio_devices.clone(), vsock_state.clone(), uart.clone());
 
-        let memory_preparation = if background_ram {
+        let memory_preparation = if background_ram && !demand_ram {
             mem.as_ref().map(|control| {
                 let memory = memory.clone();
                 let control = control.clone();

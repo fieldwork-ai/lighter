@@ -67,7 +67,9 @@ pub struct MemState {
     addr: u64,
     region: u64,
     requested: AtomicU64,
-    /// Prefix with complete host backing; only this memory may be offered.
+    /// Prefix safe for guest access. Eager/background modes publish completed
+    /// backing; demand mode can expose the range once first-access handlers
+    /// are installed. Only this memory may be offered to Linux.
     available: AtomicU64,
     preparation_cancelled: Mutex<bool>,
     preparation_changed: Condvar,
