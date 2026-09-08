@@ -266,11 +266,14 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
 }
 
 fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
+    let _total = lighter_vmm::boot_timing::Phase::new("cli_start");
     let config = config::Config::load()?;
     // Checked before starting rather than after failing: a missing kernel
     // produces a machine that exits immediately, and the log says less than
     // this does.
+    let doctor_phase = lighter_vmm::boot_timing::Phase::new("cli_doctor");
     let findings = doctor::run();
+    drop(doctor_phase);
     let docker_available = findings.iter().any(|f| f.what == "docker client" && f.ok);
     let blocking: Vec<_> = findings
         .into_iter()

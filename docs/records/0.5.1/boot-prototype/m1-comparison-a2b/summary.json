@@ -1,0 +1,66 @@
+[
+  {
+    "memory_mib": 4096,
+    "sequence": "ABBA",
+    "metric": "docker_ms",
+    "eager_ms": 799.1761124981323,
+    "background_ms": 634.5253850406247,
+    "change_percent": -20.60255867043228
+  },
+  {
+    "memory_mib": 4096,
+    "sequence": "ABBA",
+    "metric": "first_container_ms",
+    "eager_ms": 984.4133086262375,
+    "background_ms": 815.4925746670883,
+    "change_percent": -17.159533752634903
+  },
+  {
+    "memory_mib": 4096,
+    "sequence": "BAAB",
+    "metric": "docker_ms",
+    "eager_ms": 811.3672317494439,
+    "background_ms": 633.2571544171741,
+    "change_percent": -21.95184502931362
+  },
+  {
+    "memory_mib": 4096,
+    "sequence": "BAAB",
+    "metric": "first_container_ms",
+    "eager_ms": 986.5497015211267,
+    "background_ms": 812.8195068606711,
+    "change_percent": -17.609877575613986
+  },
+  {
+    "memory_mib": 2048,
+    "sequence": "ABBA",
+    "metric": "docker_ms",
+    "eager_ms": 651.2142429270128,
+    "background_ms": 609.5274971180216,
+    "change_percent": -6.40138729485119
+  },
+  {
+    "memory_mib": 2048,
+    "sequence": "ABBA",
+    "metric": "first_container_ms",
+    "eager_ms": 835.1966194162012,
+    "background_ms": 789.5153767535767,
+    "change_percent": -5.469519583850269
+  },
+  {
+    "memory_mib": 2048,
+    "sequence": "BAAB",
+    "metric": "docker_ms",
+    "eager_ms": 657.771519142857,
+    "background_ms": 620.0337258386392,
+    "change_percent": -5.737219111188329
+  },
+  {
+    "memory_mib": 2048,
+    "sequence": "BAAB",
+    "metric": "first_container_ms",
+    "eager_ms": 832.1365701492341,
+    "background_ms": 802.0837128381808,
+    "change_percent": -3.6115294519100005
+  }
+]

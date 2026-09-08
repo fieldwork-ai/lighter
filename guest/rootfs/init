@@ -469,6 +469,22 @@ while [ ! -S /run/containerd/containerd.sock ] && [ "$waited" -lt 200 ]; do
 	waited=$((waited + 1))
 done
 [ -S /run/containerd/containerd.sock ] || echo "INIT containerd=missing after=$((waited * 10))ms"
+# Background preparation can reach Docker before all RAM is online.
+# Docker restores containers internally, bypassing the host API inspector.
+# Conservatively wait if any saved container exists, including stopped ones;
+# do not parse Docker's private restart-policy metadata or change its semantics.
+boot_ram_mib=""
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in lighter.boot_ram_mib=*) boot_ram_mib="${arg#lighter.boot_ram_mib=}";; esac
+done
+if [ -n "$boot_ram_mib" ]; then
+    for saved in /var/lib/docker/containers/*/config.v2.json; do
+        if [ -f "$saved" ]; then
+            /sbin/lighter-boot-memory "$boot_ram_mib"
+            break
+        fi
+    done
+fi
 # `lighter.dockerd_debug` on the command line: dockerd's debug log, whose
 # timestamps are how a container start is taken apart.
 dockerd_debug=""

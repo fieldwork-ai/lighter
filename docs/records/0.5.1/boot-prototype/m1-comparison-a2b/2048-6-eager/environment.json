@@ -1,0 +1,20 @@
+{
+  "cli": "/Users/admin/lighter/.logs/051/lighter-background-a2",
+  "cli_sha256": "217790a27fea031f851ff63ba5ed06436802b1c901730f8f7058b6fa44125d57",
+  "guest": "/Users/admin/lighter/.logs/051/guest-a2",
+  "payload": {
+    "Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "rootfs.ext4": "91d5fe96ee9f2efabb410c1372a121d29e293a8327cf283442df2d2390871722"
+  },
+  "source": "60e94cb870ce2764f77ca82839001681820004db",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83\n",
+  "cpus": 8,
+  "memory_mib": [
+    2048
+  ],
+  "reps": 3,
+  "sampling": "docker version poll every 50ms; first Alpine true with image present",
+  "shared_host": true,
+  "timing": false,
+  "background": false
+}

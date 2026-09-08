@@ -46,5 +46,7 @@ jobs:
         run: python3 scripts/test-idle-poll.py
       - name: Check vsock blocking receive lock handling
         run: python3 scripts/test-vsock-wait.py
+      - name: Restored containers wait for online memory
+        run: python3 scripts/test-boot-memory.py
       - name: Speed gate rejects failed performance floors
         run: bash scripts/test-speed-gate.sh

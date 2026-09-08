@@ -159,11 +159,13 @@ pub struct Machine {
     /// Queue watchers, and the handles that retire them. Held because a
     /// detached poller would outlive the transport it polls.
     pollers: Vec<(Arc<virtio::poll::Kicks>, JoinHandle<()>)>,
+    memory_preparation: Option<JoinHandle<()>>,
 }
 
 impl Machine {
     /// Builds a machine and starts every core.
     pub fn start(config: &MachineConfig) -> Result<Machine, MachineError> {
+        let _total = crate::boot_timing::Phase::new("machine_start");
         if !lighter_hv::hv_supported() {
             return Err(MachineError::NoHypervisor);
         }
@@ -207,19 +209,26 @@ impl Machine {
         // 4. Guest RAM.
         let mut memory = GuestMemory::new(vm.clone());
         memory.add_region(layout.ram.base, layout.ram.size as usize)?;
-        // The hot-plug range is mapped whole and lazily, like RAM: a block the
-        // guest never plugs is never touched and costs nothing.
+        let background_ram = std::env::var("LIGHTER_BACKGROUND_RAM").as_deref() != Ok("0");
+        // Background preparation keeps the unused range unmapped
+        // until each block has correctly accounted backing.
         if let Some(hotplug) = layout.hotplug {
-            memory.add_region(hotplug.base, hotplug.size as usize)?;
+            if background_ram {
+                memory.reserve_region(hotplug.base, hotplug.size as usize)?;
+            } else {
+                memory.add_region(hotplug.base, hotplug.size as usize)?;
+            }
         }
         let memory = Arc::new(memory);
 
         // 5. Kernel and initramfs.
+        let kernel_phase = crate::boot_timing::Phase::new("kernel_load");
         let mut loader = KernelLoader::new(&layout, &config.kernel)?;
         if let Some(initramfs) = &config.initramfs {
             loader = loader.with_initramfs(initramfs)?;
         }
         let (boot, initramfs) = loader.load(&memory)?;
+        drop(kernel_phase);
 
         // 6. Devices, and the bus they sit on.
         let raw_mode = if config.interactive {
@@ -308,12 +317,16 @@ impl Machine {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(|mib| mib << 20)
                 .unwrap_or(hotplug.size);
-            Arc::new(crate::virtio::mem::MemState::new(
+            let state = Arc::new(crate::virtio::mem::MemState::new(
                 config.ram_bytes,
                 hotplug.base,
                 hotplug.size,
                 offered,
-            ))
+            ));
+            if background_ram {
+                state.defer_backing();
+            }
+            state
         });
         let mem_slot = mem_state.as_ref().map(|state| {
             let slot = virtio.len();
@@ -594,10 +607,19 @@ impl Machine {
 
         // 7. The device tree describes the machine built above, from the same
         //    layout rather than a parallel description of it.
+        let mut cmdline = config.cmdline.clone();
+        if background_ram && layout.hotplug.is_some() {
+            // Every caller, including the benchmark VMM, gives guest init the
+            // full startup target before Docker can restore saved containers.
+            cmdline.push_str(&format!(
+                " lighter.boot_ram_mib={}",
+                (config.ram_bytes + config.hotplug_bytes) >> 20
+            ));
+        }
         let dtb = fdt::build(&FdtParams {
             layout: &layout,
             vcpus: config.vcpus,
-            cmdline: &config.cmdline,
+            cmdline: &cmdline,
             initramfs,
             virtio_slots,
         })?;
@@ -701,6 +723,47 @@ impl Machine {
 
         crate::dump::install(virtio_devices.clone(), vsock_state.clone(), uart.clone());
 
+        let memory_preparation = if background_ram {
+            mem.as_ref().map(|control| {
+                let memory = memory.clone();
+                let control = control.clone();
+                let ctx = ctx.clone();
+                std::thread::Builder::new()
+                    .name("memory-prepare".into())
+                    .spawn(move || {
+                        let prepare = || {
+                            let _phase = crate::boot_timing::Phase::new("memory_background");
+                            let mut ready = 0;
+                            while ready < control.state().region_bytes() {
+                                if ctx.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                                    return;
+                                }
+                                match memory.prepare_next(
+                                    control.state().addr(),
+                                    virtio::mem::BLOCK_SIZE as usize,
+                                ) {
+                                    Ok(bytes) => ready = bytes as u64,
+                                    Err(error) => {
+                                        tracing::error!(%error, "background memory preparation failed");
+                                        // Never let a failed partial mapping reach the guest.
+                                        // Fail closed, just as the reclamation path does.
+                                        std::process::abort();
+                                    }
+                                }
+                                control.backing_ready(ready);
+                            }
+                        };
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)).is_err() {
+                            tracing::error!("background memory preparation panicked");
+                            std::process::abort();
+                        }
+                    })
+                    .expect("failed to spawn memory preparation")
+            })
+        } else {
+            None
+        };
+
         Ok(Machine {
             filesystem_notifications,
             _vm: vm,
@@ -718,6 +781,7 @@ impl Machine {
             proxies: Vec::new(),
             _memory_policy: memory_policy,
             pollers,
+            memory_preparation,
         })
     }
 
@@ -752,13 +816,22 @@ impl Machine {
     /// than the guest could ask for more (`MemControl::plug_all`). The
     /// request line is what is looked for, in each chunk as it passes.
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
-        let inspect: Option<crate::vsock_proxy::Inspector> = match &self._memory_policy {
-            Some(policy) if guest_port == DOCKER_PORT && self.mem.is_some() => {
-                let whole = policy.whole();
+        let inspect: Option<crate::vsock_proxy::Inspector> = match &self.mem {
+            Some(mem) if guest_port == DOCKER_PORT => {
+                let mem = mem.clone();
+                let whole = self._memory_policy.as_ref().map(|policy| policy.whole());
                 Some(Arc::new(move |bytes: &[u8]| {
                     if starts_a_container(bytes) {
-                        whole.call();
+                        if let Some(whole) = &whole {
+                            whole.call()?;
+                        } else {
+                            // Readiness is still required if the host pressure
+                            // observer could not start and policy is absent.
+                            mem.wait_for_backing()?;
+                            mem.plug_all();
+                        }
                     }
+                    Ok(())
                 }))
             }
             _ => None,
@@ -801,6 +874,9 @@ impl Machine {
     /// Asks every core to stop.
     pub fn shutdown(&self) {
         self.ctx.stop();
+        if let Some(mem) = &self.mem {
+            mem.cancel_preparation();
+        }
     }
 
     fn stop_others(&mut self) {
@@ -811,6 +887,9 @@ impl Machine {
         for (kicks, thread) in self.pollers.drain(..) {
             kicks.stop();
             let _ = thread.join();
+        }
+        if let Some(worker) = self.memory_preparation.take() {
+            let _ = worker.join();
         }
         for handle in self.threads.drain(..) {
             let _ = handle.join();
@@ -841,14 +920,63 @@ impl Drop for Machine {
 /// build (BuildKit runs its steps in containers of its own, reached through
 /// a session).
 fn starts_a_container(bytes: &[u8]) -> bool {
-    const REQUESTS: [&[u8]; 5] = [
+    const REQUESTS: [&[u8]; 9] = [
         b"/containers/create",
         b"/start HTTP/",
+        b"/start?",
         b"/restart HTTP/",
+        b"/restart?",
+        b"/build HTTP/",
         b"/build?",
         b"/session HTTP/",
+        b"/session?",
     ];
+    debug_assert!(
+        REQUESTS
+            .iter()
+            .all(|needle| needle.len() <= crate::vsock_proxy::INSPECT_OVERLAP)
+    );
     REQUESTS
         .iter()
         .any(|needle| bytes.windows(needle.len()).any(|w| w == *needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_requests_are_inspected_across_every_socket_boundary() {
+        for request in [
+            "POST /v1.51/containers/create HTTP/1.1\r\n\r\n",
+            "POST /v1.51/containers/abc/start HTTP/1.1\r\n\r\n",
+            "POST /v1.51/containers/abc/restart HTTP/1.1\r\n\r\n",
+            "POST /v1.51/exec/abc/start HTTP/1.1\r\n\r\n",
+            "POST /v1.51/build?t=example HTTP/1.1\r\n\r\n",
+            "POST /v1.51/session HTTP/1.1\r\n\r\n",
+            "POST /v1.51/containers/abc/start?checkpoint=boot HTTP/1.1\r\n\r\n",
+            "POST /v1.51/containers/abc/restart?t=10 HTTP/1.1\r\n\r\n",
+            "POST /v1.51/build HTTP/1.1\r\n\r\n",
+            "POST /v1.51/session?name=build HTTP/1.1\r\n\r\n",
+        ] {
+            for chunk in 1..=request.len() {
+                let inspect: crate::vsock_proxy::Inspector = Arc::new(|bytes| {
+                    if starts_a_container(bytes) {
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "memory not ready"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let mut stream = crate::vsock_proxy::StreamInspector::new(inspect);
+                assert!(
+                    request
+                        .as_bytes()
+                        .chunks(chunk)
+                        .any(|bytes| stream.check(bytes).is_err()),
+                    "missed {request:?} with {chunk}-byte reads"
+                );
+            }
+        }
+        assert!(!starts_a_container(b"GET /version HTTP/1.1\r\n\r\n"));
+    }
 }

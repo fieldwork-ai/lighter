@@ -1,0 +1,24 @@
+#!/bin/sh
+# Before Docker restores containers, wait for the configured startup memory
+# to be online. Counting memory blocks avoids guessing kernel MemTotal overhead.
+set -eu
+target_mib="${1:?configured RAM in MiB}"
+sysfs="${2:-/sys/devices/system/memory}"
+case "$target_mib" in ''|*[!0-9]*) echo 'invalid boot memory target' >&2; exit 1;; esac
+block_hex=$(cat "$sysfs/block_size_bytes")
+case "$block_hex" in ''|*[!0-9a-fA-F]*) echo 'invalid memory block size' >&2; exit 1;; esac
+block_bytes=$((0x$block_hex))
+[ "$block_bytes" -gt 0 ] || exit 1
+attempt=0
+while [ "$attempt" -lt 200 ]; do
+    online=$(grep -l '^online$' "$sysfs"/memory[0-9]*/state 2>/dev/null | wc -l)
+    online_mib=$((online * block_bytes / 1048576))
+    if [ "$online_mib" -ge "$target_mib" ]; then
+        echo "INIT boot_memory=ready online_mib=$online_mib waited_ms=$((attempt * 50))"
+        exit 0
+    fi
+    sleep 0.05
+    attempt=$((attempt + 1))
+done
+echo "INIT boot_memory=timeout online_mib=$online_mib target_mib=$target_mib" >&2
+exit 1

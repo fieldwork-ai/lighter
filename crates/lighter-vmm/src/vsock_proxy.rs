@@ -24,7 +24,49 @@ const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 /// Looks at every chunk a host client sends into the guest before it goes,
 /// on the connection's own thread; what it does with the look is its own
 /// business, and a slow look is a slow connection.
-pub type Inspector = Arc<dyn Fn(&[u8]) + Send + Sync>;
+pub type Inspector = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
+
+/// Each connection retains enough overlap for the Docker request markers.
+/// Socket reads can split a marker at any byte, even across many short reads.
+pub(crate) const INSPECT_OVERLAP: usize = 32;
+
+pub(crate) struct StreamInspector {
+    inspect: Inspector,
+    suffix: [u8; INSPECT_OVERLAP],
+    len: usize,
+}
+
+impl StreamInspector {
+    pub(crate) fn new(inspect: Inspector) -> Self {
+        Self {
+            inspect,
+            suffix: [0; INSPECT_OVERLAP],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn check(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut boundary = [0; 2 * INSPECT_OVERLAP];
+        let head = bytes.len().min(INSPECT_OVERLAP);
+        boundary[..self.len].copy_from_slice(&self.suffix[..self.len]);
+        boundary[self.len..self.len + head].copy_from_slice(&bytes[..head]);
+        if self.len > 0 {
+            (self.inspect)(&boundary[..self.len + head])?;
+        }
+        (self.inspect)(bytes)?;
+        if bytes.len() >= INSPECT_OVERLAP {
+            self.suffix
+                .copy_from_slice(&bytes[bytes.len() - INSPECT_OVERLAP..]);
+            self.len = INSPECT_OVERLAP;
+        } else {
+            let end = self.len + head;
+            let start = end.saturating_sub(INSPECT_OVERLAP);
+            self.len = end - start;
+            self.suffix[..self.len].copy_from_slice(&boundary[start..end]);
+        }
+        Ok(())
+    }
+}
 
 pub struct VsockProxy {
     path: PathBuf,
