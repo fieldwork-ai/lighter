@@ -1,4 +1,0 @@
-f044fd21dd37838b4faf7ad8cd68bcbdfc60a9458a14b0e13b350509952a6257  target/release/lighter
-9650c082089c4cf99347522ae084b008fc2674a20186bde4ff770e8bdf537896  target/release/examples/lighter-bench
-0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da  guest/out/Image
-84cad61484b67dec2875c4bd8a812377e4ce76157dd0c78e5ab14c45d4505b44  guest/out/rootfs.ext4

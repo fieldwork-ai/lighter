@@ -1,5 +1,0 @@
-{
-  "status": "Stopped before measurements; not a complete suite",
-  "reason": "Published v0.5.0 tag absent from checkout",
-  "exit_code_record": "No driver exit-code file: metadata construction failed before its try/finally"
-}

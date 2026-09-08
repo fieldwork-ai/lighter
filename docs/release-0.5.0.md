@@ -15,7 +15,7 @@ Concurrent stdin testing also reproduced a macOS blocking-read EOF race outside
 Lighter in a C socket-pair test. Host reads now use `MSG_DONTWAIT` and wait for
 readiness on EAGAIN, without periodic polling timers. Abort shuts each socket
 direction separately because Darwin can skip write shutdown after receive has
-already closed. [Diagnosis and standalone reproducer](records/0.5.0/socket-eof/).
+already closed. Diagnosis and standalone reproducer.
 
 Linux remains 6.18.49, rebuilt with `CONFIG_NETFILTER_XT_MATCH_STATISTIC=y` for
 kind's default iptables Service rules. The guest agent identifies as 0.5.0.
@@ -35,23 +35,23 @@ identical on both:
 
 Both hosts pass formatting, Clippy, 339 workspace tests and all 15 signed
 hypervisor tests. All twelve hardware gates pass with identical fingerprints
-before and after. [M1 qualification](records/0.5.0/qualification/m1/) and
-[M5 qualification](records/0.5.0/qualification/m5/) retain logs, measurements
+before and after. M1 qualification and
+M5 qualification retain logs, measurements
 and the corrected build protocol. Hardware-gate timings are not the primary
 release performance record.
 
 Each host passes 10,000 short Docker execs, 10,000 mixed stdin commands and
 2,050 concurrent stream checks, with zero failures. The stream workload covers
 stdout/stderr, stdin EOF, published TCP responses, slow readers and abort.
-[Raw compressed checks and hashes](records/0.5.0/streams/).
+Raw compressed checks and hashes.
 
 All seven kind configurations pass on each host: one and two nodes using
 Kubernetes 1.35.8, 1.36.4 and 1.37.0 with iptables, plus two nodes on 1.37.0
 with nftables. Tests use kind v0.33.0, native arm64 nodes and IPv4. Coverage
 includes creation/deletion, local images, Service and cross-node traffic,
 DNS/HTTPS, host TCP/UDP, Mac shares, Helm, PVCs and VM restart recovery.
-[M1 inputs and results](records/0.5.0/kind-m1/) and
-[M5 inputs and results](records/0.5.0/kind-m5/) use the exact qualified CLI
+M1 inputs and results and
+M5 inputs and results use the exact qualified CLI
 hash for their host. [The guide](kubernetes.md) explains setup and tested scope;
 this is not a Kubernetes conformance claim.
 
@@ -73,7 +73,7 @@ below each configuration in these runs, followed by a reduced task-footprint cha
 experiments behind the [0.4.1 correction](memory-accounting-2026-09-06.md)
 verify the retained release mechanism; task footprint alone does not count
 distinct resident pages.
-[Inputs, samples and assertions](records/0.5.0/memory/).
+Inputs, samples and assertions.
 
 ## Release measurements
 
@@ -128,7 +128,7 @@ code; kernel and rootfs hashes also match.
 - Bootstrap SHA256: `594b09e923358787fed3c67788fa95a6d76f172b8132daae3e55d64982b9438a`.
 
 [Artifact metadata](release-0.5.0-artifacts.json) and
-[exact-artifact records](records/0.5.0/final-artifacts/) retain the signed
+exact-artifact records retain the signed
 manifest, verification, stage logs and input hashes. Both Macs pass fresh
 smoke, published 0.4.1 migration, private 0.4.2 migration, explicit activation,
 failed-boot rollback, and two-node kind with VM restart and persistent data.

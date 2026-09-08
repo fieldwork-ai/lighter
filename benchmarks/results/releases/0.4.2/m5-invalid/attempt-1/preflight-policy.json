@@ -1,6 +1,0 @@
-{
-  "changed_at": 1788802256.191612,
-  "before": "Total <=100% of one core, no process >25%",
-  "after": "Total <=5% of available machine CPU",
-  "reason": "The per-process cutoff rejected ordinary desktop redraws on the 18-core host. Changed before any timed stage; all original samples retained."
-}

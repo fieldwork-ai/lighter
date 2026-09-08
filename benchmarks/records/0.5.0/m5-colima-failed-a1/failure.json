@@ -1,4 +1,0 @@
-{
-  "status": "failed; never select this as a complete suite",
-  "reason": "The competing-VM guard did not recognize Lima 2.1 hostagent instance arguments. It stopped before timing; the profile remained isolated. Exact PID-file and disk ownership checks corrected attribution."
-}

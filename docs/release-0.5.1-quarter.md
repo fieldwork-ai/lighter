@@ -157,7 +157,7 @@ including preserved signed payloads and manifest hashes, installation ownership,
 direct-update refusal and `brew test`. The temporarily modified tap formula was
 restored. M1 is stopped after qualification with the Homebrew candidate installed.
 
-[Final evidence](records/0.5.1/qualification/) includes failed attempts and
+Final evidence includes failed attempts and
 successful retries. The three task-owned signing credential files and the
 fixture checkout's credential-directory symlink have been removed; the user's
 keychain list is unchanged. No M1 background process was paused by this work.

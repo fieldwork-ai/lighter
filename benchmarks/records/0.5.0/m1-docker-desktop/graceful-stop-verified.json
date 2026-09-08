@@ -1,1 +1,0 @@
-{"command": ["docker", "desktop", "stop", "--timeout", "300"], "no_app_processes": true}

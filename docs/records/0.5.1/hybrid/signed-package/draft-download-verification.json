@@ -1,9 +1,0 @@
-{
-  "draft": true,
-  "downloaded_sha256": {
-    "lighter-0.5.1-arm64.tar.gz": "414ba7f95f9cde1b895d7aa5982d9d5791882359b49b06c6ad2682454092169b",
-    "lighter-0.5.1-arm64": "1ae3bbc7bef22197645b6258fdc6b957df180ec542d856405404bf8396f8db7b"
-  },
-  "github_asset_digests_match": true,
-  "exactly_two_assets": true
-}

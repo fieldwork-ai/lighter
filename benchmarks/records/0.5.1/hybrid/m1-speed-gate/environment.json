@@ -1,9 +1,0 @@
-{
-  "scope": "Read-only evaluation of the completed M1 share stage; no measurements launched.",
-  "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
-  "harness_source": "16a751426cc52c9f38e0aee57f63795a4582c716",
-  "share_record": "../m1-full/051-16a7514-m1-a2-1-share.csv",
-  "boot_record": "../m1-full/051-16a7514-m1-a2-1-share-boot.log.gz",
-  "native_recorded_local_time": "2026-09-08 15:25:57",
-  "native_sha256": "d693a0e469a49a405f16a21eb05e208069c003a0bc61dfe7580d787b1dd25502"
-}

@@ -1,8 +1,0 @@
-{
-  "node": "v24.18.0",
-  "npm": "11.16.0",
-  "pnpm": "10.28.0",
-  "yarn": "1.22.22",
-  "darwin_arm64_archive_sha256": "e1a97e14c99c803e96c7339403282ea05a499c32f8d83defe9ef5ec66f979ed1",
-  "node_image": "node:24.18.0-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd"
-}

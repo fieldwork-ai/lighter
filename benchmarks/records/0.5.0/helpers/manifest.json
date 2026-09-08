@@ -1,9 +1,0 @@
-{
-  "README.md": "a58d5e52d48a457aa0a8c99d6dd58da44d53bbce7f29149a6d0618351082c828",
-  "guard-exited-process.py": "4397650d421449476ac621af56a631ff5cf33c8ae31cad8c65c3855f0f34eb06",
-  "guard-lima.py": "3b709eac524dd3fc4faf4e3e1a6646b09afb6b30f2715248865509639dcfb33f",
-  "guard-responsibility.py": "1ae3155b202fdd6a650811f4aac072dabfcd82eba8800361f6f065149aa5742e",
-  "run-competitor.sh": "a8786d4b22dd82fa9d2bd0dfb24d34c2d34deeb11e1848ea18589486c2d5296d",
-  "run-original.sh": "57c4a57eda9a3ddb5299534346521d2e395aa0511975234eed96730930ad2c8c",
-  "run-udp-diagnostic.sh": "280d13127550d445338882ba9809c2338c60b22055b6d2aca2a694eb62e2970e"
-}

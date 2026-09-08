@@ -1,5 +1,0 @@
-{
-  "files": 20,
-  "suspect_lines": [],
-  "limitation": "Setup exit codes and discarded untimed warm-up output were not retained by this protocol; scanning measured-case diagnostics does not retroactively verify those statuses."
-}

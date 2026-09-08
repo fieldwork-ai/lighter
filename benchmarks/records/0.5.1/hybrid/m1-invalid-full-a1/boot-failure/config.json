@@ -1,9 +1,0 @@
-{
-  "cpus": 8,
-  "memory_mib": 4096,
-  "disk_gib": 128,
-  "shares": [
-    "$HOME"
-  ],
-  "publish": "lan"
-}

@@ -1,8 +1,0 @@
-{
-  "archive_sha256": "414ba7f95f9cde1b895d7aa5982d9d5791882359b49b06c6ad2682454092169b",
-  "bootstrap_sha256": "1ae3bbc7bef22197645b6258fdc6b957df180ec542d856405404bf8396f8db7b",
-  "formula_sha256": "0b8048cb32abda79abc52ad4683621aa3049516e1f902aa60bafc32d4ad7abf7",
-  "operation": "reinstall",
-  "local_file_url": true,
-  "installed_tap_restored_clean": true
-}

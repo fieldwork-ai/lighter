@@ -1,1 +1,0 @@
-PASS: cross-node service, host NodePort, PVC data and Mac share after exact-release VM restart

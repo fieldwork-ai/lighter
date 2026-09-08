@@ -1,4 +1,0 @@
-{
-  "status": "failed; never select this as a complete suite",
-  "reason": "Docker containerd image storage reports OCI manifest identity where classic storage reports configuration identity. Identity validation stopped before timing. A derived map verifies both identities from the same unchanged image archives."
-}

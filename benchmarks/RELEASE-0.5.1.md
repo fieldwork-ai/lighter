@@ -64,7 +64,7 @@ The 0.5.0 columns are historical primary records, not an alternating old/new exp
 | cpu-sha256 | ms | 4223 | 4154, 4177, 4163 | 4163 | -1.4% | 0.28% |
 | container-start | ms | 155 | 137, 156, 165 | 156 | +0.6% | 9.36% |
 
-[Complete M5 records](records/0.5.1/hybrid/m5-full/)
+
 
 ## M1 — share
 
@@ -120,17 +120,22 @@ The 0.5.0 columns are historical primary records, not an alternating old/new exp
 | cpu-sha256 | ms | 7182 | 7185, 7166, 7182 | 7182 | +0.0% | 0.14% |
 | container-start | ms | 187 | 256, 207, 237 | 237 | +26.7% | 10.59% |
 
-[Complete M1 records](records/0.5.1/hybrid/m1-full/)
 
-## Reproduce the summaries
+
+## Reproduce the published comparison
 
 ```sh
-python3 scripts/records/summarize-hybrid-release.py benchmarks/records/0.5.1/hybrid/m5-full --out /tmp/lighter-m5-summary.json
-python3 scripts/records/summarize-hybrid-release.py benchmarks/records/0.5.1/hybrid/m1-full --out /tmp/lighter-m1-summary.json
+python3 benchmarks/report.py
 ```
 
-The validator checks each CSV hash, source identity, completed guard, quiet window, expected cases and repetition counts before calculating the summary. These full-suite timings use the Node-based harness; do not pool them with the separate Python-based startup experiments or attribute pure-demand prototype timings to the hybrid release.
+The selection manifests in `benchmarks/results/` identify the retained CSVs
+and environment metadata. The command regenerates `benchmarks/RESULTS.md`.
+This release report retains the historical comparison and focused follow-up
+summaries; raw qualification diagnostics are not stored in Git.
 
+These full-suite timings use the Node-based harness; do not pool them with
+the separate Python-based startup experiments or attribute pure-demand
+prototype timings to the hybrid release.
 
 ## M5 storage follow-up
 
@@ -161,16 +166,14 @@ in another VM, rather than three independent VM starts.
 
 The original full suite remains the release primary. User-directed exploratory
 repetitions after this screening are outside the retained release comparison.
-[Initial matched records](records/0.5.1/hybrid/m5-storage-focus/) and
-[the two-observation follow-up](records/0.5.1/hybrid/m5-deletion-follow-up/)
-retain the protocol, guards and source/artifact identities.
+The protocol and retained observations are summarised above.
 
 
 ## M1 package-cache follow-up
 
 The original isolated screening warmed only the selected package manager. The
 full suite warms npm, pnpm and yarn before its first measurement. A
-[matched one-observation comparison](records/0.5.1/hybrid/m1-full-warm/) uses
+matched one-observation comparison uses
 that combined preparation on both versions, with hybrid followed by 0.5.0.
 
 | Workload | 0.5.0 | Hybrid | Time change |
@@ -189,7 +192,7 @@ observations lack the full suite's preceding file-search reads and are not
 directly comparable with its warmer copy medians.
 
 
-The [npm follow-up](records/0.5.1/hybrid/m1-npm-follow-up/) reverses version
+The npm follow-up reverses version
 order (0.5.0 then hybrid) and retains the same combined package warm-up. It
 measures only npm, twice per version; it does not repeat the full suite.
 
@@ -209,13 +212,12 @@ guards and artifact checks pass, and the paused host processes were restored.
 
 Both speed gates reused the completed share stage rather than measuring it
 again. M1's 85%-of-native npm aspiration remains unmet; the established 30%
-floor passes. [M1 gate](records/0.5.1/hybrid/m1-speed-gate/) and
-[M5 gate](records/0.5.1/hybrid/m5-speed-gate/) retain their exact input scope.
+floor passes. Each gate reused the completed share CSV and its recorded native reference.
 
 The original M1 attempt failed during Docker warm-up. Its cause remains unknown
 because the inherited harness discarded stderr. The corrected harness retains
 startup failures and cleans up the private VM even if startup fails before
-returning its PID. The [invalid attempt](records/0.5.1/hybrid/m1-invalid-full-a1/)
+returning its PID. The invalid attempt
 is excluded from the selected suite.
 
 Across the M5 full suite, all 211 fseventsd samples track one process at

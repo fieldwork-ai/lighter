@@ -1,8 +1,0 @@
-{
-  "pid": 455,
-  "uid": 501,
-  "program": "/System/Library/ExtensionKit/Extensions/WallpaperAerialsExtension.appex/Contents/MacOS/WallpaperAerialsExtension",
-  "original_state": "Ss",
-  "utc": "2026-09-08T03:40:34.871343+00:00",
-  "reason": "Animated wallpaper prevents quiet preflight; pause only this user process until final observation; restore SIGCONT afterward"
-}

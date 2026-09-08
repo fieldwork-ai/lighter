@@ -14,18 +14,16 @@ Use `latency.sh` to investigate individual operations and the full workload suit
 to measure application-level effects. Each has its own run-to-run variation;
 see [repeatability](REPEATABILITY.md) before interpreting a difference.
 
-New measurements go to `results/<target>.csv` (or a labelled filename).
-Published comparisons are pinned by `results/selection.json` and
-`results/machines/<machine>/selection.json`: each target names its canonical
-CSV and metadata under `records/`. Update those paths deliberately when
-selecting a new run; recording a scratch run does not replace published inputs.
-`report.py` turns the selected records into `RESULTS.md`. A result directory
-without a selection manifest still reads its local CSVs.
+Selected CSVs and their small `.tree` environment descriptions live in
+`results/` and `results/machines/<machine>/`. The selection manifests identify
+the inputs for `report.py`, which generates `RESULTS.md`. Keep labelled scratch
+runs separate; update selected inputs deliberately when publishing new figures.
+A directory without a selection manifest reads its local CSVs.
 
-Release performance evidence lives in `records/`, alongside the release
-reports and methodology here. Design experiments, correctness gates and
-signing evidence live under `docs/`. See [the record index](records/README.md).
-Do not copy archived inputs back into `results/`.
+Git retains benchmark tooling, methodology, concise reports and the selected
+inputs needed to reproduce published tables. Raw qualification logs, process
+samples, diagnostic JSON and per-command evidence stay local under `.logs/`;
+they are not committed or attached to GitHub releases.
 
 ## What is being compared
 

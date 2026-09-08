@@ -4,7 +4,7 @@ The three full M1 suites showed higher host-share install times against a single
 
 Each arm starts a fresh VM with eight vCPUs, 4 GiB guest RAM and a 128 GiB sparse data disk. It uses the same host-share fixture, an untimed warm-up, and three ordered repetitions for npm, pnpm and yarn. Both benchmark binaries were built and signed before the initial quiet preflight. There is a twenty-second gap after each arm and no daemon reset.
 
-The 0.4.1 benchmark was rebuilt from source `5f48cf03` and uses the guest payload extracted from the published 0.4.1 archive. The 0.4.2 benchmark was retained from the qualified runtime at source `d0fbd114` and uses its matching guest payload. The harness is the current benchmark runner with explicit prebuilt binary, guest and source-stamp selection; no compilation occurs during the arms. [Raw repetitions, artifact hashes and the exact protocol](results/releases/0.4.2/abba/) are retained.
+The 0.4.1 benchmark was rebuilt from source `5f48cf03` and uses the guest payload extracted from the published 0.4.1 archive. The 0.4.2 benchmark was retained from the qualified runtime at source `d0fbd114` and uses its matching guest payload. The harness is the current benchmark runner with explicit prebuilt binary, guest and source-stamp selection; no compilation occurs during the arms. Raw repetitions, artifact hashes and the exact protocol are retained.
 
 ## Results
 

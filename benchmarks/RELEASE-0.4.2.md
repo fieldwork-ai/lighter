@@ -1,12 +1,12 @@
 # 0.4.2 release measurements
 
-The primary record is the first full M1 suite, selected before the run. Two further consecutive suites measure repeatability and exercise filesystem-daemon recovery. Two later M5 attempts were invalidated by competing VMs and excluded; [their diagnostic records](results/releases/0.4.2/m5-invalid/) explain why no new M5 performance record is selected.
+The primary record is the first full M1 suite, selected before the run. Two further consecutive suites measure repeatability and exercise filesystem-daemon recovery. Two later M5 attempts were invalidated by competing VMs and excluded; their diagnostic records explain why no new M5 performance record is selected.
 
 The comparison baseline is the complete 0.4.1 run after the user restarted fseventsd on 2026-09-07, source `5f48cf03` (the released 0.4.1 runtime). The new suites use `cc717e79`; runtime `7d2123d` is unchanged by the final formula checksum commit. Each stage starts a fresh VM with eight vCPUs, 4 GiB RAM and a 128 GiB sparse data disk. The boot case uses the same CLI defaults as the baseline. Each timing case has an untimed warm-up and three ordered repetitions; memory and power rows are single sampling windows.
 
 The baseline and new suites use the same benchmark cases and the same M1. Six consecutive quiet samples ten seconds apart precede the first new suite. There is no daemon reset between suites. These are cross-session numeric changes, not causal speedup estimates. Workload, cache, thermal and background variation remain possible. The three-run CV is descriptive and is not a universal regression threshold.
 
-Raw CSVs, source/artifact stamps, monitoring samples and the exact soak protocol are retained in [the release records](results/releases/0.4.2/).
+Raw CSVs, source/artifact stamps, monitoring samples and the exact soak protocol are retained in the release records.
 
 A subsequent [alternating M1 comparison](RELEASE-0.4.2-ABBA.md) produced changes of npm-install: -1.15%, pnpm-install: -2.71%, yarn-install: +2.49%. The larger apparent slowdown below did not reproduce consistently; the original full-suite numbers remain intact.
 
@@ -85,7 +85,7 @@ There are no filesystem or memory-policy source changes in 0.4.2. Its guest agen
 
 ## Filesystem-daemon soak
 
-![Filesystem-daemon memory and CPU over three suites](results/releases/0.4.2/fseventsd-soak.svg)
+
 
 All samples observed fseventsd PID 81590; it was not restarted. Monitoring spans 2026-09-07T16:13:55.846585+00:00 through 2026-09-07T17:15:45.681858+00:00. There were 726 valid samples and 0 monitor errors.
 

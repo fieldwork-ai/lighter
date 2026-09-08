@@ -1,3 +1,0 @@
-FROM busybox:1.37.0
-RUN mkdir /www && echo lighter-kind-qualified > /www/index.html
-CMD ["sh", "-c", "echo server-started; exec httpd -f -p 8080 -h /www"]

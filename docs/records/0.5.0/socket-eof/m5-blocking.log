@@ -1,6 +1,0 @@
-PEER_HUNG errno=35 peek=-1
-HUNG trial=33292 errno=35 peek=0
-PEER_HUNG errno=35 peek=0
-PEER_HUNG errno=35 peek=-1
-HUNG trial=75077 errno=35 peek=0
-runs=100000 host_failures=2 peer_failures=3

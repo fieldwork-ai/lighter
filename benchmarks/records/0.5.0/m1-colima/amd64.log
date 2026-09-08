@@ -1,8 +1,0 @@
-WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested
-==> colima: warming caches (not timed)
-==> colima: npm-install 19785 19233 19349  (cpu ms: user=23160 sys=13530 user=22780 sys=13320 user=22890 sys=13430)
-==> colima: pnpm-install 4212 3634 3666  (cpu ms: user=7250 sys=3310 user=6710 sys=2510 user=6810 sys=2570)
-==> colima: cpu-sha256 7291 7278 7272  (cpu ms: user=13200 sys=810 user=13190 sys=840 user=13260 sys=770)
-==> colima: container-start 201 206 195
-
-==> results in benchmarks/results/050-1b0caab-m1-colima-a3-amd64.csv

@@ -1,4 +1,0 @@
-{
-  "status": "failed; never select this as a complete suite",
-  "reason": "The guard stopped cold-start testing when a reparented Apple XPC process could not yet be attributed. Later controlled restarts proved that macOS identifies OrbStack Helper as responsible. This partial attempt is retained but excluded from primary tables."
-}

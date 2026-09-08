@@ -1,9 +1,0 @@
-==> native: warming caches (not timed)
-==> native: net-tcp-egress 110247 113088 112734
-==> native: net-tcp-egress-r 118956 120265 119687
-==> native: net-udp 22694 22704 22618
-==> native: net-connect-rate 24857 25661 24616
-==> native: net-http-latency 60 58 57
-==> native: net-dns 3836 3812 3567
-
-==> results in benchmarks/results/050-1b0caab-m1-native-a1-network.csv
