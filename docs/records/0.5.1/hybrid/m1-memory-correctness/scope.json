@@ -1,0 +1,5 @@
+{
+  "scope": "Signed hypervisor tests and memory/idle gate only; full benchmark suite is separate and still running.",
+  "tests_passed": 24,
+  "memory_idle_gate": "pass"
+}
