@@ -41,11 +41,9 @@ def main():
     cli, guest = a.cli.resolve(), a.guest.resolve()
     env = {k: v for k, v in os.environ.items()
            if not k.startswith('LIGHTER_') and k not in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG')}
-    if a.mode in ('demand', 'demand-all'):
-        env['LIGHTER_DEMAND_RAM'] = '1'
-    if a.mode == 'demand-all':
-        env['LIGHTER_DEMAND_BASE'] = '1'
     if a.mode != 'default':
+        env['LIGHTER_DEMAND_RAM'] = '1' if a.mode in ('demand', 'demand-all') else '0'
+        env['LIGHTER_DEMAND_BASE'] = '1' if a.mode == 'demand-all' else '0'
         env['LIGHTER_BACKGROUND_RAM'] = '0' if a.mode == 'eager' else '1'
     if a.timing:
         env['LIGHTER_BOOT_TIMING'] = '1'
