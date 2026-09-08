@@ -11,6 +11,7 @@ import json
 import os
 import re
 import signal
+import shutil
 from pathlib import Path
 import statistics
 import subprocess as sp
@@ -39,6 +40,8 @@ def main():
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'signal {signum}')
     signal.signal(signal.SIGTERM, interrupted)
+    if shutil.which('docker') is None:
+        ap.error('docker CLI is required on PATH')
     if a.reps < 1 or a.cpus < 1 or any(m < 128 or m % 128 for m in a.memory):
         ap.error('positive repetitions/CPUs and memory in whole 128 MiB blocks required')
     out = a.out.resolve()
