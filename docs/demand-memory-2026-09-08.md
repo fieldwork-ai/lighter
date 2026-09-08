@@ -1,7 +1,7 @@
 # Demand-backed RAM investigation
 
 Status: selected as the default for the new 0.5.1 candidate; frozen-source
-release qualification is next. Publication remains on hold. The existing
+release qualification is running on both Macs at `b303dc2`. Publication remains on hold. The existing
 notarized archives contain the earlier background-preparation implementation
 and do not qualify this code.
 
@@ -50,7 +50,7 @@ The recorder itself does not enforce quiet; the outer guard records do.
 
 ## Correctness and remaining qualification
 
-M5 tests use isolated homes while the user's daily VM remains running. Full
+The earlier M5 prototype tests used isolated homes while the user's daily VM remained running. Full
 demand backing passes new/restored-container MemTotal checks at 8, 12, 16 and
 32 GiB (within 4 KiB of eager backing), a twice-touched and verified 2 GiB working
 set, volume persistence across VM restart, amd64 execution and the two-node
@@ -72,7 +72,7 @@ peak/settled footprints. The copy case has a large first-repetition effect, so
 these are not general speedup claims. The [cold-allocation comparison](records/0.5.1/demand-prototype/cold-memory/)
 quantifies the trade-off: the first 2 GiB fill adds 266 ms on M1 and 165 ms on
 M5 with 64 KiB preparation batches. Repeat allocations do not show that penalty.
-A bounded 64/256/64 KiB comparison then measured the first 2 GiB fill at
+A bounded [64/256/64 KiB comparison](records/0.5.1/demand-prototype/batch-size/) then measured the first 2 GiB fill at
 689 → 644 ms (geometric means of arm medians), with CLI startup approximately
 701 ms in both. All 22 hardware tests also pass with 256 KiB batches. This
 reduces first-use overhead without changing allocation ownership; 256 KiB is

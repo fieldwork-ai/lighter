@@ -1,0 +1,13 @@
+diff --git a/crates/lighter-vmm/src/memory.rs b/crates/lighter-vmm/src/memory.rs
+index e0b2b8c0..e4ce5505 100644
+--- a/crates/lighter-vmm/src/memory.rs
++++ b/crates/lighter-vmm/src/memory.rs
+@@ -150,7 +150,7 @@ struct Deferred {
+ 
+ // Preparation batches do not change allocation ownership: every backing
+ // object remains one host page. Striped locks bound metadata for large VMs.
+-const DEMAND_CHUNK: usize = 64 << 10;
++const DEMAND_CHUNK: usize = 256 << 10;
+ #[cfg(test)]
+ std::thread_local! {
+     static DEMAND_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };

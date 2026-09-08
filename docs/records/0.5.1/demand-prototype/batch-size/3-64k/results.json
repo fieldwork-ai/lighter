@@ -1,0 +1,50 @@
+[
+  {
+    "rep": 0,
+    "start_ms": 735.4646659223363,
+    "allocations": [
+      {
+        "mib": 2048,
+        "allocation_ms": 683.378251,
+        "verify_ms": 82.070416
+      },
+      {
+        "mib": 2048,
+        "allocation_ms": 427.105125,
+        "verify_ms": 67.781792
+      }
+    ]
+  },
+  {
+    "rep": 1,
+    "start_ms": 676.3749999227002,
+    "allocations": [
+      {
+        "mib": 2048,
+        "allocation_ms": 685.756084,
+        "verify_ms": 67.857583
+      },
+      {
+        "mib": 2048,
+        "allocation_ms": 436.365917,
+        "verify_ms": 69.06825
+      }
+    ]
+  },
+  {
+    "rep": 2,
+    "start_ms": 662.51299995929,
+    "allocations": [
+      {
+        "mib": 2048,
+        "allocation_ms": 687.241375,
+        "verify_ms": 73.599167
+      },
+      {
+        "mib": 2048,
+        "allocation_ms": 428.52725,
+        "verify_ms": 67.750042
+      }
+    ]
+  }
+]
