@@ -117,19 +117,53 @@ paused for the last Docker Desktop stage were restored after observation.
 
 ## Exact release artifacts
 
-PENDING: final source, immutable archive/bootstrap hashes, Accepted notarization
-submission, staple/Gatekeeper verification, M5 unsigned-code equivalence and
-exact final-archive smoke on both hosts. Record 0.4.1 and private 0.4.2 migration,
-explicit activation, rollback, login-service and Homebrew tests. Private 0.5.1
-and 0.5.2 fixtures must never be published.
+The final archive and signed bootstrap were built from
+`fe9370566ae082ff2c0d5b3f642354f6ec388de9`, after the complete benchmark record.
+Apple accepted notarization submission `1ebc15c8-badd-4c5b-a621-6db2b2c78cbf`.
+Staple validation and Gatekeeper assessment pass. Removing signatures only
+from temporary copies proves both final executables equal the qualified M5
+code; kernel and rootfs hashes also match.
 
-## Publication
+- Archive SHA256: `4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52`.
+- Bootstrap SHA256: `594b09e923358787fed3c67788fa95a6d76f172b8132daae3e55d64982b9438a`.
 
-PENDING: readiness state and artifact location. Main moves through review of
-the dev → main PR. Publish both assets immediately after merge, verify public
-download hashes, then make the tap PR ready. The new installer requires the
-standalone bootstrap absent from 0.4.1.
+[Artifact metadata](release-0.5.0-artifacts.json) and
+[exact-artifact records](records/0.5.0/final-artifacts/) retain the signed
+manifest, verification, stage logs and input hashes. Both Macs pass fresh
+smoke, published 0.4.1 migration, private 0.4.2 migration, explicit activation,
+failed-boot rollback, and two-node kind with VM restart and persistent data.
+M1 exercises the real login-service path; M5 preserves its existing daily
+login service. The separate development-layout test confirms pending updates
+remain inactive through ordinary restart and background-download preferences.
 
-The M5 daily VM remains stopped at 16 GiB until public release installation;
-that installation must preserve its stopped state. Record cleanup of task-owned
-signing credentials, test resources and restored competitor settings.
+M1's first preflight found missing private future fixtures; a later kind
+wrapper found its private executable absent before cluster creation. Those
+attempts are retained. After provisioning, source and every input hash were
+checked unchanged before completing the remaining stages; earlier passing
+stages were retained. Neither correction changed release code or artifact bytes.
+
+The actual M1 Homebrew upgrade passes, including repeated postinstall,
+byte-for-byte CLI comparison, every manifest hash, signature and Gatekeeper
+verification, and refusal of direct updates from the Cellar. The test formula
+was restored, as was Homebrew's automatically enabled developer setting.
+Private future fixtures must never be published.
+
+## Review, publication and cleanup
+
+The release is prepared for [dev → main review](https://github.com/fieldwork-ai/lighter/pull/4).
+The [tap PR](https://github.com/fieldwork-ai/homebrew-tap/pull/4) carries the same
+archive checksum and stays draft until public assets exist. Publish the archive
+and signed bootstrap immediately after main merges, verify public download
+hashes, then make the tap PR ready. The new installer requires the standalone
+bootstrap absent from 0.4.1. Published bytes must remain immutable.
+
+Both task-owned Colima benchmark profiles were deleted, with existing default
+profile checksums unchanged. Competitor settings and container state were
+restored, and all test VMs are stopped. Docker context selections and existing
+Lighter endpoints were restored. The three task-owned signing cache files were
+removed after verification; the original login-keychain search list is restored.
+
+The M5 daily installation remains on public 0.4.1, stopped, with 16 GiB memory.
+After publication, install the public release while preserving its configuration,
+data and stopped state. The M1 test installation is the verified 0.5.0 Homebrew
+candidate. Neither fseventsd process was restarted during this qualification.

@@ -1,0 +1,37 @@
+[
+  {
+    "stage": "no-other-vms",
+    "exit_code": 0,
+    "seconds": 1.13
+  },
+  {
+    "stage": "fresh-smoke",
+    "exit_code": 0,
+    "seconds": 16.64
+  },
+  {
+    "stage": "migration-041",
+    "exit_code": 0,
+    "seconds": 33.07
+  },
+  {
+    "stage": "migration-private-042",
+    "exit_code": 0,
+    "seconds": 41.78
+  },
+  {
+    "stage": "activation-rollback",
+    "exit_code": 0,
+    "seconds": 87.19
+  },
+  {
+    "stage": "signed-kind",
+    "exit_code": 0,
+    "seconds": 115.23
+  },
+  {
+    "stage": "development-update-lifecycle",
+    "exit_code": 0,
+    "seconds": 15.91
+  }
+]

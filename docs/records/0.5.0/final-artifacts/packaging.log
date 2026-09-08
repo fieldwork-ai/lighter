@@ -1,0 +1,33 @@
+==> Resolving Apple Developer credentials
+    using cached credentials (<repo>/.context)
+==> Signing identity: Developer ID Application: Fieldwork AI Inc. (N7N6BNF95K)
+==> Building lighter-cli release binary
+    Finished `release` profile [optimized] target(s) in 0.12s
+==> Signing binaries with Developer ID and hardened runtime
+/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/bin/lighter: replacing existing signature
+/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/share/lighter/lighter.app: replacing existing signature
+==> Verifying signatures
+/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/bin/lighter: valid on disk
+/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/bin/lighter: satisfies its Designated Requirement
+/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/share/lighter/lighter.app: valid on disk
+/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/share/lighter/lighter.app: satisfies its Designated Requirement
+==> Submitting binaries to Apple Notary Service
+    Notarization 1ebc15c8-badd-4c5b-a621-6db2b2c78cbf: Accepted
+==> Notarization accepted by Apple
+Processing: /var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/share/lighter/lighter.app
+Processing: /var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/share/lighter/lighter.app
+The staple and validate action worked!
+Processing: /var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/share/lighter/lighter.app
+The validate action worked!
+/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/tmp.yCou7T7BCN/stage/lighter-0.5.0/share/lighter/lighter.app: accepted
+source=Notarized Developer ID
+==> Packing release tarball
+
+==> Release artifact ready:
+    File:   dist/lighter-0.5.0-arm64.tar.gz ( 81M)
+    SHA256: 4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52
+
+Formula update (packaging/lighter.rb):
+  url "https://github.com/fieldwork-ai/lighter/releases/download/v0.5.0/lighter-0.5.0-arm64.tar.gz"
+  sha256 "4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52"
+  version "0.5.0"
