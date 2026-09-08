@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import statistics
 import subprocess as sp
@@ -45,6 +46,8 @@ def main():
         env['LIGHTER_DEMAND_RAM'] = '1' if a.mode in ('demand', 'demand-all', 'hybrid') else '0'
         env['LIGHTER_DEMAND_BASE'] = '1' if a.mode in ('demand-all', 'hybrid') else '0'
         env['LIGHTER_BACKGROUND_RAM'] = '1' if a.mode in ('background', 'hybrid') else '0'
+    if a.mode == 'hybrid':
+        a.timing = True
     if a.timing:
         env['LIGHTER_BOOT_TIMING'] = '1'
     env['LIGHTER_GUEST_DIR'] = str(guest)
@@ -94,6 +97,7 @@ def main():
                         (out / f'{memory}-{rep}-host.txt').write_text(processes)
                         offset = (home / 'machine.log').stat().st_size
                         wall_time = time.time()
+                        boot_clock = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
                         t0 = time.monotonic_ns()
                         start = sp.Popen([cli, 'start', '--timeout', '120'], env=env, stdout=log, stderr=sp.STDOUT)
                         try:
@@ -111,6 +115,22 @@ def main():
                             t2 = time.monotonic_ns()
                             if start.wait(timeout=120) != 0:
                                 raise RuntimeError('start failed after Docker answered')
+                            preparation_ms = None
+                            if a.mode == 'hybrid':
+                                # Observe completion after the timed readiness/container
+                                # samples; never add this wait to either startup metric.
+                                deadline = time.monotonic() + 120
+                                while True:
+                                    with (home / 'machine.log').open('rb') as source_log:
+                                        source_log.seek(offset)
+                                        current_log = source_log.read().decode(errors='replace')
+                                    completion = re.search(r'phase=memory_background end_ns=(\d+)', current_log)
+                                    if completion:
+                                        preparation_ms = (int(completion[1]) - boot_clock) / 1e6
+                                        break
+                                    if time.monotonic() >= deadline:
+                                        raise TimeoutError('background RAM preparation completion')
+                                    time.sleep(.01)
                         finally:
                             if start.poll() is None:
                                 start.terminate()
@@ -119,7 +139,8 @@ def main():
                                 source_log.seek(offset)
                                 (out / f'{memory}-{rep}-machine.log').write_bytes(source_log.read())
                         row = dict(memory_mib=memory, rep=rep, docker_ms=(t1-t0)/1e6,
-                                   first_container_ms=(t2-t0)/1e6, wall_time=wall_time)
+                                   first_container_ms=(t2-t0)/1e6, wall_time=wall_time,
+                                   preparation_complete_ms=preparation_ms)
                         results.append(row)
                         (out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
                         print(json.dumps(row), flush=True)
