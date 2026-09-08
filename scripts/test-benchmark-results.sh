@@ -138,6 +138,56 @@ for value in '{"end":{}}' '{"end":{"sum":{}}}' '{"error":"send failed","end":{"s
 done
 SH
 bash "$WORK/iperf.sh"
+# A boot warm-up failure must retain Docker's error and stop the private home,
+# including before the harness has assigned VMM_PID. Mock the CLI, not cleanup.
+for function in cleanup boot_stop boot_start run_boot_case; do
+	sed -n "/^$function() {/,/^}/p" "$ROOT/benchmarks/run.sh" >> "$WORK/boot.sh"
+done
+mkdir -p "$WORK/scripts"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/scripts/sign.sh"
+cat > "$WORK/fake-lighter" <<'SH'
+#!/bin/sh
+case "$1" in
+config) ;;
+start) echo $$ > "$LIGHTER_HOME/lighter.pid"; echo 'VM diagnostic' > "$LIGHTER_HOME/machine.log" ;;
+stop) rm -f "$LIGHTER_HOME/lighter.pid" ;;
+esac
+SH
+chmod +x "$WORK/scripts/sign.sh" "$WORK/fake-lighter"
+cat >> "$WORK/boot.sh" <<'SH'
+set -euo pipefail
+ROOT="$PWD" TARGET=lighter LABEL=boot-failure REPS=1 FAILED=0 KEEP=1
+BOOT_HOME="" BOOT_START_PID="" BOOT_LOG="" BOOT_LOG_DIR=""
+VMM_PID="" HELPER_PID="" RUN_DIR="" ROOTFS="" CASE_OUT=""
+LIGHTER_CLI="$PWD/fake-lighter" RESULTS="$PWD/boot.csv"
+: > "$RESULTS"
+cargo() { :; }
+net_teardown() { :; }
+sleep() { :; }
+now_ms() { echo 0; }
+bench_memory_mib() { echo 4096; }
+bench_disk_gib() { echo 128; }
+boot_await_docker() {
+	for _ in $(seq 1 100); do
+		[ ! -f "$BOOT_HOME/machine.log" ] || return 0
+		command sleep 0.01
+	done
+	return 1
+}
+dk() { echo 'synthetic boot container failure' >&2; return 125; }
+trap cleanup EXIT
+run_boot_case
+SH
+rc=0
+(cd "$WORK"; bash boot.sh > boot-failure.log 2>&1) || rc=$?
+[ "$rc" -eq 125 ] || { cat "$WORK/boot-failure.log"; exit 1; }
+grep -q 'synthetic boot container failure' "$WORK/.logs/boot-boot-failure/container-0.log"
+grep -q 'VM diagnostic' "$WORK/.logs/boot-boot-failure/machine.log"
+boot_home="$(cat "$WORK/.logs/boot-boot-failure/retained-home")"
+[ ! -f "$boot_home/lighter.pid" ]
+[ ! -s "$WORK/boot.csv" ]
+rm -rf "$boot_home"
+
 # Runtime accounting must not include a supervisor just because its arguments
 # mention allowed app paths. Feed executable-only process rows through the
 # actual selector and reject use of the old argument-matching command.

@@ -152,6 +152,14 @@ def main():
                         p.kill()
                         p.wait()
         (ROOT / "benchmarks/RESULTS.md").write_bytes(report)
+        # Failed stages are never selected, but their partial measurements and
+        # boot diagnostics must survive alongside the guard's failure receipt.
+        for path in [result, result.with_suffix(".tree")]:
+            if path.exists():
+                shutil.copyfile(path, out / path.name)
+        boot_diagnostics = ROOT / ".logs" / f"boot-{label}"
+        if boot_diagnostics.exists():
+            shutil.copytree(boot_diagnostics, out / f"{label}-boot-diagnostics")
         if p.returncode:
             raise RuntimeError("invalid or failed stage " + label)
         if monitor is not None and monitor.poll() is not None:

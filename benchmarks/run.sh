@@ -145,6 +145,11 @@ ROOTFS=""
 RUN_DIR=""
 CASE_OUT=""
 FAILED=0
+BOOT_HOME=""
+BOOT_START_PID=""
+BOOT_LOG=""
+BOOT_LOG_DIR=""
+LIGHTER_CLI="target/release/lighter"
 
 # Milliseconds since the epoch, from a runtime every target already needs.
 # macOS `date` has no %N, and the shell has no sub-second clock at all.
@@ -156,6 +161,19 @@ now_ms() { node -e 'process.stdout.write(String(Date.now()))'; }
 # hundred such leftovers once filled the disk of an unsupervised machine.
 cleanup() {
 	net_teardown 2>/dev/null || true
+	if [ -n "$BOOT_HOME" ]; then
+		# A failed warm-up can exit before VMM_PID is set. Stop the exact
+		# private home even then, retaining its logs for the failed attempt.
+		if [ -n "$BOOT_START_PID" ]; then
+			if jobs -pr | grep -Fxq "$BOOT_START_PID"; then
+				kill "$BOOT_START_PID" 2>/dev/null || true
+			fi
+			wait "$BOOT_START_PID" 2>/dev/null || true
+		fi
+		LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" stop >>"$BOOT_LOG_DIR/cleanup.log" 2>&1 || true
+		[ ! -f "$BOOT_HOME/machine.log" ] || cp "$BOOT_HOME/machine.log" "$BOOT_LOG_DIR/machine.log" || true
+		printf '%s\n' "$BOOT_HOME" > "$BOOT_LOG_DIR/retained-home"
+	fi
 	[ -n "$HELPER_PID" ] && kill "$HELPER_PID" 2>/dev/null || true
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	[ "$KEEP" -eq 1 ] || rm -rf "$WORK"
@@ -948,8 +966,6 @@ materialized=0
 # For lighter it is the real command on a home of its own, not the benchmark
 # machine, so the CLI's own work (doctor, the rootfs clone, waiting for the
 # engine) is inside the number as the others' is inside theirs.
-BOOT_HOME=""
-LIGHTER_CLI="target/release/lighter"
 boot_stop() {
 	case "$TARGET" in
 	lighter) LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" stop >/dev/null 2>&1 || true ;;
@@ -973,12 +989,12 @@ boot_stop() {
 }
 boot_start() {
 	case "$TARGET" in
-	lighter) LIGHTER_HOME="$BOOT_HOME" LIGHTER_GUEST_DIR="${LIGHTER_GUEST_DIR:-guest/out}" "$LIGHTER_CLI" start >/dev/null 2>&1 & ;;
-	orbstack) orb start >/dev/null 2>&1 & ;;
-	colima) colima start "${BENCH_COLIMA_PROFILE:-default}" --activate=false >/dev/null 2>&1 & ;;
+	lighter) LIGHTER_HOME="$BOOT_HOME" LIGHTER_GUEST_DIR="${LIGHTER_GUEST_DIR:-guest/out}" "$LIGHTER_CLI" start >>"$BOOT_LOG" 2>&1 & ;;
+	orbstack) orb start >>"$BOOT_LOG" 2>&1 & ;;
+	colima) colima start "${BENCH_COLIMA_PROFILE:-default}" --activate=false >>"$BOOT_LOG" 2>&1 & ;;
 	docker-desktop) open -a Docker 2>/dev/null || open -a "Docker Desktop" 2>/dev/null; sleep 0.1 & ;;
 	esac
-	START_PID=$!
+	BOOT_START_PID=$!
 }
 # Waits until `docker version` answers, or gives up after five minutes (Docker
 # Desktop takes a minute on a good day).
@@ -991,6 +1007,8 @@ boot_await_docker() {
 }
 run_boot_case() {
 	[ "$TARGET" != native ] || return 0
+	BOOT_LOG_DIR="$ROOT/.logs/boot-${LABEL:-$TARGET}"
+	mkdir -p "$BOOT_LOG_DIR"
 	if [ "$TARGET" = lighter ]; then
 		cargo build --release -p lighter-cli >/dev/null 2>&1
 		./scripts/sign.sh "$LIGHTER_CLI" >/dev/null
@@ -1015,8 +1033,9 @@ PYOWNER
 		DOCKER_ARGS=()
 	fi
 	printf '==> %s: boot (a cold stop, then a start, %s times; untimed round first)' "$TARGET" "$REPS"
-	local rep t0 t1 t2 START_PID
+	local rep t0 t1 t2
 	for rep in $(seq 0 "$REPS"); do
+		BOOT_LOG="$BOOT_LOG_DIR/start-$rep.log"
 		boot_stop
 		sleep 2
 		t0=$(now_ms)
@@ -1024,12 +1043,22 @@ PYOWNER
 		if ! boot_await_docker "$t0"; then
 			printf ' no measurement: docker did not answer within five minutes'
 			echo "boot-docker,$rep,timeout" >> "$RESULTS"
-			break
+			FAILED=1
+			return 1
 		fi
 		t1=$(now_ms)
-		dk run --rm alpine:3.21 true >/dev/null 2>&1
+		if dk run --rm alpine:3.21 true >"$BOOT_LOG_DIR/container-$rep.log" 2>&1; then
+			:
+		else
+			local status=$?
+			printf '\n    FAILED: boot container rep %s (exit %s); logs: %s\n' "$rep" "$status" "$BOOT_LOG_DIR"
+			sed -n '1,20p' "$BOOT_LOG_DIR/container-$rep.log"
+			FAILED=1
+			return "$status"
+		fi
 		t2=$(now_ms)
-		wait "$START_PID" 2>/dev/null || true
+		wait "$BOOT_START_PID" 2>/dev/null || true
+		BOOT_START_PID=""
 		[ "$rep" -gt 0 ] || continue
 		printf ' %s/%s' "$((t1 - t0))" "$((t2 - t0))"
 		echo "boot-docker,$rep,$((t1 - t0))" >> "$RESULTS"
@@ -1042,9 +1071,11 @@ PYOWNER
 	boot_stop
 	sleep 2
 	t0=$(now_ms)
+	BOOT_LOG="$BOOT_LOG_DIR/start-idle.log"
 	boot_start
 	if boot_await_docker "$t0"; then
-		wait "$START_PID" 2>/dev/null || true
+		wait "$BOOT_START_PID" 2>/dev/null || true
+		BOOT_START_PID=""
 		sleep 60
 		[ "$TARGET" != lighter ] || VMM_PID="$(cat "$BOOT_HOME/lighter.pid" 2>/dev/null)"
 		local idle
@@ -1052,10 +1083,16 @@ PYOWNER
 		[ "$TARGET" != lighter ] || VMM_PID=""
 		echo "==> $TARGET: memory idle=$idle MiB, a minute after a cold start"
 		echo "memory-idle,1,$idle" >> "$RESULTS"
+	else
+		printf '    FAILED: idle boot did not answer; logs: %s\n' "$BOOT_LOG_DIR"
+		FAILED=1
+		return 1
 	fi
 	if [ "$TARGET" = lighter ]; then
 		boot_stop
+		cp "$BOOT_HOME/machine.log" "$BOOT_LOG_DIR/machine.log"
 		rm -rf "$BOOT_HOME"
+		BOOT_HOME=""
 	fi
 }
 
