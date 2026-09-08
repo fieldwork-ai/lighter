@@ -190,3 +190,12 @@ completion fell from 1,737 to 1,605 ms (−7.6%). There are three interleaved co
 starts per version. Removing redundant calls saves preparation work but does
 not resolve foreground startup contention. All 343 workspace and 24 signed
 hypervisor tests pass with this change.
+
+A [2 MiB worker-mapping trial](records/0.5.1/hybrid/m1-mapping-trial/) kept
+256 KiB foreground preparation and independent 16 KiB ownership, but acquired
+eight stripes at a time to map contiguous unprepared runs together. It passed
+25 signed hypervisor tests, including live holes and a partial tail. In three
+interleaved cold starts per version, preparation completion fell from 1,576 to
+1,455 ms (−7.7%) while Docker readiness rose from 855 to 900 ms (+5.2%). The
+extra batching and locking complexity was rejected; the runtime retains the
+original 256 KiB preparation path.

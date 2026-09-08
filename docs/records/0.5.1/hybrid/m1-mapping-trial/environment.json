@@ -1,0 +1,28 @@
+{
+  "base_source": "11ddb88fbc294060704f90ca1debb24afe07b546",
+  "variant_sources": {
+    "cached": "11ddb88 plus cached task port",
+    "batch": "11ddb88 plus batch-source.patch"
+  },
+  "source_patch_sha256": "580a65fdc2bd7aa0cf9882c975d6e61903d836a4e04b73100b267519334276bd",
+  "profile": {
+    "cpus": 8,
+    "memory_mib": 16384
+  },
+  "artifacts": {
+    "$HOME/lighter/.logs/051/hybrid/hybrid-boot-batch.py": "ce94053f1e1367149455bd9115235067d23e4da0bd6f74779df5d7364d38a7db",
+    "$HOME/lighter/.logs/051/hybrid/record-boot.py": "5c27960834037ca2d6c69fd455beb039f259717d4bd07ea0ea46ab5b1cdf6cb2",
+    "$HOME/lighter/.logs/051/hybrid/cached-lighter": "b4401f1a9aee75a5cb6b347320d3c9971e069006ba7d429443de22a33573384d",
+    "$HOME/lighter/.logs/051/hybrid-batch-source/target/release/lighter": "f38c633e1c6ec2fd866066dd5ab56e12d91385b9f412d828354c072a23444819",
+    "$HOME/lighter/.logs/051/hybrid-batch-source/guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "$HOME/lighter/.logs/051/hybrid-batch-source/guest/out/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71"
+  },
+  "order": [
+    "cached",
+    "batch",
+    "batch",
+    "cached",
+    "cached",
+    "batch"
+  ]
+}
