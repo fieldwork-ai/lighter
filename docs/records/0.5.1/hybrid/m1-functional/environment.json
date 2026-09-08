@@ -1,0 +1,13 @@
+{
+  "source": "274293b1a0b6d96bc60120db57765bb364583081",
+  "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+  "scope": "Ten functional hardware gates; no performance measurements or quiet-host requirement. Together with separate memory/idle and speed evidence this completes all twelve M1 hardware gates. Development binaries, not the final notarized archive.",
+  "signing": "Ad-hoc hypervisor entitlement",
+  "artifact_hash_timing": "After gates; gates build and sign their own development binaries from the clean source tree.",
+  "artifacts": {
+    "target/release/lighter": "255150a42c17f612e26720aaa5cba54a50e11f78769a5b028ae3ca708fccdea6",
+    "target/release/examples/lighter-bench": "0aba132aa3a899bc15dda3beed9bfaf5af09efde84c6543e61ffef96ad2ab096",
+    "guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "guest/out/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71"
+  }
+}
