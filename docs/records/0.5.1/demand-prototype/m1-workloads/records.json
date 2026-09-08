@@ -1,0 +1,34 @@
+[
+  {
+    "label": "051-57456cf-m1-a1-work-1-background",
+    "target": "lighter",
+    "mode": "0",
+    "cases": "npm-install copy-tree cpu-sha256 memory",
+    "options": [],
+    "sha256": "581984ba1fb9980ff065d62a2ed0f7f67a2cefce0e0490ac89431c7ccf791417"
+  },
+  {
+    "label": "051-57456cf-m1-a1-work-2-demand-all",
+    "target": "lighter",
+    "mode": "1",
+    "cases": "npm-install copy-tree cpu-sha256 memory",
+    "options": [],
+    "sha256": "df98956a0682b37a0d606a8dde337548deb74488d0b427212f85e9131eecdd19"
+  },
+  {
+    "label": "051-57456cf-m1-a1-work-3-demand-all",
+    "target": "lighter",
+    "mode": "1",
+    "cases": "npm-install copy-tree cpu-sha256 memory",
+    "options": [],
+    "sha256": "efb46cf1da7a933f7c4e1f8d58bd5eccbe4ed46a4fca0c3f39bde76410c4ef2f"
+  },
+  {
+    "label": "051-57456cf-m1-a1-work-4-background",
+    "target": "lighter",
+    "mode": "0",
+    "cases": "npm-install copy-tree cpu-sha256 memory",
+    "options": [],
+    "sha256": "d95b21de364384cdac20257ec765df26423d721a2c465d14ee5a8d3b53417367"
+  }
+]

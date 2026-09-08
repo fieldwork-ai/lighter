@@ -60,8 +60,11 @@ sparse device access, four simultaneous guest CPUs, instruction retry, partial
 reclamation, reuse without duplicate accounting, and injected allocation/map
 failures that must abort the entire disposable VM process.
 
-Before default promotion, measure ordinary workloads and reclamation on M1:
-first-access allocation moves some work from startup into later execution.
+[Matched M1 workload arms](records/0.5.1/demand-prototype/m1-workloads/)
+show no median regression in installs, copying or CPU work, and slightly lower
+peak/settled footprints. The copy case has a large first-repetition effect, so
+these are not general speedup claims. Before default promotion, measure a cold
+allocation too: first-access backing moves some work into later execution.
 The current release path unmaps/remaps each prepared 64 KiB chunk separately;
 its cost also needs measurement. No full M5 benchmark is authorized for this
 investigation. A changed release runtime requires fresh qualification,
