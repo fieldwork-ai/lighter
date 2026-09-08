@@ -1,4 +1,11 @@
-# 0.5.1 performance measurements
+# 0.5.1 performance measurements — superseded candidate
+
+This report retains the earlier quarter-RAM candidate's measurements, before
+the selected `b78dfeb` hybrid runtime. It is not the final 0.5.1 performance
+report. [Current hybrid results](../docs/demand-memory-2026-09-08.md) use one
+completed M1 full suite with three repetitions per timed case; M5 qualification
+still awaits quiet-machine clearance. Do not pool these historical suites with
+the current hybrid measurements.
 
 Three complete M1 suites use the same frozen runtime, eight vCPUs, 4 GiB guest RAM, a 128 GiB sparse disk and pinned package tools and images. The first valid suite remains the primary record. Each timing is the median of three successful repetitions; memory and idle-power rows are sampling windows. Between-run CV is sample standard deviation divided by the arithmetic mean of these three values.
 

@@ -1,10 +1,17 @@
 # 0.5.1 release qualification
 
-Status: publication on hold while the [demand-backed RAM prototype](demand-memory-2026-09-08.md)
-is evaluated. The dev → main PR is draft. This report records the earlier
-built, signed, notarized and qualified candidate; its artifact bytes remain
-frozen and do not include the demand-backed implementation. A new runtime
-requires new release qualification and notarization.
+Status: the selected hybrid runtime is `b78dfeb`; publication remains on hold.
+The [current hybrid qualification](demand-memory-2026-09-08.md) records the design,
+startup trade-off, one completed M1 full suite, all twelve M1 hardware gates and
+focused comparisons. M5 full benchmarking awaits renewed quiet-machine clearance.
+Final hybrid archives must still be built, signed, notarized and tested. Both
+release PRs remain draft; no 0.5.1 release has been published.
+
+## Superseded candidate — retained historical evidence
+
+Everything below records the earlier quarter-RAM candidate (`67d787b`), not the
+selected hybrid runtime. Its frozen artifacts and measurements must not be used
+as the final hybrid release qualification.
 
 Lighter now starts Linux from its existing quarter-RAM base while a worker
 prepares the remaining backing in 128 MiB steps. Independent 16 KiB owned

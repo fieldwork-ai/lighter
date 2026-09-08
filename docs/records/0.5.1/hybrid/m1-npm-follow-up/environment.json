@@ -1,0 +1,27 @@
+{
+  "source": "274293b1a0b6d96bc60120db57765bb364583081",
+  "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+  "baseline_source": "60e94cb870ce2764f77ca82839001681820004db",
+  "artifacts": {
+    "$HOME/lighter/.logs/051/hybrid/hybrid-full-warm-npm-repeat.py": "bb7eee141a3860181b1e6402fb8f1f4c0c297811bd1884833b1c3339c7d071c6",
+    "$HOME/lighter/.logs/051/hybrid-harness-source/benchmarks/run.sh": "56eb4772e40338b5e203dc9c034a3e3e5b4f4fa8ac1ecc62ee5c32f1e356a740",
+    "$HOME/lighter/.logs/051/hybrid-harness-source/target/release/examples/lighter-bench": "6c28fcad5135e5db6e3e0e80927d9993cddf37573a46c0c9454da8ca1c6d8c17",
+    "$HOME/lighter/.logs/051/baseline-050-target/release/examples/lighter-bench": "38eef5b1beb33e3dd7db73f67bf9d8c6c781cd0578b9d7e1ab5a7723ffd14061",
+    "$HOME/lighter/.logs/051/hybrid-harness-source/guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "$HOME/lighter/.logs/051/hybrid-harness-source/guest/out/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71",
+    "/opt/homebrew/Cellar/lighter/0.5.0/share/lighter/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "/opt/homebrew/Cellar/lighter/0.5.0/share/lighter/rootfs.ext4": "84cad61484b67dec2875c4bd8a812377e4ce76157dd0c78e5ab14c45d4505b44"
+  },
+  "order": [
+    "050",
+    "hybrid"
+  ],
+  "profile": {
+    "cpus": 8,
+    "memory_mib": 4096,
+    "disk_gib": 128
+  },
+  "repetitions": 2,
+  "warmup": "npm, pnpm, yarn in one VM before measurement; same selection as the full suite",
+  "cases": "npm-install"
+}

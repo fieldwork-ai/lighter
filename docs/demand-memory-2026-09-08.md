@@ -224,6 +224,15 @@ footprint, then returned to 267 MiB within five seconds. The next container saw
 120-second idle window the process used 0.62% CPU, below the 1% gate, and its
 final footprint was 327 MiB. The full M1 suite is a separate qualification.
 
+[The remaining ten M1 functional gates](records/0.5.1/hybrid/m1-functional/)
+pass from clean source `274293b`, with the unchanged `b78dfeb` runtime. Together
+with the separate memory/idle and speed gates, all twelve hardware gates pass.
+Coverage includes boot, devices, networking, vsock, Docker, streams, publishing,
+filesystem crash recovery, amd64 execution and the daily workflow with clock-skew
+recovery. The final CLI, kernel and rootfs hashes match the full-suite inputs.
+These are development binaries signed with the hypervisor entitlement; final
+notarized-archive qualification remains outstanding.
+
 ### Invalid first full-suite attempt
 
 The [first M1 attempt](records/0.5.1/hybrid/m1-invalid-full-a1/) failed during
@@ -268,8 +277,9 @@ stage and the existing September 8 native reference, without new measurements.
 Its 85%-of-native npm aspiration remains unmet; the established 30% floor passes.
 Guest-disk package medians are close to the historical 0.5.0 primary record;
 host-share npm and pnpm are respectively 14.4% and 13.2% slower than that
-historical record. A matched comparison with the same combined package-cache
-warm-up is needed before attributing those differences to the runtime.
+historical record. The matched comparisons below do not reproduce a consistent
+package-install regression, so these historical differences cannot be attributed
+to the runtime from this evidence.
 
 The full suite's cold-start medians are 720 ms to Docker and 905 ms to the first
 container. These use the Node-based harness at 4 GiB, so they must not be pooled
@@ -294,9 +304,26 @@ that combined preparation on both versions, with hybrid followed by 0.5.0.
 | Tree copy | 16,858 ms | 17,130 ms | +1.6% |
 | Tree deletion | 2,851 ms | 2,861 ms | +0.4% |
 
-Only npm crosses the +5% investigation threshold and receives two additional
+Only npm crossed the +5% investigation threshold, triggering two additional
 observations per version. The harness can now retain the combined warm-up
 through `BENCH_EXTRA_WARM_CASES` while timing npm alone; regression tests verify
 that this does not add measurements of the warm-up-only cases. These copy
 observations lack the full suite's preceding file-search reads and are not
 directly comparable with its warmer copy medians.
+
+
+The [npm follow-up](records/0.5.1/hybrid/m1-npm-follow-up/) reverses version
+order (0.5.0 then hybrid) and retains the same combined package warm-up. It
+measures only npm, twice per version; it does not repeat the full suite.
+
+| Version | Initial observation | Follow-up observations | Combined median |
+|---|---:|---:|---:|
+| 0.5.0 | 11,214 ms | 12,077 / 11,770 ms | 11,770 ms |
+| Hybrid | 12,160 ms | 11,615 / 11,493 ms | 11,615 ms |
+
+The combined median changes by −1.3%, while the mean changes by +0.6%.
+The ranges overlap, and the initial slowdown does not reproduce consistently.
+This small diagnostic sample supports neither a speedup claim nor statistical
+equivalence. Each version has an initial observation in one VM and two follow-up
+repetitions in another; these are not three independent VM starts. Both follow-up
+guards and artifact checks pass, and the paused host processes were restored.
