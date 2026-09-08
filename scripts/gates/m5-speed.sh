@@ -84,6 +84,19 @@ median() {
 # morning of 0.3.0 with the record freshly committed.
 NATIVE=benchmarks/results/gate-native.csv
 OURS=benchmarks/results/gate-lighter.csv
+BOOT_LOG=benchmarks/results/lighter-boot.log
+CHECK_RECORDS=0
+if [ "$#" -ne 0 ]; then
+	if [ "$#" -ne 4 ] || [ "$1" != --check-records ]; then
+		echo "usage: $0 [--check-records native.csv lighter.csv lighter-boot.log]" >&2
+		exit 2
+	fi
+	NATIVE="$2"; OURS="$3"; BOOT_LOG="$4"
+	CHECK_RECORDS=1
+	for record in "$NATIVE" "$OURS" "$BOOT_LOG"; do
+		[ -f "$record" ] || { echo "missing record: $record" >&2; exit 1; }
+	done
+fi
 
 native_is_fresh() {
 	[ "${REFRESH_NATIVE:-0}" = 1 ] && return 1
@@ -98,14 +111,21 @@ native_is_fresh() {
 	[ "$age" -le "$NATIVE_MAX_AGE_DAYS" ]
 }
 
-if native_is_fresh; then
+if [ "$CHECK_RECORDS" -eq 1 ]; then
+	# The release recorder already enforces quiet, repetition counts and source
+	# identity. Apply these same thresholds without measuring the cases twice.
+	native_is_fresh || { echo "native record is stale or incomplete" >&2; exit 1; }
+	echo "==> Checking existing release records (no measurements)"
+elif native_is_fresh; then
 	echo "==> Reusing the native baseline ($(date -r "$NATIVE" '+%Y-%m-%d'); REFRESH_NATIVE=1 to redo it)"
 else
 	echo "==> Measuring macOS itself"
 	./benchmarks/run.sh --target native --reps "$REPS" --cases "$CASES" --label gate-native ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
 fi
-echo "==> Measuring the share"
-./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" --label gate-lighter ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
+if [ "$CHECK_RECORDS" -eq 0 ]; then
+	echo "==> Measuring the share"
+	./benchmarks/run.sh --target lighter --reps "$REPS" --cases "$CASES" --label gate-lighter ${LIGHTER_BENCH_ALLOW_NOISY:+--allow-noisy} >/dev/null
+fi
 
 echo
 compare() {
@@ -149,7 +169,6 @@ fi
 # way from the reclaim that failed to run. The server says so itself when its
 # count drifts past the budget, so the gate reads that rather than waiting for
 # the guest to fall over.
-BOOT_LOG="benchmarks/results/lighter-boot.log"
 # The warning is throttled to one a second, so this counts seconds spent over
 # budget rather than sweeps. A handful is the reclaim working at the edge of a
 # three-hundred-thousand-inode share; a hundred is it losing — the runs that
@@ -170,7 +189,9 @@ if [ "${NPM_RATIO:-0}" -lt "$TARGET_NPM" ]; then
 	note "npm install is ${NPM_RATIO}% of native against a ${TARGET_NPM}% target — see benchmarks/README.md for why, and what it would take"
 fi
 
-python3 benchmarks/report.py >/dev/null
+if [ "$CHECK_RECORDS" -eq 0 ]; then
+	python3 benchmarks/report.py >/dev/null
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then

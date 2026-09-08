@@ -128,3 +128,11 @@ within 4 KiB at 8, 12, 16 and 32 GiB. These are development-binary correctness
 checks with the user's Colima left running, not controlled M5 performance results
 or qualification of a notarized shipping archive. The speed and memory/idle
 hardware gates remain separate pending work.
+
+The speed gate can consume the completed suite directly:
+`bash scripts/gates/m5-speed.sh --check-records native.csv lighter.csv lighter-boot.log`.
+The caller supplies the validated full-suite CSV and its matching boot log, plus
+a fresh native baseline. This applies the existing speed, visibility and
+descriptor-budget thresholds without launching another benchmark or rewriting
+the published report. Its evaluator is checked with passing and deliberately
+failing visibility fixtures. The memory/idle gate remains a separate stress test.
