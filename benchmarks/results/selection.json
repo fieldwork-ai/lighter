@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "targets": {
+    "native": {
+      "csv": "../records/0.5.1/selection/m5/native.csv",
+      "tree": "../records/0.5.1/selection/m5/native.tree"
+    },
+    "lighter": {
+      "csv": "../records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-share.csv",
+      "tree": "../records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-share.tree"
+    },
+    "lighter-guest": {
+      "csv": "../records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-guest.csv",
+      "tree": "../records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-guest.tree"
+    },
+    "lighter-amd64": {
+      "csv": "../records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-amd64.csv",
+      "tree": "../records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-amd64.tree"
+    },
+    "orbstack": {
+      "csv": "../records/0.5.1/selection/m5/orbstack.csv",
+      "tree": "../records/0.5.1/selection/m5/orbstack.tree"
+    },
+    "orbstack-guest": {
+      "csv": "../records/0.5.0/m5-orbstack/050-1b0caab-m5-orbstack-a2-guest.csv",
+      "tree": "../records/0.5.1/selection/m5/orbstack-guest.tree"
+    },
+    "orbstack-amd64": {
+      "csv": "../records/0.5.0/m5-orbstack/050-1b0caab-m5-orbstack-a2-amd64.csv",
+      "tree": "../records/0.5.1/selection/m5/orbstack-amd64.tree"
+    },
+    "colima": {
+      "csv": "../records/0.5.0/m5-colima/050-1b0caab-m5-colima-a3-share.csv",
+      "tree": "../records/0.5.1/selection/m5/colima.tree"
+    },
+    "colima-guest": {
+      "csv": "../records/0.5.0/m5-colima/050-1b0caab-m5-colima-a3-guest.csv",
+      "tree": "../records/0.5.1/selection/m5/colima-guest.tree"
+    },
+    "colima-amd64": {
+      "csv": "../records/0.5.0/m5-colima/050-1b0caab-m5-colima-a3-amd64.csv",
+      "tree": "../records/0.5.1/selection/m5/colima-amd64.tree"
+    },
+    "docker-desktop": {
+      "csv": "../records/0.5.1/selection/m5/docker-desktop.csv",
+      "tree": "../records/0.5.1/selection/m5/docker-desktop.tree"
+    },
+    "docker-desktop-guest": {
+      "csv": "../records/0.5.0/m5-docker-desktop/050-1b0caab-m5-docker-desktop-a4-guest.csv",
+      "tree": "../records/0.5.1/selection/m5/docker-desktop-guest.tree"
+    },
+    "docker-desktop-amd64": {
+      "csv": "../records/0.5.0/m5-docker-desktop/050-1b0caab-m5-docker-desktop-a4-amd64.csv",
+      "tree": "../records/0.5.1/selection/m5/docker-desktop-amd64.tree"
+    }
+  }
+}

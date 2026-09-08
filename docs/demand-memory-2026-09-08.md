@@ -141,7 +141,7 @@ failing visibility fixtures. The memory/idle gate remains a separate stress test
 
 ### Focused M1 screening
 
-[Matched raw records](records/0.5.1/hybrid/m1-focused/) compare 0.5.0 with hybrid
+[Matched raw records](../benchmarks/records/0.5.1/hybrid/m1-focused/) compare 0.5.0 with hybrid
 `11ddb88`, using 8 CPUs and 4 GiB guest RAM. There is one measured observation
 per workload per version, with identical fixture setup and version order
 alternated across workloads. Quiet-host checks precede each arm. Paused Apple
@@ -235,159 +235,10 @@ recovery. The final CLI, kernel and rootfs hashes match the full-suite inputs.
 These are development binaries signed with the hypervisor entitlement; final
 notarized-archive qualification remains outstanding.
 
-### Invalid first full-suite attempt
+## Release qualification
 
-The [first M1 attempt](records/0.5.1/hybrid/m1-invalid-full-a1/) failed during
-the boot case's untimed Alpine start with Docker exit 125. Earlier share
-observations are retained as incomplete evidence, not a qualified full suite.
-The harness discarded Docker's error output, so the original cause is unknown.
-An exact-environment retry pulled the image and ran the container successfully.
-A preliminary diagnostic lacked the original credential-helper PATH and is
-labelled separately; its error does not explain the original failure.
-
-The failure also exposed a cleanup bug: the private boot VM could be left
-running before the harness assigned its measurement PID. It was stopped.
-`16a7514` preserves start/container diagnostics, stops that exact private home
-on failure and retains partial records even when the stage fails. The
-[harness checks](records/0.5.1/hybrid/m1-boot-harness-checks/) inject Docker exit
-125 and verify error retention and VM shutdown, then run a successful boot-only
-case. These are correctness checks, not performance measurements. The existing
-benchmark-result tests also pass with a new regression test for this path.
-
-A fresh full-suite attempt uses the same `b78dfeb` VM runtime and the corrected
-harness. The already-passed hypervisor and memory/idle checks are not repeated.
-
-### Completed M1 suite
-
-The [first valid full suite](records/0.5.1/hybrid/m1-full/) passes at harness
-`16a7514`, runtime `b78dfeb`, with 8 vCPUs and 4 GiB guest RAM. There is one
-share stage, one guest-disk stage and one amd64 stage, with three observations
-per timed case. The archived summary retains every observation, medians and
-sample CVs; these CVs describe repetitions within this suite, not a universal
-bound on run-to-run variation. All stage guards and frozen-artifact checks pass.
-
-| Workload | Host share | Guest disk |
-|---|---:|---:|
-| npm install | 12,849 ms | 7,566 ms |
-| pnpm install | 7,561 ms | 1,680 ms |
-| yarn install | 10,969 ms | 7,816 ms |
-| Tree copy | 7,593 ms | 3,905 ms |
-| Tree deletion | 2,827 ms | 613 ms |
-
-The [speed gate](records/0.5.1/hybrid/m1-speed-gate/) passes using this share
-stage and the existing September 8 native reference, without new measurements.
-Its 85%-of-native npm aspiration remains unmet; the established 30% floor passes.
-Guest-disk package medians are close to the historical 0.5.0 primary record;
-host-share npm and pnpm are respectively 14.4% and 13.2% slower than that
-historical record. The matched comparisons below do not reproduce a consistent
-package-install regression, so these historical differences cannot be attributed
-to the runtime from this evidence.
-
-The full suite's cold-start medians are 720 ms to Docker and 905 ms to the first
-container. These use the Node-based harness at 4 GiB, so they must not be pooled
-with the Python-based 16 GiB experiments. Idle footprint is 241 MiB; package-load
-footprint peaks at 4,109 MiB and settles to 817 MiB after 60 seconds. As elsewhere,
-configured RAM limits the guest, not every host allocation. Idle CPU is 5 ms/s,
-approximately 0.5% of one core. The paused Apple processes were restored after
-the recorder exited.
-
-### Matched package-cache context
-
-The original isolated screening warmed only the selected package manager. The
-full suite warms npm, pnpm and yarn before its first measurement. A
-[matched one-observation comparison](records/0.5.1/hybrid/m1-full-warm/) uses
-that combined preparation on both versions, with hybrid followed by 0.5.0.
-
-| Workload | 0.5.0 | Hybrid | Time change |
-|---|---:|---:|---:|
-| npm install | 11,214 ms | 12,160 ms | +8.4% |
-| pnpm install | 7,398 ms | 7,402 ms | +0.05% |
-| yarn install | 11,804 ms | 11,554 ms | −2.1% |
-| Tree copy | 16,858 ms | 17,130 ms | +1.6% |
-| Tree deletion | 2,851 ms | 2,861 ms | +0.4% |
-
-Only npm crossed the +5% investigation threshold, triggering two additional
-observations per version. The harness can now retain the combined warm-up
-through `BENCH_EXTRA_WARM_CASES` while timing npm alone; regression tests verify
-that this does not add measurements of the warm-up-only cases. These copy
-observations lack the full suite's preceding file-search reads and are not
-directly comparable with its warmer copy medians.
-
-
-The [npm follow-up](records/0.5.1/hybrid/m1-npm-follow-up/) reverses version
-order (0.5.0 then hybrid) and retains the same combined package warm-up. It
-measures only npm, twice per version; it does not repeat the full suite.
-
-| Version | Initial observation | Follow-up observations | Combined median |
-|---|---:|---:|---:|
-| 0.5.0 | 11,214 ms | 12,077 / 11,770 ms | 11,770 ms |
-| Hybrid | 12,160 ms | 11,615 / 11,493 ms | 11,615 ms |
-
-The combined median changes by −1.3%, while the mean changes by +0.6%.
-The ranges overlap, and the initial slowdown does not reproduce consistently.
-This small diagnostic sample supports neither a speedup claim nor statistical
-equivalence. Each version has an initial observation in one VM and two follow-up
-repetitions in another; these are not three independent VM starts. Both follow-up
-guards and artifact checks pass, and the paused host processes were restored.
-
-
-### Selected M5 full suite
-
-The [fresh M5 primary](records/0.5.1/hybrid/m5-full/) runs source `e0f4b16`
-with unchanged runtime `b78dfeb`, 8 vCPUs and 16 GiB RAM. All three stages
-(share, guest disk, amd64) pass quiet preflight, competing-VM guards, repetition
-checks and unchanged source/artifact hashes. There is one complete suite with
-three repetitions per timed case. Both earlier interrupted attempts stopped
-at guest preflight when the daily VM restarted; they are excluded, as are
-later user-requested shared-host copy diagnostics.
-
-Docker-ready observations are 521, 517 and 494 ms; first-container completion
-is 664, 672 and 653 ms. Medians are **517 / 664 ms**. The package workload peaks
-at 3,841 MiB, settles to 702 MiB after 15 seconds and 726 MiB after 60 seconds.
-Cold idle footprint is 372 MiB; idle CPU is 3 ms/s (0.3% of one core).
-
-Host-share npm/pnpm/yarn medians are 6,364 / 4,008 / 5,192 ms. Copy is 3,804 ms
-and deletion 3,224 ms, respectively 6.0% and 22.2% above the historical 0.5.0
-primary. The focused comparison below investigates these differences; historical
-medians alone do not establish a runtime effect.
-
-The [M5 speed gate](records/0.5.1/hybrid/m5-speed-gate/) passes using the
-completed share CSV and the September 7 native reference, without another
-benchmark. All 211 fseventsd observations report one process at 15 MiB, ending
-at 0.3% CPU. Five-second sampling can miss short peaks; this does not establish
-a fix for the earlier unreproduced incident. Host process pauses and the daily
-login service setting were restored after the full suite.
-
-
-### M5 storage follow-up
-
-The matched screening used 0.5.0 then hybrid, one observation per case, with
-all three package-manager warm-ups and preceding file reads. Copy measured
-5,177 / 3,760 ms; the historical copy slowdown did not reproduce in this
-screening. These single observations do not establish a copy speedup.
-
-Deletion measured 2,830 / 3,015 ms, crossing the +5% investigation threshold.
-Two additional deletions per version reversed the order, hybrid then 0.5.0,
-with the same preparation. The preceding read, walk and copy are untimed in
-this follow-up and checked for successful completion.
-
-| Version | Initial observation | Two additional observations | Median | Mean |
-|---|---:|---:|---:|---:|
-| 0.5.0 | 2,830 ms | 2,682 / 2,874 ms | 2,830 ms | 2,795 ms |
-| Hybrid | 3,015 ms | 2,957 / 3,091 ms | 3,015 ms | 3,021 ms |
-
-The retained sample is 6.5% higher by median and 8.1% by mean. This is an
-inconclusive version comparison: the unchanged hybrid's full-suite deletion
-observations span 2,642–3,662 ms, with 16.1% within-suite CV. Host/cache/order
-variation plausibly contributes to the focused difference; that variability
-does not prove that the entire difference is noise or exclude a small runtime
-effect. We do not label this an established regression or an accepted
-performance cost. The threshold triggered investigation, not a statistical
-significance test. Each version has one initial observation and two repetitions
-in another VM, rather than three independent VM starts.
-
-The original full suite remains the release primary. User-directed exploratory
-repetitions after this screening are outside the retained release comparison.
-[Initial matched records](records/0.5.1/hybrid/m5-storage-focus/) and
-[the two-observation follow-up](records/0.5.1/hybrid/m5-deletion-follow-up/)
-retain the protocol, guards and source/artifact identities.
+The [0.5.1 performance report](../benchmarks/RELEASE-0.5.1.md) owns the final
+full-suite results, selection/exclusions, cache-matched follow-ups and their
+interpretation. The [release qualification](release-0.5.1.md) owns correctness,
+signed-artifact validation and publication readiness. The experiments above
+explain the design choice; they are not additional release benchmark suites.

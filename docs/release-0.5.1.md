@@ -1,77 +1,18 @@
 # 0.5.1 release qualification
 
-The selected runtime is `b78dfeb3063e3ad7af0660050a766032c36f23c0`.
-Hybrid RAM preparation moves the creation of host backing objects off the
-startup critical path. One ordinary-priority worker completes preparation
-while Linux boots; guest CPUs and devices can safely prepare memory ahead
-of it. Docker readiness does not wait for the worker.
-
-Independent 16 KiB Mach objects retain the memory-accounting fix. Preparation
-uses 256 KiB batches. Once a region is ready, memory accesses bypass preparation
-checks and reclamation returns to whole-range calls. Completion publication,
-concurrent reclamation and shutdown are synchronized. The cached Mach task
-port removes an unnecessary kernel trap for each backing object.
-
-The configured capacity is available to the guest without eagerly making all
-of that RAM resident on the host. A VM's RAM setting does not cap every host
-process allocation. The guest memory-online gate still applies to restored
-containers. The kernel remains **6.18.49**, and data epoch remains **1**.
-
-## Startup trade-off
-
-The [investigation](demand-memory-2026-09-08.md) retains the rejected pure-demand,
-priority and mapping-batch alternatives. On M1 at 16 GiB, the selected hybrid
-measured 812 ms to Docker versus 663 ms for pure demand, with three interleaved
-cold starts per mode. The remaining 148 ms is an accepted trade-off for finishing
-preparation shortly after boot and restoring efficient reclamation. The +10%
-investigation threshold was exceeded; it was investigated, not passed. These
-Python-based experiments are separate from the Node-based full-suite timings.
+Runtime `b78dfeb3063e3ad7af0660050a766032c36f23c0` is qualified for release.
+The [design investigation](demand-memory-2026-09-08.md) explains hybrid RAM
+preparation, correctness constraints and the accepted startup trade-off.
+The kernel remains **6.18.49** and data epoch **1**.
 
 ## Performance qualification
 
-M5 cold-start medians are **517 ms to Docker / 664 ms to the first container**,
-versus the historical 0.5.0 primary's 1,649 / 1,799 ms. M1 medians are
-**720 / 905 ms**, versus 846 / 1,030 ms. The historical changes are not a
-simultaneous experiment. M5 idle memory is 372 MiB; its package-load footprint
-peaks at 3,841 MiB and settles to 726 MiB after 60 seconds.
-
-Each host contributes **one complete suite with three repetitions per timed
-case**. Memory and idle-power rows are single observation windows. M5 uses
-8 vCPUs / 16 GiB RAM; M1 uses 8 vCPUs / 4 GiB. Both use a 128 GiB sparse disk,
-the same pinned package fixture and recorded tools/images. Six quiet preflight
-observations must stay at or below 5% aggregate host CPU. A competing VM fails
-the guard. All selected stages have complete repetitions, successful guards
-and unchanged source/artifact hashes.
-
-The [performance report](../benchmarks/RELEASE-0.5.1.md) retains every selected
-observation, medians, within-suite CV and historical 0.5.0 differences. The
-README leads with M5 and identifies the competitor/native figures as retained
-0.5.0 qualification measurements. Historical differences alone do not establish
-runtime effects. Focused M1 follow-ups did not reproduce a consistent package
-installation slowdown.
-
-The M5 focused copy slowdown did not reproduce. The retained deletion sample
-measured 3,015 versus 2,830 ms (+6.5% by median; +8.1% by mean). Its version
-effect remains inconclusive: the unchanged hybrid's full-suite deletions span
-2,642–3,662 ms with 16.1% within-suite CV. Host/cache/order variation plausibly
-contributes; a small runtime effect has not been isolated or excluded. This
-is not labelled an established regression or an accepted performance cost.
-The +5% threshold triggered a one-case follow-up, not another full suite.
-Later informal user-directed repetitions are outside the retained comparison.
-
-Earlier M5 full attempts stopped at guest preflight when the daily VM restarted.
-Their completed share stage is retained but excluded from the fresh selected
-suite. The user's later shared-host copy diagnostics are also excluded. The
-original M1 attempt failed during Docker warm-up; its cause remains unknown
-because the inherited harness discarded that stderr. The corrected harness
-retains startup failures and cleans up its private VM even before startup
-returns a PID. A successful retry and injected-failure checks are recorded.
-
-Across the M5 full suite, all 211 fseventsd samples track one process at
-15 MiB, ending at 0.3% CPU. M1's full suite tracks one process at 13–15 MiB,
-ending at 14 MiB and 0.3% CPU. Neither required a daemon reset. Five-second
-sampling can miss shorter peaks; these observations do not establish a fix
-for the earlier unreproduced fseventsd incident.
+Both hosts completed one full suite with three repetitions per timed case.
+The [performance report](../benchmarks/RELEASE-0.5.1.md) is authoritative for
+measurements, configuration, methodology, selection/exclusions, variability,
+focused follow-ups and fseventsd observations. It also links to the raw inputs.
+The selected full suites and speed gates pass; remaining interpretation limits
+are recorded there rather than repeated here.
 
 ## Runtime checks
 
@@ -103,12 +44,10 @@ each check. The earlier quarter-RAM qualification and artifacts are preserved
 
 ## Final signed artifacts
 
-Built from `11e7ec0f2fd1f3d442f7989027ddef8099b9d36e` with runtime `b78dfeb`.
-Apple notarization `874a5d1a-fdd5-4ee8-80ac-54bb2e6aa5fa` is **Accepted**
-(Developer ID team `N7N6BNF95K`). The [artifact record](release-0.5.1-artifacts.json)
-contains the archive/bootstrap SHA-256 values and guest hashes. The frozen
-archive and bootstrap are the only release assets; the earlier quarter-RAM
-candidate is superseded.
+The [artifact record](release-0.5.1-artifacts.json) is authoritative for build
+and runtime revisions, archive/bootstrap hashes, guest hashes and Apple's
+accepted notarization. The frozen archive and bootstrap are the only release
+assets. The superseded quarter-RAM candidate must not be published.
 
 The archive uses portable regular ustar entries. Packaging exercises the real
 CLI installer before accepting its output. Independent checks validate the
@@ -152,17 +91,5 @@ not been performed.
 
 ## Review and publication
 
-The [main PR](https://github.com/fieldwork-ai/lighter/pull/5) and
-[tap PR](https://github.com/fieldwork-ai/homebrew-tap/pull/5) are ready for review.
-The draft `v0.5.1` release contains exactly the final archive and bootstrap;
-authenticated downloads match their qualified SHA-256 values. It remains
-unpublished. After main merges, point the draft at the reviewed merged commit,
-publish those frozen assets, verify both public URLs/hashes, then merge the tap.
-The [handoff](handoff-0.5.1.md) gives the sequence. Do not rebuild during publication.
-
-The M5 daily installation now uses the final signed 0.5.1 build, stopped,
-with its 16 GiB configuration and data disk preserved. M1's Homebrew 0.5.1 is
-also stopped. Neither host has an active lighter or Colima VM. Paused Apple
-processes were resumed, the M5 login-service enabled setting was restored,
-and the task-owned cached signing credentials were removed. Packaging's
-temporary keychain was removed and the normal user keychain list restored.
+Qualification is complete. The [publication handoff](handoff-0.5.1.md) owns
+the remaining merge/publication sequence and current host/credential state.

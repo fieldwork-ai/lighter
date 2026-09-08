@@ -10,11 +10,11 @@ The five fresh storage runs below measure variation between per-run medians, usi
 
 Competitor preparation uses the same workload cases and pinned image archives. Its isolation helper additionally recognizes Lima 2.1 instance PID files and Apple VM helpers by their exact open instance disk, or by macOS responsibility identifying an explicitly allowed runtime executable. Docker Desktop shutdown uses its synchronous CLI stop command; the original broad process-name kill could also match the supervisor arguments. The corrected OrbStack and Docker Desktop process selectors match executable names rather than supervisor arguments. These harness changes and helper hashes accompany the records. Each competitor environment records the helper hash. Docker stores that report an OCI manifest digest instead of a configuration digest use a derived identity map from the same verified archive; no image layers or workload files change.
 
-[Raw records and selection](../docs/records/0.5.0/benchmarks/) · [Competitor methods and excluded cases](RELEASE-0.5.0-COMPETITORS.md) · [Repeatability](REPEATABILITY.md)
+[Raw records and selection](records/0.5.0/) · [Competitor methods and excluded cases](RELEASE-0.5.0-COMPETITORS.md) · [Repeatability](REPEATABILITY.md)
 
-![M1 filesystem-daemon observation](../docs/records/0.5.0/benchmarks/plots/fseventsd-m1.svg)
+![M1 filesystem-daemon observation](records/0.5.0/plots/fseventsd-m1.svg)
 
-![M5 filesystem-daemon observation](../docs/records/0.5.0/benchmarks/plots/fseventsd-m5.svg)
+![M5 filesystem-daemon observation](records/0.5.0/plots/fseventsd-m5.svg)
 
 ## M1 — share
 

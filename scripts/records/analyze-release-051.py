@@ -109,7 +109,7 @@ def main():
         "Three complete M1 suites use the same frozen runtime, eight vCPUs, 4 GiB guest RAM, a 128 GiB sparse disk and pinned package tools and images. The first valid suite remains the primary record. Each timing is the median of three successful repetitions; memory and idle-power rows are sampling windows. Between-run CV is sample standard deviation divided by the arithmetic mean of these three values.", "",
         "Each stage requires six aggregate CPU observations at most 5%, ten seconds apart, and rejects unexpected VMs throughout. CPU and daemon observations remain available for assessing interference during workloads. No daemon was reset. The ABBA storage follow-up ran between full suites one and two. Warm-up/setup exit statuses were not retained by the inherited protocol; the archived measured-case diagnostics cannot validate those statuses retrospectively.", "",
         "The M5 remained shared. No full M5 suite was run for 0.5.1; the README's complete comparison remains the 0.5.0 M5 record.", "",
-        "[Raw records and selection](../docs/records/0.5.1/benchmarks/) · [Repeatability](REPEATABILITY.md)", "",
+        "[Raw records and selection](records/0.5.1/quarter/) · [Repeatability](REPEATABILITY.md)", "",
     ]
     for stage in ["share", "guest", "amd64"]:
         data = [csv_cases(next(p.glob(f"*1-{stage}.csv"))) for p in full]
