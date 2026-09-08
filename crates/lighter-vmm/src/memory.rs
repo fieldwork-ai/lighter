@@ -154,11 +154,13 @@ const DEMAND_CHUNK: usize = 256 << 10;
 #[cfg(test)]
 std::thread_local! {
     static DEMAND_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static RELEASE_SPANS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 #[derive(Debug)]
 struct Demand {
     ready: Vec<AtomicBool>,
     locks: Vec<Mutex<()>>,
+    complete: AtomicBool,
 }
 
 impl Region {
@@ -318,20 +320,21 @@ impl GuestMemory {
                 .map(|_| AtomicBool::new(false))
                 .collect(),
             locks: (0..64).map(|_| Mutex::new(())).collect(),
+            complete: AtomicBool::new(false),
         });
         Ok(())
     }
 
-    fn prepare_demand_chunk(&self, region: &Region, index: usize) -> Result<()> {
+    fn prepare_demand_chunk(&self, region: &Region, index: usize) -> Result<bool> {
         let demand = region.demand.as_ref().expect("demand region");
         if demand.ready[index].load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
         let _lock = demand.locks[index % demand.locks.len()]
             .lock()
             .expect("demand backing poisoned");
         if demand.ready[index].load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
         let offset = index * DEMAND_CHUNK;
         let len = DEMAND_CHUNK.min(region.len - offset);
@@ -367,6 +370,45 @@ impl GuestMemory {
             std::process::abort();
         }
         demand.ready[index].store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    /// Finish demand regions without waiting for guest accesses. Publication
+    /// happens after the final preparation lock is released. Ready chunks are
+    /// never replaced, including chunks reclaimed while this worker runs.
+    pub(crate) fn prepare_remaining(&self, shutdown: &AtomicBool) -> Result<()> {
+        for region in &self.regions {
+            let Some(demand) = &region.demand else {
+                continue;
+            };
+            if demand.complete.load(Ordering::Acquire) {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let mut worker_bytes = 0;
+            for index in 0..demand.ready.len() {
+                if shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if self.prepare_demand_chunk(region, index)? {
+                    worker_bytes += DEMAND_CHUNK.min(region.len - index * DEMAND_CHUNK);
+                }
+            }
+            // A ready flag can be observed just before its preparer unlocks.
+            // Drain those critical sections before publishing the fast path.
+            for lock in &demand.locks {
+                drop(lock.lock().expect("demand backing poisoned"));
+            }
+            demand.complete.store(true, Ordering::Release);
+            tracing::info!(
+                gpa = region.gpa,
+                bytes = region.len,
+                worker_bytes,
+                access_bytes = region.len - worker_bytes,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "RAM preparation complete"
+            );
+        }
         Ok(())
     }
 
@@ -456,7 +498,12 @@ impl GuestMemory {
     #[inline]
     fn region_for(&self, gpa: u64, len: usize) -> Result<&Region> {
         let region = self.region_for_release(gpa, len)?;
-        if region.demand.is_some() && len != 0 {
+        if region
+            .demand
+            .as_ref()
+            .is_some_and(|d| !d.complete.load(Ordering::Acquire))
+            && len != 0
+        {
             let first = (gpa - region.gpa) as usize / DEMAND_CHUNK;
             let last = ((gpa - region.gpa) as usize + len - 1) / DEMAND_CHUNK;
             for index in first..=last {
@@ -603,6 +650,9 @@ impl GuestMemory {
             return Ok(0);
         }
         if let Some(demand) = &region.demand {
+            if demand.complete.load(Ordering::Acquire) {
+                return self.release_backed(region, start, end);
+            }
             let mut at = start;
             let mut released = 0;
             while at < end {
@@ -626,6 +676,8 @@ impl GuestMemory {
 
     fn release_backed(&self, region: &Region, start: u64, end: u64) -> Result<u64> {
         let span = (end - start) as usize;
+        #[cfg(test)]
+        RELEASE_SPANS.with(|spans| spans.borrow_mut().push(span));
         let addr = region.host_addr(start);
 
         if let Some(vm) = &self.vm {
@@ -945,6 +997,79 @@ mod tests {
 
     #[test]
     #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn hybrid_pages_are_reclaimed_and_recharged_after_guest_reuse() {
+        guest_accounting_and_reuse(3);
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn hybrid_preparation_preserves_live_data_and_restores_whole_range_release() {
+        let vm = Arc::new(Vm::create().unwrap());
+        let mut mem = GuestMemory::new(vm);
+        let base = 0x4000_0000;
+        let size = 128 * DEMAND_CHUNK;
+        mem.reserve_demand_region(base, size).unwrap();
+        // Exercise multiple regions, including a partial final chunk.
+        let second = base + 2 * size as u64;
+        mem.reserve_demand_region(second, DEMAND_CHUNK + host_page_size() as usize)
+            .unwrap();
+        mem.write_u64(base, 0xfeed).unwrap();
+        let shutdown = AtomicBool::new(true);
+        mem.prepare_remaining(&shutdown).unwrap();
+        assert!(
+            !mem.regions[0]
+                .demand
+                .as_ref()
+                .unwrap()
+                .complete
+                .load(Ordering::Acquire)
+        );
+        shutdown.store(false, Ordering::Release);
+        std::thread::scope(|scope| {
+            scope.spawn(|| mem.prepare_remaining(&shutdown).unwrap());
+            scope.spawn(|| {
+                // Disjoint live bytes must survive both preparation and release.
+                for _ in 0..100 {
+                    for chunk in [0, 67, 127] {
+                        let address = base + (chunk * DEMAND_CHUNK) as u64;
+                        mem.write_u64(address, 0xfeed).unwrap();
+                        assert_eq!(mem.read_u64(address).unwrap(), 0xfeed);
+                    }
+                }
+            });
+            scope.spawn(|| {
+                // Guest-owned free ranges may be reported while backing advances.
+                for _ in 0..10 {
+                    mem.release(base + DEMAND_CHUNK as u64, 32 * DEMAND_CHUNK as u64)
+                        .unwrap();
+                }
+            });
+        });
+        for region in &mem.regions {
+            let demand = region.demand.as_ref().unwrap();
+            assert!(demand.complete.load(Ordering::Acquire));
+            assert!(demand.ready.iter().all(|r| r.load(Ordering::Acquire)));
+        }
+        for chunk in [0, 67, 127] {
+            assert_eq!(
+                mem.read_u64(base + (chunk * DEMAND_CHUNK) as u64).unwrap(),
+                0xfeed
+            );
+        }
+        RELEASE_SPANS.with(|spans| spans.borrow_mut().clear());
+        let free = base + DEMAND_CHUNK as u64;
+        let length = 3 * DEMAND_CHUNK;
+        mem.write_u64(free, 0xbeef).unwrap();
+        assert_eq!(mem.release(free, length as u64).unwrap(), length as u64);
+        RELEASE_SPANS.with(|spans| assert_eq!(*spans.borrow(), vec![length]));
+        assert_eq!(mem.read_u64(free).unwrap(), 0);
+        mem.write_u64(free, 0x1234).unwrap();
+        mem.prepare_remaining(&shutdown).unwrap();
+        assert_eq!(mem.read_u64(free).unwrap(), 0x1234);
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
     fn demand_sparse_concurrent_devices_and_partial_release() {
         let vm = Arc::new(Vm::create().unwrap());
         let mut mem = GuestMemory::new(vm);
@@ -1148,7 +1273,7 @@ mod tests {
         let page = host_page_size() as usize;
         mem.add_region(BASE, page).unwrap();
         let data = BASE + page as u64;
-        if mode == 2 {
+        if mode >= 2 {
             mem.reserve_demand_region(data, SIZE).unwrap();
         } else if mode == 1 {
             mem.reserve_region(data, SIZE).unwrap();
@@ -1186,7 +1311,22 @@ mod tests {
                 }
             }
         };
-        touch(1);
+        if mode == 3 {
+            std::thread::scope(|scope| {
+                scope.spawn(|| mem.prepare_remaining(&AtomicBool::new(false)).unwrap());
+                touch(1);
+            });
+            assert!(
+                mem.regions[1]
+                    .demand
+                    .as_ref()
+                    .unwrap()
+                    .complete
+                    .load(Ordering::Acquire)
+            );
+        } else {
+            touch(1);
+        }
         for round in 0..3 {
             let guest_charged = crate::footprint::bytes();
             for offset in (0..SIZE).step_by(page) {

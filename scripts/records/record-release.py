@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record three full suites, same-build variance and ABBA on a quiet Mac.
+"""Record one full suite, with three repetitions per timed case, on a quiet Mac.
 
 The first successful full suite is the primary release record. Failed runs are
 retained and never selected. This runner deliberately stops on any invalid run.
@@ -11,6 +11,7 @@ import csv
 import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import subprocess as sp
@@ -28,6 +29,11 @@ AMD64 = "npm-install pnpm-install cpu-sha256 container-start"
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--machine", choices=["m1", "m5"], required=True)
+    ap.add_argument("--release", default="0.5.1")
+    ap.add_argument("--compare-bin", type=Path)
+    ap.add_argument("--compare-guest", type=Path)
+    ap.add_argument("--cases", nargs="+", default=["npm-install", "pnpm-install", "yarn-install", "copy-tree", "rm-rf"])
+    ap.add_argument("--comparison-reps", type=int, choices=[1, 2], default=1)
     ap.add_argument("--source", required=True)
     ap.add_argument("--runtime-source", required=True)
     ap.add_argument("--out", type=Path, required=True)
@@ -38,6 +44,14 @@ def main():
         help="unique attempt number; retain earlier invalid records",
     )
     a = ap.parse_args()
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    signal.signal(signal.SIGTERM, interrupted)
+    if bool(a.compare_bin) != bool(a.compare_guest):
+        ap.error("comparison requires both --compare-bin and --compare-guest")
+    if any(case not in STORAGE.split() for case in a.cases):
+        ap.error("comparison cases must be storage workloads")
+    reps = a.comparison_reps if a.compare_bin else 3
     if a.attempt < 1:
         ap.error("attempt must be positive")
     os.chdir(ROOT)
@@ -68,8 +82,12 @@ def main():
         "LIGHTER_BENCH_KERNEL",
         "LIGHTER_BENCH_GUEST_DIR",
         "LIGHTER_BENCH_ALLOW_NOISY",
+        "LIGHTER_DEMAND_RAM",
+        "LIGHTER_DEMAND_BASE",
+        "LIGHTER_BACKGROUND_RAM",
     ]:
         env.pop(name, None)
+    env["LIGHTER_BENCH_BIN"] = str(ROOT / "target/release/examples/lighter-bench")
     report = (ROOT / "benchmarks/RESULTS.md").read_bytes()
     phase = out / "phase"
     records = []
@@ -117,12 +135,22 @@ def main():
                 "--label",
                 label,
                 "--reps",
-                "3",
+                str(reps),
                 "--cases",
                 cases,
                 *options,
             ]
-            p = sp.run(command, env=stage_env, stdout=log, stderr=sp.STDOUT)
+            p = sp.Popen(command, env=stage_env, stdout=log, stderr=sp.STDOUT)
+            try:
+                p.wait()
+            finally:
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(25)
+                    except sp.TimeoutExpired:
+                        p.kill()
+                        p.wait()
         (ROOT / "benchmarks/RESULTS.md").write_bytes(report)
         if p.returncode:
             raise RuntimeError("invalid or failed stage " + label)
@@ -137,7 +165,7 @@ def main():
                 "boot": ["boot-docker", "boot-first-container", "memory-idle"],
             }.get(case, [case])
             for name in names:
-                expected = 1 if name.startswith(("memory-", "power-")) else 3
+                expected = 1 if name.startswith(("memory-", "power-")) else reps
                 if counts[name] != expected:
                     raise RuntimeError(
                         f"{label}: {name} has {counts[name]}, expected {expected}"
@@ -195,10 +223,13 @@ def main():
                     "cargo",
                     "build",
                     "--release",
+                    "--bins",
                     "--example",
                     "lighter-bench",
                     "-p",
                     "lighter-vmm",
+                    "-p",
+                    "lighter-cli",
                 ],
                 env=env,
                 stdout=log,
@@ -226,6 +257,9 @@ def main():
             ".logs/050/benchmark-images/manifest.json",
         ]:
             expected_artifacts[str(ROOT / name)] = digest(ROOT / name)
+        if a.compare_bin:
+            for path in [a.compare_bin.resolve(), a.compare_guest.resolve() / "Image", a.compare_guest.resolve() / "rootfs.ext4"]:
+                expected_artifacts[str(path)] = digest(path)
         (out / "environment.json").write_text(
             json.dumps(
                 dict(
@@ -238,11 +272,12 @@ def main():
                     },
                     system=sp.check_output(["sw_vers"], text=True),
                     baseline_source=sp.check_output(
-                        ["git", "rev-parse", "v0.4.1"], text=True
+                        ["git", "rev-parse", "v0.5.0"], text=True
                     ).strip(),
-                    primary="first valid full suite",
+                    primary="focused comparison" if a.compare_bin else "one full suite",
                     quiet="six samples 10s apart, aggregate machine CPU <=5%; cap 15m",
-                    repetitions=3,
+                    repetitions=reps,
+                    preparation_mode="hybrid (production default)",
                     attempt=a.attempt,
                     tools=json.loads((ROOT / "benchmarks/toolchain.json").read_text()),
                     benchmark_images=json.loads(
@@ -257,54 +292,28 @@ def main():
         monitor = sp.Popen(
             ["python3", "scripts/records/monitor-host.py", str(out)], env=env
         )
-        prefix = f"050-{a.source[:7]}-{a.machine}-a{a.attempt}"
-        for suite in range(1, 4):
+        prefix = f"{a.release.replace('.', '')}-{a.source[:7]}-{a.machine}-a{a.attempt}"
+        if a.compare_bin:
+            baseline_source = sp.check_output(["git", "rev-parse", "v0.5.0^{commit}"], text=True).strip()
+            for index, case in enumerate(a.cases):
+                order = ["050", "hybrid"] if index % 2 == 0 else ["hybrid", "050"]
+                for version in order:
+                    extra = dict(LIGHTER_DEMAND_RAM="1", LIGHTER_DEMAND_BASE="1", LIGHTER_BACKGROUND_RAM="1")
+                    if version == "050":
+                        extra.update(
+                            LIGHTER_BENCH_BIN=str(a.compare_bin.resolve()),
+                            LIGHTER_BENCH_GUEST_DIR=str(a.compare_guest.resolve()),
+                            LIGHTER_BENCH_SOURCE_SHA=baseline_source,
+                            LIGHTER_DEMAND_RAM="0", LIGHTER_DEMAND_BASE="0", LIGHTER_BACKGROUND_RAM="0",
+                        )
+                    run(f"{prefix}-{case}-{version}", case, extra=extra)
+        else:
             for stage, cases, options in [
                 ("share", SHARE, ()),
                 ("guest", STORAGE, ("--where", "guest")),
                 ("amd64", AMD64, ("--where", "guest", "--arch", "amd64")),
             ]:
-                run(f"{prefix}-{suite}-{stage}", cases, options)
-        phase.write_text("ten-minute observation\n")
-        # Continue enforcing VM exclusivity throughout the observation window.
-        sp.run(
-            [
-                "python3",
-                "benchmarks/guard.py",
-                "--target",
-                "native",
-                "--log",
-                str(out / "observation-guard.jsonl"),
-                "--timeout",
-                "660",
-                "--",
-                "sleep",
-                "600",
-            ],
-            env=env,
-            check=True,
-        )
-        for index in range(1, 6):
-            run(f"{prefix}-variance-{index}", STORAGE)
-        baseline = ROOT / ".logs/050/targets/041/release/examples/lighter-bench"
-        baseline_guest = (
-            ROOT / ".logs/050/baseline-artifact/lighter-0.4.1/share/lighter"
-        )
-        baseline_source = sp.check_output(
-            ["git", "rev-parse", "v0.4.1"], text=True
-        ).strip()
-        for index, version in enumerate(["041", "050", "050", "041"], 1):
-            extra = (
-                dict(
-                    LIGHTER_BENCH_BIN=str(baseline),
-                    LIGHTER_BENCH_GUEST_DIR=str(baseline_guest),
-                    LIGHTER_BENCH_SOURCE_SHA=baseline_source,
-                )
-                if version == "041"
-                else None
-            )
-            run(f"{prefix}-abba-{index}-{version}", STORAGE, extra=extra)
-        run(f"{prefix}-native", STORAGE + " cpu-sha256 watch-latency", target="native")
+                run(f"{prefix}-1-{stage}", cases, options)
         phase.write_text("complete\n")
         successful = True
     finally:
