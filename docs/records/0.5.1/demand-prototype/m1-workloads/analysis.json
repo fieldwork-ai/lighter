@@ -1,0 +1,251 @@
+{
+  "profile": {
+    "BENCH_CPUS": "8",
+    "BENCH_MEMORY_MIB": "16384",
+    "BENCH_DISK_GIB": "128"
+  },
+  "arms": [
+    {
+      "mode": "background",
+      "label": "051-57456cf-m1-a1-work-1-background",
+      "metrics": {
+        "npm-install": {
+          "median": 11972.0,
+          "cv_percent": 2.5443419494188255,
+          "values": [
+            12109.0,
+            11972.0,
+            11531.0
+          ]
+        },
+        "copy-tree": {
+          "median": 6186.0,
+          "cv_percent": 70.51477180449834,
+          "values": [
+            18375.0,
+            6186.0,
+            5828.0
+          ]
+        },
+        "cpu-sha256": {
+          "median": 6378.0,
+          "cv_percent": 0.2002689464282934,
+          "values": [
+            6361.0,
+            6378.0,
+            6386.0
+          ]
+        },
+        "memory-peak": {
+          "median": 3815.0,
+          "cv_percent": null,
+          "values": [
+            3815.0
+          ]
+        },
+        "memory-after-15s": {
+          "median": 631.0,
+          "cv_percent": null,
+          "values": [
+            631.0
+          ]
+        },
+        "memory-after-60s": {
+          "median": 650.0,
+          "cv_percent": null,
+          "values": [
+            650.0
+          ]
+        }
+      }
+    },
+    {
+      "mode": "demand-all",
+      "label": "051-57456cf-m1-a1-work-2-demand-all",
+      "metrics": {
+        "npm-install": {
+          "median": 11517.0,
+          "cv_percent": 4.277418419753341,
+          "values": [
+            12026.0,
+            11517.0,
+            11040.0
+          ]
+        },
+        "copy-tree": {
+          "median": 5282.0,
+          "cv_percent": 72.02637696911889,
+          "values": [
+            15770.0,
+            4786.0,
+            5282.0
+          ]
+        },
+        "cpu-sha256": {
+          "median": 6300.0,
+          "cv_percent": 0.3659969087486765,
+          "values": [
+            6326.0,
+            6300.0,
+            6280.0
+          ]
+        },
+        "memory-peak": {
+          "median": 3748.0,
+          "cv_percent": null,
+          "values": [
+            3748.0
+          ]
+        },
+        "memory-after-15s": {
+          "median": 593.0,
+          "cv_percent": null,
+          "values": [
+            593.0
+          ]
+        },
+        "memory-after-60s": {
+          "median": 614.0,
+          "cv_percent": null,
+          "values": [
+            614.0
+          ]
+        }
+      }
+    },
+    {
+      "mode": "demand-all",
+      "label": "051-57456cf-m1-a1-work-3-demand-all",
+      "metrics": {
+        "npm-install": {
+          "median": 11416.0,
+          "cv_percent": 3.4173635357093253,
+          "values": [
+            12001.0,
+            11416.0,
+            11249.0
+          ]
+        },
+        "copy-tree": {
+          "median": 5348.0,
+          "cv_percent": 74.07224455234461,
+          "values": [
+            16508.0,
+            4846.0,
+            5348.0
+          ]
+        },
+        "cpu-sha256": {
+          "median": 6299.0,
+          "cv_percent": 1.6000340997048283,
+          "values": [
+            6467.0,
+            6299.0,
+            6284.0
+          ]
+        },
+        "memory-peak": {
+          "median": 3702.0,
+          "cv_percent": null,
+          "values": [
+            3702.0
+          ]
+        },
+        "memory-after-15s": {
+          "median": 578.0,
+          "cv_percent": null,
+          "values": [
+            578.0
+          ]
+        },
+        "memory-after-60s": {
+          "median": 598.0,
+          "cv_percent": null,
+          "values": [
+            598.0
+          ]
+        }
+      }
+    },
+    {
+      "mode": "background",
+      "label": "051-57456cf-m1-a1-work-4-background",
+      "metrics": {
+        "npm-install": {
+          "median": 11948.0,
+          "cv_percent": 1.5764631307711283,
+          "values": [
+            11948.0,
+            12041.0,
+            11680.0
+          ]
+        },
+        "copy-tree": {
+          "median": 6714.0,
+          "cv_percent": 63.57988795304229,
+          "values": [
+            17258.0,
+            5909.0,
+            6714.0
+          ]
+        },
+        "cpu-sha256": {
+          "median": 6344.0,
+          "cv_percent": 0.4061203342532404,
+          "values": [
+            6344.0,
+            6330.0,
+            6380.0
+          ]
+        },
+        "memory-peak": {
+          "median": 3971.0,
+          "cv_percent": null,
+          "values": [
+            3971.0
+          ]
+        },
+        "memory-after-15s": {
+          "median": 625.0,
+          "cv_percent": null,
+          "values": [
+            625.0
+          ]
+        },
+        "memory-after-60s": {
+          "median": 654.0,
+          "cv_percent": null,
+          "values": [
+            654.0
+          ]
+        }
+      }
+    }
+  ],
+  "geomeans": {
+    "background": {
+      "npm-install": 11959.993979931596,
+      "copy-tree": 6444.594944602805,
+      "cpu-sha256": 6360.9772834054365,
+      "memory-peak": 3892.218519045399,
+      "memory-after-15s": 627.9928343540232,
+      "memory-after-60s": 651.9969325081219
+    },
+    "demand-all": {
+      "npm-install": 11466.388795082781,
+      "copy-tree": 5314.897553104853,
+      "cpu-sha256": 6299.499980157154,
+      "memory-peak": 3724.9289926118036,
+      "memory-after-15s": 585.4519621625674,
+      "memory-after-60s": 605.9471924186131
+    }
+  },
+  "changes_percent": {
+    "npm-install": -4.127135729976661,
+    "copy-tree": -17.529377737603934,
+    "cpu-sha256": -0.9664757553633274,
+    "memory-peak": -4.298050729038316,
+    "memory-after-15s": -6.774101528597054,
+    "memory-after-60s": -7.062876801024698
+  }
+}

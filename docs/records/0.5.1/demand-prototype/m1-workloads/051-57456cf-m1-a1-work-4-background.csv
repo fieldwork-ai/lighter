@@ -1,0 +1,13 @@
+case,rep,ms
+npm-install,1,11948
+npm-install,2,12041
+npm-install,3,11680
+copy-tree,1,17258
+copy-tree,2,5909
+copy-tree,3,6714
+cpu-sha256,1,6344
+cpu-sha256,2,6330
+cpu-sha256,3,6380
+memory-peak,1,3971
+memory-after-15s,1,625
+memory-after-60s,1,654
