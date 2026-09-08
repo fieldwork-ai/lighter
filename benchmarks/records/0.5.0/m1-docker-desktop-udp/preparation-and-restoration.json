@@ -1,6 +1,0 @@
-{
-  "verification": "Raw JSON for three UDP repetitions; no iperf error; explicit zero receiver bytes and packets",
-  "restoration_commands": 7,
-  "all_restoration_commands_succeeded": true,
-  "left_stopped": true
-}

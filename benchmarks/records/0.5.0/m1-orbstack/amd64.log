@@ -1,8 +1,0 @@
-WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested
-==> orbstack: warming caches (not timed)
-==> orbstack: npm-install 19764 19017 18446  (cpu ms: user=23150 sys=9950 user=22050 sys=9520 user=21370 sys=8860)
-==> orbstack: pnpm-install 5073 4456 4472  (cpu ms: user=7040 sys=4130 user=6930 sys=3280 user=6630 sys=3250)
-==> orbstack: cpu-sha256 13081 12924 12919  (cpu ms: user=12830 sys=510 user=12900 sys=560 user=12860 sys=620)
-==> orbstack: container-start 239 260 257
-
-==> results in benchmarks/results/050-1b0caab-m1-orbstack-a1-amd64.csv

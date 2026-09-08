@@ -1,8 +1,0 @@
-{
-  "pid": 9363,
-  "uid": 501,
-  "program": "/usr/libexec/duetexpertd",
-  "original_state": "S",
-  "utc": "2026-09-08T03:43:45.096799+00:00",
-  "reason": "User background maintenance sustained one full CPU and prevented quiet preflight; pause this user process only, resume after final observation"
-}

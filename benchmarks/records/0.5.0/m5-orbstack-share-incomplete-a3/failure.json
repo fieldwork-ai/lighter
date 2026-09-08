@@ -1,4 +1,0 @@
-{
-  "status": "failed; never select this as a complete suite",
-  "reason": "All pre-boot cases completed with corrected executable-only runtime accounting. The guard stopped the final cold-start idle observation on an unattributed Apple XPC snapshot. Subsequent diagnostics found an XPC exiting before responsibility lookup. Preserve the full failed attempt; select completed non-boot cases explicitly and replace the entire incomplete boot case with a separately guarded run."
-}

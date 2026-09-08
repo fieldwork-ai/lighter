@@ -1,4 +1,0 @@
-{
-  "status": "failed; never select this as a complete suite",
-  "reason": "Passed fresh smoke, both migrations and login-service activation/rollback, then the kind wrapper failed before cluster creation because its private executable was absent. The original failed attempt remains intact."
-}

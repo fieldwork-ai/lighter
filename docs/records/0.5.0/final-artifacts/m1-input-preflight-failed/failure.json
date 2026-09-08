@@ -1,4 +1,0 @@
-{
-  "status": "failed; never select this as a complete suite",
-  "reason": "Missing private future fixtures during input hashing; stopped before VM tests. Retained; not release-runtime evidence."
-}

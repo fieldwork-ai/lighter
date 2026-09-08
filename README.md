@@ -169,7 +169,7 @@ Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` 
 | `sha256sum` of 1 GiB | 3.02 s | **4.16 s** | 7.92 s | 4.26 s | 4.39 s |
 | container start, `alpine true` | 138 ms | **156 ms** | 244 ms | 185 ms | 170 ms |
 
-[0.5.1 release records](docs/records/0.5.1/hybrid/) and [retained competitor records](benchmarks/records/0.5.0/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
+[0.5.1 release records](benchmarks/RELEASE-0.5.1.md) and [retained competitor records](benchmarks/RELEASE-0.5.0-COMPETITORS.md) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
 
 ---
 

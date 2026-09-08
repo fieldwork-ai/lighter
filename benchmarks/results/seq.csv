@@ -1,4 +1,0 @@
-case,rep,ms
-npm-install,1,timeout
-yarn-install,1,timeout
-yarn-install,2,timeout

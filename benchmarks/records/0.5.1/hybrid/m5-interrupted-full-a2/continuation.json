@@ -1,7 +1,0 @@
-{
-  "previous": "$HOME/git/lighter/.logs/051/hybrid-m5/full-a1",
-  "initial_share": "051-e0f4b16-m5-a1-1-share",
-  "source": "e0f4b16b6d1dde9a01b1c2fee03f97222101de04",
-  "reason": "Daily VM restarted during guest preflight; no guest measurement began. Retain the validated share stage and run only guest/amd64 from the same frozen artifacts.",
-  "helper_sha256": "7a5f698e253cbb832deb304334e7847667b8dd55e22612c367b993ea285b2328"
-}

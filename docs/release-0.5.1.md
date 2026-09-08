@@ -38,8 +38,7 @@ shared-host correctness check with the original gate thresholds, without a
 quiet-host preflight; it is not an additional performance suite. An earlier
 wrapper was cancelled during quiet preflight before any memory measurements.
 
-[Runtime records](records/0.5.1/hybrid/) retain the exact revision and scope of
-each check. The earlier quarter-RAM qualification and artifacts are preserved
+The earlier quarter-RAM qualification and artifacts are described
 [separately](release-0.5.1-quarter.md); they are not this release's proof.
 
 ## Final signed artifacts
@@ -61,8 +60,7 @@ The first signature-removal-only comparison rejected one byte: signing had
 expanded the read-only `__LINKEDIT` mapping across a 16 KiB boundary. The
 corrected verifier checks that the original mapping size is exactly the
 rounded signed file size before normalizing that derived field. No other
-remaining byte differs. [Package evidence](records/0.5.1/hybrid/signed-package/)
-retains both the initial rejection and the successful verifier and results.
+remaining byte differs. The initial rejection was caused by this signing metadata difference.
 
 Both M5 and M1 passed the same six serial checks on the exact signed archive:
 fresh installation; migration from 0.5.0; migration from 0.4.1; staged activation
@@ -78,15 +76,12 @@ Gatekeeper pass. The tap formula was restored clean. This was a reinstall,
 not a 0.5.0 Homebrew upgrade; direct signed migrations cover the latter version
 transition. The public download check follows publication.
 
-[Signed M5](records/0.5.1/hybrid/m5-signed-archive/),
-[signed M1](records/0.5.1/hybrid/m1-signed-archive/) and
-[Homebrew](records/0.5.1/hybrid/homebrew-final/) records retain the results.
 Launch Services cleanup returned -10814 for some private test bundles;
 subsequent registry/filesystem audits found no remaining registrations or homes.
 
 Private signed successor fixtures exercise the updater and rollback. They are
-never release assets. Final evidence includes input hashes, commands/results,
-migration state checks and cleanup records. A full-day daily-driver soak has
+never release assets. Raw diagnostics stay local; Git retains this qualification
+summary and the release artifact manifest. A full-day daily-driver soak has
 not been performed.
 
 ## Review and publication

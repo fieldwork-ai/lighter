@@ -1,8 +1,0 @@
-WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested
-==> docker-desktop: warming caches (not timed)
-==> docker-desktop: npm-install 21193 21939 21223  (cpu ms: user=23640 sys=15030 user=24050 sys=15560 user=23610 sys=14860)
-==> docker-desktop: pnpm-install 4649 4152 4032  (cpu ms: user=8200 sys=6010 user=7560 sys=5430 user=7390 sys=5150)
-==> docker-desktop: cpu-sha256 7306 7349 7309  (cpu ms: user=13160 sys=780 user=13190 sys=890 user=13220 sys=880)
-==> docker-desktop: container-start 242 219 213
-
-==> results in benchmarks/results/050-1b0caab-m1-docker-desktop-a2-amd64.csv

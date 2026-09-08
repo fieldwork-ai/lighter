@@ -58,7 +58,7 @@ Order: background, demand, full demand, full demand, demand, background.
 An earlier hotplug-only prototype also passed ABBA and BAAB, reducing Docker
 readiness by 41.0% and 42.4% respectively. These comparisons are against the
 background mode in the same executable, not a final signed release comparison.
-[Raw repetitions, per-arm variance, guards and artifact hashes](records/0.5.1/demand-prototype/)
+Raw repetitions, per-arm variance, guards and artifact hashes
 retain both experiments, including their exact source patches against dff2632.
 The recorder itself does not enforce quiet; the outer guard records do.
 
@@ -72,7 +72,7 @@ kind suite including restart/persistence. An earlier hotplug-only variant
 also passed 820 Docker/HTTP stream checks. A first 16 GiB attempt failed the
 disk-space preflight before starting a VM; its logs are retained separately.
 
-[All eleven M5 functional gates](records/0.5.1/demand-prototype/m5-correctness/)
+All eleven M5 functional gates
 pass at 57456cf, excluding the speed gate as instructed. The 3 GiB ballast
 check reaches a 3,573 MiB footprint and returns to 269 MiB within five seconds.
 343 workspace tests and 22 signed hardware tests pass. Hardware coverage includes
@@ -80,13 +80,13 @@ sparse device access, four simultaneous guest CPUs, instruction retry, partial
 reclamation, reuse without duplicate accounting, and injected allocation/map
 failures that must abort the entire disposable VM process.
 
-[Matched M1 workload arms](records/0.5.1/demand-prototype/m1-workloads/)
+Matched M1 workload arms
 show no median regression in installs, copying or CPU work, and slightly lower
 peak/settled footprints. The copy case has a large first-repetition effect, so
-these are not general speedup claims. The [cold-allocation comparison](records/0.5.1/demand-prototype/cold-memory/)
+these are not general speedup claims. The cold-allocation comparison
 quantifies the trade-off: the first 2 GiB fill adds 266 ms on M1 and 165 ms on
 M5 with 64 KiB preparation batches. Repeat allocations do not show that penalty.
-A bounded [64/256/64 KiB comparison](records/0.5.1/demand-prototype/batch-size/) then measured the first 2 GiB fill at
+A bounded 64/256/64 KiB comparison then measured the first 2 GiB fill at
 689 → 644 ms (geometric means of arm medians), with CLI startup approximately
 701 ms in both. All 22 hardware tests also pass with 256 KiB batches. This
 reduces first-use overhead without changing allocation ownership; 256 KiB is
@@ -117,7 +117,7 @@ remain historical evidence, not qualification of the hybrid implementation.
 
 ### Hybrid correctness at `11ddb88`
 
-[M5 correctness records](records/0.5.1/hybrid/m5-correctness/) retain 343 passing
+M5 correctness records retain 343 passing
 workspace tests (serial), 24 signed hypervisor tests and ten functional gates.
 The new tests exercise concurrent background preparation and guest/device access,
 reclamation during preparation, the completion transition, data preservation,
@@ -141,7 +141,7 @@ failing visibility fixtures. The memory/idle gate remains a separate stress test
 
 ### Focused M1 screening
 
-[Matched raw records](../benchmarks/records/0.5.1/hybrid/m1-focused/) compare 0.5.0 with hybrid
+Matched raw records compare 0.5.0 with hybrid
 `11ddb88`, using 8 CPUs and 4 GiB guest RAM. There is one measured observation
 per workload per version, with identical fixture setup and version order
 alternated across workloads. Quiet-host checks precede each arm. Paused Apple
@@ -164,7 +164,7 @@ The final full suite remains required.
 
 ### Hybrid startup contention
 
-[Three interleaved M1 cold starts per mode](records/0.5.1/hybrid/m1-boot/)
+Three interleaved M1 cold starts per mode
 at 16 GiB and 8 CPUs measured Docker-ready medians of 2,502 ms for 0.5.0,
 621 ms for pure demand and 844 ms for hybrid `11ddb88`. Hybrid's 36% penalty
 over pure demand exceeds the investigation threshold. The 0.5.0 observations
@@ -172,7 +172,7 @@ were 1,769, 2,502 and 2,645 ms; this spread remains visible in the records.
 An earlier attempt with a respawned media-analysis process was invalidated
 before selecting these results. At that stage, no full hybrid suite had been started.
 
-A [separate utility-priority trial](records/0.5.1/hybrid/m1-utility-trial/)
+A separate utility-priority trial
 measured 849 ms at ordinary priority and 774 ms at utility priority, three
 interleaved cold starts each. This modest reduction does not close the gap
 to pure demand. The priority change was removed rather than selected for release.
@@ -186,14 +186,14 @@ whereas Apple's `mach/mach_init.h` defines that C spelling as the cached
 `mach_task_self_` value. Using the same cached port removes one unnecessary
 kernel trap per page without changing ownership, preparation or reclamation.
 
-The [cached-port comparison](records/0.5.1/hybrid/m1-cached-task/) measured
+The cached-port comparison measured
 Docker-ready medians of 832 ms before and 839 ms after (+0.8%), while background
 completion fell from 1,737 to 1,605 ms (−7.6%). There are three interleaved cold
 starts per version. Removing redundant calls saves preparation work but does
 not resolve foreground startup contention. All 343 workspace and 24 signed
 hypervisor tests pass with this change.
 
-A [2 MiB worker-mapping trial](records/0.5.1/hybrid/m1-mapping-trial/) kept
+A 2 MiB worker-mapping trial kept
 256 KiB foreground preparation and independent 16 KiB ownership, but acquired
 eight stripes at a time to map contiguous unprepared runs together. It passed
 25 signed hypervisor tests, including live holes and a partial tail. In three
@@ -202,7 +202,7 @@ interleaved cold starts per version, preparation completion fell from 1,576 to
 extra batching and locking complexity was rejected; the runtime retains the
 original 256 KiB preparation path.
 
-The [lowest-background-QoS trial](records/0.5.1/hybrid/m1-background-qos-trial/)
+The lowest-background-QoS trial
 also failed to help. Three interleaved observations each measured Docker-ready
 medians of 812 ms for ordinary hybrid, 663 ms for pure demand and 882 ms for
 background-QoS hybrid. Preparation completion increased from 1,607 to 7,546 ms.
@@ -218,7 +218,7 @@ times for this hybrid, or describe the remaining contention as eliminated.
 
 ### Selected-runtime memory and idle validation
 
-[M1 hardware records](records/0.5.1/hybrid/m1-memory-correctness/) retain all
+M1 hardware records retain all
 24 passing signed hypervisor tests and the memory/idle gate on the selected
 runtime. With 8 GiB configured, a 3 GiB allocation reached a 3,560 MiB physical
 footprint, then returned to 267 MiB within five seconds. The next container saw
@@ -226,7 +226,7 @@ footprint, then returned to 267 MiB within five seconds. The next container saw
 120-second idle window the process used 0.62% CPU, below the 1% gate, and its
 final footprint was 327 MiB. The full M1 suite is a separate qualification.
 
-[The remaining ten M1 functional gates](records/0.5.1/hybrid/m1-functional/)
+The remaining ten M1 functional gates
 pass from clean source `274293b`, with the unchanged `b78dfeb` runtime. Together
 with the separate memory/idle and speed gates, all twelve hardware gates pass.
 Coverage includes boot, devices, networking, vsock, Docker, streams, publishing,

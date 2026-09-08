@@ -1,3 +1,0 @@
-# m5-storage-focus
-
-See [the analysis and measurement limits](../../../../../docs/demand-memory-2026-09-08.md#m5-storage-follow-up). This focused comparison does not replace the full-suite primary.

@@ -2,56 +2,56 @@
   "schema": 1,
   "targets": {
     "native": {
-      "csv": "../../../records/0.5.1/selection/m1/native.csv",
-      "tree": "../../../records/0.5.1/selection/m1/native.tree"
+      "csv": "native.csv",
+      "tree": "native.tree"
     },
     "lighter": {
-      "csv": "../../../records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-share.csv",
-      "tree": "../../../records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-share.tree"
+      "csv": "lighter.csv",
+      "tree": "lighter.tree"
     },
     "lighter-guest": {
-      "csv": "../../../records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-guest.csv",
-      "tree": "../../../records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-guest.tree"
+      "csv": "lighter-guest.csv",
+      "tree": "lighter-guest.tree"
     },
     "lighter-amd64": {
-      "csv": "../../../records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-amd64.csv",
-      "tree": "../../../records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-amd64.tree"
+      "csv": "lighter-amd64.csv",
+      "tree": "lighter-amd64.tree"
     },
     "orbstack": {
-      "csv": "../../../records/0.5.0/m1-orbstack/050-1b0caab-m1-orbstack-a1-share.csv",
-      "tree": "../../../records/0.5.1/selection/m1/orbstack.tree"
+      "csv": "orbstack.csv",
+      "tree": "orbstack.tree"
     },
     "orbstack-guest": {
-      "csv": "../../../records/0.5.0/m1-orbstack/050-1b0caab-m1-orbstack-a1-guest.csv",
-      "tree": "../../../records/0.5.1/selection/m1/orbstack-guest.tree"
+      "csv": "orbstack-guest.csv",
+      "tree": "orbstack-guest.tree"
     },
     "orbstack-amd64": {
-      "csv": "../../../records/0.5.0/m1-orbstack/050-1b0caab-m1-orbstack-a1-amd64.csv",
-      "tree": "../../../records/0.5.1/selection/m1/orbstack-amd64.tree"
+      "csv": "orbstack-amd64.csv",
+      "tree": "orbstack-amd64.tree"
     },
     "colima": {
-      "csv": "../../../records/0.5.0/m1-colima-failed-a1/050-1b0caab-m1-colima-a1-share.csv",
-      "tree": "../../../records/0.5.1/selection/m1/colima.tree"
+      "csv": "colima.csv",
+      "tree": "colima.tree"
     },
     "colima-guest": {
-      "csv": "../../../records/0.5.0/m1-colima/050-1b0caab-m1-colima-a3-guest.csv",
-      "tree": "../../../records/0.5.1/selection/m1/colima-guest.tree"
+      "csv": "colima-guest.csv",
+      "tree": "colima-guest.tree"
     },
     "colima-amd64": {
-      "csv": "../../../records/0.5.0/m1-colima/050-1b0caab-m1-colima-a3-amd64.csv",
-      "tree": "../../../records/0.5.1/selection/m1/colima-amd64.tree"
+      "csv": "colima-amd64.csv",
+      "tree": "colima-amd64.tree"
     },
     "docker-desktop": {
-      "csv": "../../../records/0.5.1/selection/m1/docker-desktop.csv",
-      "tree": "../../../records/0.5.1/selection/m1/docker-desktop.tree"
+      "csv": "docker-desktop.csv",
+      "tree": "docker-desktop.tree"
     },
     "docker-desktop-guest": {
-      "csv": "../../../records/0.5.0/m1-docker-desktop/050-1b0caab-m1-docker-desktop-a2-guest.csv",
-      "tree": "../../../records/0.5.1/selection/m1/docker-desktop-guest.tree"
+      "csv": "docker-desktop-guest.csv",
+      "tree": "docker-desktop-guest.tree"
     },
     "docker-desktop-amd64": {
-      "csv": "../../../records/0.5.0/m1-docker-desktop/050-1b0caab-m1-docker-desktop-a2-amd64.csv",
-      "tree": "../../../records/0.5.1/selection/m1/docker-desktop-amd64.tree"
+      "csv": "docker-desktop-amd64.csv",
+      "tree": "docker-desktop-amd64.tree"
     }
   }
 }

@@ -1,5 +1,0 @@
-{
-  "status": "share stage excluded from primary tables",
-  "reason": "The original pgrep -f OrbStack process lookup includes the Python supervisor and recorder whose allow-list arguments contain OrbStack paths. Rerun the complete share stage with executable-only process selection. Guest and amd64 elapsed-time stages are unaffected.",
-  "replacement": "050-1b0caab-m5-orbstack-a3-share"
-}

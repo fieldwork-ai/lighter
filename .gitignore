@@ -34,3 +34,16 @@ benchmarks/results/*-boot.log
 
 # The speed gate's own measurements, never the record.
 benchmarks/results/gate-*.csv
+
+# Raw release qualification evidence stays local, not in Git or release assets.
+/docs/records/
+/benchmarks/records/
+/benchmarks/results/**/*.log
+/benchmarks/results/**/*.gz
+/benchmarks/results/**/*.jsonl
+/benchmarks/results/**/*.json
+!/benchmarks/results/selection.json
+!/benchmarks/results/machines/*/selection.json
+# Retained published CSVs are tracked explicitly; new scratch runs stay local.
+/benchmarks/results/**/*.csv
+/benchmarks/results/**/*.tree

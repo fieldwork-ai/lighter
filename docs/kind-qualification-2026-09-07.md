@@ -19,7 +19,7 @@ production runtime source were changed by this investigation.
   daily work continued on the M5. These are functional observations, not
   controlled performance measurements. No test VM was started on the M1.
 
-Exact inputs and selected logs are in [the record directory](records/kind-2026-09-07/).
+Exact inputs and selected logs are in the record directory.
 The latest kind release offered several node versions; this first qualification
 deliberately pins 1.35.8. It does not establish a supported version matrix.
 

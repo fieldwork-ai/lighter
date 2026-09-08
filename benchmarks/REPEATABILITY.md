@@ -149,7 +149,7 @@ reproduce. Two runs per version do not establish a small speedup, either. In
 both versions the first copy repetition took about 14 seconds and the next two
 about 4.3 seconds, illustrating why repetition order matters.
 
-[Raw matched-run CSVs and artifact stamps](results/variance/m1/0.4.0-vs-0.4.1/)
+Raw matched-run CSVs and artifact stamps
 retain every successful observation, including the slow first repetitions.
 
 ## Historical 0.4.1 same-build storage baseline
@@ -171,8 +171,8 @@ SD is sample standard deviation; CV is SD divided by the mean. Between-run CV de
 The observed range is descriptive, not a confidence interval or an automatic regression threshold. Same-build variation does not prove that a similarly sized cross-version change is noise. Use repeated, alternating version runs to check an apparent change.
 
 Recorded on 6 September 2026, 19:12–19:43 UTC, on macOS 26.6.2 (25G83).
-[Raw runs and source/artifact stamps](results/variance/m1/0.4.1/) and the
-[host configuration](results/variance/m1/0.4.1/environment.txt) are retained.
+Raw runs and source/artifact stamps and the
+host configuration are retained.
 These are the candidate at `099b91c`; the version label does not imply a
 released or subsequently modified binary.
 

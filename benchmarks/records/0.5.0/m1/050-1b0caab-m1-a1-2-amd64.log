@@ -1,9 +1,0 @@
-    Finished `release` profile [optimized] target(s) in 0.14s
-WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested
-==> lighter: warming caches (not timed)
-==> lighter: npm-install 15547 15058 14897  (cpu ms: user=20460 sys=10140 user=20070 sys=9440 user=19890 sys=9500)
-==> lighter: pnpm-install 4065 3803 3813  (cpu ms: user=6640 sys=4120 user=6940 sys=3580 user=6630 sys=3720)
-==> lighter: cpu-sha256 7199 7177 7164  (cpu ms: user=13040 sys=570 user=13070 sys=550 user=13080 sys=500)
-==> lighter: container-start 212 171 166
-
-==> results in benchmarks/results/050-1b0caab-m1-a1-2-amd64.csv

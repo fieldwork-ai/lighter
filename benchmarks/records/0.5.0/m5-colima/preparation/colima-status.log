@@ -1,6 +1,0 @@
-time="2026-09-08T01:34:12+01:00" level=info msg="colima [profile=lighter-050-bench] is running using macOS Virtualization.Framework"
-time="2026-09-08T01:34:12+01:00" level=info msg="arch: aarch64"
-time="2026-09-08T01:34:12+01:00" level=info msg="runtime: docker"
-time="2026-09-08T01:34:12+01:00" level=info msg="mountType: virtiofs"
-time="2026-09-08T01:34:12+01:00" level=info msg="docker socket: unix://~/.colima/lighter-050-bench/docker.sock"
-time="2026-09-08T01:34:12+01:00" level=info msg="containerd socket: unix://~/.colima/lighter-050-bench/containerd.sock"

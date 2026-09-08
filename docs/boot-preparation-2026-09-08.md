@@ -18,7 +18,7 @@ service startup; it does not eliminate the remaining allocation work.
 
 ## Measurements and variation
 
-[Raw repetitions and artifact fingerprints](records/0.5.1/boot-prototype/)
+Raw repetitions and artifact fingerprints
 compare the same prototype executable and guest image with background
 preparation enabled and disabled. Each memory size uses ABBA followed by BAAB,
 three cold starts per arm, with one untimed preparation start per arm. Images

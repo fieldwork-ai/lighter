@@ -46,7 +46,6 @@
   "qualification": {
     "m5_exact_archive": "passed",
     "m1_exact_archive": "passed",
-    "homebrew_m1_reinstall": "passed; local archive URL",
-    "records": "records/0.5.1/hybrid/"
+    "homebrew_m1_reinstall": "passed; local archive URL"
   }
 }
