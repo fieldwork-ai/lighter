@@ -1,0 +1,49 @@
+[
+  {
+    "label": "051-e0f4b16-m5-a3-1-share",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf cpu-sha256 container-start watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot",
+    "options": [],
+    "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+    "preparation_flags": {
+      "LIGHTER_DEMAND_RAM": "unset",
+      "LIGHTER_DEMAND_BASE": "unset",
+      "LIGHTER_BACKGROUND_RAM": "unset"
+    },
+    "sha256": "1810f4b7d2c638cf00bc9623b5210e3b4791e7d60983d725f1f8b9f1e4f43b49"
+  },
+  {
+    "label": "051-e0f4b16-m5-a3-1-guest",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf",
+    "options": [
+      "--where",
+      "guest"
+    ],
+    "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+    "preparation_flags": {
+      "LIGHTER_DEMAND_RAM": "unset",
+      "LIGHTER_DEMAND_BASE": "unset",
+      "LIGHTER_BACKGROUND_RAM": "unset"
+    },
+    "sha256": "c3e35537aa1d8c3d025abad3b9787bfd0f3f128a9216cc6cd5a934e635bc5f5f"
+  },
+  {
+    "label": "051-e0f4b16-m5-a3-1-amd64",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install cpu-sha256 container-start",
+    "options": [
+      "--where",
+      "guest",
+      "--arch",
+      "amd64"
+    ],
+    "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+    "preparation_flags": {
+      "LIGHTER_DEMAND_RAM": "unset",
+      "LIGHTER_DEMAND_BASE": "unset",
+      "LIGHTER_BACKGROUND_RAM": "unset"
+    },
+    "sha256": "bb9c354a5d763c5a481c18d4f2fbf79ac53a10a2d101e0f742cdb5b1fba829a6"
+  }
+]

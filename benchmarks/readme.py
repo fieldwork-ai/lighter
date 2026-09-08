@@ -38,21 +38,23 @@ RUNTIMES = [
     ("docker-desktop", "Docker Desktop"),
 ]
 
-INTRO = """These M5 comparison tables retain the **0.5.0** release measurements; the 0.5.1 candidate has not yet completed its M5 benchmark run.
+def intro():
+    lighter = report.load("lighter", report.RESULTS)
+    orb = report.load("orbstack", report.RESULTS)
+    return f"""Lighter measurements are from **0.5.1**; native APFS and competitor measurements are retained from the **0.5.0** release qualification. These are separate runs of the same pinned workloads, not simultaneous comparisons. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
-
-On host-shared filesystems, lighter runs `npm ci` in **6.30 s** (faster than native APFS, outperforming OrbStack's 8.53 s), completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
+On host-shared filesystems, lighter runs `npm ci` in **{ms(lighter['npm-install'])}**, compared with OrbStack's {ms(orb['npm-install'])}, completes directory copies **{orb['copy-tree'] / lighter['copy-tree']:.1f}x faster**, idles at **{lighter['memory-idle']:.0f} MiB RAM**, and returns memory to macOS after a workload finishes.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
 
-Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 15 Sequoia). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26.6.2). Each release host contributes one complete suite with three repetitions per timed case; memory and idle-power rows are single observation windows. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
 
-Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw CSVs, repetition traces, environment fingerprints, and full M1 results are preserved in [the release measurements](benchmarks/RELEASE-0.5.0.md) and [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
+Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw observations, environment fingerprints, historical differences and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md) and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation; differences between separate runs do not by themselves establish a version effect.
 </details>"""
 
-MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac immediately via `virtio-mem` and cooperative reclamation."""
+
+MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac via `virtio-mem` and cooperative reclamation."""
 
 NETWORK_INTRO = """Throughput and latency between container and host measured with `iperf3`, keep-alive HTTP GET latency, connection setup rate, and container DNS resolution time. Bold marks best result."""
 
@@ -60,9 +62,7 @@ POWER_INTRO = """Idle CPU consumption and thread wakeups measured via `powermetr
 
 AMD64_INTRO = """Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` for Colima). Lower is better."""
 
-BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better. These are the **0.5.0 M5 comparison** results.
-
-The **0.5.1 hybrid candidate** measured **720 ms to Docker / 905 ms to the first container** on M1 with 4 GiB RAM (medians of three). A separate 16 GiB M1 test measured **812 ms to Docker**. [Current startup qualification](docs/demand-memory-2026-09-08.md) records the different profiles; these timings do not replace the M5 table."""
+BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Median of three; lower is better. Lighter uses 0.5.1; competitors retain their 0.5.0-release measurements. This includes runtime startup and Docker readiness, rather than just the Linux boot interval. [Startup design and qualification](docs/demand-memory-2026-09-08.md)."""
 
 
 def ms(value):
@@ -219,7 +219,7 @@ def boot_table(results):
         best = min(present)
         cells = [label[0].upper() + label[1:]]
         for value in values:
-            cell = "—" if value is None else f"{value / 1000:.1f} s"
+            cell = ms(value)
             if value == best and len(present) > 1:
                 cell = f"**{cell}**"
             cells.append(cell)
@@ -266,7 +266,7 @@ def amd64_table(results):
 
 
 def section():
-    out = ["## Benchmarks", "", INTRO, ""]
+    out = ["## Benchmarks", "", intro(), ""]
     for results, heading in MACHINES:
         if not results.exists() or not any(results.glob("*.csv")):
             continue
@@ -293,7 +293,7 @@ def section():
         if amd64:
             out += ["#### x86-64 images", "", AMD64_INTRO, "", amd64, ""]
     out += [
-        "[Release records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.",
+        "[0.5.1 release records](docs/records/0.5.1/hybrid/) and [retained competitor records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.",
         "",
         "---",
     ]

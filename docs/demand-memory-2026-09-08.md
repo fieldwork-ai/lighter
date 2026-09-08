@@ -3,7 +3,9 @@
 Status: hybrid preparation is now the 0.5.1 candidate. Pure demand at `b303dc2`
 was evaluated but left first-use preparation in workloads and split reclamation
 into 256 KiB calls. The historical results below describe those prototypes,
-not the hybrid candidate. Publication remains on hold pending qualification.
+not the hybrid candidate. One complete suite now passes on each host. Final
+hybrid archive qualification and a focused M5 storage follow-up remain pending;
+publication is on hold.
 
 The hybrid default offers guest capacity immediately and runs one worker over
 base RAM, then hotplug RAM. First CPU/device accesses prepare any chunk ahead
@@ -168,7 +170,7 @@ at 16 GiB and 8 CPUs measured Docker-ready medians of 2,502 ms for 0.5.0,
 over pure demand exceeds the investigation threshold. The 0.5.0 observations
 were 1,769, 2,502 and 2,645 ms; this spread remains visible in the records.
 An earlier attempt with a respawned media-analysis process was invalidated
-before selecting these results. No full hybrid suite has been started.
+before selecting these results. At that stage, no full hybrid suite had been started.
 
 A [separate utility-priority trial](records/0.5.1/hybrid/m1-utility-trial/)
 measured 849 ms at ordinary priority and 774 ms at utility priority, three
@@ -327,3 +329,31 @@ This small diagnostic sample supports neither a speedup claim nor statistical
 equivalence. Each version has an initial observation in one VM and two follow-up
 repetitions in another; these are not three independent VM starts. Both follow-up
 guards and artifact checks pass, and the paused host processes were restored.
+
+
+### Selected M5 full suite
+
+The [fresh M5 primary](records/0.5.1/hybrid/m5-full/) runs source `e0f4b16`
+with unchanged runtime `b78dfeb`, 8 vCPUs and 16 GiB RAM. All three stages
+(share, guest disk, amd64) pass quiet preflight, competing-VM guards, repetition
+checks and unchanged source/artifact hashes. There is one complete suite with
+three repetitions per timed case. Both earlier interrupted attempts stopped
+at guest preflight when the daily VM restarted; they are excluded, as are
+later user-requested shared-host copy diagnostics.
+
+Docker-ready observations are 521, 517 and 494 ms; first-container completion
+is 664, 672 and 653 ms. Medians are **517 / 664 ms**. The package workload peaks
+at 3,841 MiB, settles to 702 MiB after 15 seconds and 726 MiB after 60 seconds.
+Cold idle footprint is 372 MiB; idle CPU is 3 ms/s (0.3% of one core).
+
+Host-share npm/pnpm/yarn medians are 6,364 / 4,008 / 5,192 ms. Copy is 3,804 ms
+and deletion 3,224 ms, respectively 6.0% and 22.2% above the historical 0.5.0
+primary. A focused old/new comparison is checking these storage differences;
+historical medians alone do not establish a runtime effect.
+
+The [M5 speed gate](records/0.5.1/hybrid/m5-speed-gate/) passes using the
+completed share CSV and the September 7 native reference, without another
+benchmark. All 211 fseventsd observations report one process at 15 MiB, ending
+at 0.3% CPU. Five-second sampling can miss short peaks; this does not establish
+a fix for the earlier unreproduced incident. Host process pauses and the daily
+login service setting were restored after the full suite.

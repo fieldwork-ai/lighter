@@ -1,138 +1,132 @@
-# 0.5.1 performance measurements — superseded candidate
+# 0.5.1 performance measurements
 
-This report retains the earlier quarter-RAM candidate's measurements, before
-the selected `b78dfeb` hybrid runtime. It is not the final 0.5.1 performance
-report. [Current hybrid results](../docs/demand-memory-2026-09-08.md) use one
-completed M1 full suite with three repetitions per timed case; M5 qualification
-still awaits quiet-machine clearance. Do not pool these historical suites with
-the current hybrid measurements.
+Runtime `b78dfeb` uses hybrid RAM preparation. Each host contributes one complete suite with three repetitions per timed case. Memory and idle-power rows are single observation windows. M5 uses 8 vCPUs / 16 GiB guest RAM; M1 uses 8 vCPUs / 4 GiB. Both use a 128 GiB sparse disk and pinned tools and images.
 
-Three complete M1 suites use the same frozen runtime, eight vCPUs, 4 GiB guest RAM, a 128 GiB sparse disk and pinned package tools and images. The first valid suite remains the primary record. Each timing is the median of three successful repetitions; memory and idle-power rows are sampling windows. Between-run CV is sample standard deviation divided by the arithmetic mean of these three values.
+The M5 primary is the fresh suite after renewed quiet clearance. Earlier attempts stopped at guest preflight when the daily VM restarted; their completed share stage and the later shared-host copy diagnostics are retained separately and are not selected. All primary stages pass their quiet preflight, competing-VM guard and artifact checks.
 
-Each stage requires six aggregate CPU observations at most 5%, ten seconds apart, and rejects unexpected VMs throughout. CPU and daemon observations remain available for assessing interference during workloads. No daemon was reset. The ABBA storage follow-up ran between full suites one and two. Warm-up/setup exit statuses were not retained by the inherited protocol; the archived measured-case diagnostics cannot validate those statuses retrospectively.
+Quiet preflight requires six observations at most 5% aggregate host CPU, ten seconds apart. Host-load and fseventsd observations are retained throughout. The original measured repetitions, including any cold first observations, are never discarded. CV below is sample standard deviation divided by the mean of repetitions within this suite; it is not a bound on variation between independent runs.
 
-The M5 remained shared. No full M5 suite was run for 0.5.1; the README's complete comparison remains the 0.5.0 M5 record.
+The 0.5.0 columns are historical primary records, not an alternating old/new experiment. A difference alone does not establish a runtime effect. Negative change means a lower measurement: better for time/memory/CPU, but worse for throughput or connection rate. The focused M1 follow-ups did not reproduce a consistent package-install slowdown.
 
-[Raw records and selection](../docs/records/0.5.1/benchmarks/) · [Repeatability](REPEATABILITY.md)
+[Design and focused investigations](../docs/demand-memory-2026-09-08.md) · [Repeatability](REPEATABILITY.md) · [Superseded quarter-RAM measurements](RELEASE-0.5.1-QUARTER.md)
+
+## M5 — share
+
+| Case | Unit | 0.5.0 median | 0.5.1 observations | 0.5.1 median | Change | Within-suite CV |
+|---|---|---:|---|---:|---:|---:|
+| npm-install | ms | 6302 | 6347, 6364, 6718 | 6364 | +1.0% | 3.23% |
+| pnpm-install | ms | 3857 | 5087, 3975, 4008 | 4008 | +3.9% | 14.52% |
+| yarn-install | ms | 5124 | 5543, 5192, 5051 | 5192 | +1.3% | 4.81% |
+| ripgrep | ms | 91 | 1838, 88, 82 | 88 | -3.3% | 151.21% |
+| find-walk | ms | 95 | 98, 92, 90 | 92 | -3.2% | 4.46% |
+| copy-tree | ms | 3587 | 3626, 3804, 4025 | 3804 | +6.0% | 5.23% |
+| rm-rf | ms | 2639 | 2642, 3662, 3224 | 3224 | +22.2% | 16.11% |
+| cpu-sha256 | ms | 3011 | 3023, 3018, 2995 | 3018 | +0.2% | 0.50% |
+| container-start | ms | 152 | 138, 151, 137 | 138 | -9.2% | 5.50% |
+| watch-latency | ms | 6 | 46, 1, 2 | 2 | -66.7% | 157.33% |
+| memory-peak | MiB | 4386 | 3841 | 3841 | -12.4% | — |
+| memory-after-15s | MiB | 936 | 702 | 702 | -25.0% | — |
+| memory-after-60s | MiB | 936 | 726 | 726 | -22.4% | — |
+| net-tcp-egress | Mbit/s | 92475 | 90994, 94945, 88832 | 90994 | -1.6% | 3.38% |
+| net-tcp-egress-r | Mbit/s | 84924 | 83692, 86990, 83316 | 83692 | -1.5% | 2.39% |
+| net-tcp-port | Mbit/s | 83763 | 87001, 83599, 87104 | 87001 | +3.9% | 2.32% |
+| net-tcp-port-r | Mbit/s | 88759 | 91251, 92046, 94591 | 92046 | +3.7% | 1.88% |
+| net-udp | Mbit/s | 4993 | 4915, 5068, 5085 | 5068 | +1.5% | 1.86% |
+| net-connect-rate | connections/s | 16828 | 17205, 17106, 16184 | 17106 | +1.7% | 3.35% |
+| net-http-p99 | us | 154 | 280, 213, 174 | 213 | +38.3% | 24.11% |
+| net-http-latency | us | 60 | 70, 64, 62 | 64 | +6.7% | 6.37% |
+| net-dns | us | 37 | 40, 40, 40 | 40 | +8.1% | 0.00% |
+| power-cpu-ms-per-s | CPU ms/s | 3 | 3 | 3 | +0.0% | — |
+| power-wakeups-per-s | wakeups/s | 61 | 56 | 56 | -8.2% | — |
+| power-pkg-idle-wakeups-per-s | wakeups/s | 1 | 1 | 1 | +0.0% | — |
+| boot-docker | ms | 1649 | 521, 517, 494 | 517 | -68.6% | 2.85% |
+| boot-first-container | ms | 1799 | 664, 672, 653 | 664 | -63.1% | 1.44% |
+| memory-idle | MiB | 365 | 372 | 372 | +1.9% | — |
+
+## M5 — guest
+
+| Case | Unit | 0.5.0 median | 0.5.1 observations | 0.5.1 median | Change | Within-suite CV |
+|---|---|---:|---|---:|---:|---:|
+| npm-install | ms | 4605 | 4550, 4310, 4487 | 4487 | -2.6% | 2.80% |
+| pnpm-install | ms | 1216 | 1220, 1143, 1243 | 1220 | +0.3% | 4.36% |
+| yarn-install | ms | 4152 | 4101, 3986, 4310 | 4101 | -1.2% | 3.97% |
+| ripgrep | ms | 79 | 88, 85, 83 | 85 | +7.6% | 2.95% |
+| find-walk | ms | 97 | 92, 95, 97 | 95 | -2.1% | 2.66% |
+| copy-tree | ms | 937 | 898, 909, 873 | 898 | -4.2% | 2.07% |
+| rm-rf | ms | 387 | 399, 396, 386 | 396 | +2.3% | 1.73% |
+
+## M5 — amd64
+
+| Case | Unit | 0.5.0 median | 0.5.1 observations | 0.5.1 median | Change | Within-suite CV |
+|---|---|---:|---|---:|---:|---:|
+| npm-install | ms | 9237 | 9233, 9144, 9065 | 9144 | -1.0% | 0.92% |
+| pnpm-install | ms | 2735 | 2822, 2747, 2733 | 2747 | +0.4% | 1.73% |
+| cpu-sha256 | ms | 4223 | 4154, 4177, 4163 | 4163 | -1.4% | 0.28% |
+| container-start | ms | 155 | 137, 156, 165 | 156 | +0.6% | 9.36% |
+
+[Complete M5 records](../docs/records/0.5.1/hybrid/m5-full/)
 
 ## M1 — share
 
-| Metric | Unit | Primary | Run 2 | Run 3 | Between-run CV |
-|---|---|---:|---:|---:|---:|
-| npm-install | ms | 12413 | 12833 | 11604 | 5.09% |
-| pnpm-install | ms | 7255 | 7363 | 6658 | 5.35% |
-| yarn-install | ms | 11961 | 11305 | 11029 | 4.19% |
-| ripgrep | ms | 501 | 256 | 311 | 36.11% |
-| find-walk | ms | 125 | 148 | 126 | 9.77% |
-| copy-tree | ms | 8683 | 8184 | 7916 | 4.71% |
-| rm-rf | ms | 2840 | 2848 | 2875 | 0.64% |
-| cpu-sha256 | ms | 6299 | 6299 | 6287 | 0.11% |
-| container-start | ms | 207 | 195 | 203 | 3.03% |
-| watch-latency | ms | 4 | 2 | 14 | 96.44% |
-| memory-peak | MiB | 3426 | 4177 | 3187 | 14.36% |
-| memory-after-15s | MiB | 866 | 784 | 726 | 8.88% |
-| memory-after-60s | MiB | 858 | 786 | 731 | 8.04% |
-| net-tcp-egress | Mbit/s | 56481 | 56419 | 56271 | 0.19% |
-| net-tcp-egress-r | Mbit/s | 49936 | 49225 | 50005 | 0.87% |
-| net-tcp-port | Mbit/s | 48273 | 48193 | 47918 | 0.39% |
-| net-tcp-port-r | Mbit/s | 54242 | 54106 | 54864 | 0.74% |
-| net-udp | Mbit/s | 4784 | 4794 | 4869 | 0.96% |
-| net-connect-rate | connections/s | 18575 | 10545 | 16908 | 27.62% |
-| net-http-p99 | µs | 233 | 247 | 262 | 5.86% |
-| net-http-latency | µs | 131 | 131 | 133 | 0.88% |
-| net-dns | µs | 129 | 125 | 127 | 1.57% |
-| power-cpu-ms-per-s | CPU ms/s | 6 | 6 | 5 | 10.19% |
-| power-wakeups-per-s | wakeups/s | 53 | 50 | 53 | 3.33% |
-| power-pkg-idle-wakeups-per-s | wakeups/s | 1 | 1 | 1 | 0.00% |
-| boot-docker | ms | 634 | 643 | 652 | 1.40% |
-| boot-first-container | ms | 821 | 859 | 834 | 2.30% |
-| memory-idle | MiB | 251 | 258 | 249 | 1.87% |
+| Case | Unit | 0.5.0 median | 0.5.1 observations | 0.5.1 median | Change | Within-suite CV |
+|---|---|---:|---|---:|---:|---:|
+| npm-install | ms | 11235 | 13294, 12849, 12115 | 12849 | +14.4% | 4.67% |
+| pnpm-install | ms | 6679 | 8658, 6690, 7561 | 7561 | +13.2% | 12.91% |
+| yarn-install | ms | 10933 | 14413, 10969, 10490 | 10969 | +0.3% | 17.90% |
+| ripgrep | ms | 192 | 5925, 257, 129 | 257 | +33.9% | 157.34% |
+| find-walk | ms | 134 | 132, 121, 121 | 121 | -9.7% | 5.09% |
+| copy-tree | ms | 7888 | 7094, 8885, 7593 | 7593 | -3.7% | 11.76% |
+| rm-rf | ms | 2669 | 2697, 2827, 2838 | 2827 | +5.9% | 2.81% |
+| cpu-sha256 | ms | 6296 | 6291, 6273, 6600 | 6291 | -0.1% | 2.88% |
+| container-start | ms | 204 | 233, 188, 185 | 188 | -7.8% | 13.31% |
+| watch-latency | ms | 3 | 462, 3, 2 | 3 | +0.0% | 170.42% |
+| memory-peak | MiB | 4123 | 4109 | 4109 | -0.3% | — |
+| memory-after-15s | MiB | 813 | 818 | 818 | +0.6% | — |
+| memory-after-60s | MiB | 807 | 817 | 817 | +1.2% | — |
+| net-tcp-egress | Mbit/s | 55819 | 55046, 56692, 55911 | 55911 | +0.2% | 1.47% |
+| net-tcp-egress-r | Mbit/s | 49273 | 49210, 49280, 50340 | 49280 | +0.0% | 1.28% |
+| net-tcp-port | Mbit/s | 48211 | 48682, 49105, 48756 | 48756 | +1.1% | 0.46% |
+| net-tcp-port-r | Mbit/s | 54030 | 54727, 53668, 54963 | 54727 | +1.3% | 1.27% |
+| net-udp | Mbit/s | 4829 | 4872, 4987, 5032 | 4987 | +3.3% | 1.66% |
+| net-connect-rate | connections/s | 10607 | 11024, 14942, 26147 | 14942 | +40.9% | 45.18% |
+| net-http-p99 | us | 249 | 333, 244, 216 | 244 | -2.0% | 23.11% |
+| net-http-latency | us | 132 | 156, 130, 126 | 130 | -1.5% | 11.86% |
+| net-dns | us | 135 | 130, 202, 128 | 130 | -3.7% | 27.49% |
+| power-cpu-ms-per-s | CPU ms/s | 6 | 5 | 5 | -16.7% | — |
+| power-wakeups-per-s | wakeups/s | 51 | 53 | 53 | +3.9% | — |
+| power-pkg-idle-wakeups-per-s | wakeups/s | 1 | 0 | 0 | -100.0% | — |
+| boot-docker | ms | 846 | 782, 720, 700 | 720 | -14.9% | 5.82% |
+| boot-first-container | ms | 1030 | 960, 905, 876 | 905 | -12.1% | 4.67% |
+| memory-idle | MiB | 248 | 241 | 241 | -2.8% | — |
 
 ## M1 — guest
 
-| Metric | Unit | Primary | Run 2 | Run 3 | Between-run CV |
-|---|---|---:|---:|---:|---:|
-| npm-install | ms | 8087 | 7630 | 7562 | 3.68% |
-| pnpm-install | ms | 1727 | 1728 | 1656 | 2.42% |
-| yarn-install | ms | 7873 | 7728 | 7921 | 1.28% |
-| ripgrep | ms | 133 | 131 | 142 | 4.33% |
-| find-walk | ms | 121 | 120 | 121 | 0.48% |
-| copy-tree | ms | 3586 | 3869 | 4141 | 7.18% |
-| rm-rf | ms | 604 | 594 | 591 | 1.14% |
+| Case | Unit | 0.5.0 median | 0.5.1 observations | 0.5.1 median | Change | Within-suite CV |
+|---|---|---:|---|---:|---:|---:|
+| npm-install | ms | 7584 | 7694, 7566, 7424 | 7566 | -0.2% | 1.79% |
+| pnpm-install | ms | 1760 | 1990, 1669, 1680 | 1680 | -4.5% | 10.24% |
+| yarn-install | ms | 7828 | 8219, 7816, 7739 | 7816 | -0.2% | 3.25% |
+| ripgrep | ms | 131 | 589, 146, 122 | 146 | +11.5% | 92.05% |
+| find-walk | ms | 121 | 125, 122, 120 | 122 | +0.8% | 2.06% |
+| copy-tree | ms | 4054 | 4328, 3905, 2535 | 3905 | -3.7% | 26.11% |
+| rm-rf | ms | 603 | 564, 613, 621 | 613 | +1.7% | 5.15% |
 
 ## M1 — amd64
 
-| Metric | Unit | Primary | Run 2 | Run 3 | Between-run CV |
-|---|---|---:|---:|---:|---:|
-| npm-install | ms | 14895 | 15023 | 14757 | 0.89% |
-| pnpm-install | ms | 3891 | 3849 | 3852 | 0.61% |
-| cpu-sha256 | ms | 7171 | 7224 | 7178 | 0.40% |
-| container-start | ms | 200 | 181 | 183 | 5.55% |
+| Case | Unit | 0.5.0 median | 0.5.1 observations | 0.5.1 median | Change | Within-suite CV |
+|---|---|---:|---|---:|---:|---:|
+| npm-install | ms | 15004 | 15820, 15209, 14882 | 15209 | +1.4% | 3.11% |
+| pnpm-install | ms | 3897 | 4146, 3748, 3760 | 3760 | -3.5% | 5.83% |
+| cpu-sha256 | ms | 7182 | 7185, 7166, 7182 | 7182 | +0.0% | 0.14% |
+| container-start | ms | 187 | 256, 207, 237 | 237 | +26.7% | 10.59% |
 
-## Matched storage comparison
+[Complete M1 records](../docs/records/0.5.1/hybrid/m1-full/)
 
-The first suite appeared slower than the historical 0.5.0 record on several share workloads, prompting this follow-up. Both VMMs were rebuilt with the same compiler, using each version's guest payload. Order is 0.5.0 / 0.5.1 / 0.5.1 / 0.5.0, with three repetitions per arm. Change is the ratio of geometric means of arm medians minus one; positive means longer elapsed time.
+## Reproduce the summaries
 
-| Case | Ordered arm medians (ms) | 0.5.1 time change |
-|---|---|---:|
-| npm-install | 12855, 12173, 12879, 12333 | -0.56% |
-| pnpm-install | 7201, 6850, 6691, 7382 | -7.14% |
-| yarn-install | 11344, 11711, 11215, 11466 | +0.49% |
-| ripgrep | 382, 266, 261, 420 | -34.22% |
-| find-walk | 155, 165, 130, 129 | +3.57% |
-| copy-tree | 7712, 7834, 7661, 8550 | -4.60% |
-| rm-rf | 2792, 2905, 2889, 2917 | +1.51% |
+```sh
+python3 scripts/records/summarize-hybrid-release.py docs/records/0.5.1/hybrid/m5-full --out /tmp/lighter-m5-summary.json
+python3 scripts/records/summarize-hybrid-release.py docs/records/0.5.1/hybrid/m1-full --out /tmp/lighter-m1-summary.json
+```
 
-The broad historical install/copy slowdown did not reproduce. The small increases in find and removal remain in the record. Two arms per version cannot establish a precise causal effect, and measured variation is not an automatic threshold for declaring a difference noise.
-
-## Startup measurement protocols
-
-The full suite starts the checkout CLI with guest/out and a private development app, using Node wall-clock timestamps. The signed comparison starts the shipped Developer ID app and uses Python monotonic timestamps. Their absolute times are separate records; use the signed archive comparison below for the like-for-like release startup claim.
-
-## Signed archive startup — image-only
-
-The published 0.5.0 and final 0.5.1 archives use identical 8-vCPU, 4-GiB, 128-GiB profiles and the same Alpine image. Each arm has one untimed preparation round and five retained cold starts. An outer guard enforces the quiet-host and VM checks; the inner recorder does not itself enforce quietness.
-
-| Arm | Version | Docker median | Within-arm CV | First-container median | Within-arm CV |
-|---|---|---:|---:|---:|---:|
-| 1 | 0.5.0 | 711.3 ms | 2.85% | 895.3 ms | 2.40% |
-| 2 | 0.5.1 | 534.9 ms | 1.90% | 710.8 ms | 1.97% |
-| 3 | 0.5.1 | 537.6 ms | 3.87% | 719.0 ms | 3.25% |
-| 4 | 0.5.0 | 721.7 ms | 0.66% | 906.6 ms | 0.44% |
-
-Using geometric means of the two arm medians per version:
-
-- Docker readiness: 716.5 → 536.3 ms (-25.15% elapsed time).
-- First-container completion: 900.9 → 714.9 ms (-20.65% elapsed time).
-
-These image-only starts do not take the saved-container memory gate.
-
-## Signed archive startup — saved
-
-The published 0.5.0 and final 0.5.1 archives use identical 8-vCPU, 4-GiB, 128-GiB profiles and the same Alpine image. Each arm has one untimed preparation round and five retained cold starts. An outer guard enforces the quiet-host and VM checks; the inner recorder does not itself enforce quietness.
-
-| Arm | Version | Docker median | Within-arm CV | First-container median | Within-arm CV |
-|---|---|---:|---:|---:|---:|
-| 1 | 0.5.0 | 744.9 ms | 2.54% | 925.4 ms | 2.09% |
-| 2 | 0.5.1 | 581.3 ms | 6.55% | 757.2 ms | 5.55% |
-| 3 | 0.5.1 | 581.2 ms | 4.58% | 761.4 ms | 3.02% |
-| 4 | 0.5.0 | 764.1 ms | 6.45% | 944.1 ms | 5.51% |
-
-Using geometric means of the two arm medians per version:
-
-- Docker readiness: 754.4 → 581.3 ms (-22.95% elapsed time).
-- First-container completion: 934.7 → 759.3 ms (-18.76% elapsed time).
-
-A saved, stopped Alpine container triggers the pre-Docker memory gate in this profile. It isolates that gate's cost; it does not measure restoring an application or kind cluster.
-
-## Filesystem-daemon observation
-
-Across the three full suites, storage ABBA and ten-minute post-suite observation, 1349 observations tracked PID(s) [81590]. Sampled footprint was initially 13 MiB, peaked at 16 MiB and ended at 14 MiB. Post-suite CPU had median 0% and maximum 0.3% of one core. There were 0 collection errors and 0 invalid CPU observations.
-
-Sampling every five seconds can miss shorter peaks, and memory inherits top's display rounding. The ten-minute window precedes the later signed-archive tests. These observations do not establish a fix for an earlier incident whose trigger was not reproduced.
-
-## Interpretation and selection
-
-Full-suite attempt 1 stopped before measurements because the checkout lacked the published v0.5.0 tag. Attempt 2 is the first valid complete suite and remains primary. No slow measured repetition was discarded. The paired storage follow-up was selected after inspecting the historical difference; both the original observation and follow-up remain available.
-
-Docker probes include command execution and a 50 ms interval after failures. First-container completion includes any remaining memory preparation wait. These results describe the tested host, configuration and workload; they are not universal startup times or variance bounds. Configured guest RAM is distinct from macOS process footprint, which includes host overhead and compressed-memory charges.
+The validator checks each CSV hash, source identity, completed guard, quiet window, expected cases and repetition counts before calculating the summary. These full-suite timings use the Node-based harness; do not pool them with the separate Python-based startup experiments or attribute pure-demand prototype timings to the hybrid release.

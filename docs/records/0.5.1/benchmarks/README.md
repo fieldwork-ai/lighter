@@ -1,4 +1,7 @@
-# 0.5.1 benchmark evidence
+# Superseded quarter-RAM benchmark evidence
+
+These records describe the earlier quarter-RAM candidate. The selected hybrid
+uses [separate qualification records](../hybrid/). Do not pool the candidates.
 
 Runtime source: `67d787b5910e0dd68b7564d4716fe3b7b0126d1d`.
 
@@ -22,4 +25,4 @@ Regenerate and validate all tables from the repository root:
 python3 scripts/records/analyze-release-051.py docs/records/0.5.1/benchmarks --output /tmp/lighter-051-analysis
 ```
 
-See [the generated report](../../../../benchmarks/RELEASE-0.5.1.md) for measurements and limitations.
+See [the generated report](../../../../benchmarks/RELEASE-0.5.1-QUARTER.md) for measurements and limitations.
