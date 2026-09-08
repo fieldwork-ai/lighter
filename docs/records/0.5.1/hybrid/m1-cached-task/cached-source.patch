@@ -1,0 +1,32 @@
+diff --git a/crates/lighter-vmm/src/memory.rs b/crates/lighter-vmm/src/memory.rs
+index 0200c8d4..780e61db 100644
+--- a/crates/lighter-vmm/src/memory.rs
++++ b/crates/lighter-vmm/src/memory.rs
+@@ -96,12 +96,17 @@ impl Mmap {
+ #[cfg(target_os = "macos")]
+ fn replace_owned_pages(ptr: *mut u8, len: usize) -> Result<()> {
+     unsafe extern "C" {
+-        fn mach_task_self() -> libc::c_uint;
++        static mach_task_self_: libc::c_uint;
+         fn mach_vm_allocate(task: libc::c_uint, address: *mut u64, size: u64, flags: i32) -> i32;
+     }
+     const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+     const VM_FLAGS_PURGABLE: i32 = 0x2;
+     let page = host_page_size() as usize;
++    // Match mach_task_self() in mach/mach_init.h: libSystem caches the task
++    // port. Calling the similarly named function takes a kernel trap for
++    // every page instead. libSystem initializes this before our threads run.
++    // SAFETY: reading libSystem's initialized current-process task port.
++    let task = unsafe { mach_task_self_ };
+     for offset in (0..len).step_by(page) {
+         let mut address = ptr as u64 + offset as u64;
+         // SAFETY: replace only pages in the caller's reserved mapping. The
+@@ -109,7 +114,7 @@ fn replace_owned_pages(ptr: *mut u8, len: usize) -> Result<()> {
+         // callers retain exclusive ownership of these pages until remapped.
+         let result = unsafe {
+             mach_vm_allocate(
+-                mach_task_self(),
++                task,
+                 &mut address,
+                 page as u64,
+                 VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE,
