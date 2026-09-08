@@ -13,8 +13,8 @@
 //!
 //! One block is 128 MiB, the same as an arm64 Linux memory block with 4 KiB
 //! pages, so the driver runs in its big-block mode with one device block per
-//! Linux block and no partial blocks to reason about. The range is mapped
-//! into the guest whole and lazily (`MAP_NORESERVE`, the same as RAM); a
+//! Linux block and no partial blocks to reason about. The range is reserved
+//! up front and mapped as each block's host backing becomes ready; a
 //! plugged block is one the guest may touch, an unplugged one is released
 //! through the balloon's fresh-mapping release path and, with
 //! `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE` offered, one the guest has promised
@@ -26,7 +26,7 @@
 //! policy's business, not this file's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::mmio::{COMMON_FEATURES, VirtioMmio};
 use super::queue::Virtqueue;
@@ -67,6 +67,10 @@ pub struct MemState {
     addr: u64,
     region: u64,
     requested: AtomicU64,
+    /// Prefix with complete host backing; only this memory may be offered.
+    available: AtomicU64,
+    preparation_cancelled: Mutex<bool>,
+    preparation_changed: Condvar,
     plugged: AtomicU64,
     /// One flag per block, set while the guest holds it.
     blocks: Mutex<Vec<bool>>,
@@ -92,6 +96,9 @@ impl MemState {
             addr,
             region,
             requested: AtomicU64::new(Self::round(requested.min(region))),
+            available: AtomicU64::new(region),
+            preparation_cancelled: Mutex::new(false),
+            preparation_changed: Condvar::new(),
             plugged: AtomicU64::new(0),
             blocks: Mutex::new(vec![false; (region / BLOCK_SIZE) as usize]),
             grown_at: AtomicU64::new(u64::MAX),
@@ -126,7 +133,44 @@ impl MemState {
     }
 
     pub fn requested_bytes(&self) -> u64 {
-        self.requested.load(Ordering::Relaxed)
+        self.requested
+            .load(Ordering::Relaxed)
+            .min(self.available.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn defer_backing(&self) {
+        self.available.store(0, Ordering::Release);
+    }
+
+    fn wait_for_backing(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        if self.available.load(Ordering::Acquire) == self.region {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut cancelled = self
+            .preparation_cancelled
+            .lock()
+            .expect("memory preparation poisoned");
+        while self.available.load(Ordering::Acquire) != self.region {
+            if *cancelled {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "machine stopped during memory preparation",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "guest memory backing is not ready",
+                ));
+            }
+            (cancelled, _) = self
+                .preparation_changed
+                .wait_timeout(cancelled, remaining)
+                .expect("memory preparation poisoned");
+        }
+        Ok(())
     }
 
     pub fn plugged_bytes(&self) -> u64 {
@@ -160,6 +204,38 @@ pub struct MemControl {
 }
 
 impl MemControl {
+    pub(crate) fn backing_ready(&self, bytes: u64) {
+        // Serialize publication and config reads with the device. Memory's
+        // accessible prefix was published before this method was called.
+        let mut transport = self
+            .transport
+            .lock()
+            .expect("virtio-mem transport poisoned");
+        let _cancelled = self
+            .state
+            .preparation_cancelled
+            .lock()
+            .expect("memory preparation poisoned");
+        assert!(bytes <= self.state.region && bytes.is_multiple_of(BLOCK_SIZE));
+        assert!(bytes >= self.state.available.load(Ordering::Acquire));
+        self.state.available.store(bytes, Ordering::Release);
+        self.state.preparation_changed.notify_all();
+        transport.notify_config_change();
+    }
+
+    pub(crate) fn cancel_preparation(&self) {
+        *self
+            .state
+            .preparation_cancelled
+            .lock()
+            .expect("memory preparation poisoned") = true;
+        self.state.preparation_changed.notify_all();
+    }
+
+    pub(crate) fn wait_for_backing(&self) -> std::io::Result<()> {
+        self.state
+            .wait_for_backing(std::time::Duration::from_secs(30))
+    }
     pub fn new(state: Arc<MemState>, transport: Arc<Mutex<VirtioMmio>>) -> MemControl {
         MemControl { state, transport }
     }
@@ -350,6 +426,11 @@ impl Mem {
         let span = first..first + count;
         match kind {
             REQ_PLUG => {
+                if (first + count) as u64 * BLOCK_SIZE
+                    > self.state.available.load(Ordering::Acquire)
+                {
+                    return (RESP_NACK, 0);
+                }
                 if blocks[span.clone()].iter().any(|&b| b) {
                     return (RESP_NACK, 0);
                 }
@@ -376,7 +457,10 @@ impl Mem {
             REQ_UNPLUG_ALL => {
                 blocks.fill(false);
                 self.state.plugged.store(0, Ordering::Relaxed);
-                let _ = mem.release_thoroughly(self.state.addr, self.state.region);
+                let ready = self.state.available.load(Ordering::Acquire);
+                if ready != 0 {
+                    let _ = mem.release_thoroughly(self.state.addr, ready);
+                }
                 (RESP_ACK, 0)
             }
             REQ_STATE => {
@@ -456,14 +540,14 @@ impl VirtioDevice for Mem {
     }
 
     /// `struct virtio_mem_config`: block size, node, padding, then the
-    /// range's address and size, the usable size (the whole range here), what
+    /// range's address and size, the usable size (the prepared prefix), what
     /// is plugged, and what is offered.
     fn config_read(&self, offset: u64, data: &mut [u8]) {
         let mut config = [0u8; 56];
         config[0..8].copy_from_slice(&BLOCK_SIZE.to_le_bytes());
         config[16..24].copy_from_slice(&self.state.addr.to_le_bytes());
         config[24..32].copy_from_slice(&self.state.region.to_le_bytes());
-        config[32..40].copy_from_slice(&self.state.region.to_le_bytes());
+        config[32..40].copy_from_slice(&self.state.available.load(Ordering::Acquire).to_le_bytes());
         config[40..48].copy_from_slice(&self.state.plugged_bytes().to_le_bytes());
         config[48..56].copy_from_slice(&self.state.requested_bytes().to_le_bytes());
         let start = offset as usize;
@@ -498,6 +582,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backing_wait_requires_the_whole_range_and_shutdown_wakes_it() {
+        use crate::irq::NullIrq;
+        use std::time::Duration;
+
+        let control = || {
+            let state = Arc::new(MemState::new(
+                1 << 30,
+                1 << 30,
+                2 * BLOCK_SIZE,
+                2 * BLOCK_SIZE,
+            ));
+            state.defer_backing();
+            let transport = Arc::new(Mutex::new(VirtioMmio::new(
+                Box::new(Mem::new(state.clone())),
+                Arc::new(GuestMemory::detached()),
+                Arc::new(NullIrq),
+            )));
+            MemControl::new(state, transport)
+        };
+        let mem = control();
+        mem.backing_ready(BLOCK_SIZE);
+        assert_eq!(
+            mem.state
+                .wait_for_backing(Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        let waiter = mem.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || sent.send(waiter.wait_for_backing()).unwrap());
+        assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
+        mem.backing_ready(2 * BLOCK_SIZE);
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        thread.join().unwrap();
+
+        let mem = control();
+        let waiter = mem.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || sent.send(waiter.wait_for_backing()).unwrap());
+        assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
+        mem.cancel_preparation();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        thread.join().unwrap();
+    }
+
+    #[test]
     fn the_base_is_a_quarter_and_a_gigabyte_at_least() {
         // Not through the environment: a parallel test may be reading it.
         if std::env::var_os("LIGHTER_VIRTIO_MEM").is_some() {
@@ -510,6 +651,43 @@ mod tests {
         assert_eq!(split(2 << 30), (1 << 30, 1 << 30));
         assert_eq!(split(1 << 30), (1 << 30, 0));
         assert_eq!(split(512 << 20), (512 << 20, 0));
+    }
+
+    #[test]
+    fn unprepared_blocks_are_not_offered_or_pluggable() {
+        let state = Arc::new(MemState::new(
+            1 << 30,
+            1 << 30,
+            4 * BLOCK_SIZE,
+            4 * BLOCK_SIZE,
+        ));
+        state.defer_backing();
+        let mut device = Mem::new(state.clone());
+        assert_eq!(state.requested_bytes(), 0);
+        let mut request = [0u8; REQ_LEN];
+        request[0..2].copy_from_slice(&REQ_PLUG.to_le_bytes());
+        request[8..16].copy_from_slice(&state.addr().to_le_bytes());
+        request[16..18].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            device.handle(&request, &GuestMemory::detached()).0,
+            RESP_NACK
+        );
+        state.available.store(BLOCK_SIZE, Ordering::Release);
+        assert_eq!(state.requested_bytes(), BLOCK_SIZE);
+        assert_eq!(
+            device.handle(&request, &GuestMemory::detached()).0,
+            RESP_ACK
+        );
+        request[8..16].copy_from_slice(&(state.addr() + BLOCK_SIZE).to_le_bytes());
+        assert_eq!(
+            device.handle(&request, &GuestMemory::detached()).0,
+            RESP_NACK
+        );
+        // A pressure reduction made during preparation stays effective when
+        // more backing becomes ready; preparation must not overwrite targets.
+        state.set_requested_bytes(0);
+        state.available.store(4 * BLOCK_SIZE, Ordering::Release);
+        assert_eq!(state.requested_bytes(), 0);
     }
 
     #[test]

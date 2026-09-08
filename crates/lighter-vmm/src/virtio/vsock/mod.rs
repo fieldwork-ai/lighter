@@ -1827,6 +1827,7 @@ pub fn pump<S: Socket>(
     // A megabyte per read: what the socket holds arrives in one call and
     // goes to the guest as one batch of packets under one wake.
     let mut buf = vec![0u8; 1 << 20];
+    let mut inspect = inspect.map(crate::vsock_proxy::StreamInspector::new);
     let mut host_closed = false;
     loop {
         let read = match read_host_socket(&socket, &mut buf) {
@@ -1838,8 +1839,11 @@ pub fn pump<S: Socket>(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        if let Some(inspect) = &inspect {
-            inspect(&buf[..read]);
+        if let Some(inspect) = &mut inspect
+            && let Err(error) = inspect.check(&buf[..read])
+        {
+            tracing::warn!(%error, "request prerequisite failed; closing connection without forwarding");
+            break;
         }
         // `send` delivers as it goes; there is nothing to poke afterwards.
         if !shared.send(key, &buf[..read]) {
@@ -2026,6 +2030,37 @@ mod tests {
         let inner = shared.lock();
         assert_eq!(inner.done.iter().copied().collect::<Vec<_>>(), [7]);
         assert_eq!(inner.conns[&key].credit.fwd_cnt(), 0);
+    }
+
+    #[test]
+    fn a_failed_request_prerequisite_closes_without_forwarding() {
+        let shared = Arc::new(VsockShared::new());
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let key = shared.open(2375, socket.try_clone().unwrap());
+        shared.lock().conns.get_mut(&key).unwrap().state = State::Established;
+        let inspect: crate::vsock_proxy::Inspector = Arc::new(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backing not ready",
+            ))
+        });
+        let worker_shared = shared.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            pump(worker_shared, key, socket, Some(inspect));
+            done.send(()).unwrap();
+        });
+        peer.write_all(b"POST /containers/create HTTP/1.1\r\n\r\n")
+            .unwrap();
+        finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        worker.join().unwrap();
+        // A prerequisite failure must not become a best-effort forwarded
+        // request, and teardown must wake the peer and the writer thread.
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert_eq!(shared.lock().conns[&key].credit.counters().2, 0);
     }
 
     fn flat(chunks: Option<Vec<Chunk>>) -> Option<Vec<u8>> {

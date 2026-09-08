@@ -15,7 +15,8 @@
 
 use std::io;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use lighter_hv::{MemoryPerms, Vm};
 
@@ -51,6 +52,17 @@ struct Mmap {
 
 impl Mmap {
     fn anonymous(len: usize) -> Result<Mmap> {
+        let mapping = Self::reserve(len)?;
+        #[cfg(target_os = "macos")]
+        {
+            let _owned = crate::boot_timing::Phase::new("memory_owned_objects");
+            replace_owned_pages(mapping.ptr, len)?;
+        }
+        Ok(mapping)
+    }
+
+    fn reserve(len: usize) -> Result<Mmap> {
+        let reservation = crate::boot_timing::Phase::new("memory_reservation");
         // SAFETY: a plain anonymous mapping request; the result is checked
         // against MAP_FAILED before use.
         let ptr = unsafe {
@@ -70,8 +82,7 @@ impl Mmap {
             ptr: ptr.cast(),
             len,
         };
-        #[cfg(target_os = "macos")]
-        replace_owned_pages(mapping.ptr, len)?;
+        drop(reservation);
         Ok(mapping)
     }
 }
@@ -127,6 +138,13 @@ struct Region {
     len: usize,
     host: *mut u8,
     _backing: Mmap,
+    deferred: Option<Deferred>,
+}
+
+#[derive(Debug)]
+struct Deferred {
+    ready: AtomicUsize,
+    preparation: Mutex<()>,
 }
 
 impl Region {
@@ -135,7 +153,11 @@ impl Region {
         let Some(end) = gpa.checked_add(len as u64) else {
             return false;
         };
-        gpa >= self.gpa && end <= self.gpa + self.len as u64
+        let ready = self
+            .deferred
+            .as_ref()
+            .map_or(self.len, |d| d.ready.load(Ordering::Acquire));
+        gpa >= self.gpa && end <= self.gpa + ready as u64
     }
 
     /// Host address for a guest address known to be inside this region.
@@ -200,6 +222,7 @@ impl GuestMemory {
                 len,
                 host: backing.ptr,
                 _backing: backing,
+                deferred: None,
             }],
         }
     }
@@ -221,16 +244,93 @@ impl GuestMemory {
         // SAFETY: the backing mapping is owned by the Region we are about to
         // push, and `Drop for GuestMemory` removes the guest mapping before
         // that Region — and therefore the host pages — goes away.
-        unsafe { vm.map(host.cast(), gpa, len, MemoryPerms::RWX)? };
+        {
+            let _mapping = crate::boot_timing::Phase::new("memory_hypervisor_map");
+            unsafe { vm.map(host.cast(), gpa, len, MemoryPerms::RWX)? };
+        }
 
         self.regions.push(Region {
             gpa,
             len,
             host,
             _backing: backing,
+            deferred: None,
         });
         self.regions.sort_by_key(|r| r.gpa);
         Ok(())
+    }
+
+    /// Reserve an inaccessible hotplug range. Only `prepare_next` exposes it.
+    pub(crate) fn reserve_region(&mut self, gpa: u64, len: usize) -> Result<()> {
+        if self.vm.is_none() {
+            return Err(MemoryError::Detached);
+        }
+        let end = gpa
+            .checked_add(len as u64)
+            .ok_or(MemoryError::OutOfBounds { gpa, len })?;
+        if self
+            .regions
+            .iter()
+            .any(|r| gpa < r.gpa + r.len as u64 && r.gpa < end)
+        {
+            return Err(MemoryError::Overlap { gpa });
+        }
+        let backing = Mmap::reserve(len)?;
+        self.regions.push(Region {
+            gpa,
+            len,
+            host: backing.ptr,
+            _backing: backing,
+            deferred: Some(Deferred {
+                ready: AtomicUsize::new(0),
+                preparation: Mutex::new(()),
+            }),
+        });
+        self.regions.sort_by_key(|r| r.gpa);
+        Ok(())
+    }
+
+    /// Prepare one prefix extension, publishing it only after accounting and
+    /// the guest mapping are established. Existing pages are never replaced.
+    pub(crate) fn prepare_next(&self, gpa: u64, amount: usize) -> Result<usize> {
+        let region = self
+            .regions
+            .iter()
+            .find(|r| r.gpa == gpa)
+            .ok_or(MemoryError::OutOfBounds { gpa, len: amount })?;
+        let deferred = region
+            .deferred
+            .as_ref()
+            .ok_or(MemoryError::OutOfBounds { gpa, len: amount })?;
+        let _exclusive = deferred
+            .preparation
+            .lock()
+            .expect("memory preparation poisoned");
+        let start = deferred.ready.load(Ordering::Acquire);
+        let end = start.saturating_add(amount).min(region.len);
+        if end == start {
+            return Ok(end);
+        }
+        let page = host_page_size() as usize;
+        if !start.is_multiple_of(page) || !end.is_multiple_of(page) {
+            return Err(MemoryError::OutOfBounds { gpa, len: amount });
+        }
+        let address = region.host_addr(gpa + start as u64);
+        #[cfg(target_os = "macos")]
+        replace_owned_pages(address, end - start)?;
+        let vm = self.vm.as_ref().ok_or(MemoryError::Detached)?;
+        // SAFETY: this prefix extension has never been exposed to the guest or
+        // device models. Owned backing is complete and remains alive in Region.
+        unsafe {
+            vm.map(
+                address.cast(),
+                gpa + start as u64,
+                end - start,
+                MemoryPerms::RWX,
+            )?;
+        }
+        deferred.ready.store(end, Ordering::Release);
+        Ok(end)
     }
 
     /// Total bytes of guest RAM.
@@ -494,7 +594,13 @@ impl Drop for GuestMemory {
                 // SAFETY: no vCPU can be running: GuestMemory is held by the
                 // Machine, which joins every vCPU thread before dropping it.
                 unsafe {
-                    let _ = vm.unmap(region.gpa, region.len);
+                    let ready = region
+                        .deferred
+                        .as_ref()
+                        .map_or(region.len, |d| d.ready.load(Ordering::Acquire));
+                    if ready != 0 {
+                        let _ = vm.unmap(region.gpa, ready);
+                    }
                 }
             }
         }
@@ -636,6 +742,48 @@ mod tests {
     #[test]
     #[ignore = "requires a signed test binary and Hypervisor.framework"]
     fn reported_pages_are_recharged_after_guest_reuse() {
+        guest_accounting_and_reuse(false);
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn deferred_pages_are_recharged_after_guest_reuse() {
+        guest_accounting_and_reuse(true);
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn deferred_backing_is_inaccessible_until_prepared_and_never_overwritten() {
+        let vm = Arc::new(Vm::create().unwrap());
+        let mut mem = GuestMemory::new(vm);
+        let base = 0x4000_0000;
+        let page = host_page_size() as usize;
+        mem.reserve_region(base, 4 * page).unwrap();
+        assert!(mem.read_u64(base).is_err());
+        assert!(mem.host_span(base, 1).is_err());
+        assert!(mem.write_u64(base, 1).is_err());
+        assert!(mem.release(base, page as u64).is_err());
+        assert!(mem.prepare_next(base, page + 1).is_err());
+        assert!(mem.read_u64(base).is_err());
+        assert_eq!(mem.prepare_next(base, page).unwrap(), page);
+        mem.write_u64(base, 0x1234).unwrap();
+        assert!(mem.read_u64(base + page as u64).is_err());
+        assert!(mem.reserve_region(base + page as u64, page).is_err());
+        std::thread::scope(|scope| {
+            scope.spawn(|| mem.prepare_next(base, page).unwrap());
+            scope.spawn(|| mem.prepare_next(base, page).unwrap());
+        });
+        assert_eq!(mem.read_u64(base).unwrap(), 0x1234);
+        assert_eq!(mem.read_u64(base + 2 * page as u64).unwrap(), 0);
+        assert!(mem.read_u64(base + 3 * page as u64).is_err());
+        assert_eq!(mem.prepare_next(base, page).unwrap(), 4 * page);
+        assert_eq!(mem.prepare_next(base, page).unwrap(), 4 * page);
+        assert_eq!(mem.read_u64(base).unwrap(), 0x1234);
+        assert_eq!(mem.release(base, page as u64).unwrap(), page as u64);
+        assert_eq!(mem.read_u64(base).unwrap(), 0);
+    }
+
+    fn guest_accounting_and_reuse(deferred: bool) {
         use lighter_hv::{Exception, Exit, Gic, GicLayout, Reg};
         const BASE: u64 = 0x4000_0000;
         const SIZE: usize = 32 << 20;
@@ -645,7 +793,14 @@ mod tests {
         let page = host_page_size() as usize;
         mem.add_region(BASE, page).unwrap();
         let data = BASE + page as u64;
-        mem.add_region(data, SIZE).unwrap();
+        if deferred {
+            mem.reserve_region(data, SIZE).unwrap();
+            for _ in 0..4 {
+                mem.prepare_next(data, SIZE / 4).unwrap();
+            }
+        } else {
+            mem.add_region(data, SIZE).unwrap();
+        }
         // str x2,[x0]; add x0,x0,#4096; cmp x0,x1; b.lo -12; brk #0
         let code = [
             0xf900_0002u32,
@@ -722,6 +877,7 @@ mod tests {
             len: 0x1000,
             host: backing.ptr,
             _backing: backing,
+            deferred: None,
         };
 
         assert!(region.contains(0x4000_0000, 1));

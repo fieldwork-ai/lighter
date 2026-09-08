@@ -1,0 +1,114 @@
+[
+  {
+    "memory_mib": 16384,
+    "arm": 1,
+    "mode": "eager",
+    "docker_ms": 1376.843166,
+    "first_container_ms": 1503.943708
+  },
+  {
+    "memory_mib": 16384,
+    "arm": 2,
+    "mode": "background",
+    "docker_ms": 642.869917,
+    "first_container_ms": 1187.470708
+  },
+  {
+    "memory_mib": 16384,
+    "arm": 3,
+    "mode": "background",
+    "docker_ms": 723.636333,
+    "first_container_ms": 1273.020833
+  },
+  {
+    "memory_mib": 16384,
+    "arm": 4,
+    "mode": "eager",
+    "docker_ms": 1612.663583,
+    "first_container_ms": 1744.551625
+  },
+  {
+    "memory_mib": 16384,
+    "arm": 5,
+    "mode": "background",
+    "docker_ms": 701.1975,
+    "first_container_ms": 1281.970125
+  },
+  {
+    "memory_mib": 16384,
+    "arm": 6,
+    "mode": "eager",
+    "docker_ms": 1647.383916,
+    "first_container_ms": 1827.075375
+  },
+  {
+    "memory_mib": 16384,
+    "arm": 7,
+    "mode": "eager",
+    "docker_ms": 1626.222208,
+    "first_container_ms": 1804.300333
+  },
+  {
+    "memory_mib": 16384,
+    "arm": 8,
+    "mode": "background",
+    "docker_ms": 709.437834,
+    "first_container_ms": 1310.081709
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 1,
+    "mode": "eager",
+    "docker_ms": 1395.774792,
+    "first_container_ms": 1577.000042
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 2,
+    "mode": "background",
+    "docker_ms": 679.722125,
+    "first_container_ms": 1066.29575
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 3,
+    "mode": "background",
+    "docker_ms": 645.947542,
+    "first_container_ms": 1091.853375
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 4,
+    "mode": "eager",
+    "docker_ms": 1454.459667,
+    "first_container_ms": 1629.357208
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 5,
+    "mode": "background",
+    "docker_ms": 661.012542,
+    "first_container_ms": 1113.153542
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 6,
+    "mode": "eager",
+    "docker_ms": 1751.317208,
+    "first_container_ms": 1926.059333
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 7,
+    "mode": "eager",
+    "docker_ms": 1737.635334,
+    "first_container_ms": 1913.617792
+  },
+  {
+    "memory_mib": 12288,
+    "arm": 8,
+    "mode": "background",
+    "docker_ms": 771.337333,
+    "first_container_ms": 1289.597333
+  }
+]

@@ -126,7 +126,9 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
     // that is what gives the process a name and the flame in Activity
     // Monitor. The guest directory is resolved here and passed down,
     // because the bundled copy cannot find it by walking up from itself.
+    let bundle_phase = lighter_vmm::boot_timing::Phase::new("cli_bundle");
     let exe = crate::bundle::ensure()?;
+    drop(bundle_phase);
     let guest = paths::guest_dir()?;
     let mut command = std::process::Command::new(exe);
     command.arg("run");
@@ -152,11 +154,14 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
         });
     }
 
+    let spawn_phase = lighter_vmm::boot_timing::Phase::new("cli_spawn");
     let mut child = if crate::service::start_registered()? {
         None
     } else {
         Some(command.spawn()?)
     };
+    drop(spawn_phase);
+    let _readiness = lighter_vmm::boot_timing::Phase::new("cli_docker_readiness");
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if let Some(identity) = crate::instance::Identity::read(&home)?

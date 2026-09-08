@@ -1,0 +1,23 @@
+[
+  {
+    "memory_mib": 16384,
+    "rep": 1,
+    "docker_ms": 1759.975459,
+    "first_container_ms": 1992.936375,
+    "wall_time": 1788857270.0994072
+  },
+  {
+    "memory_mib": 16384,
+    "rep": 2,
+    "docker_ms": 1445.110416,
+    "first_container_ms": 1624.990958,
+    "wall_time": 1788857274.211884
+  },
+  {
+    "memory_mib": 16384,
+    "rep": 3,
+    "docker_ms": 1333.962167,
+    "first_container_ms": 1504.329584,
+    "wall_time": 1788857278.199986
+  }
+]

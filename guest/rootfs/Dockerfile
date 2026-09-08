@@ -35,11 +35,12 @@ RUN apk add --no-cache \
 COPY init /sbin/lighter-init
 COPY lighter-agent /sbin/lighter-agent
 COPY build-runc /sbin/lighter-build-runc
+COPY boot-memory /sbin/lighter-boot-memory
 # The binfmt handler for x86-64 when Rosetta is not there: the agent under a
 # second name, which it recognizes and answers with what to install. A hard
 # link, because `binfmt_misc` opens the registered path once at boot and the
 # agent tells the two apart by `/proc/self/exe`.
-RUN chmod +x /sbin/lighter-init /sbin/lighter-agent /sbin/lighter-build-runc \
+RUN chmod +x /sbin/lighter-init /sbin/lighter-agent /sbin/lighter-build-runc /sbin/lighter-boot-memory \
 	&& ln /sbin/lighter-agent /sbin/lighter-noamd64
 
 # Docker's data root lives on the dedicated disk, mounted at boot. Creating the

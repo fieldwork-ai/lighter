@@ -205,13 +205,19 @@ impl MemoryPolicy {
 pub struct MakeWhole(Arc<Steering>);
 
 impl MakeWhole {
-    pub fn call(&self) {
-        let Some(mem) = &self.0.mem else { return };
+    pub fn call(&self) -> std::io::Result<()> {
+        let Some(mem) = &self.0.mem else {
+            return Ok(());
+        };
+        // Backing preparation has its own bounded wait. Do not consume the
+        // guest's plug deadline while the host is still creating that backing.
+        mem.wait_for_backing()?;
         if mem.state().plugged_bytes() == mem.state().region_bytes() {
-            return;
+            return Ok(());
         }
         self.0.guest_offers(0, true);
         mem.plug_all();
+        Ok(())
     }
 }
 

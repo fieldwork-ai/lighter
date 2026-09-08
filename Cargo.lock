@@ -268,7 +268,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "lighter-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-docker"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "serde",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-fs"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "tracing",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-hv"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "thiserror",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-vmm"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "lighter-docker",
