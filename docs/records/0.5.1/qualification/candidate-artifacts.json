@@ -1,0 +1,7 @@
+{
+  ".logs/051/lighter-67d787b": "3ced40bf51841731314a25c1d827646faaf262a68c3cb6f9eafdf13733afa1b1",
+  ".logs/051/guest-candidate/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+  ".logs/051/guest-candidate/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71",
+  ".logs/051/guest-candidate/lighter-agent": "4fcd6f1457997f59ff9979959f446854b89b663dbeb657e67cf02690d8df53d3",
+  ".logs/051/guest-candidate/kernel.version": "ca25e5b95574dc33d64bc8cde1d1d04f52dc7d2ffce9cbac79358915618aae67"
+}

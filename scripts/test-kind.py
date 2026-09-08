@@ -22,6 +22,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--lighter", required=True)
+    ap.add_argument("--expected-version", default="0.5.0")
     ap.add_argument("--kind", required=True)
     ap.add_argument("--kubectl", required=True)
     ap.add_argument("--helm", required=True)
@@ -178,8 +179,8 @@ def main():
     )
     (out / "kind.json").write_text(json.dumps(config, indent=2))
     base_version = cmd([a.lighter, "--version"]).stdout
-    if not base_version.startswith("lighter 0.5.0"):
-        raise RuntimeError("qualification requires the 0.5.0 CLI")
+    if base_version.strip() != f"lighter {a.expected_version}":
+        raise RuntimeError(f"qualification requires the {a.expected_version} CLI")
     guest = Path(os.environ["LIGHTER_GUEST_DIR"])
     metadata = dict(
         lighter=base_version.strip(),

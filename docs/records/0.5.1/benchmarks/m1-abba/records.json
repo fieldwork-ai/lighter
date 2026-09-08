@@ -1,0 +1,30 @@
+[
+  {
+    "label": "051-67d787b-m1-a1-abba-1-050",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf",
+    "options": [],
+    "sha256": "361b4d97499cb23dacaaa07211dcfbca302a7a2c4cde82d168dde98ac7f33981"
+  },
+  {
+    "label": "051-67d787b-m1-a1-abba-2-051",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf",
+    "options": [],
+    "sha256": "9c8414923d25bd2b51f7a7d1b973dc9da457992c7519fb5e521e2cc649c45ad0"
+  },
+  {
+    "label": "051-67d787b-m1-a1-abba-3-051",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf",
+    "options": [],
+    "sha256": "2be33c2e391a4fa451d0db7747efbb214874b8fbfbaad3b717ac04abafb08cb4"
+  },
+  {
+    "label": "051-67d787b-m1-a1-abba-4-050",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf",
+    "options": [],
+    "sha256": "9c951b50b58b04dc8b7ea5abdfe0498cd6618e5af32ff47a40e8708eeba82207"
+  }
+]

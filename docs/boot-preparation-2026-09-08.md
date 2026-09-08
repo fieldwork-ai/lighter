@@ -93,9 +93,15 @@ machine log and CLI stderr. Neither is needed for normal operation. The updated
 root filesystem is part of the release: its pre-restore memory gate must travel
 with the VMM.
 
-## Remaining release work
+## Final release qualification
 
-Complete qualification on the frozen candidate, record the full M1 workload
-suite and final startup comparisons, then sign, notarize and test the exact
-archive before opening the release PRs. Existing README benchmark tables remain
-identified as 0.5.0 measurements until supported replacements are available.
+The frozen runtime and final signed, notarized archive have completed
+qualification. [The release report](release-0.5.1.md) records all three full M1
+suites, separate comparisons of the signed release archives, installation,
+rollback, kind and Homebrew checks. The final image-only signed comparison
+measures Docker readiness at 716.5 → 536.3 ms and first-container completion at
+900.9 → 714.9 ms on M1. These are distinct from the prototypes above.
+
+Existing README benchmark tables remain identified as 0.5.0 M5 measurements.
+The shared M5 was not used for a full replacement record. Publication follows
+the dev → main release PR merge.

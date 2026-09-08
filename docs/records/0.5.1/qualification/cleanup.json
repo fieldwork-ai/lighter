@@ -1,0 +1,15 @@
+{
+  "utc": "2026-09-08T11:45:17.240450+00:00",
+  "removed_task_signing_files": [
+    ".context/cert.p12",
+    ".context/AuthKey.p8",
+    ".context/apple.local.env"
+  ],
+  "all_task_signing_files_absent": true,
+  "future_context_link_absent": true,
+  "user_keychain_list_unchanged": true,
+  "m5_daily_release": "0.5.0",
+  "m5_daily_config_unchanged": true,
+  "m5_daily_memory_mib": 16384,
+  "m1_services_paused_by_this_work": false
+}
