@@ -1,0 +1,25 @@
+{
+  "artifacts": {
+    "/Users/nick/git/lighter/.logs/051/demand/lighter-a4": "4290a37d818b90e2acd4d62b133c0a00bf146fc8acbeae2d87896a1580ef0b20",
+    "/Users/nick/git/lighter/.logs/051/guest-candidate/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "/Users/nick/git/lighter/.logs/051/guest-candidate/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71",
+    "/Users/nick/git/lighter/.logs/051/demand/source-a4.patch": "6044971c5190ce4197bacc1d9ba05b4f6f7e1fd88e522b2eab8c252a4f4e0446",
+    "/Users/nick/git/lighter/.logs/051/demand/cold-memory-m5.py": "e3058bd317ed5344d313c3cf0ac369ae711c332a7f5b7e524b1f4f1120b4322b",
+    "/Users/nick/git/lighter/.logs/050/benchmark-images/arm64.tar": "5495a5bb8a43d7fa401a7a185ee97fb90842ec60b3bbc8c1aaf7f53e13fa1452"
+  },
+  "source": "684b9e5491c6cb5dbe50d8f629d08b9cf6642508",
+  "order": [
+    "background",
+    "demand-all",
+    "demand-all",
+    "background"
+  ],
+  "profile": {
+    "cpus": 8,
+    "memory_mib": 16384,
+    "disk_gib": 64,
+    "shares": [],
+    "publish": "localhost"
+  },
+  "program": "const n=2*1024*1024*1024;const t=process.hrtime.bigint();const b=Buffer.allocUnsafe(n);b.fill(0x5a);const allocated=process.hrtime.bigint();for(let i=0;i<n;i+=4096){if(b[i]!==0x5a)throw Error('corrupt '+i);}console.log(JSON.stringify({mib:n/1048576,allocation_ms:Number(allocated-t)/1e6,verify_ms:Number(process.hrtime.bigint()-allocated)/1e6}));"
+}

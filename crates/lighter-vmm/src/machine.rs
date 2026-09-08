@@ -208,16 +208,22 @@ impl Machine {
 
         // 4. Guest RAM.
         let mut memory = GuestMemory::new(vm.clone());
-        let demand_ram = std::env::var("LIGHTER_DEMAND_RAM").as_deref() == Ok("1");
-        let demand_base = demand_ram && std::env::var("LIGHTER_DEMAND_BASE").as_deref() == Ok("1");
+        let background_ram = std::env::var("LIGHTER_BACKGROUND_RAM").as_deref() != Ok("0");
+        // Preserve the original eager opt-out; an explicit demand setting
+        // takes precedence when comparing preparation strategies.
+        let demand_ram = match std::env::var("LIGHTER_DEMAND_RAM").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => background_ram,
+        };
+        let demand_base = demand_ram && std::env::var("LIGHTER_DEMAND_BASE").as_deref() != Ok("0");
         if demand_base {
             memory.reserve_demand_region(layout.ram.base, layout.ram.size as usize)?;
         } else {
             memory.add_region(layout.ram.base, layout.ram.size as usize)?;
         }
-        let background_ram = std::env::var("LIGHTER_BACKGROUND_RAM").as_deref() != Ok("0");
-        // Background preparation keeps the unused range unmapped
-        // until each block has correctly accounted backing.
+        // Demand RAM is prepared by first access. The background comparison
+        // path offers each block only after its backing is prepared.
         if let Some(hotplug) = layout.hotplug {
             if demand_ram {
                 memory.reserve_demand_region(hotplug.base, hotplug.size as usize)?;

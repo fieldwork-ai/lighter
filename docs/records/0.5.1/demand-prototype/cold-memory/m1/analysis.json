@@ -1,0 +1,169 @@
+{
+  "profile": {
+    "cpus": 8,
+    "memory_mib": 16384,
+    "disk_gib": 64,
+    "shares": [],
+    "publish": "localhost"
+  },
+  "arms": [
+    {
+      "arm": 1,
+      "mode": "background",
+      "metrics": {
+        "cli_start_ms": {
+          "median_ms": 1638.4841669350863,
+          "cv_percent": 1.8999502916725577,
+          "values_ms": [
+            1638.4841669350863,
+            1690.6913329148665,
+            1634.2539170291275
+          ]
+        },
+        "first_allocation_ms": {
+          "median_ms": 425.916501,
+          "cv_percent": 0.2921551748572945,
+          "values_ms": [
+            423.852,
+            426.082042,
+            425.916501
+          ]
+        },
+        "second_allocation_ms": {
+          "median_ms": 418.904251,
+          "cv_percent": 4.280476295025485,
+          "values_ms": [
+            438.35,
+            418.904251,
+            402.443959
+          ]
+        }
+      }
+    },
+    {
+      "arm": 2,
+      "mode": "demand-all",
+      "metrics": {
+        "cli_start_ms": {
+          "median_ms": 776.1199160013348,
+          "cv_percent": 11.042577729644677,
+          "values_ms": [
+            640.1973749743775,
+            776.1199160013348,
+            784.523457987234
+          ]
+        },
+        "first_allocation_ms": {
+          "median_ms": 675.4815,
+          "cv_percent": 0.6249194837982073,
+          "values_ms": [
+            682.608334,
+            675.4815,
+            675.080376
+          ]
+        },
+        "second_allocation_ms": {
+          "median_ms": 429.374375,
+          "cv_percent": 0.8413712686770833,
+          "values_ms": [
+            423.356667,
+            429.374375,
+            429.779209
+          ]
+        }
+      }
+    },
+    {
+      "arm": 3,
+      "mode": "demand-all",
+      "metrics": {
+        "cli_start_ms": {
+          "median_ms": 774.5488330256194,
+          "cv_percent": 13.15063291890064,
+          "values_ms": [
+            651.1754170060158,
+            774.5488330256194,
+            848.5076669603586
+          ]
+        },
+        "first_allocation_ms": {
+          "median_ms": 679.075083,
+          "cv_percent": 0.4321787863117023,
+          "values_ms": [
+            683.055958,
+            677.322459,
+            679.075083
+          ]
+        },
+        "second_allocation_ms": {
+          "median_ms": 428.642917,
+          "cv_percent": 1.9021068080362253,
+          "values_ms": [
+            428.642917,
+            428.953042,
+            414.827042
+          ]
+        }
+      }
+    },
+    {
+      "arm": 4,
+      "mode": "background",
+      "metrics": {
+        "cli_start_ms": {
+          "median_ms": 1667.1493330504745,
+          "cv_percent": 2.2593365968580494,
+          "values_ms": [
+            1648.344665998593,
+            1721.399417030625,
+            1667.1493330504745
+          ]
+        },
+        "first_allocation_ms": {
+          "median_ms": 396.553458,
+          "cv_percent": 0.4282969002267237,
+          "values_ms": [
+            398.293458,
+            396.553458,
+            394.896708
+          ]
+        },
+        "second_allocation_ms": {
+          "median_ms": 428.923667,
+          "cv_percent": 1.2116762469445665,
+          "values_ms": [
+            424.730417,
+            428.923667,
+            435.078792
+          ]
+        }
+      }
+    }
+  ],
+  "geometric_means_of_arm_medians": {
+    "background": {
+      "cli_start_ms": 1652.7546055357386,
+      "first_allocation_ms": 410.97282305623366,
+      "second_allocation_ms": 423.8843562350565
+    },
+    "demand-all": {
+      "cli_start_ms": 775.3339765718868,
+      "first_allocation_ms": 677.2759080887672,
+      "second_allocation_ms": 429.0084901083566
+    }
+  },
+  "changes": {
+    "cli_start_ms": {
+      "ms": -877.4206289638519,
+      "percent": -53.08837900224377
+    },
+    "first_allocation_ms": {
+      "ms": 266.30308503253355,
+      "percent": 64.79822267860644
+    },
+    "second_allocation_ms": {
+      "ms": 5.1241338733001385,
+      "percent": 1.2088518478984955
+    }
+  }
+}

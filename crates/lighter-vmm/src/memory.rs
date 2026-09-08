@@ -150,7 +150,7 @@ struct Deferred {
 
 // Preparation batches do not change allocation ownership: every backing
 // object remains one host page. Striped locks bound metadata for large VMs.
-const DEMAND_CHUNK: usize = 64 << 10;
+const DEMAND_CHUNK: usize = 256 << 10;
 #[cfg(test)]
 std::thread_local! {
     static DEMAND_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -308,7 +308,7 @@ impl GuestMemory {
     }
 
     /// Advertise addressable RAM whose backing is created before first access.
-    /// This prototype retains virtio-mem's logical plug/unplug protocol.
+    /// Retains virtio-mem's logical plug/unplug protocol.
     pub(crate) fn reserve_demand_region(&mut self, gpa: u64, len: usize) -> Result<()> {
         self.reserve_region(gpa, len)?;
         let region = self.regions.iter_mut().find(|r| r.gpa == gpa).unwrap();

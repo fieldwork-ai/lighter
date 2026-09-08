@@ -1,0 +1,24 @@
+{
+  "artifacts": {
+    "/Users/admin/lighter/.logs/051/demand-source/target/release/lighter": "8c90b27315098b10b731a264f32acddd6b708a116b5c91fd8208e3105030611f",
+    "/Users/admin/lighter/guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "/Users/admin/lighter/guest/out/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71",
+    "/Users/admin/lighter/.logs/051/demand/cold-memory-m1.py": "1e598b3db39e063ada97fc7e270f5cbac4a0862b18be51af3f8cde98aca12853",
+    "/Users/admin/lighter/.logs/050/benchmark-images/arm64.tar": "5495a5bb8a43d7fa401a7a185ee97fb90842ec60b3bbc8c1aaf7f53e13fa1452"
+  },
+  "source": "57456cfd65fc3e5e2e5ffbc69b46a17667313b80",
+  "order": [
+    "background",
+    "demand-all",
+    "demand-all",
+    "background"
+  ],
+  "profile": {
+    "cpus": 8,
+    "memory_mib": 16384,
+    "disk_gib": 64,
+    "shares": [],
+    "publish": "localhost"
+  },
+  "program": "const n=2*1024*1024*1024;const t=process.hrtime.bigint();const b=Buffer.allocUnsafe(n);b.fill(0x5a);const allocated=process.hrtime.bigint();for(let i=0;i<n;i+=4096){if(b[i]!==0x5a)throw Error('corrupt '+i);}console.log(JSON.stringify({mib:n/1048576,allocation_ms:Number(allocated-t)/1e6,verify_ms:Number(process.hrtime.bigint()-allocated)/1e6}));"
+}
