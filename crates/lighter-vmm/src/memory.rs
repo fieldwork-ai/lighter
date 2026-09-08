@@ -15,7 +15,7 @@
 
 use std::io;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lighter_hv::{MemoryPerms, Vm};
@@ -139,12 +139,26 @@ struct Region {
     host: *mut u8,
     _backing: Mmap,
     deferred: Option<Deferred>,
+    demand: Option<Demand>,
 }
 
 #[derive(Debug)]
 struct Deferred {
     ready: AtomicUsize,
     preparation: Mutex<()>,
+}
+
+// Preparation batches do not change allocation ownership: every backing
+// object remains one host page. Striped locks bound metadata for large VMs.
+const DEMAND_CHUNK: usize = 64 << 10;
+#[cfg(test)]
+std::thread_local! {
+    static DEMAND_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+#[derive(Debug)]
+struct Demand {
+    ready: Vec<AtomicBool>,
+    locks: Vec<Mutex<()>>,
 }
 
 impl Region {
@@ -223,6 +237,7 @@ impl GuestMemory {
                 host: backing.ptr,
                 _backing: backing,
                 deferred: None,
+                demand: None,
             }],
         }
     }
@@ -255,6 +270,7 @@ impl GuestMemory {
             host,
             _backing: backing,
             deferred: None,
+            demand: None,
         });
         self.regions.sort_by_key(|r| r.gpa);
         Ok(())
@@ -285,9 +301,96 @@ impl GuestMemory {
                 ready: AtomicUsize::new(0),
                 preparation: Mutex::new(()),
             }),
+            demand: None,
         });
         self.regions.sort_by_key(|r| r.gpa);
         Ok(())
+    }
+
+    /// Advertise addressable RAM whose backing is created before first access.
+    /// This prototype retains virtio-mem's logical plug/unplug protocol.
+    pub(crate) fn reserve_demand_region(&mut self, gpa: u64, len: usize) -> Result<()> {
+        self.reserve_region(gpa, len)?;
+        let region = self.regions.iter_mut().find(|r| r.gpa == gpa).unwrap();
+        region.deferred = None;
+        region.demand = Some(Demand {
+            ready: (0..len.div_ceil(DEMAND_CHUNK))
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            locks: (0..64).map(|_| Mutex::new(())).collect(),
+        });
+        Ok(())
+    }
+
+    fn prepare_demand_chunk(&self, region: &Region, index: usize) -> Result<()> {
+        let demand = region.demand.as_ref().expect("demand region");
+        if demand.ready[index].load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _lock = demand.locks[index % demand.locks.len()]
+            .lock()
+            .expect("demand backing poisoned");
+        if demand.ready[index].load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let offset = index * DEMAND_CHUNK;
+        let len = DEMAND_CHUNK.min(region.len - offset);
+        let gpa = region.gpa + offset as u64;
+        let address = region.host_addr(gpa);
+        // No CPU or device can access this chunk before publication. A later
+        // attempt never replaces a published chunk, even after page reporting.
+        let prepare = || -> Result<()> {
+            #[cfg(test)]
+            let injected_failure = DEMAND_FAILURE.with(|fault| fault.replace(0));
+            #[cfg(test)]
+            if injected_failure == 1 {
+                return Err(MemoryError::OwnedMapping(-1));
+            }
+            #[cfg(target_os = "macos")]
+            replace_owned_pages(address, len)?;
+            #[cfg(test)]
+            if injected_failure == 2 {
+                return Err(MemoryError::Detached);
+            }
+            let vm = self.vm.as_ref().ok_or(MemoryError::Detached)?;
+            // SAFETY: independent owned backing is complete and stable until drop.
+            unsafe {
+                vm.map(address.cast(), gpa, len, MemoryPerms::RWX)?;
+            }
+            Ok(())
+        };
+        if let Err(error) = prepare() {
+            // A secondary CPU or a device thread must not die alone and leave
+            // the rest of the guest running with an unserviceable RAM promise.
+            // Match background preparation's failure policy for the entire VM.
+            tracing::error!(%error, gpa, len, "cannot prepare demand memory");
+            std::process::abort();
+        }
+        demand.ready[index].store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Only stage-2 translation faults in demand RAM are retried. Device MMIO,
+    /// permission faults and other aborts retain their existing handling.
+    pub(crate) fn resolve_demand_fault(&self, exception: lighter_hv::Exception) -> Result<bool> {
+        if !matches!(
+            exception.class(),
+            lighter_hv::Exception::EC_DATA_ABORT_LOWER_EL
+                | lighter_hv::Exception::EC_INSN_ABORT_LOWER_EL
+        ) || !(4..=7).contains(&(exception.iss() & 0x3f))
+        {
+            return Ok(false);
+        }
+        let gpa = exception.physical_address;
+        let Some(region) = self
+            .regions
+            .iter()
+            .find(|r| r.demand.is_some() && r.contains(gpa, 1))
+        else {
+            return Ok(false);
+        };
+        self.prepare_demand_chunk(region, (gpa - region.gpa) as usize / DEMAND_CHUNK)?;
+        Ok(true)
     }
 
     /// Prepare one prefix extension, publishing it only after accounting and
@@ -343,11 +446,24 @@ impl GuestMemory {
     }
 
     #[inline]
-    fn region_for(&self, gpa: u64, len: usize) -> Result<&Region> {
+    fn region_for_release(&self, gpa: u64, len: usize) -> Result<&Region> {
         self.regions
             .iter()
             .find(|r| r.contains(gpa, len))
             .ok_or(MemoryError::OutOfBounds { gpa, len })
+    }
+
+    #[inline]
+    fn region_for(&self, gpa: u64, len: usize) -> Result<&Region> {
+        let region = self.region_for_release(gpa, len)?;
+        if region.demand.is_some() && len != 0 {
+            let first = (gpa - region.gpa) as usize / DEMAND_CHUNK;
+            let last = ((gpa - region.gpa) as usize + len - 1) / DEMAND_CHUNK;
+            for index in first..=last {
+                self.prepare_demand_chunk(region, index)?;
+            }
+        }
+        Ok(region)
     }
 
     /// Copies `buf.len()` bytes out of guest memory.
@@ -471,7 +587,7 @@ impl GuestMemory {
         })?;
         // Validate the original range before alignment; wrapping must never
         // turn an invalid descriptor into a valid release of unrelated RAM.
-        let region = self.region_for(gpa, len_usize)?;
+        let region = self.region_for_release(gpa, len_usize)?;
         let end = gpa.checked_add(len).ok_or(MemoryError::OutOfBounds {
             gpa,
             len: len_usize,
@@ -486,6 +602,29 @@ impl GuestMemory {
         if end <= start {
             return Ok(0);
         }
+        if let Some(demand) = &region.demand {
+            let mut at = start;
+            let mut released = 0;
+            while at < end {
+                let index = (at - region.gpa) as usize / DEMAND_CHUNK;
+                let next = end.min(region.gpa + ((index + 1) * DEMAND_CHUNK) as u64);
+                let _lock = demand.locks[index % demand.locks.len()]
+                    .lock()
+                    .expect("demand backing poisoned");
+                // An untouched chunk already has no physical backing. Reporting
+                // it must not allocate it or race a first access into replacing
+                // newly published live pages.
+                if demand.ready[index].load(Ordering::Acquire) {
+                    released += self.release_backed(region, at, next)?;
+                }
+                at = next;
+            }
+            return Ok(released);
+        }
+        self.release_backed(region, start, end)
+    }
+
+    fn release_backed(&self, region: &Region, start: u64, end: u64) -> Result<u64> {
         let span = (end - start) as usize;
         let addr = region.host_addr(start);
 
@@ -543,7 +682,7 @@ impl GuestMemory {
     /// first, and never merge across separately allocated backing regions.
     pub(crate) fn release_reported(&self, spans: &mut [(u64, u64)]) -> Result<u64> {
         for &(gpa, len) in spans.iter() {
-            self.region_for(
+            self.region_for_release(
                 gpa,
                 usize::try_from(len).map_err(|_| MemoryError::OutOfBounds {
                     gpa,
@@ -563,7 +702,7 @@ impl GuestMemory {
                 Some((first, last))
                     if start <= last
                         && self
-                            .region_for(first, (last.max(end) - first) as usize)
+                            .region_for_release(first, (last.max(end) - first) as usize)
                             .is_ok() =>
                 {
                     run = Some((first, last.max(end)));
@@ -591,6 +730,21 @@ impl Drop for GuestMemory {
         // later VM in the same process cannot map the same address again.
         if let Some(vm) = &self.vm {
             for region in &self.regions {
+                if let Some(demand) = &region.demand {
+                    // All users have joined. Unmap only published chunks;
+                    // unprepared holes have never had stage-2 mappings.
+                    for (index, ready) in demand.ready.iter().enumerate() {
+                        if ready.load(Ordering::Acquire) {
+                            let offset = index * DEMAND_CHUNK;
+                            let len = DEMAND_CHUNK.min(region.len - offset);
+                            // SAFETY: no vCPU or device can still access memory.
+                            unsafe {
+                                let _ = vm.unmap(region.gpa + offset as u64, len);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // SAFETY: no vCPU can be running: GuestMemory is held by the
                 // Machine, which joins every vCPU thread before dropping it.
                 unsafe {
@@ -742,13 +896,13 @@ mod tests {
     #[test]
     #[ignore = "requires a signed test binary and Hypervisor.framework"]
     fn reported_pages_are_recharged_after_guest_reuse() {
-        guest_accounting_and_reuse(false);
+        guest_accounting_and_reuse(0);
     }
 
     #[test]
     #[ignore = "requires a signed test binary and Hypervisor.framework"]
     fn deferred_pages_are_recharged_after_guest_reuse() {
-        guest_accounting_and_reuse(true);
+        guest_accounting_and_reuse(1);
     }
 
     #[test]
@@ -783,7 +937,208 @@ mod tests {
         assert_eq!(mem.read_u64(base).unwrap(), 0);
     }
 
-    fn guest_accounting_and_reuse(deferred: bool) {
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn demand_pages_fault_in_and_are_recharged_after_guest_reuse() {
+        guest_accounting_and_reuse(2);
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn demand_sparse_concurrent_devices_and_partial_release() {
+        let vm = Arc::new(Vm::create().unwrap());
+        let mut mem = GuestMemory::new(vm);
+        let base = 0x4000_0000;
+        let size = 128 * DEMAND_CHUNK;
+        mem.reserve_demand_region(base, size).unwrap();
+        let demand = mem.regions[0].demand.as_ref().unwrap();
+        assert_eq!(mem.release(base, size as u64).unwrap(), 0);
+        assert!(demand.ready.iter().all(|r| !r.load(Ordering::Acquire)));
+        assert!(mem.host_span(base + size as u64 - 1, 2).is_err());
+        std::thread::scope(|scope| {
+            for thread in 0..8u64 {
+                let mem = &mem;
+                scope.spawn(move || {
+                    for chunk in [0, 67, 127] {
+                        let address = base + chunk * DEMAND_CHUNK as u64 + thread * 8;
+                        for _ in 0..100 {
+                            mem.write_u64(address, thread + 1).unwrap();
+                            assert_eq!(mem.read_u64(address).unwrap(), thread + 1);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            demand
+                .ready
+                .iter()
+                .filter(|r| r.load(Ordering::Acquire))
+                .count(),
+            3
+        );
+        // A device span crossing preparation boundaries must be fully backed.
+        let boundary = base + 2 * DEMAND_CHUNK as u64;
+        mem.write(boundary - 4, &[0x5a; 8]).unwrap();
+        let ptr = mem.host_span(boundary - 4, 8).unwrap();
+        // SAFETY: the span was prepared, and no guest is accessing this fixture.
+        unsafe {
+            assert_eq!(ptr.add(7).read_volatile(), 0x5a);
+        }
+        let page = host_page_size();
+        mem.write_u64(base + page, 0xfeed).unwrap();
+        assert_eq!(mem.release(base, page).unwrap(), page);
+        assert_eq!(mem.read_u64(base).unwrap(), 0);
+        assert_eq!(mem.read_u64(base + page).unwrap(), 0xfeed);
+        assert_eq!(mem.read_u64(base + 127 * DEMAND_CHUNK as u64).unwrap(), 1);
+        let mut spans = [(base + 10 * DEMAND_CHUNK as u64, DEMAND_CHUNK as u64)];
+        assert_eq!(mem.release_reported(&mut spans).unwrap(), 0);
+        assert!(!demand.ready[10].load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn demand_instruction_fault_is_prepared_without_advancing_pc() {
+        use lighter_hv::{Exception, Exit, Gic, GicLayout, Reg};
+        let vm = Arc::new(Vm::create().unwrap());
+        let _gic = Gic::create(&vm, GicLayout::default()).unwrap();
+        let mut mem = GuestMemory::new(vm.clone());
+        let base = 0x4000_0000;
+        mem.reserve_demand_region(base, DEMAND_CHUNK).unwrap();
+        let mut cpu = vm.create_vcpu().unwrap();
+        cpu.set_trap_debug_exceptions(true).unwrap();
+        cpu.set_reg(Reg::Pc, base).unwrap();
+        cpu.set_reg(Reg::Cpsr, lighter_hv::PSTATE_EL1H_DAIF_MASKED)
+            .unwrap();
+        let Exit::Exception(e) = cpu.run().unwrap() else {
+            panic!("expected instruction abort")
+        };
+        assert_eq!(e.class(), Exception::EC_INSN_ABORT_LOWER_EL);
+        assert!(mem.resolve_demand_fault(e).unwrap());
+        assert_eq!(cpu.reg(Reg::Pc).unwrap(), base);
+        // Install a BRK after handling the otherwise uninitialized fetch.
+        mem.write_u32(base, 0xd420_0000).unwrap();
+        assert!(
+            matches!(cpu.run().unwrap(), Exit::Exception(e) if e.class() == Exception::EC_BRK64)
+        );
+        let bad = Exception {
+            syndrome: (Exception::EC_DATA_ABORT_LOWER_EL as u64) << 26 | 4,
+            physical_address: base - 1,
+            virtual_address: 0,
+        };
+        assert!(!mem.resolve_demand_fault(bad).unwrap());
+        let permission = Exception {
+            syndrome: (Exception::EC_DATA_ABORT_LOWER_EL as u64) << 26 | 15,
+            physical_address: base,
+            virtual_address: base,
+        };
+        assert!(!mem.resolve_demand_fault(permission).unwrap());
+        drop(cpu);
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn simultaneous_vcpu_faults_preserve_each_writers_data() {
+        use lighter_hv::{Exception, Exit, Gic, GicLayout, Reg};
+        let vm = Arc::new(Vm::create().unwrap());
+        let _gic = Gic::create(&vm, GicLayout::default()).unwrap();
+        let mut mem = GuestMemory::new(vm.clone());
+        let code_base = 0x4000_0000;
+        let data = code_base + 0x10_0000;
+        let size = 8 << 20;
+        mem.add_region(code_base, host_page_size() as usize)
+            .unwrap();
+        mem.reserve_demand_region(data, size).unwrap();
+        // Four CPUs store distinct words on the same initially absent pages.
+        for (i, instruction) in [
+            0xf900_0002,
+            0x9140_0400,
+            0xeb01_001f,
+            0x54ff_ffa3,
+            0xd420_0000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mem.write_u32(code_base + i as u64 * 4, instruction)
+                .unwrap();
+        }
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for writer in 0..4u64 {
+                let vm = &vm;
+                let mem = &mem;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let mut cpu = vm.create_vcpu().unwrap();
+                    cpu.set_trap_debug_exceptions(true).unwrap();
+                    cpu.set_reg(Reg::Pc, code_base).unwrap();
+                    cpu.set_reg(Reg::Cpsr, lighter_hv::PSTATE_EL1H_DAIF_MASKED)
+                        .unwrap();
+                    cpu.set_reg(Reg::X0, data + writer * 8).unwrap();
+                    cpu.set_reg(Reg::X1, data + size as u64 + writer * 8)
+                        .unwrap();
+                    cpu.set_reg(Reg::X2, writer + 1).unwrap();
+                    barrier.wait();
+                    loop {
+                        match cpu.run().unwrap() {
+                            Exit::Exception(e) if mem.resolve_demand_fault(e).unwrap() => continue,
+                            Exit::Exception(e) if e.class() == Exception::EC_BRK64 => break,
+                            other => panic!("unexpected guest exit: {other:?}"),
+                        }
+                    }
+                });
+            }
+        });
+        for offset in (0..size).step_by(4096) {
+            for writer in 0..4u64 {
+                assert_eq!(
+                    mem.read_u64(data + offset as u64 + writer * 8).unwrap(),
+                    writer + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a signed test binary and Hypervisor.framework"]
+    fn demand_backing_failure_stops_the_entire_process() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "LIGHTER_TEST_DEMAND_FAILURE_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            // The deliberate abort must not write a core image of test memory.
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: a valid rlimit for the current disposable test process.
+            unsafe {
+                assert_eq!(libc::setrlimit(libc::RLIMIT_CORE, &limit), 0);
+            }
+            let vm = Arc::new(Vm::create().unwrap());
+            let mut mem = GuestMemory::new(vm);
+            mem.reserve_demand_region(0x4000_0000, DEMAND_CHUNK)
+                .unwrap();
+            DEMAND_FAILURE.with(|fault| fault.set(mode.parse().unwrap()));
+            let _ = mem.write_u64(0x4000_0000, 123);
+            panic!("failed demand backing returned control to the caller");
+        }
+        for mode in ["1", "2"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory::tests::demand_backing_failure_stops_the_entire_process",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{output:?}");
+        }
+    }
+
+    fn guest_accounting_and_reuse(mode: u8) {
         use lighter_hv::{Exception, Exit, Gic, GicLayout, Reg};
         const BASE: u64 = 0x4000_0000;
         const SIZE: usize = 32 << 20;
@@ -793,7 +1148,9 @@ mod tests {
         let page = host_page_size() as usize;
         mem.add_region(BASE, page).unwrap();
         let data = BASE + page as u64;
-        if deferred {
+        if mode == 2 {
+            mem.reserve_demand_region(data, SIZE).unwrap();
+        } else if mode == 1 {
             mem.reserve_region(data, SIZE).unwrap();
             for _ in 0..4 {
                 mem.prepare_next(data, SIZE / 4).unwrap();
@@ -821,9 +1178,13 @@ mod tests {
             vcpu.set_reg(Reg::X0, data).unwrap();
             vcpu.set_reg(Reg::X1, data + SIZE as u64).unwrap();
             vcpu.set_reg(Reg::X2, value).unwrap();
-            assert!(
-                matches!(vcpu.run().unwrap(), Exit::Exception(e) if e.class() == Exception::EC_BRK64)
-            );
+            loop {
+                match vcpu.run().unwrap() {
+                    Exit::Exception(e) if mem.resolve_demand_fault(e).unwrap() => continue,
+                    Exit::Exception(e) if e.class() == Exception::EC_BRK64 => break,
+                    other => panic!("unexpected guest exit: {other:?}"),
+                }
+            }
         };
         touch(1);
         for round in 0..3 {
@@ -878,6 +1239,7 @@ mod tests {
             host: backing.ptr,
             _backing: backing,
             deferred: None,
+            demand: None,
         };
 
         assert!(region.contains(0x4000_0000, 1));
