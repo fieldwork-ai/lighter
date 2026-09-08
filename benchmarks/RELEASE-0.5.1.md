@@ -130,3 +130,37 @@ python3 scripts/records/summarize-hybrid-release.py docs/records/0.5.1/hybrid/m1
 ```
 
 The validator checks each CSV hash, source identity, completed guard, quiet window, expected cases and repetition counts before calculating the summary. These full-suite timings use the Node-based harness; do not pool them with the separate Python-based startup experiments or attribute pure-demand prototype timings to the hybrid release.
+
+
+## M5 storage follow-up
+
+The matched screening used 0.5.0 then hybrid, one observation per case, with
+all three package-manager warm-ups and preceding file reads. Copy measured
+5,177 / 3,760 ms; the historical copy slowdown did not reproduce in this
+screening. These single observations do not establish a copy speedup.
+
+Deletion measured 2,830 / 3,015 ms, crossing the +5% investigation threshold.
+Two additional deletions per version reversed the order, hybrid then 0.5.0,
+with the same preparation. The preceding read, walk and copy are untimed in
+this follow-up and checked for successful completion.
+
+| Version | Initial observation | Two additional observations | Median | Mean |
+|---|---:|---:|---:|---:|
+| 0.5.0 | 2,830 ms | 2,682 / 2,874 ms | 2,830 ms | 2,795 ms |
+| Hybrid | 3,015 ms | 2,957 / 3,091 ms | 3,015 ms | 3,021 ms |
+
+The retained sample is 6.5% higher by median and 8.1% by mean. This is an
+inconclusive version comparison: the unchanged hybrid's full-suite deletion
+observations span 2,642–3,662 ms, with 16.1% within-suite CV. Host/cache/order
+variation plausibly contributes to the focused difference; that variability
+does not prove that the entire difference is noise or exclude a small runtime
+effect. We do not label this an established regression or an accepted
+performance cost. The threshold triggered investigation, not a statistical
+significance test. Each version has one initial observation and two repetitions
+in another VM, rather than three independent VM starts.
+
+The original full suite remains the release primary. User-directed exploratory
+repetitions after this screening are outside the retained release comparison.
+[Initial matched records](../docs/records/0.5.1/hybrid/m5-storage-focus/) and
+[the two-observation follow-up](../docs/records/0.5.1/hybrid/m5-deletion-follow-up/)
+retain the protocol, guards and source/artifact identities.

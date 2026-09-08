@@ -4,7 +4,7 @@ Status: hybrid preparation is now the 0.5.1 candidate. Pure demand at `b303dc2`
 was evaluated but left first-use preparation in workloads and split reclamation
 into 256 KiB calls. The historical results below describe those prototypes,
 not the hybrid candidate. One complete suite now passes on each host. Final
-hybrid archive qualification and a focused M5 storage follow-up remain pending;
+hybrid archive qualification remains pending;
 publication is on hold.
 
 The hybrid default offers guest capacity immediately and runs one worker over
@@ -348,8 +348,8 @@ Cold idle footprint is 372 MiB; idle CPU is 3 ms/s (0.3% of one core).
 
 Host-share npm/pnpm/yarn medians are 6,364 / 4,008 / 5,192 ms. Copy is 3,804 ms
 and deletion 3,224 ms, respectively 6.0% and 22.2% above the historical 0.5.0
-primary. A focused old/new comparison is checking these storage differences;
-historical medians alone do not establish a runtime effect.
+primary. The focused comparison below investigates these differences; historical
+medians alone do not establish a runtime effect.
 
 The [M5 speed gate](records/0.5.1/hybrid/m5-speed-gate/) passes using the
 completed share CSV and the September 7 native reference, without another
@@ -357,3 +357,37 @@ benchmark. All 211 fseventsd observations report one process at 15 MiB, ending
 at 0.3% CPU. Five-second sampling can miss short peaks; this does not establish
 a fix for the earlier unreproduced incident. Host process pauses and the daily
 login service setting were restored after the full suite.
+
+
+### M5 storage follow-up
+
+The matched screening used 0.5.0 then hybrid, one observation per case, with
+all three package-manager warm-ups and preceding file reads. Copy measured
+5,177 / 3,760 ms; the historical copy slowdown did not reproduce in this
+screening. These single observations do not establish a copy speedup.
+
+Deletion measured 2,830 / 3,015 ms, crossing the +5% investigation threshold.
+Two additional deletions per version reversed the order, hybrid then 0.5.0,
+with the same preparation. The preceding read, walk and copy are untimed in
+this follow-up and checked for successful completion.
+
+| Version | Initial observation | Two additional observations | Median | Mean |
+|---|---:|---:|---:|---:|
+| 0.5.0 | 2,830 ms | 2,682 / 2,874 ms | 2,830 ms | 2,795 ms |
+| Hybrid | 3,015 ms | 2,957 / 3,091 ms | 3,015 ms | 3,021 ms |
+
+The retained sample is 6.5% higher by median and 8.1% by mean. This is an
+inconclusive version comparison: the unchanged hybrid's full-suite deletion
+observations span 2,642–3,662 ms, with 16.1% within-suite CV. Host/cache/order
+variation plausibly contributes to the focused difference; that variability
+does not prove that the entire difference is noise or exclude a small runtime
+effect. We do not label this an established regression or an accepted
+performance cost. The threshold triggered investigation, not a statistical
+significance test. Each version has one initial observation and two repetitions
+in another VM, rather than three independent VM starts.
+
+The original full suite remains the release primary. User-directed exploratory
+repetitions after this screening are outside the retained release comparison.
+[Initial matched records](records/0.5.1/hybrid/m5-storage-focus/) and
+[the two-observation follow-up](records/0.5.1/hybrid/m5-deletion-follow-up/)
+retain the protocol, guards and source/artifact identities.
