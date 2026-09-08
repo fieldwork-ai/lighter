@@ -1,0 +1,10 @@
+[
+  {
+    "memory_mib": 16384,
+    "rep": 1,
+    "docker_ms": 665.31325,
+    "first_container_ms": 842.290083,
+    "wall_time": 1788887486.070765,
+    "preparation_complete_ms": null
+  }
+]
