@@ -4,11 +4,11 @@
 
 lighter is a lightweight virtual machine monitor built from scratch on Apple's `Hypervisor.framework` in Rust. It implements its own vCPU loop, GICv3 interrupt controller, bespoke virtio device models, and boots a custom Linux LTS kernel directly into memory in 50 milliseconds.
 
-Purpose-built for Apple Silicon, lighter is a drop-in replacement for Docker Desktop and OrbStack. It matches or beats OrbStack's speed, consumes a fraction of Docker Desktop's memory, runs completely headless with zero GUI bloat, and comes with zero commercial licensing traps.
+Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Docker Desktop and OrbStack. It matches or beats OrbStack's speed, consumes a fraction of Docker Desktop's memory, runs completely headless with zero GUI bloat, and comes with zero commercial licensing traps.
 
 **Dual-licensed MIT or Apache 2.0. No paid subscriptions, no commercial seat limits, no "free during beta", and no telemetry.**
 
-*Requires Apple Silicon (M1–M5) and macOS 15 (Sequoia) or later.*
+*Requires Apple Silicon and macOS 15 (Sequoia) or later.*
 
 ---
 
@@ -173,7 +173,7 @@ Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` 
 
 ---
 
-## Why it is fast
+## Why it's fast
 
 Running containers on macOS typically hits five performance bottlenecks: the shared filesystem boundary, virtual disk I/O, guest memory hoarding, network packet translation, and cold-start latency. lighter solves each at the hypervisor level.
 
