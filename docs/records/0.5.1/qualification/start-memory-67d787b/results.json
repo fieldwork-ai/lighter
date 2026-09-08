@@ -1,0 +1,62 @@
+[
+  {
+    "memory_mib": 8192,
+    "mode": "eager",
+    "memtotal_kib": 8208452
+  },
+  {
+    "memory_mib": 8192,
+    "mode": "background-fragmented",
+    "memtotal_kib": 8208452
+  },
+  {
+    "memory_mib": 8192,
+    "mode": "background-restored",
+    "memtotal_kib": 8208452
+  },
+  {
+    "memory_mib": 12288,
+    "mode": "eager",
+    "memtotal_kib": 12330024
+  },
+  {
+    "memory_mib": 12288,
+    "mode": "background-fragmented",
+    "memtotal_kib": 12330020
+  },
+  {
+    "memory_mib": 12288,
+    "mode": "background-restored",
+    "memtotal_kib": 12330020
+  },
+  {
+    "memory_mib": 16384,
+    "mode": "eager",
+    "memtotal_kib": 16394576
+  },
+  {
+    "memory_mib": 16384,
+    "mode": "background-fragmented",
+    "memtotal_kib": 16394580
+  },
+  {
+    "memory_mib": 16384,
+    "mode": "background-restored",
+    "memtotal_kib": 16394580
+  },
+  {
+    "memory_mib": 32768,
+    "mode": "eager",
+    "memtotal_kib": 32895296
+  },
+  {
+    "memory_mib": 32768,
+    "mode": "background-fragmented",
+    "memtotal_kib": 32895292
+  },
+  {
+    "memory_mib": 32768,
+    "mode": "background-restored",
+    "memtotal_kib": 32895292
+  }
+]

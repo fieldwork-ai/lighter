@@ -1,0 +1,23 @@
+{
+  "source": "67d787b5910e0dd68b7564d4716fe3b7b0126d1d",
+  "tracked_source_dirty": false,
+  "cli": "<repo>/.logs/051/m1-signed-boot-a1/archive-051/lighter-0.5.1/bin/lighter",
+  "cli_sha256": "b5dc6842121f6be1eef94900ab986a667b150d55907a9bc05803edc0f5b36015",
+  "guest": "<repo>/.logs/051/m1-signed-boot-a1/archive-051/lighter-0.5.1/share/lighter",
+  "payload": {
+    "Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71"
+  },
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83\n",
+  "cpus": 8,
+  "memory_mib": [
+    4096
+  ],
+  "disk_gib": 128,
+  "reps": 5,
+  "mode": "default",
+  "timing": false,
+  "saved_container": false,
+  "quiet_host_enforced": false,
+  "sampling": "docker version polled every 50 ms, plus command duration; first Alpine true with image present"
+}

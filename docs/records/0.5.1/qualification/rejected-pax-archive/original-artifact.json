@@ -1,0 +1,15 @@
+{
+  "archive_sha256": "8f9672076f8d82700b5a6e26d41e9769ab56b2df0f01aa54cc90d5f9c1fb363b",
+  "bootstrap_sha256": "b5dc6842121f6be1eef94900ab986a667b150d55907a9bc05803edc0f5b36015",
+  "qualification_source": "67d787b5910e0dd68b7564d4716fe3b7b0126d1d",
+  "runtime_source": "67d787b5910e0dd68b7564d4716fe3b7b0126d1d",
+  "guest": {
+    "Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71"
+  },
+  "unsigned_code": {
+    "bin/lighter": "7f7215695054d6aa5dd206da99b7c3c8b1f41d8756cb33d58d284c4e89ccf2c2",
+    "share/lighter/lighter.app/Contents/MacOS/lighter": "7f7215695054d6aa5dd206da99b7c3c8b1f41d8756cb33d58d284c4e89ccf2c2"
+  },
+  "release_source": "dc94d5abf3f4537a12619654eae4322bbcf39151"
+}

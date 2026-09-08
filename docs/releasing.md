@@ -17,7 +17,7 @@ One number, in the workspace `Cargo.toml`: `version` and the four internal crate
 ## The tarball
 
 ```
-scripts/package-release.sh 0.5.0
+scripts/package-release.sh 0.5.1
 ```
 
 Builds release, signs `lighter` with the Developer ID Application identity and the hypervisor entitlement (`cargo build --release` alone strips it, which is what `make sign PROFILE=release` is for during development), submits to `notarytool`, and packs `dist/lighter-<version>-arm64.tar.gz` with the kernel, the rootfs and the entitlements. `--skip-notarize` is for checking the packaging, not for shipping. The packager restores the checkout binary's development entitlement immediately after building, requires an explicit Accepted notarization status, staples and validates the app ticket, and checks Gatekeeper before packing. Missing notarization credentials are an error unless `--skip-notarize` was explicitly requested. The production runtime and guest payload must match the qualified source: 0.2.0's first tarball was built one commit early and withdrawn. If final packaging follows documentation or formula-only commits, record both source commits, verify identical guest hashes and executable bytes after removing signatures from temporary copies, and repeat exact-archive smoke tests. Any runtime or guest change requires fresh qualification.
@@ -33,6 +33,16 @@ Before publishing:
 7. Confirm the public assets download and pass their hashes, then make the tap PR ready to merge. Homebrew 6 requires testing a formula inside a tap; use an isolated tap checkout and restore its original branch afterward.
 
 The archive contains a manifest sealed inside the signed app. It authenticates the external CLI, kernel, root filesystem and kernel version. Package without AppleDouble sidecars (`COPYFILE_DISABLE=1`); the notarization staple remains an ordinary app resource. A missing or invalid signature, manifest or guest hash must fail before stopping an existing VM.
+
+Use regular `ustar` entries for the root filesystem, even when its source file
+is sparse. BSD tar's default PAX sparse representation can be read by macOS tar
+while the application's Rust extractor writes the data beneath
+`GNUSparseFile.0/`, leaving the authenticated path absent. The packager now
+checks a notarized archive through `install-archive` in private state, without
+starting a VM. Manual extraction followed by a successful VM boot does not
+replace that consumer check. Repacking an unpublished archive is permissible
+when every signed file and the stapled ticket remain unchanged; preserve the
+original attempt, record both hashes, and qualify the final archive.
 
 ## After
 

@@ -1,0 +1,31 @@
+[
+  {
+    "label": "051-67d787b-m1-a3-1-share",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf cpu-sha256 container-start watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot",
+    "options": [],
+    "sha256": "954bc9aa40a4a9aafb211e91b8e9f98113e269c35e2f21811d364af90054efaa"
+  },
+  {
+    "label": "051-67d787b-m1-a3-1-guest",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf",
+    "options": [
+      "--where",
+      "guest"
+    ],
+    "sha256": "42e2ae00e73b4c0e5f5507895220c9ddb08ae6c44ae57105adf59e3021b8fc84"
+  },
+  {
+    "label": "051-67d787b-m1-a3-1-amd64",
+    "target": "lighter",
+    "cases": "npm-install pnpm-install cpu-sha256 container-start",
+    "options": [
+      "--where",
+      "guest",
+      "--arch",
+      "amd64"
+    ],
+    "sha256": "40436708e337a0ed4fe7617fc25012a2f95bcf5d8f172d69551d20fc82539c93"
+  }
+]

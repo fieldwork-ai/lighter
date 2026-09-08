@@ -1,0 +1,202 @@
+{
+  "case-051-67d787b-m1-a3-1-amd64-cpu-sha256.out.gz": {
+    "raw_sha256": "8de6d846661a181114fad281190c45690d50cde79434df6b53ec6afe9f20e0a3",
+    "published_sha256": "488766a356db6c7322743f3a79f267383cfa8d514594ca9de2e7bf5f5914d777",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-amd64-npm-install.out.gz": {
+    "raw_sha256": "dbec95226c295e297fd32f11bab02f3cf01896cab7c1f35c77d912931c946c14",
+    "published_sha256": "aa13527b3cfb7fd4fe7bd9260f4c56c41960c40d2dc34eaaa588d57f4af630b7",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-amd64-pnpm-install.out.gz": {
+    "raw_sha256": "50e1663a21e874d8c2aca817c17999f3fb0ecdf603c28f77c01a48df14f2b483",
+    "published_sha256": "083023cf126a463439d48bf332dce05430cbc24441774bef7f5f0573f985ebeb",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-guest-copy-tree.out.gz": {
+    "raw_sha256": "5ab188746074161730e712822870361be7828c8d578c5e35cedbaee2200f4082",
+    "published_sha256": "e9e4e188c4ead97cb36efcc7d789e95a0c8608b440e71894ea3b0a313de44d13",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-guest-find-walk.out.gz": {
+    "raw_sha256": "9fa1d42ad713d4b062d56b7b342ec583b8df56830e299bdffa4c309bfc940c39",
+    "published_sha256": "0488d8fb204ec653635bc5fbb11509cbe80548fd90f78ea4746c95f9fa37584c",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-guest-npm-install.out.gz": {
+    "raw_sha256": "5a8a5750c38af1b5b672a51fd2924225633f65f0a61afb3bc54e0b2b2220ce37",
+    "published_sha256": "ccdbcba5c8d709a17a3f0248679071ae90a180b8144091323a4c36783699a86a",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-guest-pnpm-install.out.gz": {
+    "raw_sha256": "078e0c8d6ce57883de119eca2bb67deb92c433d80b321dd6093850b4c4cf4944",
+    "published_sha256": "fef5fecb7e536d5c8d56d18acdb57c03f44416d0e48e122924c4e38c0b284f46",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-guest-ripgrep.out.gz": {
+    "raw_sha256": "a66e7ade9cff92b16637cd81bd33be87aa82b28d99431fe364b0a4a279e2eb68",
+    "published_sha256": "6f1d4d61b29ae855ac43032a669ae9a15acaa8e39b5e3cbf82d5a8526fb472a5",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-guest-rm-rf.out.gz": {
+    "raw_sha256": "875e6a3288397986ce7fc5ecc6e9f6bb9c68b78e010ca30ecfabef079a7bcbe4",
+    "published_sha256": "78d8fa3c457d1377138fea524e9338e8c080cbc76f1e4a8b0f4f4c922783b71d",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-guest-yarn-install.out.gz": {
+    "raw_sha256": "9180a33705b995740d275a8496ab14319998230a22061b8c161a54793836081e",
+    "published_sha256": "8e2ad5bd08ee9997604fa6c63ef3074be78f1853d97eeab61e32e1f56c34b978",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-copy-tree.out.gz": {
+    "raw_sha256": "0d40519d73ff1d4606c2b87288db8a3aa7d6497aa89a3fc6be84299c71f917b2",
+    "published_sha256": "e5e63fbf3b21476bf62032f4049a040d756b33bfdcda96d8d8a9cc6294ced766",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-cpu-sha256.out.gz": {
+    "raw_sha256": "1bf3d2756e2fde8642eda225dc6357ed470a87decece23d8a775e9056317f49b",
+    "published_sha256": "af2c70ebfdec9de6a25b19a9f2e6d9344b4db9e00669c669062bb50ae8fc05ce",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-find-walk.out.gz": {
+    "raw_sha256": "c564ad36f3f916a6e59331238b4d04f96db16aa8eca846cbb27c3d8a96193189",
+    "published_sha256": "52f9769c82ea0f4753b1898fe2e5d146fe4f56b1b6d07983694ea6a96d207bab",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-memory.out.gz": {
+    "raw_sha256": "a3f8fabd530eb601ac25f6d0d63acc217dd072e927d5450f52fd8ac5afe88463",
+    "published_sha256": "2eeb1ed13dc19c8b24e07ccce990931d521b25fa4e9ed349f4b70bc44e9a3f75",
+    "timed_repetitions": 1
+  },
+  "case-051-67d787b-m1-a3-1-share-npm-install.out.gz": {
+    "raw_sha256": "6efa85a30c3cdcc5c15f5a07824a6452a9302e341792f5260781a919c397fb52",
+    "published_sha256": "758f66735325fcb3ef470092f7af0baeb88fd73e42365a656391dde27b10ffd6",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-pnpm-install.out.gz": {
+    "raw_sha256": "65081e484f0577b32c270ea41aa684e6777106d1d99426f2bdb5e42ba5d4860c",
+    "published_sha256": "0d3a58dbd788ff635e060465a8606db288c35939c75479ffddc04d1d9cb9561a",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-ripgrep.out.gz": {
+    "raw_sha256": "6fb2e73e32c28a2ff583c7e8505d2ae4a267f28f36ab13daa860021aad735afa",
+    "published_sha256": "1c4387eb1051529d4e5e0512fa178610e2e52d86b68099b0228c1ea3ee0f522d",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-rm-rf.out.gz": {
+    "raw_sha256": "9a82698b5d31fbc8540ec5f3ff1c5be5576243a85e119162be1421c7df97407a",
+    "published_sha256": "101c2d29d28bcff05aacff259f982fa59dc9391b52c29e1279e02db527fc2abe",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-watch-latency.out.gz": {
+    "raw_sha256": "809e4d46f44862a3d5b9db780690ae3b37117c8038b34d1e577e78971fb16029",
+    "published_sha256": "745a9f33c1c9b4a7a2464941620522f520cd36e1895166d49adb238514af4fab",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a3-1-share-yarn-install.out.gz": {
+    "raw_sha256": "54b607ce648556c2bf6b6a2667e71fefceb010cc9c870bbd631eab5cdd90dae2",
+    "published_sha256": "43bf4483381ed5cb9cf1da50675f184c0a6e9d1390e27f41ca67bae21456112d",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-amd64-cpu-sha256.out.gz": {
+    "raw_sha256": "f6ac2c10e01471bfd0614db06d3a6aab59842c232bfc59638f08267e25d71a18",
+    "published_sha256": "ed8ad78d35a3fd779fc4ad20e25437178ab9cd4540f7dd6d349bd5cb099b45c6",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-amd64-npm-install.out.gz": {
+    "raw_sha256": "a5f080d61ede6e85887e84a68b6d08fbbdabf5b1d86dfd6fa5b1323aba48b281",
+    "published_sha256": "a2672e1868e4e201b222d48419fab056c3669dcdd01802fd01f8b5445d52f0cd",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-amd64-pnpm-install.out.gz": {
+    "raw_sha256": "2e06ebac757d6f4e5ae68d118a93d1a925cdf3c0925db5f09a18ac0d9df30316",
+    "published_sha256": "10c1a03ff3a92ed0cbc9484516ec71e12440072a6cf0245dbefcec625ed3a0be",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-guest-copy-tree.out.gz": {
+    "raw_sha256": "4216df834ae23fe5d12542a79fde6656dfe0fe190dbbe2f867c1968f8db1993d",
+    "published_sha256": "6c3f36c3821b3758192dd4fb5cbc90d7780d045d121954461fc227008b593ff7",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-guest-find-walk.out.gz": {
+    "raw_sha256": "4ea0915dc1f7881f24dbb9ee5625288ef6293ae98828249dd82e9eac2bfba0cb",
+    "published_sha256": "7f3c812db84ec381996a756df72606eef6b3bee7bb9dcd3f4c9eee108e46fefa",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-guest-npm-install.out.gz": {
+    "raw_sha256": "fe3dd24a14eb5effc90a4e39b771ce99d42c0f21e2910ff5dfb2e2a5aa2edb31",
+    "published_sha256": "a7e58941cdea62d66af98a8a94194caca8aff8127a68609cf90b2b9afef6aa74",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-guest-pnpm-install.out.gz": {
+    "raw_sha256": "c15dfb74747a2fc68d8f580da5c3c71d90495e323c5e02f0b783be45718b0563",
+    "published_sha256": "bb2293ff584ed77a500fb29cb690eaa417446ee1189e0ab18aefc6e0c18c166e",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-guest-ripgrep.out.gz": {
+    "raw_sha256": "c065359c8bba29c59c74a790fe31fae3af5fdda6a246747248139b364ef7ec82",
+    "published_sha256": "64eacc95e4118cd7bfeed0e3ff3542bfcf30afe662179aa6673ea2427f3bb813",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-guest-rm-rf.out.gz": {
+    "raw_sha256": "e07cdc2da46503056bad80f744de8da490766d09a2c79c6997b0f7140b6f0e27",
+    "published_sha256": "71946ac5c71cf54d7cf500b4cd1439b09b0c13ed178ca2fe33ba92d0a9cc7abe",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-guest-yarn-install.out.gz": {
+    "raw_sha256": "158511e2c64c96f320c4511dcd4eebb544ebc0a2dc2cc2fa8f12dc405d54ed4f",
+    "published_sha256": "f61a69c5f760454c9b63d88e266dcfdf0efd36e7a60c2ddd62cc52f0d2d2a3b9",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-copy-tree.out.gz": {
+    "raw_sha256": "69fa98b085c73f690476f608cedfe444a2802c14a608591149830a0df6957c4a",
+    "published_sha256": "b69e048b88c6c725ecc1e842c1a61016b9ac4cf7f4c66653c3f03cac20ef09ea",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-cpu-sha256.out.gz": {
+    "raw_sha256": "413504716ed494b849d498434d7b58c31476fb03b3c909c01c9bd9e2d3c627eb",
+    "published_sha256": "1f5782b8589bb92aaceb2b0e81bf7ed6fa486285bb4ffa3c9d9604851a89fb77",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-find-walk.out.gz": {
+    "raw_sha256": "3fa96469d9d3a9da4b78b4639243cdd1131cb697fd6d1ef1d79b072873b01c68",
+    "published_sha256": "b52e56dc7e0050d68d00381395357bc39c6a8826710c4441a9921fe1766ae6ec",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-memory.out.gz": {
+    "raw_sha256": "5d6317fd07c797ca0bf897c9b94247d613755dd158f45ad0b4f690e4f8636e2d",
+    "published_sha256": "f5a87cac45400c6a40c5b18b5c1a1f642368d3f1804c31c2a81c3021e1248de5",
+    "timed_repetitions": 1
+  },
+  "case-051-67d787b-m1-a4-1-share-npm-install.out.gz": {
+    "raw_sha256": "de70672603239141b89238ca48d5b573afba591d74a54e9c5e0fbdef433dde4e",
+    "published_sha256": "e763911ae648a4e70c3824d937c059d5c83cf8a6c89c1d5f10ec5e03d6e9225f",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-pnpm-install.out.gz": {
+    "raw_sha256": "600cfd186b47fda340d1c09cb6b54ba3019c4b205204cd25e6a5cdd0283da72e",
+    "published_sha256": "c3d424df9e91a6b13e6e4068b8c249ea629fd98d5a2a3cad3a13e97183c96e77",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-ripgrep.out.gz": {
+    "raw_sha256": "e2b3464465a8729f67b5f87e57f99ab51945afb2307fe688e59c995d044fe9e6",
+    "published_sha256": "169c75bd0b8f825d3ba434d0729727597e98d54e3c99fea6198c1fe7c88a0297",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-rm-rf.out.gz": {
+    "raw_sha256": "1e18aaa73af506f2b2c25523b81de4c7fdea126728a479e3d8f77fb2158952d1",
+    "published_sha256": "3e0a719dfdc87878ab2420d4d5579855316268e25e20b766eccd771158f0963e",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-watch-latency.out.gz": {
+    "raw_sha256": "1f6ac66f1cfb3c7315465075507c4452296a54bd55a568f68f3febf6edac557f",
+    "published_sha256": "0861ae6684d6d921e533ceefdb5953c910a6c73f546a047c057b4b7c1acf6059",
+    "timed_repetitions": 3
+  },
+  "case-051-67d787b-m1-a4-1-share-yarn-install.out.gz": {
+    "raw_sha256": "d3bf732cd2b53337797e692e48fa44d0f20ec3274e10559dc557878923c5f40f",
+    "published_sha256": "757e881cbd45f13ecdf903d4705caa7d26f5494da6fbd3ca16183203625aaeb7",
+    "timed_repetitions": 3
+  }
+}

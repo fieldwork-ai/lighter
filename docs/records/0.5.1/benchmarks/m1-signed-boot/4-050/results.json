@@ -1,0 +1,37 @@
+[
+  {
+    "memory_mib": 4096,
+    "rep": 1,
+    "docker_ms": 725.153834,
+    "first_container_ms": 905.120625,
+    "wall_time": 1788866853.898261
+  },
+  {
+    "memory_mib": 4096,
+    "rep": 2,
+    "docker_ms": 717.327791,
+    "first_container_ms": 914.373625,
+    "wall_time": 1788866857.370569
+  },
+  {
+    "memory_mib": 4096,
+    "rep": 3,
+    "docker_ms": 720.264584,
+    "first_container_ms": 911.324459,
+    "wall_time": 1788866860.84515
+  },
+  {
+    "memory_mib": 4096,
+    "rep": 4,
+    "docker_ms": 729.68075,
+    "first_container_ms": 906.567459,
+    "wall_time": 1788866864.3290958
+  },
+  {
+    "memory_mib": 4096,
+    "rep": 5,
+    "docker_ms": 721.717666,
+    "first_container_ms": 905.719041,
+    "wall_time": 1788866867.788276
+  }
+]

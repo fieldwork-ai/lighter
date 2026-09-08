@@ -1,0 +1,12 @@
+{
+  "host": "m5",
+  "artifacts": {
+    "<repo>/dist/lighter-0.5.1-arm64.tar.gz": "d362b9e7b6ec275e9d16b633968716dda9f40f35f76b43631b1145a5b82f81ea",
+    "<repo>/dist/lighter-0.5.1-arm64": "b5dc6842121f6be1eef94900ab986a667b150d55907a9bc05803edc0f5b36015",
+    "<repo>/dist/lighter-0.4.1-arm64.tar.gz": "2f14375ef2ea1e065de856de39cb00c84489ff208e350333d31d5717861e3a9b",
+    "<repo>/dist/lighter-0.5.0-arm64.tar.gz": "4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52",
+    "<repo>/.logs/051/fixtures/future-good.tar.gz": "ae6c5c8ea3bc3c20ed95902b0e6bb525d9cb37bb6e045e7135299f92a6055855",
+    "<repo>/.logs/051/fixtures/future-bad.tar.gz": "11147fa7c6a5c803d9ec32bea20ee55778e2501a8f9a06200ad2ae2284d23183"
+  },
+  "source": "e5452e24e19c5c454702531bd18ce4331d64da42"
+}

@@ -6,6 +6,25 @@ before interpreting a release comparison. This is an empirical baseline for the
 specific host and workload below, not a universal tolerance such as “anything
 under 5% is noise.”
 
+## 0.5.1 full-suite variation on M1
+
+Three complete suites use the same frozen runtime `67d787b`, eight guest vCPUs, 4 GiB RAM, a 128 GiB sparse disk and pinned workloads. Each timing contributes its median of three repetitions. The storage ABBA follow-up ran between the first and second full suites; no filesystem daemon was reset. Quiet-host and competing-VM checks follow the protocol below. These are full-suite repetitions, separate from the five fresh storage runs used for the 0.5.0 baseline.
+
+| Case | Ordered run medians (ms) | Between-run CV |
+|---|---|---:|
+| npm-install | 12413, 12833, 11604 | 5.09% |
+| pnpm-install | 7255, 7363, 6658 | 5.35% |
+| yarn-install | 11961, 11305, 11029 | 4.19% |
+| ripgrep | 501, 256, 311 | 36.11% |
+| find-walk | 125, 148, 126 | 9.77% |
+| copy-tree | 8683, 8184, 7916 | 4.71% |
+| rm-rf | 2840, 2848, 2875 | 0.64% |
+| cpu-sha256 | 6299, 6299, 6287 | 0.11% |
+| boot-docker | 634, 643, 652 | 1.40% |
+| boot-first-container | 821, 859, 834 | 2.30% |
+
+CV uses sample standard deviation divided by the arithmetic mean of the run medians. The spread describes this session and workload. It is not a permanent variance bound; the [0.5.1 report](RELEASE-0.5.1.md) retains the matched version comparison and all three complete records. No full M5 suite was run for 0.5.1 because that host remained shared.
+
 ## 0.5.0 baseline on both hosts
 
 The 0.5.0 recording uses eight guest vCPUs and a 128 GiB sparse disk, with
