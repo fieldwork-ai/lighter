@@ -1,0 +1,21 @@
+{
+  "source": "6301eade50b35b97ef2ed37e83f3e2c9ca31940d",
+  "cli_sha256": "39a201ceecce69a44e8000b6d2971e8ca580e5def4c4dfd0b0115c5989272ee4",
+  "payload": {
+    "Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71"
+  },
+  "cpus": 8,
+  "memory_mib": [
+    8192,
+    12288,
+    16384,
+    32768
+  ],
+  "modes": [
+    "eager",
+    "default-fragmented",
+    "default-restored"
+  ],
+  "tolerance_kib": 4
+}

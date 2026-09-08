@@ -112,3 +112,19 @@ timed case. M5 latency measurements require renewed quiet-machine clearance.
 comparison when supplied `--compare-bin` and `--compare-guest`. There is no outer
 suite repetition or automatic variance/ABBA sequence. Earlier completed suites
 remain historical evidence, not qualification of the hybrid implementation.
+
+### Hybrid correctness at `11ddb88`
+
+[M5 correctness records](records/0.5.1/hybrid/m5-correctness/) retain 343 passing
+workspace tests (serial), 24 signed hypervisor tests and ten functional gates.
+The new tests exercise concurrent background preparation and guest/device access,
+reclamation during preparation, the completion transition, data preservation,
+whole-range reclamation calls and physical release/recharge. The initial parallel
+workspace run's filesystem global-counter failure is retained alongside its
+passing isolated and serial reruns; no filesystem code was changed to hide it.
+
+Fresh and automatically restored containers see the same MemTotal as eager mode
+within 4 KiB at 8, 12, 16 and 32 GiB. These are development-binary correctness
+checks with the user's Colima left running, not controlled M5 performance results
+or qualification of a notarized shipping archive. The speed and memory/idle
+hardware gates remain separate pending work.
