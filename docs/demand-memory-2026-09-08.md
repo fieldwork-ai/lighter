@@ -213,3 +213,13 @@ and restoring whole-range reclamation. The +10% investigation threshold was
 exceeded; these experiments document the investigation, not a passing result
 against that threshold. Full qualification must not claim pure-demand startup
 times for this hybrid, or describe the remaining contention as eliminated.
+
+### Selected-runtime memory and idle validation
+
+[M1 hardware records](records/0.5.1/hybrid/m1-memory-correctness/) retain all
+24 passing signed hypervisor tests and the memory/idle gate on the selected
+runtime. With 8 GiB configured, a 3 GiB allocation reached a 3,560 MiB physical
+footprint, then returned to 267 MiB within five seconds. The next container saw
+8,016 MiB MemTotal, consistent with the guest kernel's overhead. Over the
+120-second idle window the process used 0.62% CPU, below the 1% gate, and its
+final footprint was 327 MiB. The full M1 suite is a separate qualification.
