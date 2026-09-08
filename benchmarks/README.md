@@ -14,7 +14,18 @@ Use `latency.sh` to investigate individual operations and the full workload suit
 to measure application-level effects. Each has its own run-to-run variation;
 see [repeatability](REPEATABILITY.md) before interpreting a difference.
 
-Results go to `results/<target>.csv`; `report.py` turns them into `RESULTS.md`. Nothing in the report is hand-written, so a number nobody can reproduce cannot appear in it.
+New measurements go to `results/<target>.csv` (or a labelled filename).
+Published comparisons are pinned by `results/selection.json` and
+`results/machines/<machine>/selection.json`: each target names its canonical
+CSV and metadata under `records/`. Update those paths deliberately when
+selecting a new run; recording a scratch run does not replace published inputs.
+`report.py` turns the selected records into `RESULTS.md`. A result directory
+without a selection manifest still reads its local CSVs.
+
+Release performance evidence lives in `records/`, alongside the release
+reports and methodology here. Design experiments, correctness gates and
+signing evidence live under `docs/`. See [the record index](records/README.md).
+Do not copy archived inputs back into `results/`.
 
 ## What is being compared
 

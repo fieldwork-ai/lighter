@@ -66,11 +66,11 @@ lines += [
 ]
 lines += [
     "",
-    "[Raw records and selection](../docs/records/0.5.0/benchmarks/) · [Competitor methods and excluded cases](RELEASE-0.5.0-COMPETITORS.md) · [Repeatability](REPEATABILITY.md)",
+    "[Raw records and selection](records/0.5.0/) · [Competitor methods and excluded cases](RELEASE-0.5.0-COMPETITORS.md) · [Repeatability](REPEATABILITY.md)",
     "",
-    "![M1 filesystem-daemon observation](../docs/records/0.5.0/benchmarks/plots/fseventsd-m1.svg)",
+    "![M1 filesystem-daemon observation](records/0.5.0/plots/fseventsd-m1.svg)",
     "",
-    "![M5 filesystem-daemon observation](../docs/records/0.5.0/benchmarks/plots/fseventsd-m5.svg)",
+    "![M5 filesystem-daemon observation](records/0.5.0/plots/fseventsd-m5.svg)",
 ]
 summary = {}
 for host in ["m1", "m5"]:

@@ -64,7 +64,7 @@ The 0.5.0 columns are historical primary records, not an alternating old/new exp
 | cpu-sha256 | ms | 4223 | 4154, 4177, 4163 | 4163 | -1.4% | 0.28% |
 | container-start | ms | 155 | 137, 156, 165 | 156 | +0.6% | 9.36% |
 
-[Complete M5 records](../docs/records/0.5.1/hybrid/m5-full/)
+[Complete M5 records](records/0.5.1/hybrid/m5-full/)
 
 ## M1 — share
 
@@ -120,13 +120,13 @@ The 0.5.0 columns are historical primary records, not an alternating old/new exp
 | cpu-sha256 | ms | 7182 | 7185, 7166, 7182 | 7182 | +0.0% | 0.14% |
 | container-start | ms | 187 | 256, 207, 237 | 237 | +26.7% | 10.59% |
 
-[Complete M1 records](../docs/records/0.5.1/hybrid/m1-full/)
+[Complete M1 records](records/0.5.1/hybrid/m1-full/)
 
 ## Reproduce the summaries
 
 ```sh
-python3 scripts/records/summarize-hybrid-release.py docs/records/0.5.1/hybrid/m5-full --out /tmp/lighter-m5-summary.json
-python3 scripts/records/summarize-hybrid-release.py docs/records/0.5.1/hybrid/m1-full --out /tmp/lighter-m1-summary.json
+python3 scripts/records/summarize-hybrid-release.py benchmarks/records/0.5.1/hybrid/m5-full --out /tmp/lighter-m5-summary.json
+python3 scripts/records/summarize-hybrid-release.py benchmarks/records/0.5.1/hybrid/m1-full --out /tmp/lighter-m1-summary.json
 ```
 
 The validator checks each CSV hash, source identity, completed guard, quiet window, expected cases and repetition counts before calculating the summary. These full-suite timings use the Node-based harness; do not pool them with the separate Python-based startup experiments or attribute pure-demand prototype timings to the hybrid release.
@@ -161,6 +161,65 @@ in another VM, rather than three independent VM starts.
 
 The original full suite remains the release primary. User-directed exploratory
 repetitions after this screening are outside the retained release comparison.
-[Initial matched records](../docs/records/0.5.1/hybrid/m5-storage-focus/) and
-[the two-observation follow-up](../docs/records/0.5.1/hybrid/m5-deletion-follow-up/)
+[Initial matched records](records/0.5.1/hybrid/m5-storage-focus/) and
+[the two-observation follow-up](records/0.5.1/hybrid/m5-deletion-follow-up/)
 retain the protocol, guards and source/artifact identities.
+
+
+## M1 package-cache follow-up
+
+The original isolated screening warmed only the selected package manager. The
+full suite warms npm, pnpm and yarn before its first measurement. A
+[matched one-observation comparison](records/0.5.1/hybrid/m1-full-warm/) uses
+that combined preparation on both versions, with hybrid followed by 0.5.0.
+
+| Workload | 0.5.0 | Hybrid | Time change |
+|---|---:|---:|---:|
+| npm install | 11,214 ms | 12,160 ms | +8.4% |
+| pnpm install | 7,398 ms | 7,402 ms | +0.05% |
+| yarn install | 11,804 ms | 11,554 ms | −2.1% |
+| Tree copy | 16,858 ms | 17,130 ms | +1.6% |
+| Tree deletion | 2,851 ms | 2,861 ms | +0.4% |
+
+Only npm crossed the +5% investigation threshold, triggering two additional
+observations per version. The harness can now retain the combined warm-up
+through `BENCH_EXTRA_WARM_CASES` while timing npm alone; regression tests verify
+that this does not add measurements of the warm-up-only cases. These copy
+observations lack the full suite's preceding file-search reads and are not
+directly comparable with its warmer copy medians.
+
+
+The [npm follow-up](records/0.5.1/hybrid/m1-npm-follow-up/) reverses version
+order (0.5.0 then hybrid) and retains the same combined package warm-up. It
+measures only npm, twice per version; it does not repeat the full suite.
+
+| Version | Initial observation | Follow-up observations | Combined median |
+|---|---:|---:|---:|
+| 0.5.0 | 11,214 ms | 12,077 / 11,770 ms | 11,770 ms |
+| Hybrid | 12,160 ms | 11,615 / 11,493 ms | 11,615 ms |
+
+The combined median changes by −1.3%, while the mean changes by +0.6%.
+The ranges overlap, and the initial slowdown does not reproduce consistently.
+This small diagnostic sample supports neither a speedup claim nor statistical
+equivalence. Each version has an initial observation in one VM and two follow-up
+repetitions in another; these are not three independent VM starts. Both follow-up
+guards and artifact checks pass, and the paused host processes were restored.
+
+## Qualification observations
+
+Both speed gates reused the completed share stage rather than measuring it
+again. M1's 85%-of-native npm aspiration remains unmet; the established 30%
+floor passes. [M1 gate](records/0.5.1/hybrid/m1-speed-gate/) and
+[M5 gate](records/0.5.1/hybrid/m5-speed-gate/) retain their exact input scope.
+
+The original M1 attempt failed during Docker warm-up. Its cause remains unknown
+because the inherited harness discarded stderr. The corrected harness retains
+startup failures and cleans up the private VM even if startup fails before
+returning its PID. The [invalid attempt](records/0.5.1/hybrid/m1-invalid-full-a1/)
+is excluded from the selected suite.
+
+Across the M5 full suite, all 211 fseventsd samples track one process at
+15 MiB, ending at 0.3% CPU. M1 tracks one process at 13–15 MiB, ending at
+14 MiB and 0.3% CPU. Neither required a reset. Five-second sampling can miss
+shorter peaks; these observations do not establish a fix for the earlier
+unreproduced incident.

@@ -10,7 +10,7 @@ Each stage requires six aggregate CPU observations at most 5%, ten seconds apart
 
 The M5 remained shared. No full M5 suite was run for 0.5.1; the README's complete comparison remains the 0.5.0 M5 record.
 
-[Raw records and selection](../docs/records/0.5.1/benchmarks/) · [Repeatability](REPEATABILITY.md)
+[Raw records and selection](records/0.5.1/quarter/) · [Repeatability](REPEATABILITY.md)
 
 ## M1 — share
 

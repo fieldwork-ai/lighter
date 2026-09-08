@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copied from .logs/m1-record-vmem.sh on 2026-09-06: run it from the repo root on the M5; it ships the remote script over ssh and starts the record on the M1 (results back by rsync into benchmarks/results/machines/m1/ by hand).
+# Copied from .logs/m1-record-vmem.sh on 2026-09-06: run it from the repo root on the M5; it ships the remote script over ssh and starts the record on the M1 (archive results under benchmarks/records/ and update the M1 selection manifest explicitly).
 # The M1's lighter records on the virtio-mem tree: fetched from GitHub and built there, nothing rsynced.
 set -u
 ssh -o ConnectTimeout=20 -o BatchMode=yes admin@100.125.161.101 'cat > ~/remote-record.sh <<'"'"'EOS'"'"'
@@ -7,9 +7,9 @@ ssh -o ConnectTimeout=20 -o BatchMode=yes admin@100.125.161.101 'cat > ~/remote-
 set -u; cd ~/lighter; mkdir -p .logs
 export PATH=$HOME/.orbstack/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH
 export BENCH_MEMORY_MIB=4096 BENCH_CPUS=8
-# The results files are tracked, and the last record rewrote them: copied aside, then restored, or the fast-forward refuses and the record runs on the old tree (it did, once).
+# Scratch results are untracked; keep the previous observations before recording.
+# Published reports use selection manifests and do not need a checkout/reset.
 mkdir -p ~/records-aside && cp benchmarks/results/lighter.csv ~/records-aside/lighter-$(date +%H%M).csv 2>/dev/null; cp benchmarks/results/lighter-guest.csv ~/records-aside/lighter-guest-$(date +%H%M).csv 2>/dev/null
-git checkout -q -- benchmarks/results/lighter.csv benchmarks/results/lighter-guest.csv benchmarks/results/lighter-amd64.csv benchmarks/results/lighter.tree benchmarks/results/lighter-guest.tree benchmarks/results/lighter-amd64.tree benchmarks/RESULTS.md 2>/dev/null; rm -f benchmarks/results/lighter-amd64.tree
 git fetch -q origin dev && git merge -q --ff-only origin/dev || { echo "fast-forward failed"; git status --short | head -5; exit 1; }
 git log --oneline -1
 cargo build --release --example lighter-bench -p lighter-vmm 2>&1 | grep -E "^error|Finished"; cargo build --release 2>&1 | grep -E "^error|Finished"

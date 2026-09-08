@@ -151,7 +151,7 @@ The accounting correction creates an owned nonvolatile object per 16 KiB host pa
 
 ## Raw evidence and reproduction
 
-Canonical full records: [M5 share](results/lighter.csv), [guest disk](results/lighter-guest.csv), [amd64](results/lighter-amd64.csv); [M1 share](results/machines/m1/lighter.csv), [guest disk](results/machines/m1/lighter-guest.csv), [amd64](results/machines/m1/lighter-amd64.csv). Adjacent `.tree` files record source and artifact stamps. [Cache comparisons](results/variance/m1/cache-leases-041/) retain every ordered sample, including rejected profiles.
+Canonical full records: [M5 share](records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-share.csv), [guest disk](records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-guest.csv), [amd64](records/0.5.1/hybrid/m5-full/051-e0f4b16-m5-a3-1-amd64.csv); [M1 share](records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-share.csv), [guest disk](records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-guest.csv), [amd64](records/0.5.1/hybrid/m1-full/051-16a7514-m1-a2-1-amd64.csv). Adjacent `.tree` files record source and artifact stamps. [Cache comparisons](results/variance/m1/cache-leases-041/) retain every ordered sample, including rejected profiles.
 
 The [M5 observations](results/variance/m5/041-final/) retain sanitized CPU readings and the initial failed speed-gate sample. CPU rows sum ps-reported percentages over listed processes, including the benchmark; this is not a background-only or total-machine CPU reading. A blank filesystem-daemon value means it was outside the sampled top sixteen processes, not zero CPU.
 

@@ -40,6 +40,8 @@ jobs:
         run: bash scripts/test-install.sh
       - name: Benchmark rejects incomplete results
         run: bash scripts/test-benchmark-results.sh
+      - name: Benchmark reports use canonical selected records
+        run: python3 scripts/test-benchmark-selection.py
       - name: Task footprint measures actual allocations
         run: python3 scripts/test-task-footprint.py
       - name: Idle polling preserves wakeups

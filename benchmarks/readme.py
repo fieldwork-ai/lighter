@@ -50,7 +50,7 @@ On Apple Silicon, lighter launches containers cold in **664 ms** (over 2x faster
 
 Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 15 Sequoia). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
 
-Lighter measurements reflect the 0.5.1 release; competitor measurements retain their 0.5.0-release suite. Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw observations, environment fingerprints, and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md), and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation.
+Lighter measurements reflect the 0.5.1 release; competitor measurements retain their 0.5.0-release suite. Docker Desktop's host-share cleanup failed during testing; affected install timings are excluded. Raw observations, environment fingerprints, and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md), and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation.
 </details>"""
 
 
@@ -293,7 +293,7 @@ def section():
         if amd64:
             out += ["#### x86-64 images", "", AMD64_INTRO, "", amd64, ""]
     out += [
-        "[0.5.1 release records](docs/records/0.5.1/hybrid/) and [retained competitor records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.",
+        "[0.5.1 release records](docs/records/0.5.1/hybrid/) and [retained competitor records](benchmarks/records/0.5.0/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.",
         "",
         "---",
     ]
