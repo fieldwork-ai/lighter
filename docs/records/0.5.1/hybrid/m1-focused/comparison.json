@@ -1,0 +1,37 @@
+[
+  {
+    "case": "npm-install",
+    "baseline_ms": 11041,
+    "hybrid_ms": 11173,
+    "change_percent": 1.1955438818947561,
+    "additional_samples_required": false
+  },
+  {
+    "case": "pnpm-install",
+    "baseline_ms": 5860,
+    "hybrid_ms": 5883,
+    "change_percent": 0.3924914675767832,
+    "additional_samples_required": false
+  },
+  {
+    "case": "yarn-install",
+    "baseline_ms": 10589,
+    "hybrid_ms": 10219,
+    "change_percent": -3.4941920861271125,
+    "additional_samples_required": false
+  },
+  {
+    "case": "copy-tree",
+    "baseline_ms": 15925,
+    "hybrid_ms": 15921,
+    "change_percent": -0.025117739403457406,
+    "additional_samples_required": false
+  },
+  {
+    "case": "rm-rf",
+    "baseline_ms": 2745,
+    "hybrid_ms": 2744,
+    "change_percent": -0.03642987249544705,
+    "additional_samples_required": false
+  }
+]

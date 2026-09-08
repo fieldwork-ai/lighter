@@ -136,3 +136,26 @@ a fresh native baseline. This applies the existing speed, visibility and
 descriptor-budget thresholds without launching another benchmark or rewriting
 the published report. Its evaluator is checked with passing and deliberately
 failing visibility fixtures. The memory/idle gate remains a separate stress test.
+
+### Focused M1 screening
+
+[Matched raw records](records/0.5.1/hybrid/m1-focused/) compare 0.5.0 with hybrid
+`11ddb88`, using 8 CPUs and 4 GiB guest RAM. There is one measured observation
+per workload per version, with identical fixture setup and version order
+alternated across workloads. Quiet-host checks precede each arm. Paused Apple
+background processes were restored after the controller exited.
+
+| Host-share workload | 0.5.0 | Hybrid | Time change |
+|---|---:|---:|---:|
+| npm install | 11,041 ms | 11,173 ms | +1.2% |
+| pnpm install | 5,860 ms | 5,883 ms | +0.4% |
+| yarn install | 10,589 ms | 10,219 ms | −3.5% |
+| Tree copy | 15,925 ms | 15,921 ms | −0.03% |
+| Tree deletion | 2,745 ms | 2,744 ms | −0.04% |
+
+No case crosses the predeclared +5% investigation threshold, so no additional
+screening samples are triggered. This does not establish statistical equivalence
+or a speedup. It shows the earlier historical slowdown was not reproduced in
+this matched screening of the hybrid candidate. Copying is a first observation
+on a newly materialized tree, not the median of the earlier full-suite repeats.
+The final full suite remains required.
