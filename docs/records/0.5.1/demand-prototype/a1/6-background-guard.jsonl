@@ -1,0 +1,27 @@
+{"time": 1788871579.702776, "phase": "preflight", "machine_cpu_percent": 3.45, "vms": [], "unexpected": []}
+{"time": 1788871579.723572, "phase": "quiet", "machine_cpu_percent": 3.45, "vms": [], "unexpected": []}
+{"time": 1788871589.797173, "phase": "quiet", "machine_cpu_percent": 3.225, "vms": [], "unexpected": []}
+{"time": 1788871599.873813, "phase": "quiet", "machine_cpu_percent": 3.1999999999999997, "vms": [], "unexpected": []}
+{"time": 1788871609.9501472, "phase": "quiet", "machine_cpu_percent": 3.6125, "vms": [], "unexpected": []}
+{"time": 1788871620.024352, "phase": "quiet", "machine_cpu_percent": 3.1125000000000003, "vms": [], "unexpected": []}
+{"time": 1788871630.0985699, "phase": "quiet", "machine_cpu_percent": 3.3874999999999997, "vms": [], "unexpected": []}
+{"time": 1788871630.127807, "phase": "running", "machine_cpu_percent": 3.5, "vms": [], "unexpected": []}
+{"time": 1788871631.1606479, "phase": "running", "machine_cpu_percent": 14.8875, "vms": [], "unexpected": []}
+{"time": 1788871632.1972659, "phase": "running", "machine_cpu_percent": 26.85, "vms": [{"pid": 9520, "parent": 9516, "cpu": 175.0, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871633.2750652, "phase": "running", "machine_cpu_percent": 5.45, "vms": [{"pid": 9520, "parent": 1, "cpu": 27.9, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871634.304311, "phase": "running", "machine_cpu_percent": 12.3375, "vms": [{"pid": 9520, "parent": 1, "cpu": 73.0, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871635.3371031, "phase": "running", "machine_cpu_percent": 2.125, "vms": [], "unexpected": []}
+{"time": 1788871636.411564, "phase": "running", "machine_cpu_percent": 1.725, "vms": [], "unexpected": []}
+{"time": 1788871637.448745, "phase": "running", "machine_cpu_percent": 5.075, "vms": [{"pid": 9539, "parent": 9534, "cpu": 0.0, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871638.475887, "phase": "running", "machine_cpu_percent": 19.0625, "vms": [{"pid": 9539, "parent": 9534, "cpu": 138.9, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871639.5175838, "phase": "running", "machine_cpu_percent": 3.325, "vms": [], "unexpected": []}
+{"time": 1788871640.591388, "phase": "running", "machine_cpu_percent": 2.1374999999999997, "vms": [], "unexpected": []}
+{"time": 1788871641.6301491, "phase": "running", "machine_cpu_percent": 3.2875, "vms": [], "unexpected": []}
+{"time": 1788871642.6610649, "phase": "running", "machine_cpu_percent": 20.0375, "vms": [{"pid": 9571, "parent": 9564, "cpu": 141.9, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871643.7424462, "phase": "running", "machine_cpu_percent": 7.6375, "vms": [{"pid": 9571, "parent": 1, "cpu": 40.0, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871644.81659, "phase": "running", "machine_cpu_percent": 2.5, "vms": [], "unexpected": []}
+{"time": 1788871645.893517, "phase": "running", "machine_cpu_percent": 4.1625, "vms": [], "unexpected": []}
+{"time": 1788871646.926226, "phase": "running", "machine_cpu_percent": 21.849999999999998, "vms": [{"pid": 9601, "parent": 9596, "cpu": 155.6, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871648.006697, "phase": "running", "machine_cpu_percent": 8.987499999999999, "vms": [{"pid": 9601, "parent": 1, "cpu": 50.3, "command": "/private/tmp/lighter-boot-record-ldiwlpyw/lighter.app/Contents/MacOS/lighter", "kind": "lighter", "allowed": true}], "unexpected": []}
+{"time": 1788871649.080426, "phase": "finished", "machine_cpu_percent": 3.2, "vms": [], "unexpected": []}
+{"result": "complete", "error": null, "exit_code": 0}

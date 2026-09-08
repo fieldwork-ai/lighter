@@ -1,7 +1,8 @@
 # Preparing RAM alongside Linux boot
 
-Status: implemented for the 0.5.1 candidate; release qualification is ongoing.
-These are prototype measurements, not final signed-release results.
+Status: background preparation was qualified in an unpublished 0.5.1 candidate.
+Publication is on hold for the newer [demand-backed RAM investigation](demand-memory-2026-09-08.md).
+The initial measurements below are prototypes, not final signed-release results.
 
 The accounting fix introduced in 0.4.1 gives each 16 KiB host page its own
 nonvolatile owned memory object. This prevents duplicate charging when both

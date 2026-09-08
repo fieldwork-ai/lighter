@@ -1,0 +1,23 @@
+{
+  "artifacts": {
+    "/Users/admin/lighter/.logs/051/demand-target/release/lighter": "f51562a60618148e3896891e6526cac142daf376b037ecda7a63719a1235df27",
+    "/Users/admin/lighter/guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "/Users/admin/lighter/guest/out/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71",
+    "/Users/admin/lighter/.logs/051/demand/source-a3.patch": "e9cd5c2298423011ed8ee6dee8f2acf5fbb997415976aee0aabb6c8ea8a15e8f"
+  },
+  "profile": {
+    "cpus": 8,
+    "memory_mib": 16384,
+    "saved_container": true,
+    "reps": 3
+  },
+  "order": [
+    "background",
+    "demand",
+    "demand-all",
+    "demand-all",
+    "demand",
+    "background"
+  ],
+  "platform": "Apple M1"
+}
