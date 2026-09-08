@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 from pathlib import Path
 import statistics
 import subprocess as sp
@@ -35,6 +36,9 @@ def main():
     ap.add_argument('--saved-container', action='store_true')
     ap.add_argument('--timing', action='store_true')
     a = ap.parse_args()
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f'signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
     if a.reps < 1 or a.cpus < 1 or any(m < 128 or m % 128 for m in a.memory):
         ap.error('positive repetitions/CPUs and memory in whole 128 MiB blocks required')
     out = a.out.resolve()
