@@ -1,0 +1,55 @@
+{
+  "source": "e0f4b16b6d1dde9a01b1c2fee03f97222101de04",
+  "runtime_source": "b78dfeb3063e3ad7af0660050a766032c36f23c0",
+  "artifacts": {
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/guest/out/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/guest/out/rootfs.ext4": "91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/target/release/examples/lighter-bench": "beb13bd36b28ea4bee380ebf84878e7747c010bcdd50cee8b62ff6ab1931ad5f",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/target/release/lighter": "bdc30394cd3d4700fc42e9bee19430824118032104d5c14e7731367ff3e4ade6",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/.logs/050/benchmark-images/arm64.tar": "5495a5bb8a43d7fa401a7a185ee97fb90842ec60b3bbc8c1aaf7f53e13fa1452",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/.logs/050/benchmark-images/amd64.tar": "bf6795387ff04b9719c00249d03adf578e26eb6e46627cc398f08957bda82dbc",
+    "$HOME/git/lighter/.logs/051/hybrid-m5-source/.logs/050/benchmark-images/manifest.json": "64540d3e6ffb0ff232f478bda13e551ef09782ea85a2f96f5c4f17d0c85698cc"
+  },
+  "profile": {
+    "BENCH_CPUS": "8",
+    "BENCH_MEMORY_MIB": "16384",
+    "BENCH_DISK_GIB": "128"
+  },
+  "system": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83\n",
+  "baseline_source": "60e94cb870ce2764f77ca82839001681820004db",
+  "primary": "one full suite",
+  "quiet": "six samples 10s apart, aggregate machine CPU <=5%; cap 15m",
+  "repetitions": 3,
+  "preparation_mode": "hybrid (production default)",
+  "attempt": 1,
+  "tools": {
+    "node": "v24.18.0",
+    "npm": "11.16.0",
+    "pnpm": "10.28.0",
+    "yarn": "1.22.22",
+    "darwin_arm64_archive_sha256": "e1a97e14c99c803e96c7339403282ea05a499c32f8d83defe9ef5ec66f979ed1",
+    "node_image": "node:24.18.0-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd"
+  },
+  "benchmark_images": {
+    "arm64": {
+      "archive_sha256": "5495a5bb8a43d7fa401a7a185ee97fb90842ec60b3bbc8c1aaf7f53e13fa1452",
+      "image_id": "sha256:7432a806d1ad0d1efa1c56bf5786780eb8ff0a67e2b1148c8226741114669281",
+      "tools": {
+        "node": "v24.18.0",
+        "npm": "11.16.0",
+        "pnpm": "10.28.0",
+        "yarn": "1.22.22"
+      }
+    },
+    "amd64": {
+      "archive_sha256": "bf6795387ff04b9719c00249d03adf578e26eb6e46627cc398f08957bda82dbc",
+      "image_id": "sha256:c8a587d8d48a7f7ebd87efe67ec077b8401fc928852bed575bfb4427d0a629d5",
+      "tools": {
+        "node": "v24.18.0",
+        "npm": "11.16.0",
+        "pnpm": "10.28.0",
+        "yarn": "1.22.22"
+      }
+    }
+  }
+}

@@ -20,17 +20,17 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Docker Des
 | **Commercial use** | **Free forever** | $8–$10 / user / mo | $5–$24 / user / mo | Free |
 | **Telemetry** | **Zero** | Yes | Yes | None |
 | **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
-| **Cold start (to container, M5)** | 1.8 s (0.5.0) | 1.4 s | 2.1 s | 9.0 s |
-| **Idle memory** | **365 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
-| **Memory 15s after heavy build** | **936 MiB** | 2,776 MiB | 10,145 MiB | 10,145 MiB |
-| **`npm ci` (own disk)** | **4.61 s** | 6.83 s | 7.96 s | 7.56 s |
-| **`npm ci` (host share)** | **6.30 s** | 8.53 s | — | 17.89 s |
-| **Host share copy (`cp -a`)** | **3.59 s** | 9.58 s | — | 41.95 s |
-| **Container DNS resolution** | **37 µs** | 262 µs | 513 µs | 481 µs |
+| **Cold start (to container, M5)** | **664 ms** | 1.4 s | 2.1 s | 9.0 s |
+| **Idle memory** | **372 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
+| **Memory 15s after heavy build** | **702 MiB** | 2,776 MiB | — | 10,145 MiB |
+| **`npm ci` (own disk)** | **4.49 s** | 6.83 s | 7.96 s | 7.56 s |
+| **`npm ci` (host share)** | **6.36 s** | 8.53 s | — | 17.89 s |
+| **Host share copy (`cp -a`)** | **3.80 s** | 9.58 s | — | 41.95 s |
+| **Container DNS resolution** | **40 µs** | 262 µs | 513 µs | 481 µs |
 | **Kubernetes support** | **kind, kubectl, Helm** | Built-in | Built-in | k3s |
-| **x86-64 Rosetta (`sha256sum`)** | **4.22 s** | 7.92 s | 4.39 s | 4.26 s |
+| **x86-64 Rosetta (`sha256sum`)** | **4.16 s** | 7.92 s | 4.39 s | 4.26 s |
 
-**0.5.1 candidate startup:** **905 ms to the first container** on M1 with 4 GiB RAM; **812 ms to Docker** in the separate 16 GiB test. Medians of three. The M5 comparison above remains the 0.5.0 record until the new M5 run. [Measurements and methodology](docs/demand-memory-2026-09-08.md).
+**0.5.1 on M5:** **517 ms to Docker / 664 ms to the first container**, with 16 GiB RAM. Medians of three. Competitor figures retain the 0.5.0-release comparison. [Measurements and methodology](benchmarks/RELEASE-0.5.1.md).
 
 ---
 
@@ -80,53 +80,51 @@ Direct installations can opt into background update downloads with `lighter upda
 
 ## Benchmarks
 
-These M5 comparison tables retain the **0.5.0** release measurements; the 0.5.1 candidate has not yet completed its M5 benchmark run.
+Lighter measurements are from **0.5.1**; native APFS and competitor measurements are retained from the **0.5.0** release qualification. These are separate runs of the same pinned workloads, not simultaneous comparisons. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
-
-On host-shared filesystems, lighter runs `npm ci` in **6.30 s** (faster than native APFS, outperforming OrbStack's 8.53 s), completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
+On host-shared filesystems, lighter runs `npm ci` in **6.36 s**, compared with OrbStack's 8.53 s, completes directory copies **2.5x faster**, idles at **372 MiB RAM**, and returns memory to macOS after a workload finishes.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
 
-Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 15 Sequoia). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26.6.2). Each release host contributes one complete suite with three repetitions per timed case; memory and idle-power rows are single observation windows. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
 
-Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw CSVs, repetition traces, environment fingerprints, and full M1 results are preserved in [the release measurements](benchmarks/RELEASE-0.5.0.md) and [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
+Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw observations, environment fingerprints, historical differences and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md) and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation; differences between separate runs do not by themselves establish a version effect.
 </details>
 
 ### MacBook Pro — Apple M5 Pro (18 cores, 48 GB RAM)
 
 | Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.53 s | **4.61 s** (142%) | 6.83 s (96%) | 7.56 s (86%) | 7.96 s (82%) |
-| `pnpm install` | 4.32 s | 1.22 s (355%) | 1.80 s (240%) | **1.06 s** (408%) | 2.75 s (157%) |
-| `yarn install` | 5.89 s | **4.15 s** (142%) | 5.05 s (117%) | 6.00 s (98%) | 10.10 s (58%) |
-| `ripgrep` (file read) | 927 ms | **79 ms** (1173%) | 118 ms (786%) | 115 ms (806%) | 126 ms (736%) |
-| `find` (metadata walk) | 390 ms | **97 ms** (402%) | 129 ms (302%) | 185 ms (211%) | 124 ms (315%) |
-| `cp -a node_modules` | 16.76 s | **937 ms** (1789%) | 1.05 s (1599%) | 1.35 s (1242%) | 2.49 s (673%) |
-| `rm -rf node_modules` | 4.18 s | **387 ms** (1081%) | 473 ms (884%) | 488 ms (857%) | 397 ms (1053%) |
+| `npm ci` | 6.53 s | **4.49 s** (145%) | 6.83 s (96%) | 7.56 s (86%) | 7.96 s (82%) |
+| `pnpm install` | 4.32 s | 1.22 s (354%) | 1.80 s (240%) | **1.06 s** (408%) | 2.75 s (157%) |
+| `yarn install` | 5.89 s | **4.10 s** (144%) | 5.05 s (117%) | 6.00 s (98%) | 10.10 s (58%) |
+| `ripgrep` (file read) | 927 ms | **85 ms** (1091%) | 118 ms (786%) | 115 ms (806%) | 126 ms (736%) |
+| `find` (metadata walk) | 390 ms | **95 ms** (411%) | 129 ms (302%) | 185 ms (211%) | 124 ms (315%) |
+| `cp -a node_modules` | 16.76 s | **898 ms** (1866%) | 1.05 s (1599%) | 1.35 s (1242%) | 2.49 s (673%) |
+| `rm -rf node_modules` | 4.18 s | **396 ms** (1056%) | 473 ms (884%) | 488 ms (857%) | 397 ms (1053%) |
 
 | Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.53 s | **6.30 s** (104%) | 8.53 s (77%) | 17.89 s (36%) | — |
-| `pnpm install` | 4.32 s | **3.86 s** (112%) | 4.93 s (88%) | 25.95 s (17%) | — |
-| `yarn install` | 5.89 s | **5.12 s** (115%) | 7.97 s (74%) | 22.81 s (26%) | — |
-| `ripgrep` (file read) | 927 ms | **91 ms** (1019%) | 1.00 s (93%) | 3.02 s (31%) | — |
-| `find` (metadata walk) | 390 ms | **95 ms** (411%) | 452 ms (86%) | 1.46 s (27%) | — |
-| `cp -a node_modules` | 16.76 s | **3.59 s** (467%) | 9.58 s (175%) | 41.95 s (40%) | — |
-| `rm -rf node_modules` | 4.18 s | **2.64 s** (158%) | 3.35 s (125%) | 8.38 s (50%) | — |
-| Host file edit -> container | 1 ms | 6 ms | 11 ms | **2 ms** | 3 ms |
+| `npm ci` | 6.53 s | **6.36 s** (103%) | 8.53 s (77%) | 17.89 s (36%) | — |
+| `pnpm install` | 4.32 s | **4.01 s** (108%) | 4.93 s (88%) | 25.95 s (17%) | — |
+| `yarn install` | 5.89 s | **5.19 s** (113%) | 7.97 s (74%) | 22.81 s (26%) | — |
+| `ripgrep` (file read) | 927 ms | **88 ms** (1053%) | 1.00 s (93%) | 3.02 s (31%) | — |
+| `find` (metadata walk) | 390 ms | **92 ms** (424%) | 452 ms (86%) | 1.46 s (27%) | — |
+| `cp -a node_modules` | 16.76 s | **3.80 s** (441%) | 9.58 s (175%) | 41.95 s (40%) | — |
+| `rm -rf node_modules` | 4.18 s | **3.22 s** (130%) | 3.35 s (125%) | 8.38 s (50%) | — |
+| Host file edit -> container | 1 ms | **2 ms** | 11 ms | **2 ms** | 3 ms |
 
 #### Memory footprint
 
-macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac immediately via `virtio-mem` and cooperative reclamation.
+macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac via `virtio-mem` and cooperative reclamation.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Idle, a minute after start | **365 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
-| Peak through an npm install | **4386 MiB** | 5699 MiB | 10054 MiB | — |
-| 15 s after it ends | **936 MiB** | 2776 MiB | 10145 MiB | — |
-| 60 s after it ends | **936 MiB** | 1720 MiB | 10149 MiB | — |
+| Idle, a minute after start | **372 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
+| Peak through an npm install | **3841 MiB** | 5699 MiB | 10054 MiB | — |
+| 15 s after it ends | **702 MiB** | 2776 MiB | 10145 MiB | — |
+| 60 s after it ends | **726 MiB** | 1720 MiB | 10149 MiB | — |
 
 #### The network
 
@@ -134,15 +132,15 @@ Throughput and latency between container and host measured with `iperf3`, keep-a
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 124.1 | 92.5 | **95.1** | 4.5 | 24.5 |
-| TCP, the Mac to a container | Gbit/s | 131.2 | **84.9** | 51.5 | 4.0 | 14.7 |
-| TCP into a published port | Gbit/s | — | **83.8** | 52.3 | 3.9 | 14.5 |
-| TCP out of a published port | Gbit/s | — | **88.8** | 88.3 | 4.2 | 32.5 |
-| UDP, container to the Mac | Gbit/s | 21.1 | **5.0** | 3.0 | 3.1 | 0.0 |
-| connects to a published port | thousand per second | 26.6 | 16.8 | **21.2** | 16.1 | 15.7 |
-| GET on a published port, median | µs | 40 | **60** | 74 | 229 | 125 |
-| GET on a published port, p99 | µs | 68 | 154 | **132** | 366 | 232 |
-| DNS lookup from a container, median | µs | 5611 | **37** | 262 | 481 | 513 |
+| TCP, container to the Mac | Gbit/s | 124.1 | 91.0 | **95.1** | 4.5 | 24.5 |
+| TCP, the Mac to a container | Gbit/s | 131.2 | **83.7** | 51.5 | 4.0 | 14.7 |
+| TCP into a published port | Gbit/s | — | **87.0** | 52.3 | 3.9 | 14.5 |
+| TCP out of a published port | Gbit/s | — | **92.0** | 88.3 | 4.2 | 32.5 |
+| UDP, container to the Mac | Gbit/s | 21.1 | **5.1** | 3.0 | 3.1 | 0.0 |
+| connects to a published port | thousand per second | 26.6 | 17.1 | **21.2** | 16.1 | 15.7 |
+| GET on a published port, median | µs | 40 | **64** | 74 | 229 | 125 |
+| GET on a published port, p99 | µs | 68 | 213 | **132** | 366 | 232 |
+| DNS lookup from a container, median | µs | 5611 | **40** | 262 | 481 | 513 |
 
 #### Idle power
 
@@ -151,18 +149,16 @@ Idle CPU consumption and thread wakeups measured via `powermetrics` over a 60-se
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
 | CPU, ms per second | 3 | **2** | 4 | 36 |
-| Wakeups per second | 61 | 120 | **41** | 3873 |
+| Wakeups per second | 56 | 120 | **41** | 3873 |
 
 #### Starting up
 
-Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better. These are the **0.5.0 M5 comparison** results.
-
-The **0.5.1 hybrid candidate** measured **720 ms to Docker / 905 ms to the first container** on M1 with 4 GiB RAM (medians of three). A separate 16 GiB M1 test measured **812 ms to Docker**. [Current startup qualification](docs/demand-memory-2026-09-08.md) records the different profiles; these timings do not replace the M5 table.
+Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Median of three; lower is better. Lighter uses 0.5.1; competitors retain their 0.5.0-release measurements. This includes runtime startup and Docker readiness, rather than just the Linux boot interval. [Startup design and qualification](docs/demand-memory-2026-09-08.md).
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Start until docker answers | 1.6 s | **1.1 s** | 8.8 s | 1.8 s |
-| Start until the first container has run | 1.8 s | **1.4 s** | 9.0 s | 2.1 s |
+| Start until docker answers | **517 ms** | 1.14 s | 8.80 s | 1.83 s |
+| Start until the first container has run | **664 ms** | 1.41 s | 9.04 s | 2.11 s |
 
 #### x86-64 images
 
@@ -170,12 +166,12 @@ Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` 
 
 | Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 4.61 s | **9.24 s** | 13.14 s | 12.73 s | 14.28 s |
-| `pnpm install` | 1.22 s | **2.73 s** | 3.58 s | 2.85 s | 3.85 s |
-| `sha256sum` of 1 GiB | 3.01 s | **4.22 s** | 7.92 s | 4.26 s | 4.39 s |
-| container start, `alpine true` | 152 ms | **155 ms** | 244 ms | 185 ms | 170 ms |
+| `npm ci` | 4.49 s | **9.14 s** | 13.14 s | 12.73 s | 14.28 s |
+| `pnpm install` | 1.22 s | **2.75 s** | 3.58 s | 2.85 s | 3.85 s |
+| `sha256sum` of 1 GiB | 3.02 s | **4.16 s** | 7.92 s | 4.26 s | 4.39 s |
+| container start, `alpine true` | 138 ms | **156 ms** | 244 ms | 185 ms | 170 ms |
 
-[Release records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
+[0.5.1 release records](docs/records/0.5.1/hybrid/) and [retained competitor records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
 
 ---
 
@@ -199,8 +195,8 @@ Container writable layers and named volumes live on an internal virtual disk (`~
 
 ### 3. Cooperative memory management
 Virtual machines that hoard allocated RAM starve macOS and trigger disk swapping.
-- **Dynamic sizing with `virtio-mem`:** The guest boots with a quarter of its configured memory and expands dynamically in 128 MiB blocks via `virtio-mem` as containers demand it. When containers exit, unused blocks are released back to macOS.
-- **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory drops to **365 MiB** (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB). Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at 936 MiB while competitors hold over 2,700–10,000 MiB.
+- **Dynamic sizing with `virtio-mem`:** Linux boots from a quarter-sized base and onlines additional configured memory in 128 MiB blocks via `virtio-mem`. Host backing is prepared concurrently; unused pages and blocks are returned to macOS.
+- **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory measures **372 MiB** (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB). Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at 702 MiB in this workload, compared with OrbStack's 2,776 MiB and Colima's 10,145 MiB.
 - **Compressor-steered ballooning:** On memory-constrained Macs, macOS compresses memory before signaling out-of-memory pressure. lighter tracks host memory compression activity: when macOS begins compressing heavily, lighter's balloon inflates in aligned 16 KiB blocks to yield host physical memory, deflating once compression subsides.
 
 ### 4. The network as streams, not packets
@@ -209,11 +205,11 @@ Other runtimes assign the VM a virtual network interface card and run a userspac
 lighter avoids packet transport across the VM boundary entirely:
 - **Direct stream bridging:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which establishes a single vsock stream to the host. The host opens a native macOS socket to the destination and copies bytes between the two. The Mac's native network stack handles routing, VPNs, and proxies automatically.
 - **In-kernel BPF sockmap:** The container socket and the vsock stream are joined directly in the guest kernel via a BPF sockmap. The data path is a zero-process kernel-to-kernel copy.
-- **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency drops to **37 µs**—seven times faster than OrbStack (262 µs) and over fourteen times faster than Docker Desktop (513 µs).
+- **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency measures **40 µs**, compared with OrbStack at 262 µs and Docker Desktop at 513 µs in the retained comparison.
 - **Low-latency polling:** After every network event, the host transport thread polls briefly before sleeping, servicing immediate request-response replies without scheduler wake latency.
 
 ### 5. Boot overlaps memory preparation
-The 0.5.1 candidate starts the guest while a worker prepares the remaining RAM backing. At 16 GiB on M1, Docker answers in **812 ms** and preparation finishes around **1.61 s**; Docker readiness does not wait for completion. [Controlled measurements](docs/demand-memory-2026-09-08.md).
+Lighter starts the guest while a worker prepares the remaining RAM backing. At 16 GiB on M5, Docker answers in **517 ms**; readiness does not wait for preparation to finish. [Design and controlled measurements](docs/demand-memory-2026-09-08.md).
 
 - **Hybrid RAM preparation:** Memory is prepared on first access when needed, while one worker finishes the backing concurrently. Completed regions resume whole-range reclamation.
 - **50-millisecond custom kernel boot:** Hardware probing is stripped down strictly to the virtual devices present.
