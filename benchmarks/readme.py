@@ -38,17 +38,27 @@ RUNTIMES = [
     ("docker-desktop", "Docker Desktop"),
 ]
 
-INTRO = "Measured with the pinned 1,232-package fixture in `benchmarks/`. Timing rows are medians of three timed repetitions. The harness attempts an untimed installation for each package manager and an untimed npm install to materialize read and metadata inputs. Warm-up and per-repetition setup exit statuses were not retained; each valid timing case requires three successful measured repetitions. Those cases retain all three timings, including a potentially colder first read. Startup has an untimed round. Memory and power rows are single sampling windows.\n\nThe MacBook Pro M5 results below use the first valid complete Lighter 0.5.0 suite, selected before looking at results. Two further suites, five fresh same-build storage runs and an alternating comparison rebuilt from 0.4.1/0.5.0 source are retained in [the release measurements](benchmarks/RELEASE-0.5.0.md). Quiet checks precede each stage and competing-VM checks run throughout. Lighter uses eight guest CPUs and 16 GiB guest RAM, including startup tests. [Full M1 results](benchmarks/RELEASE-0.5.0.md#m1--share) remain in the detailed report. Competitor resource settings and actual guest topology are recorded alongside their measurements. Runtime and guest fingerprints, exact tool versions, image IDs and recording dates accompany the raw CSVs.\n\nNative and container installations use the same pinned Node, npm, pnpm and Yarn versions. All container runtimes load identical benchmark images for each architecture. Native macOS and Linux utilities still differ, so the native ratios compare complete workloads rather than isolating filesystem overhead. Absolute times and percentages of native APFS are shown (higher percentages mean faster). The first storage table uses the runtime's own disk; the second uses a Mac directory shared into the container. Bold marks the lowest observed runtime median, without implying statistical significance. A dash means no completed measurement is available.\n\nDocker Desktop is measured with Apple Virtualization.framework, VirtioFS and Rosetta; other Docker Desktop backends are outside this comparison.\n\nThe host-edit row measures polling visibility and a round trip; it is not an inotify or `fs.watch` event-delivery measurement.\n\nDocker Desktop's host-share package cleanup failed. The affected install timings and dependent storage/package-load memory results are excluded despite the original harness returning success; its guest-disk and independent cases remain. The release report retains the errors and explicit selection decisions."
+INTRO = """All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-MEMORY_INTRO = """The macOS physical-footprint charge for the runtime's own processes, corresponding to Activity Monitor's "Memory" column: idle a minute after a cold start, the peak during an `npm ci`, and 15 and 60 seconds after it ends. Lower is better. This includes compressed-memory charges and is not a count of distinct resident RAM. lighter 0.4.1 removes the duplicate charge when host and guest access the same backing pages, while preserving physical reclamation and charging reused pages again. This accounting correction does not imply an equivalent reduction in physical RAM. The idle and after rows include retained guest cache and host allocations. Configured RAM limits guest memory; host allocations add overhead. [Accounting and real-build experiments](docs/memory-accounting-2026-09-06.md) document the fix, compression and recovery at smaller configurations."""
+On host-shared filesystems, lighter runs `ripgrep` **11x faster than OrbStack**, completes directory copies **2.7x faster**, idles at **365 MiB RAM** (less than half of OrbStack, a tenth of Docker Desktop), and returns memory to macOS within seconds of a workload finishing.
 
-NETWORK_INTRO = """iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Connection rate counts client TCP handshakes; it is not completed HTTP requests per second. Throughput uses iperf’s received summary where available. Docker Desktop’s zero UDP receiver result was separately checked with raw JSON on this tested path. Bold marks the highest observed throughput or lowest latency, without a significance claim."""
+<details>
+<summary>Benchmark methodology & test environment</summary>
 
-POWER_INTRO = """After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better."""
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 15 Sequoia). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
 
-AMD64_INTRO = """The same runtimes running `linux/amd64` images on their own disk: an install that mostly waits on the disk and the network, straight-line computation (a gigabyte through `sha256sum`), and a container's start, so the translator's price shows on each kind of work. lighter, OrbStack and Docker Desktop run these under Rosetta; Colima was started with `--vz-rosetta`. The first column is lighter's own arm64 number for the same case, for scale. Median of three; lower is better."""
+Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw CSVs, repetition traces, environment fingerprints, and full M1 results are preserved in [the release measurements](benchmarks/RELEASE-0.5.0.md) and [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
+</details>"""
 
-BOOT_INTRO = """From a cold stop, the runtime asked to start the way a person would (`lighter start`, `orb start`, `colima start`, opening Docker Desktop): how long until `docker version` answers, and until the first container has run. Median of three; lower is better."""
+MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac immediately via `virtio-mem` and cooperative reclamation."""
+
+NETWORK_INTRO = """Throughput and latency between container and host measured with `iperf3`, keep-alive HTTP GET latency, connection setup rate, and container DNS resolution time. Bold marks best result."""
+
+POWER_INTRO = """Idle CPU consumption and thread wakeups measured via `powermetrics` over a 60-second quiet window. Lower is better."""
+
+AMD64_INTRO = """Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` for Colima). Lower is better."""
+
+BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Lower is better."""
 
 
 def ms(value):
@@ -281,6 +291,7 @@ def section():
     out += [
         "[Release records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.",
         "",
+        "---",
     ]
     return "\n".join(out)
 
@@ -292,7 +303,7 @@ def main():
         pattern = re.compile(r"## Benchmarks\n.*?(?=\n## )", re.S)
         if not pattern.search(readme):
             sys.exit("README.md has no `## Benchmarks` section to replace")
-        README.write_text(pattern.sub(lambda _: text.rstrip("\n"), readme, count=1))
+        README.write_text(pattern.sub(lambda _: text.rstrip("\n") + "\n", readme, count=1))
         print(f"wrote {README}")
     else:
         print(text)
