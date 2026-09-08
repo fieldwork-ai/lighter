@@ -202,14 +202,23 @@ echo "==> Packing release tarball"
 mkdir -p dist
 cp "$STAGE/bin/lighter" "dist/lighter-$VERSION-arm64"
 TARBALL="dist/lighter-$VERSION-arm64.tar.gz"
-TAR_ARGS=("-czf" "$TARBALL" "-C" "$WORK/stage" "lighter-$VERSION")
-if tar --help 2>&1 | grep -q -- '--sparse'; then
-	TAR_ARGS=("--sparse" "${TAR_ARGS[@]}")
-fi
+# Use ordinary ustar entries even when APFS preserves holes in rootfs.ext4.
+# BSD tar's default PAX sparse encoding can extract under GNUSparseFile.0/
+# with our Rust reader, leaving the authenticated rootfs path absent. Gzip
+# compresses the zero ranges; the logical guest image remains identical.
+TAR_ARGS=("--format" "ustar" "-czf" "$TARBALL" "-C" "$WORK/stage" "lighter-$VERSION")
 # Extended attributes are not release payloads. AppleDouble sidecars create
 # extra archive roots for non-libarchive readers; the stapled ticket is an
 # ordinary Contents/CodeResources file and remains in the archive.
 COPYFILE_DISABLE=1 tar "${TAR_ARGS[@]}"
+
+# Exercise the consumer, not just the system tar reader. This installs into
+# private state without starting a VM or touching the daily installation.
+if [ -z "$SKIP_NOTARIZE" ]; then
+	echo "==> Verifying archive through the release installer"
+	LIGHTER_HOME="$WORK/install-home" "$STAGE/bin/lighter" install-archive \
+		--archive "$TARBALL" --prefix "$WORK/install-prefix"
+fi
 
 SIZE="$(du -h "$TARBALL" | cut -f1)"
 SHA="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
