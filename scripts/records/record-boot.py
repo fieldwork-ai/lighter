@@ -30,7 +30,7 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--memory', type=int, nargs='+', required=True)
     ap.add_argument('--cpus', type=int, default=8)
-    ap.add_argument('--reps', type=int, default=10)
+    ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--mode', choices=['default', 'eager', 'background', 'demand', 'demand-all', 'hybrid'], default='default')
     ap.add_argument('--image', default='alpine:3.21')
     ap.add_argument('--saved-container', action='store_true')

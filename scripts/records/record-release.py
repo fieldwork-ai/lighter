@@ -194,6 +194,11 @@ def main():
                 target=target,
                 cases=cases,
                 options=options,
+                runtime_source=stage_env["LIGHTER_BENCH_SOURCE_SHA"],
+                preparation_flags={
+                    name: stage_env.get(name, "unset")
+                    for name in ["LIGHTER_DEMAND_RAM", "LIGHTER_DEMAND_BASE", "LIGHTER_BACKGROUND_RAM"]
+                },
                 sha256=digest(result),
             )
         )
