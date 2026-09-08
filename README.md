@@ -17,7 +17,7 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Docker Des
 | Metric / Feature | lighter | OrbStack | Docker Desktop | Colima |
 |---|---|---|---|---|
 | **License** | **MIT / Apache 2.0** | Proprietary | Proprietary | Apache 2.0 |
-| **Commercial use** | **Free forever** | $8–$10 / user / mo | $5–$24 / user / mo | Free |
+| **Commercial use** | **Free forever** | $8–$10 / user / mo | $9–$24 / user / mo (≥250) | Free |
 | **Telemetry** | **Zero** | Yes | Yes | None |
 | **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
 | **Cold start (to container)** | **664 ms** | 1.4 s | 2.1 s | 9.0 s |
@@ -169,7 +169,7 @@ Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` 
 | `sha256sum` of 1 GiB | 3.02 s | **4.16 s** | 7.92 s | 4.26 s | 4.39 s |
 | container start, `alpine true` | 138 ms | **156 ms** | 244 ms | 185 ms | 170 ms |
 
-[0.5.1 release records](docs/records/0.5.1/hybrid/) and [retained competitor records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
+[0.5.1 release records](docs/records/0.5.1/hybrid/) and [retained competitor records](benchmarks/records/0.5.0/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
 
 ---
 
