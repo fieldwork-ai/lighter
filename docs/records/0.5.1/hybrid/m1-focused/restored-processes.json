@@ -1,0 +1,20 @@
+[
+  {
+    "pid": 455,
+    "command": "/System/Library/ExtensionKit/Extensions/WallpaperAerialsExtension.appex/Contents/MacOS/WallpaperAerialsExtension",
+    "start": "Sat Aug 29 10:59:10 2026",
+    "restored": true
+  },
+  {
+    "pid": 9081,
+    "command": "/System/Library/PrivateFrameworks/PhotoAnalysis.framework/Versions/A/Support/photoanalysisd",
+    "start": "Mon Sep  7 03:01:48 2026",
+    "restored": true
+  },
+  {
+    "pid": 81218,
+    "command": "/System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+    "start": "Mon Sep  7 11:41:40 2026",
+    "restored": true
+  }
+]
