@@ -223,3 +223,25 @@ footprint, then returned to 267 MiB within five seconds. The next container saw
 8,016 MiB MemTotal, consistent with the guest kernel's overhead. Over the
 120-second idle window the process used 0.62% CPU, below the 1% gate, and its
 final footprint was 327 MiB. The full M1 suite is a separate qualification.
+
+### Invalid first full-suite attempt
+
+The [first M1 attempt](records/0.5.1/hybrid/m1-invalid-full-a1/) failed during
+the boot case's untimed Alpine start with Docker exit 125. Earlier share
+observations are retained as incomplete evidence, not a qualified full suite.
+The harness discarded Docker's error output, so the original cause is unknown.
+An exact-environment retry pulled the image and ran the container successfully.
+A preliminary diagnostic lacked the original credential-helper PATH and is
+labelled separately; its error does not explain the original failure.
+
+The failure also exposed a cleanup bug: the private boot VM could be left
+running before the harness assigned its measurement PID. It was stopped.
+`16a7514` preserves start/container diagnostics, stops that exact private home
+on failure and retains partial records even when the stage fails. The
+[harness checks](records/0.5.1/hybrid/m1-boot-harness-checks/) inject Docker exit
+125 and verify error retention and VM shutdown, then run a successful boot-only
+case. These are correctness checks, not performance measurements. The existing
+benchmark-result tests also pass with a new regression test for this path.
+
+A fresh full-suite attempt uses the same `b78dfeb` VM runtime and the corrected
+harness. The already-passed hypervisor and memory/idle checks are not repeated.
