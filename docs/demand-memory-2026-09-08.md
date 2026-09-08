@@ -278,3 +278,25 @@ footprint peaks at 4,109 MiB and settles to 817 MiB after 60 seconds. As elsewhe
 configured RAM limits the guest, not every host allocation. Idle CPU is 5 ms/s,
 approximately 0.5% of one core. The paused Apple processes were restored after
 the recorder exited.
+
+### Matched package-cache context
+
+The original isolated screening warmed only the selected package manager. The
+full suite warms npm, pnpm and yarn before its first measurement. A
+[matched one-observation comparison](records/0.5.1/hybrid/m1-full-warm/) uses
+that combined preparation on both versions, with hybrid followed by 0.5.0.
+
+| Workload | 0.5.0 | Hybrid | Time change |
+|---|---:|---:|---:|
+| npm install | 11,214 ms | 12,160 ms | +8.4% |
+| pnpm install | 7,398 ms | 7,402 ms | +0.05% |
+| yarn install | 11,804 ms | 11,554 ms | −2.1% |
+| Tree copy | 16,858 ms | 17,130 ms | +1.6% |
+| Tree deletion | 2,851 ms | 2,861 ms | +0.4% |
+
+Only npm crosses the +5% investigation threshold and receives two additional
+observations per version. The harness can now retain the combined warm-up
+through `BENCH_EXTRA_WARM_CASES` while timing npm alone; regression tests verify
+that this does not add measurements of the warm-up-only cases. These copy
+observations lack the full suite's preceding file-search reads and are not
+directly comparable with its warmer copy medians.
