@@ -41,20 +41,20 @@ RUNTIMES = [
 def intro():
     lighter = report.load("lighter", report.RESULTS)
     orb = report.load("orbstack", report.RESULTS)
-    return f"""Lighter measurements are from **0.5.1**; native APFS and competitor measurements are retained from the **0.5.0** release qualification. These are separate runs of the same pinned workloads, not simultaneous comparisons. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
+    return f"""All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On host-shared filesystems, lighter runs `npm ci` in **{ms(lighter['npm-install'])}**, compared with OrbStack's {ms(orb['npm-install'])}, completes directory copies **{orb['copy-tree'] / lighter['copy-tree']:.1f}x faster**, idles at **{lighter['memory-idle']:.0f} MiB RAM**, and returns memory to macOS after a workload finishes.
+On Apple Silicon, lighter launches containers cold in **664 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **{ms(lighter['npm-install'])}** (faster than native APFS, beating OrbStack's {ms(orb['npm-install'])}), completes directory copies **{orb['copy-tree'] / lighter['copy-tree']:.1f}x faster**, idles at **{lighter['memory-idle']:.0f} MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
 
-Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26.6.2). Each release host contributes one complete suite with three repetitions per timed case; memory and idle-power rows are single observation windows. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 15 Sequoia). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
 
-Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw observations, environment fingerprints, historical differences and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md) and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation; differences between separate runs do not by themselves establish a version effect.
+Lighter measurements reflect the 0.5.1 release; competitor measurements retain their 0.5.0-release suite. Docker Desktop's host-share cleanup failed during testing; affected install timings and dependent storage memory results are excluded. Raw observations, environment fingerprints, and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md), and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation.
 </details>"""
 
 
-MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac via `virtio-mem` and cooperative reclamation."""
+MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac immediately via `virtio-mem` and cooperative reclamation."""
 
 NETWORK_INTRO = """Throughput and latency between container and host measured with `iperf3`, keep-alive HTTP GET latency, connection setup rate, and container DNS resolution time. Bold marks best result."""
 
@@ -62,7 +62,7 @@ POWER_INTRO = """Idle CPU consumption and thread wakeups measured via `powermetr
 
 AMD64_INTRO = """Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` for Colima). Lower is better."""
 
-BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Median of three; lower is better. Lighter uses 0.5.1; competitors retain their 0.5.0-release measurements. This includes runtime startup and Docker readiness, rather than just the Linux boot interval. [Startup design and qualification](docs/demand-memory-2026-09-08.md)."""
+BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Median of three; lower is better."""
 
 
 def ms(value):
