@@ -1,0 +1,4 @@
+Stopped.
+Starting lighter (4 cores, 6144 MiB)…
+Docker 28.3.3 on linux/arm64
+Running as pid 46934; use DOCKER_HOST=unix:///private/tmp/lighter-kind-m5.1h4w3x6t/docker.sock

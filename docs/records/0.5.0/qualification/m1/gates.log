@@ -1,0 +1,372 @@
+
+[1m==> m1  first boot[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.02s
+
+==> Booting with 1 vCPU(s)
+  [32mok[0m   guest ran and exited (2s wall)
+  [32mok[0m   all 1 core(s) online
+  [32mok[0m   guest sees 1968 MiB of RAM
+  [32mok[0m   device tree parsed
+  [32mok[0m   PL011 driver bound
+  [32mok[0m   virtual timer advances
+  [32mok[0m   init completed
+  [32mok[0m   PSCI SYSTEM_OFF handled
+  [32mok[0m   GIC located 1 redistributor(s)
+
+==> Booting with 4 vCPU(s)
+  [32mok[0m   guest ran and exited (2s wall)
+  [32mok[0m   all 4 core(s) online
+  [32mok[0m   guest sees 1968 MiB of RAM
+  [32mok[0m   device tree parsed
+  [32mok[0m   PL011 driver bound
+  [32mok[0m   virtual timer advances
+  [32mok[0m   init completed
+  [32mok[0m   PSCI SYSTEM_OFF handled
+  [32mok[0m   GIC located 4 redistributor(s)
+
+[32mM1 PASS[0m — a kernel we built boots on a VMM we wrote.
+
+[1m==> m2  core devices[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.02s
+
+==> Phase 1: device probe
+  [32mok[0m   guest ran and exited
+  [32mok[0m   virtio-blk bound
+  [32mok[0m   virtio-rng bound
+  [32mok[0m   virtio-balloon bound
+  [32mok[0m   guest sees a 4 GiB /dev/vda
+  [32mok[0m   block data survives a write/read round trip
+  [32mok[0m   entropy pool is filled (256 bits)
+
+==> Phase 2: write 64 MiB in the guest
+  [32mok[0m   guest wrote 64 MiB to /dev/vda
+  [32mok[0m   host image grew to 65536 KiB
+  [32mok[0m   a freshly created 4 GiB image cost 256 KiB
+
+==> Phase 3: verify persistence, then discard
+  [32mok[0m   data written by the previous boot was still there
+  [32mok[0m   guest issued a discard over the whole device
+  [32mok[0m   host image shrank from 65536 KiB to 0 KiB
+
+[32mM2 PASS[0m — block, entropy and balloon work; the disk grows and gives space back.
+
+[1m==> m3  network[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.02s
+
+==> Booting with networking
+  [32mok[0m   virtio-net bound with the expected MAC
+  [32mok[0m   DHCP leased 192.168.127.2
+  [32mok[0m   gateway answers ICMP
+  [32mok[0m   nettest completed
+
+[32mmilestone 3 network gate passed[0m
+
+[1m==> m3  vsock[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.02s
+
+==> Booting with a socket proxied to guest port 2375
+  [32mok[0m   guest agent bound vsock port 2375
+  [32mok[0m   host socket exists
+  [32mok[0m   round trip through vsock returned the message intact
+  [32mok[0m   1 MB round trip returned 1000000 bytes (credit window respected)
+  [32mok[0m   virtio-vsock probed in the guest
+
+[32mmilestone 3 vsock gate passed[0m
+
+[1m==> m3  docker[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.02s
+
+==> Booting the Docker guest
+  [32mok[0m   guest booted and the docker socket is served (1s)
+  [32mok[0m   dockerd came up
+  [32mok[0m   docker client reached the daemon: 28.3.3 on linux/arm64
+  [32mok[0m   docker run hello-world produced its output
+
+==> Checking build worker OOM isolation
+  [32mok[0m   BuildKit workers do not inherit daemon OOM protection
+Unable to find image 'alpine:3.21' locally
+3.21: Pulling from library/alpine
+2dd7199cff98: Already exists
+Digest: sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+Status: Downloaded newer image for alpine:3.21
+  [32mok[0m   Docker and containerd retain their OOM protection
+==> Bringing up a Fieldwork-shaped stack
+  [32mok[0m   compose up: all services reported healthy
+  [32mok[0m   mailpit reachable on 127.0.0.1:18025
+  [32mok[0m   minio reachable on 127.0.0.1:19000
+  [33mskip[0m psql not installed; postgres checked by port only
+Connection to 127.0.0.1 port 15434 [tcp/*] succeeded!
+  [32mok[0m   postgres port open
+  [32mok[0m   forward withdrawn when the container stopped
+  [32mok[0m   compose down cleaned up
+  [32mok[0m   a container loads an nftables firewall (ct state, log, limit, reject, dnat, masquerade)
+
+[32mmilestone 3 docker gate passed[0m — docker on macOS, on a VMM we wrote.
+
+[1m==> m3  streams[0m
+==> Booting with streams
+  [32mok[0m   the guest installed its redirect
+PASS: 100 failed preparations detach maps, return slots and preserve I/O; partial activation aborts
+
+exit=0
+--end--
+
+  [32mok[0m   failed sockmap joins clean up and preserve fallback I/O
+  [32mok[0m   TLS to example.com over the stream
+  [32mok[0m   a closed port is refused in 0s (curl exit 52)
+scripts/gates/m3-streams.sh: line 107: 92907 Terminated: 15          python3 -  <<'PY'
+import socket
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); srv.bind(("0.0.0.0", 18096)); srv.listen(5)
+while True:
+    c, _ = srv.accept()
+    while c.recv(4096): pass
+    c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"); c.close()
+PY
+
+  [32mok[0m   half-close: the reply arrives after the request side closed
+  [32mok[0m   host.docker.internal reaches a server on the Mac
+  [32mok[0m   a published port answers on the Mac
+  [32mok[0m   the published port closed with the container
+  [32mok[0m   256 MiB out of a container arrived intact
+  [32mok[0m   256 MiB into a published port arrived intact
+  [32mok[0m   a thousand concurrent connections from one container
+  [32mok[0m   DNS from a container
+  [32mok[0m   UDP to an external resolver (dig @8.8.8.8)
+  [32mok[0m   ICMP from a container
+  [32mok[0m   a container has a v6 default route
+  ··   IPv6: the Mac has no v6 route; egress checks skipped
+  [32mok[0m   AAAA withheld on a Mac without a v6 route
+
+m3-streams: all checks passed
+scripts/gates/m3-streams.sh: line 38: 92920 Terminated: 15          python3 -u - > "$LIGHTER_HOME/http.log" 2>&1  <<'PY'
+import socket
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 18099))
+srv.listen(5)
+print("HTTP fixture ready", flush=True)
+while True:
+    c, _ = srv.accept()
+    with c:
+        c.settimeout(5)
+        try:
+            c.recv(4096)
+            c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        except OSError:
+            pass
+PY
+
+scripts/gates/m3-streams.sh: line 38: 92965 Terminated: 15          python3 -  <<'PY'
+import socket, threading
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); srv.bind(("0.0.0.0", 18097)); srv.listen(2048)
+held = []
+while True:
+    c, _ = srv.accept(); held.append(c)
+PY
+
+
+[1m==> m3  publish[0m
+==> Booting
+  [33mskip[0m no global IPv6 address on en0; global v6 checks skipped
+  [32mok[0m   -p 18098:80 answers on 127.0.0.1
+  [32mok[0m   -p 18098:80 answers on [::1]
+  [32mok[0m   -p 18098:80 answers on the LAN address 192.168.50.21
+  [32mok[0m   -p 127.0.0.1:18097:80 answers on 127.0.0.1
+  [32mok[0m   -p 127.0.0.1:18097:80 is not on the LAN address
+  [32mok[0m   -p 127.0.0.1:18097:80 is not on [::1]
+  [32mok[0m   every listener closed with its container
+  [32mok[0m   the same port publishes again at once
+  [32mok[0m   udp: 64 B echoed via 127.0.0.1
+  [32mok[0m   udp: 8192 B echoed via 127.0.0.1
+  [32mok[0m   udp: 64 B echoed via ::1
+  [32mok[0m   udp: 8192 B echoed via ::1
+  [32mok[0m   udp: 64 B echoed via 192.168.50.21
+  [32mok[0m   udp: 8192 B echoed via 192.168.50.21
+  [32mok[0m   udp: two hundred clients each got their own reply
+  [32mok[0m   udp: the port is closed with the container (TimeoutError: timed out)
+  [32mok[0m   IPv6-only UDP publish reaches an IPv6-only service
+==> HTTP immediately after connection bursts
+{'mode': 'all-interface', 'round': 1, 'connections': 3000, 'requests': 2000, 'seconds': 0.7082069169264287}
+{'mode': 'all-interface', 'round': 2, 'connections': 3000, 'requests': 2000, 'seconds': 0.6418463750742376}
+{'mode': 'loopback', 'round': 1, 'connections': 3000, 'requests': 2000, 'seconds': 0.9594302501063794}
+{'mode': 'loopback', 'round': 2, 'connections': 3000, 'requests': 2000, 'seconds': 0.9551934999180958}
+published connection bursts passed; inbound resources drained
+  [32mok[0m   connection bursts preserve HTTP on all-interface and loopback publishes
+
+m3-publish: all checks passed (1 skipped)
+
+[1m==> m4  filesystem[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.03s
+
+==> Boot 1: the guest checks the filesystem against itself
+  [32mok[0m   mount
+  [32mok[0m   roundtrip
+  [32mok[0m   append
+  [32mok[0m   large-file
+  [32mok[0m   many-files
+  [32mok[0m   unlink-while-open
+  [32mok[0m   rename-open-directory
+  [32mok[0m   hard-link
+  [32mok[0m   symlink
+  [32mok[0m   mmap-shared
+  [32mok[0m   mmap-write-visible
+  [32mok[0m   fsync-reopen
+  [32mok[0m   truncate
+  [32mok[0m   sparse-seek
+  [32mok[0m   permissions
+  [32mok[0m   rename-storm
+  [32mok[0m   directory-tree
+  [32mok[0m   statfs
+  [32mok[0m   the guest's cleanup reached the host: nothing left in the share
+
+==> Boot 2: host and guest changing the same directory in turns
+  [32mok[0m   a file the guest wrote is on the host immediately
+  [32mok[0m   cross-mount
+  [32mok[0m   guest-write-visible-to-host
+  [32mok[0m   host-write-visible-to-guest
+  [32mok[0m   host-overwrite-is-seen
+  [32mok[0m   host-rename-is-seen
+  [32mok[0m   host-delete-is-seen
+  [32mok[0m   new-host-directory-is-listed
+
+==> Boot 3: fsync, then SIGKILL the VMM mid-flight
+  [32mok[0m   1 MiB survived SIGKILL of the VMM, byte for byte
+
+==> Boot 4: a macOS directory bind-mounted into a container
+  [32mok[0m   the share is mounted in the Docker guest
+  [32mok[0m   a container read a file that macOS wrote
+  [32mok[0m   macOS sees a file the container wrote
+==> Recovering from lost filesystem notifications
+reset: PASS old
+reset: PASS new
+overflow: PASS old
+overflow: PASS new
+expiry: PASS old
+expiry: PASS new
+expiry: fresh after 20.058s without invalidation
+filesystem cache reset and expiry probes passed
+  [32mok[0m   cache reset, queue overflow and independent expiry recover shared files
+
+[32mmilestone 4 filesystem gate passed[0m — a shared directory that agrees with itself.
+
+[1m==> m5  speed[0m
+==> Measuring macOS itself
+==> Measuring the share
+    Finished `release` profile [optimized] target(s) in 0.15s
+
+  [32mok[0m   ripgrep: 136ms against 1267ms native — 932% (floor 200%)
+  [32mok[0m   find-walk: 121ms against 621ms native — 513% (floor 200%)
+  [32mok[0m   npm-install: 10637ms against 8378ms native — 79% (floor 30%)
+  [32mok[0m   copy-tree: 5542ms against 22458ms native — 405% (floor 35%)
+  [32mok[0m   a host change reaches the guest in 3ms (budget 100ms)
+  [32mok[0m   the share stayed inside its descriptor budget (1s over, budget 30s)
+
+  [33m··[0m   read targets met: ripgrep 932% and the metadata walk 513% of native, against a 80% target
+  [33m··[0m   npm install is 79% of native against a 85% target — see benchmarks/README.md for why, and what it would take
+
+[32mmilestone 5 speed gate passed[0m
+
+[1m==> m6  memory[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.14s
+
+==> Booting with 8 GiB of guest RAM
+  [32mok[0m   booted in 2s, holding 450 MiB
+
+==> Making the guest use 3072 MiB, then giving it back
+  [32mok[0m   footprint rose to 3574 MiB (+3124 MiB) while the guest was using it
+  [32mok[0m   gave back 3300 of 3124 MiB (105%) within 5s
+
+==> The range: out when nothing runs, whole for a container
+  [32mok[0m   the range came out 0s after the last container left (384 MiB of kernel-zone blocks left plugged); footprint 274 MiB
+  [32mok[0m   a container saw MemTotal 8016 MiB of the 8192 configured
+  [32mok[0m   range settled after the MemTotal probe (6s)
+
+==> Watching an idle machine for 120s
+  [32mok[0m   idle CPU 0.60% over 120s (budget 1.0%)
+  [33m··[0m   idle footprint 327 MiB
+  [33m··[0m   guest reports total 13955 MiB across this run; balloon currently holds 0 MiB
+
+[32mmilestone 6 memory gate passed[0m — the guest gives memory back, and idles at nothing.
+
+[1m==> m7  x86-64[0m
+==> Building guest artifacts if missing
+==> Building and signing the VMM
+    Finished `release` profile [optimized] target(s) in 0.02s
+
+==> Booting
+  [32mok[0m   guest booted in 1s
+  [32mok[0m   the guest registered rosetta as the x86-64 handler
+  [32mok[0m   the kernel found the per-thread memory-ordering switch
+
+==> Running amd64 containers
+  [32mok[0m   an amd64 container reports x86_64
+  [32mok[0m   an amd64 Node image ran a real program: x64 147
+  [32mok[0m   native containers still report aarch64
+  [32mok[0m   x86-64 threads under Rosetta see x86 memory ordering (0 reorderings in 2M rounds)
+
+[32mmilestone 7 gate passed[0m — x86-64 containers run under rosetta.
+
+[1m==> m8  daily driver[0m
+==> Building and signing the CLI
+    Finished `release` profile [optimized] target(s) in 0.08s
+
+==> Starting the way a person does
+  [32mok[0m   lighter start brought up a machine reachable at DOCKER_HOST
+  [32mok[0m   lighter doctor is happy
+  [32mok[0m   the docker CLI reaches the gate's machine through DOCKER_HOST
+
+==> Bringing up a day's stack
+  [32mok[0m   six services healthy in 11s
+  [32mok[0m   mailpit answers on localhost (HTTP 200)
+  [32mok[0m   minio answers on localhost (HTTP 200)
+  [32mok[0m   nginx answers on localhost (HTTP 200)
+  [32mok[0m   postgres is serving, and exec returns with stdin held open
+
+==> A file edited on the Mac, seen by a container
+  [32mok[0m   the change reached the container
+
+==> What a closed lid does
+  [32mok[0m   the guest clock is now 3602s behind, as a sleep would leave it
+  [32mok[0m   waking put the clock right (within 0s)
+
+==> Everything still works afterwards
+  [32mok[0m   postgres survived it
+  [32mok[0m   mailpit answers on localhost (HTTP 200)
+  [32mok[0m   a container completed a TLS handshake
+
+==> Stopping
+  [32mok[0m   lighter stop left nothing running
+
+==> Starting without a local Docker CLI
+  [32mok[0m   the machine starts and serves its API without docker on PATH
+
+[32mmilestone 8 gate passed[0m — a day of work, and a night of sleep.
+
+[1m==> Gates[0m
+  [32mpass[0m  m1  first boot              4s
+  [32mpass[0m  m2  core devices            5s
+  [32mpass[0m  m3  network                 3s
+  [32mpass[0m  m3  vsock                  40s
+  [32mpass[0m  m3  docker                 26s
+  [32mpass[0m  m3  streams                35s
+  [32mpass[0m  m3  publish                35s
+  [32mpass[0m  m4  filesystem             45s
+  [32mpass[0m  m5  speed                 316s
+  [32mpass[0m  m6  memory                150s
+  [32mpass[0m  m7  x86-64                 13s
+  [32mpass[0m  m8  daily driver           18s
+  total                           690s

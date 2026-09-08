@@ -1,0 +1,66 @@
+{
+  "lighter": "lighter 0.5.0",
+  "lighter_sha256": "f044fd21dd37838b4faf7ad8cd68bcbdfc60a9458a14b0e13b350509952a6257",
+  "source": "79c293c738e1e90d1acb88eaafcca25b23e19a58",
+  "kind": "kind v0.33.0 go1.26.7 darwin/arm64",
+  "kubectl": {
+    "clientVersion": {
+      "major": "1",
+      "minor": "37",
+      "gitVersion": "v1.37.0",
+      "gitCommit": "f54c212e3a2f75d674b717a9b29052b20b60aefc",
+      "gitTreeState": "clean",
+      "buildDate": "2026-08-26T10:48:06Z",
+      "goVersion": "go1.26.6",
+      "compiler": "gc",
+      "platform": "darwin/arm64"
+    },
+    "kustomizeVersion": "v5.8.1"
+  },
+  "image": "kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5",
+  "base_image": "python@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a",
+  "nodes": 1,
+  "proxy_mode": "iptables",
+  "guest_sha256": {
+    "Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "rootfs.ext4": "84cad61484b67dec2875c4bd8a812377e4ce76157dd0c78e5ab14c45d4505b44"
+  },
+  "vm_config": {
+    "cpus": 4,
+    "memory_mib": 4096,
+    "disk_gib": 64,
+    "shares": [
+      "<repo>"
+    ],
+    "publish": "localhost"
+  },
+  "kubernetes": {
+    "clientVersion": {
+      "major": "1",
+      "minor": "37",
+      "gitVersion": "v1.37.0",
+      "gitCommit": "f54c212e3a2f75d674b717a9b29052b20b60aefc",
+      "gitTreeState": "clean",
+      "buildDate": "2026-08-26T10:48:06Z",
+      "goVersion": "go1.26.6",
+      "compiler": "gc",
+      "platform": "darwin/arm64"
+    },
+    "kustomizeVersion": "v5.8.1",
+    "serverVersion": {
+      "major": "1",
+      "minor": "37",
+      "emulationMajor": "1",
+      "emulationMinor": "37",
+      "minCompatibilityMajor": "1",
+      "minCompatibilityMinor": "36",
+      "gitVersion": "v1.37.0",
+      "gitCommit": "f54c212e3a2f75d674b717a9b29052b20b60aefc",
+      "gitTreeState": "clean",
+      "buildDate": "2026-08-26T10:44:25Z",
+      "goVersion": "go1.26.6",
+      "compiler": "gc",
+      "platform": "linux/arm64"
+    }
+  }
+}

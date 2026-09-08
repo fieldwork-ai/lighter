@@ -1318,6 +1318,10 @@ impl Loop {
 
     /// Bytes read from the socket that the guest had no credit for, tried again.
     fn push_to_guest(&mut self, key: ConnKey) {
+        if self.shared.guest_receive_closed(key) {
+            self.stop_host_input(key);
+            return;
+        }
         let Some(stream) = self.streams.get_mut(&key) else {
             return;
         };
@@ -1338,7 +1342,27 @@ impl Loop {
                         }
                     }
                 }
-                Err(Gone) => self.close(key),
+                Err(Gone) => {
+                    if self.shared.guest_receive_closed(key) {
+                        self.stop_host_input(key);
+                    } else {
+                        self.close(key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The guest refuses further input but may still owe the host a response.
+    fn stop_host_input(&mut self, key: ConnKey) {
+        if let Some(stream) = self.streams.get_mut(&key) {
+            stream.to_guest.clear();
+            stream.to_guest_at = 0;
+            stream.tcp_eof = true;
+            stream.reading = false;
+            if let Some(tcp) = &stream.tcp {
+                self.kq.read(tcp.as_raw_fd(), false);
+                let _ = tcp.shutdown(std::net::Shutdown::Read);
             }
         }
     }
@@ -1502,6 +1526,11 @@ impl Loop {
     }
 
     fn readable(&mut self, key: ConnKey) {
+        if self.shared.guest_receive_closed(key) {
+            self.stop_host_input(key);
+            self.pull_from_guest(key);
+            return;
+        }
         let Some(stream) = self.streams.get_mut(&key) else {
             return;
         };
@@ -1562,7 +1591,12 @@ impl Loop {
                     return;
                 }
                 Err(Gone) => {
-                    self.close(key);
+                    if self.shared.guest_receive_closed(key) {
+                        self.stop_host_input(key);
+                        self.pull_from_guest(key);
+                    } else {
+                        self.close(key);
+                    }
                     return;
                 }
             }

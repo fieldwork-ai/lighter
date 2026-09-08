@@ -1,0 +1,27 @@
+enabled
+interpreter /usr/bin/python3.12
+flags: 
+offset 0
+magic cb0d0d0a
+enabled
+interpreter /usr/bin/qemu-i386
+flags: POCF
+offset 0
+magic 7f454c4601010100000000000000000002000300
+mask fffffffffffefe00fffffffffffffffffeffffff
+disabled
+interpreter /usr/bin/qemu-x86_64
+flags: POCF
+offset 0
+magic 7f454c4602010100000000000000000002003e00
+mask fffffffffffefe00fffffffffffffffffeffffff
+enabled
+interpreter /mnt/lima-rosetta/rosetta
+flags: OCF
+offset 0
+magic 7f454c4602010100000000000000000002003e00
+mask fffffffffffefe00fffffffffffffffffeffffff
+enabled
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root        19G  1.2G   18G   7% /
+/dev/vdb1       126G  520M  119G   1% /var/lib/docker

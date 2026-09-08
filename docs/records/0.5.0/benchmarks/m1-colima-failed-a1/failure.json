@@ -1,0 +1,4 @@
+{
+  "status": "failed; never select this as a complete suite",
+  "reason": "Host-share pnpm completed zero of three timed repetitions. Every other requested case completed. Repeated diagnostics at the same host path exposed EMFILE on stat; raising guest nofile to 65536 did not resolve it. This suite is failed; only complete non-pnpm cases are eligible for explicitly partial comparison."
+}

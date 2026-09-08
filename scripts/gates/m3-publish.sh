@@ -14,6 +14,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 LIGHTER="${LIGHTER_BIN:-target/release/lighter}"
 export LIGHTER_HOME="$(mktemp -d -t lighter-m3p)"
+if [ -n "${LIGHTER_BENCH_OWNER_FILE:-}" ]; then
+	python3 - "$LIGHTER_BENCH_OWNER_FILE" "$LIGHTER_HOME/lighter.app/Contents/MacOS/lighter" <<'PYOWNER'
+import json, sys
+with open(sys.argv[1], 'a') as f:
+    f.write(json.dumps(sys.argv[2]) + '\n')
+PYOWNER
+fi
 D="docker -H unix://$LIGHTER_HOME/docker.sock"
 FAILED=0
 SKIPPED=0

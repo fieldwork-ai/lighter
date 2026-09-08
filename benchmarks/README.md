@@ -10,9 +10,9 @@ benchmarks/run.sh --target orbstack --reps 3
 python3 benchmarks/report.py
 ```
 
-Reach for `latency.sh` first. It answers "did that change help" in fifteen
-seconds and at a precision the workload cases cannot reach; see *How to
-measure* below for which question each one can actually answer.
+Use `latency.sh` to investigate individual operations and the full workload suite
+to measure application-level effects. Each has its own run-to-run variation;
+see [repeatability](REPEATABILITY.md) before interpreting a difference.
 
 Results go to `results/<target>.csv`; `report.py` turns them into `RESULTS.md`. Nothing in the report is hand-written, so a number nobody can reproduce cannot appear in it.
 
@@ -20,15 +20,15 @@ Results go to `results/<target>.csv`; `report.py` turns them into `RESULTS.md`. 
 
 Every target runs the same case scripts against the same fixture — a pinned `node_modules` tree — on the same machine. What differs is only how the directory reaches the process: on `native` it is the Mac's own disk, and everywhere else it is a bind mount through whatever that runtime uses for file sharing.
 
-`native` is the reference. It is a hard reference: a shared filesystem at 100% of it is costing nothing at all next to a local disk, which is not a thing shared filesystems normally are.
+`native` is a whole-workload reference on macOS APFS. Native and container runs pin the same package tools, but use different operating systems and may execute different platform-specific package steps. A ratio of 100% does not establish zero filesystem overhead.
 
 `--where guest` runs the cases on the runtime's own disk instead of the share, into `<target>-guest.csv`. `--arch amd64` runs them in the x86-64 build of the image (`--platform linux/amd64`, so under Rosetta on Apple silicon), into `<target>-amd64.csv`; the README's x86-64 table is those runs on the own disk. Two cases exist for that table's sake and run under either architecture: `cpu-sha256`, a gigabyte through `sha256sum` with no disk or network in it, and `container-start`, `docker run --rm alpine true` timed from the host.
 
-## Three rules the harness enforces
+## Timing protocol
 
-**The timing loop runs inside the target.** It used to run outside, around a whole `docker run`, and that measured container startup: a metadata walk costing the filesystem 1,566 requests reported 550ms, of which about 450ms was Docker creating and destroying a container. The native target pays no such cost, so the comparison was not between two filesystems at all. Everything before the first measurement — image pull, container start, a cold page cache — now happens once and is not timed.
+**The timing loop runs inside the target.** It used to run outside, around a whole `docker run`, and that measured container startup: a metadata walk costing the filesystem 1,566 requests reported 550ms, of which about 450ms was Docker creating and destroying a container. The native target pays no such cost, so the comparison was not between two filesystems at all. Image loading and that container startup occur before the internal timing loop. Cache state can still change between operations and repetitions.
 
-**Caches are warmed, and the warming is not timed.** An `npm install` that downloads is measuring the network. Each target gets its own package cache on its own storage, warmed by an untimed run first.
+**Warm-up is attempted outside the timing loop.** Each target has its own package cache on its own storage. The 0.5.0 recording protocol attempted untimed package installations but ignored warm-up and per-repetition setup statuses. Three successful measured repetitions are required for each valid case; the first can still contain a colder access. Retained measured-case diagnostics do not retroactively verify the discarded warm-up output.
 
 **The median is reported.** Not the mean, which one scheduling hiccup drags around, and not the best, which is a claim about the machine being idle.
 
@@ -43,7 +43,7 @@ Every target runs the same case scripts against the same fixture — a pinned `n
 | `find-walk` | `find -type f` over `node_modules` | lookups and directory reads, no file opened |
 | `copy-tree` | `cp -a node_modules node_modules_copy` | read and create together |
 | `rm-rf` | deleting a package tree | unlinks and rmdirs, nothing else |
-| `watch-latency` | a change on the host, seen in the guest | how quickly a cache can be corrected |
+| `watch-latency` | a host edit observed by polling inside the container | file visibility round trip, not fs.watch/inotify delivery |
 
 The three installs are not redundant. `pnpm` keeps its store on the runtime's
 own disk and hard-links out of it, which it cannot do across a device boundary
@@ -56,59 +56,52 @@ own disk and hard-links out of it, which it cannot do across a device boundary
 
 ## How to measure, and what can be measured
 
-Three instruments, and picking the wrong one is how an afternoon disappears.
+Release records use the versions in `toolchain.json` for both native and
+container workloads. Prepare the private native tools with
+`bash scripts/records/prepare-benchmark-tools.sh`, then set
+`BENCH_TOOLS_PATH="$PWD/.logs/050/tools/native/bin"` and
+`BENCH_REQUIRE_PINNED_TOOLS=1`. This preserves the Mac's globally installed tools.
+Controlled release runs also load identical prebuilt arm64/amd64 image archives
+through `LIGHTER_BENCH_IMAGE_DIR`; each archive hash and loaded image ID is
+verified, and the native tool versions and image ID accompany each CSV.
 
-| | resolves | costs | use it for |
-|---|---|---|---|
-| `benchmarks/latency.sh` | ~2 us | 15s, or 45s at `REPEAT=3` | did this change help |
-| `run.sh --cases npm-install --reps 3` | ~5% | 6 min | did it land, and by how much |
-| `run.sh` (whole suite) | ~5% | 20 min | the published table |
+Use the workload-specific, fresh-run CVs in [REPEATABILITY.md](REPEATABILITY.md),
+not a universal five-percent cutoff. The 0.5.0 record runs three full suites on
+each host, five additional fresh storage suites, and a separate old/new/new/old
+comparison. Each storage case contributes the median of three ordered timings.
+The between-run CV uses the sample standard deviation divided by the mean of
+those medians. It is descriptive, not a significance test or regression gate.
 
-The workload cases cannot resolve small effects, and no number of repetitions
-fixes that. Measured across twenty runs of `npm-install` under configurations
-that turned out to be equivalent, the standard deviation is 269ms on a mean of
-11,242 — 2.4%. Three repetitions resolve a 5.5% difference; ten resolve 3.0%;
-resolving half a percent would take about three hundred and sixty. A difference
-that small is not there to be found by running the same thing more times.
+`latency.sh` narrows an investigation to individual syscalls. Repeat across fresh
+boots and retain ordered repetitions: many samples from one boot do not measure
+between-boot variation. Its guest-disk control can help locate an effect, but
+shared and guest filesystems have different bottlenecks; neither path cancels
+arbitrary background interference.
 
-So: **if the effect you expect is smaller than five percent, do not use a
-workload case at all.** Use `latency.sh`, which measures one syscall at a time
-and resolves microseconds, and read the spread column before the number — a
-change smaller than the spread has not been measured, however confident the
-difference of two medians looks.
+Release timing requires six consecutive aggregate host-CPU samples at most 5%,
+ten seconds apart. The VM guard samples throughout and rejects unrelated VMs.
+The selected competitor is attributed to its exact executable or private
+instance, including VM restarts. The observer records filesystem-daemon CPU and
+memory without restarting it. All failed attempts remain separate from valid
+performance records. Quiet preflight does not guarantee a perfectly idle host
+throughout a workload, so the continuous observations matter too.
 
-Two things `latency.sh` needs saying about it. Its own variation is
-boot-to-boot rather than sample-to-sample, so `OPS` is already far past the
-point of diminishing returns and `REPEAT` is the knob that matters; the first
-boot is a warm-up and is discarded. And `create-parallel` is the only case that
-issues its work concurrently, which makes it the only one that can see a lock
-on either side of the boundary — a change that removes contention shows up in
-every other case as nothing at all.
+Alternate version order when checking an apparent change, preserve the original
+record, and disclose any follow-up selected after seeing its result. Alternation
+reduces some order effects; it cannot ensure interference affects both versions
+equally. The [0.5.0 report](RELEASE-0.5.0.md) records the complete comparison and
+its limits, including the unusually variable M1 read case.
 
-Every case is measured twice, in the same boot and alternating: once against
-the share and once against the guest's own disk. The second is a control. It is
-what separates "our filesystem is slow" from "the virtual machine is slow",
-which look identical from outside and have different fixes — and it is what
-says whether a change landed on the guest side or the host side.
+## Historical filesystem investigations
 
-It is not a cure for a busy machine, and should not be sold as one. The two
-paths do not share a bottleneck: one ends at APFS and the other at a virtual
-disk, so contention inflates the share column and the boundary column and
-leaves the control alone. On a contended host this is a decomposition rather
-than a measurement, and the honest thing is to compare against a run taken
-under the same conditions rather than against a number from a quiet afternoon.
+The measurements and design experiments below predate the 0.5.0 release record.
+They explain earlier implementation decisions. The former 85%-of-native install
+target is historical, and these samples are not current performance claims.
+Use the regenerated README tables and release record for current results.
 
-The stronger technique for a machine you cannot make quiet is to **interleave**:
-alternate the two configurations boot by boot rather than running all of one
-and then all of the other. Drift and interference then hit both arms equally,
-which is not true of A-then-B. `ROUNDS` does this within a boot; for anything
-that needs a reboot to change, alternate the boots.
+In these historical samples, the read cases were faster than their native macOS reference. That is not a trick: the guest's page cache answers without any round trip, and Linux's VFS is quicker than the one underneath it. It is only possible because the cache can be *corrected* — see `crates/lighter-fs/src/notify.rs` and the guest kernel patch — so the timeouts can be thirty seconds instead of a hundred milliseconds while a host edit still lands in single-digit milliseconds.
 
-## Where lighter stands, and why
-
-The read cases are faster than macOS itself. That is not a trick: the guest's page cache answers without any round trip, and Linux's VFS is quicker than the one underneath it. It is only possible because the cache can be *corrected* — see `crates/lighter-fs/src/notify.rs` and the guest kernel patch — so the timeouts can be thirty seconds instead of a hundred milliseconds while a host edit still lands in single-digit milliseconds.
-
-The write cases are not, and the plan's 85%-of-native target for `npm install` is not met. What that is actually made of, measured with the server's own opcode histogram rather than reasoned about:
+The historical write samples did not meet the earlier 85%-of-native target for `npm install`. What that is actually made of, measured with the server's own opcode histogram rather than reasoned about:
 
 One install is about 636,000 filesystem requests. Of those, 66,000 are creates
 costing 39 microseconds apiece on the host — which is APFS making a file, and

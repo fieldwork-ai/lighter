@@ -1,0 +1,27 @@
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+Sending build context to Docker daemon  2.048kB
+
+Step 1/3 : FROM busybox:1.37.0
+1.37.0: Pulling from library/busybox
+e001ca9bbec8: Pulling fs layer
+e001ca9bbec8: Verifying Checksum
+e001ca9bbec8: Download complete
+e001ca9bbec8: Pull complete
+Digest: sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+Status: Downloaded newer image for busybox:1.37.0
+ ---> 6df9636795d3
+Step 2/3 : RUN mkdir /www && echo lighter-kind-qualified > /www/index.html
+ ---> Running in 301bb7fb0dfe
+ ---> Removed intermediate container 301bb7fb0dfe
+ ---> 4b2d0e4d8336
+Step 3/3 : CMD ["sh", "-c", "echo server-started; exec httpd -f -p 8080 -h /www"]
+ ---> Running in 8feec4fadaa5
+ ---> Removed intermediate container 8feec4fadaa5
+ ---> 535897170f04
+Successfully built 535897170f04
+Successfully tagged lighter-kind-app:qualification
+using docker due to KIND_EXPERIMENTAL_PROVIDER
+Image: "lighter-kind-app:qualification" with ID "sha256:535897170f04258168916c01caa41e5ebaf2228886c5c787626351ea5019412c" not yet present on node "lighter-qualification-control-plane", loading...

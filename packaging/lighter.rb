@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 # Homebrew formula for lighter.
 #
 # Lives in a tap (fieldwork-ai/homebrew-tap) rather than homebrew-core: core
@@ -5,13 +7,13 @@
 # entitlement, and it is the entitlement that makes this work at all.
 #
 # Release binaries carry a notarized Developer ID signature and the hypervisor
-# entitlement. post_install verifies the signature and only signs ad hoc if it
-# is missing or invalid.
+# entitlement. post_install verifies signatures without modifying the signed payload.
 class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
-  url "https://github.com/fieldwork-ai/lighter/releases/download/v0.4.1/lighter-0.4.1-arm64.tar.gz"
-  sha256 "2f14375ef2ea1e065de856de39cb00c84489ff208e350333d31d5717861e3a9b"
+  url "https://github.com/fieldwork-ai/lighter/releases/download/v0.5.0/lighter-0.5.0-arm64.tar.gz"
+  version "0.5.0"
+  sha256 "4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52"
   license any_of: ["MIT", "Apache-2.0"]
 
   # Apple Silicon only, and not by omission: there is no Intel path and there
@@ -27,15 +29,24 @@ class Lighter < Formula
     prefix.install "LICENSE-MIT", "LICENSE-APACHE", "README.md"
   end
 
+  # Ownership includes a digest of the final canonical Cellar path.
+  # rubocop:disable FormulaAudit/InstallSteps
   def post_install
-    # Verify the signature; if unsigned or stripped, sign ad-hoc with the hypervisor entitlement.
-    unless quiet_system("/usr/bin/codesign", "--verify", bin/"lighter")
-      system "/usr/bin/codesign", "--force", "--sign", "-",
-             "--entitlements", pkgshare/"entitlements.plist",
-             "--options", "runtime",
-             bin/"lighter"
-    end
+    # Brew owns upgrades; the CLI must never replace this keg itself.
+    require "digest"
+    require "json"
+    managed_prefix = prefix.parent.realpath.to_s
+    metadata = {
+      schema: 1,
+      method: "homebrew",
+      prefix: managed_prefix,
+      id:     Digest::SHA256.hexdigest(managed_prefix)[0, 24],
+    }
+    File.write(pkgshare/"installation.json", JSON.pretty_generate(metadata))
+    system "/usr/bin/codesign", "--verify", "--strict", bin/"lighter"
+    system "/usr/bin/codesign", "--verify", "--strict", "--deep", pkgshare/"lighter.app"
   end
+  # rubocop:enable FormulaAudit/InstallSteps
 
   def caveats
     <<~EOS

@@ -1,0 +1,4 @@
+   Compiling lighter-vmm v0.4.2 (/Users/nick/git/lighter/crates/lighter-vmm)
+   Compiling lighter-cli v0.4.2 (/Users/nick/git/lighter/crates/lighter-cli)
+    Finished `release` profile [optimized] target(s) in 18.04s
+  target/release/lighter: replacing existing signature

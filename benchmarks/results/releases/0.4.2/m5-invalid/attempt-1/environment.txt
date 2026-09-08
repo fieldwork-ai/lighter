@@ -1,0 +1,22 @@
+Mon Sep  7 17:23:15 UTC 2026
+d0fbd114f19b333af7b3b9732d9637a27c962d6c
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+hw.ncpu: 18
+hw.memsize: 51539607552
+  PID  %CPU COMM
+22091  24.5 top
+22086   5.8 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python
+47987   3.7 claude
+  735   3.3 /usr/libexec/sysmond
+55699   3.3 codex
+22079   3.2 bash
+ 8586   3.2 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+36417   2.9 /Users/nick/.local/bin/claude
+60498   1.8 /Applications/Signal.app/Contents/Frameworks/Signal Helper (Renderer).app/Contents/MacOS/Signal Helper (Renderer)
+67699   1.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 1901   1.4 /Applications/WhatsApp.app/Contents/MacOS/WhatsApp
+  742   1.4 /System/Library/DriverExtensions/AppleCentauriAlpha.dext/AppleCentauriAlpha
+33076   1.2 /Users/nick/.local/bin/claude
+46565   1.1 /Applications/cmux.app/Contents/MacOS/cmux

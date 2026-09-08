@@ -1,0 +1,14 @@
+{
+  "host": "m1",
+  "utc": "2026-09-08T04:10:57.870513+00:00",
+  "source": "fe9370566ae082ff2c0d5b3f642354f6ec388de9",
+  "artifacts": {
+    "<repo>/dist/lighter-0.5.0-arm64.tar.gz": "4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52",
+    "<repo>/dist/lighter-0.5.0-arm64": "594b09e923358787fed3c67788fa95a6d76f172b8132daae3e55d64982b9438a",
+    "<repo>/dist/lighter-0.4.1-arm64.tar.gz": "2f14375ef2ea1e065de856de39cb00c84489ff208e350333d31d5717861e3a9b",
+    "<repo>/dist/lighter-0.4.2-arm64.tar.gz": "3f5a02bc8b3b44ae5afb51ee10fed249af1f01c17137d9d483170553c2a966d7",
+    "<repo>/.logs/050/fixtures/future-good.tar.gz": "de92c6abfb67504404ec932069b1d7cbf76c374daae7403c1d489798d2e167e5",
+    "<repo>/.logs/050/fixtures/future-bad.tar.gz": "2b54ad3f372aa4040f6838d99cc0443be12d987d357efb2d6c7fa421e7ce31ee"
+  },
+  "login": true
+}

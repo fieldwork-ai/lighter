@@ -1,0 +1,51 @@
+==> colima: warming caches (not timed)
+==> colima: npm-install 23722 23726 23657  (cpu ms: user=15240 sys=13830 user=15080 sys=14010 user=15230 sys=14000)
+==> colima: pnpm-install 42366  (cpu ms: user=4940 sys=6250)
+    FAILED: pnpm-install produced 1/3 measurements (exit 1)
+      TIME_MS 42366
+      CPU_MS user=4940 sys=6250
+      /work/cases/runner.js:60
+          throw err;
+          ^
+      
+      Error: Command failed: /bin/sh /work/cases/pnpm-install.sh
+          at genericNodeError (node:internal/errors:985:15)
+          at wrappedFn (node:internal/errors:539:14)
+          at checkExecSyncError (node:child_process:925:11)
+          at execFileSync (node:child_process:961:15)
+          at sh (/work/cases/runner.js:33:3)
+          at Object.<anonymous> (/work/cases/runner.js:54:5)
+          at Module._compile (node:internal/modules/cjs/loader:1871:14)
+          at Object..js (node:internal/modules/cjs/loader:2002:10)
+          at Module.load (node:internal/modules/cjs/loader:1594:32)
+          at Module._load (node:internal/modules/cjs/loader:1396:12) {
+        status: 1,
+        signal: null,
+        output: [ null, null, null ],
+      Error: Command failed: /bin/sh /work/cases/pnpm-install.sh
+          at genericNodeError (node:internal/errors:985:15)
+          at wrappedFn (node:internal/errors:539:14)
+          at checkExecSyncError (node:child_process:925:11)
+          at execFileSync (node:child_process:961:15)
+          at sh (/work/cases/runner.js:33:3)
+          at Object.<anonymous> (/work/cases/runner.js:54:5)
+          at Module._compile (node:internal/modules/cjs/loader:1871:14)
+          at Object..js (node:internal/modules/cjs/loader:2002:10)
+          at Module.load (node:internal/modules/cjs/loader:1594:32)
+          at Module._load (node:internal/modules/cjs/loader:1396:12) {
+        status: 1,
+        signal: null,
+        output: [ null, null, null ],
+        pid: 42,
+        stdout: null,
+        stderr: null
+      }
+      
+      Node.js v24.18.0
+
+==> colima: yarn-install 30508 28268 28132  (cpu ms: user=14570 sys=18510 user=14550 sys=17890 user=14480 sys=17500)
+==> colima: materializing the package tree
+==> colima: ripgrep 13313 18429 17667  (cpu ms: user=920 sys=2930 user=870 sys=2770 user=930 sys=2730)
+==> colima: find-walk 3833 3839 3816  (cpu ms: user=110 sys=460 user=110 sys=480 user=100 sys=470)
+==> colima: copy-treeINVALID: KeyboardInterrupt
+rm: ~/.lighter-bench/colima/npm/node_modules_copy: Directory not empty

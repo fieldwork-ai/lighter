@@ -1,0 +1,2 @@
+PEER_HUNG errno=35 peek=0
+runs=100000 host_failures=0 peer_failures=1

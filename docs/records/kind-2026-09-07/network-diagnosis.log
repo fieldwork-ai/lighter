@@ -1,0 +1,28 @@
+lighter-kind-qualified
+wget: download timed out
+persistent-token
+I0907 19:17:28.216078       1 proxier.go:770] "Sync failed" ipFamily="IPv4" retryingTime="30s"
+E0907 19:17:29.241033       1 proxier.go:1503] "Failed to execute iptables-restore" err=<
+	exit status 4: Warning: Extension statistic revision 0 not supported, missing kernel module?
+	iptables-restore v1.8.9 (nf_tables):
+	line 37: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-ERIFXISQEP7F7OF4
+	line 45: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-JD5MR3NA4I4DYORP
+	line 58: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-TCOU7JCQXEZGVUNU
+ > ipFamily="IPv4"
+I0907 19:17:29.241067       1 proxier.go:770] "Sync failed" ipFamily="IPv4" retryingTime="30s"
+E0907 19:17:33.647598       1 proxier.go:1503] "Failed to execute iptables-restore" err=<
+	exit status 4: Warning: Extension statistic revision 0 not supported, missing kernel module?
+	iptables-restore v1.8.9 (nf_tables):
+	line 42: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-TCOU7JCQXEZGVUNU
+	line 50: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-ERIFXISQEP7F7OF4
+	line 58: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-JD5MR3NA4I4DYORP
+ > ipFamily="IPv4"
+I0907 19:17:33.647621       1 proxier.go:770] "Sync failed" ipFamily="IPv4" retryingTime="30s"
+E0907 19:17:34.687532       1 proxier.go:1503] "Failed to execute iptables-restore" err=<
+	exit status 4: Warning: Extension statistic revision 0 not supported, missing kernel module?
+	iptables-restore v1.8.9 (nf_tables):
+	line 43: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-TCOU7JCQXEZGVUNU
+	line 51: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-ERIFXISQEP7F7OF4
+	line 59: RULE_APPEND failed (No such file or directory): rule in chain KUBE-SVC-JD5MR3NA4I4DYORP
+ > ipFamily="IPv4"
+I0907 19:17:34.687570       1 proxier.go:770] "Sync failed" ipFamily="IPv4" retryingTime="30s"

@@ -1,0 +1,15 @@
+{
+  "order": [
+    "0.4.1",
+    "0.4.2",
+    "0.4.2",
+    "0.4.1"
+  ],
+  "cases": [
+    "npm-install",
+    "pnpm-install",
+    "yarn-install"
+  ],
+  "summary": "Median of three repetitions in each arm; geometric mean of the two arm medians per version; ratio 0.4.2 / 0.4.1 minus one.",
+  "limitations": "Two arms per version do not establish a general regression rate or statistical significance. Retain all repetitions and report directional consistency."
+}

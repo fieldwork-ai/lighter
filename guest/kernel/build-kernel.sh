@@ -119,6 +119,7 @@ required=(
 	CONFIG_PACKET
 	CONFIG_INET
 	CONFIG_NFT_COMPAT
+	CONFIG_NETFILTER_XT_MATCH_STATISTIC
 )
 missing=0
 for opt in "${required[@]}"; do

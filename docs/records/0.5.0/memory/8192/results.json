@@ -1,0 +1,130 @@
+[
+  {
+    "check": "normal cluster creation",
+    "passed": true
+  },
+  {
+    "check": "all nodes Ready",
+    "passed": true
+  },
+  {
+    "check": "local image build",
+    "passed": true
+  },
+  {
+    "check": "load local image into every node",
+    "passed": true
+  },
+  {
+    "check": "deploy workload and PVC",
+    "passed": true
+  },
+  {
+    "check": "application Ready",
+    "passed": true
+  },
+  {
+    "check": "client Ready",
+    "passed": true
+  },
+  {
+    "check": "initial Service routing convergence",
+    "passed": true
+  },
+  {
+    "check": "Service DNS, cross-node TCP and host NodePort",
+    "passed": true
+  },
+  {
+    "check": "external DNS and HTTPS",
+    "passed": true
+  },
+  {
+    "check": "direct Pod IP",
+    "passed": true
+  },
+  {
+    "check": "cluster UDP",
+    "passed": true
+  },
+  {
+    "check": "host UDP NodePort",
+    "passed": true
+  },
+  {
+    "check": "Mac share read/write",
+    "passed": true
+  },
+  {
+    "check": "flushed Pod write visible on Mac",
+    "passed": true
+  },
+  {
+    "check": "updated Mac file visible",
+    "passed": true
+  },
+  {
+    "check": "pod logs",
+    "passed": true
+  },
+  {
+    "check": "kubectl port-forward",
+    "passed": true
+  },
+  {
+    "check": "Helm install/upgrade helm-v1",
+    "passed": true
+  },
+  {
+    "check": "Helm workload helm-v1",
+    "passed": true
+  },
+  {
+    "check": "Helm install/upgrade helm-v2",
+    "passed": true
+  },
+  {
+    "check": "Helm workload helm-v2",
+    "passed": true
+  },
+  {
+    "check": "Helm uninstall",
+    "passed": true
+  },
+  {
+    "check": "mixed Docker/build/Kubernetes memory pressure",
+    "passed": true
+  },
+  {
+    "check": "PVC survives Pod replacement",
+    "passed": true
+  },
+  {
+    "check": "VM stop",
+    "passed": true
+  },
+  {
+    "check": "VM restart",
+    "passed": true
+  },
+  {
+    "check": "traffic recovers after VM restart",
+    "passed": true
+  },
+  {
+    "check": "PVC survives VM restart",
+    "passed": true
+  },
+  {
+    "check": "host UDP after restart",
+    "passed": true
+  },
+  {
+    "check": "ordinary Docker after kind",
+    "passed": true
+  },
+  {
+    "check": "cluster cleanup",
+    "passed": true
+  }
+]

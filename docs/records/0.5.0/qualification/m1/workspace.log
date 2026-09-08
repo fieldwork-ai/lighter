@@ -1,0 +1,421 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/main.rs (target/debug/deps/lighter-70c22b0549d6a3b3)
+
+running 25 tests
+test config::tests::the_defaults_leave_the_mac_usable ... ok
+test config::tests::missing_fields_fall_back_to_defaults ... ok
+test doctor::tests::the_report_names_a_remedy_for_every_failure ... ok
+test config::tests::a_config_round_trips ... ok
+test installation::tests::legacy_is_not_silently_adopted ... ok
+test instance::tests::daemon_child ... ok
+test instance::tests::a_recycled_pid_cannot_be_signalled ... ok
+test machine::legacy_tests::legacy_child ... ok
+test instance::tests::legacy_pid_files_are_not_authority_to_signal ... ok
+test instance::tests::owner_publishes_and_cleans_up_under_the_lock ... ok
+test release::tests::only_stable_versions ... ok
+test installation::tests::copied_marker_cannot_claim_another_prefix ... ok
+test instance::tests::a_record_copied_from_another_home_is_not_its_owner ... ok
+test updates::tests::background_downloads_require_opt_in_and_back_off ... ok
+test updates::tests::release_origin_and_channel_are_checked ... ok
+test installation::tests::brew_receipt_and_marker_must_agree ... ok
+test release::tests::rejects_links_before_extraction ... ok
+test upgrade::tests::activation_excludes_concurrent_start ... ok
+test release::tests::payload_tampering_and_missing_artifacts_fail_closed ... ok
+test instance::tests::a_directly_started_owner_can_be_found_and_stopped ... ok
+test release::tests::extraction_rejects_traversal_absolute_paths_and_duplicate_files ... ok
+test upgrade::tests::an_in_flight_update_cannot_replace_a_newer_selection ... ok
+test doctor::tests::every_check_can_say_what_to_do ... ok
+test upgrade::tests::selector_never_mixes_release_paths ... ok
+test machine::legacy_tests::legacy_peer_is_authenticated_and_shutdown_keeps_replacement_paths ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running unittests src/lib.rs (target/debug/deps/lighter_docker-2a377ef6bcc840c3)
+
+running 17 tests
+test http::tests::cancelling_a_finished_stream_does_not_shutdown_a_reused_fd ... ok
+test tests::a_missing_address_means_every_interface ... ok
+test tests::a_published_binding_prints_as_its_socket_address ... ok
+test http::tests::event_headers_can_be_cancelled_before_the_body_exists ... ok
+test tests::handles_containers_with_no_ports_and_a_missing_key ... ok
+test http::tests::finite_json_accepts_length_and_chunked_bodies ... ok
+test tests::ignores_exposed_but_unpublished_ports ... ok
+test tests::keeps_both_families_of_one_publish ... ok
+test tests::keeps_the_bind_address ... ok
+test tests::keeps_udp_and_skips_what_nothing_carries ... ok
+test tests::reads_a_published_port ... ok
+test tests::reads_several_containers ... ok
+test http::tests::a_blocked_write_has_a_deadline_too ... ok
+test http::tests::a_stalled_response_obeys_the_callers_deadline ... ok
+test http::tests::event_headers_have_a_deadline_even_without_cancellation ... ok
+test http::tests::established_event_body_outlives_setup_deadline_and_is_cancellable ... ok
+test http::tests::trickled_headers_and_bodies_do_not_extend_the_deadline ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running unittests src/lib.rs (target/debug/deps/lighter_fs-26e1706451644eb7)
+
+running 59 tests
+test cache::tests::zero_everywhere_reads_as_caching_off ... ok
+test cache::tests::a_quiet_directory_gets_the_configured_validity ... ok
+test cache::tests::the_lifetime_depends_on_being_able_to_take_it_back ... ok
+test cache::tests::a_lost_watch_cannot_be_reenabled_by_late_feature_negotiation ... ok
+test errno::tests::an_unknown_errno_becomes_eio ... ok
+test cache::tests::an_idle_host_costs_no_lock ... ok
+test cache::tests::a_touched_directory_is_not_cacheable_at_all ... ok
+test errno::tests::eagain_and_edeadlk_cross_over ... ok
+test errno::tests::the_divergent_values_are_mapped ... ok
+test errno::tests::the_shared_prefix_passes_through ... ok
+test fuse::tests::a_dirent_that_would_overrun_its_budget_is_refused ... ok
+test fsevents::tests::lost_event_detail_requests_one_rescan_per_callback ... ok
+test fuse::tests::an_entry_encodes_to_the_size_the_kernel_expects ... ok
+test fuse::tests::attributes_encode_to_the_size_the_kernel_expects ... ok
+test fuse::tests::dirents_are_padded_to_eight_bytes ... ok
+test fuse::tests::truncated_input_decodes_to_none_rather_than_panicking ... ok
+test fuse::tests::two_names_are_split_at_their_terminators ... ok
+test inode::tests::a_parked_inode_comes_back ... ok
+test inode::tests::a_batched_or_excessive_forget_does_not_underflow ... ok
+test inode::tests::a_parked_inode_does_not_survive_deletion ... ok
+test inode::tests::a_reinserted_file_gets_a_new_nodeid ... ok
+test inode::tests::a_parked_inode_survives_being_renamed ... ok
+test inode::tests::a_parked_inode_whose_name_was_taken_is_stale ... ok
+test inode::tests::a_reused_inode_number_does_not_alias_onto_the_dead_file ... ok
+test inode::tests::handle_numbers_are_not_recycled ... ok
+test inode::tests::an_inode_survives_until_every_lookup_is_forgotten ... ok
+test inode::tests::the_descriptor_budget_leaves_room ... ok
+test inode::tests::an_unlinked_inode_is_never_parked ... ok
+test inode::tests::handles_are_issued_and_released ... ok
+test inode::tests::the_root_cannot_be_forgotten ... ok
+test notify::tests::a_reset_withdraws_earlier_messages_but_preserves_later_changes ... ok
+test notify::tests::a_waker_is_called_when_something_arrives ... ok
+test notify::tests::an_entry_notification_carries_a_terminated_name ... ok
+test inode::tests::the_descriptor_tally_survives_park_and_revive ... ok
+test notify::tests::an_inode_notification_covers_the_whole_file ... ok
+test notify::tests::an_unsent_message_goes_back_to_the_front ... ok
+test notify::tests::messages_come_back_in_the_order_they_went_in ... ok
+test opencache::tests::a_cached_descriptor_comes_back ... ok
+test opencache::tests::a_read_only_descriptor_is_a_miss_for_a_write ... ok
+test opencache::tests::an_evicted_descriptor_stays_alive_for_its_current_user ... ok
+test opencache::tests::eviction_removes_what_it_is_asked_to ... ok
+test inode::tests::one_host_file_is_one_nodeid_however_many_names ... ok
+test stats::tests::an_unnamed_opcode_is_still_counted ... ok
+test stats::tests::counts_and_times_are_grouped_by_opcode ... ok
+test sys::tests::a_descriptor_reports_its_own_path ... ok
+test sys::tests::append_does_not_become_truncate ... ok
+test sys::tests::create_exclusive_translates_whole ... ok
+test sys::tests::directory_and_nofollow_survive_translation ... ok
+test sys::tests::escaping_names_are_refused ... ok
+test sys::tests::flags_macos_lacks_are_dropped ... ok
+test sys::tests::sparse_seek_constants_are_not_the_same_number ... ok
+test sys::tests::the_access_mode_is_the_low_two_bits_on_both_systems ... ok
+test notify::tests::the_backlog_is_bounded ... ok
+test cache::tests::the_cooldown_expires ... ok
+test opencache::tests::the_cache_stays_under_its_limit ... ok
+test cache::tests::the_hot_set_is_swept_rather_than_grown ... ok
+test inode::tests::the_reclaim_keeps_a_share_under_its_budget ... ok
+test inode::tests::a_working_set_hotter_than_the_budget_is_still_bounded ... ok
+test inode::tests::a_share_larger_than_one_sweep_is_still_kept_in_budget ... ok
+
+test result: ok. 59 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.48s
+
+     Running tests/fsevents.rs (target/debug/deps/fsevents-61fe2081af06fa95)
+
+running 4 tests
+test tests::a_rescan_must_follow_the_write_it_is_expected_to_cover ... ok
+test tests::our_own_writes_are_not_reported ... ok
+test tests::a_host_change_is_reported ... ok
+test tests::a_watcher_can_be_dropped_while_events_are_arriving ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.46s
+
+     Running tests/passthrough.rs (target/debug/deps/passthrough-eb340f73636706b7)
+
+running 58 tests
+test a_file_written_by_the_guest_appears_on_the_host ... ok
+test a_forgotten_async_file_leaves_the_registry ... ok
+test a_file_written_by_the_host_is_read_by_the_guest ... ok
+test a_clone_replaces_the_destination_name ... ok
+test a_clone_is_read_through_the_nodeid_the_caller_holds ... ok
+test a_directory_removed_and_remade_is_found_at_once ... ok
+test a_directory_emptied_before_its_creates_landed_can_be_removed ... ok
+test a_chmod_after_a_chmod_reaches_the_host ... ok
+test a_hard_link_shares_its_nodeid ... ok
+test a_forgotten_unlinked_file_leaves_the_registry ... ok
+test a_link_is_acknowledged_and_reaches_the_host ... ok
+test a_large_directory_lists_completely_across_pages ... ok
+test a_forgotten_directory_with_promises_is_found_again_as_itself ... ok
+test a_link_source_survives_being_renamed ... ok
+test a_listing_and_a_lookup_agree_about_inode_numbers ... ok
+test a_listing_in_progress_survives_a_thousand_other_listings ... ok
+test a_listing_names_a_promised_directory_by_its_own_nodeid ... ok
+test a_listing_never_repeats_an_entry ... ok
+test a_promised_directory_survives_being_forgotten ... ok
+test a_read_is_clamped_to_the_buffer_the_guest_supplied ... ok
+test a_parked_directory_is_not_revived_by_creating_inside_it ... ok
+test a_second_exclusive_create_of_a_promised_name_is_eexist ... ok
+test a_temporary_written_and_renamed_is_made_under_its_final_name ... ok
+test a_time_set_after_a_write_outlives_the_write ... ok
+test a_tree_removed_recreated_and_removed_again_is_gone ... ok
+test a_truncated_request_is_an_error_not_a_panic ... ok
+test a_write_after_an_unlink_is_what_getattr_and_read_report ... ok
+test a_parked_file_is_reached_through_its_parent ... ok
+test a_write_only_source_can_be_cloned ... ok
+test acknowledged_writes_are_never_observable_as_missing ... ok
+test an_empty_create_reaches_the_host ... ok
+test an_open_file_survives_being_renamed_on_the_host ... ok
+test an_open_file_survives_being_unlinked ... ok
+test appending_does_not_truncate ... ok
+test atomic_o_trunc_is_never_advertised ... ok
+test a_parked_inode_still_reads_back_what_was_written ... ok
+test concurrent_host_renames_do_not_corrupt_a_listing ... ok
+test create_excl_on_an_existing_file_is_eexist ... ok
+test create_refuses_a_directory ... ok
+test create_refuses_a_symlink ... ok
+test create_reports_whether_it_created ... ok
+test every_pnpm_shape_releases_when_forgotten_by_its_count ... ok
+test distinct_files_have_distinct_inode_numbers_and_one_link ... ok
+test extended_attributes_round_trip ... ok
+test fsync_reaches_the_host_file ... ok
+test fsync_settles_the_apply_queue_before_replying ... ok
+test host_ownership_is_presented_to_the_guest_as_root ... ok
+test listing_parked_clones_revives_none_of_them ... ok
+test listings_show_promises_without_waiting ... ok
+test names_cannot_escape_the_share ... ok
+test promised_attributes_are_what_readers_see ... ok
+test removing_a_non_empty_directory_reports_enotempty ... ok
+test renamed_and_symlinked_files_are_forgotten_cleanly ... ok
+test setattr_can_truncate_without_a_handle ... ok
+test statfs_describes_a_filesystem_with_room_on_it ... ok
+test symlinks_round_trip ... ok
+test two_renames_onto_one_promised_name_land_in_order ... ok
+test the_reclaim_keeps_up_while_the_tree_is_being_walked ... ok
+
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+     Running unittests src/lib.rs (target/debug/deps/lighter_hv-0bd14786bba43bc1)
+
+running 2 tests
+test regs::tests::sysreg_encoding_matches_sdk_values ... ok
+test regs::tests::gpr_index_maps_to_declaration_order ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/lighter_vmm-df99610ed296e151)
+
+running 189 tests
+test bus::tests::rejects_aborts_that_are_not_device_accesses ... ok
+test bus::tests::refuses_to_guess_without_a_syndrome ... ok
+test bus::tests::sign_extension_follows_the_access_width ... ok
+test bus::tests::decodes_access_width_and_direction ... ok
+test bus::tests::unclaimed_addresses_read_zero_rather_than_faulting ... ok
+test bus::tests::rejects_overlapping_windows ... ok
+test clock::tests::the_answer_is_seconds_then_nanos_little_endian ... ok
+test devices::pl011::tests::receive_path_tracks_fifo_emptiness ... ok
+test devices::pl011::tests::interrupt_status_masks_and_clears ... ok
+test bus::tests::dispatches_by_window_and_offsets_relative_to_it ... ok
+test devices::pl011::tests::identifies_as_a_pl011_to_the_amba_bus ... ok
+test dns::tests::aaaa_is_answered_only_where_the_mac_can_route_it ... ok
+test dns::tests::a_question_is_parsed_whole ... ok
+test devices::pl011::tests::guest_writes_reach_the_sink ... ok
+test devices::pl011::tests::input_is_bounded_and_drops_rather_than_growing ... ok
+test dns::tests::a_reply_carries_the_id_the_question_and_the_addresses ... ok
+test dns::tests::the_docker_names_are_the_mac ... ok
+test devices::pl011::tests::sysrq_preserves_the_break_bit_and_key_order ... ok
+test kernel::tests::alignment_is_idempotent_and_rounds_up ... ok
+test kernel::tests::parses_a_real_header_shape ... ok
+test fdt::tests::boots_without_an_initramfs ... ok
+test kernel::tests::rejects_anything_that_is_not_an_image ... ok
+test fdt::tests::produces_a_wellformed_blob ... ok
+test layout::tests::device_window_clears_the_maximum_redistributor_region ... ok
+test layout::tests::rejects_a_redistributor_that_would_swallow_the_devices ... ok
+test layout::tests::virtio_slots_tile_their_window_without_gaps ... ok
+test layout::tests::windows_do_not_overlap ... ok
+test memory::tests::reported_pages_are_recharged_after_guest_reuse ... ignored, requires a signed test binary and Hypervisor.framework
+test memory::tests::region_bounds ... ok
+test fdt::tests::virtio_slots_are_declared_lowest_first ... ok
+test memory::tests::primitives_work_at_every_alignment_and_stay_in_bounds ... ok
+test memory_policy::tests::a_resize_updates_the_device_without_a_new_pressure_event ... ok
+test memory_policy::tests::each_level_asks_for_a_sensible_share ... ok
+test memory::tests::reporting_merges_adjacent_fragments_but_not_gaps ... ok
+test memory_policy::tests::large_guests_reach_the_cap_within_32_polls_and_recover ... ok
+test memory::tests::a_single_reported_host_page_is_zeroed_and_edges_are_preserved ... ok
+test memory_policy::tests::guest_need_vetoes_compression_without_disabling_host_pressure ... ok
+test memory_policy::tests::pressure_floors_follow_the_plugged_memory ... ok
+test memory_policy::tests::steering_steps_up_while_compressing_and_eases_when_quiet ... ok
+test memory_policy::tests::the_levels_are_ordered_and_distinct ... ok
+test memory_policy::tests::the_statistics_struct_is_the_kernels_size ... ok
+test memory_policy::tests::unplugging_the_range_bounds_an_existing_steering_target ... ok
+test net::tests::a_forwarded_v6_reply_is_readdressed_to_the_guest ... ok
+test net::tests::a_discover_gets_an_offer_and_a_request_an_ack_with_the_lease ... ok
+test net::tests::a_listener_report_is_housekeeping_not_a_drop ... ok
+test net::tests::a_reply_off_the_host_socket_becomes_a_frame_to_the_guest ... ok
+test net::tests::a_neighbour_solicitation_for_the_gateway_is_advertised ... ok
+test net::tests::a_solicitation_for_another_address_is_housekeeping ... ok
+test net::tests::echo_to_the_gateway_comes_straight_back_with_its_payload ... ok
+test net::tests::echo_to_the_v6_gateway_is_answered_and_elsewhere_forwarded ... ok
+test net::tests::the_gateway_and_the_host_alias_answer_arp_and_nothing_else_does ... ok
+test net::tests::the_guest_mac_is_the_one_the_lease_is_keyed_on ... ok
+test net::tests::what_has_a_stream_is_dropped_in_either_family ... ok
+test psci::tests::decodes_both_calling_conventions ... ok
+test psci::tests::return_codes_sign_extend_the_way_the_guest_reads_them ... ok
+test psci::tests::unknown_functions_are_refused_not_guessed ... ok
+test psci::tests::version_is_one_point_one ... ok
+test reactor::tests::a_header_round_trips_through_its_bytes ... ok
+test reactor::tests::a_v6_header_carries_sixteen_bytes ... ok
+test reactor::tests::the_gateway_and_the_host_alias_are_the_mac ... ok
+test rosetta::tests::a_window_is_only_found_between_nuls ... ok
+test rosetta::tests::sha256_matches_a_known_vector ... ok
+test reactor::tests::a_full_backlog_drops_new_frames_whole ... ok
+test reactor::tests::a_nonblocking_connect_to_a_closed_port_reports_the_refusal ... ok
+test reactor::tests::a_framed_batch_beyond_the_credit_is_finished_when_credit_returns ... ok
+test reactor::tests::frames_arriving_behind_a_backlog_queue_behind_it_in_order ... ok
+test sockbuf::tests::a_unix_socket_is_widened_past_the_default ... ok
+test streams::tests::a_v4_header_names_its_address_and_port ... ok
+test streams::tests::a_v6_header_carries_sixteen_bytes ... ok
+test streams::tests::an_unknown_family_is_refused ... ok
+test smp::tests::power_on_reports_the_states_linux_probes_for ... ok
+test smp::tests::core_zero_starts_on_and_others_start_off ... ok
+test smp::tests::a_core_that_powers_off_can_be_started_again ... ok
+test smp::tests::a_parked_core_wakes_with_its_start_request ... ok
+test streams::tests::the_agent_dials_where_docker_bound ... ok
+test streams::tests::the_gateway_and_the_host_alias_are_the_mac ... ok
+test smp::tests::shutdown_releases_parked_cores ... ok
+test streams::tests::the_localhost_scope_keeps_every_interface_publishes_on_loopback ... ok
+test sysreg::tests::decodes_every_field_independently ... ok
+test sysreg::tests::decodes_the_trap_that_stopped_the_first_boot ... ok
+test streams::tests::both_families_of_one_port_bind_side_by_side ... ok
+test sysreg::tests::os_lock_registers_are_all_recognised ... ok
+test sysreg::tests::reads_are_answered_with_zero_and_writes_are_dropped ... ok
+test sysreg::tests::unknown_registers_are_answered_rather_than_fatal ... ok
+test vcpu::tests::affinity_ignores_the_res1_bit_and_upper_levels ... ok
+test virtio::balloon::tests::ballooned_bytes_counts_in_four_kib_pages ... ok
+test virtio::balloon::tests::config_reports_target_and_actual ... ok
+test virtio::balloon::tests::offers_free_page_reporting ... ok
+test virtio::balloon::tests::page_frames_coalesce_into_contiguous_runs ... ok
+test virtio::block::tests::config_reads_past_the_end_are_zero_filled ... ok
+test virtio::block::tests::a_read_only_disk_advertises_ro ... ok
+test virtio::block::tests::discard_requires_negotiation ... ok
+test virtio::block::tests::a_header_alone_is_refused ... ok
+test virtio::block::tests::reports_capacity_in_sectors ... ok
+test virtio::block::tests::offers_discard_so_the_disk_can_shrink ... ok
+test rosetta::tests::the_installed_rosetta_carries_the_key ... ok
+test virtio::disk::tests::accesses_past_the_end_are_refused ... ok
+test virtio::disk::tests::a_new_image_is_logically_large_and_physically_empty ... ok
+test virtio::disk::tests::read_only_disks_refuse_every_mutation ... ok
+test virtio::block::tests::several_queues_are_advertised_with_mq ... ok
+test virtio::fs::tests::a_tag_too_long_for_the_config_space_is_refused ... ok
+test virtio::mem::tests::plug_and_unplug_track_the_blocks ... ok
+test virtio::mem::tests::requested_is_whole_blocks_within_the_range ... ok
+test virtio::disk::tests::write_zeroes_without_unmap_still_zeroes ... ok
+test virtio::mem::tests::the_base_is_a_quarter_and_a_gigabyte_at_least ... ok
+test virtio::mmio::tests::advertises_modern_virtio ... ok
+test virtio::mmio::tests::activation_happens_once_when_the_driver_is_ready ... ok
+test virtio::mmio::tests::config_space_reads_are_byte_addressable ... ok
+test virtio::mmio::tests::driver_features_accumulate_across_both_halves ... ok
+test virtio::mmio::tests::feature_word_is_selectable_in_halves ... ok
+test virtio::mmio::tests::interrupt_status_is_write_one_to_clear ... ok
+test virtio::disk::tests::round_trips_data ... ok
+test virtio::mmio::tests::notifications_before_driver_ok_are_refused ... ok
+test virtio::mmio::tests::ring_addresses_assemble_from_two_halves ... ok
+test virtio::mmio::tests::writing_zero_to_status_resets_the_device ... ok
+test virtio::net::tests::config_reports_mac_link_and_mtu ... ok
+test virtio::net::tests::does_not_advertise_offloads_it_cannot_perform ... ok
+test virtio::net::tests::header_length_is_the_version_1_size ... ok
+test virtio::net::tests::outbox_takes_a_batch_and_reports_a_park ... ok
+test virtio::net::tests::outbox_is_bounded_by_bytes ... ok
+test virtio::poll::tests::a_kick_before_the_wait_is_remembered ... ok
+test virtio::net::tests::receive_backlog_is_bounded ... ok
+test footprint::tests::a_running_process_has_a_footprint ... ok
+test virtio::queue::tests::a_batch_of_exactly_one_ring_still_owes_the_interrupt ... ignored
+test virtio::queue::tests::a_descriptor_loop_terminates ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::a_head_cannot_be_returned_twice ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::a_packed_chain_is_taken_with_its_buffer_id ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::a_packed_check_moves_the_cursor_even_when_interrupts_are_disabled ... ignored
+test virtio::queue::tests::a_packed_completion_publishes_the_id_and_advances_by_the_chain ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::a_packed_descriptor_from_the_last_lap_is_not_available ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::a_packed_indirect_table_expands_to_its_entries ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::a_queue_with_no_rings_is_not_ready ... ok
+test virtio::queue::tests::an_out_of_range_head_is_consumed_not_retried ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::geometry_must_be_a_power_of_two ... ok
+test virtio::queue::tests::indirect_descriptors_are_followed ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::pops_a_single_descriptor_chain ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::disk::tests::punching_a_hole_returns_space_to_the_host ... ok
+test virtio::queue::tests::reset_restores_the_cursor_as_well_as_the_geometry ... ok
+test virtio::queue::tests::suppression_writes_the_event_index_when_it_is_negotiated ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::the_event_check_is_an_interval_and_survives_the_wrap ... ok
+test virtio::queue::tests::used_ring_records_head_and_written_length ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::queue::tests::walks_a_multi_descriptor_chain_in_order ... ignored, needs the hypervisor entitlement; run via `make test-hv`
+test virtio::rng::tests::identifies_as_an_entropy_source ... ok
+test virtio::serviced_tests::a_single_queue_names_only_itself ... ok
+test virtio::rng::tests::the_host_pool_is_readable ... ok
+test virtio::serviced_tests::combining_two_queues_names_both ... ok
+test virtio::serviced_tests::nothing_serviced_is_nothing_to_interrupt_about ... ok
+test virtio::vsock::credit::tests::a_full_peer_buffer_stalls_rather_than_overruns ... ok
+test virtio::vsock::credit::tests::a_peer_reporting_more_consumed_than_we_sent_stalls_safely ... ok
+test virtio::vsock::credit::tests::accounting_survives_the_counters_wrapping ... ok
+test virtio::vsock::credit::tests::available_shrinks_as_we_send_and_recovers_as_the_peer_consumes ... ok
+test virtio::vsock::credit::tests::our_own_consumed_count_is_what_we_publish ... ok
+test virtio::vsock::credit::tests::sends_nothing_before_the_peer_has_advertised_anything ... ok
+test virtio::vsock::packet::tests::header_is_forty_four_bytes ... ok
+test virtio::vsock::packet::tests::rejects_a_length_longer_than_the_buffer ... ok
+test virtio::vsock::packet::tests::rejects_a_short_header ... ok
+test virtio::vsock::packet::tests::round_trips_through_the_wire_format ... ok
+test virtio::vsock::packet::tests::unknown_operations_become_invalid_rather_than_panicking ... ok
+test virtio::vsock::tests::a_failed_pump_write_returns_the_guest_buffers ... ok
+test virtio::vsock::tests::a_full_shutdown_closes_the_connection ... ok
+test virtio::vsock::tests::a_guest_initiated_connection_is_refused_explicitly ... ok
+test virtio::vsock::tests::a_partial_completion_wakes_a_parked_deliverer ... ok
+test virtio::vsock::tests::a_payload_larger_than_the_buffer_is_split_not_truncated ... ok
+test virtio::vsock::tests::a_reset_removes_the_connection ... ok
+test virtio::vsock::tests::a_response_establishes_the_connection ... ok
+test virtio::vsock::tests::a_send_only_shutdown_keeps_the_connection_open ... ok
+test virtio::vsock::tests::abort_after_peer_half_close_still_closes_our_write_direction ... ok
+test virtio::vsock::tests::acknowledging_delivery_advances_credit_and_tells_the_guest ... ok
+test virtio::vsock::tests::config_space_reports_the_guest_cid ... ok
+test virtio::vsock::tests::data_for_an_unknown_connection_is_reset_rather_than_dropped ... ok
+test virtio::vsock::tests::full_shutdown_drains_queued_and_inflight_responses_before_reset ... ok
+test virtio::vsock::tests::guest_data_is_buffered_rather_than_written_inline ... ok
+test virtio::vsock::packet::tests::rejects_a_payload_over_the_maximum ... ok
+test virtio::net::tests::closing_the_outbox_releases_a_taker ... ok
+test virtio::vsock::tests::opening_a_connection_queues_a_request ... ok
+test virtio::vsock::tests::receive_half_close_stops_input_but_keeps_output_until_send_close ... ok
+test virtio::vsock::tests::reset_returns_queued_guest_buffers_but_not_a_writers_live_batch ... ok
+test virtio::vsock::tests::sending_on_a_closed_connection_reports_failure ... ok
+test virtio::vsock::tests::sending_respects_the_peers_credit ... ok
+test virtio::vsock::tests::the_writer_is_told_to_finish_after_a_half_close ... ok
+test virtio::vsock::tests::the_writer_receives_what_the_guest_sent ... ok
+test virtio::fs::tests::queue_indices_do_not_overlap ... ok
+test virtio::poll::tests::stopping_releases_a_waiter ... ok
+test virtio::poll::tests::a_kick_wakes_a_waiter ... ok
+test virtio::vsock::tests::host_read_is_cancelled_by_local_receive_shutdown ... ok
+test virtio::vsock::tests::host_read_waits_for_data_then_observes_half_close ... ok
+test virtio::fs::tests::config_reads_past_the_end_are_zero_rather_than_out_of_bounds ... ok
+test virtio::fs::tests::the_tag_is_advertised_nul_padded ... ok
+test workers::tests::a_finished_thread_is_reused ... ok
+
+test result: ok. 174 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+   Doc-tests lighter_docker
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lighter_fs
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lighter_hv
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lighter_vmm
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,51 @@
+==> Fetching downloads for: fieldwork-ai/tap/lighter
+==> Would upgrade 1 requested outdated package
+fieldwork-ai/tap/lighter 0.4.2 -> 0.5.0
+✔︎ Formula lighter (0.5.0)
+==> Upgrading fieldwork-ai/tap/lighter
+  0.4.2 -> 0.5.0 
+[34m==>[0m [1m/usr/bin/codesign --verify --strict /opt/homebrew/Cellar/lighter/0.5.0/bin/l[0m
+[34m==>[0m [1m/usr/bin/codesign --verify --strict --deep /opt/homebrew/Cellar/lighter/0.5.[0m
+🍺  /opt/homebrew/Cellar/lighter/0.5.0: 20 files, 2.2GB, built in 3 seconds
+==> Caveats
+==> lighter
+Start it, and point the Docker CLI at it:
+
+  lighter start
+
+To have it start when you log in:
+
+  lighter install
+
+If anything is wrong, this says what:
+
+  lighter doctor
+
+To start fieldwork-ai/tap/lighter now and restart at login:
+  brew services start fieldwork-ai/tap/lighter
+Or, if you don't want/need a background service you can just run:
+  /opt/homebrew/opt/lighter/bin/lighter run
+==> Upgraded 1 requested outdated package
+fieldwork-ai/tap/lighter 0.4.2 -> 0.5.0
+==> Postinstalling lighter
+[34m==>[0m [1m/usr/bin/codesign --verify --strict /opt/homebrew/Cellar/lighter/0.5.0/bin/l[0m
+[34m==>[0m [1m/usr/bin/codesign --verify --strict --deep /opt/homebrew/Cellar/lighter/0.5.[0m
+==> Postinstalling lighter
+[34m==>[0m [1m/usr/bin/codesign --verify --strict /opt/homebrew/Cellar/lighter/0.5.0/bin/l[0m
+[34m==>[0m [1m/usr/bin/codesign --verify --strict --deep /opt/homebrew/Cellar/lighter/0.5.[0m
+  installation  Homebrew; /opt/homebrew/Cellar/lighter/0.5.0/bin/lighter
+  CLI version   0.5.0
+  installed     0.5.0
+  kernel image  6.18.49
+  running       stopped or unknown
+lighter is not running.
+Already up to date (0.5.0).
+Warning: test is a developer command, so Homebrew's
+developer mode has been automatically turned on.
+To turn developer mode off, run:
+  brew developer off
+
+==> Testing fieldwork-ai/tap/lighter
+[34m==>[0m [1m/opt/homebrew/Cellar/lighter/0.5.0/bin/lighter --help[0m
+[34m==>[0m [1m/opt/homebrew/Cellar/lighter/0.5.0/bin/lighter doctor[0m
+PASS: Homebrew upgrade, repeated metadata registration, signed payload preservation, and direct-update refusal

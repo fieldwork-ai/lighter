@@ -41,6 +41,18 @@ impl Finding {
 /// Runs every check.
 pub fn run() -> Vec<Finding> {
     let mut findings = Vec::new();
+    findings.push(match crate::installation::current() {
+        Ok(_) => Finding::good("installation", crate::installation::describe()),
+        Err(error) => Finding::bad(
+            "installation",
+            format!("conflicting metadata: {error}"),
+            "repair this installation using its original installer before updating",
+        ),
+    });
+    findings.push(Finding::good(
+        "release versions",
+        crate::installation::version_report().trim(),
+    ));
 
     findings.push(if lighter_hv::hv_supported() {
         Finding::good("hardware virtualization", "supported")

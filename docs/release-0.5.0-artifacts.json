@@ -1,0 +1,34 @@
+{
+  "archive_sha256": "4da3fca84dbaf6d1ede81d682efbb52df64db438cfeef9679d3e60eb05e8df52",
+  "bootstrap_sha256": "594b09e923358787fed3c67788fa95a6d76f172b8132daae3e55d64982b9438a",
+  "benchmark_source": "1b0caabf34fbe359f11cd47cc87ce45dc8583682",
+  "runtime_source": "66897086c3702b75d79cb6fcfed7736842b80780",
+  "guest": {
+    "Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+    "rootfs.ext4": "84cad61484b67dec2875c4bd8a812377e4ce76157dd0c78e5ab14c45d4505b44"
+  },
+  "unsigned_code": {
+    "bin/lighter": "7e9946fecdd28e0785d2839b3aee1a4b9f596b24e9963034d330cc8b280c2fdb",
+    "share/lighter/lighter.app/Contents/MacOS/lighter": "7e9946fecdd28e0785d2839b3aee1a4b9f596b24e9963034d330cc8b280c2fdb"
+  },
+  "release_source": "fe9370566ae082ff2c0d5b3f642354f6ec388de9",
+  "version": "0.5.0",
+  "notarization_id": "1ebc15c8-badd-4c5b-a621-6db2b2c78cbf",
+  "notarization_status": "Accepted",
+  "staple_validation": "passed",
+  "gatekeeper": "Notarized Developer ID; passed",
+  "developer_team": "N7N6BNF95K",
+  "signed_manifest": {
+    "schema": 1,
+    "version": "0.5.0",
+    "kernel_version": "6.18.49",
+    "data_epoch": 1,
+    "files": {
+      "bin/lighter": "594b09e923358787fed3c67788fa95a6d76f172b8132daae3e55d64982b9438a",
+      "share/lighter/Image": "0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da",
+      "share/lighter/rootfs.ext4": "84cad61484b67dec2875c4bd8a812377e4ce76157dd0c78e5ab14c45d4505b44",
+      "share/lighter/kernel.version": "ca25e5b95574dc33d64bc8cde1d1d04f52dc7d2ffce9cbac79358915618aae67"
+    }
+  },
+  "publication": "Unpublished; staged for dev to main review. Publish immutable assets after merge."
+}

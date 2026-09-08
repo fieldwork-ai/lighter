@@ -17,7 +17,8 @@ Running containers on macOS has traditionally forced a compromise between heavy,
 - **Bespoke storage and filesystem:** In-memory cached reads with macOS `FSEvents` invalidation, event-loss recovery and finite cache leases over `lighter-fs`, paired with an internal `btrfs` disk using reflink clones and inline completions. The [benchmarks below](#benchmarks) measure file-change latency and storage work on both a host share and the guest disk.
 - **Packetless networking:** No userspace TCP/IP stack or virtual network card overhead. Container sockets are bridged to host sockets over vsock, with BPF sockmaps carrying the guest data path where available.
 - **Dynamic memory via virtio-mem:** Sized to what it actually runs. The guest expands for containers and releases unused memory afterward. Nonvolatile owned backing removes duplicate host/guest charges while preserving reclamation.
-- **Measured startup:** Cold-start and first-container timings are recorded on both Macs below. Correct memory accounting adds initialization work that scales with the configured RAM ceiling; the [release comparison](benchmarks/RELEASE-0.4.1.md) records that cost.
+- **Measured startup:** Cold-start and first-container timings for the MacBook Pro M5 are recorded below. Correct memory accounting adds initialization work that scales with the configured RAM ceiling; the [release comparison](benchmarks/RELEASE-0.4.1.md) records that cost.
+- **Local Kubernetes through kind:** One- and two-node arm64 clusters are qualified on M1 and M5. Use standard kind, kubectl and Helm commands; the [guide](docs/kubernetes.md) records tested versions and scope.
 - **No GUI:** A headless daemon or launchd service. Idle CPU and wakeups are measured alongside the other runtimes below.
 - **LTS kernel strategy:** Tracks upstream Linux Longterm Support (LTS) releases with a minimal set of hypervisor-focused patches, updated regularly with upstream point releases.
 
@@ -30,6 +31,12 @@ Running containers on macOS has traditionally forced a compromise between heavy,
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fieldwork-ai/lighter/main/scripts/install.sh | sh
 ```
+
+Updates are explicit: `lighter upgrade` applies a verified release, and a
+running VM requires `lighter upgrade --restart`. Direct installations can
+opt into background downloads with `lighter update auto-download on`;
+downloads never activate themselves. Homebrew installations stay managed by
+Brew. [Installation ownership, migration and update behaviour](docs/updates.md).
 
 ### Or via Homebrew
 
@@ -59,6 +66,26 @@ lighter config      # View or change CPU, memory, and disk allocations
 lighter install     # Register with launchd to start automatically on login
 lighter stop        # Cleanly shut down the machine
 ```
+
+---
+
+## Kubernetes
+
+Run local Kubernetes clusters with kind on Lighter 0.5.0:
+
+```sh
+brew install kind kubectl
+lighter start
+docker context use lighter
+KIND_EXPERIMENTAL_PROVIDER=docker kind create cluster --name dev \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 \
+  --wait 180s
+kubectl --context kind-dev get nodes
+```
+
+Use ordinary kind, kubectl and Helm commands for local development. The
+[setup guide and tested scope](docs/kubernetes.md) cover the pinned version
+matrix, local images, ports, Mac files, persistent volumes and restart behavior.
 
 ---
 
@@ -122,32 +149,40 @@ Kernel releases track upstream Linux LTS point updates, ensuring ongoing securit
 
 ## Benchmarks
 
-Measured against a 1,232-package `package.json` fixture (`benchmarks/`). Timing figures are the median of three timed repetitions, following an untimed warm-up run. Numbers are reported as absolute time and as a percentage of native APFS on the same machine (higher means faster). The first table is the runtime's own disk, where a container's writable layer and its volumes live; the second is a host share, the Mac's directory bind-mounted into the container. Bold marks the fastest runtime in each row; a dash is a case the runtime could not complete.
+Measured with the pinned 1,232-package fixture in `benchmarks/`. Timing rows are medians of three timed repetitions. The harness attempts an untimed installation for each package manager and an untimed npm install to materialize read and metadata inputs. Warm-up and per-repetition setup exit statuses were not retained; each valid timing case requires three successful measured repetitions. Those cases retain all three timings, including a potentially colder first read. Startup has an untimed round. Memory and power rows are single sampling windows.
 
-OrbStack, Colima and Docker Desktop were measured on the same machines. The final lighter M5 record was observed under variable filesystem-daemon/background load; its small differences do not establish performance changes. M1 provides the controlled release comparison. Runtime records are refreshed independently, so their rows can come from different sessions. Recording dates, source commits and artifact hashes for lighter are retained in the `.tree` files beside its CSVs. [Measured run-to-run variation](benchmarks/REPEATABILITY.md) records the same-build storage baseline. [0.4.1 measurements](benchmarks/RELEASE-0.4.1.md) report full records, controlled cache-profile comparisons, startup costs and host background conditions; earlier release comparisons remain archived.
+The MacBook Pro M5 results below use the first valid complete Lighter 0.5.0 suite, selected before looking at results. Two further suites, five fresh same-build storage runs and an alternating comparison rebuilt from 0.4.1/0.5.0 source are retained in [the release measurements](benchmarks/RELEASE-0.5.0.md). Quiet checks precede each stage and competing-VM checks run throughout. Lighter uses eight guest CPUs and 16 GiB guest RAM, including startup tests. [Full M1 results](benchmarks/RELEASE-0.5.0.md#m1--share) remain in the detailed report. Competitor resource settings and actual guest topology are recorded alongside their measurements. Runtime and guest fingerprints, exact tool versions, image IDs and recording dates accompany the raw CSVs.
 
-### Apple M5 Pro (18 cores, 48 GB RAM)
+Native and container installations use the same pinned Node, npm, pnpm and Yarn versions. All container runtimes load identical benchmark images for each architecture. Native macOS and Linux utilities still differ, so the native ratios compare complete workloads rather than isolating filesystem overhead. Absolute times and percentages of native APFS are shown (higher percentages mean faster). The first storage table uses the runtime's own disk; the second uses a Mac directory shared into the container. Bold marks the lowest observed runtime median, without implying statistical significance. A dash means no completed measurement is available.
+
+Docker Desktop is measured with Apple Virtualization.framework, VirtioFS and Rosetta; other Docker Desktop backends are outside this comparison.
+
+The host-edit row measures polling visibility and a round trip; it is not an inotify or `fs.watch` event-delivery measurement.
+
+Docker Desktop's host-share package cleanup failed. The affected install timings and dependent storage/package-load memory results are excluded despite the original harness returning success; its guest-disk and independent cases remain. The release report retains the errors and explicit selection decisions.
+
+### MacBook Pro — Apple M5 Pro (18 cores, 48 GB RAM)
 
 | Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.16 s | **4.58 s** (135%) | 7.01 s (88%) | 8.59 s (72%) | 8.61 s (72%) |
-| `pnpm install` | 3.77 s | 1.14 s (331%) | 2.03 s (185%) | **1.14 s** (332%) | 2.87 s (131%) |
-| `yarn install` | 5.75 s | **4.13 s** (139%) | 5.08 s (113%) | 6.58 s (87%) | 11.14 s (52%) |
-| `ripgrep` (file read) | 927 ms | **95 ms** (976%) | 102 ms (909%) | 121 ms (766%) | 124 ms (748%) |
-| `find` (metadata walk) | 357 ms | **91 ms** (392%) | 127 ms (281%) | 176 ms (203%) | 131 ms (273%) |
-| `cp -a node_modules` | 13.55 s | **889 ms** (1525%) | 1.11 s (1216%) | 1.88 s (722%) | 2.58 s (526%) |
-| `rm -rf node_modules` | 3.65 s | **390 ms** (937%) | 496 ms (737%) | 551 ms (663%) | 428 ms (854%) |
+| `npm ci` | 6.53 s | **4.61 s** (142%) | 6.83 s (96%) | 7.56 s (86%) | 7.96 s (82%) |
+| `pnpm install` | 4.32 s | 1.22 s (355%) | 1.80 s (240%) | **1.06 s** (408%) | 2.75 s (157%) |
+| `yarn install` | 5.89 s | **4.15 s** (142%) | 5.05 s (117%) | 6.00 s (98%) | 10.10 s (58%) |
+| `ripgrep` (file read) | 927 ms | **79 ms** (1173%) | 118 ms (786%) | 115 ms (806%) | 126 ms (736%) |
+| `find` (metadata walk) | 390 ms | **97 ms** (402%) | 129 ms (302%) | 185 ms (211%) | 124 ms (315%) |
+| `cp -a node_modules` | 16.76 s | **937 ms** (1789%) | 1.05 s (1599%) | 1.35 s (1242%) | 2.49 s (673%) |
+| `rm -rf node_modules` | 4.18 s | **387 ms** (1081%) | 473 ms (884%) | 488 ms (857%) | 397 ms (1053%) |
 
 | Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.16 s | **6.46 s** (95%) | 8.49 s (73%) | 17.79 s (35%) | 17.91 s (34%) |
-| `pnpm install` | 3.77 s | **3.82 s** (99%) | 4.72 s (80%) | 25.43 s (15%) | 28.34 s (13%) |
-| `yarn install` | 5.75 s | **5.34 s** (108%) | 7.79 s (74%) | 22.16 s (26%) | 22.58 s (25%) |
-| `ripgrep` (file read) | 927 ms | **96 ms** (966%) | 1.02 s (91%) | 6.86 s (14%) | 9.84 s (9%) |
-| `find` (metadata walk) | 357 ms | **91 ms** (392%) | 595 ms (60%) | 1.43 s (25%) | 1.88 s (19%) |
-| `cp -a node_modules` | 13.55 s | **3.90 s** (348%) | 8.71 s (156%) | 44.30 s (31%) | 33.55 s (40%) |
-| `rm -rf node_modules` | 3.65 s | **2.48 s** (148%) | 2.97 s (123%) | 8.05 s (45%) | 6.56 s (56%) |
-| Host file edit -> container | 2 ms | **3 ms** | — | 1.00 s | 1.00 s |
+| `npm ci` | 6.53 s | **6.30 s** (104%) | 8.53 s (77%) | 17.89 s (36%) | — |
+| `pnpm install` | 4.32 s | **3.86 s** (112%) | 4.93 s (88%) | 25.95 s (17%) | — |
+| `yarn install` | 5.89 s | **5.12 s** (115%) | 7.97 s (74%) | 22.81 s (26%) | — |
+| `ripgrep` (file read) | 927 ms | **91 ms** (1019%) | 1.00 s (93%) | 3.02 s (31%) | — |
+| `find` (metadata walk) | 390 ms | **95 ms** (411%) | 452 ms (86%) | 1.46 s (27%) | — |
+| `cp -a node_modules` | 16.76 s | **3.59 s** (467%) | 9.58 s (175%) | 41.95 s (40%) | — |
+| `rm -rf node_modules` | 4.18 s | **2.64 s** (158%) | 3.35 s (125%) | 8.38 s (50%) | — |
+| Host file edit -> container | 1 ms | 6 ms | 11 ms | **2 ms** | 3 ms |
 
 #### Memory footprint
 
@@ -155,26 +190,26 @@ The macOS physical-footprint charge for the runtime's own processes, correspondi
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Idle, a minute after start | **303 MiB** | 1197 MiB | 11361 MiB | 2111 MiB |
-| Peak through an npm install | **4085 MiB** | 5498 MiB | 8700 MiB | 9182 MiB |
-| 15 s after it ends | **817 MiB** | 2850 MiB | 8735 MiB | 9187 MiB |
-| 60 s after it ends | **846 MiB** | 2114 MiB | 8735 MiB | 9187 MiB |
+| Idle, a minute after start | **365 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
+| Peak through an npm install | **4386 MiB** | 5699 MiB | 10054 MiB | — |
+| 15 s after it ends | **936 MiB** | 2776 MiB | 10145 MiB | — |
+| 60 s after it ends | **936 MiB** | 1720 MiB | 10149 MiB | — |
 
 #### The network
 
-iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Connection rate counts client TCP handshakes; it is not completed HTTP requests per second. Bold marks the best runtime in each row.
+iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Connection rate counts client TCP handshakes; it is not completed HTTP requests per second. Throughput uses iperf’s received summary where available. Docker Desktop’s zero UDP receiver result was separately checked with raw JSON on this tested path. Bold marks the highest observed throughput or lowest latency, without a significance claim.
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 123.5 | 94.0 | **97.2** | 4.5 | 23.2 |
-| TCP, the Mac to a container | Gbit/s | 129.2 | **87.6** | 52.9 | 3.9 | 14.3 |
-| TCP into a published port | Gbit/s | — | **87.0** | 54.2 | 3.8 | 14.3 |
-| TCP out of a published port | Gbit/s | — | **94.4** | 93.1 | 4.4 | 33.4 |
-| UDP, container to the Mac | Gbit/s | 21.8 | **5.0** | 3.1 | 3.3 | 0.0 |
-| connects to a published port | thousand per second | 26.0 | **17.4** | 16.2 | 15.8 | 17.0 |
-| GET on a published port, median | µs | 40 | **61** | 73 | 224 | 119 |
-| GET on a published port, p99 | µs | 70 | 180 | **119** | 361 | 245 |
-| DNS lookup from a container, median | µs | 2850 | **38** | 251 | 483 | 474 |
+| TCP, container to the Mac | Gbit/s | 124.1 | 92.5 | **95.1** | 4.5 | 24.5 |
+| TCP, the Mac to a container | Gbit/s | 131.2 | **84.9** | 51.5 | 4.0 | 14.7 |
+| TCP into a published port | Gbit/s | — | **83.8** | 52.3 | 3.9 | 14.5 |
+| TCP out of a published port | Gbit/s | — | **88.8** | 88.3 | 4.2 | 32.5 |
+| UDP, container to the Mac | Gbit/s | 21.1 | **5.0** | 3.0 | 3.1 | 0.0 |
+| connects to a published port | thousand per second | 26.6 | 16.8 | **21.2** | 16.1 | 15.7 |
+| GET on a published port, median | µs | 40 | **60** | 74 | 229 | 125 |
+| GET on a published port, p99 | µs | 68 | 154 | **132** | 366 | 232 |
+| DNS lookup from a container, median | µs | 5611 | **37** | 262 | 481 | 513 |
 
 #### Idle power
 
@@ -182,8 +217,8 @@ After a quiet minute, a minute of powermetrics samples over the runtime's proces
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| CPU, ms per second | 4 | **2** | 5 | 25 |
-| Wakeups per second | 57 | 99 | **50** | 3748 |
+| CPU, ms per second | 3 | **2** | 4 | 36 |
+| Wakeups per second | 61 | 120 | **41** | 3873 |
 
 #### Starting up
 
@@ -191,8 +226,8 @@ From a cold stop, the runtime asked to start the way a person would (`lighter st
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Start until docker answers | **1.3 s** | 1.5 s | 11.8 s | 2.1 s |
-| Start until the first container has run | **1.5 s** | 1.9 s | 12.0 s | 2.4 s |
+| Start until docker answers | 1.6 s | **1.1 s** | 8.8 s | 1.8 s |
+| Start until the first container has run | 1.8 s | **1.4 s** | 9.0 s | 2.1 s |
 
 #### x86-64 images
 
@@ -200,91 +235,12 @@ The same runtimes running `linux/amd64` images on their own disk: an install tha
 
 | Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 4.58 s | **9.22 s** | 13.16 s | 12.71 s | 14.45 s |
-| `pnpm install` | 1.14 s | 2.70 s | 4.44 s | **2.70 s** | 3.89 s |
-| `sha256sum` of 1 GiB | 3.00 s | **4.19 s** | 8.01 s | 4.30 s | 4.44 s |
-| container start, `alpine true` | 147 ms | **154 ms** | 280 ms | 180 ms | 165 ms |
+| `npm ci` | 4.61 s | **9.24 s** | 13.14 s | 12.73 s | 14.28 s |
+| `pnpm install` | 1.22 s | **2.73 s** | 3.58 s | 2.85 s | 3.85 s |
+| `sha256sum` of 1 GiB | 3.01 s | **4.22 s** | 7.92 s | 4.26 s | 4.39 s |
+| container start, `alpine true` | 152 ms | **155 ms** | 244 ms | 185 ms | 170 ms |
 
-### Apple M1 (8 cores, 8 GB RAM)
-
-| Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|---|
-| `npm ci` | 7.81 s | **7.54 s** (104%) | 9.67 s (81%) | 11.44 s (68%) | 12.60 s (62%) |
-| `pnpm install` | 4.38 s | 1.67 s (263%) | 2.40 s (182%) | **1.57 s** (278%) | 2.23 s (197%) |
-| `yarn install` | 10.44 s | **7.81 s** (134%) | 7.87 s (133%) | 10.80 s (97%) | 11.74 s (89%) |
-| `ripgrep` (file read) | 1.21 s | 159 ms (760%) | **143 ms** (845%) | 171 ms (707%) | 260 ms (465%) |
-| `find` (metadata walk) | 510 ms | **124 ms** (411%) | 138 ms (370%) | 214 ms (238%) | 152 ms (336%) |
-| `cp -a node_modules` | 24.53 s | 3.03 s (810%) | **2.49 s** (986%) | 2.71 s (905%) | 6.20 s (396%) |
-| `rm -rf node_modules` | 5.38 s | **574 ms** (937%) | 667 ms (806%) | 829 ms (649%) | 592 ms (908%) |
-
-| Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|---|
-| `npm ci` | 7.81 s | **10.88 s** (72%) | 11.25 s (69%) | 23.00 s (34%) | 25.46 s (31%) |
-| `pnpm install` | 4.38 s | 6.21 s (70%) | **5.91 s** (74%) | — | 45.94 s (10%) |
-| `yarn install` | 10.44 s | 11.20 s (93%) | **10.43 s** (100%) | 28.11 s (37%) | 35.44 s (29%) |
-| `ripgrep` (file read) | 1.21 s | **431 ms** (281%) | 1.09 s (110%) | 15.36 s (8%) | 13.15 s (9%) |
-| `find` (metadata walk) | 510 ms | **126 ms** (405%) | 525 ms (97%) | 3.81 s (13%) | 4.10 s (12%) |
-| `cp -a node_modules` | 24.53 s | **7.42 s** (331%) | 16.13 s (152%) | 59.57 s (41%) | 45.90 s (53%) |
-| `rm -rf node_modules` | 5.38 s | **2.62 s** (206%) | 3.92 s (137%) | 12.45 s (43%) | 12.82 s (42%) |
-| Host file edit -> container | 2 ms | **2 ms** | 3 ms | **2 ms** | 12 ms |
-
-#### Memory footprint
-
-The macOS physical-footprint charge for the runtime's own processes, corresponding to Activity Monitor's "Memory" column: idle a minute after a cold start, the peak during an `npm ci`, and 15 and 60 seconds after it ends. Lower is better. This includes compressed-memory charges and is not a count of distinct resident RAM. lighter 0.4.1 removes the duplicate charge when host and guest access the same backing pages, while preserving physical reclamation and charging reused pages again. This accounting correction does not imply an equivalent reduction in physical RAM. The idle and after rows include retained guest cache and host allocations. Configured RAM limits guest memory; host allocations add overhead. [Accounting and real-build experiments](docs/memory-accounting-2026-09-06.md) document the fix, compression and recovery at smaller configurations.
-
-| Reading | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|
-| Idle, a minute after start | **242 MiB** | 733 MiB | 1145 MiB | 1753 MiB |
-| Peak through an npm install | **4098 MiB** | 4302 MiB | 4364 MiB | 4505 MiB |
-| 15 s after it ends | **834 MiB** | 1876 MiB | 4337 MiB | 4473 MiB |
-| 60 s after it ends | **828 MiB** | 1480 MiB | 4337 MiB | 4472 MiB |
-
-#### The network
-
-iperf3 between a container and the Mac in both directions, on the path a container sees (its egress to the Mac's LAN address) and on the path the Mac sees (a published port on localhost); then connection setup, request latency on a kept-alive connection, and DNS from inside a container. Connection rate counts client TCP handshakes; it is not completed HTTP requests per second. Bold marks the best runtime in each row.
-
-| Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 117.7 | 57.3 | **64.9** | 4.3 | 13.6 |
-| TCP, the Mac to a container | Gbit/s | 117.0 | **50.0** | 29.2 | 3.2 | 10.1 |
-| TCP into a published port | Gbit/s | — | **49.1** | 29.9 | 3.1 | 10.1 |
-| TCP out of a published port | Gbit/s | — | 55.4 | **67.6** | 3.8 | 22.2 |
-| UDP, container to the Mac | Gbit/s | 24.4 | **5.0** | 3.1 | 2.6 | 0.0 |
-| connects to a published port | thousand per second | 24.9 | 15.2 | 16.4 | 7.9 | **17.7** |
-| GET on a published port, median | µs | 54 | 132 | **127** | 453 | 153 |
-| GET on a published port, p99 | µs | 106 | 247 | **221** | 574 | 372 |
-| DNS lookup from a container, median | µs | 3876 | **120** | 425 | 686 | 758 |
-
-#### Idle power
-
-After a quiet minute, a minute of powermetrics samples over the runtime's processes: CPU as milliseconds of core per second, and wakeups per second. Lower is better.
-
-| Reading | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|
-| CPU, ms per second | **7** | 20 | 11 | 44 |
-| Wakeups per second | 58 | 84 | **55** | 1998 |
-
-#### Starting up
-
-From a cold stop, the runtime asked to start the way a person would (`lighter start`, `orb start`, `colima start`, opening Docker Desktop): how long until `docker version` answers, and until the first container has run. Median of three; lower is better.
-
-| Reading | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|
-| Start until docker answers | **0.6 s** | 1.2 s | 9.8 s | 2.7 s |
-| Start until the first container has run | **0.8 s** | 1.5 s | 10.0 s | 3.2 s |
-
-#### x86-64 images
-
-The same runtimes running `linux/amd64` images on their own disk: an install that mostly waits on the disk and the network, straight-line computation (a gigabyte through `sha256sum`), and a container's start, so the translator's price shows on each kind of work. lighter, OrbStack and Docker Desktop run these under Rosetta; Colima was started with `--vz-rosetta`. The first column is lighter's own arm64 number for the same case, for scale. Median of three; lower is better.
-
-| Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Colima | Docker Desktop |
-|---|---|---|---|---|---|
-| `npm ci` | 7.54 s | **15.02 s** | 19.59 s | 19.85 s | 21.94 s |
-| `pnpm install` | 1.67 s | **3.77 s** | 4.61 s | 3.78 s | 4.18 s |
-| `sha256sum` of 1 GiB | 6.28 s | **7.13 s** | 13.09 s | 7.26 s | 7.34 s |
-| container start, `alpine true` | 198 ms | **191 ms** | 302 ms | 211 ms | 232 ms |
-
-`benchmarks/RESULTS.md` contains the full logs, individual repetition timings, and methodology.
+[Release records](docs/records/0.5.0/benchmarks/) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
 ## What it does
 
 - **Docker and Compose compatibility:** Full support via standard Docker CLI and Compose plugins.
@@ -297,7 +253,7 @@ The same runtimes running `linux/amd64` images on their own disk: an install tha
 ## Out of scope
 
 - **GUI:** lighter runs headless in the background as a launchd service or terminal process.
-- **Kubernetes:** Focused purely on fast Docker container workflows.
+- **Managed Kubernetes:** Local clusters run through [kind](docs/kubernetes.md); lighter does not manage a built-in cluster or Kubernetes upgrades.
 - **Intel Macs:** Built strictly for Apple Silicon (ARM64).
 - **Windows or Linux hosts:** lighter is purpose-built for macOS.
 

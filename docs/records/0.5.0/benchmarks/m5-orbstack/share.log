@@ -1,0 +1,26 @@
+==> orbstack: warming caches (not timed)
+==> orbstack: npm-install 8717 8785 8545  (cpu ms: user=6900 sys=20410 user=7020 sys=23110 user=6860 sys=22080)
+==> orbstack: pnpm-install 5096 4925 4938  (cpu ms: user=2340 sys=21350 user=2200 sys=19190 user=2070 sys=19370)
+==> orbstack: yarn-install 8077 8086 7912  (cpu ms: user=5820 sys=26600 user=5690 sys=26580 user=5780 sys=25780)
+==> orbstack: materializing the package tree
+==> orbstack: ripgrep 983 1006 1008  (cpu ms: user=300 sys=7450 user=300 sys=7630 user=320 sys=7610)
+==> orbstack: find-walk 761 505 458  (cpu ms: user=50 sys=700 user=40 sys=460 user=50 sys=410)
+==> orbstack: copy-tree 9453 9530 9410  (cpu ms: user=840 sys=8600 user=870 sys=11980 user=860 sys=11870)
+==> orbstack: rm-rf 3259 3318 3367  (cpu ms: user=890 sys=12190 user=1060 sys=17020 user=850 sys=14310)
+==> orbstack: cpu-sha256 5648 5652 5749  (cpu ms: user=5310 sys=370 user=5330 sys=380 user=5420 sys=360)
+==> orbstack: container-start 269 262 251
+==> orbstack: watch-latency 10 2 98
+==> orbstack: memory peak=5736 after15s=2769 after60s=1788 (MiB)
+==> orbstack: net-tcp-egress 92740 88695 96281
+==> orbstack: net-tcp-egress-r 51447 51215 53362
+==> orbstack: net-tcp-port 52739 52009 52713
+==> orbstack: net-tcp-port-r 90297 88855 89226
+==> orbstack: net-udp 3078 3020 2773
+==> orbstack: net-connect-rate 20025 20086 20203
+==> orbstack: net-http-latency 78 75 73
+==> orbstack: net-dns 260 264 260
+==> orbstack: power-idle (a minute of quiet, then a minute of samples) cpu=3 ms/s wakeups=121/s pkg-idle-wakeups=2/s (powermetrics)
+==> orbstack: boot (a cold stop, then a start, 3 times; untimed round first) 1149/1444 1136/1434 1228/1527
+==> orbstack: memory idle=935 MiB, a minute after a cold start
+
+==> results in benchmarks/results/050-1b0caab-m5-orbstack-a2-share.csv

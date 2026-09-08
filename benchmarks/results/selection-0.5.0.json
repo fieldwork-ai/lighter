@@ -1,0 +1,161 @@
+{
+  "release": "0.5.0",
+  "recording_source": "1b0caabf34fbe359f11cd47cc87ce45dc8583682",
+  "runtime_source": "66897086c3702b75d79cb6fcfed7736842b80780",
+  "selection": "First valid complete Lighter share/guest/amd64 suite by execution order; two further full suites and every completed fresh/alternating follow-up retained separately.",
+  "m5": {
+    "own": "records-1b0caab-m5-a1",
+    "primary": 1,
+    "native_network": "050-1b0caab-m5-native-a1",
+    "colima": "050-1b0caab-m5-colima-a3",
+    "orbstack": {
+      "status": "composite: completed pre-boot cases from corrected share attempt; separately completed cold-start case; guest/amd64 from a2",
+      "failed_cases": {},
+      "share": {
+        "parts": [
+          {
+            "directory": "m5-orbstack-share-incomplete-a3",
+            "label": "050-1b0caab-m5-orbstack-a3",
+            "exclude_cases": [
+              "boot-docker",
+              "boot-first-container",
+              "memory-idle"
+            ],
+            "expected_exit_code": 1,
+            "reason": "Guard stopped the final cold-start idle observation; all preceding non-boot cases completed under continuous successful guard checks."
+          },
+          {
+            "directory": "m5-orbstack-boot",
+            "label": "050-1b0caab-m5-orbstack-a4",
+            "include_cases": [
+              "boot-docker",
+              "boot-first-container",
+              "memory-idle"
+            ],
+            "expected_exit_code": 0
+          }
+        ]
+      },
+      "guest": {
+        "directory": "m5-orbstack",
+        "label": "050-1b0caab-m5-orbstack-a2"
+      },
+      "amd64": {
+        "directory": "m5-orbstack",
+        "label": "050-1b0caab-m5-orbstack-a2"
+      }
+    },
+    "docker-desktop": {
+      "status": "partial: share package cleanup failed; affected storage and package-load memory observations excluded after diagnostic audit",
+      "failed_cases": {
+        "share": [
+          "npm-install",
+          "pnpm-install",
+          "yarn-install",
+          "ripgrep",
+          "find-walk",
+          "copy-tree",
+          "rm-rf",
+          "memory-peak",
+          "memory-after-15s",
+          "memory-after-60s"
+        ]
+      },
+      "share": {
+        "directory": "m5-docker-desktop",
+        "label": "050-1b0caab-m5-docker-desktop-a4",
+        "expected_exit_code": 0,
+        "exclude_cases": [
+          "npm-install",
+          "pnpm-install",
+          "yarn-install",
+          "ripgrep",
+          "find-walk",
+          "copy-tree",
+          "rm-rf",
+          "memory-peak",
+          "memory-after-15s",
+          "memory-after-60s"
+        ]
+      },
+      "guest": {
+        "directory": "m5-docker-desktop",
+        "label": "050-1b0caab-m5-docker-desktop-a4"
+      },
+      "amd64": {
+        "directory": "m5-docker-desktop",
+        "label": "050-1b0caab-m5-docker-desktop-a4"
+      }
+    },
+    "baab": "050-1b0caab-m5-baab-a4"
+  },
+  "m1": {
+    "own": "records-1b0caab-m1-a1",
+    "primary": 1,
+    "native_network": "050-1b0caab-m1-native-a1",
+    "colima": {
+      "status": "partial: host-share pnpm failed; complete cases retained",
+      "failed_cases": {
+        "share": [
+          "pnpm-install"
+        ]
+      },
+      "share": {
+        "directory": "m1-colima-failed-a1",
+        "label": "050-1b0caab-m1-colima-a1"
+      },
+      "guest": {
+        "directory": "m1-colima",
+        "label": "050-1b0caab-m1-colima-a3"
+      },
+      "amd64": {
+        "directory": "m1-colima",
+        "label": "050-1b0caab-m1-colima-a3"
+      }
+    },
+    "orbstack": "050-1b0caab-m1-orbstack-a1",
+    "docker-desktop": {
+      "status": "partial: share package cleanup failed; affected storage and package-load memory observations excluded after diagnostic audit",
+      "failed_cases": {
+        "share": [
+          "npm-install",
+          "pnpm-install",
+          "yarn-install",
+          "ripgrep",
+          "find-walk",
+          "copy-tree",
+          "rm-rf",
+          "memory-peak",
+          "memory-after-15s",
+          "memory-after-60s"
+        ]
+      },
+      "share": {
+        "directory": "m1-docker-desktop",
+        "label": "050-1b0caab-m1-docker-desktop-a2",
+        "expected_exit_code": 0,
+        "exclude_cases": [
+          "npm-install",
+          "pnpm-install",
+          "yarn-install",
+          "ripgrep",
+          "find-walk",
+          "copy-tree",
+          "rm-rf",
+          "memory-peak",
+          "memory-after-15s",
+          "memory-after-60s"
+        ]
+      },
+      "guest": {
+        "directory": "m1-docker-desktop",
+        "label": "050-1b0caab-m1-docker-desktop-a2"
+      },
+      "amd64": {
+        "directory": "m1-docker-desktop",
+        "label": "050-1b0caab-m1-docker-desktop-a2"
+      }
+    },
+    "baab": "050-1b0caab-m1-baab-a3"
+  }
+}

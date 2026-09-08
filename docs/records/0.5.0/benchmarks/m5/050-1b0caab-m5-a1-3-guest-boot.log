@@ -1,0 +1,509 @@
+2026-09-07T23:10:09.189970Z  INFO lighter_vmm::net: network started gateway="192.168.127.1" guest="192.168.127.2" mtu=1500
+2026-09-07T23:10:09.190104Z  INFO lighter_vmm::machine: attached disk path=/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/lighter-rootfs.Rc6afc7ouf.ext4 capacity_mib=2048 allocated_kib=2097152
+2026-09-07T23:10:09.190178Z  INFO lighter_vmm::machine: attached disk path=/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/lighter-bench.zQIQUxbx1x/data.img capacity_mib=131072 allocated_kib=0
+2026-09-07T23:10:09.190906Z  INFO lighter_fs::server: share opened root=~/.lighter-bench/lighter attr_ms=100 entry_ms=100 dir_entry_ms=1000 watched=true descriptors=184320
+2026-09-07T23:10:09.191360Z  INFO lighter_fs::server: share opened root=/Library/Apple/usr/libexec/oah/RosettaLinux attr_ms=100 entry_ms=100 dir_entry_ms=1000 watched=true descriptors=184320
+2026-09-07T23:10:09.191901Z  INFO lighter_vmm::machine: machine started vcpus=8 ram_mib=4096 entry=0x40000000 dtb=0x43400000
+2026-09-07T23:10:09.192385Z  INFO lighter_vmm::vsock_proxy: proxying a socket into the guest path=/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/lighter-bench.zQIQUxbx1x/docker.sock guest_port=2375
+2026-09-07T23:10:09.192447Z  INFO lighter_vmm::vsock_proxy: proxying a socket into the guest path=/var/folders/43/y9_kklv94ks4dt0rtcddmgf00000gn/T/lighter-bench.zQIQUxbx1x/control.sock guest_port=2376
+2026-09-07T23:10:09.192517Z  WARN lighter_vmm::virtio::mmio: queue notified before the driver was ready device="virtio-vsock" index=0
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x610f0000]
+[    0.000000] Linux version 6.18.49-lighter (root@cc682f9944e9) (gcc (Debian 12.2.0-14+deb12u1) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP Mon Sep  7 19:57:38 UTC 2026
+[    0.000000] KASLR disabled due to lack of seed
+[    0.000000] Machine model: linux,dummy-virt
+[    0.000000] efi: UEFI not found.
+[    0.000000] OF: reserved mem: Reserved memory: No reserved-memory node in the DT
+[    0.000000] NUMA: Faking a node at [mem 0x0000000040000000-0x000000013fffffff]
+[    0.000000] NODE_DATA(0) allocated [mem 0x13f802d00-0x13f80547f]
+[    0.000000] Zone ranges:
+[    0.000000]   DMA      [mem 0x0000000040000000-0x00000000ffffffff]
+[    0.000000]   DMA32    empty
+[    0.000000]   Normal   [mem 0x0000000100000000-0x000000013fffffff]
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000040000000-0x000000013fffffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000040000000-0x000000013fffffff]
+[    0.000000] cma: Reserved 32 MiB at 0x00000000fe000000
+[    0.000000] psci: probing for conduit method from DT.
+[    0.000000] psci: PSCIv1.1 detected in firmware.
+[    0.000000] psci: Using standard PSCI v0.2 function IDs
+[    0.000000] psci: Trusted OS migration not required
+[    0.000000] psci: SMC Calling Convention v1.0
+[    0.000000] percpu: Embedded 23 pages/cpu s63320 r0 d30888 u94208
+[    0.000000] Detected PIPT I-cache on CPU0
+[    0.000000] CPU features: detected: Address authentication (IMP DEF algorithm)
+[    0.000000] CPU features: detected: GICv3 CPU interface
+[    0.000000] CPU features: detected: Spectre-v4
+[    0.000000] CPU features: detected: Spectre-BHB
+[    0.000000] alternatives: applying boot alternatives
+[    0.000000] Kernel command line: console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init psi=0 idle.poll_ns=200000 lighter.time=1788822607 lighter.share=bench:/mnt/bench  lighter.rosetta 
+[    0.000000] printk: log buffer data + meta data: 131072 + 458752 = 589824 bytes
+[    0.000000] Dentry cache hash table entries: 524288 (order: 10, 4194304 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 262144 (order: 9, 2097152 bytes, linear)
+[    0.000000] software IO TLB: area num 8.
+[    0.000000] software IO TLB: mapped [mem 0x00000000fa000000-0x00000000fe000000] (64MB)
+[    0.000000] Fallback order for Node 0: 0 
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 1048576
+[    0.000000] Policy zone: Normal
+[    0.000000] mem auto-init: stack:off, heap alloc:off, heap free:off
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=8, Nodes=1
+[    0.000000] rcu: Hierarchical RCU implementation.
+[    0.000000] rcu: 	RCU event tracing is enabled.
+[    0.000000] rcu: 	RCU restricting CPUs from NR_CPUS=512 to nr_cpu_ids=8.
+[    0.000000] 	Tracing variant of Tasks RCU enabled.
+[    0.000000] rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.
+[    0.000000] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=8
+[    0.000000] RCU Tasks Trace: Setting shift to 3 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=8.
+[    0.000000] NR_IRQS: 64, nr_irqs: 64, preallocated irqs: 0
+[    0.000000] GICv3: 988 SPIs implemented
+[    0.000000] GICv3: 0 Extended SPIs implemented
+[    0.000000] Root IRQ handler: gic_handle_irq
+[    0.000000] GICv3: GICv3 features: 16 PPIs, RSS
+[    0.000000] GICv3: GICD_CTLR.DS=1, SCR_EL3.FIQ=0
+[    0.000000] GICv3: CPU0: found redistributor 0 region 0:0x00000000080a0000
+[    0.000000] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.000000] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+[    0.000000] arch_timer: cp15 timer running at 24.00MHz (virt).
+[    0.000000] clocksource: arch_sys_counter: mask: 0xffffffffffffff max_cycles: 0x588fe9dc0, max_idle_ns: 440795202592 ns
+[    0.000000] sched_clock: 56 bits at 24MHz, resolution 41ns, wraps every 4398046511097ns
+[    0.000053] Console: colour dummy device 80x25
+[    0.000076] Calibrating delay loop (skipped), value calculated using timer frequency.. 48.00 BogoMIPS (lpj=96000)
+[    0.000077] pid_max: default: 32768 minimum: 301
+[    0.000092] LSM: initializing lsm=capability
+[    0.000145] Mount-cache hash table entries: 8192 (order: 4, 65536 bytes, linear)
+[    0.000155] Mountpoint-cache hash table entries: 8192 (order: 4, 65536 bytes, linear)
+[    0.000407] cacheinfo: Unable to detect cache hierarchy for CPU 0
+[    0.000556] Apple TSO: available per thread (PR_SET_MEM_MODEL); boot value off
+[    0.000584] rcu: Hierarchical SRCU implementation.
+[    0.000584] rcu: 	Max phase no-delay instances is 1000.
+[    0.000624] Timer migration: 1 hierarchy levels; 8 children per group; 1 crossnode level
+[    0.000667] EFI services will not be available.
+[    0.000753] smp: Bringing up secondary CPUs ...
+[    0.000887] Detected PIPT I-cache on CPU1
+[    0.000902] GICv3: CPU1: found redistributor 1 region 0:0x00000000080c0000
+[    0.000953] CPU1: Booted secondary processor 0x0000000001 [0x610f0000]
+[    0.001136] Detected PIPT I-cache on CPU2
+[    0.001150] GICv3: CPU2: found redistributor 2 region 0:0x00000000080e0000
+[    0.001186] CPU2: Booted secondary processor 0x0000000002 [0x610f0000]
+[    0.001310] Detected PIPT I-cache on CPU3
+[    0.001325] GICv3: CPU3: found redistributor 3 region 0:0x0000000008100000
+[    0.001360] CPU3: Booted secondary processor 0x0000000003 [0x610f0000]
+[    0.001488] Detected PIPT I-cache on CPU4
+[    0.001504] GICv3: CPU4: found redistributor 4 region 0:0x0000000008120000
+[    0.001540] CPU4: Booted secondary processor 0x0000000004 [0x610f0000]
+[    0.001673] Detected PIPT I-cache on CPU5
+[    0.001691] GICv3: CPU5: found redistributor 5 region 0:0x0000000008140000
+[    0.001726] CPU5: Booted secondary processor 0x0000000005 [0x610f0000]
+[    0.001841] Detected PIPT I-cache on CPU6
+[    0.001860] GICv3: CPU6: found redistributor 6 region 0:0x0000000008160000
+[    0.001895] CPU6: Booted secondary processor 0x0000000006 [0x610f0000]
+[    0.002026] Detected PIPT I-cache on CPU7
+[    0.002047] GICv3: CPU7: found redistributor 7 region 0:0x0000000008180000
+[    0.002082] CPU7: Booted secondary processor 0x0000000007 [0x610f0000]
+[    0.002094] smp: Brought up 1 node, 8 CPUs
+[    0.002095] SMP: Total of 8 processors activated.
+[    0.002095] CPU: All CPU(s) started at EL1
+[    0.002104] CPU features: detected: Branch Target Identification
+[    0.002105] CPU features: detected: ARMv8.4 Translation Table Level
+[    0.002105] CPU features: detected: Data cache clean to the PoU not required for I/D coherence
+[    0.002106] CPU features: detected: Common not Private translations
+[    0.002106] CPU features: detected: CRC32 instructions
+[    0.002106] CPU features: detected: Data independent timing control (DIT)
+[    0.002106] CPU features: detected: E0PD
+[    0.002106] CPU features: detected: Enhanced Privileged Access Never
+[    0.002107] CPU features: detected: Generic authentication (IMP DEF algorithm)
+[    0.002107] CPU features: detected: RCpc load-acquire (LDAPR)
+[    0.002107] CPU features: detected: LSE atomic instructions
+[    0.002107] CPU features: detected: Privileged Access Never
+[    0.002108] CPU features: detected: RAS Extension Support
+[    0.002108] CPU features: detected: Speculation barrier (SB)
+[    0.002108] CPU features: detected: TLB range maintenance instructions
+[    0.002233] alternatives: applying system-wide alternatives
+[    0.003647] Memory: 3957332K/4194304K available (19008K kernel code, 6390K rwdata, 12684K rodata, 12224K init, 709K bss, 198256K reserved, 32768K cma-reserved)
+[    0.003755] devtmpfs: initialized
+[    0.004011] posixtimers hash table entries: 4096 (order: 4, 65536 bytes, linear)
+[    0.004035] futex hash table entries: 2048 (131072 bytes on 1 NUMA nodes, total 128 KiB, linear).
+[    0.004057] 19952 pages in range for non-PLT usage
+[    0.004058] 511472 pages in range for PLT usage
+[    0.004071] pinctrl core: initialized pinctrl subsystem
+[    0.004195] DMI not present or invalid.
+[    0.004976] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.005192] DMA: preallocated 512 KiB GFP_KERNEL pool for atomic allocations
+[    0.005267] DMA: preallocated 512 KiB GFP_KERNEL|GFP_DMA pool for atomic allocations
+[    0.005326] DMA: preallocated 512 KiB GFP_KERNEL|GFP_DMA32 pool for atomic allocations
+[    0.005387] thermal_sys: Registered thermal governor 'step_wise'
+[    0.005388] thermal_sys: Registered thermal governor 'power_allocator'
+[    0.005392] cpuidle: using governor menu
+[    0.005400] NET: Registered PF_QIPCRTR protocol family
+2026-09-07T23:10:09.238806Z  WARN lighter_vmm::virtio::mmio: queue notified before the driver was ready device="virtio-vsock" index=0
+[    0.005415] hw-breakpoint: found 6 breakpoint and 4 watchpoint registers.
+2026-09-07T23:10:09.238991Z  WARN lighter_vmm::virtio::mmio: queue notified before the driver was ready device="fs" index=5
+2026-09-07T23:10:09.239004Z  INFO lighter_fs::cache: cache lifetime set by whether the guest can be told to forget invalidation="push" attr_ms=20000 entry_ms=20000
+[    0.005505] ASID allocator initialised with 65536 entries
+2026-09-07T23:10:09.239116Z  INFO lighter_vmm::virtio::fs: share activated tag=bench root=~/.lighter-bench/lighter
+[    0.005630] Serial: AMBA PL011 UART driver
+2026-09-07T23:10:09.239338Z  WARN lighter_vmm::virtio::mmio: queue notified before the driver was ready device="fs" index=5
+2026-09-07T23:10:09.239345Z  INFO lighter_fs::cache: cache lifetime set by whether the guest can be told to forget invalidation="push" attr_ms=20000 entry_ms=20000
+[    0.005763] c000000.pl011: ttyAMA0 at MMIO 0xc000000 (irq = 13, base_baud = 0) is a PL011 rev1
+2026-09-07T23:10:09.239446Z  INFO lighter_vmm::virtio::fs: share activated tag=rosetta root=/Library/Apple/usr/libexec/oah/RosettaLinux
+[    0.005811] printk: console [ttyAMA0] enabled
+[    0.006408] HugeTLB: registered 1.00 GiB page size, pre-allocated 0 pages
+[    0.006408] HugeTLB: 0 KiB vmemmap can be freed for a 1.00 GiB page
+[    0.006409] HugeTLB: registered 32.0 MiB page size, pre-allocated 0 pages
+[    0.006412] HugeTLB: 0 KiB vmemmap can be freed for a 32.0 MiB page
+[    0.006412] HugeTLB: registered 2.00 MiB page size, pre-allocated 0 pages
+[    0.006412] HugeTLB: 0 KiB vmemmap can be freed for a 2.00 MiB page
+[    0.006413] HugeTLB: registered 64.0 KiB page size, pre-allocated 0 pages
+[    0.006413] HugeTLB: 0 KiB vmemmap can be freed for a 64.0 KiB page
+[    0.007445] raid6: skipped pq benchmark and selected neonx8
+[    0.007446] raid6: using neon recovery algorithm
+[    0.007463] ACPI: Interpreter disabled.
+[    0.007571] iommu: Default domain type: Translated
+[    0.007572] iommu: DMA domain TLB invalidation policy: strict mode
+[    0.009491] pps_core: LinuxPPS API ver. 1 registered
+[    0.009492] pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+[    0.009493] PTP clock support registered
+[    0.009500] EDAC MC: Ver: 3.0.0
+[    0.009562] scmi_core: SCMI protocol bus registered
+[    0.009615] FPGA manager framework
+[    0.009701] nfc: nfc_init: NFC Core ver 0.1
+[    0.009705] NET: Registered PF_NFC protocol family
+[    0.010225] clocksource: Switched to clocksource arch_sys_counter
+[    0.010287] VFS: Disk quotas dquot_6.6.0
+[    0.010289] VFS: Dquot-cache hash table entries: 512 (order 0, 4096 bytes)
+[    0.010483] pnp: PnP ACPI: disabled
+[    0.010866] NET: Registered PF_INET protocol family
+[    0.010940] IP idents hash table entries: 65536 (order: 7, 524288 bytes, linear)
+[    0.011253] tcp_listen_portaddr_hash hash table entries: 2048 (order: 3, 32768 bytes, linear)
+[    0.011258] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.011260] TCP established hash table entries: 32768 (order: 6, 262144 bytes, linear)
+[    0.011294] TCP bind hash table entries: 32768 (order: 8, 1048576 bytes, linear)
+[    0.011431] TCP: Hash tables configured (established 32768 bind 32768)
+[    0.011450] UDP hash table entries: 2048 (order: 5, 131072 bytes, linear)
+[    0.011468] UDP-Lite hash table entries: 2048 (order: 5, 131072 bytes, linear)
+[    0.011491] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.011711] kvm [1]: HYP mode not available
+[    0.011829] Initialise system trusted keyrings
+[    0.011867] workingset: timestamp_bits=42 max_order=20 bucket_order=0
+[    0.011897] squashfs: version 4.0 (2009/01/31) Phillip Lougher
+[    0.011910] fuse: init (API version 7.45)
+[    0.011948] SGI XFS with ACLs, security attributes, scrub, repair, no debug enabled
+[    0.012005] 9p: Installing v9fs 9p2000 file system support
+[    0.017590] NET: Registered PF_ALG protocol family
+[    0.017592] xor: measuring software checksum speed
+[    0.017654]    8regs           : 53565 MB/sec
+[    0.017709]    32regs          : 60153 MB/sec
+[    0.017751]    arm64_neon      : 77807 MB/sec
+[    0.017751] xor: using function: arm64_neon (77807 MB/sec)
+[    0.017756] Key type asymmetric registered
+[    0.017757] Asymmetric key parser 'x509' registered
+[    0.017764] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 239)
+[    0.017765] io scheduler mq-deadline registered
+[    0.017765] io scheduler kyber registered
+[    0.017768] io scheduler bfq registered
+[    0.022902] ledtrig-cpu: registered to indicate activity on CPUs
+[    0.022907] IPMI message handler: version 39.2
+[    0.022909] ipmi device interface
+[    0.022945] ipmi_si: IPMI System Interface driver
+[    0.022949] ipmi_si: Unable to find any System Interface(s)
+[    0.024199] virtiofs virtio4: discovered new tag: bench
+[    0.024572] virtiofs virtio5: discovered new tag: rosetta
+[    0.025076] Free page reporting enabled
+[    0.025158] virtio_mem virtio8: start address: 0x140000000
+[    0.025158] virtio_mem virtio8: region size: 0x300000000
+[    0.025158] virtio_mem virtio8: device block size: 0x8000000
+[    0.025159] virtio_mem virtio8: nid: 0
+[    0.025159] virtio_mem virtio8: memory block size: 0x8000000
+[    0.025159] virtio_mem virtio8: big block size: 0x8000000
+[    0.025179] virtio_mem virtio8: plugged size: 0x0
+[    0.025180] virtio_mem virtio8: requested size: 0x300000000
+[    0.025579] Fallback order for Node 0: 0 
+[    0.025580] Built 1 zonelists, mobility grouping on.  Total pages: 1014343
+[    0.025580] Policy zone: Normal
+[    0.027205] Serial: 8250/16550 driver, 4 ports, IRQ sharing enabled
+[    0.027401] msm_serial: driver initialized
+[    0.027418] SuperH (H)SCI(F) driver initialized
+[    0.027423] STM32 USART driver initialized
+[    0.027616] random: crng init done
+[    0.028497] loop: module loaded
+[    0.063349] virtio_blk virtio0: 8/0/0 default/read/poll queues
+[    0.063656] virtio_blk virtio0: [vda] 4194304 512-byte logical blocks (2.15 GB/2.00 GiB)
+[    0.066045] virtio_blk virtio1: 8/0/0 default/read/poll queues
+[    0.066403] virtio_blk virtio1: [vdb] 268435456 512-byte logical blocks (137 GB/128 GiB)
+[    0.066585] zram: Added device: zram0
+[    0.067055] tun: Universal TUN/TAP device driver, 1.6
+[    0.067561] VFIO - User Level meta-driver version: 0.3
+[    0.068704]  cs_system_cfg: CoreSight Configuration manager initialised
+[    0.068860] gnss: GNSS driver registered with major 503
+[    0.068992] GACT probability NOT on
+[    0.068999] Mirror/redirect action on
+[    0.069532] IPVS: Registered protocols ()
+[    0.069539] IPVS: Connection hash table configured (size=4096, memory=32Kbytes)
+[    0.069559] IPVS: ipvs loaded.
+[    0.069581] Initializing XFRM netlink socket
+[    0.069586] NET: Registered PF_INET6 protocol family
+[    0.069690] Segment Routing with IPv6
+[    0.069692] In-situ OAM (IOAM) with IPv6
+[    0.069699] sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+[    0.069735] NET: Registered PF_PACKET protocol family
+[    0.069760] 8021q: 802.1Q VLAN Support v1.8
+[    0.069780] 9pnet: Installing 9P2000 support
+[    0.069785] Key type dns_resolver registered
+[    0.069792] NET: Registered PF_VSOCK protocol family
+[    0.070828] registered taskstats version 1
+[    0.070854] Loading compiled-in X.509 certificates
+[    0.071361] Demotion targets for Node 0: null
+[    0.071431] Btrfs loaded, zoned=no, fsverity=no
+[    0.071492] clk: Disabling unused clocks
+[    0.071493] PM: genpd: Disabling unused power domains
+[    0.071822] check access for rdinit=/init failed: -2, ignoring
+[    0.088329] EXT4-fs (vda): mounted filesystem b6b766ac-cd49-44a5-aac0-ad1817245fe0 r/w with ordered data mode. Quota mode: none.
+[    0.088351] VFS: Mounted root (ext4 filesystem) on device 254:0.
+[    0.088554] devtmpfs: mounted
+[    0.088861] Freeing unused kernel memory: 12224K
+[    0.088876] Run /sbin/lighter-init as init process
+INIT clock=2026-09-07T23:10:07Z
+INIT filesystems=ok
+INIT formatting=/dev/vdb fs=btrfs mkfs=
+INIT data_fs=btrfs
+INIT data_opts=noatime,nodatacow,commit=30,thread_pool=1
+[    0.180730] BTRFS: device label lighter-data devid 1 transid 8 /dev/vdb (254:16) scanned by mount (137)
+[    0.180988] BTRFS info (device vdb): first mount of filesystem 6af2e493-a142-4015-8d4c-bc20b5ea164b
+[    0.181000] BTRFS info (device vdb): using crc32c (crc32c-lib) checksum algorithm
+[    0.181658] BTRFS info (device vdb): checking UUID tree
+[    0.181689] BTRFS info (device vdb): setting nodatasum
+[    0.181693] BTRFS info (device vdb): setting nodatacow
+INIT data=mounted[    0.181698] BTRFS info (device vdb): turning on async discard
+[    0.181702] BTRFS info (device vdb): enabling free space tree
+
+INIT fstrim=0ms
+[    0.187184] zram0: detected capacity change from 0 to 4194304
+[    0.189333] Adding 2097148k swap on /dev/zram0.  Priority:100 extents:1 across:2097148k SS
+INIT zram=on
+[    0.190202] rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.
+2026-09-07T23:10:09.405949Z  INFO lighter_fs::server: filesystem negotiated guest=7.45 max_write=262144 readdirplus=true create_dialect=true
+INIT binfmt=x86_64 via=rosetta
+2026-09-07T23:10:09.406693Z  INFO lighter_fs::server: filesystem negotiated guest=7.45 max_write=262144 readdirplus=true create_dialect=true
+INIT share=bench at=/mnt/bench
+INIT dhcp=ok t=0.19
+INIT ipv6=ok
+INIT dockerd=ready after=50ms t=0.26
+AGENT inbound port=2378
+AGENT listening port=2376
+AGENT listening port=2375
+AGENT tcp-proxy port=15201
+AGENT dns addr=192.168.127.2
+AGENT udp-inbound
+AGENT udp-proxy port=15202
+AGENT clock=set trip_us=30 attempt=0
+AGENT udp-proxy port=15202
+INIT streams=on
+INIT ready t=0.26
+2026-09-07T23:10:17.918787Z  INFO lighter_vmm::virtio::mem: virtio-mem offer requested_mib=640 plugged_mib=12288
+[    8.704174] virtio_mem virtio8: plugged size: 0x300000000
+[    8.704187] virtio_mem virtio8: requested size: 0x28000000
+[    9.339738] Fallback order for Node 0: 0 
+[    9.339750] Built 1 zonelists, mobility grouping on.  Total pages: 2049623
+[    9.339755] Policy zone: Normal
+2026-09-07T23:10:19.012044Z  INFO lighter_vmm::virtio::mem: virtio-mem offer requested_mib=12288 plugged_mib=640
+[    9.797369] virtio_mem virtio8: plugged size: 0x28000000
+[    9.797380] virtio_mem virtio8: requested size: 0x300000000
+[    9.797952] Fallback order for Node 0: 0 
+[    9.797960] Built 1 zonelists, mobility grouping on.  Total pages: 1178679
+[    9.797965] Policy zone: Normal
+[   10.025103] docker0: port 1(veth4dca9d7) entered blocking state
+[   10.025113] docker0: port 1(veth4dca9d7) entered disabled state
+[   10.025121] veth4dca9d7: entered allmulticast mode
+[   10.025137] veth4dca9d7: entered promiscuous mode
+[   10.127701] eth0: renamed from vethd5bc278
+[   10.136607] docker0: port 1(veth4dca9d7) entered blocking state
+[   10.136613] docker0: port 1(veth4dca9d7) entered forwarding state
+AGENT sockmap=on
+[   20.102929] docker0: port 1(veth4dca9d7) entered disabled state
+[   20.102959] vethd5bc278: renamed from eth0
+[   20.122604] docker0: port 1(veth4dca9d7) entered disabled state
+[   20.122827] veth4dca9d7 (unregistering): left allmulticast mode
+[   20.122833] veth4dca9d7 (unregistering): left promiscuous mode
+[   20.122834] docker0: port 1(veth4dca9d7) entered disabled state
+[   20.646149] docker0: port 1(vethbde7afe) entered blocking state
+[   20.646157] docker0: port 1(vethbde7afe) entered disabled state
+[   20.646163] vethbde7afe: entered allmulticast mode
+[   20.646174] vethbde7afe: entered promiscuous mode
+[   20.648777] eth0: renamed from vethe30f0c3
+[   20.648971] docker0: port 1(vethbde7afe) entered blocking state
+[   20.648978] docker0: port 1(vethbde7afe) entered forwarding state
+[   29.978363] docker0: port 1(vethbde7afe) entered disabled state
+[   29.978397] vethe30f0c3: renamed from eth0
+[   30.002100] docker0: port 1(vethbde7afe) entered disabled state
+[   30.002344] vethbde7afe (unregistering): left allmulticast mode
+[   30.002351] vethbde7afe (unregistering): left promiscuous mode
+[   30.002356] docker0: port 1(vethbde7afe) entered disabled state
+[   30.260679] docker0: port 1(veth59aba2c) entered blocking state
+[   30.260687] docker0: port 1(veth59aba2c) entered disabled state
+[   30.260692] veth59aba2c: entered allmulticast mode
+[   30.260708] veth59aba2c: entered promiscuous mode
+[   30.263063] eth0: renamed from vetha17dbb8
+[   30.263263] docker0: port 1(veth59aba2c) entered blocking state
+[   30.263270] docker0: port 1(veth59aba2c) entered forwarding state
+[   62.245968] docker0: port 1(veth59aba2c) entered disabled state
+[   62.246011] vetha17dbb8: renamed from eth0
+[   62.273916] docker0: port 1(veth59aba2c) entered disabled state
+[   62.274138] veth59aba2c (unregistering): left allmulticast mode
+[   62.274146] veth59aba2c (unregistering): left promiscuous mode
+[   62.274150] docker0: port 1(veth59aba2c) entered disabled state
+[   62.741650] docker0: port 1(veth461198c) entered blocking state
+[   62.741659] docker0: port 1(veth461198c) entered disabled state
+[   62.741666] veth461198c: entered allmulticast mode
+[   62.741681] veth461198c: entered promiscuous mode
+[   62.744142] eth0: renamed from vetha144be2
+[   62.744292] docker0: port 1(veth461198c) entered blocking state
+[   62.744309] docker0: port 1(veth461198c) entered forwarding state
+[   67.802177] docker0: port 1(veth461198c) entered disabled state
+[   67.802203] vetha144be2: renamed from eth0
+[   67.823556] docker0: port 1(veth461198c) entered disabled state
+[   67.823791] veth461198c (unregistering): left allmulticast mode
+[   67.823798] veth461198c (unregistering): left promiscuous mode
+[   67.823799] docker0: port 1(veth461198c) entered disabled state
+[   68.506760] docker0: port 1(veth045cbfc) entered blocking state
+[   68.506768] docker0: port 1(veth045cbfc) entered disabled state
+[   68.506773] veth045cbfc: entered allmulticast mode
+[   68.506790] veth045cbfc: entered promiscuous mode
+[   68.510160] eth0: renamed from veth624168e
+[   68.510398] docker0: port 1(veth045cbfc) entered blocking state
+[   68.510405] docker0: port 1(veth045cbfc) entered forwarding state
+[   83.667030] docker0: port 1(veth045cbfc) entered disabled state
+[   83.667061] veth624168e: renamed from eth0
+[   83.694831] docker0: port 1(veth045cbfc) entered disabled state
+[   83.695084] veth045cbfc (unregistering): left allmulticast mode
+[   83.695090] veth045cbfc (unregistering): left promiscuous mode
+[   83.695092] docker0: port 1(veth045cbfc) entered disabled state
+[   84.489480] docker0: port 1(veth219528e) entered blocking state
+[   84.489490] docker0: port 1(veth219528e) entered disabled state
+[   84.489498] veth219528e: entered allmulticast mode
+[   84.489511] veth219528e: entered promiscuous mode
+[   84.492070] eth0: renamed from vetha168de3
+[   84.492391] docker0: port 1(veth219528e) entered blocking state
+[   84.492400] docker0: port 1(veth219528e) entered forwarding state
+[   89.557813] vetha168de3: renamed from eth0
+[   89.558157] docker0: port 1(veth219528e) entered disabled state
+[   89.581954] docker0: port 1(veth219528e) entered disabled state
+[   89.582192] veth219528e (unregistering): left allmulticast mode
+[   89.582200] veth219528e (unregistering): left promiscuous mode
+[   89.582205] docker0: port 1(veth219528e) entered disabled state
+[   89.790368] docker0: port 1(vethc902c49) entered blocking state
+[   89.790375] docker0: port 1(vethc902c49) entered disabled state
+[   89.790377] vethc902c49: entered allmulticast mode
+[   89.790387] vethc902c49: entered promiscuous mode
+[   89.792754] eth0: renamed from vethf243664
+[   89.793102] docker0: port 1(vethc902c49) entered blocking state
+[   89.793112] docker0: port 1(vethc902c49) entered forwarding state
+[  103.409429] docker0: port 1(vethc902c49) entered disabled state
+[  103.409463] vethf243664: renamed from eth0
+[  103.426498] docker0: port 1(vethc902c49) entered disabled state
+[  103.426858] vethc902c49 (unregistering): left allmulticast mode
+[  103.426872] vethc902c49 (unregistering): left promiscuous mode
+[  103.426877] docker0: port 1(vethc902c49) entered disabled state
+[  103.659192] docker0: port 1(veth6fa8742) entered blocking state
+[  103.659202] docker0: port 1(veth6fa8742) entered disabled state
+[  103.659208] veth6fa8742: entered allmulticast mode
+[  103.659223] veth6fa8742: entered promiscuous mode
+[  103.661452] eth0: renamed from veth1abfd22
+[  103.661602] docker0: port 1(veth6fa8742) entered blocking state
+[  103.661617] docker0: port 1(veth6fa8742) entered forwarding state
+[  108.657306] docker0: port 1(veth6fa8742) entered disabled state
+[  108.657341] veth1abfd22: renamed from eth0
+[  108.681924] docker0: port 1(veth6fa8742) entered disabled state
+[  108.682173] veth6fa8742 (unregistering): left allmulticast mode
+[  108.682182] veth6fa8742 (unregistering): left promiscuous mode
+[  108.682183] docker0: port 1(veth6fa8742) entered disabled state
+[  109.307998] docker0: port 1(veth83fbd68) entered blocking state
+[  109.308009] docker0: port 1(veth83fbd68) entered disabled state
+[  109.308017] veth83fbd68: entered allmulticast mode
+[  109.308032] veth83fbd68: entered promiscuous mode
+[  109.310449] eth0: renamed from vetha420c1c
+[  109.310881] docker0: port 1(veth83fbd68) entered blocking state
+[  109.310893] docker0: port 1(veth83fbd68) entered forwarding state
+[  109.606120] docker0: port 1(veth83fbd68) entered disabled state
+[  109.606148] vetha420c1c: renamed from eth0
+[  109.623069] docker0: port 1(veth83fbd68) entered disabled state
+[  109.623313] veth83fbd68 (unregistering): left allmulticast mode
+[  109.623319] veth83fbd68 (unregistering): left promiscuous mode
+[  109.623320] docker0: port 1(veth83fbd68) entered disabled state
+[  109.740849] docker0: port 1(veth31e8045) entered blocking state
+[  109.740857] docker0: port 1(veth31e8045) entered disabled state
+[  109.740859] veth31e8045: entered allmulticast mode
+[  109.740870] veth31e8045: entered promiscuous mode
+[  109.743113] eth0: renamed from veth1c898d9
+[  109.743259] docker0: port 1(veth31e8045) entered blocking state
+[  109.743260] docker0: port 1(veth31e8045) entered forwarding state
+[  115.050355] docker0: port 1(veth31e8045) entered disabled state
+[  115.050380] veth1c898d9: renamed from eth0
+[  115.070327] docker0: port 1(veth31e8045) entered disabled state
+[  115.070569] veth31e8045 (unregistering): left allmulticast mode
+[  115.070575] veth31e8045 (unregistering): left promiscuous mode
+[  115.070577] docker0: port 1(veth31e8045) entered disabled state
+[  116.071608] docker0: port 1(vethd6a6c2c) entered blocking state
+[  116.071616] docker0: port 1(vethd6a6c2c) entered disabled state
+[  116.071620] vethd6a6c2c: entered allmulticast mode
+[  116.071632] vethd6a6c2c: entered promiscuous mode
+[  116.073642] eth0: renamed from veth4c858be
+[  116.073783] docker0: port 1(vethd6a6c2c) entered blocking state
+[  116.073790] docker0: port 1(vethd6a6c2c) entered forwarding state
+[  116.386396] docker0: port 1(vethd6a6c2c) entered disabled state
+[  116.386430] veth4c858be: renamed from eth0
+[  116.410765] docker0: port 1(vethd6a6c2c) entered disabled state
+[  116.410999] vethd6a6c2c (unregistering): left allmulticast mode
+[  116.411008] vethd6a6c2c (unregistering): left promiscuous mode
+[  116.411013] docker0: port 1(vethd6a6c2c) entered disabled state
+[  116.526384] docker0: port 1(veth118f57e) entered blocking state
+[  116.526391] docker0: port 1(veth118f57e) entered disabled state
+[  116.526395] veth118f57e: entered allmulticast mode
+[  116.526406] veth118f57e: entered promiscuous mode
+[  116.528507] eth0: renamed from veth43a0409
+[  116.528751] docker0: port 1(veth118f57e) entered blocking state
+[  116.528757] docker0: port 1(veth118f57e) entered forwarding state
+[  121.777705] docker0: port 1(veth118f57e) entered disabled state
+[  121.777739] veth43a0409: renamed from eth0
+[  121.802300] docker0: port 1(veth118f57e) entered disabled state
+[  121.802524] veth118f57e (unregistering): left allmulticast mode
+[  121.802531] veth118f57e (unregistering): left promiscuous mode
+[  121.802532] docker0: port 1(veth118f57e) entered disabled state
+[  122.894966] docker0: port 1(veth41eb435) entered blocking state
+[  122.894975] docker0: port 1(veth41eb435) entered disabled state
+[  122.894980] veth41eb435: entered allmulticast mode
+[  122.894996] veth41eb435: entered promiscuous mode
+[  122.896872] eth0: renamed from veth89e2005
+[  122.897140] docker0: port 1(veth41eb435) entered blocking state
+[  122.897191] docker0: port 1(veth41eb435) entered forwarding state
+[  126.625001] docker0: port 1(veth41eb435) entered disabled state
+[  126.625029] veth89e2005: renamed from eth0
+[  126.647539] docker0: port 1(veth41eb435) entered disabled state
+[  126.647828] veth41eb435 (unregistering): left allmulticast mode
+[  126.647835] veth41eb435 (unregistering): left promiscuous mode
+[  126.647840] docker0: port 1(veth41eb435) entered disabled state
+[  127.307211] docker0: port 1(veth46303da) entered blocking state
+[  127.307218] docker0: port 1(veth46303da) entered disabled state
+[  127.307220] veth46303da: entered allmulticast mode
+[  127.307231] veth46303da: entered promiscuous mode
+[  127.309099] eth0: renamed from veth7ecdab8
+[  127.309377] docker0: port 1(veth46303da) entered blocking state
+[  127.309384] docker0: port 1(veth46303da) entered forwarding state
+[  132.619497] docker0: port 1(veth46303da) entered disabled state
+[  132.619525] veth7ecdab8: renamed from eth0
+[  132.637616] docker0: port 1(veth46303da) entered disabled state
+[  132.637866] veth46303da (unregistering): left allmulticast mode
+[  132.637872] veth46303da (unregistering): left promiscuous mode
+[  132.637874] docker0: port 1(veth46303da) entered disabled state
+[  133.271047] docker0: port 1(veth96b4c7f) entered blocking state
+[  133.271058] docker0: port 1(veth96b4c7f) entered disabled state
+[  133.271066] veth96b4c7f: entered allmulticast mode
+[  133.271081] veth96b4c7f: entered promiscuous mode
+[  133.273047] eth0: renamed from vethb6638a5
+[  133.273384] docker0: port 1(veth96b4c7f) entered blocking state
+[  133.273393] docker0: port 1(veth96b4c7f) entered forwarding state
+[  139.618650] docker0: port 1(veth96b4c7f) entered disabled state
+[  139.618675] vethb6638a5: renamed from eth0
+[  139.650636] docker0: port 1(veth96b4c7f) entered disabled state
+[  139.650860] veth96b4c7f (unregistering): left allmulticast mode
+[  139.650865] veth96b4c7f (unregistering): left promiscuous mode
+[  139.650866] docker0: port 1(veth96b4c7f) entered disabled state

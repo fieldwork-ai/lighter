@@ -1,0 +1,52 @@
+Unable to find image 'docker:28.3.3-cli' locally
+28.3.3-cli: Pulling from library/docker
+6e174226ea69: Pulling fs layer
+6a98d9bd1c98: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+86cf89aa8361: Pulling fs layer
+58bebb0a3fc4: Pulling fs layer
+4281e8675ce4: Pulling fs layer
+971d2e94d734: Pulling fs layer
+27ba463c43ec: Pulling fs layer
+4ca4700619c8: Pulling fs layer
+af99e90419a3: Pulling fs layer
+86cf89aa8361: Waiting
+58bebb0a3fc4: Waiting
+4281e8675ce4: Waiting
+971d2e94d734: Waiting
+27ba463c43ec: Waiting
+4ca4700619c8: Waiting
+af99e90419a3: Waiting
+4f4fb700ef54: Verifying Checksum
+4f4fb700ef54: Download complete
+6e174226ea69: Verifying Checksum
+6e174226ea69: Download complete
+6a98d9bd1c98: Verifying Checksum
+6a98d9bd1c98: Download complete
+6e174226ea69: Pull complete
+86cf89aa8361: Verifying Checksum
+86cf89aa8361: Download complete
+6a98d9bd1c98: Pull complete
+4f4fb700ef54: Pull complete
+86cf89aa8361: Pull complete
+58bebb0a3fc4: Verifying Checksum
+58bebb0a3fc4: Download complete
+4281e8675ce4: Verifying Checksum
+4281e8675ce4: Download complete
+58bebb0a3fc4: Pull complete
+27ba463c43ec: Verifying Checksum
+27ba463c43ec: Download complete
+971d2e94d734: Verifying Checksum
+971d2e94d734: Download complete
+4ca4700619c8: Verifying Checksum
+4ca4700619c8: Download complete
+4281e8675ce4: Pull complete
+af99e90419a3: Verifying Checksum
+af99e90419a3: Download complete
+971d2e94d734: Pull complete
+27ba463c43ec: Pull complete
+4ca4700619c8: Pull complete
+af99e90419a3: Pull complete
+Digest: sha256:0135662b510037ea581d99c2e5929c5e01185139c0b86986a418bd4da0b98a44
+Status: Downloaded newer image for docker:28.3.3-cli
+direct-guest-probes-complete

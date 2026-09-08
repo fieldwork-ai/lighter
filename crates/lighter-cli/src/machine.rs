@@ -152,7 +152,11 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
         });
     }
 
-    let mut child = command.spawn()?;
+    let mut child = if crate::service::start_registered()? {
+        None
+    } else {
+        Some(command.spawn()?)
+    };
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if let Some(identity) = crate::instance::Identity::read(&home)?
@@ -167,7 +171,9 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
             // publish the PID of the losing child into its state directory.
             return Ok(identity.pid());
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(child) = child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
             anyhow::bail!(
                 "the machine exited during start ({status}); see {}",
                 log.display()
@@ -176,6 +182,10 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
         std::thread::sleep(
             Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
         );
+    }
+    if let Some(child) = child.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
     anyhow::bail!(
         "the machine did not answer within {}s; see {}",

@@ -1,0 +1,4 @@
+Linux 97d77d49f3a6 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 Linux
+Filesystem                Size      Used Available Use% Mounted on
+overlay                 223.6G      7.0G    205.2G   3% /
+0-7

@@ -1,0 +1,12 @@
+    Finished `release` profile [optimized] target(s) in 0.17s
+==> lighter: warming caches (not timed)
+==> lighter: npm-install 11206 11070 10749  (cpu ms: user=11250 sys=14130 user=10980 sys=14150 user=11030 sys=13900)
+==> lighter: pnpm-install 6997 5810 6374  (cpu ms: user=5490 sys=15190 user=4880 sys=11850 user=5390 sys=13960)
+==> lighter: yarn-install 11690 10029 9976  (cpu ms: user=10900 sys=21320 user=10310 sys=16770 user=10420 sys=15660)
+==> lighter: materializing the package tree
+==> lighter: ripgrep 5762 267 135  (cpu ms: user=800 sys=9440 user=440 sys=770 user=410 sys=610)
+==> lighter: find-walk 131 121 121  (cpu ms: user=40 sys=90 user=60 sys=80 user=50 sys=80)
+==> lighter: copy-tree 5779 8778 7815  (cpu ms: user=950 sys=3510 user=1030 sys=5640 user=1090 sys=5860)
+==> lighter: rm-rf 2668 2723 2722  (cpu ms: user=1090 sys=6260 user=1200 sys=6420 user=1030 sys=6740)
+
+==> results in benchmarks/results/050-1b0caab-m1-a1-variance-2.csv

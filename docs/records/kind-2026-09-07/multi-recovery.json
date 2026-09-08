@@ -1,0 +1,77 @@
+{
+  "passed": true,
+  "attempts": [
+    {
+      "attempt": 0,
+      "pod_returncode": 1,
+      "pod_output": "",
+      "pod_error": "error: Internal error occurred: unable to upgrade connection: pod does not exist\n",
+      "host_returncode": 52,
+      "host_output": "",
+      "host_error": "curl: (52) Empty reply from server\n"
+    },
+    {
+      "attempt": 1,
+      "pod_returncode": 1,
+      "pod_output": "",
+      "pod_error": "error: Internal error occurred: unable to upgrade connection: container not found (\"client\")\n",
+      "host_returncode": 52,
+      "host_output": "",
+      "host_error": "curl: (52) Empty reply from server\n"
+    },
+    {
+      "attempt": 2,
+      "pod_returncode": 1,
+      "pod_output": "",
+      "pod_error": "wget: bad address 'web'\ncommand terminated with exit code 1\n",
+      "host_returncode": 28,
+      "host_output": "",
+      "host_error": "curl: (28) Operation timed out after 3006 milliseconds with 0 bytes received\n"
+    },
+    {
+      "attempt": 3,
+      "pod_returncode": 1,
+      "pod_output": "",
+      "pod_error": "wget: bad address 'web'\ncommand terminated with exit code 1\n",
+      "host_returncode": 28,
+      "host_output": "",
+      "host_error": "curl: (28) Operation timed out after 3001 milliseconds with 0 bytes received\n"
+    },
+    {
+      "attempt": 4,
+      "pod_returncode": 1,
+      "pod_output": "",
+      "pod_error": "wget: bad address 'web'\ncommand terminated with exit code 1\n",
+      "host_returncode": 28,
+      "host_output": "",
+      "host_error": "curl: (28) Operation timed out after 3004 milliseconds with 0 bytes received\n"
+    },
+    {
+      "attempt": 5,
+      "pod_returncode": 1,
+      "pod_output": "",
+      "pod_error": "wget: bad address 'web'\ncommand terminated with exit code 1\n",
+      "host_returncode": 28,
+      "host_output": "",
+      "host_error": "curl: (28) Operation timed out after 3003 milliseconds with 0 bytes received\n"
+    },
+    {
+      "attempt": 6,
+      "pod_returncode": 1,
+      "pod_output": "",
+      "pod_error": "wget: bad address 'web'\ncommand terminated with exit code 1\n",
+      "host_returncode": 28,
+      "host_output": "",
+      "host_error": "curl: (28) Operation timed out after 3005 milliseconds with 0 bytes received\n"
+    },
+    {
+      "attempt": 7,
+      "pod_returncode": 0,
+      "pod_output": "lighter-kind-qualified\n",
+      "pod_error": "",
+      "host_returncode": 0,
+      "host_output": "lighter-kind-qualified\n",
+      "host_error": ""
+    }
+  ]
+}

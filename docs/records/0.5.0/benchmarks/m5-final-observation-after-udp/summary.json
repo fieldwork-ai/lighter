@@ -1,0 +1,14 @@
+{
+  "host": "m5",
+  "pids": [
+    72096
+  ],
+  "collection_errors": 0,
+  "invalid_cpu_samples": 0,
+  "peak_footprint_mib": 13.0,
+  "final_footprint_mib": 12.0,
+  "cpu_max_percent": 0.9,
+  "cpu_median_percent": 0.1,
+  "first_utc": "2026-09-08T03:32:08.605317+00:00",
+  "last_utc": "2026-09-08T03:42:55.678074+00:00"
+}

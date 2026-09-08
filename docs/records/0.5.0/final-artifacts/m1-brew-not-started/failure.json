@@ -1,0 +1,4 @@
+{
+  "status": "failed; never select this as a complete suite",
+  "reason": "Brew was not invoked because preceding archive qualification was incomplete."
+}
