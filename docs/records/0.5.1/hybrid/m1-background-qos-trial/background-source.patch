@@ -1,0 +1,79 @@
+diff --git a/crates/lighter-vmm/src/machine.rs b/crates/lighter-vmm/src/machine.rs
+index 57c7cd68..3ccae518 100644
+--- a/crates/lighter-vmm/src/machine.rs
++++ b/crates/lighter-vmm/src/machine.rs
+@@ -752,6 +752,7 @@ impl Machine {
+                         let prepare = || {
+                             let _phase = crate::boot_timing::Phase::new("memory_background");
+                             if demand_ram {
++                                crate::qos::prepare_in_background();
+                                 return memory.prepare_remaining(&ctx.shutdown);
+                             }
+                             let control = control.expect("deferred memory control");
+diff --git a/crates/lighter-vmm/src/memory.rs b/crates/lighter-vmm/src/memory.rs
+index 0200c8d4..780e61db 100644
+--- a/crates/lighter-vmm/src/memory.rs
++++ b/crates/lighter-vmm/src/memory.rs
+@@ -96,12 +96,17 @@ impl Mmap {
+ #[cfg(target_os = "macos")]
+ fn replace_owned_pages(ptr: *mut u8, len: usize) -> Result<()> {
+     unsafe extern "C" {
+-        fn mach_task_self() -> libc::c_uint;
++        static mach_task_self_: libc::c_uint;
+         fn mach_vm_allocate(task: libc::c_uint, address: *mut u64, size: u64, flags: i32) -> i32;
+     }
+     const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+     const VM_FLAGS_PURGABLE: i32 = 0x2;
+     let page = host_page_size() as usize;
++    // Match mach_task_self() in mach/mach_init.h: libSystem caches the task
++    // port. Calling the similarly named function takes a kernel trap for
++    // every page instead. libSystem initializes this before our threads run.
++    // SAFETY: reading libSystem's initialized current-process task port.
++    let task = unsafe { mach_task_self_ };
+     for offset in (0..len).step_by(page) {
+         let mut address = ptr as u64 + offset as u64;
+         // SAFETY: replace only pages in the caller's reserved mapping. The
+@@ -109,7 +114,7 @@ fn replace_owned_pages(ptr: *mut u8, len: usize) -> Result<()> {
+         // callers retain exclusive ownership of these pages until remapped.
+         let result = unsafe {
+             mach_vm_allocate(
+-                mach_task_self(),
++                task,
+                 &mut address,
+                 page as u64,
+                 VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE,
+diff --git a/crates/lighter-vmm/src/qos.rs b/crates/lighter-vmm/src/qos.rs
+index 6c3d86c5..0cc55cb0 100644
+--- a/crates/lighter-vmm/src/qos.rs
++++ b/crates/lighter-vmm/src/qos.rs
+@@ -18,6 +18,8 @@ pub const CONNECTION_STACK: usize = 256 << 10;
+ 
+ /// `QOS_CLASS_USER_INTERACTIVE`.
+ const USER_INTERACTIVE: u32 = 0x21;
++/// `QOS_CLASS_BACKGROUND`: speculative preparation yields to foreground work.
++const BACKGROUND: u32 = 0x09;
+ 
+ unsafe extern "C" {
+     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+@@ -25,9 +27,19 @@ unsafe extern "C" {
+ 
+ /// Raises the calling thread to the interactive class. Best effort.
+ pub fn raise_interactive() {
++    set_class(USER_INTERACTIVE);
++}
++
++/// Background preparation has a first-access fallback, so it need not compete
++/// at foreground priority with the vCPUs needed to make Docker ready.
++pub fn prepare_in_background() {
++    set_class(BACKGROUND);
++}
++
++fn set_class(class: u32) {
+     // SAFETY: a plain call on the current thread with constant arguments.
+-    let rc = unsafe { pthread_set_qos_class_self_np(USER_INTERACTIVE, 0) };
++    let rc = unsafe { pthread_set_qos_class_self_np(class, 0) };
+     if rc != 0 {
+-        tracing::debug!(rc, "could not raise the thread's QoS");
++        tracing::debug!(rc, class, "could not set the thread's QoS");
+     }
+ }

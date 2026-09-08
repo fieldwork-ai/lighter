@@ -199,3 +199,17 @@ interleaved cold starts per version, preparation completion fell from 1,576 to
 1,455 ms (−7.7%) while Docker readiness rose from 855 to 900 ms (+5.2%). The
 extra batching and locking complexity was rejected; the runtime retains the
 original 256 KiB preparation path.
+
+The [lowest-background-QoS trial](records/0.5.1/hybrid/m1-background-qos-trial/)
+also failed to help. Three interleaved observations each measured Docker-ready
+medians of 812 ms for ordinary hybrid, 663 ms for pure demand and 882 ms for
+background-QoS hybrid. Preparation completion increased from 1,607 to 7,546 ms.
+This policy was removed. Both versions passed the 24 signed hypervisor tests.
+
+The selected candidate retains ordinary-priority hybrid preparation with the
+cached task port (`b78dfeb` runtime). The remaining 148 ms startup gap to pure
+demand is an explicit trade-off for completing preparation shortly after boot
+and restoring whole-range reclamation. The +10% investigation threshold was
+exceeded; these experiments document the investigation, not a passing result
+against that threshold. Full qualification must not claim pure-demand startup
+times for this hybrid, or describe the remaining contention as eliminated.
