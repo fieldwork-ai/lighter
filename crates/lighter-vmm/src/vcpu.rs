@@ -206,6 +206,12 @@ impl VcpuRunner {
                     });
                 }
                 Exit::Exception(exception) => {
+                    if self.ctx.memory.resolve_demand_fault(exception)? {
+                        exitstats::bump(exitstats::Kind::DemandMemory);
+                        // Retry the instruction, including page-table walks and
+                        // atomics. Unlike MMIO emulation, the PC must not advance.
+                        continue;
+                    }
                     exitstats::bump(match exception.class() {
                         Exception::EC_DATA_ABORT_LOWER_EL => exitstats::Kind::Mmio,
                         Exception::EC_HVC64 => exitstats::Kind::Hvc,
@@ -236,11 +242,6 @@ impl VcpuRunner {
     }
 
     fn handle_exception(&mut self, exception: Exception) -> Result<Option<StopReason>, RunError> {
-        if self.ctx.memory.resolve_demand_fault(exception)? {
-            // Retry the instruction, including page-table walks and atomics.
-            // Unlike MMIO emulation, the PC must not advance.
-            return Ok(None);
-        }
         match exception.class() {
             Exception::EC_DATA_ABORT_LOWER_EL => {
                 self.handle_mmio(exception)?;

@@ -16,11 +16,20 @@ pub enum Kind {
     Hvc = 3,
     SysReg = 4,
     Other = 5,
+    DemandMemory = 6,
 }
 
-const NAMES: [&str; 6] = ["canceled", "vtimer", "mmio", "hvc", "sysreg", "other"];
+const NAMES: [&str; 7] = [
+    "canceled",
+    "vtimer",
+    "mmio",
+    "hvc",
+    "sysreg",
+    "other",
+    "ram_fault",
+];
 
-static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
 
 #[inline]
 pub fn bump(kind: Kind) {
@@ -35,7 +44,7 @@ pub fn spawn_reporter_if_enabled() -> bool {
     std::thread::Builder::new()
         .name("exit-stats".into())
         .spawn(|| {
-            let mut last = [0u64; 6];
+            let mut last = [0u64; NAMES.len()];
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let mut line = String::new();
