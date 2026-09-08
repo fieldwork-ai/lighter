@@ -1,0 +1,42 @@
+[
+  {
+    "gate": "m1-boot",
+    "exit_code": 0
+  },
+  {
+    "gate": "m2-devices",
+    "exit_code": 0
+  },
+  {
+    "gate": "m3-network",
+    "exit_code": 0
+  },
+  {
+    "gate": "m3-vsock",
+    "exit_code": 0
+  },
+  {
+    "gate": "m3-docker",
+    "exit_code": 0
+  },
+  {
+    "gate": "m3-streams",
+    "exit_code": 0
+  },
+  {
+    "gate": "m3-publish",
+    "exit_code": 0
+  },
+  {
+    "gate": "m4-fs",
+    "exit_code": 0
+  },
+  {
+    "gate": "m7-amd64",
+    "exit_code": 0
+  },
+  {
+    "gate": "m8-daily",
+    "exit_code": 0
+  }
+]
