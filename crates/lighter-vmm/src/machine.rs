@@ -222,8 +222,9 @@ impl Machine {
         } else {
             memory.add_region(layout.ram.base, layout.ram.size as usize)?;
         }
-        // Demand RAM is prepared by first access. The background comparison
-        // path offers each block only after its backing is prepared.
+        // Hybrid RAM is safe on first access while a worker completes backing.
+        // Explicit DEMAND_RAM=1,BACKGROUND_RAM=0 retains pure demand for diagnosis.
+        // The legacy background comparison offers blocks only after preparation.
         if let Some(hotplug) = layout.hotplug {
             if demand_ram {
                 memory.reserve_demand_region(hotplug.base, hotplug.size as usize)?;
@@ -740,43 +741,47 @@ impl Machine {
 
         crate::dump::install(virtio_devices.clone(), vsock_state.clone(), uart.clone());
 
-        let memory_preparation = if background_ram && !demand_ram {
-            mem.as_ref().map(|control| {
-                let memory = memory.clone();
-                let control = control.clone();
-                let ctx = ctx.clone();
+        let memory_preparation = if background_ram && (demand_ram || mem.is_some()) {
+            let memory = memory.clone();
+            let control = mem.clone();
+            let ctx = ctx.clone();
+            Some(
                 std::thread::Builder::new()
                     .name("memory-prepare".into())
                     .spawn(move || {
                         let prepare = || {
                             let _phase = crate::boot_timing::Phase::new("memory_background");
+                            if demand_ram {
+                                return memory.prepare_remaining(&ctx.shutdown);
+                            }
+                            let control = control.expect("deferred memory control");
                             let mut ready = 0;
                             while ready < control.state().region_bytes() {
                                 if ctx.shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                                    return;
+                                    return Ok(());
                                 }
-                                match memory.prepare_next(
+                                ready = memory.prepare_next(
                                     control.state().addr(),
                                     virtio::mem::BLOCK_SIZE as usize,
-                                ) {
-                                    Ok(bytes) => ready = bytes as u64,
-                                    Err(error) => {
-                                        tracing::error!(%error, "background memory preparation failed");
-                                        // Never let a failed partial mapping reach the guest.
-                                        // Fail closed, just as the reclamation path does.
-                                        std::process::abort();
-                                    }
-                                }
+                                )? as u64;
                                 control.backing_ready(ready);
                             }
+                            Ok(())
                         };
-                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)).is_err() {
-                            tracing::error!("background memory preparation panicked");
-                            std::process::abort();
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::error!(%error, "background memory preparation failed");
+                                std::process::abort();
+                            }
+                            Err(_) => {
+                                tracing::error!("background memory preparation panicked");
+                                std::process::abort();
+                            }
                         }
                     })
-                    .expect("failed to spawn memory preparation")
-            })
+                    .expect("failed to spawn memory preparation"),
+            )
         } else {
             None
         };

@@ -95,6 +95,10 @@ def main():
     )
     ap.add_argument("command", nargs=argparse.REMAINDER)
     a = ap.parse_args()
+    # Let the existing finally block stop our command on controller termination.
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    signal.signal(signal.SIGTERM, interrupted)
     command = a.command[1:] if a.command[:1] == ["--"] else a.command
     if not command or a.log.exists():
         ap.error("provide a command and a new log path")

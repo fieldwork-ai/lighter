@@ -1,16 +1,28 @@
 # Demand-backed RAM investigation
 
-Status: selected as the default for the new 0.5.1 candidate; frozen-source
-release qualification is running on both Macs at `b303dc2`. Publication remains on hold. The existing
-notarized archives contain the earlier background-preparation implementation
-and do not qualify this code.
+Status: hybrid preparation is now the 0.5.1 candidate. Pure demand at `b303dc2`
+was evaluated but left first-use preparation in workloads and split reclamation
+into 256 KiB calls. The historical results below describe those prototypes,
+not the hybrid candidate. Publication remains on hold pending qualification.
 
-The default offers the virtio-mem range immediately and prepares both it and
-the initial region on first CPU or device access. `LIGHTER_DEMAND_RAM=0` selects
-the background comparison path; `LIGHTER_BACKGROUND_RAM=0` with no explicit
-demand override preserves the original eager opt-out. `LIGHTER_DEMAND_BASE=0`
-keeps the initial quarter eager when demand backing is enabled. The recorder
-sets every comparison flag explicitly so future defaults cannot change an arm.
+The hybrid default offers guest capacity immediately and runs one worker over
+base RAM, then hotplug RAM. First CPU/device accesses prepare any chunk ahead
+of that worker through the same synchronized operation. Docker readiness does
+not wait for the worker. Preparation establishes independent backing objects
+and mappings; it does not touch all configured RAM into physical residency.
+
+After a region is completely prepared, checked host accesses bypass per-chunk
+preparation checks and reclamation uses the original contiguous-range path.
+During preparation, reclamation skips untouched chunks under the preparation
+locks. Ready chunks remain ready after reclamation and are never overwritten
+by the worker. Completion is published only after preparation locks drain.
+The worker checks shutdown between batches and is joined before VM teardown.
+
+Diagnostic modes are explicit: `LIGHTER_DEMAND_RAM=1 LIGHTER_BACKGROUND_RAM=0`
+selects pure demand; `LIGHTER_DEMAND_RAM=0 LIGHTER_BACKGROUND_RAM=1` selects the
+legacy background path; both zero select eager preparation. `LIGHTER_DEMAND_BASE=0`
+keeps the initial quarter eager in demand modes. The boot recorder's `hybrid`
+mode sets all three flags to one, and `demand-all` explicitly disables the worker.
 
 Each 256 KiB preparation batch contains sixteen independent 16 KiB owned Mach
 objects on Apple Silicon. The batch size does not change allocation ownership
@@ -83,3 +95,20 @@ its cost also needs measurement. The user has now granted sole M5 use and author
 VM is stopped and its configuration is preserved. Earlier M5 correctness
 records used the shared host. A changed release runtime requires fresh qualification,
 signing, notarization and package checks.
+
+## Hybrid validation protocol
+
+Use one M1 observation per version for host-share npm, pnpm, yarn, copy and
+deletion, alternating version order across workloads. More than 5% slowdown
+triggers two additional observations of that workload only. Record three
+interleaved cold starts per mode (0.5.0, pure demand, hybrid), including background
+completion timing. A hybrid startup median over 10% slower than pure demand
+requires investigation. These thresholds trigger investigation, not statistical
+significance claims.
+
+Freeze the final runtime before one full suite per host, three repetitions per
+timed case. M5 latency measurements require renewed quiet-machine clearance.
+`scripts/records/record-release.py` now runs that single suite, or the focused
+comparison when supplied `--compare-bin` and `--compare-guest`. There is no outer
+suite repetition or automatic variance/ABBA sequence. Earlier completed suites
+remain historical evidence, not qualification of the hybrid implementation.
