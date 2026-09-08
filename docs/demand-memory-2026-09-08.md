@@ -245,3 +245,36 @@ benchmark-result tests also pass with a new regression test for this path.
 
 A fresh full-suite attempt uses the same `b78dfeb` VM runtime and the corrected
 harness. The already-passed hypervisor and memory/idle checks are not repeated.
+
+### Completed M1 suite
+
+The [first valid full suite](records/0.5.1/hybrid/m1-full/) passes at harness
+`16a7514`, runtime `b78dfeb`, with 8 vCPUs and 4 GiB guest RAM. There is one
+share stage, one guest-disk stage and one amd64 stage, with three observations
+per timed case. The archived summary retains every observation, medians and
+sample CVs; these CVs describe repetitions within this suite, not a universal
+bound on run-to-run variation. All stage guards and frozen-artifact checks pass.
+
+| Workload | Host share | Guest disk |
+|---|---:|---:|
+| npm install | 12,849 ms | 7,566 ms |
+| pnpm install | 7,561 ms | 1,680 ms |
+| yarn install | 10,969 ms | 7,816 ms |
+| Tree copy | 7,593 ms | 3,905 ms |
+| Tree deletion | 2,827 ms | 613 ms |
+
+The [speed gate](records/0.5.1/hybrid/m1-speed-gate/) passes using this share
+stage and the existing September 8 native reference, without new measurements.
+Its 85%-of-native npm aspiration remains unmet; the established 30% floor passes.
+Guest-disk package medians are close to the historical 0.5.0 primary record;
+host-share npm and pnpm are respectively 14.4% and 13.2% slower than that
+historical record. A matched comparison with the same combined package-cache
+warm-up is needed before attributing those differences to the runtime.
+
+The full suite's cold-start medians are 720 ms to Docker and 905 ms to the first
+container. These use the Node-based harness at 4 GiB, so they must not be pooled
+with the Python-based 16 GiB experiments. Idle footprint is 241 MiB; package-load
+footprint peaks at 4,109 MiB and settles to 817 MiB after 60 seconds. As elsewhere,
+configured RAM limits the guest, not every host allocation. Idle CPU is 5 ms/s,
+approximately 0.5% of one core. The paused Apple processes were restored after
+the recorder exited.
