@@ -542,9 +542,6 @@ impl VirtioMmio {
     }
 
     pub fn poll_queue(&mut self, index: u16) -> bool {
-        if self.retry_deadline().is_some() {
-            return false;
-        }
         let Some(queue) = self.queues.get(index as usize) else {
             return false;
         };
@@ -555,7 +552,9 @@ impl VirtioMmio {
         // NOTIFIES minus POLLED.
         POLLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.notify_queue(index);
-        true
+        // While writes wait, drain newly offered reads but do not keep the
+        // watcher spinning on retained work or a capacity-limited ring.
+        self.retry_deadline().is_none()
     }
 
     /// The lock-free view of a queue, for a watcher.

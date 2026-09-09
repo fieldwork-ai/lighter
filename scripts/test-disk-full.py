@@ -30,9 +30,12 @@ def main():
     parser.add_argument('--hold', type=int, default=600)
     parser.add_argument('--poll-us', default='200')
     parser.add_argument('--cycles', type=int, default=1)
+    parser.add_argument('--max-blocked-cpu', type=float, help='maximum mean host CPU after the first 120s of each blockage')
     parser.add_argument('--both-disks', action='store_true')
     parser.add_argument('--database', action='store_true', help='exercise a PostgreSQL transaction during exhaustion')
     args = parser.parse_args()
+    if args.max_blocked_cpu is not None and args.hold < 180:
+        parser.error('--max-blocked-cpu requires --hold of at least 180 seconds')
     if args.hold < 0 or args.cycles < 1:
         parser.error('--hold must be nonnegative and --cycles must be positive')
     binary = args.binary.resolve()
@@ -57,6 +60,7 @@ def main():
     database_writer = None
     filler = None
     started = False
+    blocked_cpu_means = []
 
     def guest(command, timeout=20):
         with socket.socket(socket.AF_UNIX) as connection:
@@ -182,6 +186,11 @@ def main():
                 if len(observations) == 1 or len(observations) % 10 == 0:
                     print(f'Waiting {int(time.monotonic() - began)}s; retries={state[0]["retries"]}; host CPU={host_cpu}%; guest agent responsive', flush=True)
                 time.sleep(min(3, max(0, args.hold - (time.monotonic() - began))))
+            (output / f'observations-{cycle}.json').write_text(json.dumps(observations, indent=2))
+            settled = [o['host_cpu_percent'] for o in observations if o['elapsed'] >= 120]
+            if settled:
+                blocked_cpu_means.append(sum(settled) / len(settled))
+                print(f'Settled blocked CPU mean={blocked_cpu_means[-1]:.2f}%, max={max(settled):.2f}%', flush=True)
             print(run([str(binary), 'status'], env=env, timeout=5), flush=True)
             filler.unlink()
             deadline = time.monotonic() + 60
@@ -222,7 +231,8 @@ def main():
             for cycle in range(args.cycles):
                 assert run(docker + ['exec', 'enospc-postgres', 'psql', '-At', '-U', 'postgres', '-c',
                                     f"SELECT count(*) FROM enospc_probe_{cycle} WHERE payload = repeat(md5(n::text),200);"]).strip() == '10000'
-        (output / 'observations.json').write_text(json.dumps(observations, indent=2))
+        if args.max_blocked_cpu is not None:
+            assert len(blocked_cpu_means) == args.cycles and all(mean <= args.max_blocked_cpu for mean in blocked_cpu_means), f'blocked CPU exceeded {args.max_blocked_cpu}%: {blocked_cpu_means}'
         print(f'PASS {args.filesystem}: {args.cycles} cycle(s), {args.hold}s blockage each; database={args.database}, both_disks={args.both_disks}; verified content after reboot', flush=True)
     finally:
         # Give pending writes space before asking the disposable VM to stop.

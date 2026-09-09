@@ -345,7 +345,7 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
         println!("  memory     {mib} MiB");
     }
     for disk in &status.storage_waiting {
-        println!("  storage    Waiting for host disk space; VM running, disk I/O blocked.");
+        println!("  storage    Waiting for host disk space; VM running, writes waiting.");
         println!(
             "             {}: {}, {}s, {} retries",
             disk.disk.display(),

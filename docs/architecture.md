@@ -138,10 +138,13 @@ The idle poll's window follows the vCPU-to-core ratio (`config::idle_poll_ns`): 
 If a host operation on a virtual disk returns `ENOSPC`, lighter retains that
 request and retries it every three seconds. It does not complete the request
 with an I/O error, suspend the VM, or restart containers. There are no space
-checks or retry timers in the healthy path. Requests behind the blocked
-operation, including reads, flushes and discards on other queues of the same
-disk, wait to preserve ordering. Other devices keep operating; applications
-waiting for the disk may still time out.
+checks or retry timers in the healthy path. Writes, flushes, discards and
+zeroing retain the order in which the device accepted them across its queues.
+Reads may pass only if their range overlaps none of the earlier unfinished
+mutations, including queued mutations and the full range of a partially
+completed write. Reads may pass a flush, which changes durability rather than
+contents. GET_ID is independent of disk contents. Other devices keep operating;
+applications waiting for writes may still time out.
 
 A retained write includes its completed byte count and validated descriptor
 metadata. Retries rebuild host spans from guest addresses and continue at the
@@ -149,7 +152,17 @@ unfinished offset. The device publishes the used entry exactly once, after
 success or a non-`ENOSPC` error. Reset cancels retained requests under the
 transport lock. The poller parks without holding that lock, uses a timed wait
 only while a request is deferred, and retries even with host polling disabled
-or no further guest kicks. A blocked queue is not considered runnable work.
+or no further guest kicks. Notifications can consume new requests and complete
+safe reads without retrying the failed mutation. Retained work does not keep
+the poller spinning.
+
+There is one retrying operation per disk and a backlog of requests waiting
+behind it. Admission is bounded by each ring's size. Only descriptor metadata
+is retained; data stays in guest memory and the driver must not reuse its
+buffers until completion. Split and packed rings may complete independent
+reads out of order. After a retry completes, the
+device revisits the backlog in order so newly unblocked reads can proceed even
+if another mutation encounters ENOSPC. Reset cancels the entire backlog.
 
 `lighter status` obtains storage state from a host-only, owner-accessible
 `status.sock` under `LIGHTER_HOME`; it remains available when Docker
@@ -163,17 +176,18 @@ This protects against recoverable host allocation failures. It does not repair
 an already-aborted filesystem, retry unrelated I/O errors, change host-share
 error semantics, or guarantee application availability during prolonged waits.
 It also does not strengthen the existing host flush/crash durability contract.
-Prolonged disk-wide blocking can cause Docker/containerd CPU use to rise: their
-file-backed page faults wait behind the retained operation while other runtime
-threads spin. Ten-minute ext4/btrfs tests recovered data successfully, but this
-application behaviour remains a limitation of holding unrelated reads.
+Holding unrelated reads was found to stall Docker/containerd file-backed page
+faults and cause sustained guest CPU use during prolonged exhaustion. Allowing
+independent reads avoids that artificial dependency. Reads of ranges with
+unfinished writes must still wait, and application-level timeouts remain
+possible.
 
 The hardware regression gate uses a capped disposable APFS image and a private
 VM, never the host's main filesystem or the daily driver's data. For example:
 
 ```sh
-python3 scripts/test-disk-full.py --guest /path/to/guest --hold 600
-python3 scripts/test-disk-full.py --guest /path/to/guest --filesystem btrfs --poll-us 0 --hold 600
+python3 scripts/test-disk-full.py --guest /path/to/guest --hold 600 --max-blocked-cpu 25
+python3 scripts/test-disk-full.py --guest /path/to/guest --filesystem btrfs --poll-us 0 --hold 600 --max-blocked-cpu 25
 python3 scripts/test-disk-full.py --guest /path/to/guest --database --cycles 2 --hold 15
 python3 scripts/test-disk-full.py --guest /path/to/guest --both-disks --hold 15
 ```
