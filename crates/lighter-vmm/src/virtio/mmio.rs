@@ -283,7 +283,12 @@ impl VirtioMmio {
         }
 
         let memory = self.memory.clone();
-        let mut serviced = self.device.notify(index, &mut self.queues, &memory);
+        let serviced = self.device.notify(index, &mut self.queues, &memory);
+        self.finish_service(serviced);
+    }
+
+    fn finish_service(&mut self, mut serviced: crate::virtio::Serviced) {
+        let memory = self.memory.clone();
         loop {
             self.publish_signals();
             // Re-arm before deciding about the interrupt: the driver stops
@@ -522,7 +527,24 @@ impl VirtioMmio {
         self.kick_observer = Some(observer);
     }
 
+    pub fn retry_deadline(&self) -> Option<std::time::Instant> {
+        self.device.retry_deadline()
+    }
+
+    pub fn retry_deferred(&mut self, now: std::time::Instant) {
+        if !self.activated || self.retry_deadline().is_none_or(|deadline| now < deadline) {
+            return;
+        }
+        let serviced = self
+            .device
+            .retry_deferred(&mut self.queues, &self.memory, now);
+        self.finish_service(serviced);
+    }
+
     pub fn poll_queue(&mut self, index: u16) -> bool {
+        if self.retry_deadline().is_some() {
+            return false;
+        }
         let Some(queue) = self.queues.get(index as usize) else {
             return false;
         };

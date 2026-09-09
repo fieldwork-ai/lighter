@@ -87,13 +87,30 @@ impl Kicks {
     }
 
     /// Sleeps until the guest asks for something. False means shut down.
+    #[cfg(test)]
     fn wait(&self) -> bool {
+        self.wait_until(None)
+    }
+
+    fn wait_until(&self, deadline: Option<std::time::Instant>) -> bool {
         let mut pending = self.pending.lock().expect("poller signal poisoned");
         while !*pending {
             if self.stopped.load(Ordering::Acquire) {
                 return false;
             }
-            pending = self.arrived.wait(pending).expect("poller signal poisoned");
+            if let Some(deadline) = deadline {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return true;
+                }
+                pending = self
+                    .arrived
+                    .wait_timeout(pending, left)
+                    .expect("poller signal poisoned")
+                    .0;
+            } else {
+                pending = self.arrived.wait(pending).expect("poller signal poisoned");
+            }
         }
         *pending = false;
         !self.stopped.load(Ordering::Acquire)
@@ -119,7 +136,16 @@ pub fn spawn(
     watched: Vec<u16>,
     kicks: Arc<Kicks>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    let window = idle_window();
+    spawn_with_window(name, transport, watched, kicks, idle_window())
+}
+
+pub(crate) fn spawn_with_window(
+    name: &str,
+    transport: Arc<Mutex<VirtioMmio>>,
+    watched: Vec<u16>,
+    kicks: Arc<Kicks>,
+    window: std::time::Duration,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     let (signals, memory) = {
         let held = transport.lock().expect("polled transport poisoned");
         (
@@ -138,11 +164,26 @@ pub fn spawn(
     std::thread::Builder::new()
         .name(format!("poll-{name}"))
         .spawn(move || {
-            if window.is_zero() {
-                return;
-            }
             crate::virtio::fs::raise_server_qos();
-            while kicks.wait() {
+            loop {
+                let deadline = transport
+                    .lock()
+                    .expect("polled transport poisoned")
+                    .retry_deadline();
+                if !kicks.wait_until(deadline) {
+                    break;
+                }
+                {
+                    let mut held = transport.lock().expect("polled transport poisoned");
+                    // A stopped/reset device has no retained work. Reading the
+                    // deadline under the transport lock also rejects stale wakes.
+                    if held.retry_deadline().is_some() {
+                        held.retry_deferred(std::time::Instant::now());
+                    }
+                    if held.retry_deadline().is_some() || window.is_zero() {
+                        continue;
+                    }
+                }
                 // The kick that woke us has already been serviced by the vCPU
                 // that made it; from here the guest is told to stop bothering.
                 //
@@ -177,12 +218,14 @@ pub fn spawn(
                         held.poll_queue(*index);
                         left += held.outstanding(*index);
                     }
-                    if left == 0 {
+                    if left == 0 || held.retry_deadline().is_some() {
                         break;
                     }
                 }
-                for (index, _) in &signals {
-                    stranded += held.outstanding(*index);
+                if held.retry_deadline().is_none() {
+                    for (index, _) in &signals {
+                        stranded += held.outstanding(*index);
+                    }
                 }
                 drop(held);
                 if stranded != 0 {
