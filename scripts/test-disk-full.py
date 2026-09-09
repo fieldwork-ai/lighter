@@ -132,7 +132,7 @@ def main():
             guest('rm -f /run/enospc-go /run/enospc-result /mnt/data/enospc-probe')
             guest('(while [ ! -e /run/enospc-go ]; do sleep 0.1; done; cp /run/expected /mnt/data/enospc-probe && sync && cmp /run/expected /mnt/data/enospc-probe; echo $? > /run/enospc-result) > /run/enospc-writer.log 2>&1 &')
             if args.both_disks:
-                guest('rm -f /run/enospc-root-result /enospc-root-probe; (while [ ! -e /run/enospc-go ]; do sleep 0.1; done; cp /run/expected /enospc-root-probe && sync && cmp /run/expected /enospc-root-probe; echo $? > /run/enospc-root-result) > /run/enospc-root.log 2>&1 &')
+                guest('rm -f /run/enospc-root-result /enospc-root-probe; (while [ ! -e /run/enospc-go ]; do sleep 0.1; done; for i in $(seq 1 32); do cat /run/expected || exit; done > /enospc-root-probe && sync; echo $? > /run/enospc-root-result) > /run/enospc-root.log 2>&1 &')
             # Allocate host blocks until this *mounted image* returns real ENOSPC.
             filler = mount / 'filler'
             block = os.urandom(1024 * 1024)
@@ -156,7 +156,7 @@ def main():
                 if len(waiting) >= (2 if args.both_disks else 1):
                     break
                 time.sleep(0.2)
-            assert len(waiting) >= (2 if args.both_disks else 1), 'required deferred requests not observed'
+            assert len(waiting) >= (2 if args.both_disks else 1), f'required deferred requests not observed: {waiting}'
             print('BLOCKED', json.dumps(waiting), flush=True)
             began = time.monotonic()
             observations = []
@@ -193,7 +193,8 @@ def main():
                 raise RuntimeError('writer did not recover')
             if args.both_disks:
                 assert 'result=0' in guest('echo result=$(cat /run/enospc-root-result)')
-                guest('cmp /run/expected /enospc-root-probe')
+                expected_root = guest('(for i in $(seq 1 32); do cat /run/expected; done) | sha256sum').split()[0]
+                assert guest('sha256sum /enospc-root-probe').split()[0] == expected_root
             errors = guest('dmesg | grep -E "Aborting journal|Remounting filesystem read-only|EXT4-fs error|BTRFS.*(error|abort)" || true')
             assert errors.strip() == 'exit=0\n--end--', errors
             check = guest('cmp /run/expected /mnt/data/enospc-probe && sha256sum /mnt/data/enospc-probe; mount | grep /mnt/data; cat /run/enospc-writer.log')
@@ -211,7 +212,7 @@ def main():
         actual_hash = guest('sha256sum /mnt/data/enospc-probe').split()[0]
         assert actual_hash == expected_hash, 'content changed across clean reboot'
         if args.both_disks:
-            assert guest('sha256sum /enospc-root-probe').split()[0] == expected_hash
+            assert guest('sha256sum /enospc-root-probe').split()[0] == expected_root
         if args.database:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
