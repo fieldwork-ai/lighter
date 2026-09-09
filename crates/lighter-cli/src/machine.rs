@@ -25,6 +25,7 @@ pub struct Status {
     pub running: bool,
     pub docker: Option<String>,
     pub footprint_mib: Option<u64>,
+    pub storage_waiting: Vec<crate::storage_status::Waiting>,
 }
 
 /// The daemon that owns this home, verified with its process generation;
@@ -209,6 +210,11 @@ pub fn stop(wait: Duration) -> anyhow::Result<bool> {
     };
     // Signal the recorded process generation, not just its PID. The daemon
     // asks its own guest to sync/power off while it still holds the home lock.
+    if crate::storage_status::query(&paths::home()?, identity.pid()).is_ok_and(|s| !s.is_empty()) {
+        eprintln!(
+            "Storage is waiting for host disk space. Stopping now may lose unfinished writes."
+        );
+    }
     if !identity.signal(libc::SIGTERM)? {
         return Ok(false);
     }
@@ -238,13 +244,22 @@ pub fn stop(wait: Duration) -> anyhow::Result<bool> {
 pub fn status() -> anyhow::Result<Status> {
     let pid = running_pid()?;
     let socket = paths::docker_socket()?;
-    let docker = docker_version(&socket).ok();
+    let storage_waiting = pid
+        .and_then(|pid| crate::storage_status::query(&paths::home().ok()?, pid).ok())
+        .unwrap_or_default();
+    let timeout = if storage_waiting.is_empty() {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(250)
+    };
+    let docker = docker_version_until(&socket, Instant::now() + timeout).ok();
     let footprint = pid.and_then(footprint_mib);
     Ok(Status {
         running: pid.is_some(),
         pid,
         docker,
         footprint_mib: footprint,
+        storage_waiting,
     })
 }
 

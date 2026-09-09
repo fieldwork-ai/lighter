@@ -174,6 +174,21 @@ pub trait VirtioDevice: Send {
     /// Services a notification on `queue`.
     fn notify(&mut self, queue: u16, queues: &mut [Virtqueue], mem: &GuestMemory) -> Serviced;
 
+    /// A device with unfinished host I/O parks until this deadline.
+    fn retry_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    /// Invoked by the host timer, never by a guest kick.
+    fn retry_deferred(
+        &mut self,
+        _queues: &mut [Virtqueue],
+        _mem: &GuestMemory,
+        _now: std::time::Instant,
+    ) -> Serviced {
+        Serviced::NONE
+    }
+
     /// Returns the device to its power-on state.
     fn reset(&mut self) {}
 }

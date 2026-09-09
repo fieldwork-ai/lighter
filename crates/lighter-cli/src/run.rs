@@ -190,6 +190,15 @@ pub fn machine() -> anyhow::Result<()> {
     };
 
     let mut machine = Machine::start(&machine_config)?;
+    let _storage_status = crate::storage_status::Server::start(
+        &home,
+        machine_config
+            .disks
+            .iter()
+            .cloned()
+            .zip(machine.disks().iter().cloned())
+            .collect(),
+    )?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;
     }

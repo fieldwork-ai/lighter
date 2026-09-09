@@ -51,6 +51,17 @@ pub struct Disk {
     /// Logical size in bytes; the guest sees this as the disk's capacity.
     len: u64,
     read_only: bool,
+    /// Updated only when storage blocks, recovers or is reset.
+    pub(crate) waiting: std::sync::Mutex<Option<DiskWait>>,
+    #[cfg(test)]
+    faults: std::sync::Mutex<std::collections::VecDeque<(usize, i32)>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskWait {
+    pub operation: &'static str,
+    pub since: std::time::Instant,
+    pub retries: u64,
 }
 
 /// Moves the start of `iovs` past the first `n` bytes, and says how many
@@ -107,6 +118,9 @@ impl Disk {
             file,
             len,
             read_only,
+            waiting: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            faults: Default::default(),
         })
     }
 
@@ -117,7 +131,19 @@ impl Disk {
             file,
             len,
             read_only,
+            waiting: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            faults: Default::default(),
         })
+    }
+
+    pub fn waiting(&self) -> Option<DiskWait> {
+        self.waiting.lock().expect("disk status poisoned").clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&self, after: usize, errno: i32) {
+        self.faults.lock().unwrap().push_back((after, errno));
     }
 
     /// Reads `iovs` worth of bytes at `offset`, scattered straight into the
@@ -163,20 +189,46 @@ impl Disk {
     /// Writes `iovs` worth of bytes at `offset`, gathered straight from the
     /// spans they name, in one `pwritev`.
     pub fn write_vectored_at(&self, offset: u64, iovs: &mut [libc::iovec]) -> io::Result<()> {
+        self.write_vectored_progress(offset, iovs, &mut 0)
+    }
+
+    /// `done` survives errors; callers rebuild the original spans on retry.
+    pub fn write_vectored_progress(
+        &self,
+        offset: u64,
+        iovs: &mut [libc::iovec],
+        done: &mut usize,
+    ) -> io::Result<()> {
         if self.read_only {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "disk is read-only",
-            ));
+            return Err(io::ErrorKind::PermissionDenied.into());
         }
         let total: usize = iovs.iter().map(|iov| iov.iov_len).sum();
         self.check_range(offset, total as u64)?;
-        let mut at = 0;
-        let mut offset = offset;
-        let mut left = total;
+        if *done > total {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut at = advance(iovs, *done);
+        let mut offset = offset + *done as u64;
+        let mut left = total - *done;
         while left > 0 {
             let rest = &mut iovs[at..];
             let count = rest.len().min(libc::IOV_MAX as usize) as libc::c_int;
+            #[cfg(test)]
+            let original_len = rest[0].iov_len;
+            #[cfg(test)]
+            let count = {
+                let mut faults = self.faults.lock().unwrap();
+                if let Some((remaining, errno)) = faults.front().copied() {
+                    if remaining == 0 {
+                        faults.pop_front();
+                        return Err(io::Error::from_raw_os_error(errno));
+                    }
+                    rest[0].iov_len = rest[0].iov_len.min(remaining);
+                    1
+                } else {
+                    count
+                }
+            };
             // SAFETY: as for reads.
             let n = unsafe {
                 libc::pwritev(
@@ -186,6 +238,10 @@ impl Disk {
                     offset as libc::off_t,
                 )
             };
+            #[cfg(test)]
+            {
+                rest[0].iov_len = original_len;
+            }
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -197,6 +253,11 @@ impl Disk {
                 return Err(io::ErrorKind::WriteZero.into());
             }
             let n = n as usize;
+            *done += n;
+            #[cfg(test)]
+            if let Some((remaining, _)) = self.faults.lock().unwrap().front_mut() {
+                *remaining -= n;
+            }
             at += advance(rest, n);
             offset += n as u64;
             left -= n;
@@ -282,6 +343,10 @@ impl Disk {
     /// every other Mac container runtime gives a guest's flush, and takes
     /// tens of microseconds.
     pub fn flush(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some((_, errno)) = self.faults.lock().unwrap().pop_front() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         if self.read_only {
             return Ok(());
         }
@@ -339,18 +404,44 @@ impl Disk {
     /// the blocks stay allocated, so punching is both correct and free; if the
     /// punch fails we still owe it zeroes, and fall back to writing them.
     pub fn write_zeroes(&self, offset: u64, len: u64, may_unmap: bool) -> io::Result<()> {
-        if may_unmap && self.punch_hole(offset, len).is_ok() {
+        self.write_zeroes_progress(offset, len, may_unmap, &mut 0)
+    }
+
+    pub fn write_zeroes_progress(
+        &self,
+        offset: u64,
+        len: u64,
+        may_unmap: bool,
+        done: &mut usize,
+    ) -> io::Result<()> {
+        self.check_range(offset, len)?;
+        if *done as u64 > len {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // Discard may ignore partial APFS blocks; WRITE_ZEROES may not.
+        // Only use hole punching when it covers the entire requested range.
+        if *done == 0
+            && may_unmap
+            && offset.is_multiple_of(4096)
+            && len.is_multiple_of(4096)
+            && self.punch_hole(offset, len).is_ok()
+        {
+            *done = len as usize;
             return Ok(());
         }
-        self.check_range(offset, len)?;
-
         const CHUNK: usize = 1 << 20;
         let zeros = vec![0u8; CHUNK.min(len as usize)];
-        let mut written = 0u64;
-        while written < len {
-            let n = ((len - written) as usize).min(zeros.len());
-            self.write_at(offset + written, &zeros[..n])?;
-            written += n as u64;
+        while (*done as u64) < len {
+            let n = CHUNK.min(len as usize - *done);
+            let mut span = [libc::iovec {
+                iov_base: zeros.as_ptr().cast_mut().cast(),
+                iov_len: n,
+            }];
+            let mut progress = 0;
+            let result =
+                self.write_vectored_progress(offset + *done as u64, &mut span, &mut progress);
+            *done += progress;
+            result?;
         }
         Ok(())
     }

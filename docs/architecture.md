@@ -133,6 +133,70 @@ The idle poll's window follows the vCPU-to-core ratio (`config::idle_poll_ns`): 
 
 **The registry must be able to breathe.** A parked directory taxes every name inside it, so directories are residency-privileged in every sweep. At a full share a new file is bound parked rather than opened and closed again a moment later. And the lookup count must match the kernel's exactly, in both directions: the server finding its own entry for a name is not a lookup, and a reply that names no nodeid — a clone's reply is a size — owes none, so the inode it made is born without one. Counting one too many left every unlinked file a FORGET short of release and a tree walk taking sixteen minutes; later it left every imported file in the registry forever, sixty thousand an install, and a server that got slower with each repetition. A test now forgets each shape by the count the kernel would use and asks the registry to be empty.
 
+## Host disk exhaustion
+
+If a host operation on a virtual disk returns `ENOSPC`, lighter retains that
+request and retries it every three seconds. It does not complete the request
+with an I/O error, suspend the VM, or restart containers. There are no space
+checks or retry timers in the healthy path. Writes, flushes, discards and
+zeroing retain the order in which the device accepted them across its queues.
+Reads may pass only if their range overlaps none of the earlier unfinished
+mutations, including queued mutations and the full range of a partially
+completed write. Reads may pass a flush, which changes durability rather than
+contents. GET_ID is independent of disk contents. Other devices keep operating;
+applications waiting for writes may still time out.
+
+A retained write includes its completed byte count and validated descriptor
+metadata. Retries rebuild host spans from guest addresses and continue at the
+unfinished offset. The device publishes the used entry exactly once, after
+success or a non-`ENOSPC` error. Reset cancels retained requests under the
+transport lock. The poller parks without holding that lock, uses a timed wait
+only while a request is deferred, and retries even with host polling disabled
+or no further guest kicks. Notifications can consume new requests and complete
+safe reads without retrying the failed mutation. Retained work does not keep
+the poller spinning.
+
+There is one retrying operation per disk and a backlog of requests waiting
+behind it. Admission is bounded by each ring's size. Only descriptor metadata
+is retained; data stays in guest memory and the driver must not reuse its
+buffers until completion. Split and packed rings may complete independent
+reads out of order. After a retry completes, the
+device revisits the backlog in order so newly unblocked reads can proceed even
+if another mutation encounters ENOSPC. Reset cancels the entire backlog.
+
+`lighter status` obtains storage state from a host-only, owner-accessible
+`status.sock` under `LIGHTER_HOME`; it remains available when Docker
+cannot answer. Its version-1 JSON response contains a `waiting` list with each
+disk's path, operation, elapsed waiting seconds and retry count. The listener
+sleeps in `accept` between queries and writes no status files. Logs record
+blocking, recovery and terminal errors rather than every retry. Explicitly
+stopping while blocked warns that unfinished writes can be lost.
+
+This protects against recoverable host allocation failures. It does not repair
+an already-aborted filesystem, retry unrelated I/O errors, change host-share
+error semantics, or guarantee application availability during prolonged waits.
+It also does not strengthen the existing host flush/crash durability contract.
+Holding unrelated reads was found to stall Docker/containerd file-backed page
+faults and cause sustained guest CPU use during prolonged exhaustion. Allowing
+independent reads avoids that artificial dependency. Reads of ranges with
+unfinished writes must still wait, and application-level timeouts remain
+possible.
+
+The hardware regression gate uses a capped disposable APFS image and a private
+VM, never the host's main filesystem or the daily driver's data. For example:
+
+```sh
+python3 scripts/test-disk-full.py --guest /path/to/guest --hold 600 --max-blocked-cpu 25
+python3 scripts/test-disk-full.py --guest /path/to/guest --filesystem btrfs --poll-us 0 --hold 600 --max-blocked-cpu 25
+python3 scripts/test-disk-full.py --guest /path/to/guest --database --cycles 2 --hold 15
+python3 scripts/test-disk-full.py --guest /path/to/guest --both-disks --hold 15
+```
+
+The candidate CLI must be signed with the hypervisor entitlement. The gate
+checks recovery and content across a subsequent clean reboot; evidence stays
+in ignored `.logs/`. Deterministic unit tests cover partial writes, deferred
+flushes, ordering, reset, and timer recovery without guest notifications.
+
 ## The network is streams
 
 A container's TCP connection does not cross to the Mac as packets. Inside the guest, netfilter redirects every TCP connection that would leave through the network device — `fib daddr oif "eth0"` in prerouting, the interface itself in output, so nothing bound for a container, a bridge or the guest is touched and no list of subnets has to follow Docker around — to a small agent, which reads where the connection was going and opens one vsock connection to the host per TCP connection, the destination in a nineteen-byte header. On the host each becomes an ordinary macOS socket to that destination, and bytes are copied both ways until both sides are done. Published ports are the same thing the other way round: the host binds what Docker bound in the guest (every interface for `-p 8080:80`, in both families; loopback for `-p 127.0.0.1:8080:80`; or loopback for everything under `lighter config --publish localhost`), each accepted connection is a vsock stream opening with the same nineteen-byte header, naming where in the guest the agent is to dial — eth0's address for a publish on every interface, the bound address itself for one Docker bound somewhere in particular, where only its proxy answers — and the agent connects to what Docker has there. UDP goes both ways as flows on one stream per direction, in seven-byte frames (length, flow, kind) with an opening frame naming the destination: outbound, netfilter's TPROXY delivers a container's datagrams to the agent with their destination intact, and the host holds a socket per flow; inbound, the host binds the published port, gives each client a flow, and the agent holds a socket per flow connected to Docker's proxy. A frame is never cut at the guest's credit and abandoned — the tail waits in the stream's backlog and goes when credit returns, because a half frame desynchronises the reader for good — and a flow nobody has used for a minute is closed by whichever side opened it. ICMP and DHCP keep going out the network device, where the VMM answers them itself; DNS is a framed stream of its own to the Mac's resolver.
