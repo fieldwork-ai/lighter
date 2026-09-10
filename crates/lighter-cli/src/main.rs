@@ -20,6 +20,7 @@ mod paths;
 mod release;
 mod run;
 mod service;
+mod storage_status;
 mod updates;
 mod upgrade;
 
@@ -342,6 +343,16 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
     }
     if let Some(mib) = status.footprint_mib {
         println!("  memory     {mib} MiB");
+    }
+    for disk in &status.storage_waiting {
+        println!("  storage    Waiting for host disk space; VM running, writes waiting.");
+        println!(
+            "             {}: {}, {}s, {} retries",
+            disk.disk.display(),
+            disk.operation,
+            disk.waiting_seconds,
+            disk.retries
+        );
     }
     println!("  socket     {}", paths::docker_socket()?.display());
     Ok(std::process::ExitCode::SUCCESS)
