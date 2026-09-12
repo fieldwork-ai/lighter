@@ -1,0 +1,31 @@
+mm: keep speculative readahead out of direct reclaim
+
+An overcommitted memory cgroup can repeatedly evict and refault executable
+pages while readahead charges speculative folios. __GFP_NORETRY alone does
+not prevent memcg reclaim from retrying when each pass frees some pages.
+This can starve a daemon sharing the cgroup with its workers without
+reaching OOM, even when the rest of the guest has plenty of free memory.
+
+Clear __GFP_DIRECT_RECLAIM for readahead allocations and charges. If the
+prefetch cannot be satisfied immediately, it can fail and let the demand
+read/fault path reclaim for the data actually needed. Keep background
+reclaim enabled and leave demand allocation flags, cgroup limits and
+ordinary readahead window sizes unchanged.
+
+Validated on Linux 6.18.49 with an 8 GiB, no-swap BuildKit cgroup running
+two native application builds: the released kernel repeatedly timed out
+worker queries and required cancellation; this change let OOM terminate
+an oversized worker while the daemon and surviving build progressed.
+
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -672,7 +672,8 @@
+ 
+ static inline gfp_t readahead_gfp_mask(struct address_space *x)
+ {
+-	return mapping_gfp_mask(x) | __GFP_NORETRY | __GFP_NOWARN;
++	return (mapping_gfp_mask(x) & ~__GFP_DIRECT_RECLAIM) |
++		__GFP_NORETRY | __GFP_NOWARN;
+ }
+ 
+ typedef int filler_t(struct file *, struct folio *);
