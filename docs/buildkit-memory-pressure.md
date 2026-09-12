@@ -119,4 +119,27 @@ fix, so its startup/memory differences are not kernel-only comparisons.
 
 Raw qualification records stay local; published benchmark selections and the
 README are unchanged. The M5 daily VM was left on released 0.5.3. No full M5
-benchmark or new release publication is part of this qualification.
+benchmark or new release publication was part of that initial qualification.
+
+## Signed 0.5.4 acceptance
+
+The final signed archive repeated the original workflow on the shared M5 with
+the same pinned application, BuildKit image, VM settings and container limit.
+This is the second signed candidate: the first, from `7a8f401`, passed the same
+workflow (cold pair, two explicit memory errors by 60.8 s; warm pair, two by
+72.9 s; uncached build after, on the unchanged builder) and was withdrawn
+unpublished when the release gate found the stream corruption fixed by kernel
+patch 0030. The final archive's kernel carries that patch beside the readahead
+correction; nothing else in the guest changed.
+
+On the final archive the cold pair returned two explicit memory errors by
+60.3 s with two OOM kills recorded and no cancellation. The warm pair on the
+same live builder saw one worker OOM-killed at 78.0 s and the survivor finish
+in 128.7 s; all eleven worker queries during it succeeded, the slowest in
+1.05 s. The subsequent uncached single build completed its builder stage in
+73.4 s. Builder container ID, PID and start time remained unchanged
+throughout. These are acceptance observations on a shared host, not
+performance records.
+
+See the [0.5.4 release notes](release-notes-0.5.4.md) for final artifact and
+release qualification details.
