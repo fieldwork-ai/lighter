@@ -240,7 +240,9 @@ fi
 # engine's processes: the page cache a process fills is charged to its
 # cgroup, and the root cgroup cannot be asked to reclaim, so both daemons
 # live in one the agent can trim (see its bound_container_cache).
-mkdir -p /var/log /run/containerd /sys/fs/cgroup/engine
+# Establish the containers' parent before the first container runs, so the
+# agent can distinguish an empty hierarchy from unavailable population data.
+mkdir -p /var/log /run/containerd /sys/fs/cgroup/engine /sys/fs/cgroup/docker
 echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
 # RCU grace periods expedited from here on. A container's start and stop
 # wait on several (cgroups, netfilter rules, namespaces), each a few jiffies

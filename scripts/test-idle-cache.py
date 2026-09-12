@@ -66,6 +66,27 @@ def main():
             subprocess.run([binary, 'start'], env=env, stdout=log, stderr=subprocess.STDOUT,
                            timeout=75, check=True)
         assert not run(docker + ['ps', '-aq']).strip(), 'test VM must be empty'
+        # Before Docker has ever started a container, init must establish a
+        # known-empty hierarchy. An absent parent is conservatively treated as
+        # live by the agent and used to suppress cold-start memory reclamation.
+        cold_population = guest('cat /sys/fs/cgroup/docker/cgroup.events')
+        assert 'populated 0' in cold_population, cold_population
+
+        def mem_total_kib():
+            return int(guest("awk '$1 == \"MemTotal:\" {print $2}' /proc/meminfo"))
+
+        cold_total_before = mem_total_kib()
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            cold_total_after = mem_total_kib()
+            if cold_total_after < 3 * 1024**2:
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(f'unused VM did not release its memory range: {cold_total_after} KiB')
+        cold = dict(population=cold_population, total_kib_before=cold_total_before,
+                    total_kib_after=cold_total_after)
+        (out / 'cold.json').write_text(json.dumps(cold, indent=2) + '\n')
         run(docker + ['buildx', 'create', '--name', builder, '--driver', 'docker-container',
                       '--driver-opt', f'image={IMAGE}', f'unix://{home}/docker.sock'])
         created = True
@@ -102,7 +123,7 @@ def main():
         assert before > 16 * 1024, f'executable was not warm: {before} KiB'
         time.sleep(15)
         after = resident_file()
-        result = dict(live_file_kib_before=before, live_file_kib_after=after,
+        result = dict(cold=cold, live_file_kib_before=before, live_file_kib_after=after,
                       population=population, immediate_child_processes=direct)
         (out / 'live.json').write_text(json.dumps(result, indent=2) + '\n')
         assert after >= before * 0.8, f'live executable evicted: {before} -> {after} KiB'

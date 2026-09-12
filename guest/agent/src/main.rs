@@ -255,8 +255,8 @@ fn bound_container_cache() {
     let bound = cmdline_value("lighter.cachebound")
         .map(|mib| mib << 20)
         .unwrap_or(0);
-    // dockerd makes the containers' cgroup at the first container, which
-    // can be any time: the bound is written once it exists.
+    // Init creates the containers' parent. Retry the opt-in bound until its
+    // memory controller is available.
     let mut bounded = bound == 0;
     let always_fast = std::fs::read_to_string("/proc/cmdline")
         .map(|c| c.split_whitespace().any(|w| w == "lighter.reporting=fast"))

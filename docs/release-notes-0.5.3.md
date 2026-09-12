@@ -15,6 +15,8 @@ Workload detection now reads the cgroup's hierarchical population flag. Nested
 groups, including builders and their execution processes, count as live even
 when the immediate parent has no direct processes. Missing or malformed
 population information is treated conservatively as live work.
+The empty parent cgroup is established during boot, so an unused VM can reclaim
+memory before its first container runs.
 
 These are general memory-policy fixes. They do not add BuildKit-specific
 handling or make oversized concurrent builds fit within a shared memory cap.
