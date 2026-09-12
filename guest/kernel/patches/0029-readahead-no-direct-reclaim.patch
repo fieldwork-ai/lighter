@@ -1,8 +1,8 @@
 mm: keep speculative readahead out of direct reclaim
 
 An overcommitted memory cgroup can repeatedly evict and refault executable
-pages while readahead charges speculative folios. __GFP_NORETRY alone does
-not prevent memcg reclaim from retrying when each pass frees some pages.
+pages while readahead charges speculative folios. __GFP_NORETRY still
+allows a reclaim pass for each charge, and a retry if margin reappears.
 This can starve a daemon sharing the cgroup with its workers without
 reaching OOM, even when the rest of the guest has plenty of free memory.
 
