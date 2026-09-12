@@ -1,0 +1,118 @@
+sockmap: a segment overlapping delivered bytes is read once
+
+TCP queues a segment whose head has already arrived — a retransmission
+that crossed the ACK for its first part — whole, with a D-SACK for the
+head, since every reader of the receive queue skips by sequence number:
+tcp_recvmsg and tcp_read_sock take the offset of copied_seq into the skb
+and copy from there. tcp_read_skb, the sockmap reader, did not. It handed
+each skb whole to the verdict, so a redirect sent the overlap again — a
+256 MiB transfer out of a container arrived with four segments' worth,
+5,792 bytes, repeated in place; a controlled second segment starting
+eight bytes into the first delivered thirty-two bytes for twenty-four —
+and tcp_eat_skb advanced copied_seq by the whole skb too, past the stream.
+
+The reader now keeps its own place in the stream, the end of the last skb
+it was handed, and takes off the front of each skb what lies before it.
+Its own place rather than copied_seq, which lags a pass verdict's bytes
+until a process reads them, and rather than a cursor in the call, which
+would not know what an earlier call had handed over. It starts where the
+socket's last reader stopped, so an skb partly read before the join is
+not handed over whole either. The trim happens before the skb leaves the
+queue: if it needs memory the system has not got, the skb stays and the
+read returns ENOMEM for the next data-ready to retry, and nothing is lost.
+
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -374,6 +374,12 @@
+ 				 * total number of DSACK blocks received
+ 				 */
+ 	u32	compressed_ack_rcv_nxt;
++	/* A sockmap reader's place in the stream (tcp_read_skb): the next
++	 * sequence number it will be handed. Ahead of copied_seq by what it
++	 * has passed to its own socket's ingress queue and no process has
++	 * read yet; behind rcv_nxt by what is still queued. Socket lock.
++	 */
++	u32	read_skb_seq;
+ 	struct list_head tsq_node; /* anchor in tsq_tasklet.head list */
+ 
+ 	/* Information of the most recently (s)acked skb */
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1705,40 +1705,62 @@
+ 	return __tcp_read_sock(sk, desc, recv_actor, false,
+ 			       &tcp_sk(sk)->copied_seq);
+ }
+ EXPORT_SYMBOL(tcp_read_sock);
+ 
+ int tcp_read_sock_noack(struct sock *sk, read_descriptor_t *desc,
+ 			sk_read_actor_t recv_actor, bool noack,
+ 			u32 *copied_seq)
+ {
+ 	return __tcp_read_sock(sk, desc, recv_actor, noack, copied_seq);
+ }
+ 
+ int tcp_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
+ {
++	struct tcp_sock *tp = tcp_sk(sk);
+ 	struct sk_buff *skb;
+ 	int copied = 0;
+ 
+ 	if (sk->sk_state == TCP_LISTEN)
+ 		return -ENOTCONN;
+ 
+ 	while ((skb = skb_peek(&sk->sk_receive_queue)) != NULL) {
+ 		u8 tcp_flags;
+ 		int used;
++
++		/* A segment may begin before the reader's place: a
++		 * retransmission whose head had already arrived is queued
++		 * whole, since a process reading by sequence number skips
++		 * what it has had. This reader is handed skbs, so the part
++		 * it has had comes off the front here, while the skb is
++		 * still queued: if the pull needs memory the system has not
++		 * got, the skb stays for the next data-ready, nothing lost.
++		 */
++		if (before(TCP_SKB_CB(skb)->seq, tp->read_skb_seq)) {
++			u32 offset = tp->read_skb_seq - TCP_SKB_CB(skb)->seq;
+ 
++			if (WARN_ON_ONCE(offset > skb->len))
++				offset = skb->len;
++			if (!pskb_pull(skb, offset)) {
++				if (!copied)
++					copied = -ENOMEM;
++				break;
++			}
++			TCP_SKB_CB(skb)->seq += offset;
++		}
+ 		__skb_unlink(skb, &sk->sk_receive_queue);
+ 		WARN_ON_ONCE(!skb_set_owner_sk_safe(skb, sk));
++		tp->read_skb_seq = TCP_SKB_CB(skb)->end_seq;
+ 		tcp_flags = TCP_SKB_CB(skb)->tcp_flags;
+ 		used = recv_actor(sk, skb);
+ 		if (used < 0) {
+ 			if (!copied)
+ 				copied = used;
+ 			break;
+ 		}
+ 		copied += used;
+ 
+ 		if (tcp_flags & TCPHDR_FIN)
+ 			break;
+ 	}
+ 	return copied;
+ }
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -1305,6 +1305,12 @@
+ 	if (psock->saved_data_ready)
+ 		return;
+ 
++	/* The reader starts where the socket's last one stopped, and keeps
++	 * its own place from here: copied_seq lags a pass verdict's bytes
++	 * until a process reads them.
++	 */
++	if (sk_is_tcp(sk))
++		tcp_sk(sk)->read_skb_seq = tcp_sk(sk)->copied_seq;
+ 	psock->saved_data_ready = sk->sk_data_ready;
+ 	WRITE_ONCE(sk->sk_data_ready, sk_psock_verdict_data_ready);
+ 	WRITE_ONCE(sk->sk_write_space, sk_psock_write_space);

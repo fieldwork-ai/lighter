@@ -48,6 +48,8 @@ jobs:
         run: python3 scripts/test-idle-poll.py
       - name: Check vsock blocking receive lock handling
         run: python3 scripts/test-vsock-wait.py
+      - name: Sockmap reader hands each byte over once
+        run: python3 scripts/test-tcp-read-skb.py
       - name: Restored containers wait for online memory
         run: python3 scripts/test-boot-memory.py
       - name: Speed gate rejects failed performance floors
