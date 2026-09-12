@@ -105,7 +105,14 @@ The balloon is the host asking for more. macOS pressure levels set a floor: a qu
 
 The guest balloon driver allocates aligned order-2 compound pages (guest patch 0014): four guest pages are one 16 KiB host page. Scattered 4 KiB allocations previously removed memory from the guest without returning it to the Mac. These compound pages do not migrate, so a balloon inside a movable block can keep that block plugged. The guest's voluntary balloon offers are consequently accepted only once the virtio-mem range is fully out; host pressure can still insist while containers run.
 
-The guest agent trims idle cache, which free page reporting alone cannot identify as unused. Container CPU activity drives two passes at five and ten seconds of idleness, reclaiming the containers' cold cache and the engine's cache. The engine runs in its own cgroup so image-layer cache is reachable by this operation. Compaction then gathers the freed fragments into reportable runs, and reporting briefly uses its faster idle settings. Active work restores the normal reporting rate. There is no default cache ceiling on running containers: the worklog records several such limits that made package installs slower.
+Automatic file-cache trimming waits for an empty, idle container hierarchy.
+`cgroup.events` reports population recursively, including nested builder and
+execution groups. CPU idleness alone does not make a running process's mapped
+files disposable: image extraction can charge those shared pages to the Docker
+engine rather than the container using them. Empty hierarchies receive cleanup
+passes after approximately three and eight seconds; free-page reporting and
+pressure recovery still operate while workloads run. Unknown population is
+handled conservatively as live work. Compaction gathers freed fragments into reportable runs, and reporting briefly uses its faster idle settings. New work restores the normal reporting rate. There is no default cache ceiling on running containers.
 
 Docker and containerd have OOM protection so a full guest does not lose its engine. BuildKit launches use a runtime wrapper that resets the inherited OOM score before executing runc: the build competes with ordinary containers at score adjustment zero. Without that boundary, an oversized build inherited the daemon's -900 adjustment and Linux killed small application containers instead. The Docker hardware gate checks both worker and daemon scores.
 

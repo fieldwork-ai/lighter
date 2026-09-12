@@ -18,7 +18,7 @@ COPY src ./src
 # `--locked` rather than a best-effort fallback: this binary ends up inside a
 # guest image, and "it built with whatever was newest that day" is not a
 # property we want a rootfs to have.
-RUN cargo build --release --locked
+RUN cargo test --locked && cargo build --release --locked
 
 # Prove it needs no loader, here, where the failure is a build error rather than
 # a guest that cannot exec its agent. The test is the absence of an ELF
