@@ -149,10 +149,11 @@ else
 fi
 
 echo "==> Bringing up a Fieldwork-shaped stack"
-if docker compose -f "$COMPOSE" up -d --wait --wait-timeout 300 >/dev/null 2>&1; then
+if docker compose -f "$COMPOSE" up -d --wait --wait-timeout 300 >"$LOG.compose" 2>&1; then
 	pass "compose up: all services reported healthy"
 else
 	fail "compose up did not reach a healthy state"
+	tail -30 "$LOG.compose" | sed 's/^/    /'
 	docker compose -f "$COMPOSE" ps 2>&1 | sed 's/^/    /'
 fi
 
