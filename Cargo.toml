@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -11,10 +11,10 @@ repository = "https://github.com/fieldwork-ai/lighter"
 authors = ["Nick Rogers"]
 
 [workspace.dependencies]
-lighter-hv = { path = "crates/lighter-hv", version = "0.5.0" }
-lighter-vmm = { path = "crates/lighter-vmm", version = "0.5.0" }
-lighter-docker = { path = "crates/lighter-docker", version = "0.5.0" }
-lighter-fs = { path = "crates/lighter-fs", version = "0.5.0" }
+lighter-hv = { path = "crates/lighter-hv", version = "0.5.3" }
+lighter-vmm = { path = "crates/lighter-vmm", version = "0.5.3" }
+lighter-docker = { path = "crates/lighter-docker", version = "0.5.3" }
+lighter-fs = { path = "crates/lighter-fs", version = "0.5.3" }
 
 anyhow = "1"
 thiserror = "2"

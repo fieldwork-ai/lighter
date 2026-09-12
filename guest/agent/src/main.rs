@@ -13,6 +13,7 @@
 //!   docker CLI ──unix──▶ lighter ──vsock──▶ agent ──unix──▶ dockerd
 //! ```
 
+mod memory_policy;
 mod sockmap;
 mod udp;
 mod udp_inbound;
@@ -22,6 +23,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
+use memory_policy::{IdleTrim, TICKS_PER_SEC};
 use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
@@ -213,37 +215,9 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Answers one control connection.
-///
-/// A line protocol, because the vocabulary is two words and a number and
-/// anything more would be a serialization format to maintain. Each command
-/// gets one line back so the host can tell "done" from "this build does not
-/// know that word".
-/// Gives the containers' page cache back once they have been idle a while.
-///
-/// From what an 8 GB Mac with a 4 GiB guest showed, in order. Left alone,
-/// the cache fills the guest and macOS compresses the guest's pages while
-/// reporting no pressure at all, and the install after a big one paid
-/// fifteen percent faulting its memory back in. A bound on the cache — as
-/// `memory.high`, at half of RAM or three quarters, or kept by reclaiming
-/// above a line every second — cured that and cost more than it cured:
-/// the first of three repetitions of every install took twice as long as
-/// the third, and yarn ran a third slower throughout, because an install's
-/// working set is the cache and any bound the working set crosses is paid
-/// on every page. The host's compressor is left to the host-side policy,
-/// which asks for a reclaim only under real distress; with that alone the
-/// install after a big one paid three percent.
-///
-/// What remains is what OrbStack's footprint shows: back at two gigabytes
-/// within a quarter minute of an install ending. Once the containers have
-/// been idle ten seconds the cache is trimmed to a sixteenth of RAM,
-/// coldest pages first (`memory.reclaim`), and free page reporting hands
-/// the freed memory back. Idle is the containers' own CPU from their
-/// cgroup, not the guest's — a guest installing against the share is three
-/// quarters idle waiting on the host — and half a minute of it, because
-/// three seconds was the pause between one install and the next and every
-/// one started cold. dockerd makes the cgroup at the first container, which
-/// can be any time, so this simply keeps looking.
+/// Return free memory throughout the workload lifecycle. Proactive file-cache
+/// trimming waits for an empty container hierarchy: a quiet process can still
+/// need its executable and mapped files, including pages charged to the engine.
 fn bound_container_cache() {
     let Some(mut total) = mem_total() else { return };
     // With a virtio-mem range the guest's size is the host's to set, from
@@ -316,6 +290,7 @@ fn bound_container_cache() {
     // extracted, and whatever else it read, charged where a trim can reach.
     let engine = "/sys/fs/cgroup/engine";
     let mut idle_for = 0u32;
+    let mut idle_trim = IdleTrim::default();
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 16]> = None;
@@ -331,7 +306,6 @@ fn bound_container_cache() {
     // idle, and a one-second tick put the first offer three seconds after
     // the last container stopped — past the moment anything looking at the
     // machine five seconds after its work would read.
-    const TICKS_PER_SEC: u32 = 4;
     loop {
         // A quarter-second tick while anything is happening; one a second
         // once the guest has been idle ten seconds. Each tick is a timer
@@ -355,6 +329,8 @@ fn bound_container_cache() {
         let used = now.saturating_sub(last);
         last = now;
         idle_for = if used < step as u64 * 50_000 / TICKS_PER_SEC as u64 { idle_for + step } else { 0 };
+        let populated = memory_policy::populated(std::path::Path::new(containers));
+        let trim_due = idle_trim.tick(populated, idle_for > 0, step);
         let heavy = used >= step as u64 * 500_000 / TICKS_PER_SEC as u64;
         light_for = if heavy { 0 } else { light_for + step };
         // Freed memory goes back at reporting's idle rate for a while after
@@ -363,7 +339,9 @@ fn bound_container_cache() {
         // `lighter.reporting=fast` on the command line keeps reporting
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
-        if hurried && !always_fast && (idle_for == 0 || idle_for >= 25 * TICKS_PER_SEC) {
+        if hurried && !always_fast
+            && (populated || idle_for == 0 || idle_trim.elapsed_ticks() >= 25 * TICKS_PER_SEC)
+        {
             set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
             hurried = false;
             at_rest = !heavy;
@@ -412,8 +390,7 @@ fn bound_container_cache() {
         // tripped the release, the next tick offered everything again, three
         // gigabytes moved every second and a half and copy-tree took twice
         // as long. The release stays with active work short of memory.
-        let running = running_containers(containers);
-        let active = idle_for == 0 && running > 0;
+        let active = idle_for == 0 && populated;
         let busy = guest_cpu_busy(&mut cpu_last);
         quiet_for = if busy < step as u64 * 100_000 / TICKS_PER_SEC as u64 { quiet_for + step } else { 0 };
         // Three seconds of it, not one: a second's pause between two
@@ -446,43 +423,20 @@ fn bound_container_cache() {
                 // predecessor's cache were being unplugged (the M1's installs
                 // a fifth slower); eight is the second trim's moment, when
                 // the cache is already gone and the unplug is cheap.
-                quiet_for >= 3 * TICKS_PER_SEC || (running == 0 && idle_for >= 8 * TICKS_PER_SEC),
-                running == 0,
+                quiet_for >= 3 * TICKS_PER_SEC
+                    || (!populated && idle_trim.elapsed_ticks() >= 8 * TICKS_PER_SEC),
+                !populated,
                 dynamic && quiet_for == 0,
             );
         }
-        // Two passes, five and ten seconds idle: the containers down to a
-        // sixty-fourth of RAM (their warmest pages) and the engine to
-        // almost nothing, since nothing it cached is a build's working
-        // set; then the same again, and compaction again — what the first
-        // trim freed was in file-sized pieces, and a second pass on a guest
-        // that has been idle a while coalesces what the first missed. Five
-        // because the suite pauses three seconds between installs, and a
-        // trim between two would cost the second its cache; and because
-        // OrbStack's footprint is back at its resting size within fifteen
-        // seconds of an install. A sixteenth of RAM kept at the first pass
-        // was measured: 0.4 GB back at five seconds, 1.4 at ten, and the
-        // fifteen-second reading caught the second pass mid-drain.
-        //
-        // With no container running at all, three and eight seconds instead:
-        // nothing is between commands then, and the cache is the last thing
-        // the host is still holding for a guest that has stopped.
-        let running = running_containers(containers);
-        // Three and eight seconds whether or not a container is running:
-        // five was chosen so a trim would not land between two installs
-        // and cost the second its cache, and that cost was measured at
-        // nothing (`lighter.trim=0`, three reps, level). Three is inside the
-        // five seconds after work that a footprint is read at.
-        let (first, second) = (3, 8);
-        // `lighter.trim=0` keeps the caches: the A/B for what a trim costs
-        // the next command.
-        if !trims {
+        // Image extraction charges shared file pages to the engine. A running
+        // container can map those pages without owning their charge, so neither
+        // cgroup's cache is disposable merely because container CPU is quiet.
+        // Trim only after three and eight seconds with no populated descendants.
+        if !trims || !trim_due {
             continue;
         }
-        let (floor, engine_floor) = match idle_for {
-            x if x == first * TICKS_PER_SEC || x == second * TICKS_PER_SEC => (total / 64, 8 << 20),
-            _ => continue,
-        };
+        let (floor, engine_floor) = (total / 64, 8 << 20);
         // Both trims take file cache only: a workload's memory is never
         // swapped behind its back, and neither is the engine's — swapping
         // dockerd and containerd into zram here read 60 MiB less at idle
@@ -490,6 +444,11 @@ fn bound_container_cache() {
         // swap-in, 450–1131 ms for a container start after a suite of
         // installs. zram stays for a guest with nothing left.
         for (cgroup, resting, swappiness) in [(containers, floor, 0), (engine, engine_floor, 0)] {
+            // A new container may have arrived since the tick's population
+            // read. Recheck before each potentially blocking reclaim request.
+            if memory_policy::populated(std::path::Path::new(containers)) {
+                break;
+            }
             let current = std::fs::read_to_string(format!("{cgroup}/memory.current"))
                 .ok()
                 .and_then(|c| c.trim().parse::<u64>().ok())
@@ -507,37 +466,16 @@ fn bound_container_cache() {
         // eighth of RAM — is reporting's: hurried for a while and compacted
         // into reportable runs, as before the balloon. On a 4 GiB guest the
         // reserve alone read 600 MB more at a minute without this.
-        set_reporting(100, 5);
-        hurried = true;
-        compact_until_reportable();
+        if !memory_policy::populated(std::path::Path::new(containers)) {
+            set_reporting(100, 5);
+            hurried = true;
+            compact_until_reportable();
+        }
     }
 }
 
 /// The host port that takes the guest's memory offer.
 const MEMORY_PORT: u32 = 2381;
-
-/// Sixteen bytes to the host: the free memory beyond a reserve of an
-/// eighth of RAM (MiB; zero holds the balloon where it is), available
-/// and free (MiB), and a release flag that asks the whole balloon back.
-/// Reconnects on the next tick if the stream is gone; the host treats a
-/// closed stream as a release.
-/// Containers with a process in them: one child cgroup each under the
-/// containers' cgroup.
-fn running_containers(containers: &str) -> usize {
-    std::fs::read_dir(containers)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .filter(|e| {
-                    std::fs::read_to_string(e.path().join("cgroup.procs"))
-                        .map(|p| !p.trim().is_empty())
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0)
-}
 
 /// Busy CPU time of the whole guest since the last call, in microseconds
 /// of core (user, system and interrupt time from `/proc/stat`).

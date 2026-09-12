@@ -52,3 +52,5 @@ jobs:
         run: python3 scripts/test-boot-memory.py
       - name: Speed gate rejects failed performance floors
         run: bash scripts/test-speed-gate.sh
+      - name: Memory policy preserves live nested workloads
+        run: bash scripts/test-memory-policy.sh
