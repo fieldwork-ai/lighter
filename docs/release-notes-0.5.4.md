@@ -40,16 +40,30 @@ this fix from the idle-cache policy corrections shipped in 0.5.3. Linux remains
 
 ## Release artifacts
 
-Packaged source: `7a8f40105488456e4356da76bf1d6b28f3ef6c34`.
-Apple accepted notarization `97e92ef2-9c78-4102-9579-af4ca17b531e`;
+Packaged source: `ab2cabb` (`ab2cabb3` on the release branch; the stream
+fix). A first candidate from `7a8f40105488456e4356da76bf1d6b28f3ef6c34`,
+notarized as `97e92ef2-9c78-4102-9579-af4ca17b531e`, was withdrawn unpublished
+when its stream gate failed; only the kernel differs.
+Apple accepted notarization `30e46b48-b446-44b8-bf5b-908c3a7afc1e`;
 the app ticket is stapled and Gatekeeper accepts the archive's app.
 
 | Artifact | SHA256 |
 | --- | --- |
-| `lighter-0.5.4-arm64.tar.gz` | `bfceaf5c6257e4e8a9521ef60982baac2909a6d55739323b2a9f7a0039bd20c0` |
-| `lighter-0.5.4-arm64` bootstrap | `9ac44e1e20c42bdb72285f90198fc13764dd6746954644f5c45d65217d41e4b7` |
-| Guest kernel | `d6fda8264ae57151f11c9069966430468d510567547057a5cdd620e8c7be472f` |
+| `lighter-0.5.4-arm64.tar.gz` | `f9533404042f398617980171ab3f499a454043574c5118dda7488bb3a26cb071` |
+| `lighter-0.5.4-arm64` bootstrap | `9fbdb218cc8ca47f3b31e4dfe5f3b3d7461fb3038de75d3ba0ee4cb81dd498dd` |
+| Guest kernel | `33c72dd4987331679097b0fa360f57beb621c4ee10ec111eb3064eeaaf517a97` |
 | Guest root filesystem | `7fc3df5fda5607f08c4a3b1c81526436f2ff16b7f1a8656c69a42b786d5c5da8` |
+
+Qualification of this exact archive: on the dedicated M1, formatting, clippy,
+360 workspace and 24 hypervisor tests, all twelve hardware gates (the stream
+gate now sends the overlapping segments on every run), a fresh-install smoke,
+a real 0.4.1 upgrade preserving a running container and volume, staged
+upgrades with interrupted-transaction recovery, tamper rejection, rollback and
+the login service, kind restart persistence, and a Homebrew upgrade from the
+public 0.5.3 with the installed binary byte-equal to the bootstrap. On the M5,
+the same source checks, the raw-socket overlap reproducer, the stream gate,
+smoke, migration, the idle-cache memory policy and the BuildKit workflow above.
+The benchmark suite was not repeated for this rebuild.
 
 Final release metadata may follow the packaged source; runtime, guest and build
 inputs remain identical. Removing signatures from temporary executable copies
