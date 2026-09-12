@@ -12,7 +12,8 @@ can exceed that cap. The bad outcome is not an allocation failure: the daemon
 spends minutes unresponsive, without OOM resolving the overload, and even
 cancelling one client may fail to drain the work promptly.
 
-On the failing kernel, function-graph tracing of BuildKit threads showed
+On a tracing-enabled diagnostic kernel that still reproduced the failure
+with full preemption and block polling disabled, BuildKit thread captures showed
 repeated `filemap_fault` → readahead → `filemap_add_folio` → memcg charge →
 reclaim. Executable pages were being evicted and faulted back in. Individual
 reclaims often made progress, allowing more speculative charges and reclaim
@@ -100,6 +101,22 @@ code stayed resident, the empty engine released cache, and the cold empty VM
 returned unused memory.
 
 All twelve M1 hardware gates passed, along with 360 workspace tests,
-24 signed hypervisor tests, formatting and Clippy. One full M1 suite with
-three repetitions per timed case is being recorded before review. The M5 daily VM remains on released 0.5.3;
-no full M5 benchmark or new release publication is part of this qualification.
+24 signed hypervisor tests, formatting and Clippy. One full M1 benchmark suite
+passed all three sections (host share, guest disk and amd64), with three
+repetitions per timed case and no competing VM detected.
+
+Against the earlier 0.5.3 qualification record, host-share pnpm and copy medians
+were 13.7% and 12.5% higher; most other workloads were broadly level or faster.
+A subsequent kernel-only comparison used the same executable, root filesystem,
+4 GiB/8-vCPU limits, pinned fixture/tools and case order, with one warmed
+observation per case per kernel. pnpm was 5.668 → 5.599 s (−1.2%); copy was
+16.938 → 17.087 s (+0.9%). It did not reproduce the earlier increases. The
+shorter preceding workload means these absolute times are not interchangeable
+with full-suite rows. One observation per kernel cannot rule out small effects;
+no durable performance regression or general speedup is established here.
+The earlier full-suite record also predates 0.5.3's final cold-idle initialization
+fix, so its startup/memory differences are not kernel-only comparisons.
+
+Raw qualification records stay local; published benchmark selections and the
+README are unchanged. The M5 daily VM was left on released 0.5.3. No full M5
+benchmark or new release publication is part of this qualification.
