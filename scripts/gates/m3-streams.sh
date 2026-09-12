@@ -178,6 +178,41 @@ got="$($D exec m3s-sink cat /tmp/y.sha 2>/dev/null)"
 [ -n "$got" ] && [ "$got" = "$inhash" ] && pass "256 MiB into a published port arrived intact" || fail "integrity in: sent $inhash, got ${got:-nothing}"
 $D rm -f m3s-sink >/dev/null 2>&1
 
+# overlap: a retransmitted segment that starts inside delivered bytes is
+# read once by the kernel join (a quarter gigabyte once arrived with four
+# segments repeated in place, and the check above passed dozens of times
+# between). A raw client behind the container's egress sends sixteen bytes,
+# then sixteen more from eight bytes back; the Mac must receive twenty-four.
+$D run -d --name m3s-overlap --cap-add NET_ADMIN alpine:3.21 sleep 300 >/dev/null 2>&1
+$D exec m3s-overlap apk add -q python3 iptables >/dev/null 2>&1
+$D cp scripts/gates/fixtures/overlap-client.py m3s-overlap:/overlap-client.py >/dev/null 2>&1
+got="$(python3 - "$LAN_IP" $D <<'PY'
+import socket, subprocess, sys, threading
+lan, docker = sys.argv[1], sys.argv[2:]
+srv = socket.socket(); srv.bind(("0.0.0.0", 0)); srv.listen(1); srv.settimeout(30); port = srv.getsockname()[1]
+chunks, first = [], threading.Event()
+def receive():
+    try:
+        with srv, srv.accept()[0] as c:
+            c.settimeout(10)
+            while True:
+                b = c.recv(65536)
+                if not b: break
+                chunks.append(b)
+                if sum(map(len, chunks)) >= 16: first.set()
+    except OSError: pass
+t = threading.Thread(target=receive); t.start()
+p = subprocess.Popen(docker + ["exec", "-i", "m3s-overlap", "python3", "/overlap-client.py", lan, str(port)],
+                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+if first.wait(20): p.communicate("next\n", timeout=30)
+else: p.kill()
+t.join(30)
+print(b"".join(chunks).decode("ascii", "replace"))
+PY
+)"
+$D rm -f m3s-overlap >/dev/null 2>&1
+[ "$got" = ABCDEFGHIJKLMNOPQRSTUVWX ] && pass "a segment overlapping delivered bytes is read once" || fail "overlap: got ${got:-nothing}, want ABCDEFGHIJKLMNOPQRSTUVWX"
+
 # many: a thousand concurrent connections to a holder on the Mac
 python3 - <<'PY' &
 import socket, threading
