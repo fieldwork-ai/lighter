@@ -97,7 +97,10 @@ await_footprint() {
 echo
 echo "==> Booting with 8 GiB of guest RAM"
 : > "$LOG"
-"$BIN" \
+# The pressure section below raises a host pressure level at a moment of
+# its choosing, through the policy's test hook.
+PRESSURE_FILE="$RUN_DIR/pressure"
+LIGHTER_PRESSURE_TEST_FILE="$PRESSURE_FILE" "$BIN" \
 	--kernel "$KERNEL" \
 	--disk "$ROOTFS" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
@@ -239,6 +242,80 @@ else
 fi
 note "idle footprint $(footprint) MiB"
 note "guest reports total $(field reported_mib) MiB across this run; balloon currently holds $(field ballooned_mib) MiB"
+
+# ----------------------------------------------------------------- pressure --
+# At Warn the Mac asks the guest for a quarter of its RAM, at Critical a half.
+# A guest with no memory to spare cannot give it, and a target past what it
+# could give had its balloon driver retrying the allocation five times a
+# second, each try a reclaim pass on a guest with nothing left to reclaim,
+# until Docker stopped answering (a defect report of 2026-09-14: a build
+# bounded at 10 GiB of a 16 GiB guest). The floor is held at what the
+# balloon already has while the guest says it is short, and resumes once the
+# guest has been fine for a few seconds.
+echo
+echo "==> A host pressure floor against a guest with no memory to spare"
+# A tmpfs of most of RAM leaves the guest under an eighth available, which
+# is its own line for "short"; the loop keeps it busy, and counts, so its
+# progress under the floor can be read.
+SHORT_MIB=7168
+docker run -d --name m6-short --tmpfs /ballast:rw,size=$((SHORT_MIB + 128))m alpine:3.21 \
+	sh -c "dd if=/dev/zero of=/ballast/x bs=1M count=$SHORT_MIB 2>/dev/null; i=0; while :; do i=\$((i+1)); echo \$i > /ballast/count; done" \
+	>/dev/null 2>&1 || fail "could not make the guest short of memory"
+sleep 20
+answers() { perl -e 'alarm shift; exec @ARGV' "$1" docker ps -q >/dev/null 2>&1; }
+# An exec into a guest this short takes a while: runc has to find pages for
+# a process on a machine keeping a few hundred megabytes free. Docker itself
+# answering is checked separately, with its own bound.
+count() {
+	local try c
+	for try in 1 2 3; do
+		c="$(perl -e 'alarm 20; exec @ARGV' docker exec m6-short cat /ballast/count 2>/dev/null || true)"
+		[ -n "$c" ] && { echo "$c"; return; }
+	done
+}
+answers 10 || fail "Docker stopped answering while the guest was merely short"
+before_floor="$(field ballooned_mib)"
+puffs_before="$(grep -ac 'Out of puff' "$LOG" || true)"
+count_before="$(count)"
+echo warn > "$PRESSURE_FILE"
+sleep 20
+if answers 10; then pass "Docker answers 20s into a Warn floor on a short guest"; else fail "Docker stopped answering under the floor"; fi
+count_after="$(count)"
+if [ "${count_after:-0}" -gt "${count_before:-0}" ]; then
+	pass "the container kept running under the floor (${count_before:-?} → ${count_after:-?})"
+else
+	fail "the container made no progress under the floor (${count_before:-?} → ${count_after:-?})"
+fi
+if sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -aq "host pressure floor held"; then
+	pass "the floor was held at what the balloon had"
+else
+	fail "the floor was not held; the policy took the quarter from a short guest"
+fi
+grew=$(( $(field ballooned_mib) - ${before_floor:-0} ))
+[ "$grew" -le 256 ] && pass "the balloon grew ${grew} MiB under the held floor" || fail "the balloon grew ${grew} MiB under a floor that should have been held"
+puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
+[ "$puffs" -le 10 ] && pass "${puffs} failed inflations while held" || fail "${puffs} failed inflations: the driver is retrying against a guest with nothing to give"
+docker rm -f m6-short >/dev/null 2>&1
+# With the container gone the guest is fine again and, five seconds later,
+# the floor resumes: a quarter of what the guest has by then, which is the
+# base and whatever of the range is still plugged, since with nothing
+# running the range is on its way out. The driver may be a batch short.
+waited=0
+while :; do
+	held="$(field ballooned_mib)"
+	expected=$(( (2048 + $(field plugged_mib)) / 4 - 64 ))
+	[ "${held:-0}" -ge "$expected" ] && break
+	[ "$waited" -ge 90 ] && break
+	sleep 5
+	waited=$((waited + 5))
+done
+if [ "${held:-0}" -ge "$expected" ]; then
+	pass "the floor resumed once the guest was fine: balloon holds ${held} MiB of a quarter of $(( 2048 + $(field plugged_mib) )) after ${waited}s"
+else
+	fail "the floor did not resume: balloon holds ${held:-0} MiB, a quarter of $(( 2048 + $(field plugged_mib) )) wanted, after ${waited}s"
+fi
+echo normal > "$PRESSURE_FILE"
+sleep 5
 
 echo
 if [ "$FAILED" -eq 0 ]; then
