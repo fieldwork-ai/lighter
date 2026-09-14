@@ -83,6 +83,12 @@ impl BalloonState {
         self.actual_pages.load(Ordering::Relaxed)
     }
 
+    /// What an inflation would have counted, for policy tests without a guest.
+    #[cfg(test)]
+    pub(crate) fn set_actual_pages_for_test(&self, pages: u32) {
+        self.actual_pages.store(pages, Ordering::Relaxed);
+    }
+
     pub fn reported_bytes(&self) -> u64 {
         self.reported_bytes.load(Ordering::Relaxed)
     }
