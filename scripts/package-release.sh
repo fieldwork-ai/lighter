@@ -231,4 +231,3 @@ echo
 echo "Formula update (packaging/lighter.rb):"
 echo "  url \"https://github.com/fieldwork-ai/lighter/releases/download/v$VERSION/lighter-$VERSION-arm64.tar.gz\""
 echo "  sha256 \"$SHA\""
-echo "  version \"$VERSION\""
