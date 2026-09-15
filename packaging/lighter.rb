@@ -28,8 +28,9 @@ class Lighter < Formula
     prefix.install "LICENSE-MIT", "LICENSE-APACHE", "README.md"
   end
 
-  # Ownership includes a digest of the final canonical Cellar path.
-  # rubocop:disable FormulaAudit/InstallSteps
+  # Ownership includes a digest of the final canonical Cellar path. This is
+  # post_install on purpose (it must run against the installed keg); the tap's
+  # style check excludes the cop that would ask for post_install_steps.
   def post_install
     # Brew owns upgrades; the CLI must never replace this keg itself.
     require "digest"
@@ -45,7 +46,6 @@ class Lighter < Formula
     system "/usr/bin/codesign", "--verify", "--strict", bin/"lighter"
     system "/usr/bin/codesign", "--verify", "--strict", "--deep", pkgshare/"lighter.app"
   end
-  # rubocop:enable FormulaAudit/InstallSteps
 
   def caveats
     <<~EOS
