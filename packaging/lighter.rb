@@ -12,7 +12,6 @@ class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
   url "https://github.com/fieldwork-ai/lighter/releases/download/v0.5.5/lighter-0.5.5-arm64.tar.gz"
-  version "0.5.5"
   sha256 "7fbc1e77b0140bdb1bd20955ff985fa5f951fc20164b3e8e606c23d34684fe9d"
   license any_of: ["MIT", "Apache-2.0"]
 
@@ -29,8 +28,9 @@ class Lighter < Formula
     prefix.install "LICENSE-MIT", "LICENSE-APACHE", "README.md"
   end
 
-  # Ownership includes a digest of the final canonical Cellar path.
-  # rubocop:disable FormulaAudit/InstallSteps
+  # Ownership includes a digest of the final canonical Cellar path. This is
+  # post_install on purpose (it must run against the installed keg); the tap's
+  # style check excludes the cop that would ask for post_install_steps.
   def post_install
     # Brew owns upgrades; the CLI must never replace this keg itself.
     require "digest"
@@ -46,7 +46,6 @@ class Lighter < Formula
     system "/usr/bin/codesign", "--verify", "--strict", bin/"lighter"
     system "/usr/bin/codesign", "--verify", "--strict", "--deep", pkgshare/"lighter.app"
   end
-  # rubocop:enable FormulaAudit/InstallSteps
 
   def caveats
     <<~EOS
