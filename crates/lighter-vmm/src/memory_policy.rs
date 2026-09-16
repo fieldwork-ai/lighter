@@ -12,18 +12,20 @@
 //! macOS compressing and swapping a guest's pages, which is far more expensive
 //! than the guest simply not having them.
 //!
-//! macOS's three pressure levels set a minimum target. A periodic sample of
-//! compression activity provides gentler steering before those levels rise.
-//! Both targets follow the guest's currently plugged memory, not just the
-//! size it had when the last pressure notification arrived. Guest demand vetoes
-//! compression-only steering so it cannot compete with deflate-on-OOM, and
-//! holds a macOS pressure floor at what the balloon already has: a guest
-//! with no memory to spare cannot give a quarter of it, and a target past
-//! what it can give had its driver retrying the allocation five times a
-//! second, each try a reclaim pass on a guest with nothing left to reclaim,
-//! until Docker stopped answering (a defect report of 2026-09-14: a build
-//! bounded at 10 GiB of a 16 GiB guest when the Mac reported Warn). The
-//! floor resumes once the guest has said it is fine for a few seconds.
+//! macOS's three pressure levels set how far and how fast the balloon may
+//! be asked to grow. A periodic sample of compression activity moves it
+//! before those levels rise.
+//! Both follow the guest's currently plugged memory, not just the size it
+//! had when the last pressure notification arrived. They are one ramp: the
+//! level raises its cap and its step, the compressor moves it, and the quiet
+//! rule brings it down. A guest that is short holds the ramp at what the
+//! balloon already has: a guest with no memory to spare cannot give a
+//! quarter of it, and a target past what it can give had its driver retrying
+//! the allocation five times a second, each try a reclaim pass on a guest
+//! with nothing left to reclaim, until Docker stopped answering (a defect
+//! report of 2026-09-14: a build bounded at 10 GiB of a 16 GiB guest when
+//! the Mac reported Warn). The ramp moves again once the guest has said it
+//! is fine for a few seconds.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,15 +36,26 @@ use crate::virtio::balloon::{BALLOON_PAGE_SIZE, BalloonState};
 use crate::virtio::mem::{BLOCK_SIZE, MemControl};
 use crate::virtio::mmio::VirtioMmio;
 
-/// What fraction of guest RAM to reclaim at each level.
+/// How much of guest RAM the ramp may reach at each level, and how fast.
 ///
 /// Deliberately not aggressive at `Warn`: the system reclaiming is normal on a
 /// Mac and happens long before anything is in trouble, so taking half the
 /// guest's memory then would make every browser tab a stutter in the
 /// container. `Critical` means macOS is about to swap or kill something, and at
 /// that point a slow guest is much better than a wedged host.
-const WARN_FRACTION: u64 = 4; // a quarter
-const CRITICAL_FRACTION: u64 = 2; // a half
+///
+/// A level raises the cap and the step of the one ramp; it never sets a
+/// target of its own. A target that jumped to a quarter of RAM had the guest
+/// hunting for all of it at once (a burst of failed allocations on every
+/// Warn), and a target that fell to nothing the moment the level read Normal
+/// had the guest refilling two gigabytes of cache the host then compressed
+/// again, a minute later, eighteen times in half an hour (defect observation
+/// of 2026-09-16). At an eighth of the distance a second a level is reached
+/// in about eight seconds; coming down is the ramp's own quiet rule.
+const WARN_FRACTION: u64 = 4; // cap: a quarter
+const CRITICAL_FRACTION: u64 = 2; // cap: a half
+const WARN_STEP_FRACTION: u64 = 32;
+const CRITICAL_STEP_FRACTION: u64 = 16;
 
 /// The pressure levels are the floor of the policy, not the whole of it.
 /// An 8 GB Mac with a 4 GiB guest whose page cache had filled with three
@@ -77,8 +90,8 @@ const CRITICAL_FRACTION: u64 = 2; // a half
 const COMPRESSING_BYTES_PER_POLL: u64 = 64 << 20;
 const STEP_MIN_BYTES: u64 = 32 << 20;
 const STEP_FRACTION: u64 = 256;
-/// The steering never asks for more than this share of guest RAM; the
-/// pressure levels may.
+/// With no host pressure the ramp never asks for more than this share of
+/// guest RAM; the pressure levels raise it.
 const STEER_CAP_FRACTION: u64 = 8;
 const POLL: Duration = Duration::from_secs(1);
 
@@ -88,12 +101,12 @@ pub const AGENT_CONTROL_PORT: u32 = 2376;
 pub const MEMORY_PORT: u32 = 2381;
 /// The guest keeps at least this fraction of its RAM out of the balloon.
 const GUEST_RESERVE_FRACTION: u64 = 16;
-/// A held pressure floor resumes once the guest has been fine for this
-/// long: the steering's patience before it deflates, so a build settling
-/// at its reserve is not squeezed on every second it dips under the line
-/// and recovers. Time, not lines: the agent sends a line only when its
-/// numbers change, so an idle guest is silent, and silence is no verdict.
-const FLOOR_PATIENCE: Duration = Duration::from_secs(5);
+/// A held ramp moves again once the guest has been fine for this long: the
+/// ramp's own patience before it deflates, so a build settling at its
+/// reserve is not squeezed on every second it dips under the line and
+/// recovers. Time, not lines: the agent sends a line only when its numbers
+/// change, so an idle guest is silent, and silence is no verdict.
+const HOLD_PATIENCE: Duration = Duration::from_secs(5);
 /// An inflation that has made next to no progress toward its target for
 /// this long is one the guest cannot make: its driver is retrying an
 /// allocation that fails, five times a second, each try a reclaim pass that
@@ -132,7 +145,6 @@ impl MemoryPolicy {
             mem,
             last_line: Mutex::new((0, false)),
             level: AtomicU32::new(Pressure::Normal as u32),
-            level_pages: AtomicU32::new(0),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
@@ -161,7 +173,6 @@ impl MemoryPolicy {
                 .name("memory-policy".into())
                 .spawn(move || {
                     let mut last = host.sample();
-                    let mut quiet_for = 0u32;
                     // `LIGHTER_MEM_TRACE=1`: what the guest has reported free
                     // and what the host holds, every second, to the log.
                     let trace = std::env::var("LIGHTER_MEM_TRACE").map(|v| v == "1").unwrap_or(false);
@@ -201,15 +212,13 @@ impl MemoryPolicy {
                                 steering.balloon.reported_bytes() >> 20,
                                 steering.balloon.offered_bytes() >> 20,
                                 (steering.compression.lock().expect("compression policy poisoned").pages as u64 * BALLOON_PAGE_SIZE) >> 20,
-                                (steering.level_pages.load(Ordering::Relaxed) as u64 * BALLOON_PAGE_SIZE) >> 20
+                                (u64::from(cap_pages(steering.level.load(Ordering::Relaxed), steering.total_bytes())) * BALLOON_PAGE_SIZE) >> 20
                             );
                         }
                         steering.resize_again();
                         let Some(now) = host.sample() else { continue };
                         if let Some(then) = last {
-                            let compressed = now.compressed.saturating_sub(then.compressed);
-                            quiet_for = if compressed == 0 { quiet_for + 1 } else { 0 };
-                            steering.steer(compressed, quiet_for);
+                            steering.steer(now.compressed.saturating_sub(then.compressed));
                         }
                         last = Some(now);
                     }
@@ -277,30 +286,41 @@ fn steering_enabled() -> bool {
         .is_none_or(|v| v != "0")
 }
 
+/// The ramp, and what holds it.
 #[derive(Default)]
 struct CompressionState {
+    /// The ramp's target, in balloon pages: stepped by the poll, frozen by
+    /// a hold, withdrawn by the guest.
     pages: u32,
-    guest_needs_memory: bool,
-    /// When the guest last became fine (a line without `need` or
-    /// `release`); none until it has said so, so a pressure floor waits for
-    /// the guest to speak before it takes anything.
+    /// The guest is short: its `need` line, a `release` with no host
+    /// pressure, an inflation that stalled, or its agent gone.
+    guest_short: bool,
+    /// When the guest last became fine; none until it has said so, so the
+    /// ramp waits for the guest to speak before it takes anything.
     healthy_since: Option<Instant>,
     /// While the balloon is short of its target: what it held, and when it
     /// last grew.
     inflation: Option<(u32, Instant)>,
-    /// Whether the last `apply` held the floor below what pressure asked,
-    /// so the transitions are logged once each way rather than every poll.
-    floor_reported: bool,
+    /// What the guest had at the last poll: a shrink clamps the ramp.
+    last_total: u64,
+    /// Polls in a row with the host compressing nothing. A level change
+    /// restarts it: a level that just dropped gets a few seconds' grace
+    /// before the ramp eases, so a host flapping between Warn and Normal
+    /// does not have the balloon eased on every Normal second.
+    quiet_polls: u32,
+    /// Whether the last `apply` reported the ramp held, so the transitions
+    /// are logged once each way rather than every poll.
+    hold_reported: bool,
 }
 
 impl CompressionState {
-    /// Whether a pressure floor is held at what the balloon has: the guest
-    /// is short, or has not been fine for long enough yet.
-    fn floor_held(&self, now: Instant) -> bool {
-        self.guest_needs_memory
+    /// Whether the ramp is held at what the balloon has: the guest is
+    /// short, or has not been fine for long enough yet.
+    fn held(&self, now: Instant) -> bool {
+        self.guest_short
             || self
                 .healthy_since
-                .is_none_or(|since| now.duration_since(since) < FLOOR_PATIENCE)
+                .is_none_or(|since| now.duration_since(since) < HOLD_PATIENCE)
     }
 }
 
@@ -317,12 +337,10 @@ struct Steering {
     /// ends, and an idle guest sends nothing new: the policy's loop asks
     /// again (`resize_again`).
     last_line: Mutex<(u64, bool)>,
+    /// The host's pressure level: the ramp's cap and step.
     level: AtomicU32,
-    /// What the pressure level asks for, what the compressor asks for, and
-    /// what the guest itself offers: the balloon's target is the largest.
-    level_pages: AtomicU32,
-    // Keep the heuristic target and its guest-pressure veto together: a
-    // compression poll must not restore a target withdrawn concurrently.
+    // Keep the ramp and its hold together: a poll must not restore a
+    // target withdrawn concurrently.
     compression: Mutex<CompressionState>,
     // Publish targets in the same order they are computed from current state.
     apply_lock: Mutex<()>,
@@ -387,31 +405,51 @@ impl Steering {
         false
     }
 
-    fn steer(&self, compressed: u64, quiet_for: u32) {
+    /// The poll, with what the host compressed since the last one: the
+    /// ramp moves unless held. A held ramp is frozen where the balloon is
+    /// by `apply`.
+    fn steer(&self, compressed: u64) {
         {
             let mut state = self
                 .compression
                 .lock()
                 .expect("compression policy poisoned");
-            state.pages = if state.guest_needs_memory {
-                0
+            let total = self.total_bytes();
+            let shrunk = total < state.last_total;
+            state.last_total = total;
+            state.quiet_polls = if compressed == 0 {
+                state.quiet_polls.saturating_add(1)
             } else {
-                steer(state.pages, compressed, quiet_for, self.total_bytes())
+                0
             };
+            if !state.held(Instant::now()) {
+                state.pages = steer(
+                    state.pages,
+                    compressed,
+                    state.quiet_polls,
+                    total,
+                    self.level.load(Ordering::Relaxed),
+                    shrunk,
+                );
+            }
         }
-        // A resize still changes the explicit host-pressure floor.
         self.apply();
     }
 
-    /// A line from the guest: whether it is short of memory (`need`, or a
-    /// `release` of its balloon). Compression alone is a heuristic, not an
-    /// instruction to take memory from a guest already trying to reclaim or
-    /// return its balloon. Otherwise deflate-on-OOM and renewed inflation
-    /// can keep recycling the same pages while an oversized build makes
-    /// little progress. A host pressure floor is kept, but held at what the
-    /// balloon has until the guest has been fine for `FLOOR_PATIENCE`.
-    fn guest_demand(&self, needs_memory: bool) {
-        self.guest_short(needs_memory, Instant::now());
+    /// A line from the guest. `need` (busy, under an eighth available) holds
+    /// the ramp where the balloon is, at any level: deflate-on-OOM and
+    /// renewed inflation would otherwise recycle the same pages while an
+    /// oversized build made little progress. `release` (active work, free
+    /// memory under half the reserve) is the guest asking for the reserve
+    /// back: with no host pressure the ramp is withdrawn and held, as it
+    /// always was; under host pressure it is ignored, because inflation
+    /// itself keeps free memory low while the guest still has gigabytes of
+    /// cold cache to give — a hold on it kept two gigabytes back from a
+    /// host that was swapping, and the host asked again a minute later.
+    fn guest_demand(&self, need: bool, release: bool) {
+        let normal = self.level.load(Ordering::Relaxed) == Pressure::Normal as u32;
+        let short = need || (release && normal);
+        self.guest_short(short, short && normal, Instant::now());
     }
 
     /// The balloon's own progress, from the policy's poll: a target the
@@ -434,7 +472,7 @@ impl Steering {
             } else if let Some((seen, since)) = state.inflation
                 && actual.saturating_sub(seen) < progress
             {
-                !state.guest_needs_memory && now.duration_since(since) >= INFLATION_STALL
+                !state.guest_short && now.duration_since(since) >= INFLATION_STALL
             } else {
                 state.inflation = Some((actual, now));
                 false
@@ -448,33 +486,34 @@ impl Steering {
                 STALL_PROGRESS_BYTES >> 20,
                 INFLATION_STALL.as_secs()
             );
-            self.guest_short(true, now);
+            self.guest_short(true, false, now);
         }
     }
 
-    fn guest_short(&self, needs_memory: bool, now: Instant) {
+    /// The guest is `short`, or no longer is; `withdraw` gives the ramp
+    /// back entirely (the guest wants its reserve and the host is not
+    /// short), otherwise a hold freezes it where the balloon is.
+    fn guest_short(&self, short: bool, withdraw: bool, now: Instant) {
         let changed = {
             let mut state = self
                 .compression
                 .lock()
                 .expect("compression policy poisoned");
-            let held = state.floor_held(now);
-            if needs_memory {
+            let held = state.held(now);
+            if short {
                 state.healthy_since = None;
-            } else if state.healthy_since.is_none() || state.guest_needs_memory {
+            } else if state.healthy_since.is_none() || state.guest_short {
                 state.healthy_since = Some(now);
             }
-            let changed = state.guest_needs_memory != needs_memory;
-            if changed {
-                state.guest_needs_memory = needs_memory;
-                // Recovery starts a fresh ramp; never restore a pre-pressure
-                // target just because the guest has become healthy again.
+            let changed = state.guest_short != short;
+            state.guest_short = short;
+            if withdraw {
                 state.pages = 0;
             }
-            changed || held != state.floor_held(now)
+            changed || withdraw || held != state.held(now)
         };
         if changed {
-            tracing::debug!(needs_memory, "guest demand updated the balloon's targets");
+            tracing::debug!(short, withdraw, "the guest's line moved the ramp");
             self.apply();
         }
     }
@@ -556,35 +595,35 @@ impl Steering {
             .apply_lock
             .lock()
             .expect("memory policy apply poisoned");
-        let floor = pressure_pages(self.level.load(Ordering::Relaxed), self.total_bytes());
         let actual = self.balloon.actual_pages();
-        let (level_pages, compression_pages) = {
+        let ramp = {
             let mut state = self
                 .compression
                 .lock()
                 .expect("compression policy poisoned");
             // Re-evaluated on every poll (`steer` applies), which is how a
-            // hold ends once the guest's patience has run.
-            let held = state.floor_held(Instant::now()) && floor > actual;
-            if held != state.floor_reported {
-                state.floor_reported = held;
+            // hold ends once the guest's patience has run. While held the
+            // ramp is frozen where the balloon is, and follows it down if
+            // deflate-on-OOM takes pages back: never re-inflated.
+            let held = state.held(Instant::now());
+            if held {
+                state.pages = state.pages.min(actual);
+            }
+            if held != state.hold_reported {
+                state.hold_reported = held;
                 let mib = |pages: u32| (u64::from(pages) * BALLOON_PAGE_SIZE) >> 20;
                 if held {
                     tracing::info!(
-                        floor_mib = mib(floor),
                         held_mib = mib(actual),
-                        "host pressure floor held at what the balloon has: the guest is short of memory"
+                        "balloon ramp held at what the balloon has: the guest is short of memory"
                     );
                 } else {
-                    tracing::info!(floor_mib = mib(floor), "host pressure floor resumes");
+                    tracing::info!(ramp_mib = mib(state.pages), "balloon ramp resumes");
                 }
             }
-            (if held { actual } else { floor }, state.pages)
+            state.pages
         };
-        self.level_pages.store(level_pages, Ordering::Relaxed);
-        let pages = level_pages
-            .max(compression_pages)
-            .max(self.guest_pages.load(Ordering::Relaxed));
+        let pages = ramp.max(self.guest_pages.load(Ordering::Relaxed));
         let before = self.balloon.target_pages();
         if pages == before {
             return;
@@ -648,7 +687,7 @@ fn memory_guest(
                     // do not migrate (guest patch 0014), and one inflated
                     // into a movable block pins that block in for good — m6
                     // read 128 MiB stuck and the driver retrying at 2.5% CPU.
-                    steering.guest_demand(release || need);
+                    steering.guest_demand(need, release);
                     let taken = steering.guest_sizes(spare_mib, release || need, nothing_runs);
                     if release || need {
                         steering.guest_offers(0, true);
@@ -656,9 +695,9 @@ fn memory_guest(
                         steering.guest_offers(spare_mib, false);
                     }
                 }
-                // Without current guest feedback, stop speculative reclamation
-                // and withdraw its offers. Explicit host-pressure floors remain.
-                steering.guest_demand(true);
+                // Without current guest feedback the guest is short until it
+                // says otherwise: the ramp holds, and its offers are withdrawn.
+                steering.guest_demand(true, false);
                 steering.guest_offers(0, true);
             }
         })
@@ -674,33 +713,68 @@ fn memory_guest(
 /// then paid for the cache it did not have.
 const QUIET_POLLS_BEFORE_DEFLATE: u32 = 5;
 
-fn steer(pages: u32, compressed: u64, quiet_for: u32, total_bytes: u64) -> u32 {
-    let as_pages = |bytes: u64| (bytes / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX)) as u32;
-    let cap = as_pages(total_bytes / STEER_CAP_FRACTION);
-    let step = as_pages((total_bytes / STEP_FRACTION).max(STEP_MIN_BYTES));
-    // An idle guest can unplug most of its range between polls. A target
-    // sized for the old guest must not keep reclaiming from its small base.
-    let pages = pages.min(cap);
-    if compressed >= COMPRESSING_BYTES_PER_POLL {
-        pages.saturating_add(step).min(cap)
+fn as_pages(bytes: u64) -> u32 {
+    (bytes / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX)) as u32
+}
+
+/// How much of the guest the ramp may reach at a level.
+fn cap_pages(level: u32, total_bytes: u64) -> u32 {
+    let fraction = match level {
+        level if level == Pressure::Warn as u32 => WARN_FRACTION,
+        level if level == Pressure::Critical as u32 => CRITICAL_FRACTION,
+        _ => STEER_CAP_FRACTION,
+    };
+    as_pages(total_bytes / fraction)
+}
+
+/// The ramp's rule, as arithmetic. Up while the host is under pressure or
+/// compressing, by the level's step, to the level's cap; down by the small
+/// step once the host has been quiet for a few seconds with no pressure;
+/// nothing in between. A level that drops leaves the ramp where it is, above
+/// the new cap, to ease down: a target that fell to nothing had the guest
+/// refill what the host then compressed again. A guest that shrank (its
+/// range unplugged between polls) is the exception: a target sized for the
+/// old guest must not keep reclaiming from its small base, so it is clamped
+/// to the cap at once. Never past the guest's reserve.
+fn steer(
+    pages: u32,
+    compressed: u64,
+    quiet_for: u32,
+    total_bytes: u64,
+    level: u32,
+    shrunk: bool,
+) -> u32 {
+    let normal = level == Pressure::Normal as u32;
+    let cap = cap_pages(level, total_bytes);
+    let reserve = as_pages(total_bytes - total_bytes / GUEST_RESERVE_FRACTION);
+    let small = as_pages((total_bytes / STEP_FRACTION).max(STEP_MIN_BYTES));
+    let step_up = match level {
+        level if level == Pressure::Warn as u32 => as_pages(total_bytes / WARN_STEP_FRACTION),
+        level if level == Pressure::Critical as u32 => {
+            as_pages(total_bytes / CRITICAL_STEP_FRACTION)
+        }
+        _ => small,
+    };
+    let pages = if shrunk {
+        pages.min(cap)
+    } else {
+        pages.min(reserve)
+    };
+    if !normal || compressed >= COMPRESSING_BYTES_PER_POLL {
+        if pages >= cap {
+            pages
+        } else {
+            pages.saturating_add(step_up).min(cap)
+        }
     } else if quiet_for >= QUIET_POLLS_BEFORE_DEFLATE {
-        pages.saturating_sub(step)
+        pages.saturating_sub(small)
     } else {
         pages
     }
 }
 
-/// The pressure-level half of the policy.
+/// The pressure-level half of the policy: the cap and step of the ramp.
 struct Levels(Arc<Steering>);
-
-fn pressure_pages(level: u32, total_bytes: u64) -> u32 {
-    let bytes = match level {
-        level if level == Pressure::Warn as u32 => total_bytes / WARN_FRACTION,
-        level if level == Pressure::Critical as u32 => total_bytes / CRITICAL_FRACTION,
-        _ => 0,
-    };
-    (bytes / BALLOON_PAGE_SIZE).min(u64::from(u32::MAX)) as u32
-}
 
 impl Observer for Levels {
     fn pressure(&self, level: Pressure) {
@@ -709,9 +783,14 @@ impl Observer for Levels {
         if previous != level as u32 {
             tracing::info!(
                 pressure = ?level,
-                reclaim_mib = (u64::from(pressure_pages(level as u32, steering.total_bytes())) * BALLOON_PAGE_SIZE) >> 20,
+                cap_mib = (u64::from(cap_pages(level as u32, steering.total_bytes())) * BALLOON_PAGE_SIZE) >> 20,
                 "host memory pressure changed"
             );
+            steering
+                .compression
+                .lock()
+                .expect("compression policy poisoned")
+                .quiet_polls = 0;
         }
         steering.apply();
     }
@@ -797,6 +876,14 @@ struct HostSample {
 mod tests {
     use super::*;
 
+    const NORMAL: u32 = Pressure::Normal as u32;
+    const WARN: u32 = Pressure::Warn as u32;
+    const CRITICAL: u32 = Pressure::Critical as u32;
+
+    fn mib(pages: u32) -> u64 {
+        (u64::from(pages) * BALLOON_PAGE_SIZE) >> 20
+    }
+
     /// The three levels have to be ordered, because a policy that treats
     /// `Warn` and `Critical` the same either overreacts to a browser tab or
     /// underreacts to the machine swapping.
@@ -805,39 +892,48 @@ mod tests {
         assert!(Pressure::Normal < Pressure::Warn);
         assert!(Pressure::Warn < Pressure::Critical);
         const { assert!(WARN_FRACTION > CRITICAL_FRACTION) };
+        const { assert!(WARN_STEP_FRACTION > CRITICAL_STEP_FRACTION) };
     }
 
-    /// The arithmetic, without a hypervisor: an 8 GiB guest, and what each
-    /// level asks it to give up.
+    /// The arithmetic, without a hypervisor: an 8 GiB guest, and how far
+    /// each level lets the ramp go.
     #[test]
-    fn each_level_asks_for_a_sensible_share() {
+    fn each_level_caps_the_ramp_at_a_sensible_share() {
         let ram: u64 = 8 << 30;
-        let pages = |bytes: u64| bytes / BALLOON_PAGE_SIZE;
-        assert_eq!(pages(ram / WARN_FRACTION), pages(2 << 30));
-        assert_eq!(pages(ram / CRITICAL_FRACTION), pages(4 << 30));
+        assert_eq!(mib(cap_pages(NORMAL, ram)), 1024);
+        assert_eq!(mib(cap_pages(WARN, ram)), 2048);
+        assert_eq!(mib(cap_pages(CRITICAL, ram)), 4096);
         // And the page count has to fit the field the guest reads it from.
-        assert!(pages(ram / CRITICAL_FRACTION) <= u64::from(u32::MAX));
+        assert!(u64::from(cap_pages(CRITICAL, 1 << 40)) <= u64::from(u32::MAX));
     }
 
-    /// The steering rule: a step up while compressing, a step down
+    /// With no host pressure: a step up while compressing, a step down
     /// once quiet for long enough, and a hold in between; never past the
     /// cap or below zero.
     #[test]
     fn steering_steps_up_while_compressing_and_eases_when_quiet() {
         let total = 4 << 30;
-        let cap = ((512u64 << 20) / BALLOON_PAGE_SIZE) as u32;
-        let up = steer(0, 64 << 20, 0, total);
-        assert_eq!(u64::from(up) * BALLOON_PAGE_SIZE, 32 << 20);
-        assert_eq!(steer(up, 0, 2, total), up, "quiet but not for long: held");
+        let cap = cap_pages(NORMAL, total);
+        let up = steer(0, 64 << 20, 0, total, NORMAL, false);
+        assert_eq!(mib(up), 32);
         assert_eq!(
-            steer(up, 1 << 20, 0, total),
+            steer(up, 0, 2, total, NORMAL, false),
+            up,
+            "quiet but not for long: held"
+        );
+        assert_eq!(
+            steer(up, 1 << 20, 0, total, NORMAL, false),
             up,
             "a trickle, so no quiet yet: held"
         );
-        let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, total);
-        assert_eq!(u64::from(up - down) * BALLOON_PAGE_SIZE, 32 << 20);
-        assert_eq!(steer(cap, 1 << 30, 0, total), cap, "never past the cap");
-        assert_eq!(steer(1, 0, 30, total), 0, "never below zero");
+        let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL, false);
+        assert_eq!(mib(up - down), 32);
+        assert_eq!(
+            steer(cap, 1 << 30, 0, total, NORMAL, false),
+            cap,
+            "never past the cap"
+        );
+        assert_eq!(steer(1, 0, 30, total, NORMAL, false), 0, "never below zero");
     }
 
     #[test]
@@ -846,92 +942,82 @@ mod tests {
             let total = gib << 30;
             let mut pages = 0;
             for _ in 0..32 {
-                pages = steer(pages, 64 << 20, 0, total);
+                pages = steer(pages, 64 << 20, 0, total, NORMAL, false);
             }
             assert_eq!(u64::from(pages) * BALLOON_PAGE_SIZE, total / 8);
             for _ in 0..32 {
-                pages = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total);
+                pages = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL, false);
             }
             assert_eq!(pages, 0);
         }
-        assert_eq!(
-            u64::from(steer(0, 64 << 20, 0, 24 << 30)) * BALLOON_PAGE_SIZE,
-            96 << 20
-        );
+        assert_eq!(mib(steer(0, 64 << 20, 0, 24 << 30, NORMAL, false)), 96);
     }
 
+    /// A level raises the cap and the step: a quarter of the guest within
+    /// eight polls at Warn, half at Critical, with or without compression.
     #[test]
-    fn unplugging_the_range_bounds_an_existing_steering_target() {
-        let old_target = ((3u64 << 30) / BALLOON_PAGE_SIZE) as u32;
-        // No compression and not quiet long enough: the old rule held the
-        // entire 3 GiB target after a 24 GiB guest shrank to its 6 GiB base.
-        assert_eq!(
-            u64::from(steer(old_target, 0, 1, 6 << 30)) * BALLOON_PAGE_SIZE,
-            768 << 20
-        );
-        assert_eq!(steer(u32::MAX, u64::MAX, 0, 0), 0);
-    }
-
-    #[test]
-    fn pressure_floors_follow_the_plugged_memory() {
-        for (level, divisor) in [(Pressure::Warn, 4), (Pressure::Critical, 2)] {
-            for total in [24 << 30, 1 << 30, 8 << 30] {
-                assert_eq!(
-                    u64::from(pressure_pages(level as u32, total)) * BALLOON_PAGE_SIZE,
-                    total / divisor
-                );
+    fn a_level_raises_the_cap_and_the_ramp_climbs_it_in_eight_polls() {
+        let total: u64 = 16 << 30;
+        for (level, share) in [(WARN, 4), (CRITICAL, 2)] {
+            let mut pages = 0;
+            let mut polls = 0;
+            while u64::from(pages) * BALLOON_PAGE_SIZE < total / share {
+                pages = steer(pages, 0, 0, total, level, false);
+                polls += 1;
+                assert!(polls <= 8, "reached in eight polls, not {polls}");
             }
-        }
-        assert_eq!(pressure_pages(Pressure::Normal as u32, 24 << 30), 0);
-    }
-
-    #[test]
-    fn a_resize_updates_the_device_without_a_new_pressure_event() {
-        use crate::bus::MmioDevice;
-        use crate::irq::NullIrq;
-        use crate::memory::GuestMemory;
-        use crate::virtio::balloon::Balloon;
-
-        let balloon = Arc::new(BalloonState::default());
-        let transport = Arc::new(Mutex::new(VirtioMmio::new(
-            Box::new(Balloon::new(balloon.clone())),
-            Arc::new(GuestMemory::detached()),
-            Arc::new(NullIrq),
-        )));
-        let mut steering = Steering {
-            balloon,
-            transport: transport.clone(),
-            ram_bytes: 24 << 30,
-            mem: None,
-            last_line: Mutex::new((0, false)),
-            level: AtomicU32::new(Pressure::Warn as u32),
-            level_pages: AtomicU32::new(((6u64 << 30) / BALLOON_PAGE_SIZE) as u32),
-            compression: Mutex::new(CompressionState::default()),
-            apply_lock: Mutex::new(()),
-            guest_pages: AtomicU32::new(0),
-        };
-        // The guest has been up and fine, and the preceding warning event
-        // has already reached the device.
-        healthy(&steering);
-        steering.apply();
-        // Change total_bytes without changing the pressure level or the
-        // compressor target, as a range resize does between policy polls.
-        for (gib, expected_mib) in [(24, 6144), (6, 1536), (24, 6144)] {
-            steering.ram_bytes = gib << 30;
-            steering.steer(0, 0);
-            let mut config = [0; 4];
-            transport.lock().unwrap().read(0x100, &mut config);
+            assert_eq!(u64::from(pages) * BALLOON_PAGE_SIZE, total / share);
             assert_eq!(
-                u64::from(u32::from_le_bytes(config)) * BALLOON_PAGE_SIZE,
-                expected_mib << 20
+                steer(pages, 0, 0, total, level, false),
+                pages,
+                "and no further"
+            );
+            assert_eq!(
+                steer(pages, 0, 30, total, level, false),
+                pages,
+                "a quiet host under pressure does not ease"
             );
         }
-        let mut generation = [0; 4];
-        transport.lock().unwrap().read(0xfc, &mut generation);
+    }
+
+    /// A level that drops leaves the ramp above the new cap, to ease down by
+    /// the small step only once the host has been quiet: a target that fell
+    /// to nothing on Normal had the guest refill what the host then
+    /// compressed again.
+    #[test]
+    fn a_level_drop_is_a_plateau_that_eases_when_quiet() {
+        let total: u64 = 16 << 30;
+        let mut pages = 0;
+        for _ in 0..8 {
+            pages = steer(pages, 0, 0, total, WARN, false);
+        }
+        assert_eq!(mib(pages), 4096);
+        let held = steer(pages, 0, 0, total, NORMAL, false);
+        assert_eq!(held, pages, "Normal, not quiet yet: nothing moves");
         assert_eq!(
-            u32::from_le_bytes(generation),
-            3,
-            "each change notified the guest"
+            steer(pages, 64 << 20, 0, total, NORMAL, false),
+            pages,
+            "compressing above the Normal cap: no step up, no step down"
+        );
+        let eased = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL, false);
+        assert_eq!(mib(pages - eased), 64, "a 256th of 16 GiB");
+    }
+
+    /// The exception: a guest whose range unplugged between polls is clamped
+    /// to the cap at once, so a target sized for the old guest does not keep
+    /// reclaiming from its small base. Never past the guest's reserve either.
+    #[test]
+    fn a_shrunk_guest_clamps_the_ramp_to_its_cap() {
+        let old_target = as_pages(3 << 30);
+        assert_eq!(mib(steer(old_target, 0, 1, 6 << 30, NORMAL, true)), 768);
+        assert_eq!(mib(steer(old_target, 0, 1, 6 << 30, WARN, true)), 1536);
+        assert_eq!(steer(u32::MAX, u64::MAX, 0, 0, NORMAL, true), 0);
+        // Not shrunk: a level drop keeps the target, the reserve bounds it.
+        assert_eq!(mib(steer(old_target, 0, 1, 6 << 30, NORMAL, false)), 3072);
+        assert_eq!(
+            mib(steer(u32::MAX, 0, 1, 4 << 30, NORMAL, false)),
+            4096 - 256,
+            "the guest keeps a sixteenth"
         );
     }
 
@@ -952,8 +1038,7 @@ mod tests {
             ram_bytes,
             mem: None,
             last_line: Mutex::new((0, false)),
-            level: AtomicU32::new(Pressure::Normal as u32),
-            level_pages: AtomicU32::new(0),
+            level: AtomicU32::new(NORMAL),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
@@ -968,116 +1053,218 @@ mod tests {
         (u64::from(u32::from_le_bytes(config)) * BALLOON_PAGE_SIZE) >> 20
     }
 
+    /// What `Levels::pressure` does, for a `Steering` held by value.
     fn pressure(steering: &Steering, level: Pressure) {
-        steering.level.store(level as u32, Ordering::Relaxed);
+        if steering.level.swap(level as u32, Ordering::Relaxed) != level as u32 {
+            steering.compression.lock().unwrap().quiet_polls = 0;
+        }
         steering.apply();
     }
 
-    /// A guest that has said it is fine, and long enough ago: the floor's
+    /// A guest that has said it is fine, and long enough ago: the ramp's
     /// precondition.
     fn healthy(steering: &Steering) {
-        steering.guest_demand(false);
-        steering.compression.lock().unwrap().healthy_since = Some(Instant::now() - FLOOR_PATIENCE);
+        steering.guest_demand(false, false);
+        steering.compression.lock().unwrap().healthy_since = Some(Instant::now() - HOLD_PATIENCE);
         steering.apply();
     }
 
-    #[test]
-    fn guest_need_vetoes_compression_and_holds_the_floor_at_what_the_balloon_has() {
-        let (steering, transport) = steering_for_tests(12 << 30);
-        healthy(&steering);
-        for _ in 0..32 {
-            steering.steer(64 << 20, 0);
+    /// Polls with no compression: a level moves the ramp up, and quiet
+    /// brings it down.
+    fn polls(steering: &Steering, n: usize) {
+        for _ in 0..n {
+            steering.steer(0);
         }
-        assert_eq!(target_mib(&transport), 1536);
-        steering.guest_demand(true);
+    }
+
+    /// A level change reaches the device on the next poll, and a guest that
+    /// shrank between polls sees its target clamped without a new pressure
+    /// event.
+    #[test]
+    fn the_ramp_reaches_the_device_and_a_shrink_clamps_it() {
+        use crate::bus::MmioDevice;
+
+        let (mut steering, transport) = steering_for_tests(24 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
         assert_eq!(
             target_mib(&transport),
             0,
-            "withdraw the speculative target immediately"
+            "a level sets no target of its own"
         );
-        for _ in 0..64 {
-            steering.steer(u64::MAX, 0);
-            assert_eq!(
-                target_mib(&transport),
-                0,
-                "compression must not refill it under guest pressure"
-            );
-        }
-        // The Mac's pressure floors ask for a quarter and a half; a guest
-        // that is short gives what the balloon already holds, and no more.
-        for level in [Pressure::Warn, Pressure::Critical] {
-            pressure(&steering, level);
-            assert_eq!(target_mib(&transport), 0, "an empty balloon stays empty");
-        }
-        steering
-            .balloon
-            .set_actual_pages_for_test(((1u64 << 30) / BALLOON_PAGE_SIZE) as u32);
-        for level in [Pressure::Warn, Pressure::Critical] {
-            pressure(&steering, level);
-            assert_eq!(target_mib(&transport), 1024, "held at what it has");
-        }
-        pressure(&steering, Pressure::Normal);
-        assert_eq!(target_mib(&transport), 0);
-        // Recovery: not on the fine line itself, five seconds after it.
-        pressure(&steering, Pressure::Warn);
-        steering.guest_demand(false);
-        assert_eq!(target_mib(&transport), 1024, "still held");
-        steering.compression.lock().unwrap().healthy_since =
-            Some(Instant::now() - FLOOR_PATIENCE + Duration::from_secs(1));
-        steering.apply();
+        polls(&steering, 8);
+        assert_eq!(target_mib(&transport), 6144);
+        // The range comes out: 24 GiB to its 6 GiB base between two polls.
+        steering.ram_bytes = 6 << 30;
+        steering.steer(0);
         assert_eq!(
             target_mib(&transport),
-            1024,
-            "still held, for another second"
+            1536,
+            "clamped to a quarter of what is left"
         );
-        steering.compression.lock().unwrap().healthy_since = Some(Instant::now() - FLOOR_PATIENCE);
-        steering.steer(0, 0);
+        steering.ram_bytes = 24 << 30;
+        steering.steer(0);
         assert_eq!(
             target_mib(&transport),
-            3072,
-            "the floor resumes on the next poll"
+            1536 + 768,
+            "grown again: one step up from there"
         );
-        // A relapse holds it again, at once, and at the new holding.
-        steering
-            .balloon
-            .set_actual_pages_for_test(((2u64 << 30) / BALLOON_PAGE_SIZE) as u32);
-        steering.guest_demand(true);
-        assert_eq!(target_mib(&transport), 2048);
-        pressure(&steering, Pressure::Normal);
-        healthy(&steering);
-        assert_eq!(target_mib(&transport), 0, "no stale target after recovery");
-        steering.steer(64 << 20, 0);
-        assert_eq!(
-            target_mib(&transport),
-            48,
-            "recovery starts with one new step"
+        let mut generation = [0; 4];
+        transport.lock().unwrap().read(0xfc, &mut generation);
+        assert!(
+            u32::from_le_bytes(generation) >= 10,
+            "each change notified the guest"
         );
     }
 
-    /// Before the guest has spoken at all, a floor waits: the agent is not
-    /// up yet, and a guest that never says how it is gets nothing taken by
-    /// force. A fine line, five seconds, and the floor applies in full.
+    /// A level that drops restarts the ramp's patience: five quiet polls of
+    /// grace before it eases, even if the host had been quiet through the
+    /// pressure, so a host flapping between Warn and Normal does not have
+    /// the balloon eased on every Normal second.
     #[test]
-    fn a_floor_waits_for_the_guest_to_say_it_is_fine() {
+    fn a_level_drop_restarts_the_patience_before_easing() {
+        let (steering, transport) = steering_for_tests(16 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 12);
+        assert_eq!(
+            target_mib(&transport),
+            4096,
+            "quiet polls under Warn do not ease"
+        );
+        pressure(&steering, Pressure::Normal);
+        polls(&steering, QUIET_POLLS_BEFORE_DEFLATE as usize - 1);
+        assert_eq!(target_mib(&transport), 4096, "grace");
+        polls(&steering, 1);
+        assert_eq!(target_mib(&transport), 4096 - 64, "then a 256th a second");
+    }
+
+    /// `need` holds the ramp where the balloon is, at any level, and follows
+    /// it down if deflate-on-OOM takes pages back; with no host pressure it
+    /// is withdrawn entirely first. Recovery moves again only after the
+    /// guest has been fine for a while, from where it froze.
+    #[test]
+    fn guest_need_holds_the_ramp_where_the_balloon_is() {
+        let (steering, transport) = steering_for_tests(8 << 30);
+        healthy(&steering);
+        for _ in 0..32 {
+            steering.steer(64 << 20);
+        }
+        assert_eq!(target_mib(&transport), 1024, "the Normal cap, compressing");
+        steering.guest_demand(true, false);
+        assert_eq!(
+            target_mib(&transport),
+            0,
+            "no host pressure: withdrawn at once"
+        );
+        for _ in 0..8 {
+            steering.steer(u64::MAX);
+            assert_eq!(
+                target_mib(&transport),
+                0,
+                "compression must not refill it while short"
+            );
+        }
+        // Fine again, and long enough: the ramp climbs the Warn cap.
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
+        assert_eq!(target_mib(&transport), 2048);
+        // The driver got half of it, then the guest says it is short.
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(1 << 30));
+        steering.guest_demand(true, false);
+        assert_eq!(
+            target_mib(&transport),
+            1024,
+            "held at what it has, not withdrawn"
+        );
+        polls(&steering, 8);
+        assert_eq!(
+            target_mib(&transport),
+            1024,
+            "the level does not move a held ramp"
+        );
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(512 << 20));
+        polls(&steering, 1);
+        assert_eq!(
+            target_mib(&transport),
+            512,
+            "follows deflate-on-OOM down, never up"
+        );
+        // Recovery: not on the fine line itself, five seconds after it.
+        steering.guest_demand(false, false);
+        polls(&steering, 3);
+        assert_eq!(target_mib(&transport), 512, "still held");
+        steering.compression.lock().unwrap().healthy_since = Some(Instant::now() - HOLD_PATIENCE);
+        polls(&steering, 1);
+        assert_eq!(
+            target_mib(&transport),
+            512 + 256,
+            "one Warn step from where it froze"
+        );
+    }
+
+    /// `release` is the guest asking for its reserve back: withdrawn and
+    /// held with no host pressure, as ever; ignored under pressure, where
+    /// inflation itself keeps free memory low while the guest still has
+    /// cache to give.
+    #[test]
+    fn guest_release_withdraws_at_normal_and_is_ignored_under_pressure() {
+        let (steering, transport) = steering_for_tests(8 << 30);
+        healthy(&steering);
+        for _ in 0..32 {
+            steering.steer(64 << 20);
+        }
+        assert_eq!(target_mib(&transport), 1024);
+        steering.guest_demand(false, true);
+        assert_eq!(target_mib(&transport), 0, "withdrawn");
+        steering.steer(u64::MAX);
+        assert_eq!(target_mib(&transport), 0, "and held");
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 2);
+        assert_eq!(target_mib(&transport), 512);
+        steering.guest_demand(false, true);
+        polls(&steering, 1);
+        assert_eq!(
+            target_mib(&transport),
+            768,
+            "a release under Warn does not stop the ramp"
+        );
+    }
+
+    /// Before the guest has spoken at all, the ramp waits: the agent is not
+    /// up yet, and a guest that never says how it is gets nothing taken by
+    /// force. A fine line, five seconds, and the ramp climbs.
+    #[test]
+    fn the_ramp_waits_for_the_guest_to_say_it_is_fine() {
         let (steering, transport) = steering_for_tests(8 << 30);
         pressure(&steering, Pressure::Critical);
+        polls(&steering, 8);
         assert_eq!(target_mib(&transport), 0);
-        steering.guest_demand(false);
+        steering.guest_demand(false, false);
+        polls(&steering, 2);
         assert_eq!(target_mib(&transport), 0, "fine, but not for long enough");
         healthy(&steering);
+        polls(&steering, 8);
         assert_eq!(target_mib(&transport), 4096);
     }
 
     /// An inflation that makes no progress for three seconds is one the
     /// guest cannot make, whatever its last line said: its agent may be
     /// alive and not scheduled, which is what starvation looks like from
-    /// here. The floor is held where the balloon is until the guest says
-    /// it is fine again.
+    /// here. The ramp is held where the balloon is until the guest says it
+    /// is fine again.
     #[test]
-    fn a_stalled_inflation_holds_the_floor() {
+    fn a_stalled_inflation_holds_the_ramp() {
         let (steering, transport) = steering_for_tests(8 << 30);
         healthy(&steering);
         pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
         assert_eq!(target_mib(&transport), 2048);
         let t = Instant::now();
         steering.inflation_stalled(t);
@@ -1086,7 +1273,7 @@ mod tests {
         // Progress resets the clock.
         steering
             .balloon
-            .set_actual_pages_for_test(((512u64 << 20) / BALLOON_PAGE_SIZE) as u32);
+            .set_actual_pages_for_test(as_pages(512 << 20));
         steering.inflation_stalled(t + INFLATION_STALL);
         steering.inflation_stalled(t + 2 * INFLATION_STALL - Duration::from_millis(1));
         assert_eq!(target_mib(&transport), 2048, "it grew; still inflating");
@@ -1094,9 +1281,15 @@ mod tests {
         assert_eq!(target_mib(&transport), 512, "stalled: held at what it has");
         // Held, the target is met, and nothing is withdrawn twice.
         steering.inflation_stalled(t + Duration::from_secs(60));
+        polls(&steering, 3);
         assert_eq!(target_mib(&transport), 512);
         healthy(&steering);
-        assert_eq!(target_mib(&transport), 2048, "fine again, and long enough");
+        polls(&steering, 1);
+        assert_eq!(
+            target_mib(&transport),
+            512 + 256,
+            "fine again: one step from where it froze"
+        );
     }
 
     /// The driver's retries each reclaim a little, and may get a page or
@@ -1107,10 +1300,12 @@ mod tests {
         let (steering, transport) = steering_for_tests(8 << 30);
         healthy(&steering);
         pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
         let t = Instant::now();
-        let mib = |n: u64| ((n << 20) / BALLOON_PAGE_SIZE) as u32;
         for second in 0..3 {
-            steering.balloon.set_actual_pages_for_test(mib(second));
+            steering
+                .balloon
+                .set_actual_pages_for_test(as_pages(second << 20));
             steering.inflation_stalled(t + Duration::from_secs(second));
             assert_eq!(
                 target_mib(&transport),
@@ -1118,7 +1313,9 @@ mod tests {
                 "creeping, not yet three seconds"
             );
         }
-        steering.balloon.set_actual_pages_for_test(mib(3));
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(3 << 20));
         steering.inflation_stalled(t + Duration::from_secs(3));
         assert_eq!(
             target_mib(&transport),
@@ -1127,20 +1324,23 @@ mod tests {
         );
     }
 
-    /// The hold never lowers a target below what the balloon has: a floor
-    /// under the holding is the floor.
+    /// The hold never raises a target: a balloon holding more than the ramp
+    /// asked (the guest's own offers) leaves the ramp where it was.
     #[test]
-    fn a_held_floor_is_never_more_than_the_floor() {
+    fn a_held_ramp_is_never_more_than_the_ramp() {
         let (steering, transport) = steering_for_tests(8 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 2);
+        assert_eq!(target_mib(&transport), 512);
         steering
             .balloon
-            .set_actual_pages_for_test(((3u64 << 30) / BALLOON_PAGE_SIZE) as u32);
-        steering.guest_demand(true);
-        pressure(&steering, Pressure::Warn);
+            .set_actual_pages_for_test(as_pages(3 << 30));
+        steering.guest_demand(true, false);
         assert_eq!(
             target_mib(&transport),
-            2048,
-            "the floor, not the larger holding"
+            512,
+            "the ramp, not the larger holding"
         );
     }
 
