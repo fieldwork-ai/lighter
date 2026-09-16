@@ -244,35 +244,33 @@ note "idle footprint $(footprint) MiB"
 note "guest reports total $(field reported_mib) MiB across this run; balloon currently holds $(field ballooned_mib) MiB"
 
 # ----------------------------------------------------------------- pressure --
-# At Warn the Mac asks the guest for a quarter of its RAM, at Critical a half.
-# A guest with no memory to spare cannot give it, and a target past what it
-# could give had its balloon driver retrying the allocation five times a
-# second, each try a reclaim pass on a guest with nothing left to reclaim,
-# until Docker stopped answering (a defect report of 2026-09-14: a build
-# bounded at 10 GiB of a 16 GiB guest). The floor is held at what the
-# balloon already has while the guest says it is short, and resumes once the
-# guest has been fine for a few seconds.
+# At Warn the Mac lets the balloon ramp to a quarter of the guest, at
+# Critical a half. A guest with no memory to spare cannot give it, and a
+# target past what it could give had its balloon driver retrying the
+# allocation five times a second, each try a reclaim pass on a guest with
+# nothing left to reclaim, until Docker stopped answering (a defect report
+# of 2026-09-14: a build bounded at 10 GiB of a 16 GiB guest). The ramp is
+# held at what the balloon already has while the guest says it is short,
+# and moves again once the guest has been fine for a few seconds.
 echo
 echo "==> A host pressure floor against a guest with no memory to spare"
 # A tmpfs of most of RAM leaves the guest under an eighth available, which
 # is its own line for "short"; the loop keeps it busy, and counts, so its
 # progress under the floor can be read.
+# An idle container beside it keeps the guest whole, as a daily machine
+# is: with nothing running the range leaves and the guest is its base,
+# where the ramp's smallest step is a large share of a small balloon.
+docker run -d --name m6-keeper alpine:3.21 sleep 900 >/dev/null 2>&1 || fail "could not start the keeper"
+sleep 5
 SHORT_MIB=7168
 docker run -d --name m6-short --tmpfs /ballast:rw,size=$((SHORT_MIB + 128))m alpine:3.21 \
-	sh -c "dd if=/dev/zero of=/ballast/x bs=1M count=$SHORT_MIB 2>/dev/null; i=0; while :; do i=\$((i+1)); echo \$i > /ballast/count; done" \
+	sh -c "dd if=/dev/zero of=/ballast/x bs=1M count=$SHORT_MIB 2>/dev/null; i=0; while :; do i=\$((i+1)); [ \$((i % 100000)) -eq 0 ] && echo \$i; done" \
 	>/dev/null 2>&1 || fail "could not make the guest short of memory"
 sleep 20
 answers() { perl -e 'alarm shift; exec @ARGV' "$1" docker ps -q >/dev/null 2>&1; }
-# An exec into a guest this short takes a while: runc has to find pages for
-# a process on a machine keeping a few hundred megabytes free. Docker itself
-# answering is checked separately, with its own bound.
-count() {
-	local try c
-	for try in 1 2 3; do
-		c="$(perl -e 'alarm 20; exec @ARGV' docker exec m6-short cat /ballast/count 2>/dev/null || true)"
-		[ -n "$c" ] && { echo "$c"; return; }
-	done
-}
+# Read through dockerd's log of the container, not an exec into it: starting
+# a process in a guest this short can take longer than the check.
+count() { perl -e 'alarm 10; exec @ARGV' docker logs --tail 1 m6-short 2>/dev/null | tail -1; }
 answers 10 || fail "Docker stopped answering while the guest was merely short"
 before_floor="$(field ballooned_mib)"
 puffs_before="$(grep -ac 'Out of puff' "$LOG" || true)"
@@ -286,35 +284,77 @@ if [ "${count_after:-0}" -gt "${count_before:-0}" ]; then
 else
 	fail "the container made no progress under the floor (${count_before:-?} → ${count_after:-?})"
 fi
-if sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -aq "host pressure floor held"; then
-	pass "the floor was held at what the balloon had"
+if grep -aq "balloon ramp held" "$LOG"; then
+	pass "the ramp was held at what the balloon had"
 else
-	fail "the floor was not held; the policy took the quarter from a short guest"
+	fail "the ramp was not held; the policy took the quarter from a short guest"
 fi
 grew=$(( $(field ballooned_mib) - ${before_floor:-0} ))
-[ "$grew" -le 256 ] && pass "the balloon grew ${grew} MiB under the held floor" || fail "the balloon grew ${grew} MiB under a floor that should have been held"
+[ "$grew" -le 256 ] && pass "the balloon grew ${grew} MiB under the held ramp" || fail "the balloon grew ${grew} MiB under a ramp that should have been held"
 puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
 [ "$puffs" -le 10 ] && pass "${puffs} failed inflations while held" || fail "${puffs} failed inflations: the driver is retrying against a guest with nothing to give"
 docker rm -f m6-short >/dev/null 2>&1
 # With the container gone the guest is fine again and, five seconds later,
-# the floor resumes: a quarter of what the guest has by then, which is the
-# base and whatever of the range is still plugged, since with nothing
-# running the range is on its way out. The driver may be a batch short.
+# the ramp climbs: a 32nd of the guest a second to a quarter of what it has
+# by then, which is the base and whatever of the range is still plugged,
+# since with nothing running the range is on its way out. The guest gives
+# cache, not failures. The driver may be a batch short.
+puffs_before="$(grep -ac 'Out of puff' "$LOG" || true)"
 waited=0
 while :; do
 	held="$(field ballooned_mib)"
 	expected=$(( (2048 + $(field plugged_mib)) / 4 - 64 ))
 	[ "${held:-0}" -ge "$expected" ] && break
-	[ "$waited" -ge 90 ] && break
+	[ "$waited" -ge 60 ] && break
 	sleep 5
 	waited=$((waited + 5))
 done
 if [ "${held:-0}" -ge "$expected" ]; then
-	pass "the floor resumed once the guest was fine: balloon holds ${held} MiB of a quarter of $(( 2048 + $(field plugged_mib) )) after ${waited}s"
+	pass "the ramp climbed once the guest was fine: balloon holds ${held} MiB of a quarter of $(( 2048 + $(field plugged_mib) )) after ${waited}s"
 else
-	fail "the floor did not resume: balloon holds ${held:-0} MiB, a quarter of $(( 2048 + $(field plugged_mib) )) wanted, after ${waited}s"
+	fail "the ramp did not climb: balloon holds ${held:-0} MiB, a quarter of $(( 2048 + $(field plugged_mib) )) wanted, after ${waited}s"
 fi
+puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
+[ "$puffs" -le 10 ] && pass "${puffs} failed inflations on the climb: cache given, not fought for" || fail "${puffs} failed inflations on the climb"
+# The level dropping is a plateau, not a cliff: what the balloon holds
+# stays for the quiet rule to ease down a 256th of the guest a second,
+# rather than going back to the guest to refill the cache the host then
+# compresses again (the comb of 2026-09-16: eighteen Warn/Normal flips in
+# half an hour, a two-gigabyte inflate-and-deflate on each).
+at_warn="$(field ballooned_mib)"
+guest_mib=$(( 2048 + $(field plugged_mib) ))
+step=$(( guest_mib / 256 )); [ "$step" -lt 32 ] && step=32
 echo normal > "$PRESSURE_FILE"
+sleep 15
+after="$(field ballooned_mib)"
+# Five seconds of patience, then at most ten small steps: what a plateau
+# that eases looks like fifteen seconds in. A cliff is gone at once.
+floor=$(( at_warn - 10 * step - 64 ))
+[ "${after:-0}" -ge "$floor" ] && pass "Normal is a plateau: ${after} of ${at_warn} MiB held 15s later (eases ${step} MiB/s at most)" || fail "Normal was a cliff: ${after:-0} of ${at_warn} MiB left after 15s, ${floor} expected"
+sleep 60
+later="$(field ballooned_mib)"
+[ "${later:-0}" -lt "${after:-0}" ] && pass "and it eases: ${later} MiB after another 60s" || fail "it did not ease: ${later:-0} MiB after another 60s (was ${after:-0})"
+# The reported workflow: the host flapping between Warn and Normal. The
+# balloon must ride it out where it is, not cycle to nothing and back.
+first=""
+min_held=999999
+puffs_before="$(grep -ac 'Out of puff' "$LOG" || true)"
+for flap in 1 2 3; do
+	echo warn > "$PRESSURE_FILE"
+	sleep 20
+	now="$(field ballooned_mib)"
+	[ -z "$first" ] && first="$now"
+	[ "${now:-0}" -lt "$min_held" ] && min_held="$now"
+	echo normal > "$PRESSURE_FILE"
+	sleep 20
+	now="$(field ballooned_mib)"
+	[ "${now:-0}" -lt "$min_held" ] && min_held="$now"
+done
+puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
+[ "$min_held" -ge $(( first / 2 )) ] && pass "three Warn/Normal flaps: balloon never below ${min_held} MiB of its first ${first}" || fail "flapping cycled the balloon down to ${min_held} MiB from ${first}"
+[ "$puffs" -le 10 ] && pass "${puffs} failed inflations across the flaps" || fail "${puffs} failed inflations across the flaps"
+echo normal > "$PRESSURE_FILE"
+docker rm -f m6-keeper >/dev/null 2>&1
 sleep 5
 
 echo
