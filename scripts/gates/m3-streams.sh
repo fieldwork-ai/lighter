@@ -148,6 +148,30 @@ code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:180
 $D stop -t 1 m3s-http >/dev/null 2>&1; sleep 2
 if nc -z -w 1 127.0.0.1 18098 2>/dev/null; then fail "the published port is still open after the container stopped"; else pass "the published port closed with the container"; fi
 
+# published over ::1: `localhost` on a Mac is ::1 first, and Docker's v6
+# mapping of a publish reaches the container's IPv6 address, where a server
+# that binds 0.0.0.0 (most of them) does not listen. The agent retries a
+# refused v6 publish on the guest's v4, Docker's v4 mapping, so the server
+# answers on localhost as it would under Docker Desktop.
+$D run -d --rm --name m3s-v4only -p 18093:80 alpine:3.21 sh -c 'apk add -q python3 >/dev/null 2>&1; python3 -c "import http.server as h, socketserver as s
+s.TCPServer.allow_reuse_address = True
+class Ok(h.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header(\"Content-Length\", \"2\"); self.end_headers(); self.wfile.write(b\"ok\")
+    def log_message(self, *a): pass
+s.TCPServer((\"0.0.0.0\", 80), Ok).serve_forever()"' >/dev/null 2>&1
+waited=0; until [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:18093/ 2>/dev/null)" = 200 ] || [ "$waited" -ge 60 ]; do sleep 2; waited=$((waited + 2)); done
+code4="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18093/ 2>/dev/null)"
+code6="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 'http://[::1]:18093/' 2>/dev/null)"
+if [ "$code4" = 200 ] && [ "$code6" = 200 ]; then
+	pass "a server bound to 0.0.0.0 answers on 127.0.0.1 and on ::1 (localhost)"
+else
+	fail "published over ::1: 127.0.0.1 gave ${code4:-none}, ::1 gave ${code6:-none} after ${waited}s"
+	echo "    container: $($D inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' m3s-v4only 2>&1 | head -1)"
+	$D logs m3s-v4only 2>&1 | tail -3 | sed 's/^/    /'
+fi
+$D stop -t 1 m3s-v4only >/dev/null 2>&1
+
 # integrity: a checksummed quarter gigabyte each way. iperf3 checks
 # nothing about the bytes it moves, and a split copy once reordered them.
 python3 - <<'PY' &

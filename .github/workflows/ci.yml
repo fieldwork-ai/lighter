@@ -56,3 +56,5 @@ jobs:
         run: bash scripts/test-speed-gate.sh
       - name: Memory policy preserves live nested workloads
         run: bash scripts/test-memory-policy.sh
+      - name: A refused v6 publish is retried on v4
+        run: bash scripts/test-inbound-fallback.sh
