@@ -16,10 +16,8 @@ own access bits. Anonymous memory is never a candidate, and neither is a page
 any process has mapped: a sleeping process keeps its heap, its text and its
 mapped files. tmpfs pages idle for an hour go to the guest's zram, compressed,
 and fault back in microseconds. What the pass frees returns through free page
-reporting and through a balloon offer the host now takes with the virtio-mem
-range in; a container being created, started, exec'd or built gets the whole
-guest back in one motion, and a shrink lets the balloon go before the range
-comes out.
+reporting, fed by a compaction pass, within seconds; nothing on the host
+changes.
 
 The kernel gains DAMON (the sysfs interface and physical-address operations
 only). The classic LRU and every reclaim path are as before. `lighter.idle_age`

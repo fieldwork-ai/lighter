@@ -175,12 +175,6 @@ impl MemState {
         Ok(())
     }
 
-    /// What the guest has plugged, for tests of the policy above the device.
-    #[cfg(test)]
-    pub fn set_plugged_for_test(&self, bytes: u64) {
-        self.plugged.store(bytes, Ordering::Relaxed);
-    }
-
     pub fn plugged_bytes(&self) -> u64 {
         self.plugged.load(Ordering::Relaxed)
     }

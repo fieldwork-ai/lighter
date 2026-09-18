@@ -422,7 +422,7 @@ rssfile() { perl -e 'alarm 10; exec @ARGV' docker exec "$1" grep RssFile /proc/1
 cold0="$(cgstat m6-cold file)"
 warm0="$(cgstat m6-warm file)"
 mapped0="$(rssfile m6-mapped)"
-returned0=$(( $(field reported_mib) + $(field ballooned_mib) ))
+reported0="$(field reported_mib)"
 plugged0="$(field plugged_mib)"
 puffs0="$(grep -ac 'Out of puff' "$LOG" || true)"
 [ "${cold0:-0}" -ge 1900 ] && pass "the cold container cached ${cold0} MiB, the warm one ${warm0} MiB, the sleeping process maps ${mapped0} MiB" \
@@ -447,47 +447,35 @@ mapped1="$(rssfile m6-mapped)"
 	|| fail "the warm container lost its cache (${warm0} → ${warm1:-?} MiB): a page read every five seconds was evicted"
 [ "${mapped0:-0}" -ge 16 ] && [ "${mapped1:-0}" -ge $(( mapped0 - 4 )) ] && pass "the sleeping process's mapped pages stayed (${mapped0} → ${mapped1} MiB)" \
 	|| fail "the sleeping process lost mapped pages (${mapped0:-?} → ${mapped1:-?} MiB)"
-# What the pass freed comes back: compacted, reporting returns the bulk
-# within two seconds, and the offer that follows an eviction is taken by
-# the balloon with the range in.
+# What the pass freed comes back through free page reporting alone: the
+# agent compacts, and reporting returns the runs within seconds, with the
+# range in and no balloon inflated for it.
 waited=0
-while [ $(( $(field reported_mib) + $(field ballooned_mib) - returned0 )) -lt 1500 ] && [ "$waited" -lt 30 ]; do
+while [ $(( $(field reported_mib) - reported0 )) -lt 1500 ] && [ "$waited" -lt 30 ]; do
 	sleep 2
 	waited=$((waited + 2))
 done
-returned=$(( $(field reported_mib) + $(field ballooned_mib) - returned0 ))
-[ "$returned" -ge 1500 ] && pass "${returned} MiB returned to the host within ${waited}s (balloon $(field ballooned_mib) MiB, range $(field plugged_mib) MiB plugged)" \
-	|| fail "only ${returned} MiB returned within ${waited}s (balloon $(field ballooned_mib) MiB, reported $(field reported_mib) MiB)"
+returned=$(( $(field reported_mib) - reported0 ))
+[ "$returned" -ge 1500 ] && pass "${returned} MiB reported back to the host within ${waited}s (footprint $(footprint) MiB, range $(field plugged_mib) MiB plugged)" \
+	|| fail "only ${returned} MiB reported back within ${waited}s (footprint $(footprint) MiB)"
+[ "$(field ballooned_mib)" -le 64 ] && pass "no balloon inflated for it ($(field ballooned_mib) MiB)" \
+	|| fail "the balloon holds $(field ballooned_mib) MiB after the pass; the pass is reporting's, not the balloon's"
 [ "$(field plugged_mib)" -ge "${plugged0:-0}" ] && pass "the range stayed in through the eviction (${plugged0} MiB plugged)" \
 	|| fail "the range moved during the eviction (${plugged0} → $(field plugged_mib) MiB plugged)"
 puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs0 ))
-[ "$puffs" -le 10 ] && pass "${puffs} failed inflations taking the freed memory" || fail "${puffs} failed inflations taking the freed memory"
-# A container starting gets the whole guest back in one motion.
-ballooned_before="$(field ballooned_mib)"
-perl -e 'alarm 20; exec @ARGV' docker exec m6-keeper true >/dev/null 2>&1 || fail "the keeper did not answer an exec"
-waited=0
-while [ "$(field ballooned_mib)" -gt 64 ] && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
-[ "$(field ballooned_mib)" -le 64 ] && pass "an exec let the balloon go (${ballooned_before} → $(field ballooned_mib) MiB in ${waited}s)" \
-	|| fail "the balloon still holds $(field ballooned_mib) MiB ${waited}s after an exec"
-# With everything gone the range comes out, and the balloon goes first: a
-# balloon page in a block the unplug wants would pin it.
+[ "$puffs" -le 10 ] && pass "${puffs} failed inflations across the pass" || fail "${puffs} failed inflations across the pass"
+# With everything gone the range comes out as it always did.
 docker rm -f m6-warm m6-cold m6-mapped m6-keeper >/dev/null 2>&1
-plugged_full="$(field plugged_mib)"
-ballooned_at_unplug=""
 waited=0
 while [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ] && [ "$waited" -lt 90 ]; do
-	if [ -z "$ballooned_at_unplug" ] && [ "$(field plugged_mib)" -lt "$plugged_full" ]; then
-		ballooned_at_unplug="$(field ballooned_mib)"
-	fi
 	sleep 2
 	waited=$((waited + 2))
 done
 if [ "$(field plugged_mib)" -le "$RANGE_RESIDUE_MIB" ]; then
-	pass "the range came out ${waited}s after the last container left, the balloon at ${ballooned_at_unplug:-0} MiB when it started"
+	pass "the range came out ${waited}s after the last container left"
 else
 	fail "the range is still $(field plugged_mib) MiB plugged after ${waited}s with nothing running"
 fi
-[ "${ballooned_at_unplug:-0}" -le 64 ] || fail "the balloon held ${ballooned_at_unplug} MiB as the range started out"
 
 echo
 if [ "$FAILED" -eq 0 ]; then
