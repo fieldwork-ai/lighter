@@ -115,11 +115,11 @@ and says so once.
  	INIT_WORK(&vsock->tx_work, virtio_transport_tx_work);
  	INIT_WORK(&vsock->event_work, virtio_transport_event_work);
  	INIT_WORK(&vsock->send_pkt_work, virtio_transport_send_pkt_work);
-@@ -866,6 +902,7 @@
+@@ -848,6 +884,7 @@
  	/* Other works can be queued before 'config->del_vqs()', so we flush
  	 * all works before to free the vsock object to avoid use after free.
  	 */
 +	cancel_delayed_work_sync(&vsock->rx_refill_work);
- 	flush_work(&vsock->rx_work);
  	flush_work(&vsock->tx_work);
  	flush_work(&vsock->event_work);
+ 	flush_work(&vsock->send_pkt_work);

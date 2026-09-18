@@ -13,6 +13,8 @@
 //!   docker CLI ──unix──▶ lighter ──vsock──▶ agent ──unix──▶ dockerd
 //! ```
 
+mod idle;
+mod inbound;
 mod memory_policy;
 mod sockmap;
 mod udp;
@@ -291,6 +293,12 @@ fn bound_container_cache() {
     let engine = "/sys/fs/cgroup/engine";
     let mut idle_for = 0u32;
     let mut idle_trim = IdleTrim::default();
+    // The hourly pass over idle page cache (`idle.rs`); `lighter.idle_age=<s>`
+    // shortens the hour for the gate, 0 leaves it off.
+    let mut idle = idle::Idle::start(
+        cmdline_value("lighter.idle_age").unwrap_or(idle::IDLE_HORIZON_SECS),
+        TICKS_PER_SEC,
+    );
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 16]> = None;
@@ -315,6 +323,28 @@ fn bound_container_cache() {
         // (the trims, the reporting rate at 25 s) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
         std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
+        // Under a megabyte is DAMON's own sampling: the ten pages a minute
+        // it marks old for the region estimate this does not use, evicted
+        // when the pass finds them. Not an eviction, and not an offer.
+        if let Some(evicted) = idle.tick(step)
+            && evicted >= 1 << 20
+        {
+            // What the pass freed is in pieces the size of the files that
+            // held it; compacted, reporting returns it within seconds: on
+            // the M1's gate, 2227 of 2258 MiB evicted were back with the
+            // host fifteen seconds later, with the range in and no balloon.
+            // A balloon offer beside it was tried and dropped: the offer is
+            // "beyond what the balloon holds", so lines a quarter-second
+            // apart compounded it to three times the eviction, and with
+            // containers running the balloon then stood in the next one's
+            // way.
+            compact_until_reportable();
+            println!(
+                "AGENT idle: evicted {} MiB untouched for {}",
+                evicted >> 20,
+                idle::horizon_text(idle.horizon_secs())
+            );
+        }
         if dynamic {
             total = mem_total().unwrap_or(total);
         }
@@ -1080,8 +1110,39 @@ fn forward_inbound(host: OwnedFd) {
     let Some(dst) = udp::destination_from(&header) else {
         return;
     };
+    // Docker refuses a v6 publish on behalf of a server that binds `0.0.0.0`
+    // only, which is most of them, and on a Mac `localhost` is `::1` first.
+    // Its DNAT refuses at connect; its proxy accepts and hangs up once its
+    // own dial of the container's v6 address is refused, before a byte
+    // comes back. Either way the same port on this interface's v4 address
+    // is Docker's v4 mapping, where the server is (`inbound::v4_sibling`).
+    let on_v4 = |why: &str, queued: &[u8]| -> Option<std::net::TcpStream> {
+        let alt = inbound::v4_sibling(dst, &interfaces())?;
+        let mut t = match std::net::TcpStream::connect(alt) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("lighter-agent: inbound to {dst} {why}; and to {alt}: {e}");
+                return None;
+            }
+        };
+        if t.write_all(queued).is_err() {
+            return None;
+        }
+        static ANNOUNCED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        if ANNOUNCED.lock().map(|mut a| a.insert(dst.port())).unwrap_or(false) {
+            println!("AGENT inbound port={} v6 {why}; dialling v4 {}", dst.port(), alt.ip());
+        }
+        Some(t)
+    };
     let mut tcp = match std::net::TcpStream::connect(dst) {
         Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused && dst.is_ipv6() => {
+            match on_v4("refused", &[]) {
+                Some(t) => t,
+                None => return,
+            }
+        }
         Err(e) => {
             eprintln!("lighter-agent: inbound to {dst} refused: {e}");
             return;
@@ -1094,8 +1155,21 @@ fn forward_inbound(host: OwnedFd) {
     // buffer the header was read out of still holds the header: joined as
     // it stands, the container would see the port bytes ahead of the
     // request (it did — an HTTP server answered 501 to `;\xc7GET`).
-    if copy_queued(host_read.0.as_raw_fd(), &mut tcp).is_err() {
+    let Ok(queued) = take_queued(host_read.0.as_raw_fd()) else {
         return;
+    };
+    if tcp.write_all(&queued).is_err() {
+        return;
+    }
+    if dst.is_ipv6() && hung_up_before_answering(&tcp) {
+        match on_v4("hung up before answering", &queued) {
+            Some(t) => {
+                tcp = t;
+                let _ = tcp.set_nodelay(true);
+                ends_with_its_peer(&tcp);
+            }
+            None => return,
+        }
     }
     let (tcp, host_read, host_write) = match joiner() {
         Some(j) => match joined(j, tcp, host_read, host_write) {
@@ -1118,6 +1192,44 @@ fn forward_inbound(host: OwnedFd) {
     // SAFETY: a live descriptor; shutdown of the write half only.
     unsafe { libc::shutdown(host_fd, libc::SHUT_WR) };
     let _ = inbound.join();
+}
+
+/// This guest's interfaces and their addresses, as getifaddrs reports them.
+fn interfaces() -> Vec<(String, std::net::IpAddr)> {
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills a list we free below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return out;
+    }
+    let mut cursor = list;
+    while !cursor.is_null() {
+        // SAFETY: a live entry of the list getifaddrs returned.
+        let entry = unsafe { &*cursor };
+        if !entry.ifa_addr.is_null() {
+            // SAFETY: ifa_name is a C string for the entry's lifetime.
+            let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }.to_string_lossy().into_owned();
+            // SAFETY: the family says which sockaddr the pointer holds.
+            let ip = match unsafe { (*entry.ifa_addr).sa_family } as libc::c_int {
+                libc::AF_INET => {
+                    let a = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
+                    Some(std::net::IpAddr::from(std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr))))
+                }
+                libc::AF_INET6 => {
+                    let a = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in6) };
+                    Some(std::net::IpAddr::from(std::net::Ipv6Addr::from(a.sin6_addr.s6_addr)))
+                }
+                _ => None,
+            };
+            if let Some(ip) = ip {
+                out.push((name, ip));
+            }
+        }
+        cursor = entry.ifa_next;
+    }
+    // SAFETY: the list getifaddrs returned, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    out
 }
 
 fn serve_control(stream: OwnedFd) {
@@ -1568,18 +1680,37 @@ fn copy(from: &mut impl Read, to: &mut impl Write) {
 
 /// Copies whatever the kernel already holds for `from` to `to`, and stops
 /// when nothing more is queued right now.
-fn copy_queued(from: std::os::fd::RawFd, to: &mut impl Write) -> std::io::Result<()> {
+/// Whether the peer closed within a moment of connecting, before sending a
+/// byte: Docker's proxy hanging up on a v6 publish it could not complete.
+/// A server that answers ends the wait with its first byte; a slow one
+/// costs the join fifty milliseconds and its reply nothing, since the reply
+/// waits in the socket.
+fn hung_up_before_answering(tcp: &std::net::TcpStream) -> bool {
+    let mut pfd = libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLIN | libc::POLLRDHUP, revents: 0 };
+    // SAFETY: one pollfd for a live socket, a bounded wait.
+    if unsafe { libc::poll(&mut pfd, 1, 50) } <= 0 {
+        return false;
+    }
+    let mut byte = 0u8;
+    // SAFETY: a one-byte peek into a live socket.
+    let n = unsafe { libc::recv(tcp.as_raw_fd(), std::ptr::addr_of_mut!(byte).cast(), 1, libc::MSG_PEEK) };
+    n == 0 || (n < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::ConnectionReset)
+}
+
+/// The bytes queued on `from` right now, taken off it.
+fn take_queued(from: std::os::fd::RawFd) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
     loop {
         let mut queued: libc::c_int = 0;
         if unsafe { libc::ioctl(from, libc::FIONREAD, &mut queued) } < 0 || queued <= 0 {
-            return Ok(());
+            return Ok(out);
         }
         let mut buf = vec![0u8; queued as usize];
         let n = unsafe { libc::read(from, buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
             return Err(std::io::Error::last_os_error());
         }
-        to.write_all(&buf[..n as usize])?;
+        out.extend_from_slice(&buf[..n as usize]);
     }
 }
 

@@ -7,7 +7,7 @@
 # path we are trying to make fast.
 set -euo pipefail
 
-KERNEL_VERSION="${KERNEL_VERSION:-6.18.49}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.18.52}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 JOBS="${JOBS:-$(nproc)}"
 SRC=/build/linux-${KERNEL_VERSION}

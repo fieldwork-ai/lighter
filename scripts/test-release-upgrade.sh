@@ -54,7 +54,7 @@ import pathlib,json,sys
 root=pathlib.Path(sys.argv[1])
 identity=json.loads((root/'machine.identity').read_text())
 assert identity['release_version']==sys.argv[2], identity
-assert identity['kernel_version']=='6.18.49', identity
+assert identity['kernel_version']=='6.18.52', identity
 assert json.loads((root/'share/lighter/installation.json').read_text())['method']=='script'
 assert any((root/'releases').glob('legacy-*'))
 PY
