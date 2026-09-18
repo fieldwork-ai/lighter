@@ -57,4 +57,20 @@ The data epoch remains **1**.
 
 ## Release artifacts
 
-To be recorded at packaging.
+Packaged source: `9e00a99` on `release/0.6.0` (the idle pass, Linux 6.18.52
+and the version bump). Apple accepted notarization
+`78ec4c63-53cc-4bc1-9443-a4dd81efc715`; the app ticket is stapled and
+Gatekeeper accepts the archive's app.
+
+| Artifact | SHA256 |
+| --- | --- |
+| `lighter-0.6.0-arm64.tar.gz` | `ca39d1e45b4a4597c271684abc29f718f769d139ead7f3f8feacbbbb1ff8a6c6` |
+| `lighter-0.6.0-arm64` bootstrap | `e26a23ee20b696f3f3f22404eee33099dfc8d984072b3fbe097c5430fd86643b` |
+| Guest kernel (Linux 6.18.52) | `27fb18843a7edcb89e36f76e4acdc2ae9615c77bf314e1b4baa195134d6dc92c` |
+| Guest root filesystem | `eb6490a09f36bbfa981396bb515ae8640a668432f1f6fdee04738bbf1afc263b` |
+
+The kernel is new: 6.18.52 with DAMON, built on the release commit. The root
+filesystem differs from 0.5.6's only in the guest agent: the same 102 packages
+at the same versions, and the init scripts, dockerd, containerd and runc are
+byte-identical. Final release metadata may follow the packaged source;
+runtime, guest and build inputs remain identical.
