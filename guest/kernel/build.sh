@@ -37,7 +37,7 @@ build() {
 		-v "$volume:/build" \
 		-v "$OUT:/out" \
 		-e "JOBS=$JOBS" \
-		-e "KERNEL_VERSION=${KERNEL_VERSION:-6.18.49}" \
+		-e "KERNEL_VERSION=${KERNEL_VERSION:-6.18.52}" \
 		-e "KERNEL_HZ=$hz" \
 		-e "KERNEL_IMAGE_SUFFIX=$suffix" \
 		-e "KERNEL_TRACE=${KERNEL_TRACE:-}" \

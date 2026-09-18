@@ -58,3 +58,5 @@ jobs:
         run: bash scripts/test-memory-policy.sh
       - name: A refused v6 publish is retried on v4
         run: bash scripts/test-inbound-fallback.sh
+      - name: The idle pass is one pageout scheme with three filters, in order
+        run: bash scripts/test-idle-pass.sh

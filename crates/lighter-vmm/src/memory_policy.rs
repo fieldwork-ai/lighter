@@ -263,10 +263,13 @@ impl MakeWhole {
         // Backing preparation has its own bounded wait. Do not consume the
         // guest's plug deadline while the host is still creating that backing.
         mem.wait_for_backing()?;
+        // The balloon goes whether or not the range needs plugging: with
+        // the range in, the idle pass's offer may have it holding what the
+        // container about to start will want.
+        self.0.guest_offers(0, true);
         if mem.state().plugged_bytes() == mem.state().region_bytes() {
             return Ok(());
         }
-        self.0.guest_offers(0, true);
         mem.plug_all();
         Ok(())
     }
@@ -394,6 +397,21 @@ impl Steering {
             return true;
         }
         if nothing_runs && plugged > 0 && spare_mib << 20 >= BLOCK_SIZE && !mem.held() {
+            // The offer balloon first: a balloon page in a block the unplug
+            // wants pins it (guest patch 0014), so an inflated offer is let
+            // go and the shrink waits, a poll at a time (`resize_again`),
+            // for the driver to have deflated it. The pressure ramp's
+            // balloon is not waited for: a Mac that is short keeps it, and
+            // an unplug it pins is the minute-stuck recovery's, as before.
+            let ramp = self
+                .compression
+                .lock()
+                .expect("compression policy poisoned")
+                .pages;
+            if self.guest_pages.load(Ordering::Relaxed) > 0 || self.balloon.actual_pages() > ramp {
+                self.guest_offers(0, true);
+                return true;
+            }
             // A lower offer during an unplug only extends it, so an unplug
             // the driver could not finish does not stop the next.
             let target = plugged.min(requested).saturating_sub(spare_mib << 20);
@@ -515,6 +533,38 @@ impl Steering {
         if changed {
             tracing::debug!(short, withdraw, "the guest's line moved the ramp");
             self.apply();
+        }
+    }
+
+    /// One line from the guest, applied: the range first, then the balloon
+    /// with what the range did not take (a release, or an offer once the
+    /// range is out). Measured without the range taking it first: 1330 MiB
+    /// a minute after an install on the M5 against 850, the base's freed
+    /// cache in file-sized pieces that reporting cannot return and the
+    /// range cannot hold. The balloon only once the range is out, because
+    /// its pages do not migrate (guest patch 0014) and one inflated into a
+    /// movable block pins that block in for good (m6 read 128 MiB stuck and
+    /// the driver retrying at 2.5% CPU) — except for the offer that follows
+    /// the guest's idle pass (`idle`): what it freed was nobody's working
+    /// set, so the balloon takes it with the range in, and the shrink that
+    /// later wants the range lets the balloon go first (`guest_sizes`). An
+    /// ordinary offer with the range in is still dropped: taken every quiet
+    /// second, it would have the balloon standing through the next
+    /// container's run.
+    fn guest_line(
+        &self,
+        spare_mib: u64,
+        release: bool,
+        need: bool,
+        nothing_runs: bool,
+        idle: bool,
+    ) {
+        self.guest_demand(need, release);
+        let taken = self.guest_sizes(spare_mib, release || need, nothing_runs);
+        if release || need {
+            self.guest_offers(0, true);
+        } else if !taken && (idle || self.range_out()) {
+            self.guest_offers(spare_mib, false);
         }
     }
 
@@ -674,26 +724,13 @@ fn memory_guest(
                     };
                     let spare_mib = u64::from(word(0));
                     let flags = word(12);
-                    let (release, need, nothing_runs) =
-                        (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
-                    // With a range, a line sizes the range first; what it
-                    // does not take (a release, or an offer once the range
-                    // is out) goes to the balloon as it always did. Measured
-                    // without this: 1330 MiB a minute after an install on the
-                    // M5 against 850, the base's freed cache in file-sized
-                    // pieces that reporting cannot return and the range
-                    // cannot hold.
-                    // But only once the range is out: the balloon's pages
-                    // do not migrate (guest patch 0014), and one inflated
-                    // into a movable block pins that block in for good — m6
-                    // read 128 MiB stuck and the driver retrying at 2.5% CPU.
-                    steering.guest_demand(need, release);
-                    let taken = steering.guest_sizes(spare_mib, release || need, nothing_runs);
-                    if release || need {
-                        steering.guest_offers(0, true);
-                    } else if !taken && steering.range_out() {
-                        steering.guest_offers(spare_mib, false);
-                    }
+                    let (release, need, nothing_runs, idle) = (
+                        flags & 1 != 0,
+                        flags & 2 != 0,
+                        flags & 4 != 0,
+                        flags & 8 != 0,
+                    );
+                    steering.guest_line(spare_mib, release, need, nothing_runs, idle);
                 }
                 // Without current guest feedback the guest is short until it
                 // says otherwise: the ramp holds, and its offers are withdrawn.
@@ -1075,6 +1112,128 @@ mod tests {
         for _ in 0..n {
             steering.steer(0);
         }
+    }
+
+    /// A guest with its range in: the base and a plugged range, as a
+    /// machine with a container running has.
+    fn steering_with_range_for_tests(
+        base: u64,
+        region: u64,
+    ) -> (
+        Steering,
+        Arc<Mutex<VirtioMmio>>,
+        Arc<crate::virtio::mem::MemState>,
+    ) {
+        use crate::irq::NullIrq;
+        use crate::memory::GuestMemory;
+        use crate::virtio::balloon::Balloon;
+        use crate::virtio::mem::{Mem, MemControl, MemState};
+
+        let balloon = Arc::new(BalloonState::default());
+        let transport = Arc::new(Mutex::new(VirtioMmio::new(
+            Box::new(Balloon::new(balloon.clone())),
+            Arc::new(GuestMemory::detached()),
+            Arc::new(NullIrq),
+        )));
+        let state = Arc::new(MemState::new(base, base, region, region));
+        state.set_plugged_for_test(region);
+        let mem_transport = Arc::new(Mutex::new(VirtioMmio::new(
+            Box::new(Mem::new(state.clone())),
+            Arc::new(GuestMemory::detached()),
+            Arc::new(NullIrq),
+        )));
+        let steering = Steering {
+            balloon,
+            transport: transport.clone(),
+            ram_bytes: base,
+            mem: Some(MemControl::new(state.clone(), mem_transport)),
+            last_line: Mutex::new((0, false)),
+            level: AtomicU32::new(NORMAL),
+            compression: Mutex::new(CompressionState::default()),
+            apply_lock: Mutex::new(()),
+            guest_pages: AtomicU32::new(0),
+        };
+        (steering, transport, state)
+    }
+
+    /// An ordinary offer with the range in is dropped, as it always was;
+    /// the offer that follows the guest's idle pass is taken.
+    #[test]
+    fn an_idle_offer_is_taken_with_the_range_in_and_an_ordinary_one_is_not() {
+        let (steering, transport, state) = steering_with_range_for_tests(4 << 30, 12 << 30);
+        assert!(!steering.range_out());
+        healthy(&steering);
+        steering.guest_line(2048, false, false, false, false);
+        assert_eq!(
+            target_mib(&transport),
+            0,
+            "an ordinary offer with the range in"
+        );
+        steering.guest_line(2048, false, false, false, true);
+        assert_eq!(
+            target_mib(&transport),
+            2048,
+            "the idle pass's offer with the range in"
+        );
+        assert_eq!(
+            state.plugged_bytes(),
+            12 << 30,
+            "the range stayed where it was"
+        );
+        // A release still asks the whole balloon back.
+        steering.guest_line(0, true, false, false, false);
+        assert_eq!(target_mib(&transport), 0);
+    }
+
+    /// With nothing running, a shrink lets the balloon go and waits for it
+    /// to have deflated before the range is asked out: a balloon page in a
+    /// block the unplug wants pins it.
+    #[test]
+    fn a_shrink_lets_the_balloon_go_before_it_asks_the_range_out() {
+        let (steering, transport, state) = steering_with_range_for_tests(4 << 30, 12 << 30);
+        healthy(&steering);
+        steering.guest_line(2048, false, false, false, true);
+        assert_eq!(target_mib(&transport), 2048);
+        steering
+            .balloon
+            .set_actual_pages_for_test(((2048u64 << 20) / BALLOON_PAGE_SIZE) as u32);
+        // The containers are gone and the guest offers a block's worth.
+        steering.guest_line(4096, false, false, true, false);
+        assert_eq!(target_mib(&transport), 0, "the balloon was let go");
+        assert_eq!(
+            state.requested_bytes(),
+            12 << 30,
+            "but the range was not asked out yet"
+        );
+        // Still deflating: the next line waits too.
+        steering.guest_line(4096, false, false, true, false);
+        assert_eq!(state.requested_bytes(), 12 << 30);
+        // Deflated: the shrink goes ahead.
+        steering.balloon.set_actual_pages_for_test(0);
+        steering.guest_line(4096, false, false, true, false);
+        assert_eq!(
+            state.requested_bytes(),
+            8 << 30,
+            "the range shrank by the offer"
+        );
+        assert_eq!(
+            target_mib(&transport),
+            0,
+            "and no offer went to the balloon meanwhile"
+        );
+    }
+
+    /// A container starting gets the whole guest back in one motion: the
+    /// idle pass's balloon is let go even though the range needs no plug.
+    #[test]
+    fn a_container_start_lets_the_offer_balloon_go_with_the_range_full() {
+        let (steering, transport, state) = steering_with_range_for_tests(4 << 30, 12 << 30);
+        healthy(&steering);
+        steering.guest_line(2048, false, false, false, true);
+        assert_eq!(target_mib(&transport), 2048);
+        MakeWhole(Arc::new(steering)).call().unwrap();
+        assert_eq!(target_mib(&transport), 0);
+        assert_eq!(state.requested_bytes(), 12 << 30);
     }
 
     /// A level change reaches the device on the next poll, and a guest that

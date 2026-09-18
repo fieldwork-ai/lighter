@@ -357,6 +357,138 @@ echo normal > "$PRESSURE_FILE"
 docker rm -f m6-keeper >/dev/null 2>&1
 sleep 5
 
+# ------------------------------------------------------------------ idle --
+# A second boot, with the hour the agent's idle pass waits shortened to
+# forty seconds by its command-line hook (`lighter.idle_age`). Its own
+# boot: under the sections above the pass would have started moving their
+# tmpfs ballast and cache after eighty seconds. The pass is DAMON's
+# (guest `idle.rs`): every horizon it asks each unmapped page-cache page
+# whether it was touched since the last pass and evicts the ones that were
+# not. Three containers say what must go and what must stay: one that read
+# two gigabytes once, one that re-reads its file every five seconds, and a
+# sleeping process with a mapped executable.
+echo
+echo "==> Idle page cache: a second boot, the hour shortened to 40 s"
+kill -9 "$VMM_PID" 2>/dev/null || true
+wait "$VMM_PID" 2>/dev/null || true
+VMM_PID=""
+mkdir -p .logs && cp "$LOG" .logs/m6-last-boot-1.log 2>/dev/null || true
+: > "$LOG"
+# The level stays Normal whatever the Mac is doing: a real Warn during the
+# section would have the pressure ramp inflating and the range staying in.
+echo normal > "$PRESSURE_FILE"
+LIGHTER_PRESSURE_TEST_FILE="$PRESSURE_FILE" "$BIN" \
+	--kernel "$KERNEL" \
+	--disk "$ROOTFS" \
+	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
+	--net --run-dir "$RUN_DIR" \
+	--vsock "$SOCKET:2375" \
+	--report-memory \
+	--no-tty --cpus 4 --memory-mib 8192 \
+	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) lighter.idle_age=40" \
+	>"$LOG" 2>&1 &
+VMM_PID=$!
+disown "$VMM_PID" 2>/dev/null || true
+waited=0
+while ! grep -q "AGENT listening" "$LOG" 2>/dev/null; do
+	kill -0 "$VMM_PID" 2>/dev/null || { fail "the VMM exited during the second boot"; tail -20 "$LOG" | sed 's/^/    /'; exit 1; }
+	[ "$waited" -lt "$BOOT_TIMEOUT" ] || { fail "the guest did not come up a second time"; exit 1; }
+	sleep 1
+	waited=$((waited + 1))
+done
+await_footprint || { fail "the VMM never reported its footprint after the second boot"; exit 1; }
+T0=$(date +%s)
+sleep 3
+if grep -aq "AGENT idle: pass every 40 s" "$LOG"; then
+	pass "the agent configured the pass at a 40 s horizon"
+else
+	fail "the agent did not configure the pass: $(grep -a 'AGENT idle' "$LOG" | tail -1)"
+fi
+# The first boot's containers may survive in dockerd's state, its VM having
+# been killed rather than shut down.
+docker rm -f m6-keeper m6-short >/dev/null 2>&1 || true
+start() { local name="$1"; shift; local err; err="$(docker run -d --name "$name" "$@" 2>&1 >/dev/null)" || fail "could not start $name: ${err}"; }
+start m6-keeper alpine:3.21 sleep 900
+start m6-warm alpine:3.21 sh -c 'dd if=/dev/zero of=/warm bs=1M count=256 2>/dev/null; while :; do cat /warm >/dev/null; sleep 5; done'
+start m6-cold alpine:3.21 sh -c 'dd if=/dev/zero of=/cold bs=1M count=2048 2>/dev/null; sync; sleep 900'
+start m6-mapped node:24-alpine node -e 'setInterval(() => {}, 1000000)'
+sleep 20
+# A container's own view of its cgroup, in MiB.
+cgstat() { perl -e 'alarm 10; exec @ARGV' docker exec "$1" grep -E "^$2 " /sys/fs/cgroup/memory.stat 2>/dev/null | awk '{ print int($2 / 1048576) }'; }
+# The sleeping process's resident mapped file pages (its executable and
+# libraries), from its own view: image layers are charged to the engine's
+# cgroup, not the container's, so the cgroup's `file_mapped` says nothing.
+rssfile() { perl -e 'alarm 10; exec @ARGV' docker exec "$1" grep RssFile /proc/1/status 2>/dev/null | awk '{ print int($2 / 1024) }'; }
+cold0="$(cgstat m6-cold file)"
+warm0="$(cgstat m6-warm file)"
+mapped0="$(rssfile m6-mapped)"
+returned0=$(( $(field reported_mib) + $(field ballooned_mib) ))
+plugged0="$(field plugged_mib)"
+puffs0="$(grep -ac 'Out of puff' "$LOG" || true)"
+[ "${cold0:-0}" -ge 1900 ] && pass "the cold container cached ${cold0} MiB, the warm one ${warm0} MiB, the sleeping process maps ${mapped0} MiB" \
+	|| fail "the cold container cached only ${cold0:-?} MiB"
+# The first pass marks every page old; the second, forty seconds later,
+# evicts what stayed untouched. The agent reads the pass's stats every ten
+# seconds at this horizon.
+while ! grep -aq "AGENT idle: evicted" "$LOG" && [ $(( $(date +%s) - T0 )) -lt 130 ]; do sleep 2; done
+evicted="$(sed -n 's/.*AGENT idle: evicted \([0-9][0-9]*\) MiB.*/\1/p' "$LOG" | tail -1)"
+if [ "${evicted:-0}" -ge 1800 ]; then
+	pass "the pass evicted ${evicted} MiB $(( $(date +%s) - T0 ))s after boot"
+else
+	fail "the pass evicted ${evicted:-nothing} within 130 s: $(grep -a 'AGENT idle' "$LOG" | tail -2 | tr '\n' ' ')"
+fi
+sleep 5
+cold1="$(cgstat m6-cold file)"
+warm1="$(cgstat m6-warm file)"
+mapped1="$(rssfile m6-mapped)"
+[ "${cold1:-9999}" -le 128 ] && pass "the cold container's cache is gone (${cold0} → ${cold1} MiB)" \
+	|| fail "the cold container still holds ${cold1:-?} MiB of cache"
+[ "${warm1:-0}" -ge 224 ] && pass "the warm container's cache stayed (${warm0} → ${warm1} MiB)" \
+	|| fail "the warm container lost its cache (${warm0} → ${warm1:-?} MiB): a page read every five seconds was evicted"
+[ "${mapped0:-0}" -ge 16 ] && [ "${mapped1:-0}" -ge $(( mapped0 - 4 )) ] && pass "the sleeping process's mapped pages stayed (${mapped0} → ${mapped1} MiB)" \
+	|| fail "the sleeping process lost mapped pages (${mapped0:-?} → ${mapped1:-?} MiB)"
+# What the pass freed comes back: compacted, reporting returns the bulk
+# within two seconds, and the offer that follows an eviction is taken by
+# the balloon with the range in.
+waited=0
+while [ $(( $(field reported_mib) + $(field ballooned_mib) - returned0 )) -lt 1500 ] && [ "$waited" -lt 30 ]; do
+	sleep 2
+	waited=$((waited + 2))
+done
+returned=$(( $(field reported_mib) + $(field ballooned_mib) - returned0 ))
+[ "$returned" -ge 1500 ] && pass "${returned} MiB returned to the host within ${waited}s (balloon $(field ballooned_mib) MiB, range $(field plugged_mib) MiB plugged)" \
+	|| fail "only ${returned} MiB returned within ${waited}s (balloon $(field ballooned_mib) MiB, reported $(field reported_mib) MiB)"
+[ "$(field plugged_mib)" -ge "${plugged0:-0}" ] && pass "the range stayed in through the eviction (${plugged0} MiB plugged)" \
+	|| fail "the range moved during the eviction (${plugged0} → $(field plugged_mib) MiB plugged)"
+puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs0 ))
+[ "$puffs" -le 10 ] && pass "${puffs} failed inflations taking the freed memory" || fail "${puffs} failed inflations taking the freed memory"
+# A container starting gets the whole guest back in one motion.
+ballooned_before="$(field ballooned_mib)"
+perl -e 'alarm 20; exec @ARGV' docker exec m6-keeper true >/dev/null 2>&1 || fail "the keeper did not answer an exec"
+waited=0
+while [ "$(field ballooned_mib)" -gt 64 ] && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
+[ "$(field ballooned_mib)" -le 64 ] && pass "an exec let the balloon go (${ballooned_before} → $(field ballooned_mib) MiB in ${waited}s)" \
+	|| fail "the balloon still holds $(field ballooned_mib) MiB ${waited}s after an exec"
+# With everything gone the range comes out, and the balloon goes first: a
+# balloon page in a block the unplug wants would pin it.
+docker rm -f m6-warm m6-cold m6-mapped m6-keeper >/dev/null 2>&1
+plugged_full="$(field plugged_mib)"
+ballooned_at_unplug=""
+waited=0
+while [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ] && [ "$waited" -lt 90 ]; do
+	if [ -z "$ballooned_at_unplug" ] && [ "$(field plugged_mib)" -lt "$plugged_full" ]; then
+		ballooned_at_unplug="$(field ballooned_mib)"
+	fi
+	sleep 2
+	waited=$((waited + 2))
+done
+if [ "$(field plugged_mib)" -le "$RANGE_RESIDUE_MIB" ]; then
+	pass "the range came out ${waited}s after the last container left, the balloon at ${ballooned_at_unplug:-0} MiB when it started"
+else
+	fail "the range is still $(field plugged_mib) MiB plugged after ${waited}s with nothing running"
+fi
+[ "${ballooned_at_unplug:-0}" -le 64 ] || fail "the balloon held ${ballooned_at_unplug} MiB as the range started out"
+
 echo
 if [ "$FAILED" -eq 0 ]; then
 	printf '\033[32mmilestone 6 memory gate passed\033[0m — the guest gives memory back, and idles at nothing.\n'

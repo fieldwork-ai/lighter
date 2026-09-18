@@ -13,6 +13,7 @@
 //!   docker CLI ──unix──▶ lighter ──vsock──▶ agent ──unix──▶ dockerd
 //! ```
 
+mod idle;
 mod inbound;
 mod memory_policy;
 mod sockmap;
@@ -292,6 +293,18 @@ fn bound_container_cache() {
     let engine = "/sys/fs/cgroup/engine";
     let mut idle_for = 0u32;
     let mut idle_trim = IdleTrim::default();
+    // The hourly pass over idle page cache (`idle.rs`); `lighter.idle_age=<s>`
+    // shortens the hour for the gate, 0 leaves it off.
+    let mut idle = idle::Idle::start(
+        cmdline_value("lighter.idle_age").unwrap_or(idle::IDLE_HORIZON_SECS),
+        TICKS_PER_SEC,
+    );
+    // What the last eviction freed, and the ticks left of the window after
+    // it in which the offer to the host is that much and carries the `idle`
+    // flag: long enough for compaction and a reporting cycle to have gone
+    // first, so the balloon takes the rest.
+    let mut idle_offer_mib = 0u64;
+    let mut idle_offer_for = 0u32;
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 16]> = None;
@@ -316,6 +329,28 @@ fn bound_container_cache() {
         // (the trims, the reporting rate at 25 s) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
         std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
+        // Under a megabyte is DAMON's own sampling: the ten pages a minute
+        // it marks old for the region estimate this does not use, evicted
+        // when the pass finds them. Not an eviction, and not an offer.
+        if let Some(evicted) = idle.tick(step)
+            && evicted >= 1 << 20
+        {
+            // What the pass freed is in pieces the size of the files that
+            // held it; compacted, reporting returns the bulk within two
+            // seconds, and the flagged offer below takes the rest.
+            compact_until_reportable();
+            println!(
+                "AGENT idle: evicted {} MiB untouched for {}",
+                evicted >> 20,
+                idle::horizon_text(idle.horizon_secs())
+            );
+            idle_offer_mib = evicted >> 20;
+            idle_offer_for = 8 * TICKS_PER_SEC;
+        }
+        idle_offer_for = idle_offer_for.saturating_sub(step);
+        if idle_offer_for == 0 {
+            idle_offer_mib = 0;
+        }
         if dynamic {
             total = mem_total().unwrap_or(total);
         }
@@ -428,6 +463,7 @@ fn bound_container_cache() {
                     || (!populated && idle_trim.elapsed_ticks() >= 8 * TICKS_PER_SEC),
                 !populated,
                 dynamic && quiet_for == 0,
+                idle_offer_mib,
             );
         }
         // Image extraction charges shared file pages to the engine. A running
@@ -508,6 +544,7 @@ fn offer_memory(
     quiet: bool,
     nothing_runs: bool,
     busy: bool,
+    idle_mib: u64,
 ) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -561,7 +598,19 @@ fn offer_memory(
     // free, because the cache it could reclaim is its own working set and
     // reclaiming it is the cost this avoids. The host doubles the guest.
     let need = busy && avail < (total >> 20) / 8;
-    let spare = if !release && quiet && free > reserve + reserve / 4 {
+    // Or, in the seconds after the idle pass evicted something, that much:
+    // what it freed was nobody's working set, so the offer does not wait
+    // for quiet, and the `idle` flag tells the host to take it with the
+    // range in, which an ordinary offer is not (`memory_guest`). That much
+    // and no more: an offer of everything free beyond the reserve, made
+    // with containers running, had the driver failing its last allocations
+    // against the watermarks (twenty "Out of puff" on an 8 GiB guest) and
+    // the host reading a guest that was short.
+    let spare = if release {
+        0
+    } else if idle_mib > 0 {
+        idle_mib.min(free.saturating_sub(reserve))
+    } else if quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
         0
@@ -575,7 +624,10 @@ fn offer_memory(
     // Available and free are rounded to 16 MiB: they drift by a page or two
     // on an idle guest and would defeat the comparison.
     let coarse = |v: u64| (v & !15) as u32;
-    let flags = u32::from(release) | (u32::from(need) << 1) | (u32::from(nothing_runs) << 2);
+    let flags = u32::from(release)
+        | (u32::from(need) << 1)
+        | (u32::from(nothing_runs) << 2)
+        | (u32::from(idle_mib > 0 && spare > 0) << 3);
     for (i, v) in [spare as u32, coarse(avail), coarse(free), flags].iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }

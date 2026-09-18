@@ -52,7 +52,7 @@ python3 - "$VERSION" <<'PY'
 import json,os,pathlib,sys
 identity=json.loads(pathlib.Path(str(pathlib.Path(os.environ['HOME'],'.lighter')),'machine.identity').read_text())
 assert identity['release_version']==sys.argv[1],identity
-assert identity['kernel_version']=='6.18.49',identity
+assert identity['kernel_version']=='6.18.52',identity
 PY
 "$L" stop
 [ "$(readlink "$PREFIX/current")" = "releases/$VERSION" ]
