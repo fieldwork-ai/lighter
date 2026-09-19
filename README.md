@@ -82,7 +82,7 @@ Direct installations can opt into background update downloads with `lighter upda
 
 ## Hardware & AI Acceleration
 
-lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, and it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All four devices use Docker's standard Container Device Interface (CDI) via `--device`, cost zero memory or CPU when idle, and require no special flags or configurations to enable.
+lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, and it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All four devices use Docker's standard Container Device Interface (CDI) via `--device` and need no flags to enable. At idle the GPU renderer costs about 10 MB and two threads (it initialises when the guest driver probes, at boot); the other three cost nothing until a container uses them.
 
 See [`docs/gpu.md`](docs/gpu.md) for complete technical documentation and architecture.
 
@@ -112,6 +112,7 @@ docker run --rm --device lighter.sh/mps=all python:3.12-slim sh -c '
 
 - Native `model.to("mps")` works seamlessly for both inference and training with autograd.
 - Host PyTorch is discovered automatically from your macOS environment (`lighter config --torch-python`).
+- The wheels are built for CPython 3.11 to 3.13 against torch 2.14.0, and the host's torch must be the same version; `lighter doctor` says which it found. A 3.14 image or another torch fails at `pip install lighter-mps` or at start.
 
 ### 3. Apple Neural Engine (`--device lighter.sh/ane=all`)
 
@@ -294,10 +295,10 @@ lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal
 
 Kernel releases track upstream Linux LTS point updates, ensuring ongoing security patches and driver fixes without architectural churn.
 
-### 7. Apple Silicon hardware acceleration with zero idle tax
+### 7. Apple Silicon hardware acceleration with a small idle tax
 OrbStack, Docker Desktop and Colima leave the Mac's GPU and Neural Engine inaccessible from Linux containers; Podman's krunkit reaches the GPU through Vulkan alone, and nothing else reaches the Neural Engine or gives PyTorch its `mps` device.
 
-lighter exposes the full Apple Silicon compute architecture with zero compromise:
+lighter exposes the Apple Silicon compute architecture to containers:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
 - **Zero idle tax:** Metal renderers and runtime runners initialise strictly on demand. An idle machine pays 0 MiB RAM and 0% CPU for accelerator hardware.
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.

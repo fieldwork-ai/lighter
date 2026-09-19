@@ -29,7 +29,10 @@ export PATH="$BUILD/venv/bin:$BUILD/bin:$PATH"
 
 log "MoltenVK $MVK_VERSION"
 MVK="$BUILD/MoltenVK-$MVK_VERSION"
-if [ ! -f "$MVK/MoltenVK/static/MoltenVK.xcframework/macos-arm64_x86_64/libMoltenVK.a" ]; then
+# The release tarball's top level has moved between versions (1.4.2 unpacks
+# to MoltenVK/MoltenVK/…), so the library and headers are found, not assumed.
+find_mvk_lib() { find "$MVK" -type f -name libMoltenVK.a -path '*static*macos-arm64_x86_64*' 2>/dev/null | head -1; }
+if [ -z "$(find_mvk_lib)" ]; then
 	tar="$BUILD/MoltenVK-macos-$MVK_VERSION.tar"
 	curl -fsSL -o "$tar" "https://github.com/KhronosGroup/MoltenVK/releases/download/v$MVK_VERSION/MoltenVK-macos.tar"
 	if [ -n "$MVK_SHA256" ]; then
@@ -37,8 +40,10 @@ if [ ! -f "$MVK/MoltenVK/static/MoltenVK.xcframework/macos-arm64_x86_64/libMolte
 	fi
 	rm -rf "$MVK" && mkdir -p "$MVK" && tar xf "$tar" -C "$MVK"
 fi
-MVK_INC="$MVK/MoltenVK/include"
-MVK_LIB="$MVK/MoltenVK/static/MoltenVK.xcframework/macos-arm64_x86_64"
+MVK_LIB="$(dirname "$(find_mvk_lib)")"
+[ -f "$MVK_LIB/libMoltenVK.a" ] || { echo "libMoltenVK.a not found under $MVK" >&2; exit 1; }
+MVK_INC="$(find "$MVK" -maxdepth 4 -type d -path '*MoltenVK/include' 2>/dev/null | head -1)"
+[ -f "$MVK_INC/MoltenVK/mvk_vulkan.h" ] || { echo "MoltenVK headers not found under $MVK" >&2; exit 1; }
 
 # meson wants a pkg-config; there is none without Homebrew, and the only
 # module anyone asks for is vulkan, which is MoltenVK.
