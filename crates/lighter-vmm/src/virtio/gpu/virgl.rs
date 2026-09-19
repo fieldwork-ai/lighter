@@ -86,6 +86,7 @@ unsafe extern "C" {
 }
 
 #[cfg(not(gpu_libs))]
+#[allow(clippy::missing_safety_doc)]
 mod stub {
     use super::*;
     pub unsafe fn virgl_renderer_init(_: *mut c_void, _: c_int, _: *mut Callbacks) -> c_int {
