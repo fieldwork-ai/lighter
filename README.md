@@ -29,6 +29,9 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Do
 | **Container DNS resolution** | **40 µs** | 262 µs | 513 µs | 481 µs |
 | **Kubernetes support** | **kind, kubectl, Helm** | Built-in | Built-in | k3s |
 | **x86-64 Rosetta (`sha256sum`)** | **4.16 s** | 7.92 s | 4.39 s | 4.26 s |
+| **GPU in containers (Vulkan)** | **Yes** | No | No | No |
+| **Neural Engine in containers** | **Yes** | No | No | No |
+| **PyTorch on the Mac GPU in containers** | **Yes** | No | No | No |
 
 ---
 

@@ -11,6 +11,10 @@ A release is a signed, notarized tarball on GitHub, a Homebrew formula that poin
 - The daily driver up on the same build for a working day (`make install` or the tarball), because the gates do not cover a Mac that sleeps and wakes, a VPN that changes the resolver, or a week of images.
 - The README's numbers regenerated from the record CSVs, never typed: `python3 benchmarks/readme.py --write`. The record is a quiet machine; the M1's comes from `scripts/provision-bench-host.sh`'s host and a runner like `~/remote-record3.sh` there.
 
+## The renderer and the runtime
+
+The binary links virglrenderer and MoltenVK (the GPU) and ONNX Runtime with its CoreML provider (the Neural Engine) statically, from archives that are not in git: `make gpu` and `make ane` build them into `host/out` (`host/gpu/build.sh`, `host/ane/build.sh`; the second takes most of an hour). A build without them is not a release build — the devices are stubbed and `build.rs` warns — and `nm` on the binary for `virgl_renderer_init` and `OrtGetApiBase` is the check. The guest carries the Neural Engine's plugin provider and the lighter-mps wheels, built by `guest/ane-ep/build.sh` and `guest/torch-mps/build.sh` under `make guest`.
+
 ## The version
 
 One number, in the workspace `Cargo.toml`: `version` and the four internal crates' `version` pins beside it. 0.2.0's bump missed the pins, the workspace stopped resolving mid-gate, and m7 and m8 failed for a reason that read as a guest problem. Bump all four, and the guest agent's own `guest/agent/Cargo.toml` (and its lockfile) beside them, then `cargo build`, `make guest` for the rootfs the agent lives in, and the gates again on the bumped head — the release commit is the one the gates saw.
