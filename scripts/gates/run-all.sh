@@ -25,6 +25,7 @@ GATES=(
 	"m7  x86-64:m7-amd64.sh"
 	"m8  daily driver:m8-daily.sh"
 	"m9  gpu:m9-gpu.sh"
+	"m10 neural engine:m10-ane.sh"
 )
 
 only="${1:-}"

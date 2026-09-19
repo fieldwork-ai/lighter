@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         .init();
 
     let mut config = MachineConfig::default();
+    let mut ane = false;
     let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
     let mut docker_socket: Option<PathBuf> = None;
     let mut report_memory = false;
@@ -53,6 +54,7 @@ fn main() -> ExitCode {
             "--no-tty" => config.interactive = false,
             "--tso" => config.tso = true,
             "--gpu" => config.gpu = true,
+            "--ane" => ane = true,
             // Logs the process's own physical footprint on an interval. The
             // memory gate has no other way to watch a number only this process
             // can see.
@@ -113,6 +115,21 @@ fn main() -> ExitCode {
         }
     }
 
+    // The Neural Engine service, host-side; the port rides the command line.
+    let _ane = if ane {
+        match lighter_vmm::ane::Server::start() {
+            Ok(server) => {
+                config.cmdline.push_str(&format!(" lighter.ane={}", server.port()));
+                Some(server)
+            }
+            Err(e) => {
+                eprintln!("neural engine service: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut machine = match Machine::start(&config) {
         Ok(m) => m,
         Err(e) => {

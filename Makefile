@@ -139,6 +139,10 @@ gate-m8-daily: ## M8: a day of work, and a night of sleep
 gate-m9: ## M9: a container reaches the Mac's GPU through Vulkan
 	@scripts/gates/m9-gpu.sh
 
+.PHONY: gate-m10
+gate-m10: ## M10: a container runs an ONNX model on the Neural Engine
+	@scripts/gates/m10-ane.sh
+
 .PHONY: dogfood
 dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh
