@@ -54,6 +54,8 @@ pub enum MachineError {
     Run(#[from] crate::vcpu::RunError),
     #[error("console: {0}")]
     Console(#[from] io::Error),
+    #[error("spawning the {0} thread: {1}")]
+    Thread(&'static str, io::Error),
     #[error("network: {0}")]
     Network(#[from] crate::net::NetError),
     #[error(
@@ -102,6 +104,11 @@ pub struct MachineConfig {
     /// which is what Rosetta-translated code assumes. Costs native code a
     /// little; on only when Rosetta is.
     pub tso: bool,
+    /// A GPU (`virtio::gpu`): a render node the guest reaches Vulkan through.
+    pub gpu: bool,
+    /// Address space reserved for blobs the GPU maps into the guest; costs
+    /// nothing until a blob lands there.
+    pub gpu_aperture_bytes: u64,
 }
 
 impl Default for MachineConfig {
@@ -122,6 +129,8 @@ impl Default for MachineConfig {
             run_dir: std::env::temp_dir().join("lighter"),
             shares: Vec::new(),
             tso: false,
+            gpu: false,
+            gpu_aperture_bytes: 8 << 30,
         }
     }
 }
@@ -199,6 +208,11 @@ impl Machine {
             config.vcpus,
             config.ram_bytes,
             config.hotplug_bytes,
+            if config.gpu {
+                config.gpu_aperture_bytes
+            } else {
+                0
+            },
         )?;
         tracing::debug!(
             gicd = format_args!("{:#x}..{:#x}", layout.gicd.base, layout.gicd.end()),
@@ -350,6 +364,15 @@ impl Machine {
             virtio.push(Box::new(crate::virtio::mem::Mem::new(state.clone())));
             slot
         });
+        // The GPU last: its aperture is above everything, and its completion
+        // thread needs the transport, wired below.
+        let gpu = layout.gpu.map(|aperture| {
+            let gpu = crate::virtio::gpu::Gpu::new(aperture);
+            let fences = gpu.fences();
+            let slot = virtio.len();
+            virtio.push(Box::new(gpu));
+            (slot, fences)
+        });
 
         let virtio_slots = virtio.len();
         let mut virtio_devices = Vec::with_capacity(virtio_slots);
@@ -367,6 +390,24 @@ impl Machine {
         let mem = mem_state
             .zip(mem_slot)
             .map(|(state, slot)| MemControl::new(state, virtio_devices[slot].clone()));
+        // Fences signal on the renderer's threads; a thread of the device's
+        // takes the transport lock and returns the waiting commands, so the
+        // renderer's callback never has to.
+        if let Some((slot, fences)) = gpu {
+            let transport = virtio_devices[slot].clone();
+            std::thread::Builder::new()
+                .name("gpu-fences".into())
+                .spawn(move || {
+                    loop {
+                        fences.wait();
+                        transport
+                            .lock()
+                            .expect("gpu transport poisoned")
+                            .service_queue(crate::virtio::gpu::CONTROL_QUEUE);
+                    }
+                })
+                .map_err(|e| MachineError::Thread("gpu-fences", e))?;
+        }
 
         // vsock queues packets from host threads and must be able to deliver
         // them itself; see the note on the waker in the vsock module.
@@ -669,6 +710,7 @@ impl Machine {
                     // MPIDR affinity all agree; see CpuPark::await_creation_turn
                     // for what goes wrong when they do not.
                     ctx.park.await_creation_turn(index);
+                    crate::qos::register_vcpu();
                     let created =
                         vm.create_vcpu()
                             .map_err(|source| crate::vcpu::RunError::Hypervisor {

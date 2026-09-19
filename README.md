@@ -1,10 +1,10 @@
 # lighter
 
-**The open-source, headless container engine for macOS.**
+**The open-source, headless container engine for macOS — with native Apple Silicon GPU, Neural Engine, and PyTorch acceleration.**
 
 lighter is a lightweight virtual machine monitor built from scratch on Apple's `Hypervisor.framework` in Rust. It implements its own vCPU loop, GICv3 interrupt controller, bespoke virtio device models, and boots a custom Linux LTS kernel directly into memory in 50 milliseconds.
 
-Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Docker Desktop and OrbStack. It matches or beats OrbStack's speed, consumes a fraction of Docker Desktop's memory, runs completely headless with zero GUI bloat, and comes with zero commercial licensing traps.
+Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Docker Desktop, and OrbStack. It matches or beats OrbStack's speed, consumes a fraction of Docker Desktop's memory, runs completely headless with zero GUI bloat, exposes Apple Silicon hardware accelerators directly to Linux containers, and comes with zero commercial licensing traps.
 
 **Dual-licensed MIT or Apache 2.0. No paid subscriptions, no commercial seat limits, no "free during beta", and no telemetry.**
 
@@ -29,6 +29,10 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Do
 | **Container DNS resolution** | **40 µs** | 262 µs | 513 µs | 481 µs |
 | **Kubernetes support** | **kind, kubectl, Helm** | Built-in | Built-in | k3s |
 | **x86-64 Rosetta (`sha256sum`)** | **4.16 s** | 7.92 s | 4.39 s | 4.26 s |
+| **Apple Silicon GPU (Vulkan)** | **Yes** | No | No | No |
+| **Apple Neural Engine (ANE)** | **Yes** | No | No | No |
+| **PyTorch on Mac GPU (MPS)** | **Yes** | No | No | No |
+| **llama.cpp / whisper on Metal** | **Yes** (95 t/s vs 110 native) | No | No | No |
 
 ---
 
@@ -73,6 +77,72 @@ lighter upgrade     # Upgrade to the latest release
 ```
 
 Direct installations can opt into background update downloads with `lighter update auto-download on` (downloads never activate without an explicit restart). Homebrew installations remain managed by `brew`. See [installation ownership, migration, and update behaviour](docs/updates.md).
+
+---
+
+## Hardware & AI Acceleration
+
+lighter is the first container runtime for macOS that exposes Apple Silicon's GPU, Neural Engine, and unified memory architecture directly to Linux containers. All accelerator devices use Docker's standard Container Device Interface (CDI) via `--device`, cost zero memory or CPU when idle, and require no special flags or configurations to enable.
+
+See [`docs/gpu.md`](docs/gpu.md) for complete technical documentation and architecture.
+
+### 1. ggml & llama.cpp on Metal (`--device lighter.sh/metal=all`)
+
+Run `llama.cpp`, `whisper.cpp`, and ggml-based models directly on Apple Silicon Metal kernels via an in-process RPC engine:
+
+```bash
+docker run --rm --device lighter.sh/metal=all -v ./models:/models llama-cpp-rpc \
+  llama-bench -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --rpc "$LIGHTER_METAL" -ngl 99
+```
+
+- **95 tokens/sec generation** in-container vs **110 native** on an M1 (87% of native; vs 21 t/s on CPU).
+- **1,911 prompt tokens/sec** in-container vs 1,953 native.
+- **Whisper transcription**: 11-second audio clip transcribed in 1.30s (vs 5.80s on container CPU).
+- Includes automatic host-side tensor caching (`~/.lighter/ggml-cache`) for instant reloads.
+
+### 2. PyTorch with Apple Silicon MPS (`--device lighter.sh/mps=all`)
+
+Linux PyTorch has no native Apple MPS backend. lighter provides `lighter-mps` inside the container, forwarding ATen operators across vsock to the host Mac's GPU:
+
+```bash
+docker run --rm --device lighter.sh/mps=all python:3.12-slim sh -c '
+  pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install lighter-mps &&
+  python -c "import torch, lighter_mps; x = torch.randn(3, 3, device=\"mps\"); print((x @ x).device)"'
+```
+
+- Native `model.to("mps")` works seamlessly for both inference and training with autograd.
+- Host PyTorch is discovered automatically from your macOS environment (`lighter config --torch-python`).
+
+### 3. Apple Neural Engine (`--device lighter.sh/ane=all`)
+
+Execute computer vision and edge inference on Apple's Neural Engine at a fraction of a watt:
+
+```python
+import onnxruntime as ort
+
+ort.register_execution_provider_library("lighter", "/usr/lib/lighter/liblighter_ane_ep.so")
+devices = [d for d in ort.get_ep_devices() if d.ep_name == "LighterANE"]
+options = ort.SessionOptions()
+options.add_provider_for_devices(devices, {})
+session = ort.InferenceSession("model.onnx", options)
+```
+
+- Ships a custom `no_std` ONNX Runtime Execution Provider (`liblighter_ane_ep.so`) linking no libc.
+- **ResNet-50 in 1.76 ms** on the Neural Engine (vs 30.0 ms CPU, 7.9 ms GPU).
+- **Frigate NVR**: YOLO11n object detection runs at **7.6 ms/frame at <1% CPU** (vs 15.1 ms and 36% CPU on container CPU).
+
+### 4. General-Purpose Vulkan (`--device lighter.sh/gpu=all`)
+
+Exposes a virtio-gpu Venus render node decoded on macOS by `virglrenderer` over `MoltenVK`:
+
+```bash
+docker run --rm --device lighter.sh/gpu=all alpine:edge sh -c \
+  'apk add mesa-vulkan-virtio vulkan-loader vulkan-tools && vulkaninfo --summary'
+# Output: deviceName = Virtio-GPU Venus (Apple M...)
+```
+
+- Works out-of-the-box with standard distribution Mesa drivers (`mesa-vulkan-virtio`, `mesa-vulkan-drivers`).
+- Accelerates Vulkan compute, ncnn, ONNX WebGPU, and graphics workloads.
 
 ---
 
@@ -224,10 +294,20 @@ lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal
 
 Kernel releases track upstream Linux LTS point updates, ensuring ongoing security patches and driver fixes without architectural churn.
 
+### 7. Apple Silicon hardware acceleration with zero idle tax
+Traditional VM monitors leave macOS GPUs and Neural Engines completely inaccessible from Linux containers, or impose heavy helper processes that consume gigabytes of idle RAM.
+
+lighter exposes the full Apple Silicon compute architecture with zero compromise:
+- **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
+- **Zero idle tax:** Metal renderers and runtime runners initialise strictly on demand. An idle machine pays 0 MiB RAM and 0% CPU for accelerator hardware.
+- **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
+- **Sub-millisecond thread QoS boosting:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive` and extends the guest kernel's poll-before-WFI window to 2–5 ms (`qos::Boost`), cutting request loop latency to achieve 87–90% of native Metal inference speeds.
+
 ---
 
 ## Features
 
+- **Apple Silicon hardware acceleration:** Native access to Apple Silicon GPU (Vulkan and Metal/ggml), Neural Engine (ANE via ONNX Runtime), and PyTorch MPS in containers via standard Docker CDI (`--device lighter.sh/...`). See the [Hardware & AI Acceleration guide](docs/gpu.md).
 - **Docker CLI & Compose compatibility:** Works seamlessly as a registered Docker context with existing `docker`, `docker compose`, and third-party developer tooling.
 - **x86-64 containers under Rosetta:** Run `linux/amd64` images on Apple Silicon with near-native performance via Apple Rosetta (`lighter rosetta --install`). See [x86-64 architecture and performance](docs/x86-64.md).
 - **Local Kubernetes with kind:** Spin up single-node and multi-node arm64 Kubernetes clusters with standard `kind`, `kubectl`, and `helm` commands without control-plane overhead when idle. See the [Kubernetes guide](docs/kubernetes.md).
@@ -256,14 +336,16 @@ lighter (CLI)  ──spawns──▶  lighter run
                                  ├── lighter-hv       Safe Rust bindings to Hypervisor.framework
                                  ├── lighter-vmm      vCPUs, GICv3, device tree, memory layout, virtio
                                  ├── lighter-fs       virtio-fs host implementation, caching, FSEvents
-                                 └── lighter-docker   Docker socket bridge and port forwarder
+                                 ├── lighter-docker   Docker socket bridge and port forwarder
+                                 └── Accelerators     In-process Metal (ggml), Venus/MoltenVK, CoreML (ANE), MPS
 ```
 
 The guest environment consists of:
 - A custom 6.18 longterm Linux kernel booting uncompressed directly from memory (no bootloader).
 - Minimal Alpine-based root filesystem with `dockerd` and a lightweight Rust guest agent.
+- Host-accelerated virtio-gpu (Venus), ANE CoreML bridge, in-process Metal ggml RPC, and PyTorch MPS server.
 
-See [`docs/architecture.md`](docs/architecture.md) for detailed internals.
+See [`docs/architecture.md`](docs/architecture.md) and [`docs/gpu.md`](docs/gpu.md) for detailed internals.
 
 ---
 
@@ -281,10 +363,13 @@ See [`docs/architecture.md`](docs/architecture.md) for detailed internals.
 # 1. Build guest kernel and rootfs
 make guest
 
-# 2. Build lighter CLI and VMM, ad-hoc signed with hypervisor entitlement
+# 2. Build accelerator dependencies (optional, for GPU/ANE/Metal support)
+make gpu ane metal
+
+# 3. Build lighter CLI and VMM, ad-hoc signed with hypervisor entitlement
 make build
 
-# 3. Run milestone verification gates
+# 4. Run milestone verification gates
 make gates
 ```
 

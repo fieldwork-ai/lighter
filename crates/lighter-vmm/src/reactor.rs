@@ -86,6 +86,9 @@ struct Stream {
     writing: bool,
     /// For a DNS stream: bytes of a frame not yet whole.
     partial: Vec<u8>,
+    /// For a stream to an accelerator server: the vCPUs held at the
+    /// interactive class for its life.
+    boost: Option<crate::qos::Boost>,
 }
 
 /// Counters for `LIGHTER_STREAM_TRACE`.
@@ -764,6 +767,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
+                        boost: None,
                     },
                 );
             }
@@ -782,6 +786,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
+                        boost: None,
                     },
                 );
             }
@@ -803,6 +808,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
+                        boost: None,
                     },
                 );
                 self.udp_flows.insert(key, HashMap::new());
@@ -827,6 +833,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
+                        boost: None,
                     },
                 );
                 self.udp_inbound = Some(key);
@@ -875,6 +882,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
+                        boost: None,
                     },
                 );
             }
@@ -1273,6 +1281,9 @@ impl Loop {
                             self.by_fd.insert(fd, key);
                             let stream = self.streams.get_mut(&key).expect("present");
                             stream.tcp = Some(tcp);
+                            if crate::qos::is_accelerator(addr) {
+                                stream.boost = Some(crate::qos::Boost::vcpus());
+                            }
                             stream.phase = Phase::Connecting;
                             stream.writing = true;
                             self.kq.write(fd, true);

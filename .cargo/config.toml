@@ -1,0 +1,3 @@
+[env]
+# lighter runs on macOS 15 and later; the renderer libraries are built for it too.
+MACOSX_DEPLOYMENT_TARGET = "15.0"

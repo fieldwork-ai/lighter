@@ -135,11 +135,39 @@ gate-m7-amd64: ## M7: x86-64 containers run
 gate-m8-daily: ## M8: a day of work, and a night of sleep
 	@scripts/gates/m8-daily.sh
 
+.PHONY: gate-m9
+gate-m9: ## M9: a container reaches the Mac's GPU through Vulkan
+	@scripts/gates/m9-gpu.sh
+
+.PHONY: gate-m10
+gate-m10: ## M10: a container runs an ONNX model on the Neural Engine
+	@scripts/gates/m10-ane.sh
+
+.PHONY: gate-m11
+gate-m11: ## M11: a container's PyTorch runs on the Mac's GPU
+	@scripts/gates/m11-mps.sh
+
+.PHONY: gate-m12
+gate-m12: ## M12: a container's llama.cpp runs on the Mac's GPU with Metal kernels
+	@scripts/gates/m12-metal.sh
+
 .PHONY: dogfood
 dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh
 
 .PHONY: dist
+.PHONY: gpu
+gpu: ## Build the GPU renderer libraries (virglrenderer + MoltenVK) into host/out
+	@host/gpu/build.sh
+
+.PHONY: ane
+ane: ## Build ONNX Runtime with CoreML into host/out/ort (the Neural Engine device)
+	@host/ane/build.sh
+
+.PHONY: metal
+metal: ## Build ggml with Metal and RPC into host/out/ggml (lighter.sh/metal)
+	@host/metal/build.sh
+
 dist: ## Build a release tarball (VERSION=x.y.z)
 	@scripts/package-release.sh $(VERSION)
 

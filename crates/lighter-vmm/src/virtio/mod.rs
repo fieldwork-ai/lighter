@@ -10,6 +10,7 @@ pub mod balloon;
 pub mod block;
 pub mod disk;
 pub mod fs;
+pub mod gpu;
 pub mod mem;
 pub mod mmio;
 pub mod net;
@@ -30,6 +31,8 @@ pub mod device_type {
     pub const CONSOLE: u32 = 3;
     pub const RNG: u32 = 4;
     pub const BALLOON: u32 = 5;
+    /// virtio-gpu (`gpu`), a render node for Venus and nothing else.
+    pub const GPU: u32 = 16;
     /// virtio-mem (`mem.rs`).
     pub const MEM: u32 = 24;
     pub const VSOCK: u32 = 19;
@@ -121,6 +124,17 @@ impl Serviced {
     }
 }
 
+/// A shared-memory region a device exposes through the transport: a window of
+/// guest-physical address space the device fills on demand (virtio 1.2,
+/// "Shared memory regions"). virtio-gpu's host-visible region is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmRegion {
+    /// The id the driver selects it by (`shmid`); device-specific.
+    pub id: u8,
+    pub base: u64,
+    pub len: u64,
+}
+
 /// A virtio device model.
 ///
 /// The transport owns the queues and the negotiation state; a device only
@@ -154,6 +168,12 @@ pub trait VirtioDevice: Send {
     /// Largest size for one queue, where a device wants them unequal.
     fn queue_max_size_of(&self, _queue: u16) -> u16 {
         self.queue_max_size()
+    }
+
+    /// Shared-memory regions, if the device has any. Fixed for the device's
+    /// life: the transport reads them once.
+    fn shm_regions(&self) -> Vec<ShmRegion> {
+        Vec::new()
     }
 
     /// Device-specific configuration space.
