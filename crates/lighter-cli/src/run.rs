@@ -12,6 +12,7 @@ use lighter_vmm::virtio::fs::Share;
 use lighter_vmm::wake::{Observer, Power};
 use lighter_vmm::{Machine, MachineConfig};
 
+use crate::ane_host;
 use crate::config::Config;
 use crate::mps;
 use crate::paths;
@@ -127,14 +128,15 @@ pub fn machine() -> anyhow::Result<()> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     ));
-    // The Neural Engine service: host-side only, a loopback port the
-    // container reaches through the streams; init publishes it as a CDI
-    // device. Held for the machine's life.
+    // The Neural Engine service: a process of its own (ane_host.rs says
+    // why), on a loopback port the container reaches through the streams;
+    // init publishes it as a CDI device. Held for the machine's life.
     let _ane = if config.ane {
-        match lighter_vmm::ane::Server::start() {
-            Ok(server) => {
-                cmdline.push_str(&format!(" lighter.ane={}", server.port()));
-                Some(server)
+        match ane_host::Supervisor::start(&home.join("coreml-cache")) {
+            Ok(host) => {
+                cmdline.push_str(&format!(" lighter.ane={}", host.port()));
+                lighter_vmm::qos::register_accelerator_port(host.port());
+                Some(host)
             }
             Err(e) => {
                 tracing::warn!(%e, "the neural engine service could not start");

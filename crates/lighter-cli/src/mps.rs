@@ -69,7 +69,12 @@ impl Host {
             .arg(&script)
             .arg("--port")
             .arg("0")
-            .stdin(Stdio::null())
+            // The host reads stdin and exits at its EOF, which is how it
+            // learns the machine is gone when `lighter stop` ends it with a
+            // signal that runs no destructor. Asked for, so a host started
+            // by hand from a terminal or the gates behaves as before.
+            .arg("--exit-with-parent")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;

@@ -250,11 +250,25 @@ def serve(c, device):
         c.close()
 
 
+def exit_with_parent():
+    """lighter holds the writing end of stdin; its EOF means the machine is gone."""
+    try:
+        while sys.stdin.buffer.read(64):
+            pass
+    except Exception:
+        pass
+    import os
+    os._exit(0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--exit-with-parent", action="store_true", help="exit at stdin's EOF; lighter holds the other end")
     args = ap.parse_args()
+    if args.exit_with_parent:
+        threading.Thread(target=exit_with_parent, daemon=True).start()
     global DEVICE
     DEVICE = args.device
     if DEVICE == "mps" and not torch.backends.mps.is_available():

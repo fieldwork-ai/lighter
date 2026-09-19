@@ -20,6 +20,7 @@ pub mod protocol;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use protocol::{Reader, Writer};
@@ -33,23 +34,34 @@ impl Server {
     /// thread. The runtime is created on the first connection, not here:
     /// ONNX Runtime and CoreML cost memory a machine that never runs a model
     /// should not pay.
-    pub fn start() -> io::Result<Server> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    /// `cache` is a directory for CoreML's compiled models, kept across
+    /// machines; none means every load compiles.
+    pub fn start(cache: Option<&std::path::Path>) -> io::Result<Server> {
+        Self::start_at(0, cache)
+    }
+
+    /// The same on a port the caller chose (0 for any): the helper process
+    /// the CLI supervises is restarted on the port the guest was told.
+    pub fn start_at(port: u16, cache: Option<&std::path::Path>) -> io::Result<Server> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let port = listener.local_addr()?.port();
         crate::qos::register_accelerator_port(port);
+        let cache = cache.map(|c| c.to_path_buf());
         std::thread::Builder::new()
             .name("ane-accept".into())
             .spawn(move || {
                 let runtime: Arc<OnceLock<Result<ort::Runtime, String>>> =
                     Arc::new(OnceLock::new());
+                let cache: Arc<Option<PathBuf>> = Arc::new(cache);
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
                     let runtime = runtime.clone();
+                    let cache = cache.clone();
                     let _ = std::thread::Builder::new()
                         .name("ane-conn".into())
                         .spawn(move || {
                             crate::qos::raise_interactive();
-                            serve(stream, &runtime)
+                            serve(stream, &runtime, cache.as_deref())
                         });
                 }
             })?;
@@ -82,7 +94,11 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Option<(u32, Vec<u8>)>> {
     Ok(Some((kind, payload)))
 }
 
-fn serve(mut stream: TcpStream, runtime: &OnceLock<Result<ort::Runtime, String>>) {
+fn serve(
+    mut stream: TcpStream,
+    runtime: &OnceLock<Result<ort::Runtime, String>>,
+    cache: Option<&std::path::Path>,
+) {
     let _ = stream.set_nodelay(true);
     let mut sessions: HashMap<u64, ort::Session> = HashMap::new();
     let mut next_id = 1u64;
@@ -95,7 +111,7 @@ fn serve(mut stream: TcpStream, runtime: &OnceLock<Result<ort::Runtime, String>>
                 return;
             }
         };
-        let reply = match handle(kind, &payload, runtime, &mut sessions, &mut next_id) {
+        let reply = match handle(kind, &payload, runtime, cache, &mut sessions, &mut next_id) {
             Ok(body) => protocol::frame(kind, &body),
             Err(msg) => {
                 tracing::debug!(kind, %msg, "neural engine request failed");
@@ -112,13 +128,14 @@ fn handle(
     kind: u32,
     payload: &[u8],
     runtime: &OnceLock<Result<ort::Runtime, String>>,
+    cache: Option<&std::path::Path>,
     sessions: &mut HashMap<u64, ort::Session>,
     next_id: &mut u64,
 ) -> Result<Vec<u8>, String> {
     match kind {
         protocol::LOAD => {
             let rt = runtime
-                .get_or_init(ort::Runtime::new)
+                .get_or_init(|| ort::Runtime::new(cache))
                 .as_ref()
                 .map_err(|e| e.clone())?;
             let session = rt.load(payload)?;
@@ -127,6 +144,7 @@ fn handle(
             tracing::info!(
                 session = id,
                 bytes = payload.len(),
+                model = format_args!("{:016x}", ort::model_fingerprint(payload)),
                 "neural engine model loaded"
             );
             sessions.insert(id, session);
@@ -143,7 +161,7 @@ fn handle(
                 inputs.push(r.tensor()?);
             }
             let session = sessions
-                .get(&id)
+                .get_mut(&id)
                 .ok_or_else(|| format!("no session {id}"))?;
             let outputs = session.run(&inputs)?;
             let mut w = Writer::new();

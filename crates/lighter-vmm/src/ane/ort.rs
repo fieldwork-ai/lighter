@@ -6,10 +6,20 @@
 //! with a message saying so, and the guest's fallback is the CPU provider it
 //! already has.
 //!
-//! The provider is asked for the `NeuralNetwork` model format on purpose:
-//! the newer `MLProgram` never reached the Neural Engine for a convolutional
-//! model in testing (E5RT refused it as unbounded whatever the shapes said),
-//! while `NeuralNetwork` ran ResNet-50 in 1.76 ms where the CPU took 30.
+//! The device is "ONNX to CoreML", and CoreML covers the Mac's GPU and CPU
+//! as well as the Neural Engine, so a model is loaded three ways and the
+//! first run decides: the `NeuralNetwork` format with every compute unit,
+//! which is what reaches the Neural Engine (the newer `MLProgram` never did
+//! for a convolutional model; E5RT refused it as unbounded whatever the
+//! shapes said, while `NeuralNetwork` ran ResNet-50 in 1.76 ms where the
+//! CPU took 30); `MLProgram` with the CPU and GPU, for graphs the Neural
+//! Engine will not take whole; and ONNX Runtime's own CPU, the floor. Each
+//! is timed on the run's real inputs after a warm-up and the fastest is
+//! kept, so a model that CoreML would only partition badly still runs where
+//! it is quickest. `LIGHTER_ANE_UNITS=ane|gpu|cpu` pins one instead.
+//!
+//! CoreML's compiled models are cached under the lighter home
+//! (`coreml-cache`), so a model, or a shape of it, compiles once.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
@@ -20,6 +30,40 @@ use super::protocol::{Tensor, element_size};
 pub struct Runtime {
     api: &'static sys::OrtApi,
     env: *mut sys::OrtEnv,
+    /// CoreML's compile cache, `ModelCacheDirectory`; none when unset.
+    cache: Option<CString>,
+    /// `crashes` beside it: one file per (model, candidate) mid-run.
+    markers: Option<std::path::PathBuf>,
+}
+
+/// One way of running a model: which format CoreML gets and which units it
+/// may use, or no CoreML at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Units {
+    NeuralEngine,
+    Gpu,
+    Cpu,
+}
+
+impl Units {
+    fn label(self) -> &'static str {
+        match self {
+            Units::NeuralEngine => "neural engine",
+            Units::Gpu => "gpu",
+            Units::Cpu => "cpu",
+        }
+    }
+
+    /// The candidates in the order tried: all three, or the one the
+    /// environment pins.
+    fn candidates() -> Vec<Units> {
+        match std::env::var("LIGHTER_ANE_UNITS").as_deref() {
+            Ok("ane") => vec![Units::NeuralEngine],
+            Ok("gpu") => vec![Units::Gpu],
+            Ok("cpu") => vec![Units::Cpu],
+            _ => vec![Units::NeuralEngine, Units::Gpu, Units::Cpu],
+        }
+    }
 }
 
 // SAFETY: ORT's env and sessions are thread-safe by contract; the pointers
@@ -27,9 +71,62 @@ pub struct Runtime {
 unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
 
+/// Where a session records the candidate it is about to run for the first
+/// time, so a crash inside CoreML is remembered for the next load.
+struct Markers {
+    dir: std::path::PathBuf,
+    hash: u64,
+}
+
+/// The model's name for the log.
+pub fn model_fingerprint(model: &[u8]) -> u64 {
+    fingerprint(model)
+}
+
+/// A stable name for the model. ONNX Runtime names the fused node it hands
+/// the provider after a hash of the subgraph's content, `LighterANE_<n>`,
+/// and the guest writes that name into the graph it sends; the bytes around
+/// it vary between two loads of the same model (initializer order), so the
+/// name is the key when it is there, and a hash of the bytes otherwise.
+fn fingerprint(model: &[u8]) -> u64 {
+    if let Some(at) = model.windows(11).position(|w| w == b"LighterANE_") {
+        let digits: Vec<u8> = model[at + 11..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .copied()
+            .collect();
+        if let Ok(n) = std::str::from_utf8(&digits).unwrap_or("").parse::<u64>() {
+            return n;
+        }
+    }
+    fnv(model)
+}
+
+/// FNV-1a over the model bytes: a name for it, not a security property.
+fn fnv(model: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for chunk in model.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        h ^= u64::from_le_bytes(word);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^ model.len() as u64
+}
+
+fn marker_name(hash: u64, units: Units) -> String {
+    format!("{hash:016x}-{}", units.label().replace(' ', "-"))
+}
+
 pub struct Session {
     api: &'static sys::OrtApi,
+    /// The session in use; while `pending` is not empty, the first candidate.
     session: *mut sys::OrtSession,
+    units: Units,
+    /// The other candidates, timed against `session` at the first run and
+    /// then released.
+    pending: Vec<(Units, *mut sys::OrtSession)>,
+    markers: Option<Markers>,
     inputs: Vec<CString>,
     outputs: Vec<CString>,
 }
@@ -63,12 +160,12 @@ impl Runtime {
     }
 
     #[cfg(not(ane_libs))]
-    pub fn new() -> Result<Runtime, String> {
+    pub fn new(_cache: Option<&std::path::Path>) -> Result<Runtime, String> {
         Err("lighter was built without ONNX Runtime (host/ane/build.sh)".into())
     }
 
     #[cfg(ane_libs)]
-    pub fn new() -> Result<Runtime, String> {
+    pub fn new(cache: Option<&std::path::Path>) -> Result<Runtime, String> {
         let base = unsafe { sys::OrtGetApiBase() };
         if base.is_null() {
             return Err("OrtGetApiBase returned null".into());
@@ -91,53 +188,56 @@ impl Runtime {
                 &mut env
             )
         );
-        Ok(Runtime { api, env })
+        Ok(Runtime {
+            api,
+            env,
+            cache: cache.and_then(|c| {
+                std::fs::create_dir_all(c).ok()?;
+                CString::new(c.as_os_str().as_encoded_bytes()).ok()
+            }),
+            markers: cache.and_then(|c| {
+                let dir = c.join("crashes");
+                std::fs::create_dir_all(&dir).ok()?;
+                Some(dir)
+            }),
+        })
     }
 
-    /// Loads a model and puts it on the Neural Engine where CoreML can, the
-    /// CPU where it cannot.
+    /// Loads a model every way it might run; the first run picks one. A
+    /// candidate that crashed the process on this model before is skipped:
+    /// its marker was written before the run and never removed.
     pub fn load(&self, model: &[u8]) -> Result<Session, String> {
         let api = self.api;
-        let mut options: *mut sys::OrtSessionOptions = ptr::null_mut();
-        check!(api, (api.CreateSessionOptions.unwrap())(&mut options));
-        let keys = [
-            CString::new("ModelFormat").unwrap(),
-            CString::new("MLComputeUnits").unwrap(),
-        ];
-        let values = [
-            CString::new("NeuralNetwork").unwrap(),
-            CString::new("ALL").unwrap(),
-        ];
-        let key_ptrs: Vec<*const c_char> = keys.iter().map(|k| k.as_ptr()).collect();
-        let value_ptrs: Vec<*const c_char> = values.iter().map(|v| v.as_ptr()).collect();
-        let provider = CString::new("CoreML").unwrap();
-        let st = unsafe {
-            (api.SessionOptionsAppendExecutionProvider.unwrap())(
-                options,
-                provider.as_ptr(),
-                key_ptrs.as_ptr(),
-                value_ptrs.as_ptr(),
-                keys.len(),
-            )
-        };
-        if !st.is_null() {
-            let msg = status_message(api, st);
-            tracing::warn!(%msg, "CoreML provider unavailable; running on the CPU");
+        let mut made: Vec<(Units, *mut sys::OrtSession)> = Vec::new();
+        let mut last_err = String::new();
+        let markers = self
+            .markers
+            .as_ref()
+            .map(|dir| (dir.clone(), fingerprint(model)));
+        for units in Units::candidates() {
+            if let Some((dir, hash)) = &markers
+                && dir.join(marker_name(*hash, units)).exists()
+            {
+                tracing::warn!(
+                    units = units.label(),
+                    "neural engine: candidate crashed on this model before; skipped"
+                );
+                last_err = format!("{} crashed on this model before", units.label());
+                continue;
+            }
+            match self.create(model, units) {
+                Ok(session) => made.push((units, session)),
+                Err(e) => {
+                    tracing::debug!(units = units.label(), %e, "neural engine: candidate refused");
+                    last_err = e;
+                }
+            }
         }
-        let mut session: *mut sys::OrtSession = ptr::null_mut();
-        let created = unsafe {
-            (api.CreateSessionFromArray.unwrap())(
-                self.env,
-                model.as_ptr().cast(),
-                model.len(),
-                options,
-                &mut session,
-            )
+        let Some((units, session)) = made.first().copied() else {
+            return Err(last_err);
         };
-        unsafe { (api.ReleaseSessionOptions.unwrap())(options) };
-        if !created.is_null() {
-            return Err(status_message(api, created));
-        }
+        let pending = made[1..].to_vec();
+        let markers = markers.map(|(dir, hash)| Markers { dir, hash });
         let mut allocator: *mut sys::OrtAllocator = ptr::null_mut();
         check!(
             api,
@@ -182,9 +282,69 @@ impl Runtime {
         Ok(Session {
             api,
             session,
+            units,
+            pending,
+            markers,
             inputs,
             outputs,
         })
+    }
+
+    /// One session with CoreML asked for `units`, or plain ONNX Runtime.
+    fn create(&self, model: &[u8], units: Units) -> Result<*mut sys::OrtSession, String> {
+        let api = self.api;
+        let mut options: *mut sys::OrtSessionOptions = ptr::null_mut();
+        check!(api, (api.CreateSessionOptions.unwrap())(&mut options));
+        if units != Units::Cpu {
+            let (format, compute) = match units {
+                Units::NeuralEngine => ("NeuralNetwork", "ALL"),
+                _ => ("MLProgram", "CPUAndGPU"),
+            };
+            let mut keys = vec![
+                CString::new("ModelFormat").unwrap(),
+                CString::new("MLComputeUnits").unwrap(),
+            ];
+            let mut values = vec![
+                CString::new(format).unwrap(),
+                CString::new(compute).unwrap(),
+            ];
+            if let Some(cache) = &self.cache {
+                keys.push(CString::new("ModelCacheDirectory").unwrap());
+                values.push(cache.clone());
+            }
+            let key_ptrs: Vec<*const c_char> = keys.iter().map(|k| k.as_ptr()).collect();
+            let value_ptrs: Vec<*const c_char> = values.iter().map(|v| v.as_ptr()).collect();
+            let provider = CString::new("CoreML").unwrap();
+            let st = unsafe {
+                (api.SessionOptionsAppendExecutionProvider.unwrap())(
+                    options,
+                    provider.as_ptr(),
+                    key_ptrs.as_ptr(),
+                    value_ptrs.as_ptr(),
+                    keys.len(),
+                )
+            };
+            if !st.is_null() {
+                let msg = status_message(api, st);
+                unsafe { (api.ReleaseSessionOptions.unwrap())(options) };
+                return Err(msg);
+            }
+        }
+        let mut session: *mut sys::OrtSession = ptr::null_mut();
+        let created = unsafe {
+            (api.CreateSessionFromArray.unwrap())(
+                self.env,
+                model.as_ptr().cast(),
+                model.len(),
+                options,
+                &mut session,
+            )
+        };
+        unsafe { (api.ReleaseSessionOptions.unwrap())(options) };
+        if !created.is_null() {
+            return Err(status_message(api, created));
+        }
+        Ok(session)
     }
 }
 
@@ -197,8 +357,87 @@ impl Drop for Runtime {
 }
 
 impl Session {
-    pub fn run(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>, String> {
+    /// Runs the model. The first run times every candidate on these inputs,
+    /// after a warm-up each, and keeps the fastest.
+    pub fn run(&mut self, inputs: &[Tensor]) -> Result<Vec<Tensor>, String> {
+        if !self.pending.is_empty() {
+            self.choose(inputs);
+        }
+        self.run_on(self.session, inputs)
+    }
+
+    /// Times each candidate: one untimed run to compile and warm, then the
+    /// best of three. A candidate that fails to run is dropped. Logged, so
+    /// the choice is a number in the log rather than a guess.
+    fn choose(&mut self, inputs: &[Tensor]) {
         let api = self.api;
+        let mut candidates = vec![(self.units, self.session)];
+        candidates.append(&mut self.pending);
+        let mut best: Option<(Units, *mut sys::OrtSession, f64)> = None;
+        let mut report = Vec::new();
+        for (units, session) in candidates {
+            // The marker outlives a crash: if CoreML takes the process down
+            // in this run, the next load of this model skips the candidate.
+            let marker = self
+                .markers
+                .as_ref()
+                .map(|m| m.dir.join(marker_name(m.hash, units)));
+            if let Some(path) = &marker {
+                let _ = std::fs::write(path, b"");
+            }
+            let warmed = self.run_on(session, inputs);
+            if let Some(path) = &marker {
+                let _ = std::fs::remove_file(path);
+            }
+            if warmed.is_err() {
+                report.push(format!("{}: failed", units.label()));
+                unsafe { (api.ReleaseSession.unwrap())(session) };
+                continue;
+            }
+            let mut fastest = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                if self.run_on(session, inputs).is_err() {
+                    break;
+                }
+                fastest = fastest.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            report.push(format!("{}: {:.2} ms", units.label(), fastest));
+            match best {
+                Some((_, _, ms)) if ms <= fastest => {
+                    unsafe { (api.ReleaseSession.unwrap())(session) };
+                }
+                Some((_, previous, _)) => {
+                    unsafe { (api.ReleaseSession.unwrap())(previous) };
+                    best = Some((units, session, fastest));
+                }
+                None => best = Some((units, session, fastest)),
+            }
+        }
+        match best {
+            Some((units, session, _)) => {
+                self.units = units;
+                self.session = session;
+                tracing::info!(chosen = units.label(), candidates = %report.join(", "), "neural engine model placed");
+            }
+            None => {
+                // Every candidate failed to run; keep the first so the error
+                // reaches the caller from the run itself.
+                self.session = ptr::null_mut();
+                tracing::warn!(candidates = %report.join(", "), "neural engine: no candidate ran");
+            }
+        }
+    }
+
+    fn run_on(
+        &self,
+        session: *mut sys::OrtSession,
+        inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>, String> {
+        let api = self.api;
+        if session.is_null() {
+            return Err("the model could not be run by any provider".into());
+        }
         if inputs.len() != self.inputs.len() {
             return Err(format!(
                 "the model takes {} inputs, {} were sent",
@@ -243,7 +482,7 @@ impl Session {
             let mut outs: Vec<*mut sys::OrtValue> = vec![ptr::null_mut(); self.outputs.len()];
             let st = unsafe {
                 (api.Run.unwrap())(
-                    self.session,
+                    session,
                     ptr::null(),
                     in_names.as_ptr(),
                     values.as_ptr() as *const *const sys::OrtValue,
@@ -324,6 +563,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         if !self.session.is_null() {
             unsafe { (self.api.ReleaseSession.unwrap())(self.session) };
+        }
+        for (_, session) in self.pending.drain(..) {
+            unsafe { (self.api.ReleaseSession.unwrap())(session) };
         }
     }
 }

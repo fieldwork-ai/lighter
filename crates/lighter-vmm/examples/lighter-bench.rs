@@ -119,7 +119,7 @@ fn main() -> ExitCode {
 
     // The Neural Engine service, host-side; the port rides the command line.
     let _ane = if ane {
-        match lighter_vmm::ane::Server::start() {
+        match lighter_vmm::ane::Server::start(None) {
             Ok(server) => {
                 config
                     .cmdline

@@ -55,6 +55,11 @@ that is what `lighter.sh/mps` is for.
 - `lighter config --gpu`, `--ane`, `--mps`, `--metal` (`on`/`off`), `--torch-python`.
 - `lighter doctor` reports each of the four devices: on and served, off in
   the configuration, or missing its host component.
+- The Neural Engine service runs as a child process of `lighter start`,
+  restarted on the same port if CoreML crashes on a model (Piper's did), and
+  loads each model three ways, Neural Engine, GPU and CPU, keeping the one
+  the first run times fastest; CoreML's compiled models are cached under the
+  lighter home.
 - The ggml server is lighter's own accept loop: each client on a thread of
   its own with ggml backends of its own, so a resident whisper.cpp and an
   on-demand llama.cpp share the GPU, and a client that resets is a log line

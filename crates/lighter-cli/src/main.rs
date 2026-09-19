@@ -9,6 +9,7 @@
 //! `lighter status` answerable by anyone rather than only by whoever is
 //! holding the console.
 
+mod ane_host;
 mod bundle;
 mod config;
 mod context;
@@ -57,6 +58,14 @@ enum Command {
     Status,
     /// Check that this Mac can run lighter, and say what to fix if not.
     Doctor,
+    /// The Neural Engine service, run as a child of `lighter start`.
+    #[command(hide = true, name = "ane-host")]
+    AneHost {
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        cache: std::path::PathBuf,
+    },
     /// Rosetta for amd64 containers: whether this Mac has it, and installing it.
     Rosetta {
         /// Run Apple's installer for Rosetta.
@@ -211,6 +220,10 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             start(Duration::from_secs(120))
         }
         Command::Status => status(),
+        Command::AneHost { port, cache } => {
+            ane_host::serve(port, &cache)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         Command::Doctor => {
             let findings = doctor::run();
             print!("{}", doctor::report(&findings));
