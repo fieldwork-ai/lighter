@@ -317,10 +317,10 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
                         | "docker context"
                         | "machine"
                         | "rosetta"
-                        | "gpu (lighter.sh/gpu)"
-                        | "neural engine (lighter.sh/ane)"
-                        | "ggml (lighter.sh/metal)"
-                        | "pytorch (lighter.sh/mps)"
+                        | "lighter.sh/gpu"
+                        | "lighter.sh/ane"
+                        | "lighter.sh/metal"
+                        | "lighter.sh/mps"
                 )
         })
         .collect();

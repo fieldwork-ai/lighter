@@ -32,7 +32,7 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Do
 | **GPU in containers (Vulkan)** | **Yes** | No | No | No |
 | **Neural Engine in containers** | **Yes** | No | No | No |
 | **PyTorch on the Mac GPU in containers** | **Yes** | No | No | No |
-| **llama.cpp on Metal from a container** | **Yes** (81 t/s vs 110 native) | No | No | No |
+| **llama.cpp on Metal from a container** | **Yes** (82 t/s vs 110 native) | No | No | No |
 
 ---
 
