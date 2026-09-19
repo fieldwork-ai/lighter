@@ -1,6 +1,6 @@
-# The GPU, the Neural Engine and PyTorch in containers
+# The GPU, the Neural Engine, PyTorch and ggml in containers
 
-Three devices, each a CDI device name on `docker run`, all on by default and all costing nothing until a container uses them (`lighter config --gpu off`, `--ane off`, `--mps off` to remove them).
+Four devices, each a CDI device name on `docker run`, all on by default and all costing nothing until a container uses them (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off` to remove them).
 
 ## Vulkan: `--device lighter.sh/gpu=all`
 
@@ -21,7 +21,29 @@ What runs on it is whatever speaks Vulkan: llama.cpp's Vulkan backend, whisper.c
 | native macOS, Metal | 1923 | 99 |
 | native macOS, CPU | 229 | 79 |
 
-PyTorch is not on this list: on Linux it has no Vulkan backend, so a container's `torch` stays on the CPU (the `lighter.sh/mps` device is the answer for PyTorch, below).
+PyTorch is not on this list: on Linux it has no Vulkan backend, so a container's `torch` stays on the CPU (the `lighter.sh/mps` device is the answer for PyTorch, below). And the generation number is a ceiling every Venus stack shares: ggml's Vulkan shaders go through MoltenVK, which exposes neither cooperative matrices nor integer dot products, where ggml's Metal backend has hand-written kernels for both. For llama.cpp and the rest of the ggml family, `lighter.sh/metal` is the faster door.
+
+## ggml on the Mac's GPU: `--device lighter.sh/metal=all`
+
+llama.cpp, whisper.cpp, stable-diffusion.cpp and anything else on ggml can hand their tensors to a ggml RPC server; lighter runs that server in-process, on the Mac's Metal backend with ggml's own kernels. The weights cross once at load and a few kilobytes of activations cross per token. The container's build needs `GGML_RPC=ON`; the device sets `LIGHTER_METAL` and `LLAMA_ARG_RPC` to the server, so `llama-server`, `llama-cli` and the other tools that read their arguments from the environment use it without a flag, and `llama-bench` takes `--rpc "$LIGHTER_METAL"`.
+
+```bash
+docker run --rm --device lighter.sh/metal=all -v models:/models llama-cpp-rpc \
+  llama-bench -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --rpc "$LIGHTER_METAL" -ngl 99
+```
+
+Same model, same M1, `llama-bench -p 128 -n 32`:
+
+| where | prompt, t/s | generation, t/s |
+|---|---:|---:|
+| container, `lighter.sh/metal` | 1658 | 81 |
+| container, `lighter.sh/gpu` (Vulkan) | 1028 | 45 |
+| container, CPU | 329 | 21 |
+| native macOS, Metal | 1949 | 110 |
+
+What remains between the container and native is the round trip per token over the streams, a few milliseconds each; larger models spend proportionally more time in the kernels and less in the trip.
+
+**Versions.** ggml's RPC protocol is versioned and checked at connect: the container's ggml must speak the version lighter was built with. `host/metal/build.sh` pins the llama.cpp commit and writes the protocol version to `host/out/ggml/rpc-proto-version`; a mismatch fails with ggml's own message at the first request. ggml notes the protocol is not hardened, which is why the server binds loopback only and is reachable solely through lighter's streams.
 
 **How it is built.** The renderer is statically linked; `host/gpu/build.sh` builds virglrenderer (Venus only, render server as a thread) against the MoltenVK release archive into `host/out`, and the VMM's `build.rs` links what it finds there. Two patches are carried: the guest kernel places host-visible blobs on 16 KiB boundaries (Apple silicon's page; stock Mesa then works unchanged, `guest/kernel/patches/0031`), and virglrenderer gets an eventfd where macOS has none (`host/gpu/patches/0001`), without which its fence thread never runs and every Vulkan wait hangs.
 
@@ -59,4 +81,4 @@ Eager mode is one round trip per operator over the streams. A 60-step training l
 
 ## Gates
 
-`make gate-m9` (Vulkan: vulkaninfo through the CDI device), `make gate-m10` (an ONNX model through the plugin provider, outputs checked against the CPU), `make gate-m11` (a container's PyTorch training a model and running a convolution on `mps`). All need `docker` on the Mac and pull an image; m11 needs a Python with torch and MPS on the Mac (`LIGHTER_GATE_TORCH_PYTHON`).
+`make gate-m9` (Vulkan: vulkaninfo through the CDI device), `make gate-m10` (an ONNX model through the plugin provider, outputs checked against the CPU), `make gate-m11` (a container's PyTorch training a model and running a convolution on `mps`), `make gate-m12` (llama-bench in a container over RPC to Metal, at least 70% of native generation when a native `llama-bench` is given). All need `docker` on the Mac and pull an image; m11 needs a Python with torch and MPS on the Mac (`LIGHTER_GATE_TORCH_PYTHON`); m12 needs an image with llama.cpp built with `GGML_RPC` (`LIGHTER_GATE_LLAMA_IMAGE_TAR`).

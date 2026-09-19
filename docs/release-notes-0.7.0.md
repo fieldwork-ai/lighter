@@ -1,8 +1,8 @@
 # lighter 0.7.0
 
-## The GPU, the Neural Engine and PyTorch, in containers
+## The GPU, the Neural Engine, PyTorch and ggml, in containers
 
-Three things no other Docker for macOS offers, each a device name on
+Four things no other Docker for macOS offers, each a device name on
 `docker run`, each on by default and costing nothing until a container uses
 it (`docs/gpu.md`).
 
@@ -38,22 +38,32 @@ host: lighter finds a Python whose `torch` has MPS (`lighter config
 --torch-python`) and starts a small server in it; the container's and the
 Mac's torch must share a major.minor.
 
+**ggml on the Mac's GPU** (`--device lighter.sh/metal=all`). llama.cpp,
+whisper.cpp and the rest of the ggml family, built with `GGML_RPC`, hand
+their layers to a ggml RPC server that lighter runs in-process on the Mac's
+Metal backend with ggml's own kernels. Same model, same M1: 1658 tokens/s of
+prompt processing and 81 of generation in a container, against 1028 and 45
+over Vulkan and 1949 and 110 native. The Vulkan device is the general one;
+for ggml this is the fast one, and the gap to native is the round trip per
+token.
+
 Linux PyTorch has no Vulkan backend, so `lighter.sh/gpu` gives it nothing;
 that is what `lighter.sh/mps` is for.
 
 ## Also
 
-- `lighter config --gpu`, `--ane`, `--mps` (`on`/`off`), `--torch-python`.
-- Three gates: m9 (vulkaninfo through the CDI device), m10 (an ONNX model
+- `lighter config --gpu`, `--ane`, `--mps`, `--metal` (`on`/`off`), `--torch-python`.
+- Four gates: m9 (vulkaninfo through the CDI device), m10 (an ONNX model
   through the plugin provider, checked against the CPU), m11 (a container's
-  PyTorch training a model on `mps`).
+  PyTorch training a model on `mps`), m12 (llama-bench in a container over
+  RPC to Metal, against native).
 - The guest kernel gains DRM for virtio-gpu (every SoC display driver pinned
   off): 3 ms of boot, 2 MiB of Image. Linux remains **6.18.52**; the data
   epoch remains **1**.
-- The release build links virglrenderer, MoltenVK and ONNX Runtime
-  statically: `make gpu` and `make ane` (`host/gpu/build.sh`,
-  `host/ane/build.sh`) build them into `host/out` first; without them the
-  VMM builds with the devices stubbed and says so.
+- The release build links virglrenderer, MoltenVK, ONNX Runtime and ggml
+  statically: `make gpu`, `make ane` and `make metal` (`host/gpu/build.sh`,
+  `host/ane/build.sh`, `host/metal/build.sh`) build them into `host/out`
+  first; without them the VMM builds with the devices stubbed and says so.
 
 ## Release artifacts
 
