@@ -164,11 +164,14 @@ pub fn run() -> Vec<Finding> {
                     python.display()
                 ),
             ),
-            // Not a fault the machine cannot start with; the device is simply absent.
-            Err(why) => Finding::bad(
+            // Not a fault: torch on the Mac is the user's choice, and without
+            // it the device is simply absent. Said as a finding that passes,
+            // with the way to turn it on.
+            Err(why) => Finding::good(
                 "lighter.sh/mps",
-                format!("no Python with torch and MPS ({why})"),
-                "pip install torch in a Python on PATH, or `lighter config --torch-python <path>`",
+                format!(
+                    "absent: no Python with torch and MPS ({why}); pip install torch in a Python on PATH, or `lighter config --torch-python <path>`"
+                ),
             ),
         }
     });
