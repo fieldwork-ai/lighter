@@ -37,6 +37,11 @@ python3 "$SRC/tools/ci_build/build.py" \
 		CMAKE_POLICY_VERSION_MINIMUM=3.5 \
 	> "$BUILD/ort-build.log" 2>&1 || { tail -30 "$BUILD/ort-build.log"; exit 1; }
 
+# build.py builds ONNX Runtime's own targets; re2, which the session code
+# links, is a dependency that its static build leaves unbuilt on some
+# machines (an M5 Pro; an M1 built it). Built by name.
+ninja -C "$SRC/build/Release" re2 > "$BUILD/ort-re2.log" 2>&1 || { tail -5 "$BUILD/ort-re2.log"; exit 1; }
+
 log "Collecting archives into host/out/ort"
 rm -f "$OUT"/*.a
 find "$SRC/build/Release" -name '*.a' \

@@ -55,6 +55,14 @@ that is what `lighter.sh/mps` is for.
 - `lighter config --gpu`, `--ane`, `--mps`, `--metal` (`on`/`off`), `--torch-python`.
 - `lighter doctor` reports each of the four devices: on and served, off in
   the configuration, or missing its host component.
+- The ggml server is lighter's own accept loop: each client on a thread of
+  its own with ggml backends of its own, so a resident whisper.cpp and an
+  on-demand llama.cpp share the GPU, and a client that resets is a log line
+  where ggml's own loop would have ended the device. It keeps ggml's tensor
+  cache in `ggml-cache` under the lighter home.
+- A stream to an accelerator port is refused unless the container it comes
+  from asked for that device: the guest agent checks dockerd's record of the
+  container's CDI requests. The ports never leave loopback.
 - The accelerator servers' threads run at the interactive QoS class, and
   while a container has a stream open to one of them the vCPUs are held
   there too and the guest polls a few milliseconds before sleeping a vCPU,

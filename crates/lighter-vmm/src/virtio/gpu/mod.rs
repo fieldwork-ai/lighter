@@ -488,8 +488,7 @@ impl Gpu {
         // host's size is whatever Metal gave, rounded up to the same page.
         let len = (size as usize).div_ceil(HOST_PAGE) * HOST_PAGE;
         let gpa = self.aperture.base + offset;
-        let fits =
-            offset.is_multiple_of(HOST_PAGE as u64)
+        let fits = offset.is_multiple_of(HOST_PAGE as u64)
             && offset
                 .checked_add(len as u64)
                 .is_some_and(|end| end <= self.aperture.size);

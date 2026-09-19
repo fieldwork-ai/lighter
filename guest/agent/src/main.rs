@@ -942,6 +942,15 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     let Some((ip, port)) = original_destination(tcp.as_raw_fd()) else {
         return;
     };
+    // An accelerator port is reached only by a container that asked for the
+    // device; the connection is dropped otherwise, which the container sees
+    // as a reset.
+    if let Some(kind) = accelerator::kind_of(port) {
+        let Ok(peer) = tcp.peer_addr() else { return };
+        if !accelerator::permitted(kind, peer.ip()) {
+            return;
+        }
+    }
     // The vCPUs poll rather than sleep between a model's messages, for as
     // long as this stream is open.
     let _wide = accelerator::Wide::open(port);

@@ -88,3 +88,59 @@ pub fn u32_at(b: &[u8], at: usize) -> u32 {
 pub fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_bytes(kind: u32, flags: u32, fence: u64, ctx: u32, ring: u8) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&kind.to_le_bytes());
+        b.extend_from_slice(&flags.to_le_bytes());
+        b.extend_from_slice(&fence.to_le_bytes());
+        b.extend_from_slice(&ctx.to_le_bytes());
+        b.push(ring);
+        b.extend_from_slice(&[0, 0, 0]);
+        b
+    }
+
+    #[test]
+    fn a_header_parses_field_by_field() {
+        let b = header_bytes(0x0103, FLAG_FENCE | 0x8000, 0x1122_3344_5566_7788, 7, 2);
+        let h = Header::parse(&b).unwrap();
+        assert_eq!(
+            (h.kind, h.flags, h.fence_id, h.ctx_id, h.ring_idx),
+            (0x0103, FLAG_FENCE | 0x8000, 0x1122_3344_5566_7788, 7, 2)
+        );
+    }
+
+    #[test]
+    fn a_short_buffer_is_not_a_header() {
+        assert!(Header::parse(&[0u8; HDR_LEN - 1]).is_none());
+        assert!(Header::parse(&[]).is_none());
+    }
+
+    #[test]
+    fn the_response_echoes_fence_context_and_ring_and_only_the_fence_flag() {
+        let h = Header::parse(&header_bytes(1, FLAG_FENCE | 0x8000, 99, 5, 1)).unwrap();
+        let mut out = Vec::new();
+        h.response(0x1100, &mut out);
+        assert_eq!(out.len(), HDR_LEN);
+        let r = Header::parse(&out).unwrap();
+        assert_eq!(
+            (r.kind, r.flags, r.fence_id, r.ctx_id, r.ring_idx),
+            (0x1100, FLAG_FENCE, 99, 5, 1)
+        );
+        let unfenced = Header::parse(&header_bytes(1, 0x8000, 3, 0, 0)).unwrap();
+        out.clear();
+        unfenced.response(0x1100, &mut out);
+        assert_eq!(Header::parse(&out).unwrap().flags, 0);
+    }
+
+    #[test]
+    fn little_endian_readers() {
+        let b = [0x78, 0x56, 0x34, 0x12, 0xff, 0, 0, 0, 0, 0, 0, 0x01];
+        assert_eq!(u32_at(&b, 0), 0x1234_5678);
+        assert_eq!(u64_at(&b, 4), 0x0100_0000_0000_00ff);
+    }
+}
