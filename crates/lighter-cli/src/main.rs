@@ -96,6 +96,9 @@ enum Command {
         /// The Python whose torch serves the PyTorch device; `auto` to search PATH.
         #[arg(long)]
         torch_python: Option<String>,
+        /// Whether containers may run ggml on the Mac's GPU (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        metal: Option<config::Toggle>,
     },
     /// Put the guest's clock right.
     ///
@@ -257,6 +260,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             ane,
             mps,
             torch_python,
+            metal,
         } => configure(Settings {
             cpus,
             memory,
@@ -266,6 +270,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             ane,
             mps,
             torch_python,
+            metal,
         }),
         Command::Resync => {
             let now = std::time::SystemTime::now()
@@ -413,6 +418,7 @@ struct Settings {
     ane: Option<config::Toggle>,
     mps: Option<config::Toggle>,
     torch_python: Option<String>,
+    metal: Option<config::Toggle>,
 }
 
 fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
@@ -425,6 +431,7 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         ane,
         mps,
         torch_python,
+        metal,
     } = settings;
     let mut config = config::Config::load()?;
     let changed = cpus.is_some()
@@ -434,7 +441,8 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         || gpu.is_some()
         || ane.is_some()
         || mps.is_some()
-        || torch_python.is_some();
+        || torch_python.is_some()
+        || metal.is_some();
     if let Some(cpus) = cpus {
         config.cpus = cpus;
     }
@@ -479,6 +487,7 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
     );
     println!("  gpu        {}", if config.gpu { "on" } else { "off" });
     println!("  ane        {}", if config.ane { "on" } else { "off" });
+    println!("  metal      {}", if config.metal { "on" } else { "off" });
     println!(
         "  mps        {}{}",
         if config.mps { "on" } else { "off" },

@@ -1,4 +1,4 @@
-"""The host half of `lighter.dev/mps`: PyTorch on the Mac's GPU, driven by a
+"""The host half of `lighter.sh/mps`: PyTorch on the Mac's GPU, driven by a
 container's PyTorch one operator at a time.
 
 Runs in the user's own Python, whichever has `torch` with MPS. A container's

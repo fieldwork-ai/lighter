@@ -24,6 +24,7 @@ fn main() -> ExitCode {
 
     let mut config = MachineConfig::default();
     let mut ane = false;
+    let mut metal = false;
     let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
     let mut docker_socket: Option<PathBuf> = None;
     let mut report_memory = false;
@@ -55,6 +56,7 @@ fn main() -> ExitCode {
             "--tso" => config.tso = true,
             "--gpu" => config.gpu = true,
             "--ane" => ane = true,
+            "--metal" => metal = true,
             // Logs the process's own physical footprint on an interval. The
             // memory gate has no other way to watch a number only this process
             // can see.
@@ -126,6 +128,22 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("neural engine service: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _metal = if metal {
+        match lighter_vmm::metal::Server::start() {
+            Ok(server) => {
+                config
+                    .cmdline
+                    .push_str(&format!(" lighter.metal={}", server.port()));
+                Some(server)
+            }
+            Err(e) => {
+                eprintln!("metal service: {e}");
                 None
             }
         }

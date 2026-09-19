@@ -156,6 +156,14 @@ dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 gpu: ## Build the GPU renderer libraries (virglrenderer + MoltenVK) into host/out
 	@host/gpu/build.sh
 
+.PHONY: ane
+ane: ## Build ONNX Runtime with CoreML into host/out/ort (the Neural Engine device)
+	@host/ane/build.sh
+
+.PHONY: metal
+metal: ## Build ggml with Metal and RPC into host/out/ggml (lighter.sh/metal)
+	@host/metal/build.sh
+
 dist: ## Build a release tarball (VERSION=x.y.z)
 	@scripts/package-release.sh $(VERSION)
 

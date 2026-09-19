@@ -90,4 +90,41 @@ fn main() {
             ane.display()
         );
     }
+
+    // ggml with its Metal and RPC backends, static (host/metal/build.sh):
+    // llama.cpp and friends in a container run their layers here.
+    println!("cargo:rustc-check-cfg=cfg(ggml_libs)");
+    println!("cargo:rerun-if-env-changed=LIGHTER_GGML_LIBS");
+    let ggml = std::env::var_os("LIGHTER_GGML_LIBS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../host/out/ggml"));
+    println!("cargo:rerun-if-changed={}", ggml.display());
+    let wanted = [
+        "ggml-rpc",
+        "ggml-metal",
+        "ggml-blas",
+        "ggml-cpu",
+        "ggml",
+        "ggml-base",
+    ];
+    if cfg!(target_os = "macos")
+        && wanted
+            .iter()
+            .all(|l| ggml.join(format!("lib{l}.a")).exists())
+    {
+        println!("cargo:rustc-link-search=native={}", ggml.display());
+        for l in wanted {
+            println!("cargo:rustc-link-lib=static={l}");
+        }
+        for f in ["Metal", "MetalKit", "Foundation", "Accelerate"] {
+            println!("cargo:rustc-link-lib=framework={f}");
+        }
+        println!("cargo:rustc-link-lib=c++");
+        println!("cargo:rustc-cfg=ggml_libs");
+    } else {
+        println!(
+            "cargo:warning=ggml archives not found in {}; building without lighter.sh/metal (host/metal/build.sh)",
+            ggml.display()
+        );
+    }
 }

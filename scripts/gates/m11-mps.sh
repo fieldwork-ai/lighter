@@ -3,7 +3,7 @@
 #
 # Starts the mps host (the Mac's own torch, in the Python that has it), boots
 # the Docker guest with `lighter.mps=<port>`, and in a stock Python container
-# given `--device lighter.dev/mps=all` installs torch and lighter-mps, then
+# given `--device lighter.sh/mps=all` installs torch and lighter-mps, then
 # trains a small model and runs a convolution on torch.device("mps").
 set -euo pipefail
 if ! command -v cargo >/dev/null 2>&1; then
@@ -89,9 +89,9 @@ pass "guest booted (${waited}s)"
 grep -q "INIT mps=port" "$LOG" && pass "init published the device" || fail "init did not publish the device"
 
 echo
-echo "==> PyTorch in a container (${IMAGE}, --device lighter.dev/mps=all)"
+echo "==> PyTorch in a container (${IMAGE}, --device lighter.sh/mps=all)"
 docker volume create lighter-gate-pip >/dev/null 2>&1 || true
-container="$(docker create --device lighter.dev/mps=all -v lighter-gate-pip:/root/.cache/pip "$IMAGE" sh -c \
+container="$(docker create --device lighter.sh/mps=all -v lighter-gate-pip:/root/.cache/pip "$IMAGE" sh -c \
 	"pip install -q --index-url https://download.pytorch.org/whl/cpu torch==$TORCH_VERSION >/dev/null 2>&1 || exit 97; pip install -q --no-index lighter-mps >/dev/null 2>&1 || exit 98; python /fixtures/mps-client.py 2>&1")"
 docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
 if out="$(docker start -a "$container" 2>&1)"; then

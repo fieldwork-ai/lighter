@@ -53,14 +53,14 @@ hostname "$(cat /etc/hostname 2>/dev/null || echo lighter)"
 ip link set lo up
 
 # The GPU, when the machine has one, as a CDI device: `docker run --device
-# lighter.dev/gpu=all` gets the render node. dockerd reads /etc/cdi on its
+# lighter.sh/gpu=all` gets the render node. dockerd reads /etc/cdi on its
 # own; nothing else is needed for a container to reach Vulkan, its own Mesa
 # does the rest.
 if [ -e /dev/dri/renderD128 ]; then
 	mkdir -p /etc/cdi
 	cat > /etc/cdi/lighter.yaml <<-EOF
 	cdiVersion: "0.6.0"
-	kind: lighter.dev/gpu
+	kind: lighter.sh/gpu
 	devices:
 	  - name: all
 	    containerEdits:
@@ -79,7 +79,7 @@ for arg in $(cat /proc/cmdline); do
 		mkdir -p /etc/cdi
 		cat > /etc/cdi/lighter-ane.yaml <<-EOF
 		cdiVersion: "0.6.0"
-		kind: lighter.dev/ane
+		kind: lighter.sh/ane
 		devices:
 		  - name: all
 		    containerEdits:
@@ -97,7 +97,7 @@ for arg in $(cat /proc/cmdline); do
 		mkdir -p /etc/cdi
 		cat > /etc/cdi/lighter-mps.yaml <<-EOF
 		cdiVersion: "0.6.0"
-		kind: lighter.dev/mps
+		kind: lighter.sh/mps
 		devices:
 		  - name: all
 		    containerEdits:
@@ -110,6 +110,20 @@ for arg in $(cat /proc/cmdline); do
 		          options: ["ro", "bind"]
 		EOF
 		echo "INIT mps=port ${arg#lighter.mps=}"
+		;;
+	lighter.metal=*)
+		mkdir -p /etc/cdi
+		cat > /etc/cdi/lighter-metal.yaml <<-EOF
+		cdiVersion: "0.6.0"
+		kind: lighter.sh/metal
+		devices:
+		  - name: all
+		    containerEdits:
+		      env:
+		        - LIGHTER_METAL=192.168.127.254:${arg#lighter.metal=}
+		        - LLAMA_ARG_RPC=192.168.127.254:${arg#lighter.metal=}
+		EOF
+		echo "INIT metal=port ${arg#lighter.metal=}"
 		;;
 	esac
 done

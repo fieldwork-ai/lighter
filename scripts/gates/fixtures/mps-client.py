@@ -1,4 +1,4 @@
-# A container's PyTorch on lighter.dev/mps: a training loop and a convolution,
+# A container's PyTorch on lighter.sh/mps: a training loop and a convolution,
 # both on torch.device("mps"), executed by the Mac's torch. The gate reads the
 # RESULT line.
 import time, torch, lighter_mps  # noqa: F401

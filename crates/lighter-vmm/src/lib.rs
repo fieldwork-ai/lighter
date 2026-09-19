@@ -43,6 +43,7 @@ pub mod machine;
 pub mod memory;
 pub mod memory_policy;
 pub mod mempressure;
+pub mod metal;
 pub mod net;
 pub mod psci;
 pub mod qos;

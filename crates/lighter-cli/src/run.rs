@@ -144,6 +144,21 @@ pub fn machine() -> anyhow::Result<()> {
     } else {
         None
     };
+    // ggml on the Mac's GPU, in-process. Held for the machine's life.
+    let _metal = if config.metal {
+        match lighter_vmm::metal::Server::start() {
+            Ok(server) => {
+                cmdline.push_str(&format!(" lighter.metal={}", server.port()));
+                Some(server)
+            }
+            Err(e) => {
+                tracing::info!(%e, "no lighter.sh/metal this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // PyTorch on the Mac's GPU: the user's own torch, in their own Python,
     // when there is one. Held for the machine's life.
     let _mps = if config.mps {
@@ -155,12 +170,12 @@ pub fn machine() -> anyhow::Result<()> {
                     Some(host)
                 }
                 Err(e) => {
-                    tracing::warn!(%e, "the pytorch host could not start; no lighter.dev/mps this run");
+                    tracing::warn!(%e, "the pytorch host could not start; no lighter.sh/mps this run");
                     None
                 }
             },
             Err(why) => {
-                tracing::info!(%why, "no torch with MPS on the Mac; no lighter.dev/mps this run");
+                tracing::info!(%why, "no torch with MPS on the Mac; no lighter.sh/mps this run");
                 None
             }
         }

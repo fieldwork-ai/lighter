@@ -2,7 +2,7 @@
 # m10: a container runs an ONNX model on the Mac's Neural Engine.
 #
 # Boots the Docker guest with the Neural Engine service, then runs a small
-# CNN in a stock Python container given the CDI device `lighter.dev/ane=all`:
+# CNN in a stock Python container given the CDI device `lighter.sh/ane=all`:
 # ONNX Runtime in the container loads lighter's plugin provider, which sends
 # the graph to the host, where ONNX Runtime's CoreML provider runs it. The
 # claim is that the outputs match the container's own CPU provider.
@@ -81,10 +81,10 @@ grep -q "neural engine service listening" "$LOG" && pass "the host service is li
 grep -q "INIT ane=port" "$LOG" && pass "init published the device" || fail "init did not publish the device"
 
 echo
-echo "==> An ONNX model in a container (${IMAGE}, --device lighter.dev/ane=all)"
+echo "==> An ONNX model in a container (${IMAGE}, --device lighter.sh/ane=all)"
 # The fixtures go in by `docker cp`: the daemon is in the guest, so a bind
 # mount of a Mac path would need a share this machine does not have.
-container="$(docker create --device lighter.dev/ane=all "$IMAGE" sh -c \
+container="$(docker create --device lighter.sh/ane=all "$IMAGE" sh -c \
 	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1')"
 docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
 if out="$(docker start -a "$container" 2>&1)"; then

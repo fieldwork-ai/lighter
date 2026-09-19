@@ -2,7 +2,7 @@
 # m9: a container reaches the Mac's GPU through Vulkan.
 #
 # Boots the Docker guest with the GPU, then runs vulkaninfo in a stock Alpine
-# container given the CDI device `lighter.dev/gpu=all`. The claim is that Mesa's
+# container given the CDI device `lighter.sh/gpu=all`. The claim is that Mesa's
 # Venus driver in the container enumerates the host's GPU, which means the
 # kernel's virtio-gpu driver found the device, the capset crossed, a blob was
 # mapped through the aperture, and a fenced submission completed.
@@ -95,8 +95,8 @@ grep -q "cap set 0: id 4" "$LOG" && pass "the Venus capset crossed" || fail "no 
 grep -q "INIT gpu=/dev/dri/renderD128" "$LOG" && pass "init published the render node" || fail "no render node at init"
 
 echo
-echo "==> Vulkan in a container (${IMAGE}, --device lighter.dev/gpu=all)"
-if out="$(docker run --rm --device lighter.dev/gpu=all "$IMAGE" sh -c \
+echo "==> Vulkan in a container (${IMAGE}, --device lighter.sh/gpu=all)"
+if out="$(docker run --rm --device lighter.sh/gpu=all "$IMAGE" sh -c \
 	'apk add -q mesa-vulkan-virtio vulkan-loader vulkan-tools >/dev/null 2>&1 || exit 97; timeout 120 vulkaninfo --summary 2>&1' 2>&1)"; then
 	if grep -q "Virtio-GPU Venus" <<<"$out"; then
 		pass "vulkaninfo: $(grep -m1 deviceName <<<"$out" | sed 's/.*= //')"

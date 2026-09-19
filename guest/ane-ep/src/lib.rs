@@ -135,7 +135,7 @@ impl Link {
     /// Dials the host named by `LIGHTER_ANE` (`a.b.c.d:port`).
     fn connect() -> Result<Link, String> {
         let mut buf = [0u8; 64];
-        let n = sys::env(b"LIGHTER_ANE", &mut buf).ok_or_else(|| String::from("LIGHTER_ANE is not set; run the container with --device lighter.dev/ane=all"))?;
+        let n = sys::env(b"LIGHTER_ANE", &mut buf).ok_or_else(|| String::from("LIGHTER_ANE is not set; run the container with --device lighter.sh/ane=all"))?;
         let text = core::str::from_utf8(&buf[..n]).map_err(|_| String::from("LIGHTER_ANE is not text"))?;
         let (host, port) = text.rsplit_once(':').ok_or_else(|| String::from("LIGHTER_ANE is not host:port"))?;
         let port: u16 = port.trim().parse().map_err(|_| String::from("LIGHTER_ANE port is not a number"))?;

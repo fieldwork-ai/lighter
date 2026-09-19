@@ -4,9 +4,9 @@ Status: built. Approved 2026-09-19, spikes passed the same day, all three device
 
 ## What ships
 
-- **Vulkan in containers** (`docker run --device lighter.dev/gpu`): a virtio-gpu device speaking Venus, rendered on the host by virglrenderer over MoltenVK, so llama.cpp, whisper.cpp, ncnn and ONNX Runtime's WebGPU provider reach the M-series GPU from a stock Linux image. The libkrun design, transplanted.
-- **The Neural Engine in containers** (`--device lighter.dev/ane`): an ONNX Runtime plugin execution provider in the guest that ships a graph and its tensors over vsock to a host runner, which is ONNX Runtime's own CoreML provider with compute units set to all. Vision and small-model inference at a few watts.
-- **PyTorch on the Mac GPU in containers** (`--device lighter.dev/mps`): a guest extension that occupies PyTorch's MPS dispatch key on Linux with one boxed fallback forwarding every operator to the user's own PyTorch on the host, running on MPS. `model.to("mps")` works unchanged. Inference and training, eager and compiled.
+- **Vulkan in containers** (`docker run --device lighter.sh/gpu`): a virtio-gpu device speaking Venus, rendered on the host by virglrenderer over MoltenVK, so llama.cpp, whisper.cpp, ncnn and ONNX Runtime's WebGPU provider reach the M-series GPU from a stock Linux image. The libkrun design, transplanted.
+- **The Neural Engine in containers** (`--device lighter.sh/ane`): an ONNX Runtime plugin execution provider in the guest that ships a graph and its tensors over vsock to a host runner, which is ONNX Runtime's own CoreML provider with compute units set to all. Vision and small-model inference at a few watts.
+- **PyTorch on the Mac GPU in containers** (`--device lighter.sh/mps`): a guest extension that occupies PyTorch's MPS dispatch key on Linux with one boxed fallback forwarding every operator to the user's own PyTorch on the host, running on MPS. `model.to("mps")` works unchanged. Inference and training, eager and compiled.
 
 Not in scope, stated in the release notes: PyTorch through Vulkan (no such backend exists), a Metal wire protocol (nothing on Linux would consume it), and any bundled PyTorch or CoreML runtime on the host.
 
@@ -19,7 +19,7 @@ Not in scope, stated in the release notes: PyTorch through Vulkan (no such backe
 5. The Neural Engine interface is an ONNX Runtime plugin EP (ABI since 1.23), built as one `no_std` shared object on raw syscalls so it loads in any container. Delivered by CDI with a unix socket the guest agent bridges to vsock.
 6. Host PyTorch is the user's own, found in an interpreter on the Mac; lighter ships the guest wheel and a host Python module, the way Rosetta is Apple's binary and lighter only arranges it. Guest wheel and host torch must match versions; `lighter doctor` is strict.
 7. The guest torch device is named `mps`, by occupying the real MPS key rather than renaming the spare `PrivateUse1` key, which cannot take a reserved name. Fallback if PyTorch refuses: `PrivateUse1` as `lighter` plus a shim resolving `mps` to it.
-8. Device names: `lighter.dev/gpu`, `lighter.dev/ane`, `lighter.dev/mps`. Docker's CDI support (on by default since 28.3) is the delivery mechanism for all three; specs are written by the guest's init.
+8. Device names: `lighter.sh/gpu`, `lighter.sh/ane`, `lighter.sh/mps`. Docker's CDI support (on by default since 28.3) is the delivery mechanism for all three; specs are written by the guest's init.
 9. All three tracks ship in 0.7.0. There is no slip rule.
 
 ## Groundwork the VMM lacks

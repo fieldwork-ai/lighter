@@ -24,21 +24,25 @@ pub struct Config {
     /// the Mac: the network (`lan`, as Docker does) or loopback only.
     pub publish: Publish,
     /// Whether the guest has a GPU: a render node containers reach Vulkan
-    /// through (`docker run --device lighter.dev/gpu=all`), rendered on the
+    /// through (`docker run --device lighter.sh/gpu=all`), rendered on the
     /// Mac's own GPU. On by default; costs nothing until a container uses it.
     pub gpu: bool,
     /// Whether containers may run ONNX models on the Mac's Neural Engine
-    /// (`docker run --device lighter.dev/ane=all`). On by default; ONNX
+    /// (`docker run --device lighter.sh/ane=all`). On by default; ONNX
     /// Runtime is loaded on the host only when a model arrives.
     pub ane: bool,
     /// Whether containers may run PyTorch on the Mac's GPU
-    /// (`docker run --device lighter.dev/mps=all`): the Mac's own `torch`
+    /// (`docker run --device lighter.sh/mps=all`): the Mac's own `torch`
     /// executes what a container's `torch` asks, one operator at a time.
     /// On by default, and present only when a Python with torch and MPS is
     /// found (`torch_python`, or the first `python3` on PATH that has it).
     pub mps: bool,
-    /// The Python whose `torch` serves `lighter.dev/mps`; empty means search.
+    /// The Python whose `torch` serves `lighter.sh/mps`; empty means search.
     pub torch_python: String,
+    /// Whether containers may run ggml (llama.cpp and friends, built with
+    /// the RPC backend) on the Mac's GPU with ggml's own Metal kernels
+    /// (`docker run --device lighter.sh/metal=all`). On by default.
+    pub metal: bool,
 }
 
 /// A switch on the command line: `--gpu on`, `--gpu off`.
@@ -90,6 +94,7 @@ impl Default for Config {
             ane: true,
             mps: true,
             torch_python: String::new(),
+            metal: true,
         }
     }
 }
@@ -204,6 +209,7 @@ mod tests {
             ane: false,
             mps: false,
             torch_python: String::new(),
+            metal: false,
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         assert!(

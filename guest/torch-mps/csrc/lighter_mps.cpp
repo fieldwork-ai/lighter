@@ -65,7 +65,7 @@ struct Link {
   void connect_once() {
     if (fd >= 0) return;
     const char* env = getenv("LIGHTER_MPS");
-    TORCH_CHECK(env, "LIGHTER_MPS is not set; run the container with --device lighter.dev/mps=all");
+    TORCH_CHECK(env, "LIGHTER_MPS is not set; run the container with --device lighter.sh/mps=all");
     std::string text(env);
     auto colon = text.rfind(':');
     TORCH_CHECK(colon != std::string::npos, "LIGHTER_MPS is not host:port");

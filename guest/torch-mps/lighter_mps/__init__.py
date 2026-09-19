@@ -1,7 +1,7 @@
 """`torch.device("mps")` inside a container, run by the Mac's own PyTorch.
 
 Importing this module is all a program has to do; `model.to("mps")` then
-works as it would on the Mac. The container needs `--device lighter.dev/mps=all`.
+works as it would on the Mac. The container needs `--device lighter.sh/mps=all`.
 """
 import torch  # noqa: F401  (must be imported before the extension)
 

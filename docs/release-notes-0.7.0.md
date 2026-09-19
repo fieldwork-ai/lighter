@@ -6,7 +6,7 @@ Three things no other Docker for macOS offers, each a device name on
 `docker run`, each on by default and costing nothing until a container uses
 it (`docs/gpu.md`).
 
-**Vulkan** (`--device lighter.dev/gpu=all`). The guest has a virtio-gpu
+**Vulkan** (`--device lighter.sh/gpu=all`). The guest has a virtio-gpu
 render node speaking Venus, decoded on the Mac by virglrenderer over MoltenVK,
 on the Mac's own GPU. A stock image with Mesa's Venus driver
 (`mesa-vulkan-virtio` on Alpine, in `mesa-vulkan-drivers` on Debian) sees
@@ -19,7 +19,7 @@ counted as guest memory. Two patches carried: the guest kernel places
 host-visible blobs on 16 KiB boundaries so stock Mesa works, and virglrenderer
 gets an eventfd where macOS has none, without which every Vulkan wait hangs.
 
-**The Neural Engine** (`--device lighter.dev/ane=all`). A container's ONNX
+**The Neural Engine** (`--device lighter.sh/ane=all`). A container's ONNX
 Runtime loads lighter's plugin execution provider,
 `/usr/lib/lighter/liblighter_ane_ep.so`, which links no libc so the one file
 loads in any image. It claims the model, serialises it and sends it to the
@@ -28,7 +28,7 @@ Mac, where ONNX Runtime's CoreML provider runs it on the Neural Engine
 crosses at the first run, when its shapes are known, since the Neural Engine
 takes only bound shapes; nodes with subgraphs stay on the container's CPU.
 
-**PyTorch on the Mac's GPU** (`--device lighter.dev/mps=all`). A container's
+**PyTorch on the Mac's GPU** (`--device lighter.sh/mps=all`). A container's
 `torch` gets `torch.device("mps")`, and the Mac's own `torch` executes every
 operator asked of it, on its GPU. `pip install lighter-mps` inside the
 container (the wheels are carried in the guest) and `import lighter_mps`;
@@ -38,8 +38,8 @@ host: lighter finds a Python whose `torch` has MPS (`lighter config
 --torch-python`) and starts a small server in it; the container's and the
 Mac's torch must share a major.minor.
 
-Linux PyTorch has no Vulkan backend, so `lighter.dev/gpu` gives it nothing;
-that is what `lighter.dev/mps` is for.
+Linux PyTorch has no Vulkan backend, so `lighter.sh/gpu` gives it nothing;
+that is what `lighter.sh/mps` is for.
 
 ## Also
 
