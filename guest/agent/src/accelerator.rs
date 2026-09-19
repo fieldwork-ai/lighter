@@ -76,6 +76,9 @@ pub fn kind_of(port: u16) -> Option<&'static str> {
 /// dockerd is asked for the running container with that address, then for
 /// its device requests. Anything short of a clear yes is a no.
 pub fn permitted(kind: &str, peer: std::net::IpAddr) -> bool {
+    // The proxy listens on the v6 wildcard, so a v4 container arrives as an
+    // IPv4-mapped address; dockerd records the plain v4 form.
+    let peer = unmapped(peer);
     let list = match docker_get("/containers/json") {
         Ok(body) => body,
         Err(e) => {
@@ -99,6 +102,14 @@ pub fn permitted(kind: &str, peer: std::net::IpAddr) -> bool {
         eprintln!("lighter-agent: the container at {peer} did not ask for lighter.sh/{kind}; refused");
     }
     yes
+}
+
+/// A v4 address in its own form, whether it arrived mapped into v6 or not.
+fn unmapped(peer: std::net::IpAddr) -> std::net::IpAddr {
+    match peer {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(peer, std::net::IpAddr::V4),
+        v4 => v4,
+    }
 }
 
 /// One HTTP GET on dockerd's socket, the body returned whole.
@@ -188,6 +199,16 @@ mod tests {
         assert_eq!(container_with_address(LISTING, "172.18.0.5").as_deref(), Some("aaa111"));
         assert_eq!(container_with_address(LISTING, "172.17.0.3").as_deref(), Some("bbb222"));
         assert_eq!(container_with_address(LISTING, "172.17.0.30"), None);
+    }
+
+    #[test]
+    fn a_mapped_v4_address_is_looked_up_in_its_v4_form() {
+        let mapped: std::net::IpAddr = "::ffff:172.18.0.5".parse().unwrap();
+        assert_eq!(unmapped(mapped).to_string(), "172.18.0.5");
+        let plain: std::net::IpAddr = "172.17.0.3".parse().unwrap();
+        assert_eq!(unmapped(plain), plain);
+        let real_v6: std::net::IpAddr = "fd00::5".parse().unwrap();
+        assert_eq!(unmapped(real_v6), real_v6);
     }
 
     #[test]
