@@ -710,6 +710,7 @@ impl Machine {
                     // MPIDR affinity all agree; see CpuPark::await_creation_turn
                     // for what goes wrong when they do not.
                     ctx.park.await_creation_turn(index);
+                    crate::qos::register_vcpu();
                     let created =
                         vm.create_vcpu()
                             .map_err(|source| crate::vcpu::RunError::Hypervisor {

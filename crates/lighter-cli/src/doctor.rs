@@ -114,6 +114,67 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("guest filesystem", e.to_string(), "set LIGHTER_GUEST_DIR"),
     });
 
+    // The accelerator devices: each is on when its host component is in
+    // the binary (the GPU, the Neural Engine, ggml) or on the Mac (torch).
+    let config = crate::config::Config::load().unwrap_or_default();
+    findings.push(
+        match (config.gpu, lighter_vmm::virtio::gpu::virgl::linked()) {
+            (false, _) => Finding::good("gpu (lighter.sh/gpu)", "off in the configuration"),
+            (true, true) => Finding::good(
+                "gpu (lighter.sh/gpu)",
+                "Vulkan for containers, on the Mac's GPU",
+            ),
+            (true, false) => Finding::bad(
+                "gpu (lighter.sh/gpu)",
+                "this build has no renderer",
+                "run `make gpu` and rebuild, or reinstall a release build",
+            ),
+        },
+    );
+    findings.push(
+        match (config.ane, lighter_vmm::ane::ort::Runtime::linked()) {
+            (false, _) => {
+                Finding::good("neural engine (lighter.sh/ane)", "off in the configuration")
+            }
+            (true, true) => Finding::good(
+                "neural engine (lighter.sh/ane)",
+                "ONNX models on the Neural Engine",
+            ),
+            (true, false) => Finding::bad(
+                "neural engine (lighter.sh/ane)",
+                "this build has no ONNX Runtime",
+                "run `make ane` and rebuild, or reinstall a release build",
+            ),
+        },
+    );
+    findings.push(match (config.metal, lighter_vmm::metal::linked()) {
+        (false, _) => Finding::good("ggml (lighter.sh/metal)", "off in the configuration"),
+        (true, true) => Finding::good(
+            "ggml (lighter.sh/metal)",
+            "llama.cpp and friends on the Mac's GPU",
+        ),
+        (true, false) => Finding::bad(
+            "ggml (lighter.sh/metal)",
+            "this build has no ggml",
+            "run `make metal` and rebuild, or reinstall a release build",
+        ),
+    });
+    findings.push(if !config.mps {
+        Finding::good("pytorch (lighter.sh/mps)", "off in the configuration")
+    } else {
+        match crate::mps::find_python(&config.torch_python) {
+            Ok((python, version)) => Finding::good(
+                "pytorch (lighter.sh/mps)",
+                format!("torch {version} with MPS in {}", python.display()),
+            ),
+            // Not a fault the machine cannot start with; the device is simply absent.
+            Err(why) => Finding::bad(
+                "pytorch (lighter.sh/mps)",
+                format!("no Python with torch and MPS ({why})"),
+                "pip install torch in a Python on PATH, or `lighter config --torch-python <path>`",
+            ),
+        }
+    });
     findings.push(match which("docker") {
         Some(path) => Finding::good("docker client", path),
         None => Finding::bad(

@@ -313,7 +313,14 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
             !f.ok
                 && !matches!(
                     f.what.as_str(),
-                    "docker client" | "docker context" | "machine" | "rosetta"
+                    "docker client"
+                        | "docker context"
+                        | "machine"
+                        | "rosetta"
+                        | "gpu (lighter.sh/gpu)"
+                        | "neural engine (lighter.sh/ane)"
+                        | "ggml (lighter.sh/metal)"
+                        | "pytorch (lighter.sh/mps)"
                 )
         })
         .collect();

@@ -167,6 +167,7 @@ pub fn machine() -> anyhow::Result<()> {
                 Ok(host) => {
                     tracing::info!(python = %python.display(), torch = %version, port = host.port(), "pytorch device served by the Mac's torch");
                     cmdline.push_str(&format!(" lighter.mps={}", host.port()));
+                    lighter_vmm::qos::register_accelerator_port(host.port());
                     Some(host)
                 }
                 Err(e) => {

@@ -36,12 +36,12 @@ Same model, same M1, `llama-bench -p 128 -n 32`:
 
 | where | prompt, t/s | generation, t/s |
 |---|---:|---:|
-| container, `lighter.sh/metal` | 1658 | 81 |
+| container, `lighter.sh/metal` | 1857 | 82 |
 | container, `lighter.sh/gpu` (Vulkan) | 1028 | 45 |
 | container, CPU | 329 | 21 |
-| native macOS, Metal | 1949 | 110 |
+| native macOS, Metal | 1953 | 110 |
 
-What remains between the container and native is the round trip per token over the streams, a few milliseconds each; larger models spend proportionally more time in the kernels and less in the trip.
+What remains between the container and native is the request loop per token: eight RPC messages, each a wake of the guest and of the server thread, and the logits back. Two things keep the loop tight. The server thread runs at the interactive QoS class, without which macOS parks it on an efficiency core while the vCPUs hold the performance ones (a native client to the same server went from 94 to 107 tokens a second on the M1 for that alone). And while a container has a stream open to the server the vCPUs are held at the interactive class too (`qos::Boost`, ended when the stream closes), because a vCPU woken late on a busy Mac is what made the container's number swing between 63 and 80 from run to run; with it the M1 gives 82 to 84 against 107 for a native client of the same server. Nothing else is boosted: an ordinary container competes with the Mac's windows no harder than any process. Larger models spend proportionally more time in the kernels and less in the loop.
 
 **Versions.** ggml's RPC protocol is versioned and checked at connect: the container's ggml must speak the version lighter was built with. `host/metal/build.sh` pins the llama.cpp commit and writes the protocol version to `host/out/ggml/rpc-proto-version`; a mismatch fails with ggml's own message at the first request. ggml notes the protocol is not hardened, which is why the server binds loopback only and is reachable solely through lighter's streams.
 

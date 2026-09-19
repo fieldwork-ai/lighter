@@ -115,9 +115,15 @@ impl Server {
         let threads = std::thread::available_parallelism()
             .map_or(4, |n| n.get() / 2)
             .max(1);
+        crate::qos::register_accelerator_port(port);
         std::thread::Builder::new()
             .name("metal-rpc".into())
             .spawn(move || {
+                // The server encodes every token's kernels on this thread;
+                // at the default class macOS parks it on an efficiency core
+                // while the vCPUs hold the performance cores, and a token
+                // takes half again as long as it does for a native client.
+                crate::qos::raise_interactive();
                 let device = device;
                 let mut devices = [device.0];
                 // Blocks for the life of the process: ggml's accept loop.

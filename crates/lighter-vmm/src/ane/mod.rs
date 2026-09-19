@@ -36,6 +36,7 @@ impl Server {
     pub fn start() -> io::Result<Server> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
+        crate::qos::register_accelerator_port(port);
         std::thread::Builder::new()
             .name("ane-accept".into())
             .spawn(move || {
@@ -46,7 +47,10 @@ impl Server {
                     let runtime = runtime.clone();
                     let _ = std::thread::Builder::new()
                         .name("ane-conn".into())
-                        .spawn(move || serve(stream, &runtime));
+                        .spawn(move || {
+                            crate::qos::raise_interactive();
+                            serve(stream, &runtime)
+                        });
                 }
             })?;
         tracing::info!(port, "neural engine service listening");
