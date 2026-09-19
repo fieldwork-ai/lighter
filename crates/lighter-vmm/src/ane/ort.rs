@@ -62,10 +62,13 @@ impl Runtime {
         cfg!(ane_libs)
     }
 
+    #[cfg(not(ane_libs))]
     pub fn new() -> Result<Runtime, String> {
-        if !Runtime::linked() {
-            return Err("lighter was built without ONNX Runtime (host/ane/build.sh)".into());
-        }
+        Err("lighter was built without ONNX Runtime (host/ane/build.sh)".into())
+    }
+
+    #[cfg(ane_libs)]
+    pub fn new() -> Result<Runtime, String> {
         let base = unsafe { sys::OrtGetApiBase() };
         if base.is_null() {
             return Err("OrtGetApiBase returned null".into());
