@@ -1,6 +1,6 @@
 # lighter 0.7.0: the GPU, the Neural Engine and PyTorch in containers
 
-Status: plan, approved 2026-09-19. Three tracks, one release, one qualification. Nothing below is built yet; the first spikes are listed at the end. Experiments land as rows in `worklog.md` as they happen.
+Status: plan, approved 2026-09-19; all five spikes passed the same day (results at the end). Three tracks, one release, one qualification. Experiments land as rows in `worklog.md` as they happen.
 
 ## What ships
 
@@ -61,3 +61,13 @@ macOS spikes, VMM code and every gate run on the M1 over Tailscale, with the dai
 - x86-64 images under Rosetta with the Venus ICD are untested and are not a release claim.
 - Track C's eager path is one round trip per operator; acceptable on lighter's vsock, competitive only under `torch.compile`. The numbers from m11 decide what the release notes promise.
 - Aliasing and in-place operators are where a remote tensor backend goes wrong; PyTorch's OpenReg reference is the pattern to follow.
+
+## Spike results (2026-09-19)
+
+1. **Venus on macOS with Command Line Tools alone.** Upstream virglrenderer (`32dac0c`) builds Venus-only and static on the M1 with `-Dvrend=false -Dvenus=true -Drender-server-mode=thread -Drender-server-worker=thread`, no Homebrew and no Xcode: meson and ninja from pip, MoltenVK from the Khronos release tarball. Two things to know: the venus-protocol subproject must be reachable as `venus-protocol/vulkan_metal.h` (a symlink until upstream settles the path), and `VIRGL_RENDERER_RENDER_SERVER` must be in the init flags or the capset stays empty. A Rust binary linking `libvirglrenderer.a`, `libvirgl.a` and `libmesa.a` plus Metal and Foundation initialises, fills the Venus capset (160 bytes) and creates a Venus context, so the renderer runs in-process as a thread. `spikes/accelerators-2026-09-19/venus-link`.
+2. **DRM in the guest kernel costs 3 ms.** 6.18.52 with `DRM`, `DRM_VIRTIO_GPU` and every SoC display driver pinned off (the defconfig turns on seventy of them, and Qualcomm's needs python3 just to build): the Image grows 2 MiB and `Run /init` moves from 88.6 ms to 91.6 ms, median of seven boots each on the M1. Accepted; the option list is in `guest/kernel/lighter.config`.
+3. **PyTorch's MPS key can be occupied on Linux.** An out-of-tree extension registers an allocator, a device guard, the `MPSHooks` class under the name PyTorch looks up (so `torch.backends.mps.is_available()` and `torch.accelerator.current_accelerator()` answer truthfully), factory and copy kernels, and one boxed fallback for everything else; `copy_` must be registered on the key because `copy_impl`'s dispatch stub is compiled out on Linux. Forward, backward and an Adam loop converge on `torch.device("mps")` against CPU PyTorch 2.14. `spikes/accelerators-2026-09-19/torch-mps`.
+4. **ONNX Runtime loads a plugin EP written in Rust.** It advertises an NPU, claims every node without a subgraph as one fused unit, re-serialises the fused graph to ONNX bytes through the public graph API (no serialisation call exists, so the plugin carries a 200-line protobuf writer), and forwards runs over a unix socket. Outputs match the CPU provider bit for bit; 0.42 ms a run for a small CNN including the socket. `spikes/accelerators-2026-09-19/ort-ep`.
+5. **The Neural Engine takes ResNet-50 at 1.76 ms.** ONNX Runtime's CoreML provider on the M1 with `ModelFormat=NeuralNetwork`: CPU 30.0 ms, CoreML on CPU 16.4, on GPU 7.9, on the Neural Engine 1.76. The `MLProgram` format never reaches the ANE for this model (E5RT rejects it as unbounded whatever the declared shapes), so the host runner uses NeuralNetwork first. Batch dimensions must be fixed for the ANE; the host binds them from the first run's shapes. `spikes/accelerators-2026-09-19/ane.py`.
+
+Two design facts the spikes settled: blob mappings on Apple silicon are 16 KiB pages, so the guest kernel's host-visible allocator is patched to 16 KiB alignment (lighter owns the kernel; stock Mesa then works unchanged) and the host rounds sizes the same way; and the ANE device sends the model at the first run rather than at compile, because that is when the shapes are known.
