@@ -13,6 +13,7 @@
 //!   docker CLI ──unix──▶ lighter ──vsock──▶ agent ──unix──▶ dockerd
 //! ```
 
+mod accelerator;
 mod idle;
 mod inbound;
 mod memory_policy;
@@ -941,6 +942,9 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     let Some((ip, port)) = original_destination(tcp.as_raw_fd()) else {
         return;
     };
+    // The vCPUs poll rather than sleep between a model's messages, for as
+    // long as this stream is open.
+    let _wide = accelerator::Wide::open(port);
     let host = match vsock::connect(STREAM_PORT) {
         Ok(fd) => fd,
         Err(e) => {

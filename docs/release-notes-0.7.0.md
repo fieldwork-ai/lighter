@@ -41,8 +41,8 @@ Mac's torch must share a major.minor.
 **ggml on the Mac's GPU** (`--device lighter.sh/metal=all`). llama.cpp,
 whisper.cpp and the rest of the ggml family, built with `GGML_RPC`, hand
 their layers to a ggml RPC server that lighter runs in-process on the Mac's
-Metal backend with ggml's own kernels. Same model, same M1: 1857 tokens/s of
-prompt processing and 82 of generation in a container, against 1028 and 45
+Metal backend with ggml's own kernels. Same model, same M1: 1911 tokens/s of
+prompt processing and 95 of generation in a container, against 1028 and 45
 over Vulkan and 1953 and 110 native. The Vulkan device is the general one;
 for ggml this is the fast one, and the gap to native is the request loop
 per token (`docs/gpu.md` says where it goes and what keeps it tight).
@@ -57,7 +57,8 @@ that is what `lighter.sh/mps` is for.
   the configuration, or missing its host component.
 - The accelerator servers' threads run at the interactive QoS class, and
   while a container has a stream open to one of them the vCPUs are held
-  there too, for that stream's life only (`docs/gpu.md` has the numbers).
+  there too and the guest polls a few milliseconds before sleeping a vCPU,
+  for that stream's life only (`docs/gpu.md` has the numbers).
 - Four gates: m9 (vulkaninfo through the CDI device), m10 (an ONNX model
   through the plugin provider, checked against the CPU), m11 (a container's
   PyTorch training a model on `mps`), m12 (llama-bench in a container over
