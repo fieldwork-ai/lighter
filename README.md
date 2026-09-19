@@ -82,7 +82,7 @@ Direct installations can opt into background update downloads with `lighter upda
 
 ## Hardware & AI Acceleration
 
-lighter is the first container runtime for macOS that exposes Apple Silicon's GPU, Neural Engine, and unified memory architecture directly to Linux containers. All accelerator devices use Docker's standard Container Device Interface (CDI) via `--device`, cost zero memory or CPU when idle, and require no special flags or configurations to enable.
+lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, and it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All four devices use Docker's standard Container Device Interface (CDI) via `--device`, cost zero memory or CPU when idle, and require no special flags or configurations to enable.
 
 See [`docs/gpu.md`](docs/gpu.md) for complete technical documentation and architecture.
 
@@ -295,7 +295,7 @@ lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal
 Kernel releases track upstream Linux LTS point updates, ensuring ongoing security patches and driver fixes without architectural churn.
 
 ### 7. Apple Silicon hardware acceleration with zero idle tax
-Traditional VM monitors leave macOS GPUs and Neural Engines completely inaccessible from Linux containers, or impose heavy helper processes that consume gigabytes of idle RAM.
+OrbStack, Docker Desktop and Colima leave the Mac's GPU and Neural Engine inaccessible from Linux containers; Podman's krunkit reaches the GPU through Vulkan alone, and nothing else reaches the Neural Engine or gives PyTorch its `mps` device.
 
 lighter exposes the full Apple Silicon compute architecture with zero compromise:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
