@@ -747,7 +747,17 @@ unsafe extern "C" fn ep_get_capability(_this: *mut OrtEp, graph: *const OrtGraph
     }
     let _ = a;
     if !take.is_empty() {
-        let st = unsafe { (ep_api().EpGraphSupportInfo_AddNodesToFuse.unwrap())(info, take.as_ptr(), take.len(), ptr::null()) };
+        // The weights stay out of the fused node's inputs: a model whose
+        // weights are initializers (every YOLO export) would otherwise reach
+        // Compute with one input per initializer beside the real ones, and
+        // the host, holding the model with its weights inside, refuses the
+        // count. The serializer reads them from the fused graph's own
+        // initializer list at Compile.
+        let options = OrtNodeFusionOptions {
+            ort_version_supported: ORT_API_VERSION,
+            drop_constant_initializers: true,
+        };
+        let st = unsafe { (ep_api().EpGraphSupportInfo_AddNodesToFuse.unwrap())(info, take.as_ptr(), take.len(), &options) };
         if !st.is_null() {
             return st;
         }
