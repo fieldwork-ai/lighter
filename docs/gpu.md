@@ -53,6 +53,8 @@ What remains between the container and native is the request loop per token: eig
 
 A container's ONNX Runtime loads lighter's plugin execution provider, `/usr/lib/lighter/liblighter_ane_ep.so`, which claims the model's graph, serialises it and sends it to the host, where ONNX Runtime's CoreML provider runs it, on the Neural Engine where it can. The provider links no libc, so the one file loads in any image.
 
+The worked example is Frigate (`examples/frigate-ane`): a forty-line detector plugin and a derived image with a newer ONNX Runtime, and YOLO11n runs at 7.6–7.9 ms a frame on the Neural Engine with the detector process at under one percent CPU, against 15.1 ms and 36% for Frigate's own CPU detector on the same clip, on an M1.
+
 ```python
 import onnxruntime as ort
 ort.register_execution_provider_library("lighter", "/usr/lib/lighter/liblighter_ane_ep.so")

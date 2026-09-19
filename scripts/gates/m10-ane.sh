@@ -85,10 +85,15 @@ echo "==> An ONNX model in a container (${IMAGE}, --device lighter.sh/ane=all)"
 # The fixtures go in by `docker cp`: the daemon is in the guest, so a bind
 # mount of a Mac path would need a share this machine does not have.
 container="$(docker create --device lighter.sh/ane=all "$IMAGE" sh -c \
-	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1')"
+	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1 && python /fixtures/ane-client.py /fixtures/tinycnn-init.onnx 2>&1')"
+# Two models: one with its weights as Constant nodes, one with them as
+# initializers, which is what every exporter produces and what the provider
+# once handed to the fused node as inputs (a YOLO export fell back to the
+# CPU with "the model takes 1 inputs, 197 were sent").
 docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
 if out="$(docker start -a "$container" 2>&1)"; then
-	pass "$(grep RESULT <<<"$out" | tail -1)"
+	pass "constants: $(grep RESULT <<<"$out" | head -1)"
+	pass "initializers: $(grep RESULT <<<"$out" | tail -1)"
 else
 	status=$?
 	if [ "$status" -eq 97 ]; then
