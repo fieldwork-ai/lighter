@@ -27,6 +27,10 @@ if [ ! -d "$SRC/.git" ]; then
 fi
 git -C "$SRC" fetch -q origin
 git -C "$SRC" checkout -q -f "$LLAMA_COMMIT"
+for p in "$ROOT"/host/metal/patches/*.patch; do
+	log "Applying $(basename "$p")"
+	git -C "$SRC" apply "$p"
+done
 
 # The Metal shader library is embedded in the archive, so there is no
 # default.metallib to ship beside the binary.

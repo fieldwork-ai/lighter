@@ -16,10 +16,22 @@
 //! The protocol has a version, checked at connect: the container's ggml must
 //! be the one this lighter was built with (`host/metal/build.sh` pins it and
 //! `docs/gpu.md` names it).
+//!
+//! The listener is lighter's, not ggml's. ggml's own server accepts on a
+//! socket it bound, serves one client at a time, and returns from its loop
+//! on the first accept error, which macOS raises for a queued client that
+//! resets before it is taken (ECONNABORTED): a benchmark that was killed
+//! left the device dead for the machine's life. So lighter accepts, and
+//! hands each descriptor to a carried ggml entry point
+//! (`host/metal/patches/0001`) on a thread of its own, with backends of its
+//! own, so a resident whisper and an on-demand llama.cpp share the GPU.
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, c_char};
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};
+use std::os::fd::IntoRawFd;
+use std::path::Path;
+use std::sync::Arc;
 
 #[repr(C)]
 pub struct GgmlBackendDevice {
@@ -34,8 +46,8 @@ unsafe extern "C" {
     fn ggml_backend_dev_by_type(kind: u32) -> *mut GgmlBackendDevice;
     fn ggml_backend_dev_name(dev: *mut GgmlBackendDevice) -> *const c_char;
     fn ggml_backend_dev_memory(dev: *mut GgmlBackendDevice, free: *mut usize, total: *mut usize);
-    fn ggml_backend_rpc_start_server(
-        endpoint: *const c_char,
+    fn ggml_backend_rpc_serve_fd(
+        fd: i32,
         cache_dir: *const c_char,
         n_threads: usize,
         n_devices: usize,
@@ -62,8 +74,8 @@ mod stub {
             *total = 0;
         }
     }
-    pub unsafe fn ggml_backend_rpc_start_server(
-        _: *const c_char,
+    pub unsafe fn ggml_backend_rpc_serve_fd(
+        _: i32,
         _: *const c_char,
         _: usize,
         _: usize,
@@ -84,15 +96,21 @@ pub struct Server {
 }
 
 // SAFETY: the device pointer is ggml's registry entry, valid for the process.
+#[derive(Clone, Copy)]
 struct Device(*mut GgmlBackendDevice);
 unsafe impl Send for Device {}
 
 impl Server {
-    /// Starts ggml's RPC server on loopback, on the Mac's GPU, from a thread.
-    /// The port is chosen by binding and releasing one, since ggml takes an
-    /// endpoint string rather than a socket; the window between is the same
-    /// one every "pick a free port" has.
-    pub fn start() -> io::Result<Server> {
+    /// Binds loopback on a port of the system's choosing and accepts from a
+    /// thread; every client is served on a thread of its own, with ggml
+    /// backends of its own.
+    ///
+    /// `cache` is a directory for ggml's tensor cache: a weight over 10 MiB
+    /// is sent as a hash first, and one the server has seen before is read
+    /// from here instead of crossing the stream again, so a model's second
+    /// load costs its small tensors only. It grows with the models used
+    /// and is safe to delete.
+    pub fn start(cache: Option<&Path>) -> io::Result<Server> {
         if !linked() {
             return Err(io::Error::other(
                 "lighter was built without ggml (host/metal/build.sh)",
@@ -107,36 +125,72 @@ impl Server {
             .into_owned();
         let (mut free, mut total) = (0usize, 0usize);
         unsafe { ggml_backend_dev_memory(dev, &mut free, &mut total) };
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let port = probe.local_addr()?.port();
-        drop(probe);
-        let endpoint = CString::new(format!("127.0.0.1:{port}")).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
         let device = Device(dev);
         let threads = std::thread::available_parallelism()
             .map_or(4, |n| n.get() / 2)
             .max(1);
         crate::qos::register_accelerator_port(port);
+        let cache = match cache {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                Some(Arc::new(
+                    CString::new(dir.as_os_str().as_encoded_bytes())
+                        .map_err(|_| io::Error::other("the cache path holds a NUL byte"))?,
+                ))
+            }
+            None => None,
+        };
         std::thread::Builder::new()
-            .name("metal-rpc".into())
+            .name("metal-accept".into())
             .spawn(move || {
-                // The server encodes every token's kernels on this thread;
-                // at the default class macOS parks it on an efficiency core
-                // while the vCPUs hold the performance cores, and a token
-                // takes half again as long as it does for a native client.
-                crate::qos::raise_interactive();
-                let device = device;
-                let mut devices = [device.0];
-                // Blocks for the life of the process: ggml's accept loop.
-                unsafe {
-                    ggml_backend_rpc_start_server(
-                        endpoint.as_ptr(),
-                        std::ptr::null(),
-                        threads,
-                        1,
-                        devices.as_mut_ptr(),
-                    )
-                };
-                let _ = &devices as *const _ as *const c_void;
+                for accepted in listener.incoming() {
+                    let stream = match accepted {
+                        Ok(stream) => stream,
+                        // A queued client that reset before it was taken, or
+                        // a descriptor table at its limit: neither ends the
+                        // device.
+                        Err(e) => {
+                            tracing::debug!(%e, "ggml rpc: accept");
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                    };
+                    let _ = stream.set_nodelay(true);
+                    crate::sockbuf::widen(&stream);
+                    let fd = stream.into_raw_fd();
+                    let cache = cache.clone();
+                    let spawned =
+                        std::thread::Builder::new()
+                            .name("metal-rpc".into())
+                            .spawn(move || {
+                                // The client's kernels are encoded on this
+                                // thread; at the default class macOS parks it on
+                                // an efficiency core while the vCPUs hold the
+                                // performance cores, and a token takes half
+                                // again as long as it does for a native client.
+                                crate::qos::raise_interactive();
+                                let device = device;
+                                let mut devices = [device.0];
+                                // Takes the descriptor: ggml closes it when the
+                                // client hangs up.
+                                unsafe {
+                                    ggml_backend_rpc_serve_fd(
+                                        fd,
+                                        cache.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                                        threads,
+                                        1,
+                                        devices.as_mut_ptr(),
+                                    )
+                                };
+                            });
+                    if let Err(e) = spawned {
+                        tracing::warn!(%e, "ggml rpc: could not serve a client");
+                        // SAFETY: ours, and no thread took it.
+                        unsafe { libc::close(fd) };
+                    }
+                }
             })?;
         tracing::info!(port, device = %name, total_mib = total >> 20, "ggml rpc server on the Mac's GPU");
         Ok(Server { port })

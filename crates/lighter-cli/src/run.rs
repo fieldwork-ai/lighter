@@ -146,7 +146,7 @@ pub fn machine() -> anyhow::Result<()> {
     };
     // ggml on the Mac's GPU, in-process. Held for the machine's life.
     let _metal = if config.metal {
-        match lighter_vmm::metal::Server::start() {
+        match lighter_vmm::metal::Server::start(Some(&home.join("ggml-cache"))) {
             Ok(server) => {
                 cmdline.push_str(&format!(" lighter.metal={}", server.port()));
                 Some(server)

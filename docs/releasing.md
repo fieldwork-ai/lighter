@@ -13,7 +13,7 @@ A release is a signed, notarized tarball on GitHub, a Homebrew formula that poin
 
 ## The renderer and the runtime
 
-The binary links virglrenderer and MoltenVK (the GPU), ONNX Runtime with its CoreML provider (the Neural Engine) and ggml with its Metal and RPC backends (`lighter.sh/metal`) statically, from archives that are not in git: `make gpu`, `make ane` and `make metal` build them into `host/out` (`host/gpu/build.sh`, `host/ane/build.sh`, `host/metal/build.sh`; the ONNX Runtime one takes most of an hour). A build without them is not a release build — the devices are stubbed and `build.rs` warns — and `nm` on the binary for `virgl_renderer_init`, `OrtGetApiBase` and `ggml_backend_rpc_start_server` is the check. The guest carries the Neural Engine's plugin provider and the lighter-mps wheels, built by `guest/ane-ep/build.sh` and `guest/torch-mps/build.sh` under `make guest`.
+The binary links virglrenderer and MoltenVK (the GPU), ONNX Runtime with its CoreML provider (the Neural Engine) and ggml with its Metal and RPC backends (`lighter.sh/metal`) statically, from archives that are not in git: `make gpu`, `make ane` and `make metal` build them into `host/out` (`host/gpu/build.sh`, `host/ane/build.sh`, `host/metal/build.sh`; the ONNX Runtime one takes most of an hour). A build without them is not a release build — the devices are stubbed and `build.rs` warns — and `nm` on the binary for `virgl_renderer_init`, `OrtGetApiBase` and `ggml_backend_rpc_serve_fd` is the check. The guest carries the Neural Engine's plugin provider and the lighter-mps wheels, built by `guest/ane-ep/build.sh` and `guest/torch-mps/build.sh` under `make guest`.
 
 ## The version
 

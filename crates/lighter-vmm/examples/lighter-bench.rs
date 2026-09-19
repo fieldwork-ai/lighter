@@ -135,7 +135,7 @@ fn main() -> ExitCode {
         None
     };
     let _metal = if metal {
-        match lighter_vmm::metal::Server::start() {
+        match lighter_vmm::metal::Server::start(None) {
             Ok(server) => {
                 config
                     .cmdline
