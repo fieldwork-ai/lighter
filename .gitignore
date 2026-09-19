@@ -54,3 +54,12 @@ benchmarks/results/gate-*.csv
 /guest/rootfs/lighter-agent
 /guest/rootfs/liblighter_ane_ep.so
 /guest/rootfs/wheels/
+
+# Guest-side build trees and their outputs: the plugin provider's cargo
+# target, the torch extension's build directory and compiled module, and
+# Python's bytecode caches. What ships is built into guest/out.
+/guest/ane-ep/target/
+/guest/torch-mps/build/
+/guest/torch-mps/lighter_mps/*.so
+__pycache__/
+*.pyc
