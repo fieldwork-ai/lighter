@@ -110,7 +110,7 @@ if [ -n "$NATIVE_BENCH" ] && [ -n "$NATIVE_MODEL" ] && [ -x "$NATIVE_BENCH" ]; t
 	ntg="$(awk -F'|' '/tg32/ {gsub(/ /,"",$8); print $8}' <<<"$native" | cut -d'±' -f1)"
 	echo "$native" | sed 's/^/    /'
 	ratio="$(python3 -c "print(int(100*${tg:-0}/max(${ntg:-1},0.001)))")"
-	if [ "$ratio" -ge 70 ]; then pass "generation in the container is ${ratio}% of native Metal (floor 70%)"; else fail "generation in the container is ${ratio}% of native Metal (floor 70%)"; fi
+	if [ "$ratio" -ge 80 ]; then pass "generation in the container is ${ratio}% of native Metal (floor 80%)"; else fail "generation in the container is ${ratio}% of native Metal (floor 80%)"; fi
 fi
 echo
 exit "$FAILED"
