@@ -135,6 +135,10 @@ gate-m7-amd64: ## M7: x86-64 containers run
 gate-m8-daily: ## M8: a day of work, and a night of sleep
 	@scripts/gates/m8-daily.sh
 
+.PHONY: gate-m9
+gate-m9: ## M9: a container reaches the Mac's GPU through Vulkan
+	@scripts/gates/m9-gpu.sh
+
 .PHONY: dogfood
 dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh
