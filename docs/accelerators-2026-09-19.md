@@ -1,6 +1,6 @@
 # lighter 0.7.0: the GPU, the Neural Engine and PyTorch in containers
 
-Status: plan, approved 2026-09-19; all five spikes passed the same day (results at the end). Three tracks, one release, one qualification. Experiments land as rows in `worklog.md` as they happen.
+Status: built. Approved 2026-09-19, spikes passed the same day, all three devices working end to end on the M1 by the evening (gates m9, m10, m11); 0.7.0 is the release (`release-notes-0.7.0.md`, `gpu.md`). This note stays as the record of the decisions and the spikes. Three tracks, one release, one qualification. Experiments land as rows in `worklog.md` as they happen.
 
 ## What ships
 
