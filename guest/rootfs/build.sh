@@ -20,6 +20,8 @@ if [ ! -f "$OUT/lighter-agent" ] \
 	"$ROOT/guest/agent/build.sh"
 fi
 cp "$OUT/lighter-agent" "$HERE/lighter-agent"
+[ -f "$OUT/liblighter_ane_ep.so" ] || "$ROOT/guest/ane-ep/build.sh"
+cp "$OUT/liblighter_ane_ep.so" "$HERE/liblighter_ane_ep.so"
 trap 'rm -f "$HERE/lighter-agent"' EXIT
 
 echo "==> Building root filesystem"

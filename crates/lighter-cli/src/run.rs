@@ -126,6 +126,23 @@ pub fn machine() -> anyhow::Result<()> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     ));
+    // The Neural Engine service: host-side only, a loopback port the
+    // container reaches through the streams; init publishes it as a CDI
+    // device. Held for the machine's life.
+    let _ane = if config.ane {
+        match lighter_vmm::ane::Server::start() {
+            Ok(server) => {
+                cmdline.push_str(&format!(" lighter.ane={}", server.port()));
+                Some(server)
+            }
+            Err(e) => {
+                tracing::warn!(%e, "the neural engine service could not start");
+                None
+            }
+        }
+    } else {
+        None
+    };
     for share in &shares {
         cmdline.push_str(&format!(
             " lighter.share={}:{}",

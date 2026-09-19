@@ -86,6 +86,9 @@ enum Command {
         /// Whether the guest has a GPU (`on`, the default, or `off`).
         #[arg(long, value_enum)]
         gpu: Option<config::Toggle>,
+        /// Whether containers may use the Neural Engine (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        ane: Option<config::Toggle>,
     },
     /// Put the guest's clock right.
     ///
@@ -244,7 +247,8 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             disk,
             publish,
             gpu,
-        } => configure(cpus, memory, disk, publish, gpu),
+            ane,
+        } => configure(cpus, memory, disk, publish, gpu, ane),
         Command::Resync => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -387,10 +391,15 @@ fn configure(
     disk: Option<u64>,
     publish: Option<config::Publish>,
     gpu: Option<config::Toggle>,
+    ane: Option<config::Toggle>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let mut config = config::Config::load()?;
-    let changed =
-        cpus.is_some() || memory.is_some() || disk.is_some() || publish.is_some() || gpu.is_some();
+    let changed = cpus.is_some()
+        || memory.is_some()
+        || disk.is_some()
+        || publish.is_some()
+        || gpu.is_some()
+        || ane.is_some();
     if let Some(cpus) = cpus {
         config.cpus = cpus;
     }
@@ -405,6 +414,9 @@ fn configure(
     }
     if let Some(gpu) = gpu {
         config.gpu = gpu.into();
+    }
+    if let Some(ane) = ane {
+        config.ane = ane.into();
     }
     if changed {
         config.save()?;
@@ -421,6 +433,7 @@ fn configure(
         }
     );
     println!("  gpu        {}", if config.gpu { "on" } else { "off" });
+    println!("  ane        {}", if config.ane { "on" } else { "off" });
     for share in &config.shares {
         println!("  share      {share}");
     }

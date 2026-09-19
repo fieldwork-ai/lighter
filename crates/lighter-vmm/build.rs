@@ -34,4 +34,39 @@ fn main() {
             dir.display()
         );
     }
+
+    // ONNX Runtime with its CoreML provider, as the static archives
+    // host/ane/build.sh collects: every lib*.a in the directory is linked.
+    println!("cargo:rustc-check-cfg=cfg(ane_libs)");
+    println!("cargo:rerun-if-env-changed=LIGHTER_ANE_LIBS");
+    let ane = std::env::var_os("LIGHTER_ANE_LIBS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../host/out/ort"));
+    println!("cargo:rerun-if-changed={}", ane.display());
+    let mut archives: Vec<String> = std::fs::read_dir(&ane)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("lib") && n.ends_with(".a"))
+                .map(|n| n[3..n.len() - 2].to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    archives.sort();
+    if cfg!(target_os = "macos") && archives.iter().any(|a| a == "onnxruntime_session") {
+        println!("cargo:rustc-link-search=native={}", ane.display());
+        for a in &archives {
+            println!("cargo:rustc-link-lib=static={a}");
+        }
+        for f in ["CoreML", "Foundation", "Accelerate"] {
+            println!("cargo:rustc-link-lib=framework={f}");
+        }
+        println!("cargo:rustc-link-lib=c++");
+        println!("cargo:rustc-cfg=ane_libs");
+    } else {
+        println!(
+            "cargo:warning=ONNX Runtime archives not found in {}; building without the Neural Engine (host/ane/build.sh)",
+            ane.display()
+        );
+    }
 }

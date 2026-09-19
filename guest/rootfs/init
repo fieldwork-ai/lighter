@@ -70,6 +70,32 @@ if [ -e /dev/dri/renderD128 ]; then
 	echo "INIT gpu=/dev/dri/renderD128"
 fi
 
+# The Neural Engine, when the host serves one (`lighter.ane=<port>`): a CDI
+# device that gives a container lighter's ONNX Runtime plugin provider and
+# the address it forwards to, the Mac's loopback through the streams.
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	lighter.ane=*)
+		mkdir -p /etc/cdi
+		cat > /etc/cdi/lighter-ane.yaml <<-EOF
+		cdiVersion: "0.6.0"
+		kind: lighter.dev/ane
+		devices:
+		  - name: all
+		    containerEdits:
+		      env:
+		        - LIGHTER_ANE=192.168.127.254:${arg#lighter.ane=}
+		        - LIGHTER_ANE_EP=/usr/lib/lighter/liblighter_ane_ep.so
+		      mounts:
+		        - hostPath: /usr/lib/lighter/liblighter_ane_ep.so
+		          containerPath: /usr/lib/lighter/liblighter_ane_ep.so
+		          options: ["ro", "bind"]
+		EOF
+		echo "INIT ane=port ${arg#lighter.ane=}"
+		;;
+	esac
+done
+
 # The machine has no RTC, so the guest starts at the epoch. That is not a
 # cosmetic problem: every TLS handshake to a registry fails on a certificate
 # that is not valid yet, and the error names the certificate rather than the

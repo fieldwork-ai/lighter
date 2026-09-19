@@ -27,6 +27,10 @@ pub struct Config {
     /// through (`docker run --device lighter.dev/gpu=all`), rendered on the
     /// Mac's own GPU. On by default; costs nothing until a container uses it.
     pub gpu: bool,
+    /// Whether containers may run ONNX models on the Mac's Neural Engine
+    /// (`docker run --device lighter.dev/ane=all`). On by default; ONNX
+    /// Runtime is loaded on the host only when a model arrives.
+    pub ane: bool,
 }
 
 /// A switch on the command line: `--gpu on`, `--gpu off`.
@@ -75,6 +79,7 @@ impl Default for Config {
             shares: vec![home_directory()],
             publish: Publish::Lan,
             gpu: true,
+            ane: true,
         }
     }
 }
@@ -186,6 +191,7 @@ mod tests {
             shares: vec!["/tmp".into()],
             publish: Publish::Localhost,
             gpu: false,
+            ane: false,
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         assert!(

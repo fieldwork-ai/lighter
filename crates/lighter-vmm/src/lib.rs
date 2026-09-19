@@ -26,6 +26,7 @@
 //! ```
 
 pub mod boot_timing;
+pub mod ane;
 pub mod bus;
 pub mod clock;
 pub mod console;
