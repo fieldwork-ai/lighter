@@ -147,6 +147,10 @@ gate-m10: ## M10: a container runs an ONNX model on the Neural Engine
 gate-m11: ## M11: a container's PyTorch runs on the Mac's GPU
 	@scripts/gates/m11-mps.sh
 
+.PHONY: gate-m12
+gate-m12: ## M12: a container's llama.cpp runs on the Mac's GPU with Metal kernels
+	@scripts/gates/m12-metal.sh
+
 .PHONY: dogfood
 dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh
