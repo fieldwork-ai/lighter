@@ -176,7 +176,15 @@ def handle(kind, payload, s):
         n = r.u32()
         args = [r.value(s) for _ in range(n)]
         op = resolve_op(name)
-        out = op(*args)
+        # The guest sends every argument positionally in schema order; the
+        # ones the schema marks keyword-only go back by name.
+        positional, keywords = [], {}
+        for spec, value in zip(op._schema.arguments, args):
+            if spec.kwarg_only:
+                keywords[spec.name] = value
+            else:
+                positional.append(value)
+        out = op(*positional, **keywords)
         # Aliases: an output that IS one of the arguments (in-place, out=)
         # goes back as that argument's position so the guest keeps its object.
         # A tuple is several returns; anything else, a list included, is one.

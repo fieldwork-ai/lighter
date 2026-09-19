@@ -11,6 +11,7 @@
 
 mod bundle;
 mod config;
+mod mps;
 mod context;
 mod doctor;
 mod installation;
@@ -89,6 +90,12 @@ enum Command {
         /// Whether containers may use the Neural Engine (`on`, the default, or `off`).
         #[arg(long, value_enum)]
         ane: Option<config::Toggle>,
+        /// Whether containers may run PyTorch on the Mac's GPU (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        mps: Option<config::Toggle>,
+        /// The Python whose torch serves the PyTorch device; `auto` to search PATH.
+        #[arg(long)]
+        torch_python: Option<String>,
     },
     /// Put the guest's clock right.
     ///
@@ -248,7 +255,9 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             publish,
             gpu,
             ane,
-        } => configure(cpus, memory, disk, publish, gpu, ane),
+            mps,
+            torch_python,
+        } => configure(cpus, memory, disk, publish, gpu, ane, mps, torch_python),
         Command::Resync => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -392,6 +401,8 @@ fn configure(
     publish: Option<config::Publish>,
     gpu: Option<config::Toggle>,
     ane: Option<config::Toggle>,
+    mps: Option<config::Toggle>,
+    torch_python: Option<String>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let mut config = config::Config::load()?;
     let changed = cpus.is_some()
@@ -399,7 +410,9 @@ fn configure(
         || disk.is_some()
         || publish.is_some()
         || gpu.is_some()
-        || ane.is_some();
+        || ane.is_some()
+        || mps.is_some()
+        || torch_python.is_some();
     if let Some(cpus) = cpus {
         config.cpus = cpus;
     }
@@ -418,6 +431,12 @@ fn configure(
     if let Some(ane) = ane {
         config.ane = ane.into();
     }
+    if let Some(mps) = mps {
+        config.mps = mps.into();
+    }
+    if let Some(python) = torch_python {
+        config.torch_python = if python == "auto" { String::new() } else { python };
+    }
     if changed {
         config.save()?;
         println!("Saved. Restart for it to take effect: `lighter restart`");
@@ -434,6 +453,11 @@ fn configure(
     );
     println!("  gpu        {}", if config.gpu { "on" } else { "off" });
     println!("  ane        {}", if config.ane { "on" } else { "off" });
+    println!(
+        "  mps        {}{}",
+        if config.mps { "on" } else { "off" },
+        if config.torch_python.is_empty() { String::new() } else { format!(" (torch from {})", config.torch_python) }
+    );
     for share in &config.shares {
         println!("  share      {share}");
     }

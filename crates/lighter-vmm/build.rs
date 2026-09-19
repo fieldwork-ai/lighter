@@ -58,7 +58,7 @@ fn main() {
         for a in &archives {
             println!("cargo:rustc-link-lib=static={a}");
         }
-        for f in ["CoreML", "Foundation", "Accelerate"] {
+        for f in ["CoreML", "Foundation", "Accelerate", "Network"] {
             println!("cargo:rustc-link-lib=framework={f}");
         }
         println!("cargo:rustc-link-lib=c++");

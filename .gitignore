@@ -51,3 +51,6 @@ benchmarks/results/gate-*.csv
 # Retained published CSVs are tracked explicitly; new scratch runs stay local.
 /benchmarks/results/**/*.csv
 /benchmarks/results/**/*.tree
+/guest/rootfs/lighter-agent
+/guest/rootfs/liblighter_ane_ep.so
+/guest/rootfs/wheels/

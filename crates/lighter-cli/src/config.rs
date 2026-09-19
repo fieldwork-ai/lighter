@@ -31,6 +31,14 @@ pub struct Config {
     /// (`docker run --device lighter.dev/ane=all`). On by default; ONNX
     /// Runtime is loaded on the host only when a model arrives.
     pub ane: bool,
+    /// Whether containers may run PyTorch on the Mac's GPU
+    /// (`docker run --device lighter.dev/mps=all`): the Mac's own `torch`
+    /// executes what a container's `torch` asks, one operator at a time.
+    /// On by default, and present only when a Python with torch and MPS is
+    /// found (`torch_python`, or the first `python3` on PATH that has it).
+    pub mps: bool,
+    /// The Python whose `torch` serves `lighter.dev/mps`; empty means search.
+    pub torch_python: String,
 }
 
 /// A switch on the command line: `--gpu on`, `--gpu off`.
@@ -80,6 +88,8 @@ impl Default for Config {
             publish: Publish::Lan,
             gpu: true,
             ane: true,
+            mps: true,
+            torch_python: String::new(),
         }
     }
 }
@@ -192,6 +202,8 @@ mod tests {
             publish: Publish::Localhost,
             gpu: false,
             ane: false,
+            mps: false,
+            torch_python: String::new(),
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         assert!(

@@ -22,6 +22,8 @@ fi
 cp "$OUT/lighter-agent" "$HERE/lighter-agent"
 [ -f "$OUT/liblighter_ane_ep.so" ] || "$ROOT/guest/ane-ep/build.sh"
 cp "$OUT/liblighter_ane_ep.so" "$HERE/liblighter_ane_ep.so"
+[ -d "$OUT/wheels" ] || "$ROOT/guest/torch-mps/build.sh"
+rm -rf "$HERE/wheels" && cp -r "$OUT/wheels" "$HERE/wheels"
 trap 'rm -f "$HERE/lighter-agent"' EXIT
 
 echo "==> Building root filesystem"

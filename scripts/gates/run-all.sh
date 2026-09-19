@@ -26,6 +26,7 @@ GATES=(
 	"m8  daily driver:m8-daily.sh"
 	"m9  gpu:m9-gpu.sh"
 	"m10 neural engine:m10-ane.sh"
+	"m11 pytorch:m11-mps.sh"
 )
 
 only="${1:-}"

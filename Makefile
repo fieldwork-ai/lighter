@@ -143,6 +143,10 @@ gate-m9: ## M9: a container reaches the Mac's GPU through Vulkan
 gate-m10: ## M10: a container runs an ONNX model on the Neural Engine
 	@scripts/gates/m10-ane.sh
 
+.PHONY: gate-m11
+gate-m11: ## M11: a container's PyTorch runs on the Mac's GPU
+	@scripts/gates/m11-mps.sh
+
 .PHONY: dogfood
 dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh

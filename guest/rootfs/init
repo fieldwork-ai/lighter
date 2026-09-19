@@ -93,6 +93,24 @@ for arg in $(cat /proc/cmdline); do
 		EOF
 		echo "INIT ane=port ${arg#lighter.ane=}"
 		;;
+	lighter.mps=*)
+		mkdir -p /etc/cdi
+		cat > /etc/cdi/lighter-mps.yaml <<-EOF
+		cdiVersion: "0.6.0"
+		kind: lighter.dev/mps
+		devices:
+		  - name: all
+		    containerEdits:
+		      env:
+		        - LIGHTER_MPS=192.168.127.254:${arg#lighter.mps=}
+		        - PIP_FIND_LINKS=/usr/lib/lighter/wheels
+		      mounts:
+		        - hostPath: /usr/lib/lighter/wheels
+		          containerPath: /usr/lib/lighter/wheels
+		          options: ["ro", "bind"]
+		EOF
+		echo "INIT mps=port ${arg#lighter.mps=}"
+		;;
 	esac
 done
 

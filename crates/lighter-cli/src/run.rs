@@ -13,6 +13,7 @@ use lighter_vmm::wake::{Observer, Power};
 use lighter_vmm::{Machine, MachineConfig};
 
 use crate::config::Config;
+use crate::mps;
 use crate::paths;
 
 /// Builds the machine described by the configuration and runs it until it
@@ -137,6 +138,29 @@ pub fn machine() -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!(%e, "the neural engine service could not start");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // PyTorch on the Mac's GPU: the user's own torch, in their own Python,
+    // when there is one. Held for the machine's life.
+    let _mps = if config.mps {
+        match mps::find_python(&config.torch_python) {
+            Ok((python, version)) => match mps::Host::start(&python, &home) {
+                Ok(host) => {
+                    tracing::info!(python = %python.display(), torch = %version, port = host.port(), "pytorch device served by the Mac's torch");
+                    cmdline.push_str(&format!(" lighter.mps={}", host.port()));
+                    Some(host)
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "the pytorch host could not start; no lighter.dev/mps this run");
+                    None
+                }
+            },
+            Err(why) => {
+                tracing::info!(%why, "no torch with MPS on the Mac; no lighter.dev/mps this run");
                 None
             }
         }

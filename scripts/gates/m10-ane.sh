@@ -82,9 +82,12 @@ grep -q "INIT ane=port" "$LOG" && pass "init published the device" || fail "init
 
 echo
 echo "==> An ONNX model in a container (${IMAGE}, --device lighter.dev/ane=all)"
-if out="$(docker run --rm --device lighter.dev/ane=all \
-	-v "$ROOT/scripts/gates/fixtures:/fixtures:ro" "$IMAGE" sh -c \
-	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1' 2>&1)"; then
+# The fixtures go in by `docker cp`: the daemon is in the guest, so a bind
+# mount of a Mac path would need a share this machine does not have.
+container="$(docker create --device lighter.dev/ane=all "$IMAGE" sh -c \
+	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1')"
+docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
+if out="$(docker start -a "$container" 2>&1)"; then
 	pass "$(grep RESULT <<<"$out" | tail -1)"
 else
 	status=$?
@@ -94,6 +97,7 @@ else
 		fail "the client failed ($status)"; tail -15 <<<"$out" | sed 's/^/    /'
 	fi
 fi
+docker rm "$container" >/dev/null 2>&1 || true
 grep -q "neural engine model loaded" "$LOG" && pass "the host loaded the model" || fail "the host never loaded a model"
 
 echo
