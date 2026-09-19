@@ -112,7 +112,7 @@ docker run --rm --device lighter.sh/mps=all python:3.12-slim sh -c '
 
 - Native `model.to("mps")` works seamlessly for both inference and training with autograd.
 - Host PyTorch is discovered automatically from your macOS environment (`lighter config --torch-python`).
-- The wheels are built for CPython 3.11 to 3.13 against torch 2.14.0, and the host's torch must be the same version; `lighter doctor` says which it found. A 3.14 image or another torch fails at `pip install lighter-mps` or at start.
+- The wheels are built for CPython 3.11 to 3.13 against torch 2.14.0, and the host's torch must be the same version, with numpy beside it; `lighter doctor` says which it found. A 3.14 image or another torch fails at `pip install lighter-mps` or at start.
 
 ### 3. Apple Neural Engine (`--device lighter.sh/ane=all`)
 

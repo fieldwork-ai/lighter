@@ -39,7 +39,9 @@ pub fn find_python(configured: &str) -> Result<(PathBuf, String), String> {
         let out = Command::new(&python)
             .args([
                 "-c",
-                "import torch; print(torch.__version__, torch.backends.mps.is_available())",
+                // The host carries tensors through numpy, so a torch without
+                // it is not a host; the M5's first venv had one.
+                "import torch; ok = torch.backends.mps.is_available()\ntry:\n    import numpy\nexcept ImportError:\n    ok = 'no-numpy'\nprint(torch.__version__, ok)",
             ])
             .stderr(Stdio::null())
             .output();
@@ -48,10 +50,14 @@ pub fn find_python(configured: &str) -> Result<(PathBuf, String), String> {
                 let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 let mut words = text.split_whitespace();
                 let version = words.next().unwrap_or("").to_string();
-                if words.next() == Some("True") {
-                    return Ok((python, version));
+                match words.next() {
+                    Some("True") => return Ok((python, version)),
+                    Some("no-numpy") => reasons.push(format!(
+                        "{}: torch {version} without numpy (pip install numpy)",
+                        python.display()
+                    )),
+                    _ => reasons.push(format!("{}: torch {version} without MPS", python.display())),
                 }
-                reasons.push(format!("{}: torch {version} without MPS", python.display()));
             }
             _ => reasons.push(format!("{}: no torch", python.display())),
         }
