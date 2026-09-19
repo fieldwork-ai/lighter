@@ -67,7 +67,12 @@ pub struct Fences {
 
 impl Fences {
     fn push(&self, f: Signalled) {
-        tracing::trace!(ctx = f.ctx_id, ring = f.ring_idx, fence = f.fence_id, "gpu fence signalled");
+        tracing::trace!(
+            ctx = f.ctx_id,
+            ring = f.ring_idx,
+            fence = f.fence_id,
+            "gpu fence signalled"
+        );
         self.done.lock().expect("gpu fences poisoned").push_back(f);
         self.arrived.notify_one();
     }
@@ -82,7 +87,11 @@ impl Fences {
     }
 
     fn drain(&self) -> Vec<Signalled> {
-        self.done.lock().expect("gpu fences poisoned").drain(..).collect()
+        self.done
+            .lock()
+            .expect("gpu fences poisoned")
+            .drain(..)
+            .collect()
     }
 }
 
@@ -97,7 +106,12 @@ unsafe extern "C" fn write_fence(cookie: *mut c_void, fence_id: u32) {
     });
 }
 
-unsafe extern "C" fn write_context_fence(cookie: *mut c_void, ctx_id: u32, ring_idx: u32, fence_id: u64) {
+unsafe extern "C" fn write_context_fence(
+    cookie: *mut c_void,
+    ctx_id: u32,
+    ring_idx: u32,
+    fence_id: u64,
+) {
     let fences = unsafe { &*(cookie as *const Fences) };
     fences.push(Signalled {
         ctx_id,
@@ -189,23 +203,35 @@ impl Gpu {
         // SAFETY: the callbacks and cookie outlive the renderer (see Drop).
         let r = unsafe { virgl::virgl_renderer_init(cookie, flags, &mut *self.callbacks) };
         if r != 0 {
-            tracing::warn!(r, "virglrenderer failed to initialise; the GPU is unavailable");
+            tracing::warn!(
+                r,
+                "virglrenderer failed to initialise; the GPU is unavailable"
+            );
             return false;
         }
         let (mut ver, mut size) = (0u32, 0u32);
         unsafe { virgl::virgl_renderer_get_cap_set(wire::CAPSET_VENUS, &mut ver, &mut size) };
         let mut caps = vec![0u8; size as usize];
         if size > 0 {
-            unsafe { virgl::virgl_renderer_fill_caps(wire::CAPSET_VENUS, ver, caps.as_mut_ptr().cast()) };
+            unsafe {
+                virgl::virgl_renderer_fill_caps(wire::CAPSET_VENUS, ver, caps.as_mut_ptr().cast())
+            };
         }
-        tracing::info!(capset_version = ver, capset_bytes = size, "gpu renderer initialised");
+        tracing::info!(
+            capset_version = ver,
+            capset_bytes = size,
+            "gpu renderer initialised"
+        );
         self.caps = Some((ver, caps));
         self.renderer = true;
         true
     }
 
     /// Splits a chain into what the guest wrote and where it wants the reply.
-    fn split(mem: &GuestMemory, chain: impl Iterator<Item = Descriptor>) -> (Vec<u8>, Vec<(u64, u32)>) {
+    fn split(
+        mem: &GuestMemory,
+        chain: impl Iterator<Item = Descriptor>,
+    ) -> (Vec<u8>, Vec<(u64, u32)>) {
         let mut request = Vec::new();
         let mut reply = Vec::new();
         for desc in chain {
@@ -276,9 +302,18 @@ impl Gpu {
                     let nlen = wire::u32_at(req, 24).min(64);
                     let capset = wire::u32_at(req, 28) & 0xff;
                     let name = &req[32..32 + nlen as usize];
-                    let flags = if capset == 0 { wire::CAPSET_VENUS } else { capset };
+                    let flags = if capset == 0 {
+                        wire::CAPSET_VENUS
+                    } else {
+                        capset
+                    };
                     let r = unsafe {
-                        virgl::virgl_renderer_context_create_with_flags(hdr.ctx_id, flags, nlen, name.as_ptr().cast())
+                        virgl::virgl_renderer_context_create_with_flags(
+                            hdr.ctx_id,
+                            flags,
+                            nlen,
+                            name.as_ptr().cast(),
+                        )
                     };
                     if r == 0 {
                         self.contexts.insert(hdr.ctx_id, ());
@@ -303,9 +338,13 @@ impl Gpu {
                     ok(&mut out, wire::RESP_ERR_INVALID_RESOURCE_ID);
                 } else {
                     if hdr.kind == wire::CMD_CTX_ATTACH_RESOURCE {
-                        unsafe { virgl::virgl_renderer_ctx_attach_resource(hdr.ctx_id as i32, res as i32) };
+                        unsafe {
+                            virgl::virgl_renderer_ctx_attach_resource(hdr.ctx_id as i32, res as i32)
+                        };
                     } else {
-                        unsafe { virgl::virgl_renderer_ctx_detach_resource(hdr.ctx_id as i32, res as i32) };
+                        unsafe {
+                            virgl::virgl_renderer_ctx_detach_resource(hdr.ctx_id as i32, res as i32)
+                        };
                     }
                     ok(&mut out, wire::RESP_OK_NODATA);
                 }
@@ -339,18 +378,32 @@ impl Gpu {
                 let size = wire::u32_at(req, 24) as usize;
                 if !self.contexts.contains_key(&hdr.ctx_id) {
                     ok(&mut out, wire::RESP_ERR_INVALID_CONTEXT_ID);
-                } else if req.len() < 32 + size || size % 4 != 0 {
+                } else if req.len() < 32 + size || !size.is_multiple_of(4) {
                     ok(&mut out, wire::RESP_ERR_INVALID_PARAMETER);
                 } else {
                     let mut buf = req[32..32 + size].to_vec();
                     let r = unsafe {
-                        virgl::virgl_renderer_submit_cmd(buf.as_mut_ptr().cast(), hdr.ctx_id as i32, (size / 4) as i32)
+                        virgl::virgl_renderer_submit_cmd(
+                            buf.as_mut_ptr().cast(),
+                            hdr.ctx_id as i32,
+                            (size / 4) as i32,
+                        )
                     };
-                    ok(&mut out, if r == 0 { wire::RESP_OK_NODATA } else { wire::RESP_ERR_UNSPEC });
+                    ok(
+                        &mut out,
+                        if r == 0 {
+                            wire::RESP_OK_NODATA
+                        } else {
+                            wire::RESP_ERR_UNSPEC
+                        },
+                    );
                 }
             }
             other => {
-                tracing::debug!(cmd = format_args!("{other:#x}"), "gpu command not supported");
+                tracing::debug!(
+                    cmd = format_args!("{other:#x}"),
+                    "gpu command not supported"
+                );
                 ok(&mut out, wire::RESP_ERR_UNSPEC);
             }
         }
@@ -395,7 +448,11 @@ impl Gpu {
             blob_flags,
             blob_id,
             size,
-            iovecs: if iovs.is_empty() { std::ptr::null() } else { iovs.as_ptr() },
+            iovecs: if iovs.is_empty() {
+                std::ptr::null()
+            } else {
+                iovs.as_ptr()
+            },
             num_iovs: iovs.len() as u32,
         };
         let r = unsafe { virgl::virgl_renderer_resource_create_blob(&args) };
@@ -431,7 +488,8 @@ impl Gpu {
         // host's size is whatever Metal gave, rounded up to the same page.
         let len = (size as usize).div_ceil(HOST_PAGE) * HOST_PAGE;
         let gpa = self.aperture.base + offset;
-        let fits = offset % HOST_PAGE as u64 == 0 && offset + len as u64 <= self.aperture.size;
+        let fits =
+            offset.is_multiple_of(HOST_PAGE as u64) && offset + len as u64 <= self.aperture.size;
         if !fits {
             unsafe { virgl::virgl_renderer_resource_unmap(res) };
             tracing::warn!(res, offset, len, "gpu blob does not fit the aperture");
@@ -484,7 +542,12 @@ impl Gpu {
                 let p = &self.pending[i];
                 if p.ctx_id == f.ctx_id && p.ring_idx == f.ring_idx && p.fence_id <= f.fence_id {
                     let p = self.pending.remove(i);
-                    tracing::trace!(ctx = p.ctx_id, ring = p.ring_idx, fence = p.fence_id, "gpu fenced command completed");
+                    tracing::trace!(
+                        ctx = p.ctx_id,
+                        ring = p.ring_idx,
+                        fence = p.fence_id,
+                        "gpu fenced command completed"
+                    );
                     queue.push_used(mem, p.head, p.len);
                     any = true;
                 } else {
@@ -509,18 +572,40 @@ impl Gpu {
             let len = Gpu::scatter(mem, &reply, &resp);
             let fenced = hdr.flags & wire::FLAG_FENCE != 0 && self.renderer;
             if fenced {
-                let ring_idx = if hdr.flags & wire::FLAG_INFO_RING_IDX != 0 { u32::from(hdr.ring_idx) } else { 0 };
+                let ring_idx = if hdr.flags & wire::FLAG_INFO_RING_IDX != 0 {
+                    u32::from(hdr.ring_idx)
+                } else {
+                    0
+                };
                 let r = if hdr.ctx_id != 0 && self.contexts.contains_key(&hdr.ctx_id) {
-                    unsafe { virgl::virgl_renderer_context_create_fence(hdr.ctx_id, 0, ring_idx, hdr.fence_id) }
+                    unsafe {
+                        virgl::virgl_renderer_context_create_fence(
+                            hdr.ctx_id,
+                            0,
+                            ring_idx,
+                            hdr.fence_id,
+                        )
+                    }
                 } else {
                     unsafe { virgl::virgl_renderer_create_fence(hdr.fence_id as i32, 0) }
                 };
-                tracing::trace!(r, cmd = format_args!("{:#x}", hdr.kind), ctx = hdr.ctx_id, ring_idx, fence = hdr.fence_id, "gpu fence created");
+                tracing::trace!(
+                    r,
+                    cmd = format_args!("{:#x}", hdr.kind),
+                    ctx = hdr.ctx_id,
+                    ring_idx,
+                    fence = hdr.fence_id,
+                    "gpu fence created"
+                );
                 if r == 0 {
                     self.pending.push(Pending {
                         head,
                         len,
-                        ctx_id: if hdr.ctx_id != 0 && self.contexts.contains_key(&hdr.ctx_id) { hdr.ctx_id } else { 0 },
+                        ctx_id: if hdr.ctx_id != 0 && self.contexts.contains_key(&hdr.ctx_id) {
+                            hdr.ctx_id
+                        } else {
+                            0
+                        },
                         ring_idx,
                         fence_id: hdr.fence_id,
                     });
@@ -587,9 +672,7 @@ impl VirtioDevice for Gpu {
                     return Serviced::NONE;
                 };
                 let mut used = false;
-                while let Some(chain) = q.pop(mem) {
-                    let head = chain.head();
-                    drop(chain);
+                while let Some(head) = q.pop(mem).map(|chain| chain.head()) {
                     q.push_used(mem, head, 0);
                     used = true;
                 }

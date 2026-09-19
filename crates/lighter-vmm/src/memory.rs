@@ -300,7 +300,10 @@ impl GuestMemory {
     /// range is unmapped. The guest can read and write it at any time.
     pub unsafe fn map_foreign(&self, gpa: u64, host: *mut u8, len: usize) -> Result<()> {
         let vm = self.vm.as_ref().ok_or(MemoryError::Detached)?;
-        if gpa as usize % HOST_PAGE != 0 || len % HOST_PAGE != 0 || host as usize % HOST_PAGE != 0 {
+        if !(gpa as usize).is_multiple_of(HOST_PAGE)
+            || !len.is_multiple_of(HOST_PAGE)
+            || !(host as usize).is_multiple_of(HOST_PAGE)
+        {
             return Err(MemoryError::Unaligned {
                 gpa,
                 len,

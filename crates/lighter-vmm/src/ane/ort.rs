@@ -72,12 +72,22 @@ impl Runtime {
         }
         let api = unsafe { ((*base).GetApi.unwrap())(sys::ORT_API_VERSION) };
         if api.is_null() {
-            return Err(format!("ONNX Runtime does not offer API version {}", sys::ORT_API_VERSION));
+            return Err(format!(
+                "ONNX Runtime does not offer API version {}",
+                sys::ORT_API_VERSION
+            ));
         }
         let api: &'static sys::OrtApi = unsafe { &*api };
         let name = CString::new("lighter").unwrap();
         let mut env: *mut sys::OrtEnv = ptr::null_mut();
-        check!(api, (api.CreateEnv.unwrap())(sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_WARNING, name.as_ptr(), &mut env));
+        check!(
+            api,
+            (api.CreateEnv.unwrap())(
+                sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_WARNING,
+                name.as_ptr(),
+                &mut env
+            )
+        );
         Ok(Runtime { api, env })
     }
 
@@ -87,8 +97,14 @@ impl Runtime {
         let api = self.api;
         let mut options: *mut sys::OrtSessionOptions = ptr::null_mut();
         check!(api, (api.CreateSessionOptions.unwrap())(&mut options));
-        let keys = [CString::new("ModelFormat").unwrap(), CString::new("MLComputeUnits").unwrap()];
-        let values = [CString::new("NeuralNetwork").unwrap(), CString::new("ALL").unwrap()];
+        let keys = [
+            CString::new("ModelFormat").unwrap(),
+            CString::new("MLComputeUnits").unwrap(),
+        ];
+        let values = [
+            CString::new("NeuralNetwork").unwrap(),
+            CString::new("ALL").unwrap(),
+        ];
         let key_ptrs: Vec<*const c_char> = keys.iter().map(|k| k.as_ptr()).collect();
         let value_ptrs: Vec<*const c_char> = values.iter().map(|v| v.as_ptr()).collect();
         let provider = CString::new("CoreML").unwrap();
@@ -120,9 +136,20 @@ impl Runtime {
             return Err(status_message(api, created));
         }
         let mut allocator: *mut sys::OrtAllocator = ptr::null_mut();
-        check!(api, (api.GetAllocatorWithDefaultOptions.unwrap())(&mut allocator));
-        let names = |count: unsafe extern "C" fn(*const sys::OrtSession, *mut usize) -> sys::OrtStatusPtr,
-                     name: unsafe extern "C" fn(*const sys::OrtSession, usize, *mut sys::OrtAllocator, *mut *mut c_char) -> sys::OrtStatusPtr|
+        check!(
+            api,
+            (api.GetAllocatorWithDefaultOptions.unwrap())(&mut allocator)
+        );
+        let names = |count: unsafe extern "C" fn(
+            *const sys::OrtSession,
+            *mut usize,
+        ) -> sys::OrtStatusPtr,
+                     name: unsafe extern "C" fn(
+            *const sys::OrtSession,
+            usize,
+            *mut sys::OrtAllocator,
+            *mut *mut c_char,
+        ) -> sys::OrtStatusPtr|
          -> Result<Vec<CString>, String> {
             let mut n = 0usize;
             let st = unsafe { count(session, &mut n) };
@@ -141,8 +168,14 @@ impl Runtime {
             }
             Ok(out)
         };
-        let inputs = names(api.SessionGetInputCount.unwrap(), api.SessionGetInputName.unwrap())?;
-        let outputs = names(api.SessionGetOutputCount.unwrap(), api.SessionGetOutputName.unwrap())?;
+        let inputs = names(
+            api.SessionGetInputCount.unwrap(),
+            api.SessionGetInputName.unwrap(),
+        )?;
+        let outputs = names(
+            api.SessionGetOutputCount.unwrap(),
+            api.SessionGetOutputName.unwrap(),
+        )?;
         Ok(Session {
             api,
             session,
@@ -164,7 +197,11 @@ impl Session {
     pub fn run(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>, String> {
         let api = self.api;
         if inputs.len() != self.inputs.len() {
-            return Err(format!("the model takes {} inputs, {} were sent", self.inputs.len(), inputs.len()));
+            return Err(format!(
+                "the model takes {} inputs, {} were sent",
+                self.inputs.len(),
+                inputs.len()
+            ));
         }
         let mut memory_info: *mut sys::OrtMemoryInfo = ptr::null_mut();
         check!(
@@ -260,12 +297,18 @@ impl Session {
         unsafe { (api.ReleaseTensorTypeAndShapeInfo.unwrap())(info) };
         let size = element_size(element_type);
         if size == 0 {
-            return Err(format!("output of element type {element_type} cannot be carried"));
+            return Err(format!(
+                "output of element type {element_type} cannot be carried"
+            ));
         }
         let elements: usize = dims.iter().map(|d| (*d).max(0) as usize).product();
         let mut data: *mut c_void = ptr::null_mut();
-        check!(api, (api.GetTensorMutableData.unwrap())(v as *mut sys::OrtValue, &mut data));
-        let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, elements * size) }.to_vec();
+        check!(
+            api,
+            (api.GetTensorMutableData.unwrap())(v as *mut sys::OrtValue, &mut data)
+        );
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data as *const u8, elements * size) }.to_vec();
         Ok(Tensor {
             element_type,
             dims,

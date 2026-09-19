@@ -119,7 +119,9 @@ fn main() -> ExitCode {
     let _ane = if ane {
         match lighter_vmm::ane::Server::start() {
             Ok(server) => {
-                config.cmdline.push_str(&format!(" lighter.ane={}", server.port()));
+                config
+                    .cmdline
+                    .push_str(&format!(" lighter.ane={}", server.port()));
                 Some(server)
             }
             Err(e) => {

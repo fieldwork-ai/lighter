@@ -187,9 +187,7 @@ fn notify_kind(name: &str) -> usize {
 
 impl VirtioMmio {
     fn shm_region(&self) -> Option<&crate::virtio::ShmRegion> {
-        self.shm
-            .iter()
-            .find(|r| u32::from(r.id) == self.shm_sel)
+        self.shm.iter().find(|r| u32::from(r.id) == self.shm_sel)
     }
 
     pub fn new(
@@ -411,9 +409,7 @@ impl VirtioMmio {
             // A region the device does not have reads as length -1, which is
             // how the spec says "none"; its base is then meaningless.
             SHM_LEN_LOW => self.shm_region().map_or(u32::MAX, |r| r.len as u32),
-            SHM_LEN_HIGH => self
-                .shm_region()
-                .map_or(u32::MAX, |r| (r.len >> 32) as u32),
+            SHM_LEN_HIGH => self.shm_region().map_or(u32::MAX, |r| (r.len >> 32) as u32),
             SHM_BASE_LOW => self.shm_region().map_or(0, |r| r.base as u32),
             SHM_BASE_HIGH => self.shm_region().map_or(0, |r| (r.base >> 32) as u32),
             _ => 0,

@@ -252,15 +252,25 @@ void remote_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   for (uint32_t i = 0; i < nout; i++) {
     uint8_t how = r.u8();
     if (how == 0xFE) {
+      // An argument returned as itself, with whatever shape the operator
+      // left it (resize_, set_, out= into an empty tensor).
       uint32_t idx = r.u32();
-      stack->push_back(kept.at(idx));
+      c10::IValue self = kept.at(idx);
+      auto dtype = (at::ScalarType)r.u8();
+      uint32_t n = r.u32(); std::vector<int64_t> sizes(n); for (auto& s : sizes) s = r.i64();
+      n = r.u32(); std::vector<int64_t> strides(n); for (auto& s : strides) s = r.i64();
+      int64_t offset = r.i64();
+      if (self.isTensor()) {
+        auto* impl = self.toTensor().unsafeGetTensorImpl();
+        (void)dtype;
+        impl->set_sizes_and_strides(sizes, strides);
+        impl->set_storage_offset(offset);
+      }
+      stack->push_back(self);
     } else {
       stack->push_back(read_value(r));
     }
   }
-  // An in-place operator answered with an alias may have changed its shape
-  // (resize_, set_): the host's metadata is not re-read here; the ops that
-  // resize are rare and go through the explicit kernels below.
 }
 
 // ---------------- copies, the one place bytes move ----------------
@@ -308,6 +318,42 @@ at::Tensor remote_copy_from_and_resize(const at::Tensor& self, const at::Tensor&
 
 at::Scalar remote_local_scalar_dense(const at::Tensor& self) {
   return download(self).item();
+}
+
+// ---------------- convolution ----------------
+//
+// A backend that is not CPU or CUDA is asked for `convolution_overrideable`,
+// whose default throws; the host has no such kernel either, but it has
+// `convolution`, with the same arguments, and `convolution_backward`.
+
+void call_remote(const char* name, const char* overload, torch::jit::Stack& stack) {
+  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(name, overload);
+  remote_fallback(op, &stack);
+}
+
+at::Tensor remote_convolution(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,
+                              at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed,
+                              at::IntArrayRef output_padding, int64_t groups) {
+  torch::jit::Stack stack{input, weight, bias.has_value() ? c10::IValue(*bias) : c10::IValue(),
+                          c10::IValue(stride.vec()), c10::IValue(padding.vec()), c10::IValue(dilation.vec()),
+                          transposed, c10::IValue(output_padding.vec()), groups};
+  call_remote("aten::convolution", "", stack);
+  return stack.back().toTensor();
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> remote_convolution_backward(
+    const at::Tensor& grad_output, const at::Tensor& input, const at::Tensor& weight, at::IntArrayRef stride,
+    at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed, at::IntArrayRef output_padding, int64_t groups,
+    std::array<bool, 3> output_mask) {
+  c10::IValue bias_sizes = output_mask[2] ? c10::IValue(std::vector<int64_t>{weight.size(0)}) : c10::IValue();
+  c10::List<bool> mask; mask.push_back(output_mask[0]); mask.push_back(output_mask[1]); mask.push_back(output_mask[2]);
+  torch::jit::Stack stack{grad_output, input, weight, bias_sizes, c10::IValue(stride.vec()), c10::IValue(padding.vec()),
+                          c10::IValue(dilation.vec()), transposed, c10::IValue(output_padding.vec()), groups, c10::IValue(mask)};
+  call_remote("aten::convolution_backward", "", stack);
+  auto undefined = at::Tensor();
+  size_t n = stack.size();
+  auto get = [&](size_t i) { const auto& v = stack[n - 3 + i]; return v.isTensor() ? v.toTensor() : undefined; };
+  return std::make_tuple(get(0), get(1), get(2));
 }
 
 // ---------------- device plumbing ----------------
@@ -365,6 +411,8 @@ TORCH_LIBRARY_IMPL(aten, MPS, m) {
   m.impl("_copy_from", &remote_copy_from);
   m.impl("_copy_from_and_resize", &remote_copy_from_and_resize);
   m.impl("_local_scalar_dense", &remote_local_scalar_dense);
+  m.impl("convolution_overrideable", &remote_convolution);
+  m.impl("convolution_backward_overrideable", &remote_convolution_backward);
 }
 
 TORCH_LIBRARY_IMPL(_, MPS, m) {

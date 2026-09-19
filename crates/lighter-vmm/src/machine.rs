@@ -208,7 +208,11 @@ impl Machine {
             config.vcpus,
             config.ram_bytes,
             config.hotplug_bytes,
-            if config.gpu { config.gpu_aperture_bytes } else { 0 },
+            if config.gpu {
+                config.gpu_aperture_bytes
+            } else {
+                0
+            },
         )?;
         tracing::debug!(
             gicd = format_args!("{:#x}..{:#x}", layout.gicd.base, layout.gicd.end()),

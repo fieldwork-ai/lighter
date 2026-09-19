@@ -25,8 +25,8 @@
 //!     └── net       the host end of the network, behind a process boundary
 //! ```
 
-pub mod boot_timing;
 pub mod ane;
+pub mod boot_timing;
 pub mod bus;
 pub mod clock;
 pub mod console;

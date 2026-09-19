@@ -49,21 +49,9 @@ pub const NO_VIRGL: c_int = 1 << 7;
 pub const ASYNC_FENCE_CB: c_int = 1 << 8;
 pub const RENDER_SERVER: c_int = 1 << 9;
 
+// The archives and frameworks come from build.rs, which also decides
+// whether this block is compiled at all.
 #[cfg(gpu_libs)]
-#[link(name = "virglrenderer", kind = "static")]
-#[link(name = "virgl", kind = "static")]
-#[link(name = "mesa", kind = "static")]
-#[link(name = "MoltenVK", kind = "static")]
-#[link(name = "Metal", kind = "framework")]
-#[link(name = "Foundation", kind = "framework")]
-#[link(name = "IOSurface", kind = "framework")]
-#[link(name = "QuartzCore", kind = "framework")]
-#[link(name = "CoreGraphics", kind = "framework")]
-#[link(name = "IOKit", kind = "framework")]
-#[link(name = "AppKit", kind = "framework")]
-#[link(name = "objc")]
-#[link(name = "c++")]
-#[link(name = "clang_rt.osx", kind = "static")]
 unsafe extern "C" {
     pub fn virgl_renderer_init(cookie: *mut c_void, flags: c_int, cb: *mut Callbacks) -> c_int;
     pub fn virgl_renderer_cleanup(cookie: *mut c_void);
@@ -80,33 +68,70 @@ unsafe extern "C" {
     pub fn virgl_renderer_ctx_detach_resource(ctx_id: c_int, res_handle: c_int);
     pub fn virgl_renderer_resource_create_blob(args: *const BlobArgs) -> c_int;
     pub fn virgl_renderer_resource_unref(res_handle: u32);
-    pub fn virgl_renderer_resource_map(res_handle: u32, map: *mut *mut c_void, size: *mut u64) -> c_int;
+    pub fn virgl_renderer_resource_map(
+        res_handle: u32,
+        map: *mut *mut c_void,
+        size: *mut u64,
+    ) -> c_int;
     pub fn virgl_renderer_resource_unmap(res_handle: u32) -> c_int;
     pub fn virgl_renderer_resource_get_map_info(res_handle: u32, map_info: *mut u32) -> c_int;
     pub fn virgl_renderer_submit_cmd(buffer: *mut c_void, ctx_id: c_int, ndw: c_int) -> c_int;
-    pub fn virgl_renderer_context_create_fence(ctx_id: u32, flags: u32, ring_idx: u32, fence_id: u64) -> c_int;
+    pub fn virgl_renderer_context_create_fence(
+        ctx_id: u32,
+        flags: u32,
+        ring_idx: u32,
+        fence_id: u64,
+    ) -> c_int;
     pub fn virgl_renderer_create_fence(client_fence_id: c_int, ctx_id: u32) -> c_int;
 }
 
 #[cfg(not(gpu_libs))]
 mod stub {
     use super::*;
-    pub unsafe fn virgl_renderer_init(_: *mut c_void, _: c_int, _: *mut Callbacks) -> c_int { -1 }
+    pub unsafe fn virgl_renderer_init(_: *mut c_void, _: c_int, _: *mut Callbacks) -> c_int {
+        -1
+    }
     pub unsafe fn virgl_renderer_cleanup(_: *mut c_void) {}
-    pub unsafe fn virgl_renderer_get_cap_set(_: u32, v: *mut u32, s: *mut u32) { unsafe { *v = 0; *s = 0 } }
+    pub unsafe fn virgl_renderer_get_cap_set(_: u32, v: *mut u32, s: *mut u32) {
+        unsafe {
+            *v = 0;
+            *s = 0
+        }
+    }
     pub unsafe fn virgl_renderer_fill_caps(_: u32, _: u32, _: *mut c_void) {}
-    pub unsafe fn virgl_renderer_context_create_with_flags(_: u32, _: u32, _: u32, _: *const c_char) -> c_int { -1 }
+    pub unsafe fn virgl_renderer_context_create_with_flags(
+        _: u32,
+        _: u32,
+        _: u32,
+        _: *const c_char,
+    ) -> c_int {
+        -1
+    }
     pub unsafe fn virgl_renderer_context_destroy(_: u32) {}
     pub unsafe fn virgl_renderer_ctx_attach_resource(_: c_int, _: c_int) {}
     pub unsafe fn virgl_renderer_ctx_detach_resource(_: c_int, _: c_int) {}
-    pub unsafe fn virgl_renderer_resource_create_blob(_: *const BlobArgs) -> c_int { -1 }
+    pub unsafe fn virgl_renderer_resource_create_blob(_: *const BlobArgs) -> c_int {
+        -1
+    }
     pub unsafe fn virgl_renderer_resource_unref(_: u32) {}
-    pub unsafe fn virgl_renderer_resource_map(_: u32, _: *mut *mut c_void, _: *mut u64) -> c_int { -1 }
-    pub unsafe fn virgl_renderer_resource_unmap(_: u32) -> c_int { -1 }
-    pub unsafe fn virgl_renderer_resource_get_map_info(_: u32, _: *mut u32) -> c_int { -1 }
-    pub unsafe fn virgl_renderer_submit_cmd(_: *mut c_void, _: c_int, _: c_int) -> c_int { -1 }
-    pub unsafe fn virgl_renderer_context_create_fence(_: u32, _: u32, _: u32, _: u64) -> c_int { -1 }
-    pub unsafe fn virgl_renderer_create_fence(_: c_int, _: u32) -> c_int { -1 }
+    pub unsafe fn virgl_renderer_resource_map(_: u32, _: *mut *mut c_void, _: *mut u64) -> c_int {
+        -1
+    }
+    pub unsafe fn virgl_renderer_resource_unmap(_: u32) -> c_int {
+        -1
+    }
+    pub unsafe fn virgl_renderer_resource_get_map_info(_: u32, _: *mut u32) -> c_int {
+        -1
+    }
+    pub unsafe fn virgl_renderer_submit_cmd(_: *mut c_void, _: c_int, _: c_int) -> c_int {
+        -1
+    }
+    pub unsafe fn virgl_renderer_context_create_fence(_: u32, _: u32, _: u32, _: u64) -> c_int {
+        -1
+    }
+    pub unsafe fn virgl_renderer_create_fence(_: c_int, _: u32) -> c_int {
+        -1
+    }
 }
 #[cfg(not(gpu_libs))]
 pub use stub::*;

@@ -39,7 +39,8 @@ impl Server {
         std::thread::Builder::new()
             .name("ane-accept".into())
             .spawn(move || {
-                let runtime: Arc<OnceLock<Result<ort::Runtime, String>>> = Arc::new(OnceLock::new());
+                let runtime: Arc<OnceLock<Result<ort::Runtime, String>>> =
+                    Arc::new(OnceLock::new());
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
                     let runtime = runtime.clone();
@@ -67,7 +68,10 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Option<(u32, Vec<u8>)>> {
     let kind = u32::from_le_bytes(header[..4].try_into().unwrap());
     let len = u64::from_le_bytes(header[4..].try_into().unwrap());
     if len > protocol::MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame of {len} bytes refused")));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes refused"),
+        ));
     }
     let mut payload = vec![0u8; len as usize];
     stream.read_exact(&mut payload)?;
@@ -109,11 +113,18 @@ fn handle(
 ) -> Result<Vec<u8>, String> {
     match kind {
         protocol::LOAD => {
-            let rt = runtime.get_or_init(ort::Runtime::new).as_ref().map_err(|e| e.clone())?;
+            let rt = runtime
+                .get_or_init(ort::Runtime::new)
+                .as_ref()
+                .map_err(|e| e.clone())?;
             let session = rt.load(payload)?;
             let id = *next_id;
             *next_id += 1;
-            tracing::info!(session = id, bytes = payload.len(), "neural engine model loaded");
+            tracing::info!(
+                session = id,
+                bytes = payload.len(),
+                "neural engine model loaded"
+            );
             sessions.insert(id, session);
             let mut w = Writer::new();
             w.u64(id);
@@ -127,7 +138,9 @@ fn handle(
             for _ in 0..n {
                 inputs.push(r.tensor()?);
             }
-            let session = sessions.get(&id).ok_or_else(|| format!("no session {id}"))?;
+            let session = sessions
+                .get(&id)
+                .ok_or_else(|| format!("no session {id}"))?;
             let outputs = session.run(&inputs)?;
             let mut w = Writer::new();
             w.u32(outputs.len() as u32);

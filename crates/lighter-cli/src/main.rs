@@ -11,12 +11,12 @@
 
 mod bundle;
 mod config;
-mod mps;
 mod context;
 mod doctor;
 mod installation;
 mod instance;
 mod machine;
+mod mps;
 mod paths;
 mod release;
 mod run;
@@ -257,7 +257,16 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             ane,
             mps,
             torch_python,
-        } => configure(cpus, memory, disk, publish, gpu, ane, mps, torch_python),
+        } => configure(Settings {
+            cpus,
+            memory,
+            disk,
+            publish,
+            gpu,
+            ane,
+            mps,
+            torch_python,
+        }),
         Command::Resync => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -394,7 +403,8 @@ fn logs(follow: bool) -> anyhow::Result<std::process::ExitCode> {
     })
 }
 
-fn configure(
+/// What `lighter config` was asked to change; `None` leaves a setting alone.
+struct Settings {
     cpus: Option<u32>,
     memory: Option<u64>,
     disk: Option<u64>,
@@ -403,7 +413,19 @@ fn configure(
     ane: Option<config::Toggle>,
     mps: Option<config::Toggle>,
     torch_python: Option<String>,
-) -> anyhow::Result<std::process::ExitCode> {
+}
+
+fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
+    let Settings {
+        cpus,
+        memory,
+        disk,
+        publish,
+        gpu,
+        ane,
+        mps,
+        torch_python,
+    } = settings;
     let mut config = config::Config::load()?;
     let changed = cpus.is_some()
         || memory.is_some()
@@ -435,7 +457,11 @@ fn configure(
         config.mps = mps.into();
     }
     if let Some(python) = torch_python {
-        config.torch_python = if python == "auto" { String::new() } else { python };
+        config.torch_python = if python == "auto" {
+            String::new()
+        } else {
+            python
+        };
     }
     if changed {
         config.save()?;
@@ -456,7 +482,11 @@ fn configure(
     println!(
         "  mps        {}{}",
         if config.mps { "on" } else { "off" },
-        if config.torch_python.is_empty() { String::new() } else { format!(" (torch from {})", config.torch_python) }
+        if config.torch_python.is_empty() {
+            String::new()
+        } else {
+            format!(" (torch from {})", config.torch_python)
+        }
     );
     for share in &config.shares {
         println!("  share      {share}");

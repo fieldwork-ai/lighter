@@ -11,22 +11,43 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIGHTER_GPU_LIBS");
     let dir = std::env::var_os("LIGHTER_GPU_LIBS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../host/out")
-        });
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../host/out"));
     println!("cargo:rerun-if-changed={}", dir.display());
-    let all = ["libvirglrenderer.a", "libvirgl.a", "libmesa.a", "libMoltenVK.a"]
-        .iter()
-        .all(|lib| dir.join(lib).exists());
+    let all = [
+        "libvirglrenderer.a",
+        "libvirgl.a",
+        "libmesa.a",
+        "libMoltenVK.a",
+    ]
+    .iter()
+    .all(|lib| dir.join(lib).exists());
     if cfg!(target_os = "macos") && all {
         println!("cargo:rustc-link-search=native={}", dir.display());
         // MoltenVK uses `@available`, which clang lowers to a compiler-rt
         // builtin rustc does not link on its own.
-        if let Ok(out) = std::process::Command::new("cc").arg("-print-resource-dir").output() {
+        if let Ok(out) = std::process::Command::new("cc")
+            .arg("-print-resource-dir")
+            .output()
+        {
             let res = String::from_utf8_lossy(&out.stdout).trim().to_string();
             println!("cargo:rustc-link-search=native={res}/lib/darwin");
         }
+        for lib in ["virglrenderer", "virgl", "mesa", "MoltenVK", "clang_rt.osx"] {
+            println!("cargo:rustc-link-lib=static={lib}");
+        }
+        for f in [
+            "Metal",
+            "Foundation",
+            "IOSurface",
+            "QuartzCore",
+            "CoreGraphics",
+            "IOKit",
+            "AppKit",
+        ] {
+            println!("cargo:rustc-link-lib=framework={f}");
+        }
+        println!("cargo:rustc-link-lib=objc");
+        println!("cargo:rustc-link-lib=c++");
         println!("cargo:rustc-cfg=gpu_libs");
     } else {
         println!(

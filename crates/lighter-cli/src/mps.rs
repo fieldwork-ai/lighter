@@ -21,7 +21,12 @@ pub struct Host {
 pub fn find_python(configured: &str) -> Result<(PathBuf, String), String> {
     let candidates: Vec<PathBuf> = if configured.is_empty() {
         std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).map(|d| d.join("python3")).filter(|p| p.exists()).collect())
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join("python3"))
+                    .filter(|p| p.exists())
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         vec![PathBuf::from(configured)]
@@ -32,7 +37,10 @@ pub fn find_python(configured: &str) -> Result<(PathBuf, String), String> {
     let mut reasons = Vec::new();
     for python in candidates {
         let out = Command::new(&python)
-            .args(["-c", "import torch; print(torch.__version__, torch.backends.mps.is_available())"])
+            .args([
+                "-c",
+                "import torch; print(torch.__version__, torch.backends.mps.is_available())",
+            ])
             .stderr(Stdio::null())
             .output();
         match out {
@@ -72,7 +80,9 @@ impl Host {
             .trim()
             .strip_prefix("PORT ")
             .and_then(|p| p.parse().ok())
-            .ok_or_else(|| std::io::Error::other(format!("the mps host did not report a port: {line:?}")))?;
+            .ok_or_else(|| {
+                std::io::Error::other(format!("the mps host did not report a port: {line:?}"))
+            })?;
         Ok(Host { child, port })
     }
 

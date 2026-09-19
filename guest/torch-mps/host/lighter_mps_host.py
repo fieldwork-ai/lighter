@@ -34,6 +34,7 @@ T_NONE, T_TENSOR, T_INT, T_DOUBLE, T_BOOL, T_STRING, T_INTS, T_DOUBLES, T_BOOLS,
     T_SCALAR_INT, T_SCALAR_DOUBLE, T_DEVICE, T_DTYPE, T_LAYOUT, T_MEMFMT, T_INLINE, T_TUPLE, T_OPT_INTS, T_SCALAR_BOOL = range(20)
 
 DEVICE = "mps"
+TRACE = bool(__import__("os").environ.get("LIGHTER_MPS_TRACE"))
 
 
 class Session:
@@ -121,14 +122,18 @@ class Writer:
     def f64(self, v): self.parts.append(struct.pack("<d", v))
     def bytes(self, b): self.i64(len(b)); self.parts.append(bytes(b))
 
-    def tensor(self, s, t, alias_of=None):
-        """A tensor result: a handle plus the metadata the guest mirrors."""
-        self.u8(T_TENSOR)
-        self.i64(s.put(t))
+    def meta(self, t):
+        """What the guest's TensorImpl mirrors: dtype, sizes, strides, offset."""
         self.u8(DTYPE_INDEX[t.dtype])
         self.u32(t.dim()); [self.i64(x) for x in t.shape]
         self.u32(t.dim()); [self.i64(x) for x in t.stride()]
         self.i64(t.storage_offset())
+
+    def tensor(self, s, t):
+        """A tensor result: a handle plus the metadata the guest mirrors."""
+        self.u8(T_TENSOR)
+        self.i64(s.put(t))
+        self.meta(t)
         self.i64(t.untyped_storage().data_ptr())
 
     def value(self, s, v):
@@ -185,6 +190,9 @@ def handle(kind, payload, s):
             else:
                 positional.append(value)
         out = op(*positional, **keywords)
+        if TRACE:
+            desc = lambda v: (tuple(v.shape) if isinstance(v, torch.Tensor) else v)
+            print(f"[trace] {name} {[desc(a) for a in args]} -> {desc(out) if not isinstance(out, (tuple, list)) else [desc(o) for o in out]}", file=sys.stderr, flush=True)
         # Aliases: an output that IS one of the arguments (in-place, out=)
         # goes back as that argument's position so the guest keeps its object.
         # A tuple is several returns; anything else, a list included, is one.
@@ -194,7 +202,9 @@ def handle(kind, payload, s):
             if isinstance(o, torch.Tensor):
                 for i, a in enumerate(args):
                     if a is o:
-                        w.u8(0xFE); w.u32(i); break
+                        # The argument itself, possibly resized or restrided
+                        # by the operator: the guest refreshes its metadata.
+                        w.u8(0xFE); w.u32(i); w.meta(o); break
                 else:
                     w.u8(0xFF); w.tensor(s, o)
             else:
