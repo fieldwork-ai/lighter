@@ -1,0 +1,65 @@
+util: an eventfd where there is none
+
+The proxy's fence path is built on eventfd: the render server writes it
+when a timeline advances, the proxy's sync thread polls it and retires
+fences, and virgl_renderer_init strips VIRGL_RENDERER_THREAD_SYNC on any
+host without one — after which, with VIRGL_RENDERER_ASYNC_FENCE_CB, no
+fence is ever delivered: the seqno lands in shared memory and nothing
+wakes to read it. macOS has no eventfd.
+
+What the code needs of the descriptor is small: one fd, an 8-byte write
+that makes it readable, reads that drain it, and poll(). A datagram
+socket on loopback connected to itself is exactly that: each write is a
+datagram delivered to its own queue, flush reads until EAGAIN, and the
+same descriptor serves both ends.
+
+--- a/src/virgl_util.c
++++ b/src/virgl_util.c
+@@ -30,6 +30,10 @@
+ #include <errno.h>
+ #ifdef HAVE_EVENTFD_H
+ #include <sys/eventfd.h>
++#else
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <fcntl.h>
+ #endif
+ #include <unistd.h>
+ 
+@@ -89,7 +93,7 @@ bool has_eventfd(void)
+ #ifdef HAVE_EVENTFD_H
+    return true;
+ #else
+-   return false;
++   return true;
+ #endif
+ }
+ 
+@@ -98,8 +102,25 @@ int create_eventfd(unsigned int initval)
+ #ifdef HAVE_EVENTFD_H
+    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
+ #else
+-   (void)initval;
+-   return -1;
++   /* a datagram socket connected to itself: one descriptor, written and
++    * read from the same end, pollable */
++   int fd = socket(AF_INET, SOCK_DGRAM, 0);
++   if (fd < 0)
++      return -1;
++   struct sockaddr_in addr = { .sin_family = AF_INET,
++                               .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
++   socklen_t len = sizeof(addr);
++   if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) ||
++       getsockname(fd, (struct sockaddr *)&addr, &len) ||
++       connect(fd, (struct sockaddr *)&addr, sizeof(addr)) ||
++       fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) ||
++       fcntl(fd, F_SETFD, FD_CLOEXEC)) {
++      close(fd);
++      return -1;
++   }
++   if (initval)
++      write_eventfd(fd, initval);
++   return fd;
+ #endif
+ }
+ 

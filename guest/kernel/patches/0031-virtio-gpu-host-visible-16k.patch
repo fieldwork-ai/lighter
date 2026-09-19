@@ -1,0 +1,45 @@
+virtio-gpu: host-visible blobs on 16 KiB boundaries
+
+The host-visible region is where the host maps its own memory into the
+guest for a blob the guest asked to map (Venus's ring and every mappable
+device allocation). Apple silicon maps guest-physical memory in 16 KiB
+pages, so the host can only satisfy a mapping whose offset and size are
+multiples of 16 KiB; the allocator here hands out 4 KiB-granular nodes,
+and the first ring Mesa allocates (131,268 bytes) lands on a boundary the
+host cannot map, which Mesa reports as VK_ERROR_OUT_OF_HOST_MEMORY from
+vkCreateInstance.
+
+Aligning the node rather than patching Mesa keeps stock distribution
+images working: the guest kernel is lighter's, the container's Mesa is
+whatever the image ships. The object keeps its own size; only its place
+in the region is rounded, and the region is address space, not memory.
+
+--- a/drivers/gpu/drm/virtio/virtgpu_vram.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vram.c
+@@ -140,6 +140,13 @@ bool virtio_gpu_is_vram(struct virtio_gpu_object *bo)
+ 	return bo->base.base.funcs == &virtio_gpu_vram_funcs;
+ }
+ 
++/*
++ * The host maps blobs in 16 KiB pages (Apple silicon); a node must start
++ * and end on one or the host cannot map it. Cheap on any other host: the
++ * region is address space, and the object's size is unchanged.
++ */
++#define VIRTIO_GPU_HOST_VISIBLE_ALIGN	SZ_16K
++
+ static int virtio_gpu_vram_map(struct virtio_gpu_object *bo)
+ {
+ 	int ret;
+@@ -152,8 +159,10 @@ static int virtio_gpu_vram_map(struct virtio_gpu_object *bo)
+ 		return -EINVAL;
+ 
+ 	spin_lock(&vgdev->host_visible_lock);
+-	ret = drm_mm_insert_node(&vgdev->host_visible_mm, &vram->vram_node,
+-				 bo->base.base.size);
++	ret = drm_mm_insert_node_generic(&vgdev->host_visible_mm,
++					 &vram->vram_node,
++					 ALIGN(bo->base.base.size, VIRTIO_GPU_HOST_VISIBLE_ALIGN),
++					 VIRTIO_GPU_HOST_VISIBLE_ALIGN, 0, 0);
+ 	spin_unlock(&vgdev->host_visible_lock);
+ 
+ 	if (ret)

@@ -83,6 +83,9 @@ enum Command {
         /// does) or loopback (`localhost`); explicit bind addresses take precedence.
         #[arg(long, value_enum)]
         publish: Option<config::Publish>,
+        /// Whether the guest has a GPU (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        gpu: Option<config::Toggle>,
     },
     /// Put the guest's clock right.
     ///
@@ -240,7 +243,8 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             memory,
             disk,
             publish,
-        } => configure(cpus, memory, disk, publish),
+            gpu,
+        } => configure(cpus, memory, disk, publish, gpu),
         Command::Resync => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -382,9 +386,11 @@ fn configure(
     memory: Option<u64>,
     disk: Option<u64>,
     publish: Option<config::Publish>,
+    gpu: Option<config::Toggle>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let mut config = config::Config::load()?;
-    let changed = cpus.is_some() || memory.is_some() || disk.is_some() || publish.is_some();
+    let changed =
+        cpus.is_some() || memory.is_some() || disk.is_some() || publish.is_some() || gpu.is_some();
     if let Some(cpus) = cpus {
         config.cpus = cpus;
     }
@@ -396,6 +402,9 @@ fn configure(
     }
     if let Some(publish) = publish {
         config.publish = publish;
+    }
+    if let Some(gpu) = gpu {
+        config.gpu = gpu.into();
     }
     if changed {
         config.save()?;
@@ -411,6 +420,7 @@ fn configure(
             config::Publish::Localhost => "localhost (wildcard publishes on loopback)",
         }
     );
+    println!("  gpu        {}", if config.gpu { "on" } else { "off" });
     for share in &config.shares {
         println!("  share      {share}");
     }

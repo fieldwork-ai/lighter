@@ -23,6 +23,23 @@ pub struct Config {
     /// Where a port a container publishes on every interface is bound on
     /// the Mac: the network (`lan`, as Docker does) or loopback only.
     pub publish: Publish,
+    /// Whether the guest has a GPU: a render node containers reach Vulkan
+    /// through (`docker run --device lighter.dev/gpu=all`), rendered on the
+    /// Mac's own GPU. On by default; costs nothing until a container uses it.
+    pub gpu: bool,
+}
+
+/// A switch on the command line: `--gpu on`, `--gpu off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Toggle {
+    On,
+    Off,
+}
+
+impl From<Toggle> for bool {
+    fn from(t: Toggle) -> bool {
+        t == Toggle::On
+    }
 }
 
 /// Who can reach a published port: `-p 8080:80` on every interface of the
@@ -57,6 +74,7 @@ impl Default for Config {
             disk_gib: free_disk_gib().max(64),
             shares: vec![home_directory()],
             publish: Publish::Lan,
+            gpu: true,
         }
     }
 }
@@ -167,6 +185,7 @@ mod tests {
             disk_gib: 32,
             shares: vec!["/tmp".into()],
             publish: Publish::Localhost,
+            gpu: false,
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         assert!(

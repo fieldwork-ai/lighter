@@ -35,7 +35,14 @@ pub enum MemoryError {
     Map(#[from] lighter_hv::HvError),
     #[error("region at {gpa:#x} overlaps an existing region")]
     Overlap { gpa: u64 },
+    #[error("foreign mapping at {gpa:#x} of {len} bytes from host {host:#x} is not 16 KiB aligned")]
+    Unaligned { gpa: u64, len: usize, host: usize },
 }
+
+/// The granule of a guest-physical mapping on Apple silicon. A mapping whose
+/// address, host pointer or length is not a multiple is refused by the
+/// hypervisor.
+pub const HOST_PAGE: usize = 16 * 1024;
 
 type Result<T> = std::result::Result<T, MemoryError>;
 
@@ -280,6 +287,48 @@ impl GuestMemory {
             demand: None,
         });
         self.regions.sort_by_key(|r| r.gpa);
+        Ok(())
+    }
+
+    /// Maps memory that belongs to someone else — a GPU buffer the renderer
+    /// owns — into the guest at `gpa`, outside every RAM region. Nothing here
+    /// is tracked: the caller owns the mapping's life and unmaps it with
+    /// [`GuestMemory::unmap_foreign`] before the host memory goes away.
+    ///
+    /// # Safety
+    /// `host` must stay valid, and at that address, for `len` bytes until the
+    /// range is unmapped. The guest can read and write it at any time.
+    pub unsafe fn map_foreign(&self, gpa: u64, host: *mut u8, len: usize) -> Result<()> {
+        let vm = self.vm.as_ref().ok_or(MemoryError::Detached)?;
+        if gpa as usize % HOST_PAGE != 0 || len % HOST_PAGE != 0 || host as usize % HOST_PAGE != 0 {
+            return Err(MemoryError::Unaligned {
+                gpa,
+                len,
+                host: host as usize,
+            });
+        }
+        let end = gpa
+            .checked_add(len as u64)
+            .ok_or(MemoryError::OutOfBounds { gpa, len })?;
+        if self
+            .regions
+            .iter()
+            .any(|r| gpa < r.gpa + r.len as u64 && r.gpa < end)
+        {
+            return Err(MemoryError::Overlap { gpa });
+        }
+        unsafe { vm.map(host.cast(), gpa, len, MemoryPerms::RW)? };
+        Ok(())
+    }
+
+    /// Removes a mapping made by [`GuestMemory::map_foreign`].
+    ///
+    /// # Safety
+    /// No vCPU may be touching `[gpa, gpa + len)`; the guest driver unmaps its
+    /// side first, which is the protocol's promise.
+    pub unsafe fn unmap_foreign(&self, gpa: u64, len: usize) -> Result<()> {
+        let vm = self.vm.as_ref().ok_or(MemoryError::Detached)?;
+        unsafe { vm.unmap(gpa, len)? };
         Ok(())
     }
 

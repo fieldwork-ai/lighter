@@ -40,6 +40,8 @@ const QUEUE_DEVICE_HIGH: u64 = 0x0a4;
 const SHM_SEL: u64 = 0x0ac;
 const SHM_LEN_LOW: u64 = 0x0b0;
 const SHM_LEN_HIGH: u64 = 0x0b4;
+const SHM_BASE_LOW: u64 = 0x0b8;
+const SHM_BASE_HIGH: u64 = 0x0bc;
 const CONFIG_GENERATION: u64 = 0x0fc;
 const CONFIG_SPACE: u64 = 0x100;
 
@@ -69,6 +71,10 @@ pub struct VirtioMmio {
     acked_features: u64,
 
     queue_sel: u32,
+    /// Which shared-memory region the driver is asking about.
+    shm_sel: u32,
+    /// The device's shared-memory regions, read once at construction.
+    shm: Vec<crate::virtio::ShmRegion>,
     device_status: u32,
     /// Shared with the bus, which serves INTERRUPT_STATUS reads and
     /// INTERRUPT_ACK writes from it without taking this device's lock: the
@@ -180,6 +186,12 @@ fn notify_kind(name: &str) -> usize {
 }
 
 impl VirtioMmio {
+    fn shm_region(&self) -> Option<&crate::virtio::ShmRegion> {
+        self.shm
+            .iter()
+            .find(|r| u32::from(r.id) == self.shm_sel)
+    }
+
     pub fn new(
         device: Box<dyn VirtioDevice>,
         memory: Arc<GuestMemory>,
@@ -188,6 +200,7 @@ impl VirtioMmio {
         let signals = (0..device.queue_count())
             .map(|_| Arc::new(QueueSignal::default()))
             .collect();
+        let shm = device.shm_regions();
         let queues = (0..device.queue_count())
             .map(|q| Virtqueue::new(device.queue_max_size_of(q as u16)))
             .collect();
@@ -198,6 +211,8 @@ impl VirtioMmio {
         ));
         VirtioMmio {
             device,
+            shm_sel: 0,
+            shm,
             queues,
             memory,
             device_features_sel: 0,
@@ -393,10 +408,14 @@ impl VirtioMmio {
                 .load(std::sync::atomic::Ordering::Acquire),
             STATUS => self.device_status,
             CONFIG_GENERATION => self.config_generation,
-            SHM_LEN_LOW | SHM_LEN_HIGH => {
-                // No shared memory regions; the spec says report -1 for length.
-                u32::MAX
-            }
+            // A region the device does not have reads as length -1, which is
+            // how the spec says "none"; its base is then meaningless.
+            SHM_LEN_LOW => self.shm_region().map_or(u32::MAX, |r| r.len as u32),
+            SHM_LEN_HIGH => self
+                .shm_region()
+                .map_or(u32::MAX, |r| (r.len >> 32) as u32),
+            SHM_BASE_LOW => self.shm_region().map_or(0, |r| r.base as u32),
+            SHM_BASE_HIGH => self.shm_region().map_or(0, |r| (r.base >> 32) as u32),
             _ => 0,
         }
     }
@@ -475,7 +494,7 @@ impl VirtioMmio {
             QUEUE_DRIVER_HIGH => self.set_queue_addr(|q| &mut q.avail_addr, value, true),
             QUEUE_DEVICE_LOW => self.set_queue_addr(|q| &mut q.used_addr, value, false),
             QUEUE_DEVICE_HIGH => self.set_queue_addr(|q| &mut q.used_addr, value, true),
-            SHM_SEL => {}
+            SHM_SEL => self.shm_sel = value,
             _ => {}
         }
     }

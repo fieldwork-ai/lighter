@@ -17,6 +17,10 @@ initramfs*.cpio*
 # do not.
 /benchmarks/raw/
 
+# The GPU renderer's sources, tools and the libraries they produce: host/gpu/build.sh.
+/host/build/
+/host/out/
+
 .DS_Store
 .context/
 

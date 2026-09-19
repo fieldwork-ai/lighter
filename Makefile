@@ -140,6 +140,10 @@ dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh
 
 .PHONY: dist
+.PHONY: gpu
+gpu: ## Build the GPU renderer libraries (virglrenderer + MoltenVK) into host/out
+	@host/gpu/build.sh
+
 dist: ## Build a release tarball (VERSION=x.y.z)
 	@scripts/package-release.sh $(VERSION)
 

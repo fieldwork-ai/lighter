@@ -187,6 +187,8 @@ pub fn machine() -> anyhow::Result<()> {
         shares,
         // Rosetta asks the kernel for x86 ordering on its own threads.
         tso: false,
+        gpu: config.gpu,
+        gpu_aperture_bytes: 8 << 30,
     };
 
     let mut machine = Machine::start(&machine_config)?;

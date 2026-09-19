@@ -52,6 +52,24 @@ mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
 hostname "$(cat /etc/hostname 2>/dev/null || echo lighter)"
 ip link set lo up
 
+# The GPU, when the machine has one, as a CDI device: `docker run --device
+# lighter.dev/gpu=all` gets the render node. dockerd reads /etc/cdi on its
+# own; nothing else is needed for a container to reach Vulkan, its own Mesa
+# does the rest.
+if [ -e /dev/dri/renderD128 ]; then
+	mkdir -p /etc/cdi
+	cat > /etc/cdi/lighter.yaml <<-EOF
+	cdiVersion: "0.6.0"
+	kind: lighter.dev/gpu
+	devices:
+	  - name: all
+	    containerEdits:
+	      deviceNodes:
+	        - path: /dev/dri/renderD128
+	EOF
+	echo "INIT gpu=/dev/dri/renderD128"
+fi
+
 # The machine has no RTC, so the guest starts at the epoch. That is not a
 # cosmetic problem: every TLS handshake to a registry fails on a certificate
 # that is not valid yet, and the error names the certificate rather than the

@@ -52,6 +52,7 @@ fn main() -> ExitCode {
             }
             "--no-tty" => config.interactive = false,
             "--tso" => config.tso = true,
+            "--gpu" => config.gpu = true,
             // Logs the process's own physical footprint on an interval. The
             // memory gate has no other way to watch a number only this process
             // can see.
