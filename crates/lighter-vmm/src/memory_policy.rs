@@ -791,8 +791,8 @@ fn memory_guest(
             for crate::virtio::vsock::Accepted { key } in accepted {
                 let vsock = vsock.clone();
                 let steering = steering.clone();
-                let live = live.clone();
                 live.fetch_add(1, Ordering::AcqRel);
+                let alive = live.clone();
                 let spawned = std::thread::Builder::new()
                     .name("memory-line".into())
                     .spawn(move || {
@@ -825,7 +825,7 @@ fn memory_guest(
                         // Without current guest feedback the guest is short
                         // until it says otherwise: the ramp holds, and its
                         // offers are withdrawn.
-                        if live.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        if alive.fetch_sub(1, Ordering::AcqRel) == 1 {
                             steering.guest_demand(true, false);
                             steering.guest_offers(0, true);
                         }
