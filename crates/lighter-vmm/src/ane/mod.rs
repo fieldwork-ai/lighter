@@ -100,7 +100,10 @@ fn serve(
     cache: Option<&std::path::Path>,
 ) {
     let _ = stream.set_nodelay(true);
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let mut sessions: HashMap<u64, ort::Session> = HashMap::new();
     let mut next_id = 1u64;
     let mut frames = 0u64;

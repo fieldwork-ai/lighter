@@ -16,6 +16,7 @@ mod context;
 mod doctor;
 mod installation;
 mod instance;
+mod localnet;
 mod machine;
 mod mps;
 mod paths;

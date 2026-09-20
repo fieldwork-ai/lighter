@@ -200,6 +200,25 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("machine", e.to_string(), "check ~/.lighter"),
     });
 
+    // Only a connect made by the machine's own process tests the machine's
+    // own Local Network permission: the gateway is exempt and a shell is
+    // not subject, so a check from here against the router would pass while
+    // every camera, printer and NAS failed.
+    findings.push({
+        let pid = paths::home()
+            .ok()
+            .and_then(|home| crate::instance::Identity::read(&home).ok().flatten())
+            .map(|identity| identity.pid());
+        let (ok, detail, remedy) = match paths::home() {
+            Ok(home) => crate::localnet::doctor_finding(&home, pid),
+            Err(e) => (true, format!("untested: {e}"), None),
+        };
+        match remedy {
+            Some(remedy) if !ok => Finding::bad("local network", detail, &remedy),
+            _ => Finding::good("local network", detail),
+        }
+    });
+
     // A custom home never owns the global context; its machine is reached
     // by DOCKER_HOST, and telling someone to `docker context use lighter`
     // would point them at a machine this doctor is not examining.

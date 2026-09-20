@@ -267,6 +267,12 @@ pub fn machine() -> anyhow::Result<()> {
         machine.proxy_socket(&path, port)?;
     }
     lighter_vmm::streams::start(machine.vsock())?;
+    // The doctor asks this process, not a shell, to reach a device on the
+    // local network, since the permission is this process's; and the
+    // process asks macOS for it now, once, rather than at the first
+    // container that reaches for a camera.
+    let _localnet_probe = crate::localnet::Server::start(&home)?;
+    crate::localnet::ask_permission();
 
     // Ports a container publishes appear on the Mac, for as long as the
     // container is running and no longer, through a stream into the guest.

@@ -1008,7 +1008,11 @@ fn swap_usage() -> (u64, u64) {
             0,
         )
     };
-    if rc == 0 { (usage.used, usage.total) } else { (0, 0) }
+    if rc == 0 {
+        (usage.used, usage.total)
+    } else {
+        (0, 0)
+    }
 }
 
 impl HostMemory {
@@ -1416,7 +1420,11 @@ mod tests {
             .balloon
             .set_actual_pages_for_test(as_pages((4096 - 128) << 20));
         polls(&steering, 1);
-        assert_eq!(target_mib(&transport), 4096 - 256, "and again as the driver follows");
+        assert_eq!(
+            target_mib(&transport),
+            4096 - 256,
+            "and again as the driver follows"
+        );
     }
 
     /// A Mac reporting Normal with a quarter of its RAM in the compressor,
@@ -1446,7 +1454,11 @@ mod tests {
         });
         steering.guest_demand(false, true);
         polls(&steering, 2);
-        assert_eq!(target_mib(&transport), 4096, "swapping: a release is ignored too");
+        assert_eq!(
+            target_mib(&transport),
+            4096,
+            "swapping: a release is ignored too"
+        );
     }
 
     /// `need` holds the ramp where the balloon is, at any level, and follows
@@ -1540,7 +1552,11 @@ mod tests {
         steering.guest_demand(false, true);
         assert_eq!(target_mib(&transport), 1024, "released from the next poll");
         steering.steer(u64::MAX);
-        assert_eq!(target_mib(&transport), 768, "a step down, compression or not");
+        assert_eq!(
+            target_mib(&transport),
+            768,
+            "a step down, compression or not"
+        );
         polls(&steering, 3);
         assert_eq!(target_mib(&transport), 0, "and gone in four");
         steering.balloon.set_actual_pages_for_test(0);
