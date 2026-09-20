@@ -29,21 +29,22 @@ After polling with interrupts enabled, return through the generic idle loop
 before WFI so it can reprogram timers queued by an interrupt. A per-CPU
 flag skips polling on the next iteration after a timeout.
 
-The window grows only on a wakeup from outside: at idle entry the CPU
-reads the timer its clock event device has programmed, and a block that
-ends at that time was the timer, which says nothing about how soon the
-next event from a device or another CPU will come, and whose time was
-known, so spinning until it fires gains nothing over WFI. And past the
-resting size (`idle.poll_local_ns`, 200 µs) it grows only on a wakeup
-that traffic on a container's stream to an accelerator brought, counted
-where sockmap moves it on sockets the guest agent marks (patch 0032): a
-container talking to the Mac's GPU raises the cap to 5 ms so its client's
-threads stay awake between the messages of a token, and a wakeup from
-inside the guest, a thread pool's hand-off, earns no more than the
-resting window. Without both, a guest that ticks every four milliseconds,
-or one busy enough to wake every few, keeps the 5 ms cap grown for as
-long as the stream is open: a detector holds its stream for its
-lifetime, and the M1 spun a full host core for its idle home server.
+What decides is whether bytes moved on a container's stream to an
+accelerator since the CPU last went idle, counted where sockmap moves
+them on sockets the guest agent marks (patch 0032). If they did, a model
+is talking and the window grows to its cap whatever woke the CPU: a
+container talking to the Mac's GPU raises the cap to 5 ms (`idle.poll_ns`)
+so its client's threads stay awake between the messages of a token, and
+the tick or a thread's hand-off in the middle of that is no reason to
+give the window up. If nothing moved, a window past the resting size
+(`idle.poll_local_ns`, 200 µs) comes back down to it, and at the resting
+size the old adaptation applies with one change: the CPU's own timer,
+read from its clock event device at idle entry, halves the window rather
+than growing it, since its time was known and it says nothing about the
+next event from outside. Without this a guest that ticks every four
+milliseconds, or one busy enough to wake every few, keeps the 5 ms cap
+grown for as long as the stream is open: a detector holds its stream for
+its lifetime, and the M1 spun a full host core for its idle home server.
 A block is judged at the next idle entry rather than on waking: a reply
 from the host arrives as an interrupt whose bytes are counted by the
 worker it wakes, so at the instant of waking the count has not moved and
@@ -86,7 +87,7 @@ inside the guest; by its next idle entry it has run what it woke for.
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +42,222 @@
+@@ -33,13 +42,257 @@
  }
  
  /*
@@ -106,19 +107,21 @@ inside the guest; by its next idle entry it has run what it woke for.
 + * a long sleep halves it, so a machine that is really idle stops spinning
 + * within a few rounds and costs the host nothing.
 + *
-+ * Two things a wakeup must be to count as soon. Not the CPU's own timer:
-+ * that says nothing about when the next event will come, and its time is
-+ * known at idle entry, so spinning until it fires gains nothing over WFI.
-+ * And, for any window past the resting size, a wakeup that traffic on a
-+ * container's stream to an accelerator brought: a container talking to the
-+ * Mac's GPU raises the cap to 5 ms so its client's threads stay awake
-+ * between the messages of a token, and a wakeup from inside the guest, a
-+ * thread pool's hand-off, earns no more than the resting window. Without
-+ * both, a guest that ticks every four milliseconds, or one busy enough to
-+ * wake every few, keeps a 5 ms cap grown for as long as the stream is
-+ * open, one host core spun per idle vCPU; a detector holds its stream for
-+ * its lifetime. The traffic is counted where sockmap moves it, on sockets
-+ * the guest agent marks (net/core/skmsg.c).
++ * What decides is whether bytes moved on a container's stream to an
++ * accelerator since this CPU last went idle, counted where sockmap moves
++ * them on sockets the guest agent marks (net/core/skmsg.c). If they did, a
++ * model is talking, and the window grows to its cap whatever woke the CPU:
++ * a container talking to the Mac's GPU raises the cap to 5 ms so its
++ * client's threads stay awake between the messages of a token, and the
++ * tick or a thread's hand-off in the middle of that is no reason to give
++ * the window up. If nothing moved, a window past the resting size comes
++ * back down to it, and at the resting size the old adaptation applies with
++ * one change: the CPU's own timer, whose time was known at idle entry and
++ * which says nothing about the next event from outside, halves the window
++ * rather than growing it. Without this a guest that ticks every four
++ * milliseconds, or one busy enough to wake every few, keeps a 5 ms cap
++ * grown for as long as the stream is open, one host core spun per idle
++ * vCPU; a detector holds its stream for its lifetime.
 + */
 +static unsigned int idle_poll_ns = 200000;
 +module_param_named(poll_ns, idle_poll_ns, uint, 0644);
@@ -140,6 +143,9 @@ inside the guest; by its next idle entry it has run what it woke for.
 +static DEFINE_PER_CPU(bool, idle_poll_block_timer);
 +static DEFINE_PER_CPU(bool, idle_poll_block_pending);
 +static DEFINE_PER_CPU(u64, idle_poll_traffic_seen);
++/* How each block was judged, per CPU, for reading from sysfs. */
++enum { JUDGED_TIMER, JUDGED_LONG, JUDGED_TRAFFIC, JUDGED_LOCAL, JUDGED_KINDS };
++static DEFINE_PER_CPU(unsigned long, idle_poll_judged[JUDGED_KINDS]);
 +
 +/* Bytes on accelerator streams so far, every CPU's count summed. */
 +static u64 __cpuidle idle_traffic(void)
@@ -177,6 +183,25 @@ inside the guest; by its next idle entry it has run what it woke for.
 +};
 +module_param_cb(limits, &idle_poll_limits_ops, NULL, 0444);
 +
++/* Per CPU: timer/long/traffic/local judgements so far. */
++static int idle_poll_judged_get(char *buffer, const struct kernel_param *kp)
++{
++	int cpu, len = 0;
++
++	for_each_online_cpu(cpu)
++		len += sysfs_emit_at(buffer, len, "%s%lu/%lu/%lu/%lu", len ? " " : "",
++				     per_cpu(idle_poll_judged[JUDGED_TIMER], cpu),
++				     per_cpu(idle_poll_judged[JUDGED_LONG], cpu),
++				     per_cpu(idle_poll_judged[JUDGED_TRAFFIC], cpu),
++				     per_cpu(idle_poll_judged[JUDGED_LOCAL], cpu));
++	len += sysfs_emit_at(buffer, len, "\n");
++	return len;
++}
++static const struct kernel_param_ops idle_poll_judged_ops = {
++	.get = idle_poll_judged_get,
++};
++module_param_cb(judged, &idle_poll_judged_ops, NULL, 0444);
++
 +/* A wakeup this close to the programmed timer is the timer. */
 +#define IDLE_TIMER_SLACK_NS	50000
 +
@@ -209,19 +234,30 @@ inside the guest; by its next idle entry it has run what it woke for.
 +				       bool traffic)
 +{
 +	u32 limit = __this_cpu_read(idle_poll_limit_ns);
-+	u32 cap = idle_poll_ns;
++	u32 local = min(idle_poll_ns, idle_poll_local_ns);
 +
-+	if (timer_due || block_ns > idle_poll_ns) {
-+		limit /= 2;
-+	} else {
-+		if (!traffic)
-+			cap = min(cap, idle_poll_local_ns);
-+		if (limit > cap)
-+			limit = max(limit / 2, cap);
-+		else if (limit < idle_poll_grow_start_ns)
++	__this_cpu_inc(idle_poll_judged[traffic ? JUDGED_TRAFFIC :
++				       block_ns > idle_poll_ns ? JUDGED_LONG :
++				       timer_due ? JUDGED_TIMER : JUDGED_LOCAL]);
++	if (traffic) {
++		/* A model is talking: the window is worth its cap, whatever
++		 * woke this CPU and however long it slept. */
++		if (limit < idle_poll_grow_start_ns)
 +			limit = idle_poll_grow_start_ns;
 +		else
-+			limit = min_t(u64, (u64)limit * 2, cap);
++			limit = min_t(u64, (u64)limit * 2, idle_poll_ns);
++	} else if (block_ns > idle_poll_ns) {
++		limit /= 2;
++	} else if (limit > local) {
++		/* Whatever woke it, a window past the resting size with no
++		 * traffic behind it comes back down to the resting size. */
++		limit = max(limit / 2, local);
++	} else if (timer_due) {
++		limit /= 2;
++	} else if (limit < idle_poll_grow_start_ns) {
++		limit = idle_poll_grow_start_ns;
++	} else {
++		limit = min_t(u64, (u64)limit * 2, local);
 +	}
 +	__this_cpu_write(idle_poll_limit_ns, limit);
 +}

@@ -24,6 +24,9 @@ static unsigned idle_poll_grow_start_ns = 50000;
 static unsigned idle_poll_local_ns = 200000;
 static u64 next_timer_mock, now_mock, traffic_mock;
 static u64 idle_poll_block_ns, idle_poll_traffic_seen;
+enum { JUDGED_TIMER, JUDGED_LONG, JUDGED_TRAFFIC, JUDGED_LOCAL, JUDGED_KINDS };
+static unsigned long idle_poll_judged[JUDGED_KINDS];
+#define __this_cpu_inc(counter) ((counter)++)
 static bool idle_poll_block_timer, idle_poll_block_pending;
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
@@ -160,11 +163,14 @@ int main(void)
         { "the resting cap bounds the growth", 200000, 100000, 10000000, 1000000, false, 150000, 200000 },
         { "a raised cap: traffic grows past the resting size", 5000000, 100000, 10000000, 1000000, true, 200000, 400000 },
         { "a raised cap: traffic reaches the cap", 5000000, 100000, 10000000, 1000000, true, 4000000, 5000000 },
+        { "a raised cap: traffic grows whatever woke the CPU", 5000000, 100000, 1000000, 995000, true, 1000000, 2000000 },
+        { "a raised cap: traffic grows however long the block", 5000000, 9000000, 100000000, 1000000, true, 2500000, 5000000 },
         { "a raised cap: a local wakeup stops at the resting size", 5000000, 100000, 10000000, 1000000, false, 150000, 200000 },
         { "a raised cap: a local wakeup halves a larger window", 5000000, 100000, 10000000, 1000000, false, 1600000, 800000 },
         { "a raised cap: a local wakeup never halves below the resting size", 5000000, 100000, 10000000, 1000000, false, 300000, 200000 },
-        { "a raised cap: the timer halves whatever traffic grew", 5000000, 100000, 1000000, 995000, true, 5000000, 2500000 },
-        { "a raised cap: a block past it halves even with traffic", 5000000, 9000000, 100000000, 1000000, true, 5000000, 2500000 },
+        { "a raised cap: the timer halves a larger window to the resting size", 5000000, 100000, 1000000, 995000, false, 300000, 200000 },
+        { "a raised cap: the timer halves at the resting size", 5000000, 100000, 1000000, 995000, false, 200000, 100000 },
+        { "a raised cap: a block past it halves without traffic", 5000000, 9000000, 100000000, 1000000, false, 5000000, 2500000 },
     };
     for (unsigned i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
         idle_poll_ns = rules[i].cap;
