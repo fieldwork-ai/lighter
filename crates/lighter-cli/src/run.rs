@@ -228,13 +228,9 @@ pub fn machine() -> anyhow::Result<()> {
         }
     }
 
-    // The configured memory is the guest's maximum: it boots with a base
-    // and plugs the rest in as the host offers it (`lighter_vmm::virtio::mem`).
-    let (ram_bytes, hotplug_bytes) = lighter_vmm::virtio::mem::split(config.memory_mib << 20);
     let machine_config = MachineConfig {
         vcpus: config.cpus,
-        ram_bytes,
-        hotplug_bytes,
+        ram_bytes: config.memory_mib << 20,
         kernel: paths::kernel()?,
         initramfs: None,
         cmdline,

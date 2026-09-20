@@ -28,7 +28,6 @@ use crate::virtio::balloon::{Balloon, BalloonState};
 use crate::virtio::block::Block;
 use crate::virtio::disk::Disk;
 use crate::virtio::fs::{Fs, Share};
-use crate::virtio::mem::MemControl;
 use crate::virtio::mmio::VirtioMmio;
 use crate::virtio::net::Net;
 use crate::virtio::rng::Rng;
@@ -77,12 +76,8 @@ pub const DOCKER_PORT: u32 = 2375;
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
     pub vcpus: u32,
-    /// RAM the guest boots with. With `hotplug_bytes` this is the base, and
-    /// the rest is plugged in as the host offers it (`virtio::mem`).
+    /// RAM the guest boots with: all of it, one zone.
     pub ram_bytes: u64,
-    /// Memory beyond `ram_bytes` the guest may plug in, in 128 MiB blocks;
-    /// zero means no virtio-mem device and RAM alone.
-    pub hotplug_bytes: u64,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
     pub cmdline: String,
@@ -116,7 +111,6 @@ impl Default for MachineConfig {
         MachineConfig {
             vcpus: 1,
             ram_bytes: 2 << 30,
-            hotplug_bytes: 0,
             kernel: PathBuf::from("guest/out/Image"),
             initramfs: None,
             // `panic=-1` so a guest that dies exits the VMM instead of sitting
@@ -154,8 +148,6 @@ pub struct Machine {
     virtio: Vec<Arc<Mutex<VirtioMmio>>>,
     disks: Vec<Arc<Disk>>,
     balloon: Arc<BalloonState>,
-    /// The hot-plug range's state, when the machine has one, and its slot.
-    mem: Option<MemControl>,
     /// The card's host side, if the machine has one.
     network: Option<Arc<Network>>,
     vsock: Arc<VsockShared>,
@@ -207,7 +199,6 @@ impl Machine {
             &gic.params(),
             config.vcpus,
             config.ram_bytes,
-            config.hotplug_bytes,
             if config.gpu {
                 config.gpu_aperture_bytes
             } else {
@@ -235,18 +226,6 @@ impl Machine {
             memory.reserve_demand_region(layout.ram.base, layout.ram.size as usize)?;
         } else {
             memory.add_region(layout.ram.base, layout.ram.size as usize)?;
-        }
-        // Hybrid RAM is safe on first access while a worker completes backing.
-        // Explicit DEMAND_RAM=1,BACKGROUND_RAM=0 retains pure demand for diagnosis.
-        // The legacy background comparison offers blocks only after preparation.
-        if let Some(hotplug) = layout.hotplug {
-            if demand_ram {
-                memory.reserve_demand_region(hotplug.base, hotplug.size as usize)?;
-            } else if background_ram {
-                memory.reserve_region(hotplug.base, hotplug.size as usize)?;
-            } else {
-                memory.add_region(hotplug.base, hotplug.size as usize)?;
-            }
         }
         let memory = Arc::new(memory);
 
@@ -338,32 +317,6 @@ impl Machine {
         virtio.push(Box::new(Rng::from_host()?));
         let balloon_slot = virtio.len();
         virtio.push(Box::new(Balloon::new(balloon_state.clone())));
-        // virtio-mem, when the machine has a range: offered whole to begin
-        // with, or `LIGHTER_MEM_PLUG_MIB` of it, until the policy decides.
-        let mem_state = layout.hotplug.map(|hotplug| {
-            let offered = std::env::var("LIGHTER_MEM_PLUG_MIB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|mib| mib << 20)
-                .unwrap_or(hotplug.size);
-            let state = Arc::new(crate::virtio::mem::MemState::new(
-                config.ram_bytes,
-                hotplug.base,
-                hotplug.size,
-                offered,
-            ));
-            // Demand RAM is safe to offer immediately: both CPU faults and
-            // device accesses prepare backing before they complete the access.
-            if background_ram && !demand_ram {
-                state.defer_backing();
-            }
-            state
-        });
-        let mem_slot = mem_state.as_ref().map(|state| {
-            let slot = virtio.len();
-            virtio.push(Box::new(crate::virtio::mem::Mem::new(state.clone())));
-            slot
-        });
         // The GPU last: its aperture is above everything, and its completion
         // thread needs the transport, wired below.
         let gpu = layout.gpu.map(|aperture| {
@@ -387,9 +340,6 @@ impl Machine {
             bus.register(window, transport.clone())?;
             virtio_devices.push(transport);
         }
-        let mem = mem_state
-            .zip(mem_slot)
-            .map(|(state, slot)| MemControl::new(state, virtio_devices[slot].clone()));
         // Fences signal on the renderer's threads; a thread of the device's
         // takes the transport lock and returns the waiting commands, so the
         // renderer's callback never has to.
@@ -651,7 +601,6 @@ impl Machine {
             virtio_devices[balloon_slot].clone(),
             config.ram_bytes,
             vsock_state.clone(),
-            mem.clone(),
         ) {
             Ok(policy) => Some(policy),
             Err(why) => {
@@ -665,19 +614,10 @@ impl Machine {
 
         // 7. The device tree describes the machine built above, from the same
         //    layout rather than a parallel description of it.
-        let mut cmdline = config.cmdline.clone();
-        if (background_ram || demand_ram) && layout.hotplug.is_some() {
-            // Every caller, including the benchmark VMM, gives guest init the
-            // full startup target before Docker can restore saved containers.
-            cmdline.push_str(&format!(
-                " lighter.boot_ram_mib={}",
-                (config.ram_bytes + config.hotplug_bytes) >> 20
-            ));
-        }
         let dtb = fdt::build(&FdtParams {
             layout: &layout,
             vcpus: config.vcpus,
-            cmdline: &cmdline,
+            cmdline: &config.cmdline,
             initramfs,
             virtio_slots,
         })?;
@@ -783,9 +723,8 @@ impl Machine {
 
         crate::dump::install(virtio_devices.clone(), vsock_state.clone(), uart.clone());
 
-        let memory_preparation = if background_ram && (demand_ram || mem.is_some()) {
+        let memory_preparation = if background_ram && demand_ram {
             let memory = memory.clone();
-            let control = mem.clone();
             let ctx = ctx.clone();
             Some(
                 std::thread::Builder::new()
@@ -793,22 +732,7 @@ impl Machine {
                     .spawn(move || {
                         let prepare = || {
                             let _phase = crate::boot_timing::Phase::new("memory_background");
-                            if demand_ram {
-                                return memory.prepare_remaining(&ctx.shutdown);
-                            }
-                            let control = control.expect("deferred memory control");
-                            let mut ready = 0;
-                            while ready < control.state().region_bytes() {
-                                if ctx.shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                                    return Ok(());
-                                }
-                                ready = memory.prepare_next(
-                                    control.state().addr(),
-                                    virtio::mem::BLOCK_SIZE as usize,
-                                )? as u64;
-                                control.backing_ready(ready);
-                            }
-                            Ok(())
+                            memory.prepare_remaining(&ctx.shutdown)
                         };
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)) {
                             Ok(Ok(())) => {}
@@ -839,7 +763,6 @@ impl Machine {
             virtio: virtio_devices,
             disks,
             balloon: balloon_state,
-            mem,
             network,
             vsock: vsock_state,
             proxies: Vec::new(),
@@ -873,34 +796,9 @@ impl Machine {
         self.filesystem_notifications.clone()
     }
 
-    /// The Docker API's socket has one thing done to it that no other has:
-    /// a guest with a virtio-mem range is made whole before a container is
-    /// created, started, restarted or built, because what runs in it sizes
-    /// itself from `MemTotal` as it comes up and can take memory faster
-    /// than the guest could ask for more (`MemControl::plug_all`). The
-    /// request line is what is looked for, in each chunk as it passes.
+    /// Serves a guest vsock port on a host unix socket.
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
-        let inspect: Option<crate::vsock_proxy::Inspector> = match &self.mem {
-            Some(mem) if guest_port == DOCKER_PORT => {
-                let mem = mem.clone();
-                let whole = self._memory_policy.as_ref().map(|policy| policy.whole());
-                Some(Arc::new(move |bytes: &[u8]| {
-                    if starts_a_container(bytes) {
-                        if let Some(whole) = &whole {
-                            whole.call()?;
-                        } else {
-                            // Readiness is still required if the host pressure
-                            // observer could not start and policy is absent.
-                            mem.wait_for_backing()?;
-                            mem.plug_all();
-                        }
-                    }
-                    Ok(())
-                }))
-            }
-            _ => None,
-        };
-        let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone(), inspect)?;
+        let proxy = VsockProxy::listen(path, guest_port, self.vsock.clone(), None)?;
         self.proxies.push(proxy);
         Ok(())
     }
@@ -916,11 +814,6 @@ impl Machine {
     }
 
     /// The balloon's shared state, for the memory policy loop.
-    /// The virtio-mem range, when the machine has one.
-    pub fn mem(&self) -> Option<&MemControl> {
-        self.mem.as_ref()
-    }
-
     pub fn balloon(&self) -> &Arc<BalloonState> {
         &self.balloon
     }
@@ -938,9 +831,6 @@ impl Machine {
     /// Asks every core to stop.
     pub fn shutdown(&self) {
         self.ctx.stop();
-        if let Some(mem) = &self.mem {
-            mem.cancel_preparation();
-        }
     }
 
     fn stop_others(&mut self) {
@@ -976,71 +866,5 @@ impl Drop for Machine {
         // unmaps each region on the way out, so `hv_vm_destroy` cannot run
         // until that has happened. Counting clones here would just encode how
         // many things legitimately hold one.
-    }
-}
-
-/// Whether a chunk of a Docker API stream carries a request that starts a
-/// process in a container: create, start, restart, an exec's start, or a
-/// build (BuildKit runs its steps in containers of its own, reached through
-/// a session).
-fn starts_a_container(bytes: &[u8]) -> bool {
-    const REQUESTS: [&[u8]; 9] = [
-        b"/containers/create",
-        b"/start HTTP/",
-        b"/start?",
-        b"/restart HTTP/",
-        b"/restart?",
-        b"/build HTTP/",
-        b"/build?",
-        b"/session HTTP/",
-        b"/session?",
-    ];
-    debug_assert!(
-        REQUESTS
-            .iter()
-            .all(|needle| needle.len() <= crate::vsock_proxy::INSPECT_OVERLAP)
-    );
-    REQUESTS
-        .iter()
-        .any(|needle| bytes.windows(needle.len()).any(|w| w == *needle))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn container_requests_are_inspected_across_every_socket_boundary() {
-        for request in [
-            "POST /v1.51/containers/create HTTP/1.1\r\n\r\n",
-            "POST /v1.51/containers/abc/start HTTP/1.1\r\n\r\n",
-            "POST /v1.51/containers/abc/restart HTTP/1.1\r\n\r\n",
-            "POST /v1.51/exec/abc/start HTTP/1.1\r\n\r\n",
-            "POST /v1.51/build?t=example HTTP/1.1\r\n\r\n",
-            "POST /v1.51/session HTTP/1.1\r\n\r\n",
-            "POST /v1.51/containers/abc/start?checkpoint=boot HTTP/1.1\r\n\r\n",
-            "POST /v1.51/containers/abc/restart?t=10 HTTP/1.1\r\n\r\n",
-            "POST /v1.51/build HTTP/1.1\r\n\r\n",
-            "POST /v1.51/session?name=build HTTP/1.1\r\n\r\n",
-        ] {
-            for chunk in 1..=request.len() {
-                let inspect: crate::vsock_proxy::Inspector = Arc::new(|bytes| {
-                    if starts_a_container(bytes) {
-                        Err(io::Error::new(io::ErrorKind::TimedOut, "memory not ready"))
-                    } else {
-                        Ok(())
-                    }
-                });
-                let mut stream = crate::vsock_proxy::StreamInspector::new(inspect);
-                assert!(
-                    request
-                        .as_bytes()
-                        .chunks(chunk)
-                        .any(|bytes| stream.check(bytes).is_err()),
-                    "missed {request:?} with {chunk}-byte reads"
-                );
-            }
-        }
-        assert!(!starts_a_container(b"GET /version HTTP/1.1\r\n\r\n"));
     }
 }
