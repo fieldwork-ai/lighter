@@ -1,8 +1,8 @@
 # 🔥 lighter
 
-**The fast, open-source container engine for macOS — with native Apple Silicon GPU, Neural Engine, and PyTorch acceleration.**
+**The fast, open-source container engine for macOS, with native Apple Silicon GPU, Neural Engine, and PyTorch acceleration.**
 
-<a href="https://fieldwork.ai">
+<a href="https://getfieldwork.ai">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/fieldwork-logo-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/fieldwork-logo-light.svg">
@@ -10,7 +10,7 @@
   </picture>
 </a>
 
-*lighter is an open-source project sponsored by [Fieldwork](https://fieldwork.ai), providing dedicated engineering time to build and maintain high-performance virtualization and AI infrastructure for Apple Silicon.*
+*lighter is an open-source project sponsored by [Fieldwork](https://getfieldwork.ai), providing dedicated engineering time to build and maintain high-performance virtualization and AI infrastructure for Apple Silicon.*
 
 lighter is a high-performance, headless virtual machine monitor built from scratch in Rust on Apple's `Hypervisor.framework`. It boots a custom Linux LTS kernel directly into memory in 50 milliseconds, delivers shared filesystem performance faster than native APFS, and is the **first and only macOS container engine to give Linux containers direct access to Apple Silicon GPU, Metal, and Neural Engine hardware**.
 
@@ -37,8 +37,8 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 | **Idle memory** | **394 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
 | **Memory 15s after heavy build** | **842 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
 | **`npm ci` (own disk)** | **4.46 s** | 6.83 s | 7.96 s | 7.56 s |
-| **`npm ci` (host share)** | **6.42 s** | 8.53 s | — | 17.89 s |
-| **Host share copy (`cp -a`)** | **4.58 s** | 9.58 s | — | 41.95 s |
+| **`npm ci` (host share)** | **6.42 s** | 8.53 s | N/A | 17.89 s |
+| **Host share copy (`cp -a`)** | **4.58 s** | 9.58 s | N/A | 41.95 s |
 | **Container DNS resolution** | **40 µs** | 262 µs | 513 µs | 481 µs |
 | **Kubernetes support** | **kind, kubectl, Helm** | Built-in | Built-in | k3s |
 | **x86-64 Rosetta (`sha256sum`)** | **4.11 s** | 7.92 s | 4.39 s | 4.26 s |
@@ -195,7 +195,7 @@ On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster
 Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26 Tahoe). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta. Raw observations, environment fingerprints, and individual repetition timings are preserved in [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 </details>
 
-### MacBook Pro — Apple M5 Pro (18 cores, 48 GB RAM)
+### MacBook Pro: Apple M5 Pro (18 cores, 48 GB RAM)
 
 | Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
@@ -209,13 +209,13 @@ Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro
 
 | Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.53 s | **6.42 s** (102%) | 8.53 s (77%) | 17.89 s (36%) | — |
-| `pnpm install` | 4.32 s | **4.71 s** (92%) | 4.93 s (88%) | 25.95 s (17%) | — |
-| `yarn install` | 5.89 s | **5.69 s** (103%) | 7.97 s (74%) | 22.81 s (26%) | — |
-| `ripgrep` (file read) | 927 ms | **77 ms** (1204%) | 1.00 s (93%) | 3.02 s (31%) | — |
-| `find` (metadata walk) | 390 ms | **79 ms** (494%) | 452 ms (86%) | 1.46 s (27%) | — |
-| `cp -a node_modules` | 16.76 s | **4.58 s** (366%) | 9.58 s (175%) | 41.95 s (40%) | — |
-| `rm -rf node_modules` | 4.18 s | 3.46 s (121%) | **3.35 s** (125%) | 8.38 s (50%) | — |
+| `npm ci` | 6.53 s | **6.42 s** (102%) | 8.53 s (77%) | 17.89 s (36%) | N/A |
+| `pnpm install` | 4.32 s | **4.71 s** (92%) | 4.93 s (88%) | 25.95 s (17%) | N/A |
+| `yarn install` | 5.89 s | **5.69 s** (103%) | 7.97 s (74%) | 22.81 s (26%) | N/A |
+| `ripgrep` (file read) | 927 ms | **77 ms** (1204%) | 1.00 s (93%) | 3.02 s (31%) | N/A |
+| `find` (metadata walk) | 390 ms | **79 ms** (494%) | 452 ms (86%) | 1.46 s (27%) | N/A |
+| `cp -a node_modules` | 16.76 s | **4.58 s** (366%) | 9.58 s (175%) | 41.95 s (40%) | N/A |
+| `rm -rf node_modules` | 4.18 s | 3.46 s (121%) | **3.35 s** (125%) | 8.38 s (50%) | N/A |
 | Host file edit -> container | 1 ms | **2 ms** | 11 ms | **2 ms** | 3 ms |
 
 #### Memory footprint
@@ -237,8 +237,8 @@ Throughput and latency between container and host measured with `iperf3`, keep-a
 |---|---|---|---|---|---|---|
 | TCP, container to the Mac | Gbit/s | 124.1 | **102.4** | 95.1 | 4.5 | 24.5 |
 | TCP, the Mac to a container | Gbit/s | 131.2 | **95.2** | 51.5 | 4.0 | 14.7 |
-| TCP into a published port | Gbit/s | — | **98.4** | 52.3 | 3.9 | 14.5 |
-| TCP out of a published port | Gbit/s | — | **104.0** | 88.3 | 4.2 | 32.5 |
+| TCP into a published port | Gbit/s | N/A | **98.4** | 52.3 | 3.9 | 14.5 |
+| TCP out of a published port | Gbit/s | N/A | **104.0** | 88.3 | 4.2 | 32.5 |
 | UDP, container to the Mac | Gbit/s | 21.1 | **5.3** | 3.0 | 3.1 | 0.0 |
 | connects to a published port | thousand per second | 26.6 | 18.2 | **21.2** | 16.1 | 15.7 |
 | GET on a published port, median | µs | 40 | **62** | 74 | 229 | 125 |
@@ -286,7 +286,7 @@ Running containers on macOS typically hits five performance bottlenecks: the sha
 Bind mounts on macOS are notoriously slow because every filesystem call crosses the hypervisor into APFS, where traversing tens of thousands of files incurs synchronous latency.
 
 lighter eliminates the boundary overhead:
-- **In-memory cache with host change notification:** The guest's page cache serves reads directly from memory without crossing the VM boundary. Host filesystem changes invalidate guest cache entries in real time via macOS `FSEvents`. If macOS event queues drop details under extreme load, a negotiated lease reset safely expires cached entries. Read latency drops to microsecond speeds—running `ripgrep` across a 1,232-package tree takes **91 ms**, compared to 1,000 ms on OrbStack and 3,020 ms on Colima.
+- **In-memory cache with host change notification:** The guest's page cache serves reads directly from memory without crossing the VM boundary. Host filesystem changes invalidate guest cache entries in real time via macOS `FSEvents`. If macOS event queues drop details under extreme load, a negotiated lease reset safely expires cached entries. Read latency drops to microsecond speeds: running `ripgrep` across a 1,232-package tree takes **91 ms**, compared to 1,000 ms on OrbStack and 3,020 ms on Colima.
 - **Asynchronous mutation lanes:** Creates, writes, and renames complete in the guest immediately and flush to APFS via dedicated asynchronous worker queues.
 - **Identity-based inode tracking:** When descriptor limits are reached under massive directory trees (e.g. 100,000+ files in `node_modules`), inodes are parked and referenced through parent directory descriptors by identity, avoiding path walks and descriptor churn.
 
@@ -308,11 +308,11 @@ Other runtimes assign the VM a virtual network interface card and run a userspac
 lighter avoids packet transport across the VM boundary entirely:
 - **Direct stream bridging:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which establishes a single vsock stream to the host. The host opens a native macOS socket to the destination and copies bytes between the two. The Mac's native network stack handles routing, VPNs, and proxies automatically.
 - **In-kernel BPF sockmap:** The container socket and the vsock stream are joined directly in the guest kernel via a BPF sockmap. The data path is a zero-process kernel-to-kernel copy.
-- **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency drops to **40 µs**—over six times faster than OrbStack (262 µs) and nearly thirteen times faster than Docker Desktop (513 µs).
+- **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency drops to **40 µs**, over six times faster than OrbStack (262 µs) and nearly thirteen times faster than Docker Desktop (513 µs).
 - **Low-latency polling:** After every network event, the host transport thread polls briefly before sleeping, servicing immediate request-response replies without scheduler wake latency.
 
 ### 5. Sub-second startup (664 ms cold start)
-Cold start includes allocating VM metadata, booting Linux, and initializing Docker. At 16 GiB on M5, Docker answers in **517 ms** and completes the first container in **664 ms**—more than twice as fast as OrbStack:
+Cold start includes allocating VM metadata, booting Linux, and initializing Docker. At 16 GiB on M5, Docker answers in **517 ms** and completes the first container in **664 ms**, more than twice as fast as OrbStack:
 - **Hybrid RAM preparation:** lighter boots the guest immediately while memory backing is prepared concurrently in the background. First access safely prepares pages ahead of the worker, eliminating startup pauses without forfeiting whole-range reclamation.
 - **50-millisecond custom kernel boot:** Hardware probing is stripped down strictly to the virtual devices present.
 - **Parallel containerd initialization:** Init launches `containerd` immediately upon disk mount and attaches `dockerd` without polling delays.
@@ -336,7 +336,7 @@ lighter exposes the Apple Silicon compute architecture to containers:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
 - **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 394 MiB (+20 MiB over baseline).
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
-- **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`). If traffic pauses, polling drops back immediately to the resting floor within rounds—allowing resident containers (such as Frigate NVR or background speech-to-text) to run at 21–39% CPU during active detection rather than pinning a full host core.
+- **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`). If traffic pauses, polling drops back immediately to the resting floor within rounds, allowing resident containers (such as Frigate NVR or background speech-to-text) to run at 21–39% CPU during active detection rather than pinning a full host core.
 
 ---
 
