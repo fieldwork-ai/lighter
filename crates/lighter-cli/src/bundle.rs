@@ -56,10 +56,26 @@ pub fn ensure() -> anyhow::Result<PathBuf> {
 
     let source = std::env::current_exe()?;
     let target = macos.join("lighter");
-    let stale = match (std::fs::metadata(&source), std::fs::metadata(&target)) {
-        (Ok(s), Ok(t)) => s.len() != t.len() || s.modified()? > t.modified()?,
-        _ => true,
-    };
+    // Whether the copy is of this source: its size and modification time are
+    // recorded beside it at copy time and compared with the source's now.
+    // Comparing with the copy itself does not work: signing the bundle
+    // rewrites the copy's signature with the entitlements, so its size never
+    // matches the source and every start copied and re-signed the binary,
+    // 400 ms of a 46 MB release build on an M1.
+    // Beside the bundle, never inside it: codesign seals everything under
+    // Contents and a file it did not seal reads as damage.
+    let stamp_path = home.join("lighter.app.source-stamp");
+    let stamp = std::fs::metadata(&source).ok().map(|s| {
+        let modified = s
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        format!("{}:{}", s.len(), modified)
+    });
+    let stale = !target.exists()
+        || stamp.is_none()
+        || std::fs::read_to_string(&stamp_path).ok().as_deref() != stamp.as_deref();
     if stale {
         // Copy to a temporary name and rename over: the running machine may
         // be executing the old copy, and overwriting a mapped binary in
@@ -68,6 +84,9 @@ pub fn ensure() -> anyhow::Result<PathBuf> {
         std::fs::copy(&source, &staging)?;
         std::fs::rename(&staging, &target)?;
         sign(&source, contents.parent().expect("Contents has a parent"))?;
+        if let Some(stamp) = &stamp {
+            std::fs::write(&stamp_path, stamp)?;
+        }
     }
     register(contents.parent().expect("Contents has a parent"));
     Ok(target)
