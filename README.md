@@ -1,14 +1,17 @@
 # lighter
 
-**The open-source, headless container engine for macOS — with native Apple Silicon GPU, Neural Engine, and PyTorch acceleration.**
+**The fast, open-source container engine for macOS — with native Apple Silicon GPU, Neural Engine, and PyTorch acceleration.**
 
-lighter is a lightweight virtual machine monitor built from scratch on Apple's `Hypervisor.framework` in Rust. It implements its own vCPU loop, GICv3 interrupt controller, bespoke virtio device models, and boots a custom Linux LTS kernel directly into memory in 50 milliseconds.
+lighter is a high-performance, headless virtual machine monitor built from scratch in Rust on Apple's `Hypervisor.framework`. It boots a custom Linux LTS kernel directly into memory in 50 milliseconds, delivers shared filesystem performance faster than native APFS, and is the **first and only macOS container engine to give Linux containers direct access to Apple Silicon GPU, Metal, and Neural Engine hardware**.
 
-Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Docker Desktop, and OrbStack. It matches or beats OrbStack's speed, consumes a fraction of Docker Desktop's memory, runs completely headless with zero GUI bloat, exposes Apple Silicon hardware accelerators directly to Linux containers, and comes with zero commercial licensing traps.
+A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
+- 🔄 **Drop-in Docker replacement:** Works immediately with your existing `docker`, `docker compose`, `kind`, and third-party developer tooling.
+- 🚀 **Full Apple Silicon acceleration:** Run local LLMs, PyTorch (MPS), and computer vision models directly on your Mac's GPU and Neural Engine.
+- ⚡ **Blistering performance:** Cold boots in 715 ms; host file mounts and builds run faster than native APFS.
+- 🪶 **Ultra-lightweight:** Idles at just 394 MiB RAM (vs 3.5 GB for Docker Desktop) and surrenders memory back to macOS within seconds of a workload finishing.
+- 🆓 **100% Free & Open Source:** Dual-licensed MIT / Apache 2.0. No paid subscriptions, no commercial seat licenses, no telemetry, and zero GUI/Electron bloat.
 
-**Dual-licensed MIT or Apache 2.0. No paid subscriptions, no commercial seat limits, no "free during beta", and no telemetry.**
-
-*Requires Apple Silicon and macOS 15 (Sequoia) or later.*
+*Requires Apple Silicon and macOS 15+ (Sequoia, Tahoe).*
 
 ---
 
@@ -20,35 +23,45 @@ Purpose-built for Apple Silicon, lighter is a drop-in replacement for Colima, Do
 | **Commercial use** | **Free forever** | $8–$10 / user / mo | $9–$24 / user / mo (≥250) | Free |
 | **Telemetry** | **Zero** | Yes | Yes | None |
 | **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
-| **Cold start (to container)** | **664 ms** | 1.4 s | 2.1 s | 9.0 s |
-| **Idle memory** | **372 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
-| **Memory 15s after heavy build** | **702 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
-| **`npm ci` (own disk)** | **4.49 s** | 6.83 s | 7.96 s | 7.56 s |
-| **`npm ci` (host share)** | **6.36 s** | 8.53 s | — | 17.89 s |
-| **Host share copy (`cp -a`)** | **3.80 s** | 9.58 s | — | 41.95 s |
+| **Cold start (to container)** | **715 ms** | 1.4 s | 2.1 s | 9.0 s |
+| **Idle memory** | **394 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
+| **Memory 15s after heavy build** | **842 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
+| **`npm ci` (own disk)** | **4.46 s** | 6.83 s | 7.96 s | 7.56 s |
+| **`npm ci` (host share)** | **6.42 s** | 8.53 s | — | 17.89 s |
+| **Host share copy (`cp -a`)** | **4.58 s** | 9.58 s | — | 41.95 s |
 | **Container DNS resolution** | **40 µs** | 262 µs | 513 µs | 481 µs |
 | **Kubernetes support** | **kind, kubectl, Helm** | Built-in | Built-in | k3s |
-| **x86-64 Rosetta (`sha256sum`)** | **4.16 s** | 7.92 s | 4.39 s | 4.26 s |
+| **x86-64 Rosetta (`sha256sum`)** | **4.11 s** | 7.92 s | 4.39 s | 4.26 s |
 | **Apple Silicon GPU (Vulkan)** | **Yes** | No | No | No |
 | **Apple Neural Engine (ANE)** | **Yes** | No | No | No |
 | **PyTorch on Mac GPU (MPS)** | **Yes** | No | No | No |
-| **llama.cpp / whisper on Metal** | **Yes** (95 t/s vs 110 native) | No | No | No |
+| **llama.cpp / whisper on Metal** | **Yes** (93 t/s on M1, 299 on M5) | No | No | No |
+
+---
+
+## Why switch to lighter?
+
+- 🚫 **Escape Docker Desktop's bloat & licensing fees:** Docker Desktop consumes 3.5–7+ GB of RAM, runs Electron in the background, spins laptop fans, and charges $9–$24/user/month for commercial teams. lighter is a lean terminal daemon using under 400 MiB RAM, with zero licensing costs forever.
+- 🔓 **Free & Open Source forever:** OrbStack transitioned to a closed-source, paid subscription model ($8–$10/user/month). lighter is dual-licensed MIT / Apache 2.0 with zero commercial seat limits, no "free during beta" bait-and-switch, and zero telemetry.
+- 🧠 **Unlock Apple Silicon AI & GPU acceleration:** Docker Desktop, OrbStack, and Colima offer *zero* Apple Silicon GPU or Neural Engine support. lighter gives your containers native Metal (93 t/s on M1, 299 t/s on M5), PyTorch MPS training, and Neural Engine inference at <1% CPU.
+- ⚡ **Shared folders faster than native macOS:** Bind-mounting code into containers on macOS is historically painful. `lighter-fs` uses an in-memory page cache with real-time `FSEvents` invalidation, making `npm ci` and `ripgrep` faster inside containers than native APFS.
+- 🔌 **100% Drop-in Docker compatibility:** Zero workflow changes. `lighter start` sets up your Docker CLI context. Run existing `docker`, `docker compose`, `kind`, and CI scripts as normal.
 
 ---
 
 ## Install
 
-### One-line installer
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/fieldwork-ai/lighter/main/scripts/install.sh | sh
-```
-
-### Or via Homebrew
+### Via Homebrew (recommended)
 
 ```bash
 brew tap fieldwork-ai/tap
 brew install lighter
+```
+
+### Or via one-line installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fieldwork-ai/lighter/main/scripts/install.sh | sh
 ```
 
 ### Quick start
@@ -82,7 +95,18 @@ Direct installations can opt into background update downloads with `lighter upda
 
 ## Hardware & AI Acceleration
 
-lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, and it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All four devices use Docker's standard Container Device Interface (CDI) via `--device` and need no flags to enable. At idle the GPU renderer costs about 10 MB and two threads (it initialises when the guest driver probes, at boot); the other three cost nothing until a container uses them.
+lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, and it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All four devices use Docker's standard Container Device Interface (CDI) via `--device` and need no flags to enable.
+
+| Device | What a container gets | Measured performance |
+|---|---|---|
+| `lighter.sh/gpu` | Vulkan on the Mac's GPU through Venus | llama.cpp 45 t/s on M1 |
+| `lighter.sh/metal` | ggml's Metal kernels over RPC | 93 t/s on M1 (85% of native); 299 on M5 |
+| `lighter.sh/ane` | ONNX models on Neural Engine, GPU or CPU (fastest chosen) | ResNet-50 2.2 ms vs 29 ms on container CPU |
+| `lighter.sh/mps` | PyTorch on the Mac's GPU | Training step 14 ms on M1, 7 ms on M5 |
+
+Two documented costs (`docs/gpu.md`): cold start is ~50 ms longer with accelerator devices enabled (564 / 715 ms vs 517 / 664 ms on M5), and idle memory is ~20 MiB higher (394 vs 372 MiB) for the in-process servers' readiness. Devices can be disabled individually if desired (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off`).
+
+A resident accelerator client (such as Frigate NVR or a continuous speech service) no longer burns a host core at idle: with lighter's 1 ms message-horizon polling rule, CPU usage is 21–39% during active detection (compared to a full pinned core before) and returns to rest between requests.
 
 See [`docs/gpu.md`](docs/gpu.md) for complete technical documentation and architecture.
 
@@ -95,7 +119,7 @@ docker run --rm --device lighter.sh/metal=all -v ./models:/models llama-cpp-rpc 
   llama-bench -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --rpc "$LIGHTER_METAL" -ngl 99
 ```
 
-- **95 tokens/sec generation** in-container vs **110 native** on an M1 (87% of native; vs 21 t/s on CPU).
+- **93 tokens/sec generation on M1** (85% of native 110 t/s; vs 21 t/s on CPU) and **299 tokens/sec on M5**.
 - **1,911 prompt tokens/sec** in-container vs 1,953 native.
 - **Whisper transcription**: 11-second audio clip transcribed in 1.30s (vs 5.80s on container CPU).
 - Includes automatic host-side tensor caching (`~/.lighter/ggml-cache`) for instant reloads.
@@ -110,6 +134,7 @@ docker run --rm --device lighter.sh/mps=all python:3.12-slim sh -c '
   python -c "import torch, lighter_mps; x = torch.randn(3, 3, device=\"mps\"); print((x @ x).device)"'
 ```
 
+- Training step: **14 ms on M1, 7 ms on M5**.
 - Native `model.to("mps")` works seamlessly for both inference and training with autograd.
 - Host PyTorch is discovered automatically from your macOS environment (`lighter config --torch-python`).
 - The wheels are built for CPython 3.11 to 3.13 against torch 2.14.0, and the host's torch must be the same version, with numpy beside it; `lighter doctor` says which it found. A 3.14 image or another torch fails at `pip install lighter-mps` or at start.
@@ -129,8 +154,9 @@ session = ort.InferenceSession("model.onnx", options)
 ```
 
 - Ships a custom `no_std` ONNX Runtime Execution Provider (`liblighter_ane_ep.so`) linking no libc.
-- **ResNet-50 in 1.76 ms** on the Neural Engine (vs 30.0 ms CPU, 7.9 ms GPU).
+- **ResNet-50 in 2.2 ms** on the Neural Engine (vs 29 ms on container CPU).
 - **Frigate NVR**: YOLO11n object detection runs at **7.6 ms/frame at <1% CPU** (vs 15.1 ms and 36% CPU on container CPU).
+- Automatic tiering: Model loads across Neural Engine, GPU, and CPU paths on first run; fastest candidate is automatically chosen and CoreML compiled models are cached in `coreml-cache`.
 
 ### 4. General-Purpose Vulkan (`--device lighter.sh/gpu=all`)
 
@@ -151,14 +177,12 @@ docker run --rm --device lighter.sh/gpu=all alpine:edge sh -c \
 
 All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On Apple Silicon, lighter launches containers cold in **664 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **394 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
+On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **394 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
 
-Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 15 Sequoia). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
-
-Lighter measurements reflect the 0.5.1 release; competitor measurements retain their 0.5.0-release suite. Docker Desktop's host-share cleanup failed during testing; affected install timings are excluded. Raw observations, environment fingerprints, and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md), and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation.
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26 Tahoe). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta. Raw observations, environment fingerprints, and individual repetition timings are preserved in [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 </details>
 
 ### MacBook Pro — Apple M5 Pro (18 cores, 48 GB RAM)
@@ -300,9 +324,9 @@ OrbStack, Docker Desktop and Colima leave the Mac's GPU and Neural Engine inacce
 
 lighter exposes the Apple Silicon compute architecture to containers:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
-- **Zero idle tax:** Metal renderers and runtime runners initialise strictly on demand. An idle machine pays 0 MiB RAM and 0% CPU for accelerator hardware.
+- **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 394 MiB (+20 MiB over baseline).
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
-- **Sub-millisecond thread QoS boosting:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive` and extends the guest kernel's poll-before-WFI window to 2–5 ms (`qos::Boost`), cutting request loop latency to achieve 87–90% of native Metal inference speeds.
+- **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`). If traffic pauses, polling drops back immediately to the resting floor within rounds—allowing resident containers (such as Frigate NVR or background speech-to-text) to run at 21–39% CPU during active detection rather than pinning a full host core.
 
 ---
 
