@@ -7,12 +7,12 @@ that traffic is counted here, where sockmap moves every byte of a joined
 stream: the guest agent marks both sockets of such a stream with
 LIGHTER_SK_MARK_ACCELERATOR, the container's TCP socket and the vsock
 stream to the host, and each byte arriving on either is added to a per-CPU
-count the idle loop sums. A stream the agent copies itself, with sockmap
+count the idle loop sums, with the time it arrived beside it. A stream the agent copies itself, with sockmap
 off, is never counted, and keeps the resting window.
 
 --- a/include/linux/sched/idle.h
 +++ b/include/linux/sched/idle.h
-@@ -3,6 +3,16 @@
+@@ -3,6 +3,17 @@
  #define _LINUX_SCHED_IDLE_H
  
  #include <linux/sched.h>
@@ -26,6 +26,7 @@ off, is never counted, and keeps the resting window.
 + */
 +#define LIGHTER_SK_MARK_ACCELERATOR	0x4c414343
 +DECLARE_PER_CPU(unsigned long, idle_poll_traffic);
++DECLARE_PER_CPU(u64, idle_poll_traffic_at);
  
  enum cpu_idle_type {
  	__CPU_NOT_IDLE = 0,
@@ -39,13 +40,15 @@ off, is never counted, and keeps the resting window.
  #include <trace/events/sock.h>
  
  /* Guards every psock's paused list and paused_on: a source and its target
-@@ -1355,6 +1356,10 @@ static int sk_psock_verdict_recv(struct sock *sk, struct sk_buff *skb)
+@@ -1355,6 +1356,12 @@ static int sk_psock_verdict_recv(struct sock *sk, struct sk_buff *skb)
  		sock_drop(sk, skb);
  		goto out;
  	}
 +#ifdef CONFIG_ARM64
-+	if (sk->sk_mark == LIGHTER_SK_MARK_ACCELERATOR)
++	if (sk->sk_mark == LIGHTER_SK_MARK_ACCELERATOR) {
 +		this_cpu_add(idle_poll_traffic, len);
++		this_cpu_write(idle_poll_traffic_at, ktime_get_mono_fast_ns());
++	}
 +#endif
  	prog = READ_ONCE(psock->progs.stream_verdict);
  	if (!prog)

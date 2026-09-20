@@ -29,10 +29,10 @@ After polling with interrupts enabled, return through the generic idle loop
 before WFI so it can reprogram timers queued by an interrupt. A per-CPU
 flag skips polling on the next iteration after a timeout.
 
-What decides is whether bytes moved on a container's stream to an
-accelerator since the CPU last went idle, counted where sockmap moves
-them on sockets the guest agent marks (patch 0032). If they did, a model
-is talking and the window grows to its cap whatever woke the CPU: a
+What decides is whether a byte moved on a container's stream to an
+accelerator within the last window's length, counted where sockmap
+moves them on sockets the guest agent marks (patch 0032). If one did, a
+model is talking and the window grows to its cap whatever woke the CPU: a
 container talking to the Mac's GPU raises the cap to 5 ms (`idle.poll_ns`)
 so its client's threads stay awake between the messages of a token, and
 the tick or a thread's hand-off in the middle of that is no reason to
@@ -50,6 +50,10 @@ from the host arrives as an interrupt whose bytes are counted by the
 worker it wakes, so at the instant of waking the count has not moved and
 the CPU that took the interrupt would read every reply as a wakeup from
 inside the guest; by its next idle entry it has run what it woke for.
+And the question is the age of the last byte, not whether one moved
+since this CPU's last idle entry: the tick and hand-offs chop a wait
+into several idle periods, and judged per period half of them saw
+nothing move in the middle of a token loop.
 
 --- a/arch/arm64/include/asm/thread_info.h
 +++ b/arch/arm64/include/asm/thread_info.h
@@ -87,7 +91,7 @@ inside the guest; by its next idle entry it has run what it woke for.
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +42,257 @@
+@@ -33,13 +42,278 @@
  }
  
  /*
@@ -107,10 +111,11 @@ inside the guest; by its next idle entry it has run what it woke for.
 + * a long sleep halves it, so a machine that is really idle stops spinning
 + * within a few rounds and costs the host nothing.
 + *
-+ * What decides is whether bytes moved on a container's stream to an
-+ * accelerator since this CPU last went idle, counted where sockmap moves
-+ * them on sockets the guest agent marks (net/core/skmsg.c). If they did, a
-+ * model is talking, and the window grows to its cap whatever woke the CPU:
++ * What decides is whether a byte moved on a container's stream to an
++ * accelerator within the last window's length, counted where sockmap
++ * moves them on sockets the guest agent marks (net/core/skmsg.c). If one
++ * did, a model is talking, and the window grows to its cap whatever woke
++ * the CPU:
 + * a container talking to the Mac's GPU raises the cap to 5 ms so its
 + * client's threads stay awake between the messages of a token, and the
 + * tick or a thread's hand-off in the middle of that is no reason to give
@@ -142,7 +147,7 @@ inside the guest; by its next idle entry it has run what it woke for.
 +static DEFINE_PER_CPU(u64, idle_poll_block_ns);
 +static DEFINE_PER_CPU(bool, idle_poll_block_timer);
 +static DEFINE_PER_CPU(bool, idle_poll_block_pending);
-+static DEFINE_PER_CPU(u64, idle_poll_traffic_seen);
++DEFINE_PER_CPU(u64, idle_poll_traffic_at);
 +/* How each block was judged, per CPU, for reading from sysfs. */
 +enum { JUDGED_TIMER, JUDGED_LONG, JUDGED_TRAFFIC, JUDGED_LOCAL, JUDGED_KINDS };
 +static DEFINE_PER_CPU(unsigned long, idle_poll_judged[JUDGED_KINDS]);
@@ -156,6 +161,28 @@ inside the guest; by its next idle entry it has run what it woke for.
 +	for_each_possible_cpu(cpu)
 +		total += per_cpu(idle_poll_traffic, cpu);
 +	return total;
++}
++
++/*
++ * Whether a byte moved on an accelerator stream within the last window's
++ * length. Not "since this CPU last went idle": the tick and hand-offs chop
++ * a wait into several idle periods, and judged per period half of them saw
++ * nothing move in the middle of a token loop. A model that answered within
++ * the last cap is talking.
++ */
++static bool __cpuidle idle_traffic_recent(void)
++{
++	u64 latest = 0, now;
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		latest = max(latest, per_cpu(idle_poll_traffic_at, cpu));
++	if (!latest)
++		return false;
++	instrumentation_begin();
++	now = ktime_get_mono_fast_ns();
++	instrumentation_end();
++	return now - latest < idle_poll_ns;
 +}
 +
 +/* Read-only: the count, and each CPU's window, for reading from sysfs. */
@@ -305,21 +332,19 @@ inside the guest; by its next idle entry it has run what it woke for.
   */
  void __cpuidle arch_cpu_idle(void)
  {
-+	u64 start, next_timer, traffic;
++	u64 start, next_timer;
 +
 +	if (!idle_poll_ns) {
 +		cpu_do_idle();
 +		return;
 +	}
 +
-+	traffic = idle_traffic();
 +	if (__this_cpu_read(idle_poll_block_pending)) {
 +		__this_cpu_write(idle_poll_block_pending, false);
 +		idle_poll_adjust(__this_cpu_read(idle_poll_block_ns),
 +				 __this_cpu_read(idle_poll_block_timer),
-+				 traffic != __this_cpu_read(idle_poll_traffic_seen));
++				 idle_traffic_recent());
 +	}
-+	__this_cpu_write(idle_poll_traffic_seen, traffic);
 +	next_timer = idle_next_timer_ns();
 +	if (__this_cpu_read(idle_poll_limit_ns) &&
 +	    !__this_cpu_read(idle_poll_halt_next)) {

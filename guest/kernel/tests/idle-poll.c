@@ -23,7 +23,9 @@ static unsigned sleeps;
 static unsigned idle_poll_grow_start_ns = 50000;
 static unsigned idle_poll_local_ns = 200000;
 static u64 next_timer_mock, now_mock, traffic_mock;
-static u64 idle_poll_block_ns, idle_poll_traffic_seen;
+static u64 idle_poll_block_ns;
+static bool traffic_recent_mock;
+static bool idle_traffic_recent(void) { return traffic_recent_mock; }
 enum { JUDGED_TIMER, JUDGED_LONG, JUDGED_TRAFFIC, JUDGED_LOCAL, JUDGED_KINDS };
 static unsigned long idle_poll_judged[JUDGED_KINDS];
 #define __this_cpu_inc(counter) ((counter)++)
@@ -193,7 +195,7 @@ int main(void)
     idle_poll_ns = 5000000;
     idle_poll_limit_ns = 200000;
     idle_poll_halt_next = idle_poll_block_pending = false;
-    next_timer_mock = 10000000; now_mock = 1000000; traffic_mock = 10;
+    next_timer_mock = 10000000; now_mock = 1000000; traffic_recent_mock = false;
     pending = polling = irq_enabled = ipi = false; clocks = relaxations = 0;
     arch_cpu_idle();
     if (!idle_poll_block_pending || idle_poll_limit_ns != 200000) {
@@ -201,7 +203,7 @@ int main(void)
             idle_poll_block_pending, idle_poll_limit_ns);
         failures++;
     } else {
-        traffic_mock = 20;
+        traffic_recent_mock = true;
         pending = polling = irq_enabled = ipi = false; clocks = relaxations = 0;
         arch_cpu_idle();
         if (idle_poll_limit_ns != 400000) {
