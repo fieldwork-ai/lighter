@@ -16,5 +16,7 @@
     <string>APPL</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>lighter's containers reach devices on your local network, a camera, a printer or a NAS, through this Mac.</string>
 </dict>
 </plist>

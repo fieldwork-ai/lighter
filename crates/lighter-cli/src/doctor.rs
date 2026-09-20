@@ -16,6 +16,9 @@ pub struct Finding {
     pub detail: String,
     /// What to do about it, when there is something to do.
     pub remedy: Option<String>,
+    /// Worth doing, not blocking: `ok` for the exit code and for `lighter
+    /// start`, printed as a warning with its remedy.
+    pub warn: bool,
 }
 
 impl Finding {
@@ -25,6 +28,7 @@ impl Finding {
             what: what.into(),
             detail: detail.into(),
             remedy: None,
+            warn: false,
         }
     }
 
@@ -34,6 +38,19 @@ impl Finding {
             what: what.into(),
             detail: detail.into(),
             remedy: Some(remedy.into()),
+            warn: false,
+        }
+    }
+    /// Something the user should fix that nothing here can refuse to run
+    /// over: a permission that macOS grants only to a machine that is
+    /// running and has asked, for one.
+    fn warn(what: &str, detail: impl Into<String>, remedy: &str) -> Finding {
+        Finding {
+            ok: true,
+            what: what.into(),
+            detail: detail.into(),
+            remedy: Some(remedy.into()),
+            warn: true,
         }
     }
 }
@@ -213,8 +230,11 @@ pub fn run() -> Vec<Finding> {
             Ok(home) => crate::localnet::doctor_finding(&home, pid),
             Err(e) => (true, format!("untested: {e}"), None),
         };
+        // A warning, never a failure: `lighter start` must not refuse over
+        // a permission macOS grants only to a machine that is running and
+        // has asked, and a gate's fresh machine is a fresh identity.
         match remedy {
-            Some(remedy) if !ok => Finding::bad("local network", detail, &remedy),
+            Some(remedy) if !ok => Finding::warn("local network", detail, &remedy),
             _ => Finding::good("local network", detail),
         }
     });
@@ -249,7 +269,13 @@ pub fn run() -> Vec<Finding> {
 pub fn report(findings: &[Finding]) -> String {
     let mut out = String::new();
     for finding in findings {
-        let mark = if finding.ok { "ok  " } else { "FAIL" };
+        let mark = if !finding.ok {
+            "FAIL"
+        } else if finding.warn {
+            "warn"
+        } else {
+            "ok  "
+        };
         let _ = writeln!(out, "  {mark}  {:<24} {}", finding.what, finding.detail);
         if let Some(remedy) = &finding.remedy {
             let _ = writeln!(out, "        {remedy}");

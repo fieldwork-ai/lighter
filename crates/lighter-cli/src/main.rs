@@ -334,6 +334,7 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
                         | "lighter.sh/gpu"
                         | "lighter.sh/ane"
                         | "lighter.sh/metal"
+                        | "local network"
                 )
         })
         .collect();
