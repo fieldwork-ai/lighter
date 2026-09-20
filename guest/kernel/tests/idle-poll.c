@@ -20,6 +20,13 @@ static unsigned idle_poll_ns = 200000;
 static bool idle_poll_halt_next;
 static bool timer_reprogram, slept_before_reprogram;
 static unsigned sleeps;
+static unsigned idle_poll_grow_start_ns = 50000;
+static u64 next_timer_mock, now_mock;
+#define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define instrumentation_begin()
+#define instrumentation_end()
+static u64 ktime_get_mono_fast_ns(void) { return now_mock; }
+static u64 idle_next_timer_ns(void) { return next_timer_mock; }
 
 static void wake(void)
 {
@@ -67,10 +74,12 @@ static bool current_clr_polling_and_test(void)
 	return result;
 }
 
-/* The Python runner inserts the unmodified idle_poll function here. */
+/* The Python runner inserts the unmodified functions here. */
+@IDLE_SLACK@
+@IDLE_TIMER_DUE@
+@IDLE_ADJUST@
 @IDLE_POLL@
 
-static void idle_poll_adjust(u64 elapsed) { (void)elapsed; }
 static void cpu_do_idle(void)
 {
     sleeps++;
@@ -106,6 +115,8 @@ int main(void)
      * kernel/sched/idle.c must get another turn to update the stopped tick
      * before the architecture sleeps. Merely testing NEED_RESCHED misses it. */
     scenario = TIMER;
+    next_timer_mock = 10000000;
+    now_mock = 1000000;
     idle_poll_limit_ns = 500;
     idle_poll_halt_next = false;
     pending = polling = irq_enabled = ipi = false;
@@ -124,6 +135,31 @@ int main(void)
             failures++;
         } else {
             printf("PASS: timer queued while polling returns through scheduler before WFI\n");
+        }
+    }
+    /* The window grows only on a wakeup from outside: a block that ends
+     * when the programmed timer was due says nothing about the next event
+     * and was known in advance, so it halves the window instead. */
+    struct { const char *name; u64 block, next, now; u32 before, after; } rules[] = {
+        { "outside wakeup within the cap doubles", 100000, 10000000, 1000000, 60000, 120000 },
+        { "outside wakeup from nothing starts at the floor", 100000, 10000000, 1000000, 0, 50000 },
+        { "outside wakeup past the cap halves", 300000, 10000000, 1000000, 100000, 50000 },
+        { "timer wakeup within the cap halves", 100000, 1000000, 990000, 100000, 50000 },
+        { "timer wakeup just late still halves", 100000, 1000000, 1020000, 100000, 50000 },
+        { "wakeup well before the timer doubles", 100000, 1000000, 900000, 100000, 200000 },
+        { "the cap bounds the growth", 100000, 10000000, 1000000, 150000, 200000 },
+    };
+    for (unsigned i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+        idle_poll_limit_ns = rules[i].before;
+        next_timer_mock = rules[i].next;
+        now_mock = rules[i].now;
+        idle_poll_adjust(rules[i].block, idle_timer_due(next_timer_mock));
+        if (idle_poll_limit_ns != rules[i].after) {
+            fprintf(stderr, "FAIL: %s (limit %u, expected %u)\n",
+                rules[i].name, idle_poll_limit_ns, rules[i].after);
+            failures++;
+        } else {
+            printf("PASS: %s\n", rules[i].name);
         }
     }
     return failures != 0;

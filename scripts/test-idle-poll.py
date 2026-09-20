@@ -33,12 +33,31 @@ arch = re.search(
 )
 if not arch:
     sys.exit("Cannot find arch_cpu_idle in the kernel patch")
+def added_function(pattern, what):
+    found = re.search(pattern, added, re.M | re.S)
+    if not found:
+        sys.exit(f"Cannot find {what} in the kernel patch")
+    return found.group()
+
+adjust = added_function(
+    r"^static void __cpuidle idle_poll_adjust\(u64 block_ns, bool timer_due\)\n\{.*?^\}",
+    "idle_poll_adjust",
+)
+timer_due = added_function(
+    r"^static bool __cpuidle idle_timer_due\(u64 next_timer_ns\)\n\{.*?^\}",
+    "idle_timer_due",
+)
+slack = added_function(r"^#define IDLE_TIMER_SLACK_NS\t\d+$", "IDLE_TIMER_SLACK_NS")
 template = (root / "guest/kernel/tests/idle-poll.c").read_text()
 with tempfile.TemporaryDirectory(prefix="lighter-idle-poll-") as temp:
     source = Path(temp) / "idle-poll.c"
     binary = Path(temp) / "idle-poll"
     source.write_text(
-        template.replace("@IDLE_POLL@", match.group()).replace("@ARCH_IDLE@", arch.group())
+        template.replace("@IDLE_POLL@", match.group())
+        .replace("@ARCH_IDLE@", arch.group())
+        .replace("@IDLE_ADJUST@", adjust)
+        .replace("@IDLE_TIMER_DUE@", timer_due)
+        .replace("@IDLE_SLACK@", slack)
     )
     subprocess.run(
         shlex.split(os.environ.get("CC", "cc")) + [
