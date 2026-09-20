@@ -1023,7 +1023,10 @@ run_boot_case() {
 		./scripts/sign.sh "$LIGHTER_CLI" >/dev/null
 		BOOT_HOME="$(mktemp -d -t lighter-boot-home)"
 		# Use the same explicit resource profile as the other cases.
-		LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" config --cpus "${BENCH_CPUS:-8}" --memory "$(bench_memory_mib)" --disk "$(bench_disk_gib)" >/dev/null
+		# `LIGHTER_BENCH_BOOT_CONFIG_EXTRA` adds config flags for an A/B, such as
+		# `--gpu off --ane off --metal off --mps off` to boot without the devices.
+		# shellcheck disable=SC2086
+		LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" config --cpus "${BENCH_CPUS:-8}" --memory "$(bench_memory_mib)" --disk "$(bench_disk_gib)" ${LIGHTER_BENCH_BOOT_CONFIG_EXTRA:-} >/dev/null
 		# The CLI daemonizes. Register its exact private executable before start
 		# so the continuous guard can distinguish it from a daily VM.
 		if [ -n "${LIGHTER_BENCH_OWNER_FILE:-}" ]; then

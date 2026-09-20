@@ -246,7 +246,10 @@ pub fn machine() -> anyhow::Result<()> {
         shares,
         // Rosetta asks the kernel for x86 ordering on its own threads.
         tso: false,
-        gpu: config.gpu,
+        // A build without the renderer must not offer the device: the guest
+        // driver would probe it, wait five seconds for a capset that never
+        // comes, and every boot would pay that. Doctor says what is missing.
+        gpu: config.gpu && lighter_vmm::virtio::gpu::virgl::linked(),
         gpu_aperture_bytes: 8 << 30,
     };
 

@@ -54,7 +54,15 @@ fn main() -> ExitCode {
             }
             "--no-tty" => config.interactive = false,
             "--tso" => config.tso = true,
-            "--gpu" => config.gpu = true,
+            "--gpu" => {
+                if lighter_vmm::virtio::gpu::virgl::linked() {
+                    config.gpu = true;
+                } else {
+                    eprintln!(
+                        "lighter-bench: built without the renderer; --gpu ignored (host/gpu/build.sh)"
+                    );
+                }
+            }
             "--ane" => ane = true,
             "--metal" => metal = true,
             // Logs the process's own physical footprint on an interval. The
