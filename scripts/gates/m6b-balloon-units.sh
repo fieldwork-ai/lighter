@@ -49,8 +49,12 @@ order="$(probe 'cat /sys/module/page_reporting/parameters/page_reporting_order')
 movable="$(probe "awk '/^Node/{z=\$4} /managed/{if (z==\"Movable\") print \$2}' /proc/zoneinfo")"
 [ "${movable:-0}" -eq 0 ] && pass "one zone: nothing managed in ZONE_MOVABLE" || fail "ZONE_MOVABLE manages ${movable} pages; the guest should be one zone"
 sleep 5
-# A fragmented guest: unmovable pages spread through the pageblocks, so
-# the balloon cannot have whole ones.
+# A fragmented guest: page cache through most of memory and unmovable
+# pages spread through the pageblocks, so the balloon cannot have whole
+# ones and must take small units.
+docker run -d --name m6b-cache alpine sh -c 'dd if=/dev/zero of=/cache bs=1M count=2600 2>/dev/null; sync; sleep 3600' >/dev/null
+for _ in $(seq 1 60); do sleep 2; [ "$(probe "awk '/^Cached:/{print int(\$2/1024)}' /proc/meminfo")" -ge 2400 ] 2>/dev/null && break; done
+note "page cache: $(probe "awk '/^Cached:/{print int(\$2/1024)}' /proc/meminfo") MiB, free $(probe "awk '/^MemFree:/{print int(\$2/1024)}' /proc/meminfo") MiB"
 docker run -d --name m6b-pipes --privileged --ulimit nofile=1048576:1048576 python:3.12-alpine python3 -c '
 import os, time
 buf = b"x" * 65536; n = 0
@@ -64,17 +68,26 @@ for _ in $(seq 1 60); do sleep 2; docker logs m6b-pipes 2>&1 | grep -q pipes && 
 note "fragmenter: $(docker logs m6b-pipes 2>&1 | tail -1); buddyinfo Normal: $(probe 'grep Normal /proc/buddyinfo | cut -c1-90')"
 inflate0="$(vmstat balloon_inflate)"
 echo warn > "$PRESSURE_FILE"
-waited=0; while [ "$(( $(vmstat balloon_inflate) - inflate0 ))" -lt $((768 * 256)) ] && [ "$waited" -lt 60 ]; do sleep 2; waited=$((waited + 2)); done
-inflated=$(( ( $(vmstat balloon_inflate) - inflate0 ) / 256 ))
-[ "$inflated" -ge 768 ] && pass "the balloon inflated ${inflated} MiB in ${waited}s under Warn on a fragmented guest" || fail "only ${inflated} MiB inflated in ${waited}s"
+waited=0; while [ "$(field ballooned_mib)" -lt 768 ] && [ "$waited" -lt 60 ]; do sleep 2; waited=$((waited + 2)); done
+inflated="$(field ballooned_mib)"
+units=$(( $(vmstat balloon_inflate) - inflate0 ))
+[ "${inflated:-0}" -ge 768 ] && pass "the balloon inflated ${inflated} MiB in ${waited}s under Warn on a fragmented guest, in ${units} units" || fail "only ${inflated:-0} MiB inflated in ${waited}s"
+# One event per unit: a balloon of whole pageblocks is half a unit a
+# megabyte, a balloon of 16 KiB islands sixty-four.
+[ "$units" -gt 0 ] && note "$(( inflated * 1024 / units )) KiB a unit on average"
 puffs="$(grep -ac 'Out of puff' "$LOG" || true)"
 note "'Out of puff' lines: ${puffs}"
-docker rm -f m6b-pipes >/dev/null 2>&1
+# The cache and the pipes go, and compaction is forced: the small units
+# now have room to move into.
+docker rm -f m6b-pipes m6b-cache >/dev/null 2>&1
+probe 'echo 3 > /proc/sys/vm/drop_caches' || true
 sleep 3
 migrate0="$(vmstat balloon_migrate)"
 for _ in 1 2 3; do probe 'echo 1 > /proc/sys/vm/compact_memory' || true; sleep 2; done
 migrated=$(( $(vmstat balloon_migrate) - migrate0 ))
-if [ "$migrated" -gt 0 ]; then pass "compaction migrated ${migrated} balloon units (balloon_migrate)"; else fail "no balloon unit migrated under forced compaction (balloon_migrate ${migrate0} -> $(vmstat balloon_migrate))"; fi
+if [ "$migrated" -gt 0 ]; then pass "compaction migrated ${migrated} balloon units (balloon_migrate)"
+elif [ "$units" -gt 0 ] && [ $(( inflated * 1024 / units )) -ge 1024 ]; then pass "nothing to migrate: the units were whole pageblocks ($(( inflated * 1024 / units )) KiB a unit), which compaction never moves"
+else fail "no balloon unit migrated under forced compaction (balloon_migrate ${migrate0} -> $(vmstat balloon_migrate), $(( inflated * 1024 / (units > 0 ? units : 1) )) KiB a unit)"; fi
 if probe 'dmesg | grep -aE "WARNING:|BUG:|Oops|refcount_t|bad page|kernel BUG" | head -3' | grep -q .; then fail "the guest's kernel warned: $(probe 'dmesg | grep -aE "WARNING:|BUG:|Oops|refcount_t|bad page|kernel BUG" | head -1')"; else pass "no kernel warning through the migration"; fi
 echo normal > "$PRESSURE_FILE"
 sleep 12
@@ -82,7 +95,7 @@ sleep 12
 # The balloon comes down on the guest's release, then the freed units are reported.
 docker run -d --name m6b-work --tmpfs /w:rw,size=1600m alpine sh -c 'dd if=/dev/zero of=/w/x bs=1M count=1400 2>/dev/null; sleep 60' >/dev/null 2>&1 || true
 sleep 25
-note "after a 1.4 GiB tmpfs: balloon $(field ballooned_mib) MiB, footprint $(field mib) MiB, migrated total $(vmstat balloon_migrate), deflated $(( $(vmstat balloon_deflate) / 256 )) MiB"
-docker rm -f m6b-work m6b-probe >/dev/null 2>&1
+note "after a 1.4 GiB tmpfs: balloon $(field ballooned_mib) MiB, footprint $(field mib) MiB, migrated total $(vmstat balloon_migrate), $(vmstat balloon_deflate) units deflated"
+docker rm -f m6b-work m6b-probe m6b-cache >/dev/null 2>&1
 echo
 if [ "$FAILED" -eq 0 ]; then printf '\033[32mm6b balloon units gate passed\033[0m\n'; else printf '\033[31mm6b balloon units gate failed\033[0m\n'; exit 1; fi

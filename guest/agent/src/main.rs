@@ -587,11 +587,14 @@ fn offer_memory(
     // free, because the cache it could reclaim is its own working set and
     // reclaiming it is the cost this avoids. The host doubles the guest.
     // And by the harm itself: pressure stall information says how much of
-    // the last ten seconds some task spent waiting on memory. A tenth of
+    // the last ten seconds every task spent waiting on memory. A tenth of
     // it is a guest that is short whatever its free counts say (the M5's
     // guest at 19:16Z on 2026-09-20 was stalling with gigabytes "free" in
-    // a zone its kernel could not use).
-    let need = busy && (avail < (total >> 20) / 8 || psi_some >= 1000);
+    // a zone its kernel could not use). `full`, not `some`: `some` counts
+    // one task's reclaim, which is the host's own reclaim request and the
+    // compaction after it, and a need on it handed the balloon back the
+    // moment the host had asked for it (m6b, the M1, 2026-09-21).
+    let need = busy && (avail < (total >> 20) / 8 || psi_full >= 1000);
     let spare = if offers && !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
