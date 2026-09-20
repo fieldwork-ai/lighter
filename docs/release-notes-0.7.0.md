@@ -72,8 +72,9 @@ that is what `lighter.sh/mps` is for.
   while a container has a stream open to one of them the vCPUs are held
   there too, and the guest may poll a few milliseconds before sleeping a
   vCPU, for that stream's life only. The guest kernel keeps that window
-  wide only while the stream's own bytes are moving, so a resident client
-  costs the Mac nothing between requests (`docs/gpu.md` has the numbers).
+  wide only for a millisecond after each of the stream's own small
+  messages, so a resident client costs the Mac nothing between requests
+  (`docs/gpu.md` has the numbers).
 - Four gates: m9 (vulkaninfo through the CDI device), m10 (an ONNX model
   through the plugin provider, checked against the CPU), m11 (a container's
   PyTorch training a model on `mps`), m12 (llama-bench in a container over
