@@ -118,8 +118,11 @@ built_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'impor
 # A release build links the renderer, ONNX Runtime and ggml; without their
 # archives (make gpu, make ane, make metal) the devices are stubbed and the
 # binary is not a release. releasing.md names these symbols as the check.
+# The table is read once: piped into `grep -q`, nm dies of SIGPIPE at the
+# first match and `pipefail` reports the symbol missing when it is there.
+symbols="$(nm target/release/lighter 2>/dev/null || true)"
 for symbol in _virgl_renderer_init _OrtGetApiBase _ggml_backend_rpc_serve_fd; do
-	nm target/release/lighter 2>/dev/null | grep -q " T $symbol$" || nm target/release/lighter 2>/dev/null | grep -q " $symbol$" \
+	grep -q -- " $symbol$" <<<"$symbols" \
 		|| { echo "error: $symbol is not in the binary: the accelerator archives are missing (make gpu && make ane && make metal)" >&2; exit 1; }
 done
 
