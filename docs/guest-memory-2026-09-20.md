@@ -72,8 +72,9 @@ boot unchanged (729–801 ms to Docker), idle a minute after a cold start
 283 MiB with the range against 412 without, more than the page arrays alone
 (48 MiB) because pages touched at boot lie scattered through four
 gigabytes of pageblocks that reporting at the 2 MiB order never returns.
-The 64 KiB reporting order is what the single zone's footprint is judged
-with. On the same guest the harness ran 14, 16 and 14 seconds per export
+The agent's rest reporting order, 128 KiB, is what the single zone's
+footprint is judged with; the 2 MiB default applies only before the agent
+speaks. On the same guest the harness ran 14, 16 and 14 seconds per export
 under the same fragmenter and hog, API calls under 1.1 s, allocation stalls
 31 thousand across the run against 207 thousand.
 
@@ -87,7 +88,8 @@ The migration series feared at planning was mostly already in Linux 6.18:
 than its target order, `isolate_movable_ops_page` takes the head, and
 `alloc_migration_target` allocates the destination at the source's order.
 The driver's part is to tell the host in units and keep its accounting in
-each page's order. Patch 0034 registers free page reporting at order 4.
+each page's order. Patch 0034 makes the kernel's default reporting order four host pages, for
+the moments before the agent sets its own.
 
 ## The policy
 

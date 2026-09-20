@@ -321,7 +321,7 @@ Cold start includes allocating VM metadata, booting Linux, and initializing Dock
 
 ### 6. Minimal Linux LTS kernel strategy
 lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal, audited patch set focused strictly on hypervisor performance:
-- Balloon units from a whole pageblock down to a host page, movable and migratable, and free page reporting at 64 KiB (`0014`, `0034`); a vsock packet the allocator refuses is sent shorter rather than dropped (`0033`).
+- Balloon units from a whole pageblock down to a host page, movable and migratable, and a 64 KiB default for free page reporting before the agent sets its own (`0014`, `0034`); a vsock packet the allocator refuses is sent shorter rather than dropped (`0033`).
 - BPF sockmap backoff to avoid backlog worker spinning (`0025`).
 - Apple Silicon TSO memory ordering for high-speed Rosetta x86-64 execution (`0023`).
 - `btrfs` direct interrupt-context completions (`0009`).

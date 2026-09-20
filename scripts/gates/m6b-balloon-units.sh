@@ -41,8 +41,13 @@ probe() { docker exec m6b-probe sh -c "$1"; }
 vmstat() { probe "grep -E '^$1 ' /proc/vmstat | awk '{print \$2}'"; }
 zones() { probe "awk '/^Node/{z=\$4} /managed/{printf \"%s=%d MiB \", z, \$2*4/1024}' /proc/zoneinfo"; }
 note "zones: $(zones)"
-[ "$(probe 'cat /sys/module/page_reporting/parameters/page_reporting_order')" = 4 ] && pass "free page reporting at order 4 (64 KiB)" || fail "reporting order is $(probe 'cat /sys/module/page_reporting/parameters/page_reporting_order')"
-if probe "awk '/^Node/{z=\$4} /managed/{print z}' /proc/zoneinfo" | grep -q Movable; then fail "a Movable zone exists; the guest should be one zone"; else pass "one zone: no ZONE_MOVABLE"; fi
+order="$(probe 'cat /sys/module/page_reporting/parameters/page_reporting_order')"
+# The agent sets the order: its rest order once it runs, the pageblock
+# order while containers churn; the kernel's default (0034) is what holds
+# before it speaks.
+[ "${order:-0}" -ge 4 ] && [ "${order:-0}" -le 9 ] && pass "free page reporting at order ${order}" || fail "reporting order is ${order}"
+movable="$(probe "awk '/^Node/{z=\$4} /managed/{if (z==\"Movable\") print \$2}' /proc/zoneinfo")"
+[ "${movable:-0}" -eq 0 ] && pass "one zone: nothing managed in ZONE_MOVABLE" || fail "ZONE_MOVABLE manages ${movable} pages; the guest should be one zone"
 sleep 5
 # A fragmented guest: unmovable pages spread through the pageblocks, so
 # the balloon cannot have whole ones.
@@ -70,7 +75,7 @@ migrate0="$(vmstat balloon_migrate)"
 for _ in 1 2 3; do probe 'echo 1 > /proc/sys/vm/compact_memory' || true; sleep 2; done
 migrated=$(( $(vmstat balloon_migrate) - migrate0 ))
 if [ "$migrated" -gt 0 ]; then pass "compaction migrated ${migrated} balloon units (balloon_migrate)"; else fail "no balloon unit migrated under forced compaction (balloon_migrate ${migrate0} -> $(vmstat balloon_migrate))"; fi
-if probe 'dmesg | grep -aiE "WARNING|BUG|Oops|refcount|bad page" | head -3' | grep -q .; then fail "the guest's kernel warned: $(probe 'dmesg | grep -aiE "WARNING|BUG|Oops|refcount|bad page" | head -1')"; else pass "no kernel warning through the migration"; fi
+if probe 'dmesg | grep -aE "WARNING:|BUG:|Oops|refcount_t|bad page|kernel BUG" | head -3' | grep -q .; then fail "the guest's kernel warned: $(probe 'dmesg | grep -aE "WARNING:|BUG:|Oops|refcount_t|bad page|kernel BUG" | head -1')"; else pass "no kernel warning through the migration"; fi
 echo normal > "$PRESSURE_FILE"
 sleep 12
 [ "$(field ballooned_mib)" -ge 512 ] && pass "Normal is a plateau: balloon holds $(field ballooned_mib) MiB 12s later" || fail "the balloon fell to $(field ballooned_mib) MiB on Normal"

@@ -31,9 +31,9 @@ and what the guest keeps stays compactable. The units are movable pages
 (`CONFIG_BALLOON_COMPACTION`): allocated as movable, so the balloon never
 takes the pageblocks the kernel's own allocations live in, and migrated by
 compaction as compound folios, the driver telling the host the new unit
-before the old. Free page reporting runs at 64 KiB rather than a 2 MiB
-pageblock, so a fragmented guest still returns what it frees (guest
-patches 0014 and 0034).
+before the old. The kernel's default free page reporting order, for the
+moments before the agent sets its own, is four host pages rather than a
+2 MiB pageblock (guest patches 0014 and 0034).
 
 ## Streams survive a guest short of memory
 
