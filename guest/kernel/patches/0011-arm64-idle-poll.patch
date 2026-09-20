@@ -29,10 +29,13 @@ After polling with interrupts enabled, return through the generic idle loop
 before WFI so it can reprogram timers queued by an interrupt. A per-CPU
 flag skips polling on the next iteration after a timeout.
 
-What decides is whether a byte moved on a container's stream to an
-accelerator within the last window's length, counted where sockmap
-moves them on sockets the guest agent marks (patch 0032). If one did, a
-model is talking and the window grows to its cap whatever woke the CPU: a
+What decides is whether a message moved on a container's stream to an
+accelerator within the last window's length, a message being a page or
+less, counted where sockmap moves them on sockets the guest agent marks
+(patch 0032); a tensor's bulk does not count, since a wakeup saved is
+worth nothing to a transfer, and a detector's frame is 3.5 MB of it every
+200 ms. If one did, a model is talking and the window grows to its cap
+whatever woke the CPU: a
 container talking to the Mac's GPU raises the cap to 5 ms (`idle.poll_ns`)
 so its client's threads stay awake between the messages of a token, and
 the tick or a thread's hand-off in the middle of that is no reason to
@@ -91,7 +94,7 @@ nothing move in the middle of a token loop.
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +42,278 @@
+@@ -33,13 +42,279 @@
  }
  
  /*
@@ -164,11 +167,12 @@ nothing move in the middle of a token loop.
 +}
 +
 +/*
-+ * Whether a byte moved on an accelerator stream within the last window's
-+ * length. Not "since this CPU last went idle": the tick and hand-offs chop
-+ * a wait into several idle periods, and judged per period half of them saw
-+ * nothing move in the middle of a token loop. A model that answered within
-+ * the last cap is talking.
++ * Whether a message moved on an accelerator stream within the last
++ * window's length (a message being a page or less; a tensor's bulk does
++ * not count, net/core/skmsg.c). Not "since this CPU last went idle": the
++ * tick and hand-offs chop a wait into several idle periods, and judged per
++ * period half of them saw nothing move in the middle of a token loop. A
++ * model that answered within the last cap is talking.
 + */
 +static bool __cpuidle idle_traffic_recent(void)
 +{
