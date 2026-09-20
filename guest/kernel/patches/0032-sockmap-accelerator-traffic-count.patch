@@ -44,7 +44,7 @@ off, is never counted, and keeps the resting window.
  #include <trace/events/sock.h>
  
  /* Guards every psock's paused list and paused_on: a source and its target
-@@ -1355,6 +1356,17 @@ static int sk_psock_verdict_recv(struct sock *sk, struct sk_buff *skb)
+@@ -1355,6 +1356,18 @@ static int sk_psock_verdict_recv(struct sock *sk, struct sk_buff *skb)
  		sock_drop(sk, skb);
  		goto out;
  	}
