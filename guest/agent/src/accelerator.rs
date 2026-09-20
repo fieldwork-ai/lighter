@@ -16,10 +16,27 @@
 //! 5 ms is the cap that keeps the vCPU awake between messages and lets it
 //! sleep through the compute.
 //!
-//! So the window is widened for exactly as long as a stream to an
-//! accelerator port is open, and restored when the last one closes. The
-//! ports come from the kernel command line, where init also reads them for
-//! the CDI specs. The sysfs knobs are the patch's module parameters.
+//! So the window is widened while a stream to an accelerator port is
+//! carrying bytes, and put back a quarter of a second after the last byte
+//! moved on any of them. Not for as long as a stream is open: a resident
+//! client holds its connection for its lifetime (Frigate's detector, a
+//! whisper or llama server), and a 5 ms cap on a guest that ticks every
+//! 4 ms means the vCPUs never reach WFI at all — the M1's home server cost
+//! the Mac a full core with the widened window held open for Frigate, 90%
+//! of it the four vCPU threads polling for nothing, against a quarter of a
+//! core at rest. The kernel's own adaptation cannot help: its window grows
+//! whenever a wakeup arrives within the cap, which the tick guarantees.
+//! The bytes are counted where the kernel keeps them, the socket's
+//! `TCP_INFO`, sampled every 50 ms, since a joined stream's bytes never
+//! pass through this process. Only the Metal and PyTorch streams earn the
+//! window: theirs are the message loops, eight messages a token and an
+//! operator at a time. A Neural Engine stream carries one request and one
+//! answer per inference, a frame every 200 ms for a detector at five a
+//! second, which no quiet threshold separates from a large model's wait
+//! for its logits, and which the window would shorten by tens of
+//! microseconds against milliseconds of compute. The ports come from the
+//! kernel command line, where init also reads them for the CDI specs. The
+//! sysfs knobs are the patch's module parameters.
 //!
 //! The same ports are gated here. The servers behind them parse what they
 //! are sent inside the lighter process, and the CDI device only names the
@@ -30,14 +47,23 @@
 //! container; the agent asks dockerd over its socket, by the connection's
 //! source address, and refuses on any doubt.
 
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const POLL_NS: &str = "/sys/module/idle/parameters/poll_ns";
 const POLL_GROW_START_NS: &str = "/sys/module/idle/parameters/poll_grow_start_ns";
 
-/// The cap and the floor while a stream is open, nanoseconds.
+/// The cap and the floor while a stream is carrying bytes, nanoseconds.
 const WIDE_NS: &str = "5000000";
 const WIDE_START_NS: &str = "2000000";
+
+/// How often the streams' byte counts are read, and how long they may
+/// stand still before the window is put back. A model answering a token
+/// moves bytes every few milliseconds; a detector at one frame a second
+/// earns the window for each frame's exchange and gives it back between.
+const SAMPLE: Duration = Duration::from_millis(50);
+const QUIET: Duration = Duration::from_millis(250);
 
 /// The keys init publishes as devices; each names a host loopback port, and
 /// the CDI kind is `lighter.sh/<name>`.
@@ -61,10 +87,6 @@ fn devices() -> &'static [(u16, &'static str)] {
             })
             .collect()
     })
-}
-
-fn ports() -> impl Iterator<Item = u16> {
-    devices().iter().map(|&(port, _)| port)
 }
 
 /// The CDI kind behind an accelerator port, if it is one.
@@ -223,46 +245,170 @@ mod tests {
     }
 }
 
-/// Streams open to accelerator ports, and the resting values to put back.
-static OPEN: Mutex<(u32, Option<(String, String)>)> = Mutex::new((0, None));
+/// A stream being watched: its own descriptor, so the socket outlives
+/// nothing but the stream's thread, and the count last read from it.
+struct Stream {
+    id: u64,
+    fd: OwnedFd,
+    bytes: u64,
+}
 
-/// Held for the life of a stream to an accelerator port; `None` for any
-/// other stream.
-pub struct Wide(());
+/// The streams to accelerator ports, whether the window is wide (with the
+/// resting values to put back), when bytes last moved, and whether the
+/// watcher thread is running.
+struct Watch {
+    streams: Vec<Stream>,
+    resting: Option<(String, String)>,
+    last_moved: Option<Instant>,
+    running: bool,
+    next_id: u64,
+}
 
-impl Wide {
-    pub fn open(port: u16) -> Option<Wide> {
-        if !ports().any(|p| p == port) {
+static WATCH: Mutex<Watch> = Mutex::new(Watch {
+    streams: Vec::new(),
+    resting: None,
+    last_moved: None,
+    running: false,
+    next_id: 0,
+});
+
+/// Held for the life of a stream to a Metal or PyTorch port; `None` for
+/// any other stream. While it is held, bytes moving on the stream keep the
+/// vCPUs' poll window wide.
+pub struct Watched(u64);
+
+impl Watched {
+    pub fn open(port: u16, tcp: &std::net::TcpStream) -> Option<Watched> {
+        if !matches!(kind_of(port), Some("metal" | "mps")) {
             return None;
         }
-        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
-        if open.0 == 0 {
-            let resting = (
-                std::fs::read_to_string(POLL_NS).ok()?,
-                std::fs::read_to_string(POLL_GROW_START_NS).ok()?,
-            );
-            // The floor first, so the cap is never below it.
-            if std::fs::write(POLL_GROW_START_NS, WIDE_START_NS).is_err()
-                || std::fs::write(POLL_NS, WIDE_NS).is_err()
-            {
-                return None;
-            }
-            open.1 = Some(resting);
+        let fd = tcp.as_fd().try_clone_to_owned().ok()?;
+        let mut watch = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let id = watch.next_id;
+        watch.next_id += 1;
+        // Counted from nothing, so whatever the client has already sent
+        // reads as movement at the first sample.
+        watch.streams.push(Stream { id, fd, bytes: 0 });
+        if !watch.running {
+            watch.running = true;
+            std::thread::spawn(watcher);
         }
-        open.0 += 1;
-        Some(Wide(()))
+        Some(Watched(id))
     }
 }
 
-impl Drop for Wide {
+impl Drop for Watched {
     fn drop(&mut self) {
-        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
-        open.0 -= 1;
-        if open.0 == 0
-            && let Some((poll_ns, start_ns)) = open.1.take()
-        {
-            let _ = std::fs::write(POLL_NS, poll_ns.trim());
-            let _ = std::fs::write(POLL_GROW_START_NS, start_ns.trim());
+        let mut watch = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        watch.streams.retain(|s| s.id != self.0);
+    }
+}
+
+/// Reads every stream's byte count each `SAMPLE`; widens the window when
+/// any moved, puts it back after `QUIET` without movement, and ends, with
+/// the window at rest, once the last stream has closed.
+fn watcher() {
+    loop {
+        std::thread::sleep(SAMPLE);
+        let mut watch = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if watch.streams.is_empty() {
+            narrow(&mut watch);
+            watch.running = false;
+            return;
         }
+        let mut moved = false;
+        for stream in &mut watch.streams {
+            let bytes = bytes_moved(&stream.fd);
+            if bytes != stream.bytes {
+                stream.bytes = bytes;
+                moved = true;
+            }
+        }
+        let now = Instant::now();
+        if moved {
+            watch.last_moved = Some(now);
+            if watch.resting.is_none() {
+                widen(&mut watch);
+            }
+        } else if watch.resting.is_some()
+            && watch.last_moved.is_none_or(|t| now.duration_since(t) > QUIET)
+        {
+            narrow(&mut watch);
+        }
+    }
+}
+
+/// Bytes that have crossed a TCP socket in both directions, as the kernel
+/// counts them; zero for a descriptor that is not one.
+fn bytes_moved(fd: &OwnedFd) -> u64 {
+    // SAFETY: a zeroed tcp_info is a valid value to be filled in; the
+    // length passed is the struct's own, and the kernel fills no more.
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut libc::tcp_info).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+    info.tcpi_bytes_received.wrapping_add(info.tcpi_bytes_acked)
+}
+
+fn widen(watch: &mut Watch) {
+    let Ok(poll_ns) = std::fs::read_to_string(POLL_NS) else { return };
+    let Ok(start_ns) = std::fs::read_to_string(POLL_GROW_START_NS) else { return };
+    // The floor first, so the cap is never below it.
+    if std::fs::write(POLL_GROW_START_NS, WIDE_START_NS).is_err()
+        || std::fs::write(POLL_NS, WIDE_NS).is_err()
+    {
+        return;
+    }
+    watch.resting = Some((poll_ns, start_ns));
+}
+
+fn narrow(watch: &mut Watch) {
+    if let Some((poll_ns, start_ns)) = watch.resting.take() {
+        let _ = std::fs::write(POLL_NS, poll_ns.trim());
+        let _ = std::fs::write(POLL_GROW_START_NS, start_ns.trim());
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn bytes_are_counted_both_ways() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let fd = server.as_fd().try_clone_to_owned().unwrap();
+        assert_eq!(bytes_moved(&fd), 0);
+        client.write_all(&[7u8; 100]).unwrap();
+        let mut buf = [0u8; 100];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(bytes_moved(&fd), 100);
+        server.write_all(&[9u8; 50]).unwrap();
+        client.read_exact(&mut buf[..50]).unwrap();
+        // The reply counts once the client's ack is in.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bytes_moved(&fd) < 150 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(bytes_moved(&fd), 150);
+    }
+
+    #[test]
+    fn a_closed_descriptor_counts_nothing() {
+        let file = std::fs::File::open("/proc/self/stat").unwrap();
+        let fd = file.as_fd().try_clone_to_owned().unwrap();
+        assert_eq!(bytes_moved(&fd), 0);
     }
 }
