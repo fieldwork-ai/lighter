@@ -21,7 +21,11 @@ static bool idle_poll_halt_next;
 static bool timer_reprogram, slept_before_reprogram;
 static unsigned sleeps;
 static unsigned idle_poll_grow_start_ns = 50000;
-static u64 next_timer_mock, now_mock;
+static unsigned idle_poll_local_ns = 200000;
+static u64 next_timer_mock, now_mock, traffic_mock;
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+static u64 idle_traffic(void) { return traffic_mock; }
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define instrumentation_begin()
 #define instrumentation_end()
@@ -139,21 +143,32 @@ int main(void)
     }
     /* The window grows only on a wakeup from outside: a block that ends
      * when the programmed timer was due says nothing about the next event
-     * and was known in advance, so it halves the window instead. */
-    struct { const char *name; u64 block, next, now; u32 before, after; } rules[] = {
-        { "outside wakeup within the cap doubles", 100000, 10000000, 1000000, 60000, 120000 },
-        { "outside wakeup from nothing starts at the floor", 100000, 10000000, 1000000, 0, 50000 },
-        { "outside wakeup past the cap halves", 300000, 10000000, 1000000, 100000, 50000 },
-        { "timer wakeup within the cap halves", 100000, 1000000, 990000, 100000, 50000 },
-        { "timer wakeup just late still halves", 100000, 1000000, 1020000, 100000, 50000 },
-        { "wakeup well before the timer doubles", 100000, 1000000, 900000, 100000, 200000 },
-        { "the cap bounds the growth", 100000, 10000000, 1000000, 150000, 200000 },
+     * and was known in advance, so it halves the window instead. Past the
+     * resting size it grows only on a wakeup that accelerator traffic
+     * brought; one from inside the guest earns the resting window at most,
+     * and brings a larger one back down to it. */
+    struct { const char *name; unsigned cap; u64 block, next, now; bool traffic; u32 before, after; } rules[] = {
+        { "outside wakeup within the cap doubles", 200000, 100000, 10000000, 1000000, false, 60000, 120000 },
+        { "outside wakeup from nothing starts at the floor", 200000, 100000, 10000000, 1000000, false, 0, 50000 },
+        { "outside wakeup past the cap halves", 200000, 300000, 10000000, 1000000, false, 100000, 50000 },
+        { "timer wakeup within the cap halves", 200000, 100000, 1000000, 990000, false, 100000, 50000 },
+        { "timer wakeup just late still halves", 200000, 100000, 1000000, 1020000, false, 100000, 50000 },
+        { "wakeup well before the timer doubles", 200000, 100000, 1000000, 900000, false, 100000, 200000 },
+        { "the resting cap bounds the growth", 200000, 100000, 10000000, 1000000, false, 150000, 200000 },
+        { "a raised cap: traffic grows past the resting size", 5000000, 100000, 10000000, 1000000, true, 200000, 400000 },
+        { "a raised cap: traffic reaches the cap", 5000000, 100000, 10000000, 1000000, true, 4000000, 5000000 },
+        { "a raised cap: a local wakeup stops at the resting size", 5000000, 100000, 10000000, 1000000, false, 150000, 200000 },
+        { "a raised cap: a local wakeup halves a larger window", 5000000, 100000, 10000000, 1000000, false, 1600000, 800000 },
+        { "a raised cap: a local wakeup never halves below the resting size", 5000000, 100000, 10000000, 1000000, false, 300000, 200000 },
+        { "a raised cap: the timer halves whatever traffic grew", 5000000, 100000, 1000000, 995000, true, 5000000, 2500000 },
+        { "a raised cap: a block past it halves even with traffic", 5000000, 9000000, 100000000, 1000000, true, 5000000, 2500000 },
     };
     for (unsigned i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+        idle_poll_ns = rules[i].cap;
         idle_poll_limit_ns = rules[i].before;
         next_timer_mock = rules[i].next;
         now_mock = rules[i].now;
-        idle_poll_adjust(rules[i].block, idle_timer_due(next_timer_mock));
+        idle_poll_adjust(rules[i].block, idle_timer_due(next_timer_mock), rules[i].traffic);
         if (idle_poll_limit_ns != rules[i].after) {
             fprintf(stderr, "FAIL: %s (limit %u, expected %u)\n",
                 rules[i].name, idle_poll_limit_ns, rules[i].after);

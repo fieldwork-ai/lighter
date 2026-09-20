@@ -40,7 +40,7 @@ def added_function(pattern, what):
     return found.group()
 
 adjust = added_function(
-    r"^static void __cpuidle idle_poll_adjust\(u64 block_ns, bool timer_due\)\n\{.*?^\}",
+    r"^static void __cpuidle idle_poll_adjust\(u64 block_ns, bool timer_due,\n\s+bool traffic\)\n\{.*?^\}",
     "idle_poll_adjust",
 )
 timer_due = added_function(

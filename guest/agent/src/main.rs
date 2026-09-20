@@ -985,6 +985,10 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     }
     let _ = tcp.set_nodelay(true);
     ends_with_its_peer(&tcp);
+    if _wide.is_some() {
+        accelerator::mark(tcp.as_raw_fd());
+        accelerator::mark(host_write.0.as_raw_fd());
+    }
     let (tcp, host_read, mut host_write) = match joiner() {
         Some(j) => match joined(j, tcp, host_read, host_write) {
             Ok(()) => return,

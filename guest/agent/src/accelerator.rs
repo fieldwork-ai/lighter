@@ -235,6 +235,35 @@ mod tests {
     }
 }
 
+/// The socket mark the guest kernel counts traffic by: bytes arriving on a
+/// socket carrying it, in either direction of a joined stream, are what
+/// earn the poll window its growth past the resting size (kernel patches
+/// 0011 and 0032; the value is `LIGHTER_SK_MARK_ACCELERATOR` there).
+const SK_MARK_ACCELERATOR: u32 = 0x4c41_4343;
+
+/// Marks one end of an accelerator stream for the kernel's count. Both
+/// ends are marked, the container's TCP socket and the vsock stream to the
+/// host, since each direction's bytes arrive on its own socket.
+pub fn mark(fd: std::os::fd::RawFd) {
+    let mark: libc::c_uint = SK_MARK_ACCELERATOR;
+    // SAFETY: a live socket descriptor; the option value is the size given.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            (&mark as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&mark) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        eprintln!(
+            "lighter-agent: cannot mark an accelerator stream: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Streams open to accelerator ports, and the resting cap to put back.
 static OPEN: Mutex<(u32, Option<String>)> = Mutex::new((0, None));
 

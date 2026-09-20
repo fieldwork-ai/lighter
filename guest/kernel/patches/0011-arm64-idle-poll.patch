@@ -33,11 +33,17 @@ The window grows only on a wakeup from outside: at idle entry the CPU
 reads the timer its clock event device has programmed, and a block that
 ends at that time was the timer, which says nothing about how soon the
 next event from a device or another CPU will come, and whose time was
-known, so spinning until it fires gains nothing over WFI. Without this a
-guest that ticks every four milliseconds keeps any cap above 4 ms grown
-for as long as it lives: with the cap at 5 ms for a container's stream to
-the Mac's GPU, and a detector holding its stream for its lifetime, the M1
-spun a full host core for an idle guest.
+known, so spinning until it fires gains nothing over WFI. And past the
+resting size (`idle.poll_local_ns`, 200 µs) it grows only on a wakeup
+that traffic on a container's stream to an accelerator brought, counted
+where sockmap moves it on sockets the guest agent marks (patch 0032): a
+container talking to the Mac's GPU raises the cap to 5 ms so its client's
+threads stay awake between the messages of a token, and a wakeup from
+inside the guest, a thread pool's hand-off, earns no more than the
+resting window. Without both, a guest that ticks every four milliseconds,
+or one busy enough to wake every few, keeps the 5 ms cap grown for as
+long as the stream is open: a detector holds its stream for its
+lifetime, and the M1 spun a full host core for its idle home server.
 
 --- a/arch/arm64/include/asm/thread_info.h
 +++ b/arch/arm64/include/asm/thread_info.h
@@ -59,7 +65,7 @@ spun a full host core for an idle guest.
  #define _TIF_32BIT		(1 << TIF_32BIT)
 --- a/arch/arm64/kernel/idle.c
 +++ b/arch/arm64/kernel/idle.c
-@@ -5,6 +5,13 @@
+@@ -5,6 +5,14 @@
  
  #include <linux/cpu.h>
  #include <linux/irqflags.h>
@@ -68,12 +74,13 @@ spun a full host core for an idle guest.
 +#include <linux/percpu.h>
 +#include <linux/sched/clock.h>
 +#include <linux/sched/idle.h>
++#include <linux/cpumask.h>
 +#include <linux/tick.h>
 +#include <linux/timekeeping.h>
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +40,147 @@
+@@ -33,13 +41,175 @@
  }
  
  /*
@@ -93,22 +100,42 @@ spun a full host core for an idle guest.
 + * a long sleep halves it, so a machine that is really idle stops spinning
 + * within a few rounds and costs the host nothing.
 + *
-+ * Only a wakeup from outside counts as soon: an interrupt from a device or
-+ * another CPU. The CPU's own timer says nothing about when the next event
-+ * will come, and its time is known at idle entry, so spinning until it
-+ * fires gains nothing over WFI. Without that distinction a guest that ticks
-+ * every four milliseconds keeps any cap above that grown for as long as it
-+ * lives, one host core spun per idle vCPU: a container holding a stream to
-+ * the Mac's GPU raises the cap to 5 ms, and a detector holds its stream for
-+ * its lifetime.
++ * Two things a wakeup must be to count as soon. Not the CPU's own timer:
++ * that says nothing about when the next event will come, and its time is
++ * known at idle entry, so spinning until it fires gains nothing over WFI.
++ * And, for any window past the resting size, a wakeup that traffic on a
++ * container's stream to an accelerator brought: a container talking to the
++ * Mac's GPU raises the cap to 5 ms so its client's threads stay awake
++ * between the messages of a token, and a wakeup from inside the guest, a
++ * thread pool's hand-off, earns no more than the resting window. Without
++ * both, a guest that ticks every four milliseconds, or one busy enough to
++ * wake every few, keeps a 5 ms cap grown for as long as the stream is
++ * open, one host core spun per idle vCPU; a detector holds its stream for
++ * its lifetime. The traffic is counted where sockmap moves it, on sockets
++ * the guest agent marks (net/core/skmsg.c).
 + */
 +static unsigned int idle_poll_ns = 200000;
 +module_param_named(poll_ns, idle_poll_ns, uint, 0644);
 +static unsigned int idle_poll_grow_start_ns = 50000;
 +module_param_named(poll_grow_start_ns, idle_poll_grow_start_ns, uint, 0644);
++/* The most a wakeup from inside the guest earns. */
++static unsigned int idle_poll_local_ns = 200000;
++module_param_named(poll_local_ns, idle_poll_local_ns, uint, 0644);
 +
 +static DEFINE_PER_CPU(u32, idle_poll_limit_ns);
 +static DEFINE_PER_CPU(bool, idle_poll_halt_next);
++DEFINE_PER_CPU(unsigned long, idle_poll_traffic);
++
++/* Bytes on accelerator streams so far, every CPU's count summed. */
++static u64 __cpuidle idle_traffic(void)
++{
++	u64 total = 0;
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		total += per_cpu(idle_poll_traffic, cpu);
++	return total;
++}
 +
 +/* A wakeup this close to the programmed timer is the timer. */
 +#define IDLE_TIMER_SLACK_NS	50000
@@ -138,17 +165,23 @@ spun a full host core for an idle guest.
 +	return now + IDLE_TIMER_SLACK_NS >= next_timer_ns;
 +}
 +
-+static void __cpuidle idle_poll_adjust(u64 block_ns, bool timer_due)
++static void __cpuidle idle_poll_adjust(u64 block_ns, bool timer_due,
++				       bool traffic)
 +{
 +	u32 limit = __this_cpu_read(idle_poll_limit_ns);
++	u32 cap = idle_poll_ns;
 +
-+	if (!timer_due && block_ns <= idle_poll_ns) {
-+		if (limit < idle_poll_grow_start_ns)
++	if (timer_due || block_ns > idle_poll_ns) {
++		limit /= 2;
++	} else {
++		if (!traffic)
++			cap = min(cap, idle_poll_local_ns);
++		if (limit > cap)
++			limit = max(limit / 2, cap);
++		else if (limit < idle_poll_grow_start_ns)
 +			limit = idle_poll_grow_start_ns;
 +		else
-+			limit = min_t(u64, (u64)limit * 2, idle_poll_ns);
-+	} else {
-+		limit /= 2;
++			limit = min_t(u64, (u64)limit * 2, cap);
 +	}
 +	__this_cpu_write(idle_poll_limit_ns, limit);
 +}
@@ -188,7 +221,7 @@ spun a full host core for an idle guest.
   */
  void __cpuidle arch_cpu_idle(void)
  {
-+	u64 start, next_timer;
++	u64 start, next_timer, traffic;
 +
 +	if (!idle_poll_ns) {
 +		cpu_do_idle();
@@ -196,6 +229,7 @@ spun a full host core for an idle guest.
 +	}
 +
 +	next_timer = idle_next_timer_ns();
++	traffic = idle_traffic();
 +	if (__this_cpu_read(idle_poll_limit_ns) &&
 +	    !__this_cpu_read(idle_poll_halt_next)) {
 +		bool woke = idle_poll(&start);
@@ -203,7 +237,8 @@ spun a full host core for an idle guest.
 +		__this_cpu_write(idle_poll_halt_next, !woke);
 +		if (woke)
 +			idle_poll_adjust(local_clock_noinstr() - start,
-+					 idle_timer_due(next_timer));
++					 idle_timer_due(next_timer),
++					 idle_traffic() != traffic);
 +		/* Polling enabled IRQs: an interrupt may have queued a timer
 +		 * without setting NEED_RESCHED. Return through do_idle() to
 +		 * reprogram the stopped tick before the next iteration's WFI.
@@ -218,6 +253,6 @@ spun a full host core for an idle guest.
  	 * tricks
  	 */
  	cpu_do_idle();
-+	idle_poll_adjust(local_clock_noinstr() - start,
-+			 idle_timer_due(next_timer));
++	idle_poll_adjust(local_clock_noinstr() - start, idle_timer_due(next_timer),
++			 idle_traffic() != traffic);
  }
