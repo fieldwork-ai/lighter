@@ -1454,11 +1454,20 @@ mod tests {
             ram: 8 << 30,
         };
         steering.observe(&sample((2 << 30) + (1 << 20)));
-        assert!(steering.compression.lock().unwrap().overcommitted, "over a quarter");
+        assert!(
+            steering.compression.lock().unwrap().overcommitted,
+            "over a quarter"
+        );
         steering.observe(&sample((2 << 30) - (100 << 20)));
-        assert!(steering.compression.lock().unwrap().overcommitted, "just under: still in");
+        assert!(
+            steering.compression.lock().unwrap().overcommitted,
+            "just under: still in"
+        );
         steering.observe(&sample((2 << 30) - (500 << 20)));
-        assert!(!steering.compression.lock().unwrap().overcommitted, "a fifth below: out");
+        assert!(
+            !steering.compression.lock().unwrap().overcommitted,
+            "a fifth below: out"
+        );
     }
 
     /// `need` freezes the ramp where the balloon is and brings it down the
