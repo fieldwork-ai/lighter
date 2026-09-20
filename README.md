@@ -151,7 +151,7 @@ docker run --rm --device lighter.sh/gpu=all alpine:edge sh -c \
 
 All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On Apple Silicon, lighter launches containers cold in **664 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.36 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.5x faster**, idles at **372 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
+On Apple Silicon, lighter launches containers cold in **664 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **394 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
@@ -165,23 +165,23 @@ Lighter measurements reflect the 0.5.1 release; competitor measurements retain t
 
 | Workload (own disk) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.53 s | **4.49 s** (145%) | 6.83 s (96%) | 7.56 s (86%) | 7.96 s (82%) |
-| `pnpm install` | 4.32 s | 1.22 s (354%) | 1.80 s (240%) | **1.06 s** (408%) | 2.75 s (157%) |
-| `yarn install` | 5.89 s | **4.10 s** (144%) | 5.05 s (117%) | 6.00 s (98%) | 10.10 s (58%) |
-| `ripgrep` (file read) | 927 ms | **85 ms** (1091%) | 118 ms (786%) | 115 ms (806%) | 126 ms (736%) |
-| `find` (metadata walk) | 390 ms | **95 ms** (411%) | 129 ms (302%) | 185 ms (211%) | 124 ms (315%) |
-| `cp -a node_modules` | 16.76 s | **898 ms** (1866%) | 1.05 s (1599%) | 1.35 s (1242%) | 2.49 s (673%) |
-| `rm -rf node_modules` | 4.18 s | **396 ms** (1056%) | 473 ms (884%) | 488 ms (857%) | 397 ms (1053%) |
+| `npm ci` | 6.53 s | **4.46 s** (146%) | 6.83 s (96%) | 7.56 s (86%) | 7.96 s (82%) |
+| `pnpm install` | 4.32 s | 1.15 s (377%) | 1.80 s (240%) | **1.06 s** (408%) | 2.75 s (157%) |
+| `yarn install` | 5.89 s | **4.35 s** (135%) | 5.05 s (117%) | 6.00 s (98%) | 10.10 s (58%) |
+| `ripgrep` (file read) | 927 ms | **97 ms** (956%) | 118 ms (786%) | 115 ms (806%) | 126 ms (736%) |
+| `find` (metadata walk) | 390 ms | **90 ms** (433%) | 129 ms (302%) | 185 ms (211%) | 124 ms (315%) |
+| `cp -a node_modules` | 16.76 s | **851 ms** (1970%) | 1.05 s (1599%) | 1.35 s (1242%) | 2.49 s (673%) |
+| `rm -rf node_modules` | 4.18 s | **375 ms** (1115%) | 473 ms (884%) | 488 ms (857%) | 397 ms (1053%) |
 
 | Workload (host share) | native APFS | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 6.53 s | **6.36 s** (103%) | 8.53 s (77%) | 17.89 s (36%) | — |
-| `pnpm install` | 4.32 s | **4.01 s** (108%) | 4.93 s (88%) | 25.95 s (17%) | — |
-| `yarn install` | 5.89 s | **5.19 s** (113%) | 7.97 s (74%) | 22.81 s (26%) | — |
-| `ripgrep` (file read) | 927 ms | **88 ms** (1053%) | 1.00 s (93%) | 3.02 s (31%) | — |
-| `find` (metadata walk) | 390 ms | **92 ms** (424%) | 452 ms (86%) | 1.46 s (27%) | — |
-| `cp -a node_modules` | 16.76 s | **3.80 s** (441%) | 9.58 s (175%) | 41.95 s (40%) | — |
-| `rm -rf node_modules` | 4.18 s | **3.22 s** (130%) | 3.35 s (125%) | 8.38 s (50%) | — |
+| `npm ci` | 6.53 s | **6.42 s** (102%) | 8.53 s (77%) | 17.89 s (36%) | — |
+| `pnpm install` | 4.32 s | **4.71 s** (92%) | 4.93 s (88%) | 25.95 s (17%) | — |
+| `yarn install` | 5.89 s | **5.69 s** (103%) | 7.97 s (74%) | 22.81 s (26%) | — |
+| `ripgrep` (file read) | 927 ms | **77 ms** (1204%) | 1.00 s (93%) | 3.02 s (31%) | — |
+| `find` (metadata walk) | 390 ms | **79 ms** (494%) | 452 ms (86%) | 1.46 s (27%) | — |
+| `cp -a node_modules` | 16.76 s | **4.58 s** (366%) | 9.58 s (175%) | 41.95 s (40%) | — |
+| `rm -rf node_modules` | 4.18 s | 3.46 s (121%) | **3.35 s** (125%) | 8.38 s (50%) | — |
 | Host file edit -> container | 1 ms | **2 ms** | 11 ms | **2 ms** | 3 ms |
 
 #### Memory footprint
@@ -190,10 +190,10 @@ macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Idle, a minute after start | **372 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
-| Peak through an npm install | **3841 MiB** | 5699 MiB | 10054 MiB | 7339 MiB |
-| 15 s after it ends | **702 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
-| 60 s after it ends | **726 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
+| Idle, a minute after start | **394 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
+| Peak through an npm install | **3971 MiB** | 5699 MiB | 10054 MiB | 7339 MiB |
+| 15 s after it ends | **842 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
+| 60 s after it ends | **847 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
 
 #### The network
 
@@ -201,15 +201,15 @@ Throughput and latency between container and host measured with `iperf3`, keep-a
 
 | Case | unit | native | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|---|
-| TCP, container to the Mac | Gbit/s | 124.1 | 91.0 | **95.1** | 4.5 | 24.5 |
-| TCP, the Mac to a container | Gbit/s | 131.2 | **83.7** | 51.5 | 4.0 | 14.7 |
-| TCP into a published port | Gbit/s | — | **87.0** | 52.3 | 3.9 | 14.5 |
-| TCP out of a published port | Gbit/s | — | **92.0** | 88.3 | 4.2 | 32.5 |
-| UDP, container to the Mac | Gbit/s | 21.1 | **5.1** | 3.0 | 3.1 | 0.0 |
-| connects to a published port | thousand per second | 26.6 | 17.1 | **21.2** | 16.1 | 15.7 |
-| GET on a published port, median | µs | 40 | **64** | 74 | 229 | 125 |
-| GET on a published port, p99 | µs | 68 | 213 | **132** | 366 | 232 |
-| DNS lookup from a container, median | µs | 5611 | **40** | 262 | 481 | 513 |
+| TCP, container to the Mac | Gbit/s | 124.1 | **102.4** | 95.1 | 4.5 | 24.5 |
+| TCP, the Mac to a container | Gbit/s | 131.2 | **95.2** | 51.5 | 4.0 | 14.7 |
+| TCP into a published port | Gbit/s | — | **98.4** | 52.3 | 3.9 | 14.5 |
+| TCP out of a published port | Gbit/s | — | **104.0** | 88.3 | 4.2 | 32.5 |
+| UDP, container to the Mac | Gbit/s | 21.1 | **5.3** | 3.0 | 3.1 | 0.0 |
+| connects to a published port | thousand per second | 26.6 | 18.2 | **21.2** | 16.1 | 15.7 |
+| GET on a published port, median | µs | 40 | **62** | 74 | 229 | 125 |
+| GET on a published port, p99 | µs | 68 | 146 | **132** | 366 | 232 |
+| DNS lookup from a container, median | µs | 5611 | **39** | 262 | 481 | 513 |
 
 #### Idle power
 
@@ -217,8 +217,8 @@ Idle CPU consumption and thread wakeups measured via `powermetrics` over a 60-se
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| CPU, ms per second | 3 | **2** | 4 | 36 |
-| Wakeups per second | 56 | 120 | **41** | 3873 |
+| CPU, ms per second | 4 | **2** | 4 | 36 |
+| Wakeups per second | 55 | 120 | **41** | 3873 |
 
 #### Starting up
 
@@ -226,8 +226,8 @@ Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker 
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Start until docker answers | **517 ms** | 1.14 s | 8.80 s | 1.83 s |
-| Start until the first container has run | **664 ms** | 1.41 s | 9.04 s | 2.11 s |
+| Start until docker answers | **564 ms** | 1.14 s | 8.80 s | 1.83 s |
+| Start until the first container has run | **715 ms** | 1.41 s | 9.04 s | 2.11 s |
 
 #### x86-64 images
 
@@ -235,10 +235,10 @@ Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` 
 
 | Workload (x86-64 image, own disk) | lighter, arm64 | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|---|
-| `npm ci` | 4.49 s | **9.14 s** | 13.14 s | 12.73 s | 14.28 s |
-| `pnpm install` | 1.22 s | **2.75 s** | 3.58 s | 2.85 s | 3.85 s |
-| `sha256sum` of 1 GiB | 3.02 s | **4.16 s** | 7.92 s | 4.26 s | 4.39 s |
-| container start, `alpine true` | 138 ms | **156 ms** | 244 ms | 185 ms | 170 ms |
+| `npm ci` | 4.46 s | **9.23 s** | 13.14 s | 12.73 s | 14.28 s |
+| `pnpm install` | 1.15 s | **2.71 s** | 3.58 s | 2.85 s | 3.85 s |
+| `sha256sum` of 1 GiB | 3.00 s | **4.11 s** | 7.92 s | 4.26 s | 4.39 s |
+| container start, `alpine true` | 153 ms | **152 ms** | 244 ms | 185 ms | 170 ms |
 
 [0.5.1 release records](benchmarks/RELEASE-0.5.1.md) and [retained competitor records](benchmarks/RELEASE-0.5.0-COMPETITORS.md) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
 

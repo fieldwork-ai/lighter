@@ -1,19 +1,19 @@
-commit=e0f4b16
-date=2026-09-08T21:35Z
+commit=41d39d0-dirty
+date=2026-09-20T01:51Z
 host=NicksFWMBP
 host.node=v24.18.0
 host.npm=11.16.0
-host.pnpm=10.28.0
+host.pnpm=11.23.0
 host.yarn=1.22.22
 extra_warm_cases=
-image_id=sha256:7432a806d1ad0d1efa1c56bf5786780eb8ff0a67e2b1148c8226741114669281
-runtime_source=b78dfeb3063e3ad7af0660050a766032c36f23c0
-cpus=8 memory_mib=16384 disk_gib=128
-lighter-bench=882249414d1d789a4b8edbdfa717e67c
-lighter-bench.sha256=beb13bd36b28ea4bee380ebf84878e7747c010bcdd50cee8b62ff6ab1931ad5f
-Image=2dab503b5e1ff822d41c831d757e9f6d
-Image.sha256=0b4d835c10f6c5849ee85d4ccab53dec8e0dd3de2dcdb55cc128f78d68a034da
-rootfs.ext4=f87c81c7f6366ce07d6e76cc8ed3c792
-rootfs.ext4.sha256=91fc6821ebb2513dc7a35097745bd2895cea0660bacdd3de7dcab49e33eb7b71
-lighter-agent=4ac61f53abab0fd71970f2e53486c320
-lighter-agent.sha256=4fcd6f1457997f59ff9979959f446854b89b663dbeb657e67cf02690d8df53d3
+image_id=sha256:715fb7023a06ca178a31fa5e51e16b75f5b96b7196398369401cdcc78e13b1d7
+runtime_source=41d39d075725bd596ee9026a4e588a0c8a2e967a
+cpus=8 memory_mib=16384 disk_gib=64
+lighter-bench=469e5d81e0a0cd1f8f22dbdeb68f572c
+lighter-bench.sha256=790e91ba903efb8bf74b8ca72c52268b9257df3761edb89fe6096bf8aefc7ac4
+Image=dc045926d20d062411e6d0b8109d91db
+Image.sha256=14a91f848a9fccaf3881fa5a93cd704a9b8b45b8757cc349afa7442fdc46b4bf
+rootfs.ext4=3e7ccc7930f93f92bcbc752b86696b17
+rootfs.ext4.sha256=68f74c4ec2ee71741c4a9be6d8a3a157760aed11b520a5c5dba6b45300820955
+lighter-agent=62f1c7eddbf3735a3da113c26bd61d64
+lighter-agent.sha256=32d161bbb514f8a7228c88e387e7395e52478f3bf18c80b5c44c6e56bbe7134c
