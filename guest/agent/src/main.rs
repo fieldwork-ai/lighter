@@ -430,11 +430,17 @@ fn bound_container_cache() {
         // alone: the peak 600 MB better, the minute reading 500 MB worse,
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
-        if total >= balloon_min {
+        // The line goes whatever the guest's size: need, release and the
+        // stall averages are the host's only word from inside, and a ramp
+        // that never hears "fine" never moves (m6, the M1, 2026-09-21).
+        // Only the offer of spare memory is for guests of eight gigabytes
+        // and up, where the balloon beat reporting alone.
+        {
             offer_memory(
                 &mut memory_stream,
                 &mut last_offer,
                 total,
+                total >= balloon_min,
                 active,
                 // Quiet, or nothing running and the containers eight seconds
                 // idle: the quiet rule protects running work from a seesaw,
@@ -522,6 +528,7 @@ fn offer_memory(
     stream: &mut Option<OwnedFd>,
     last: &mut Option<[u8; 32]>,
     total: u64,
+    offers: bool,
     active: bool,
     quiet: bool,
     nothing_runs: bool,
@@ -585,7 +592,7 @@ fn offer_memory(
     // guest at 19:16Z on 2026-09-20 was stalling with gigabytes "free" in
     // a zone its kernel could not use).
     let need = busy && (avail < (total >> 20) / 8 || psi_some >= 1000);
-    let spare = if !release && quiet && free > reserve + reserve / 4 {
+    let spare = if offers && !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
         0
