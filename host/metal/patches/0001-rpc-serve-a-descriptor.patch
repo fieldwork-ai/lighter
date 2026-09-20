@@ -1,0 +1,103 @@
+rpc: serve a client on a descriptor the caller already holds
+
+ggml's server accepts on a socket it bound itself, serves one client at a
+time, and returns from its loop on the first accept error (macOS gives
+ECONNABORTED for a queued client that resets), after which the port is
+dead. lighter owns the listener instead and hands each accepted descriptor
+to this call on a thread of its own; it creates backends for that client
+and frees them when it hangs up, so clients run concurrently.
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 1f8cb7906..318491d37 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -27,6 +27,12 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint,
+ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+ 
++// Serves one client on a connected descriptor until it hangs up, then closes
++// it. Each call creates its own backends on the devices and frees them at the
++// end, so clients on separate threads run concurrently.
++GGML_BACKEND_API void ggml_backend_rpc_serve_fd(int fd, const char * cache_dir,
++                                                size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+ 
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index c24caad77..ef1323ac0 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -2078,6 +2078,44 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+     }
+ }
+ 
++void ggml_backend_rpc_serve_fd(int fd, const char * cache_dir,
++                               size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
++    static std::once_flag transport_once;
++    static bool transport_ok = false;
++    std::call_once(transport_once, [] { transport_ok = rpc_transport_init(); });
++    if (!transport_ok) {
++        GGML_LOG_ERROR("Failed to initialize RPC transport\n");
++        return;
++    }
++    std::vector<ggml_backend_t> backends;
++    for (size_t i = 0; i < n_devices; i++) {
++        auto dev = devices[i];
++        auto backend = ggml_backend_dev_init(dev, nullptr);
++        if (!backend) {
++            GGML_LOG_ERROR("Failed to create backend for device %s\n", ggml_backend_dev_name(dev));
++            for (auto b : backends) {
++                ggml_backend_free(b);
++            }
++            return;
++        }
++        backends.push_back(backend);
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++        if (reg) {
++            auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
++            if (set_n_threads) {
++                set_n_threads(backend, n_threads);
++            }
++        }
++    }
++    {
++        auto sock = socket_t::from_fd(fd);
++        rpc_serve_client(backends, cache_dir, sock);
++    }
++    for (auto backend : backends) {
++        ggml_backend_free(backend);
++    }
++}
++
+ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+     if (n_devices == 0 || devices == nullptr) {
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 5ec15dc80..cc6964853 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -600,6 +600,10 @@ socket_t::socket_t(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
+ 
+ socket_t::~socket_t() = default;
+ 
++socket_ptr socket_t::from_fd(int fd) {
++    return socket_ptr(new socket_t(std::make_unique<impl>((sockfd_t) fd)));
++}
++
+ bool socket_t::send_data(const void * data, size_t size) {
+     return pimpl->send_data(data, size);
+ }
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 3f747ecff..127aa4434 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -27,6 +27,8 @@ struct socket_t {
+ 
+     static socket_ptr create_server(const char * host, int port);
+     static socket_ptr connect(const char * host, int port);
++    // A connected descriptor the caller owns from here on.
++    static socket_ptr from_fd(int fd);
+ 
+ private:
+     struct impl;

@@ -36,6 +36,12 @@ COPY init /sbin/lighter-init
 COPY lighter-agent /sbin/lighter-agent
 COPY build-runc /sbin/lighter-build-runc
 COPY boot-memory /sbin/lighter-boot-memory
+# The Neural Engine's ONNX Runtime plugin provider, handed to containers by
+# CDI (`lighter.sh/ane`); built by guest/ane-ep/build.sh, depends on no libc.
+COPY liblighter_ane_ep.so /usr/lib/lighter/liblighter_ane_ep.so
+# The lighter-mps wheels, one per Python, for `pip install lighter-mps` inside
+# a container given `lighter.sh/mps` (guest/torch-mps/build.sh).
+COPY wheels /usr/lib/lighter/wheels
 # The binfmt handler for x86-64 when Rosetta is not there: the agent under a
 # second name, which it recognizes and answers with what to install. A hard
 # link, because `binfmt_misc` opens the registered path once at boot and the

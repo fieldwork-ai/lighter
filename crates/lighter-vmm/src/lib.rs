@@ -25,6 +25,7 @@
 //!     └── net       the host end of the network, behind a process boundary
 //! ```
 
+pub mod ane;
 pub mod boot_timing;
 pub mod bus;
 pub mod clock;
@@ -42,6 +43,7 @@ pub mod machine;
 pub mod memory;
 pub mod memory_policy;
 pub mod mempressure;
+pub mod metal;
 pub mod net;
 pub mod psci;
 pub mod qos;

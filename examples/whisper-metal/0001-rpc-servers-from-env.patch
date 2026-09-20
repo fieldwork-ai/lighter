@@ -1,0 +1,109 @@
+diff --git a/examples/bench/bench.cpp b/examples/bench/bench.cpp
+index 84915c56..1078ee5e 100644
+--- a/examples/bench/bench.cpp
++++ b/examples/bench/bench.cpp
+@@ -1,4 +1,5 @@
+ #include "whisper.h"
++#include "../rpc-env.h"
+ 
+ #include <cstdio>
+ #include <cstring>
+@@ -171,6 +172,8 @@ static int whisper_bench_full(const whisper_params & params) {
+ 
+ int main(int argc, char ** argv) {
+     ggml_backend_load_all();
++    whisper_add_rpc_servers_from_env();
++    ggml_backend_load_all();
+ 
+     whisper_params params;
+ 
+diff --git a/examples/cli/cli.cpp b/examples/cli/cli.cpp
+index 55d5d433..b8ce08f6 100644
+--- a/examples/cli/cli.cpp
++++ b/examples/cli/cli.cpp
+@@ -2,6 +2,7 @@
+ #include "common-whisper.h"
+ 
+ #include "whisper.h"
++#include "../rpc-env.h"
+ #include "grammar-parser.h"
+ 
+ #include <cmath>
+@@ -968,6 +969,8 @@ static void output_lrc(struct whisper_context * ctx, std::ofstream & fout, const
+ static void cb_log_disable(enum ggml_log_level , const char * , void * ) { }
+ 
+ int main(int argc, char ** argv) {
++    ggml_backend_load_all();
++    whisper_add_rpc_servers_from_env();
+ #if defined(_WIN32)
+     // Set the console output code page to UTF-8, while command line arguments
+     // are still encoded in the system's code page. In this way, we can print
+diff --git a/examples/rpc-env.h b/examples/rpc-env.h
+new file mode 100644
+index 00000000..ee549247
+--- /dev/null
++++ b/examples/rpc-env.h
+@@ -0,0 +1,42 @@
++// Registers ggml RPC servers named in WHISPER_RPC (comma separated host:port),
++// or LIGHTER_METAL, as GPU devices, before a model is loaded.
++#pragma once
++
++#include "ggml-backend.h"
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++static inline void whisper_add_rpc_servers_from_env() {
++    const char * env = std::getenv("WHISPER_RPC");
++    if (!env || !*env) env = std::getenv("LIGHTER_METAL");
++    if (!env || !*env) return;
++    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
++    if (!reg) { fprintf(stderr, "whisper: no RPC backend in this build\n"); return; }
++    // One server is one registry, with a device per GPU it serves.
++    typedef ggml_backend_reg_t (*add_server_t)(const char *);
++    add_server_t add_server = (add_server_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
++    if (!add_server) { fprintf(stderr, "whisper: RPC backend has no add_server\n"); return; }
++    std::string servers(env);
++    size_t pos = 0;
++    while (pos <= servers.size()) {
++        size_t next = servers.find(',', pos);
++        std::string endpoint = servers.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
++        if (!endpoint.empty()) {
++            ggml_backend_reg_t server = add_server(endpoint.c_str());
++            if (server) {
++                for (size_t i = 0; i < ggml_backend_reg_dev_count(server); i++) {
++                    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(server, i);
++                    // Into the registry's device list, which is what the
++                    // model loader enumerates; llama.cpp does the same.
++                    ggml_backend_device_register(dev);
++                    fprintf(stderr, "whisper: using RPC server %s (%s)\n", endpoint.c_str(), ggml_backend_dev_name(dev));
++                }
++            } else {
++                fprintf(stderr, "whisper: RPC server %s not reachable\n", endpoint.c_str());
++            }
++        }
++        if (next == std::string::npos) break;
++        pos = next + 1;
++    }
++}
+diff --git a/examples/server/server.cpp b/examples/server/server.cpp
+index b745f4d7..13810c63 100644
+--- a/examples/server/server.cpp
++++ b/examples/server/server.cpp
+@@ -2,6 +2,7 @@
+ #include "common-whisper.h"
+ 
+ #include "whisper.h"
++#include "../rpc-env.h"
+ #include "httplib.h"
+ #include "json.hpp"
+ 
+@@ -640,6 +641,8 @@ void get_req_parameters(const Request & req, whisper_params & params)
+ 
+ int main(int argc, char ** argv) {
+     ggml_backend_load_all();
++    whisper_add_rpc_servers_from_env();
++    ggml_backend_load_all();
+ 
+     whisper_params params;
+     server_params sparams;

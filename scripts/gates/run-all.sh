@@ -24,6 +24,10 @@ GATES=(
 	"m6  memory:m6-memory.sh"
 	"m7  x86-64:m7-amd64.sh"
 	"m8  daily driver:m8-daily.sh"
+	"m9  gpu:m9-gpu.sh"
+	"m10 neural engine:m10-ane.sh"
+	"m11 pytorch:m11-mps.sh"
+	"m12 metal:m12-metal.sh"
 )
 
 only="${1:-}"

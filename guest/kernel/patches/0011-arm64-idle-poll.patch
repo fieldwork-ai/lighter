@@ -29,6 +29,37 @@ After polling with interrupts enabled, return through the generic idle loop
 before WFI so it can reprogram timers queued by an interrupt. A per-CPU
 flag skips polling on the next iteration after a timeout.
 
+What decides is whether a message moved on a container's stream to an
+accelerator within the last millisecond (`idle.poll_recent_ns`, an RPC
+gap's length: a token loop's messages follow each other closer than
+that, and a model's compute or a frame's bulk take longer), a message
+being a page or less, counted where sockmap moves them on sockets the
+guest agent marks (patch 0032); a tensor's bulk does not count, since a
+wakeup saved is worth nothing to a transfer, and a detector's frame is
+3.5 MB of it every 200 ms. If one did, a model is talking and the window grows to its cap
+whatever woke the CPU: a
+container talking to the Mac's GPU raises the cap to 5 ms (`idle.poll_ns`)
+so its client's threads stay awake between the messages of a token, and
+the tick or a thread's hand-off in the middle of that is no reason to
+give the window up. If nothing moved, a window past the resting size
+(`idle.poll_local_ns`, 200 µs) comes back down to it, and at the resting
+size the old adaptation applies with one change: the CPU's own timer,
+read from its clock event device at idle entry, halves the window rather
+than growing it, since its time was known and it says nothing about the
+next event from outside. Without this a guest that ticks every four
+milliseconds, or one busy enough to wake every few, keeps the 5 ms cap
+grown for as long as the stream is open: a detector holds its stream for
+its lifetime, and the M1 spun a full host core for its idle home server.
+A block is judged at the next idle entry rather than on waking: a reply
+from the host arrives as an interrupt whose bytes are counted by the
+worker it wakes, so at the instant of waking the count has not moved and
+the CPU that took the interrupt would read every reply as a wakeup from
+inside the guest; by its next idle entry it has run what it woke for.
+And the question is the age of the last byte, not whether one moved
+since this CPU's last idle entry: the tick and hand-offs chop a wait
+into several idle periods, and judged per period half of them saw
+nothing move in the middle of a token loop.
+
 --- a/arch/arm64/include/asm/thread_info.h
 +++ b/arch/arm64/include/asm/thread_info.h
 @@ -71,6 +71,7 @@
@@ -49,7 +80,7 @@ flag skips polling on the next iteration after a timeout.
  #define _TIF_32BIT		(1 << TIF_32BIT)
 --- a/arch/arm64/kernel/idle.c
 +++ b/arch/arm64/kernel/idle.c
-@@ -5,6 +5,11 @@
+@@ -5,6 +5,15 @@
  
  #include <linux/cpu.h>
  #include <linux/irqflags.h>
@@ -58,10 +89,14 @@ flag skips polling on the next iteration after a timeout.
 +#include <linux/percpu.h>
 +#include <linux/sched/clock.h>
 +#include <linux/sched/idle.h>
++#include <linux/cpumask.h>
++#include <linux/sysfs.h>
++#include <linux/tick.h>
++#include <linux/timekeeping.h>
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +38,107 @@
+@@ -33,13 +42,285 @@
  }
  
  /*
@@ -80,28 +115,198 @@ flag skips polling on the next iteration after a timeout.
 + * wakeup that arrives soon after the CPU gave up polling doubles the window,
 + * a long sleep halves it, so a machine that is really idle stops spinning
 + * within a few rounds and costs the host nothing.
++ *
++ * What decides is whether a message moved on a container's stream to an
++ * accelerator within the last millisecond, an RPC gap's length, counted
++ * where sockmap moves them on sockets the guest agent marks
++ * (net/core/skmsg.c). If one did, a model is talking, and the window grows
++ * to its cap whatever woke the CPU:
++ * a container talking to the Mac's GPU raises the cap to 5 ms so its
++ * client's threads stay awake between the messages of a token, and the
++ * tick or a thread's hand-off in the middle of that is no reason to give
++ * the window up. If nothing moved, a window past the resting size comes
++ * back down to it, and at the resting size the old adaptation applies with
++ * one change: the CPU's own timer, whose time was known at idle entry and
++ * which says nothing about the next event from outside, halves the window
++ * rather than growing it. Without this a guest that ticks every four
++ * milliseconds, or one busy enough to wake every few, keeps a 5 ms cap
++ * grown for as long as the stream is open, one host core spun per idle
++ * vCPU; a detector holds its stream for its lifetime.
 + */
 +static unsigned int idle_poll_ns = 200000;
 +module_param_named(poll_ns, idle_poll_ns, uint, 0644);
 +static unsigned int idle_poll_grow_start_ns = 50000;
 +module_param_named(poll_grow_start_ns, idle_poll_grow_start_ns, uint, 0644);
++/* The most a wakeup from inside the guest earns. */
++static unsigned int idle_poll_local_ns = 200000;
++module_param_named(poll_local_ns, idle_poll_local_ns, uint, 0644);
++/* How long after a message on an accelerator stream a model counts as
++ * talking: the length of an RPC's gap, under which a token loop's messages
++ * follow each other, and over which a model computes or a frame's bulk
++ * moves, where a wakeup saved is worth nothing. */
++static unsigned int idle_poll_recent_ns = 1000000;
++module_param_named(poll_recent_ns, idle_poll_recent_ns, uint, 0644);
 +
 +static DEFINE_PER_CPU(u32, idle_poll_limit_ns);
 +static DEFINE_PER_CPU(bool, idle_poll_halt_next);
++DEFINE_PER_CPU(unsigned long, idle_poll_traffic);
++/* The last block, judged at the next idle entry rather than on waking: a
++ * reply from the host arrives as an interrupt whose bytes are counted by
++ * the worker it wakes, so at the instant of waking the count has not moved
++ * and the wakeup would read as one from inside the guest. By the next idle
++ * entry the CPU has run what it woke for. */
++static DEFINE_PER_CPU(u64, idle_poll_block_ns);
++static DEFINE_PER_CPU(bool, idle_poll_block_timer);
++static DEFINE_PER_CPU(bool, idle_poll_block_pending);
++DEFINE_PER_CPU(u64, idle_poll_traffic_at);
++/* How each block was judged, per CPU, for reading from sysfs. */
++enum { JUDGED_TIMER, JUDGED_LONG, JUDGED_TRAFFIC, JUDGED_LOCAL, JUDGED_KINDS };
++static DEFINE_PER_CPU(unsigned long, idle_poll_judged[JUDGED_KINDS]);
 +
-+static void __cpuidle idle_poll_adjust(u64 block_ns)
++/* Bytes on accelerator streams so far, every CPU's count summed. */
++static u64 __cpuidle idle_traffic(void)
++{
++	u64 total = 0;
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		total += per_cpu(idle_poll_traffic, cpu);
++	return total;
++}
++
++/*
++ * Whether a message moved on an accelerator stream within the last RPC
++ * gap's length (a message being a page or less; a tensor's bulk does not
++ * count, net/core/skmsg.c). Not "since this CPU last went idle": the
++ * tick and hand-offs chop a wait into several idle periods, and judged per
++ * period half of them saw nothing move in the middle of a token loop. A
++ * model that answered within the last cap is talking.
++ */
++static bool __cpuidle idle_traffic_recent(void)
++{
++	u64 latest = 0, now;
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		latest = max(latest, per_cpu(idle_poll_traffic_at, cpu));
++	if (!latest)
++		return false;
++	instrumentation_begin();
++	now = ktime_get_mono_fast_ns();
++	instrumentation_end();
++	return now - latest < idle_poll_recent_ns;
++}
++
++/* Read-only: the count, and each CPU's window, for reading from sysfs. */
++static int idle_poll_traffic_get(char *buffer, const struct kernel_param *kp)
++{
++	return sysfs_emit(buffer, "%llu\n", idle_traffic());
++}
++static const struct kernel_param_ops idle_poll_traffic_ops = {
++	.get = idle_poll_traffic_get,
++};
++module_param_cb(traffic, &idle_poll_traffic_ops, NULL, 0444);
++
++static int idle_poll_limits_get(char *buffer, const struct kernel_param *kp)
++{
++	int cpu, len = 0;
++
++	for_each_online_cpu(cpu)
++		len += sysfs_emit_at(buffer, len, "%s%u", len ? " " : "",
++				     per_cpu(idle_poll_limit_ns, cpu));
++	len += sysfs_emit_at(buffer, len, "\n");
++	return len;
++}
++static const struct kernel_param_ops idle_poll_limits_ops = {
++	.get = idle_poll_limits_get,
++};
++module_param_cb(limits, &idle_poll_limits_ops, NULL, 0444);
++
++/* Per CPU: timer/long/traffic/local judgements so far. */
++static int idle_poll_judged_get(char *buffer, const struct kernel_param *kp)
++{
++	int cpu, len = 0;
++
++	for_each_online_cpu(cpu)
++		len += sysfs_emit_at(buffer, len, "%s%lu/%lu/%lu/%lu", len ? " " : "",
++				     per_cpu(idle_poll_judged[JUDGED_TIMER], cpu),
++				     per_cpu(idle_poll_judged[JUDGED_LONG], cpu),
++				     per_cpu(idle_poll_judged[JUDGED_TRAFFIC], cpu),
++				     per_cpu(idle_poll_judged[JUDGED_LOCAL], cpu));
++	len += sysfs_emit_at(buffer, len, "\n");
++	return len;
++}
++static const struct kernel_param_ops idle_poll_judged_ops = {
++	.get = idle_poll_judged_get,
++};
++module_param_cb(judged, &idle_poll_judged_ops, NULL, 0444);
++
++/* A wakeup this close to the programmed timer is the timer. */
++#define IDLE_TIMER_SLACK_NS	50000
++
++/*
++ * The next timer interrupt this CPU has programmed, as its clock event
++ * device holds it, KTIME_MAX with none. Read at idle entry, after the tick
++ * was stopped or kept, so it is the timer WFI would wake to.
++ */
++static u64 __cpuidle idle_next_timer_ns(void)
++{
++	u64 next;
++
++	instrumentation_begin();
++	next = ktime_to_ns(tick_nohz_get_next_hrtimer());
++	instrumentation_end();
++	return next;
++}
++
++static bool __cpuidle idle_timer_due(u64 next_timer_ns)
++{
++	u64 now;
++
++	instrumentation_begin();
++	now = ktime_get_mono_fast_ns();
++	instrumentation_end();
++	return now + IDLE_TIMER_SLACK_NS >= next_timer_ns;
++}
++
++static void __cpuidle idle_poll_adjust(u64 block_ns, bool timer_due,
++				       bool traffic)
 +{
 +	u32 limit = __this_cpu_read(idle_poll_limit_ns);
++	u32 local = min(idle_poll_ns, idle_poll_local_ns);
 +
-+	if (block_ns <= idle_poll_ns) {
++	__this_cpu_inc(idle_poll_judged[traffic ? JUDGED_TRAFFIC :
++				       block_ns > idle_poll_ns ? JUDGED_LONG :
++				       timer_due ? JUDGED_TIMER : JUDGED_LOCAL]);
++	if (traffic) {
++		/* A model is talking: the window is worth its cap, whatever
++		 * woke this CPU and however long it slept. */
 +		if (limit < idle_poll_grow_start_ns)
 +			limit = idle_poll_grow_start_ns;
 +		else
 +			limit = min_t(u64, (u64)limit * 2, idle_poll_ns);
-+	} else {
++	} else if (block_ns > idle_poll_ns) {
 +		limit /= 2;
++	} else if (limit > local) {
++		/* Whatever woke it, a window past the resting size with no
++		 * traffic behind it comes back down to the resting size. */
++		limit = max(limit / 2, local);
++	} else if (timer_due) {
++		limit /= 2;
++	} else if (limit < idle_poll_grow_start_ns) {
++		limit = idle_poll_grow_start_ns;
++	} else {
++		limit = min_t(u64, (u64)limit * 2, local);
 +	}
 +	__this_cpu_write(idle_poll_limit_ns, limit);
++}
++
++/* Keeps a block for judging at the next idle entry. */
++static void __cpuidle idle_poll_record(u64 block_ns, bool timer_due)
++{
++	__this_cpu_write(idle_poll_block_ns, block_ns);
++	__this_cpu_write(idle_poll_block_timer, timer_due);
++	__this_cpu_write(idle_poll_block_pending, true);
 +}
 +
 +/* Returns true if a wakeup arrived while polling, so WFI is not needed. */
@@ -139,20 +344,28 @@ flag skips polling on the next iteration after a timeout.
   */
  void __cpuidle arch_cpu_idle(void)
  {
-+	u64 start;
++	u64 start, next_timer;
 +
 +	if (!idle_poll_ns) {
 +		cpu_do_idle();
 +		return;
 +	}
 +
++	if (__this_cpu_read(idle_poll_block_pending)) {
++		__this_cpu_write(idle_poll_block_pending, false);
++		idle_poll_adjust(__this_cpu_read(idle_poll_block_ns),
++				 __this_cpu_read(idle_poll_block_timer),
++				 idle_traffic_recent());
++	}
++	next_timer = idle_next_timer_ns();
 +	if (__this_cpu_read(idle_poll_limit_ns) &&
 +	    !__this_cpu_read(idle_poll_halt_next)) {
 +		bool woke = idle_poll(&start);
 +
 +		__this_cpu_write(idle_poll_halt_next, !woke);
 +		if (woke)
-+			idle_poll_adjust(local_clock_noinstr() - start);
++			idle_poll_record(local_clock_noinstr() - start,
++					 idle_timer_due(next_timer));
 +		/* Polling enabled IRQs: an interrupt may have queued a timer
 +		 * without setting NEED_RESCHED. Return through do_idle() to
 +		 * reprogram the stopped tick before the next iteration's WFI.
@@ -167,5 +380,5 @@ flag skips polling on the next iteration after a timeout.
  	 * tricks
  	 */
  	cpu_do_idle();
-+	idle_poll_adjust(local_clock_noinstr() - start);
++	idle_poll_record(local_clock_noinstr() - start, idle_timer_due(next_timer));
  }

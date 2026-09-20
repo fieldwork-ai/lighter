@@ -12,7 +12,9 @@ use lighter_vmm::virtio::fs::Share;
 use lighter_vmm::wake::{Observer, Power};
 use lighter_vmm::{Machine, MachineConfig};
 
+use crate::ane_host;
 use crate::config::Config;
+use crate::mps;
 use crate::paths;
 
 /// Builds the machine described by the configuration and runs it until it
@@ -126,6 +128,63 @@ pub fn machine() -> anyhow::Result<()> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     ));
+    // The Neural Engine service: a process of its own (ane_host.rs says
+    // why), on a loopback port the container reaches through the streams;
+    // init publishes it as a CDI device. Held for the machine's life.
+    let _ane = if config.ane {
+        match ane_host::Supervisor::start(&home.join("coreml-cache")) {
+            Ok(host) => {
+                cmdline.push_str(&format!(" lighter.ane={}", host.port()));
+                lighter_vmm::qos::register_accelerator_port(host.port());
+                Some(host)
+            }
+            Err(e) => {
+                tracing::warn!(%e, "the neural engine service could not start");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // ggml on the Mac's GPU, in-process. Held for the machine's life.
+    let _metal = if config.metal {
+        match lighter_vmm::metal::Server::start(Some(&home.join("ggml-cache"))) {
+            Ok(server) => {
+                cmdline.push_str(&format!(" lighter.metal={}", server.port()));
+                Some(server)
+            }
+            Err(e) => {
+                tracing::info!(%e, "no lighter.sh/metal this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // PyTorch on the Mac's GPU: the user's own torch, in their own Python,
+    // when there is one. Held for the machine's life.
+    let _mps = if config.mps {
+        match mps::find_python(&config.torch_python) {
+            Ok((python, version)) => match mps::Host::start(&python, &home) {
+                Ok(host) => {
+                    tracing::info!(python = %python.display(), torch = %version, port = host.port(), "pytorch device served by the Mac's torch");
+                    cmdline.push_str(&format!(" lighter.mps={}", host.port()));
+                    lighter_vmm::qos::register_accelerator_port(host.port());
+                    Some(host)
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "the pytorch host could not start; no lighter.sh/mps this run");
+                    None
+                }
+            },
+            Err(why) => {
+                tracing::info!(%why, "no torch with MPS on the Mac; no lighter.sh/mps this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
     for share in &shares {
         cmdline.push_str(&format!(
             " lighter.share={}:{}",
@@ -187,6 +246,11 @@ pub fn machine() -> anyhow::Result<()> {
         shares,
         // Rosetta asks the kernel for x86 ordering on its own threads.
         tso: false,
+        // A build without the renderer must not offer the device: the guest
+        // driver would probe it, wait five seconds for a capset that never
+        // comes, and every boot would pay that. Doctor says what is missing.
+        gpu: config.gpu && lighter_vmm::virtio::gpu::virgl::linked(),
+        gpu_aperture_bytes: 8 << 30,
     };
 
     let mut machine = Machine::start(&machine_config)?;

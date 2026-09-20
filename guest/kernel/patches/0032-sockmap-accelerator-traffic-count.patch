@@ -1,0 +1,65 @@
+sockmap: count the bytes on a marked socket for the idle loop
+
+The arm64 idle loop polls before WFI for a window that grows on wakeups
+that arrive soon (patch 0011). Past the resting size it grows only on a
+wakeup that traffic on a container's stream to an accelerator brought, and
+that traffic is counted here, where sockmap moves every byte of a joined
+stream: the guest agent marks both sockets of such a stream with
+LIGHTER_SK_MARK_ACCELERATOR, the container's TCP socket and the vsock
+stream to the host, and each byte arriving on either is added to a per-CPU
+count the idle loop sums; the time the last message arrived is kept beside
+it, a message being a page or less, since an RPC's request or reply is
+what a wakeup saved is worth something to, and a tensor's bulk is not. A stream the agent copies itself, with sockmap
+off, is never counted, and keeps the resting window.
+
+--- a/include/linux/sched/idle.h
++++ b/include/linux/sched/idle.h
+@@ -3,6 +3,19 @@
+ #define _LINUX_SCHED_IDLE_H
+ 
+ #include <linux/sched.h>
++#include <linux/percpu-defs.h>
++
++/*
++ * Bytes arriving on a socket marked LIGHTER_SK_MARK_ACCELERATOR, counted
++ * per CPU where sockmap moves them (net/core/skmsg.c); the arm64 idle loop
++ * reads the sum to grow its poll window past the resting size only while
++ * a container's stream to an accelerator is carrying traffic.
++ */
++#define LIGHTER_SK_MARK_ACCELERATOR	0x4c414343
++/* The most a message may be, in bytes; more is a transfer. */
++#define LIGHTER_ACCELERATOR_MESSAGE_MAX	4096
++DECLARE_PER_CPU(unsigned long, idle_poll_traffic);
++DECLARE_PER_CPU(u64, idle_poll_traffic_at);
+ 
+ enum cpu_idle_type {
+ 	__CPU_NOT_IDLE = 0,
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -9,6 +9,7 @@
+ #include <net/tcp.h>
+ #include <net/tls.h>
+ #include <linux/virtio_vsock.h>
++#include <linux/sched/idle.h>
+ #include <trace/events/sock.h>
+ 
+ /* Guards every psock's paused list and paused_on: a source and its target
+@@ -1355,6 +1356,18 @@ static int sk_psock_verdict_recv(struct sock *sk, struct sk_buff *skb)
+ 		sock_drop(sk, skb);
+ 		goto out;
+ 	}
++#ifdef CONFIG_ARM64
++	if (sk->sk_mark == LIGHTER_SK_MARK_ACCELERATOR) {
++		this_cpu_add(idle_poll_traffic, len);
++		/* A message, not a transfer: an RPC's request or reply is
++		 * what a wakeup saved is worth something to; a tensor's bulk
++		 * arrives in pages, throughput-bound, and a detector's frame
++		 * is 3.5 MB of it every 200 ms. */
++		if (len <= LIGHTER_ACCELERATOR_MESSAGE_MAX)
++			this_cpu_write(idle_poll_traffic_at,
++				       ktime_get_mono_fast_ns());
++	}
++#endif
+ 	prog = READ_ONCE(psock->progs.stream_verdict);
+ 	if (!prog)
+ 		prog = READ_ONCE(psock->progs.skb_verdict);

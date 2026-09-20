@@ -9,6 +9,7 @@
 //! `lighter status` answerable by anyone rather than only by whoever is
 //! holding the console.
 
+mod ane_host;
 mod bundle;
 mod config;
 mod context;
@@ -16,6 +17,7 @@ mod doctor;
 mod installation;
 mod instance;
 mod machine;
+mod mps;
 mod paths;
 mod release;
 mod run;
@@ -56,6 +58,14 @@ enum Command {
     Status,
     /// Check that this Mac can run lighter, and say what to fix if not.
     Doctor,
+    /// The Neural Engine service, run as a child of `lighter start`.
+    #[command(hide = true, name = "ane-host")]
+    AneHost {
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        cache: std::path::PathBuf,
+    },
     /// Rosetta for amd64 containers: whether this Mac has it, and installing it.
     Rosetta {
         /// Run Apple's installer for Rosetta.
@@ -83,6 +93,21 @@ enum Command {
         /// does) or loopback (`localhost`); explicit bind addresses take precedence.
         #[arg(long, value_enum)]
         publish: Option<config::Publish>,
+        /// Whether the guest has a GPU (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        gpu: Option<config::Toggle>,
+        /// Whether containers may use the Neural Engine (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        ane: Option<config::Toggle>,
+        /// Whether containers may run PyTorch on the Mac's GPU (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        mps: Option<config::Toggle>,
+        /// The Python whose torch serves the PyTorch device; `auto` to search PATH.
+        #[arg(long)]
+        torch_python: Option<String>,
+        /// Whether containers may run ggml on the Mac's GPU (`on`, the default, or `off`).
+        #[arg(long, value_enum)]
+        metal: Option<config::Toggle>,
     },
     /// Put the guest's clock right.
     ///
@@ -195,6 +220,10 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             start(Duration::from_secs(120))
         }
         Command::Status => status(),
+        Command::AneHost { port, cache } => {
+            ane_host::serve(port, &cache)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         Command::Doctor => {
             let findings = doctor::run();
             print!("{}", doctor::report(&findings));
@@ -240,7 +269,22 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             memory,
             disk,
             publish,
-        } => configure(cpus, memory, disk, publish),
+            gpu,
+            ane,
+            mps,
+            torch_python,
+            metal,
+        } => configure(Settings {
+            cpus,
+            memory,
+            disk,
+            publish,
+            gpu,
+            ane,
+            mps,
+            torch_python,
+            metal,
+        }),
         Command::Resync => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -282,7 +326,13 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
             !f.ok
                 && !matches!(
                     f.what.as_str(),
-                    "docker client" | "docker context" | "machine" | "rosetta"
+                    "docker client"
+                        | "docker context"
+                        | "machine"
+                        | "rosetta"
+                        | "lighter.sh/gpu"
+                        | "lighter.sh/ane"
+                        | "lighter.sh/metal"
                 )
         })
         .collect();
@@ -377,14 +427,41 @@ fn logs(follow: bool) -> anyhow::Result<std::process::ExitCode> {
     })
 }
 
-fn configure(
+/// What `lighter config` was asked to change; `None` leaves a setting alone.
+struct Settings {
     cpus: Option<u32>,
     memory: Option<u64>,
     disk: Option<u64>,
     publish: Option<config::Publish>,
-) -> anyhow::Result<std::process::ExitCode> {
+    gpu: Option<config::Toggle>,
+    ane: Option<config::Toggle>,
+    mps: Option<config::Toggle>,
+    torch_python: Option<String>,
+    metal: Option<config::Toggle>,
+}
+
+fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
+    let Settings {
+        cpus,
+        memory,
+        disk,
+        publish,
+        gpu,
+        ane,
+        mps,
+        torch_python,
+        metal,
+    } = settings;
     let mut config = config::Config::load()?;
-    let changed = cpus.is_some() || memory.is_some() || disk.is_some() || publish.is_some();
+    let changed = cpus.is_some()
+        || memory.is_some()
+        || disk.is_some()
+        || publish.is_some()
+        || gpu.is_some()
+        || ane.is_some()
+        || mps.is_some()
+        || torch_python.is_some()
+        || metal.is_some();
     if let Some(cpus) = cpus {
         config.cpus = cpus;
     }
@@ -396,6 +473,22 @@ fn configure(
     }
     if let Some(publish) = publish {
         config.publish = publish;
+    }
+    if let Some(gpu) = gpu {
+        config.gpu = gpu.into();
+    }
+    if let Some(ane) = ane {
+        config.ane = ane.into();
+    }
+    if let Some(mps) = mps {
+        config.mps = mps.into();
+    }
+    if let Some(python) = torch_python {
+        config.torch_python = if python == "auto" {
+            String::new()
+        } else {
+            python
+        };
     }
     if changed {
         config.save()?;
@@ -409,6 +502,18 @@ fn configure(
         match config.publish {
             config::Publish::Lan => "lan (every interface, as Docker does)",
             config::Publish::Localhost => "localhost (wildcard publishes on loopback)",
+        }
+    );
+    println!("  gpu        {}", if config.gpu { "on" } else { "off" });
+    println!("  ane        {}", if config.ane { "on" } else { "off" });
+    println!("  metal      {}", if config.metal { "on" } else { "off" });
+    println!(
+        "  mps        {}{}",
+        if config.mps { "on" } else { "off" },
+        if config.torch_python.is_empty() {
+            String::new()
+        } else {
+            format!(" (torch from {})", config.torch_python)
         }
     );
     for share in &config.shares {

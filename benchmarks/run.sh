@@ -348,6 +348,27 @@ runner_args() {
 	fi
 }
 
+# Waits, up to five minutes, for three samples five seconds apart in which
+# fseventsd, mds, mds_stores and the mdworkers together use under 3% of a
+# core; says how long it took.
+settle_host() {
+	local i quiet=0 load
+	for i in $(seq 1 60); do
+		load="$(ps -Ao pcpu,comm | awk '/fseventsd|mds_stores|mds$|mdworker/ {s+=$1} END {printf "%d", s+0}')"
+		if [ "$load" -lt 3 ]; then quiet=$((quiet+1)); else quiet=0; fi
+		if [ "$quiet" -ge 3 ]; then
+			# Only worth a line when it took a wait; the return is explicit
+			# because a bare `return` carries the last status, and a host
+			# quiet from the first sample made that a 1 under `set -e`.
+			[ "$i" -gt 3 ] && echo "    (host settled after $((i*5)) s)"
+			return 0
+		fi
+		sleep 5
+	done
+	echo "    (host still indexing after 5 min; measuring anyway)"
+	return 0
+}
+
 run_case_native() {
 	# shellcheck disable=SC2046
 	WORK="$WORK" REPS="$REPS" CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-300}" node $(runner_args "$1" "$WORK")
@@ -1023,7 +1044,10 @@ run_boot_case() {
 		./scripts/sign.sh "$LIGHTER_CLI" >/dev/null
 		BOOT_HOME="$(mktemp -d -t lighter-boot-home)"
 		# Use the same explicit resource profile as the other cases.
-		LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" config --cpus "${BENCH_CPUS:-8}" --memory "$(bench_memory_mib)" --disk "$(bench_disk_gib)" >/dev/null
+		# `LIGHTER_BENCH_BOOT_CONFIG_EXTRA` adds config flags for an A/B, such as
+		# `--gpu off --ane off --metal off --mps off` to boot without the devices.
+		# shellcheck disable=SC2086
+		LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" config --cpus "${BENCH_CPUS:-8}" --memory "$(bench_memory_mib)" --disk "$(bench_disk_gib)" ${LIGHTER_BENCH_BOOT_CONFIG_EXTRA:-} >/dev/null
 		# The CLI daemonizes. Register its exact private executable before start
 		# so the continuous guard can distinguish it from a daily VM.
 		if [ -n "${LIGHTER_BENCH_OWNER_FILE:-}" ]; then
@@ -1167,6 +1191,16 @@ for name in $CASES; do
 		;;
 	esac
 
+	# `LIGHTER_BENCH_SETTLE=1`: wait, before each timed case, until the Mac's
+	# own file indexers are idle. A case that wrote a hundred thousand files
+	# leaves fseventsd and Spotlight busy for the next one, and a record made
+	# case after case on both Macs read the share copy at 7–9 s where the
+	# same case alone reads 4.5; with the artifacts of the previous release it
+	# read the same, so it is the host's backlog, not the runtime, and it is
+	# the runtime the record is for.
+	if [ -n "${LIGHTER_BENCH_SETTLE:-}" ]; then
+		settle_host
+	fi
 	printf '==> %s: %s' "$TARGET" "$name"
 	[ "$name" = watch-latency ] && start_watch_helper
 	rep=0

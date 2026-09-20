@@ -17,6 +17,10 @@ initramfs*.cpio*
 # do not.
 /benchmarks/raw/
 
+# The GPU renderer's sources, tools and the libraries they produce: host/gpu/build.sh.
+/host/build/
+/host/out/
+
 .DS_Store
 .context/
 
@@ -47,3 +51,15 @@ benchmarks/results/gate-*.csv
 # Retained published CSVs are tracked explicitly; new scratch runs stay local.
 /benchmarks/results/**/*.csv
 /benchmarks/results/**/*.tree
+/guest/rootfs/lighter-agent
+/guest/rootfs/liblighter_ane_ep.so
+/guest/rootfs/wheels/
+
+# Guest-side build trees and their outputs: the plugin provider's cargo
+# target, the torch extension's build directory and compiled module, and
+# Python's bytecode caches. What ships is built into guest/out.
+/guest/ane-ep/target/
+/guest/torch-mps/build/
+/guest/torch-mps/lighter_mps/*.so
+__pycache__/
+*.pyc

@@ -23,6 +23,8 @@ fn main() -> ExitCode {
         .init();
 
     let mut config = MachineConfig::default();
+    let mut ane = false;
+    let mut metal = false;
     let mut sockets: Vec<(PathBuf, u32)> = Vec::new();
     let mut docker_socket: Option<PathBuf> = None;
     let mut report_memory = false;
@@ -52,6 +54,17 @@ fn main() -> ExitCode {
             }
             "--no-tty" => config.interactive = false,
             "--tso" => config.tso = true,
+            "--gpu" => {
+                if lighter_vmm::virtio::gpu::virgl::linked() {
+                    config.gpu = true;
+                } else {
+                    eprintln!(
+                        "lighter-bench: built without the renderer; --gpu ignored (host/gpu/build.sh)"
+                    );
+                }
+            }
+            "--ane" => ane = true,
+            "--metal" => metal = true,
             // Logs the process's own physical footprint on an interval. The
             // memory gate has no other way to watch a number only this process
             // can see.
@@ -112,6 +125,39 @@ fn main() -> ExitCode {
         }
     }
 
+    // The Neural Engine service, host-side; the port rides the command line.
+    let _ane = if ane {
+        match lighter_vmm::ane::Server::start(None) {
+            Ok(server) => {
+                config
+                    .cmdline
+                    .push_str(&format!(" lighter.ane={}", server.port()));
+                Some(server)
+            }
+            Err(e) => {
+                eprintln!("neural engine service: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _metal = if metal {
+        match lighter_vmm::metal::Server::start(None) {
+            Ok(server) => {
+                config
+                    .cmdline
+                    .push_str(&format!(" lighter.metal={}", server.port()));
+                Some(server)
+            }
+            Err(e) => {
+                eprintln!("metal service: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut machine = match Machine::start(&config) {
         Ok(m) => m,
         Err(e) => {

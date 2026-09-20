@@ -13,6 +13,7 @@
 //!   docker CLI ──unix──▶ lighter ──vsock──▶ agent ──unix──▶ dockerd
 //! ```
 
+mod accelerator;
 mod idle;
 mod inbound;
 mod memory_policy;
@@ -941,6 +942,18 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     let Some((ip, port)) = original_destination(tcp.as_raw_fd()) else {
         return;
     };
+    // An accelerator port is reached only by a container that asked for the
+    // device; the connection is dropped otherwise, which the container sees
+    // as a reset.
+    if let Some(kind) = accelerator::kind_of(port) {
+        let Ok(peer) = tcp.peer_addr() else { return };
+        if !accelerator::permitted(kind, peer.ip()) {
+            return;
+        }
+    }
+    // The vCPUs may poll rather than sleep between a model's messages, for
+    // as long as this stream is open.
+    let _wide = accelerator::Wide::open(port);
     let host = match vsock::connect(STREAM_PORT) {
         Ok(fd) => fd,
         Err(e) => {
@@ -972,6 +985,10 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     }
     let _ = tcp.set_nodelay(true);
     ends_with_its_peer(&tcp);
+    if _wide.is_some() {
+        accelerator::mark(tcp.as_raw_fd());
+        accelerator::mark(host_write.0.as_raw_fd());
+    }
     let (tcp, host_read, mut host_write) = match joiner() {
         Some(j) => match joined(j, tcp, host_read, host_write) {
             Ok(()) => return,
