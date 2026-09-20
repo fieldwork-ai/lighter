@@ -1,6 +1,6 @@
 # macOS Local Network privacy silently cuts containers off from the LAN
 
-Status: diagnosed on the M5 on 2026-09-20, confirmed from the permission list, not yet fixed. Four changes proposed for 0.7.1, below. The symptom is a container that opens a connection to a device on the user's own network and never receives a byte, with nothing logged anywhere, while the Mac's own shell reaches the same device instantly.
+Status: diagnosed on the M5 on 2026-09-20, confirmed from the permission list; fixed on `dev` for 0.7.1 (`crates/lighter-cli/src/localnet.rs`): the bundle declares `NSLocalNetworkUsageDescription`, the machine sends one mDNS query at start so macOS asks once and up front, and `lighter doctor` has a `local network` row that asks the running machine to connect to a device on the network that is not the gateway and reports allowed, denied with the System Settings path, or untested and why. The identity question (item 3) is settled by observing the 0.7.0 → 0.7.1 upgrade on a Mac that granted 0.7.0. The symptom is a container that opens a connection to a device on the user's own network and never receives a byte, with nothing logged anywhere, while the Mac's own shell reaches the same device instantly.
 
 ## What it looks like
 
