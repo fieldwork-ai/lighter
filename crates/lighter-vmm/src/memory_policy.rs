@@ -128,6 +128,11 @@ const PRESSURE_MEMORY: Duration = Duration::from_secs(60);
 /// back. The 4 GiB that went back in one step at 13:41 on 2026-09-20 had
 /// the host paging the guest for thirty seconds.
 const RELEASE_STEP_FRACTION: u64 = 32;
+/// A guest whose every task is stalled on memory for this share of the
+/// last ten seconds (hundredths of a percent) comes down the release ramp
+/// two steps a poll rather than one: the pacing is for the host's sake,
+/// and a guest that is not running at all is the worse of the two.
+const STALL_FULL_HURRY: u32 = 1000;
 /// A host is overcommitted when its compressor holds more than this share
 /// of RAM: memory the guest is handed then comes out of other processes'
 /// compressed pages, whatever level the Mac reports.
@@ -168,6 +173,8 @@ impl MemoryPolicy {
             balloon,
             transport,
             ram_bytes,
+            vsock: Some(vsock.clone()),
+            reclaiming: Arc::new(AtomicBool::new(false)),
             level: AtomicU32::new(Pressure::Normal as u32),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
@@ -311,6 +318,10 @@ struct CompressionState {
     overcommitted: bool,
     /// Until when a Warn or Critical is remembered.
     pressure_until: Option<Instant>,
+    /// The guest's memory stall averages over ten seconds, hundredths of a
+    /// percent: some task stalled, every task stalled.
+    stall_some: u32,
+    stall_full: u32,
 }
 
 impl CompressionState {
@@ -337,6 +348,11 @@ struct Steering {
     transport: Arc<Mutex<VirtioMmio>>,
     /// What the guest has: its whole RAM, one zone (0.7.2).
     ram_bytes: u64,
+    /// The way to the guest's agent, for a reclaim request ahead of the
+    /// balloon; none in the tests.
+    vsock: Option<Arc<crate::virtio::vsock::VsockShared>>,
+    /// A reclaim request in flight: one at a time.
+    reclaiming: Arc<AtomicBool>,
     /// The host's pressure level: the ramp's cap and step.
     level: AtomicU32,
     // Keep the ramp and its hold together: a poll must not restore a
@@ -381,17 +397,62 @@ impl Steering {
             };
             if state.releasing {
                 // Down the ramp a step a poll, whatever else holds it;
-                // `apply` paces each step by what the host has free.
-                let step = as_pages((total / RELEASE_STEP_FRACTION).max(STEP_MIN_BYTES));
+                // `apply` paces each step by what the host has free. Two
+                // steps while the guest's every task is stalled on memory.
+                let mut step = as_pages((total / RELEASE_STEP_FRACTION).max(STEP_MIN_BYTES));
+                if state.stall_full >= STALL_FULL_HURRY {
+                    step = step.saturating_mul(2);
+                }
                 state.pages = state.pages.saturating_sub(step);
                 if state.pages == 0 {
                     state.releasing = false;
                 }
             } else if !state.held(now) {
+                let before = state.pages;
                 state.pages = steer(state.pages, compressed, state.quiet_polls, total, level);
+                // Cooperative first: a step up under pressure is asked of
+                // the guest as a reclaim of the same amount from the
+                // containers' cgroup, coldest cache first, before the
+                // balloon takes it. The kernel's LRU picks the victims;
+                // the balloon then pins pages that are already free.
+                if state.pages > before && level != Pressure::Normal as u32 {
+                    let step = u64::from(state.pages - before) * BALLOON_PAGE_SIZE;
+                    self.ask_reclaim(step >> 20);
+                }
             }
         }
         self.apply();
+    }
+
+    /// Asks the agent to reclaim `mib` from the containers' cgroup
+    /// (`memory.reclaim`), one request at a time, off the poll's thread. The
+    /// agent answers with what came back; the line is logged, and the
+    /// balloon's next step finds the pages free.
+    fn ask_reclaim(&self, mib: u64) {
+        let Some(vsock) = &self.vsock else { return };
+        if mib == 0
+            || self
+                .reclaiming
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let vsock = vsock.clone();
+        let reclaiming = self.reclaiming.clone();
+        let spawned = std::thread::Builder::new()
+            .name("memory-reclaim".into())
+            .spawn(move || {
+                let answer = ask_agent(&vsock, &format!("reclaim {mib}\n"));
+                match answer {
+                    Ok(line) => tracing::info!(asked_mib = mib, %line, "the guest reclaimed ahead of the balloon"),
+                    Err(e) => tracing::debug!(asked_mib = mib, %e, "no reclaim answer from the agent"),
+                }
+                reclaiming.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.reclaiming.store(false, Ordering::Release);
+        }
     }
 
     /// The host's own numbers, each poll: what it has free paces
@@ -419,6 +480,24 @@ impl Steering {
             );
         }
         state.overcommitted = overcommitted;
+    }
+
+    /// The guest's memory stall averages, from its line: kept for the ramp's
+    /// pace and said when they change by a whole percent.
+    fn guest_stall(&self, some: u32, full: u32) {
+        let mut state = self
+            .compression
+            .lock()
+            .expect("compression policy poisoned");
+        if some / 100 != state.stall_some / 100 || full / 100 != state.stall_full / 100 {
+            tracing::debug!(
+                some_pct = some / 100,
+                full_pct = full / 100,
+                "the guest's memory stall changed"
+            );
+        }
+        state.stall_some = some;
+        state.stall_full = full;
     }
 
     /// A line from the guest. `need` (busy, under an eighth available) holds
@@ -512,6 +591,8 @@ impl Steering {
             if withdraw && !state.releasing && state.pages > 0 {
                 tracing::info!(
                     ramp_mib = (u64::from(state.pages) * BALLOON_PAGE_SIZE) >> 20,
+                    stall_some_pct = state.stall_some / 100,
+                    stall_full_pct = state.stall_full / 100,
                     "the guest asks for its memory back; the ramp comes down"
                 );
             }
@@ -651,6 +732,31 @@ impl Steering {
 /// host inflates by that much and deflates the moment the guest says zero
 /// — work resumed, or free memory below its reserve. Sixteen bytes a
 /// second: spare, available, free (MiB), and the idle count, all `u32`.
+/// One line to the agent's control port and its first line back, over a
+/// socket pair the device carries into the guest, as the CLI's control
+/// socket is carried.
+fn ask_agent(
+    vsock: &Arc<crate::virtio::vsock::VsockShared>,
+    line: &str,
+) -> std::io::Result<String> {
+    use std::io::{BufRead, Write};
+    let (mut mine, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let host_port = vsock.open(AGENT_CONTROL_PORT, theirs);
+    if !vsock.await_established(host_port, Duration::from_secs(4)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the agent did not accept",
+        ));
+    }
+    mine.write_all(line.as_bytes())?;
+    mine.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = std::io::BufReader::new(mine.try_clone()?);
+    let mut answer = String::new();
+    reader.read_line(&mut answer)?;
+    let _ = mine.shutdown(std::net::Shutdown::Both);
+    Ok(answer.trim().to_string())
+}
+
 fn memory_guest(
     vsock: Arc<crate::virtio::vsock::VsockShared>,
     steering: Arc<Steering>,
@@ -660,13 +766,18 @@ fn memory_guest(
         .name("memory-guest".into())
         .spawn(move || {
             for crate::virtio::vsock::Accepted { key } in accepted {
-                while let Some(bytes) = vsock.read_outbound_exact(key, 16) {
+                while let Some(bytes) = vsock.read_outbound_exact(key, 32) {
                     let word = |i: usize| {
                         u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
                     };
                     let spare_mib = u64::from(word(0));
                     let flags = word(12);
                     let (release, need) = (flags & 1 != 0, flags & 2 != 0);
+                    // Pressure stall information, hundredths of a percent
+                    // of the last ten seconds: `some` is the guest's own
+                    // reason for a need; `full` paces how fast it is
+                    // answered.
+                    steering.guest_stall(word(16), word(20));
                     // The line drives the ramp and, when the guest has
                     // memory to spare, the balloon's own offer.
                     steering.guest_demand(need, release);
@@ -1050,6 +1161,8 @@ mod tests {
             balloon,
             transport: transport.clone(),
             ram_bytes,
+            vsock: None,
+            reclaiming: Arc::new(AtomicBool::new(false)),
             level: AtomicU32::new(NORMAL),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
@@ -1190,6 +1303,46 @@ mod tests {
             assert_eq!(now, expected);
             last = now;
         }
+    }
+
+    /// A guest whose every task is stalled on memory comes down two steps a
+    /// poll: 4 GiB in four polls, not eight.
+    #[test]
+    fn a_stalled_guest_comes_down_twice_as_fast() {
+        let (steering, transport) = steering_for_tests(16 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(4 << 30));
+        steering.guest_stall(4500, 1200);
+        steering.guest_demand(true, false);
+        assert_eq!(target_mib(&transport), 4096, "from the next poll");
+        for expected in [3072, 2048, 1024, 0] {
+            polls(&steering, 1);
+            assert_eq!(
+                target_mib(&transport),
+                expected,
+                "two steps a poll while every task stalls"
+            );
+        }
+        // With no full stall the pace is the usual one.
+        let (steering, transport) = steering_for_tests(16 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(4 << 30));
+        steering.guest_stall(4500, 300);
+        steering.guest_demand(true, false);
+        polls(&steering, 1);
+        assert_eq!(
+            target_mib(&transport),
+            3584,
+            "one step: some tasks stall, not all"
+        );
     }
 
     /// Each step down is no more than half of what the host has free: a

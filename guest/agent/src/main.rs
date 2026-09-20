@@ -299,7 +299,7 @@ fn bound_container_cache() {
     );
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
-    let mut last_offer: Option<[u8; 16]> = None;
+    let mut last_offer: Option<[u8; 32]> = None;
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
     // Whether a trim has left reporting hurried, so the restore below is a
@@ -518,7 +518,7 @@ fn guest_cpu_usec() -> u64 {
 /// wakeups a second for nothing. A reconnect resends.
 fn offer_memory(
     stream: &mut Option<OwnedFd>,
-    last: &mut Option<[u8; 16]>,
+    last: &mut Option<[u8; 32]>,
     total: u64,
     active: bool,
     quiet: bool,
@@ -536,6 +536,7 @@ fn offer_memory(
             >> 10
     };
     let (avail, free) = (field("MemAvailable:"), field("MemFree:"));
+    let (psi_some, psi_full) = memory_stall();
     // An eighth of RAM while containers run — a command starting draws on
     // it while the balloon deflates — and a sixteenth when nothing runs at
     // all: a 4 GiB guest with no container kept 512 MiB free that
@@ -576,7 +577,12 @@ fn offer_memory(
     // guest available asks for more before it is short — available, not
     // free, because the cache it could reclaim is its own working set and
     // reclaiming it is the cost this avoids. The host doubles the guest.
-    let need = busy && avail < (total >> 20) / 8;
+    // And by the harm itself: pressure stall information says how much of
+    // the last ten seconds some task spent waiting on memory. A tenth of
+    // it is a guest that is short whatever its free counts say (the M5's
+    // guest at 19:16Z on 2026-09-20 was stalling with gigabytes "free" in
+    // a zone its kernel could not use).
+    let need = busy && (avail < (total >> 20) / 8 || psi_some >= 1000);
     let spare = if !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
@@ -587,25 +593,56 @@ fn offer_memory(
         *last = None;
     }
     let Some(fd) = stream.as_ref() else { return };
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 32];
     // Available and free are rounded to 16 MiB: they drift by a page or two
-    // on an idle guest and would defeat the comparison.
+    // on an idle guest and would defeat the comparison; the stall averages
+    // to whole percent, for the same reason.
     let coarse = |v: u64| (v & !15) as u32;
     let flags = u32::from(release) | (u32::from(need) << 1) | (u32::from(nothing_runs) << 2);
-    for (i, v) in [spare as u32, coarse(avail), coarse(free), flags].iter().enumerate() {
+    let words = [
+        spare as u32,
+        coarse(avail),
+        coarse(free),
+        flags,
+        psi_some / 100 * 100,
+        psi_full / 100 * 100,
+        0,
+        0,
+    ];
+    for (i, v) in words.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     if *last == Some(bytes) {
         return;
     }
     // SAFETY: a plain write of a stack buffer to a descriptor we own.
-    let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), 16) };
-    if n != 16 {
+    let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), 32) };
+    if n != 32 {
         *stream = None;
         *last = None;
     } else {
         *last = Some(bytes);
     }
+}
+
+/// Pressure stall information for memory, in hundredths of a percent of
+/// the last ten seconds: `some` (any task stalled) and `full` (every task
+/// stalled). Zero when the kernel does not account it.
+fn memory_stall() -> (u32, u32) {
+    let text = std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default();
+    (psi_avg10(&text, "some"), psi_avg10(&text, "full"))
+}
+
+fn psi_avg10(text: &str, line: &str) -> u32 {
+    text.lines()
+        .find(|l| l.starts_with(line))
+        .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix("avg10=")))
+        .and_then(|v| {
+            let (whole, frac) = v.split_once('.').unwrap_or((v, "0"));
+            let frac = format!("{frac:0<2}");
+            Some(whole.parse::<u32>().ok()? * 100 + frac[..2].parse::<u32>().ok()?)
+        })
+        .unwrap_or(0)
 }
 
 /// `MemTotal`, in bytes.
@@ -1358,11 +1395,22 @@ fn handle_control(line: &str) -> String {
         // pages never were.
         (Some("reclaim"), Some(amount)) => match amount.parse::<u64>() {
             Err(_) => "error bad amount\n".into(),
-            Ok(mib) => match std::fs::write("/sys/fs/cgroup/docker/memory.reclaim", format!("{mib}M")) {
-                Ok(()) => "ok\n".into(),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => "partial\n".into(),
-                Err(e) => format!("error {e}\n"),
-            },
+            Ok(mib) => {
+                let current = || {
+                    std::fs::read_to_string("/sys/fs/cgroup/docker/memory.current")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                let before = current();
+                let result = std::fs::write("/sys/fs/cgroup/docker/memory.reclaim", format!("{mib}M"));
+                let reclaimed = before.saturating_sub(current()) >> 20;
+                match result {
+                    Ok(()) => format!("reclaimed {reclaimed}\n"),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => format!("reclaimed {reclaimed} partial\n"),
+                    Err(e) => format!("error {e}\n"),
+                }
+            }
         },
         // Diagnostics that touch no disk: procfs, sysfs and the kernel log
         // stay readable when a block device has wedged.
@@ -1835,5 +1883,19 @@ impl Write for Fd {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::psi_avg10;
+
+    #[test]
+    fn the_stall_average_is_read_in_hundredths() {
+        let text = "some avg10=12.34 avg60=5.00 avg300=1.20 total=123456\nfull avg10=0.50 avg60=0.10 avg300=0.00 total=9\n";
+        assert_eq!(psi_avg10(text, "some"), 1234);
+        assert_eq!(psi_avg10(text, "full"), 50);
+        assert_eq!(psi_avg10("", "some"), 0, "no accounting reads as no stall");
+        assert_eq!(psi_avg10("some avg10=7 total=1\n", "some"), 700);
     }
 }
