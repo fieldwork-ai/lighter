@@ -26,6 +26,17 @@
 //! report of 2026-09-14: a build bounded at 10 GiB of a 16 GiB guest when
 //! the Mac reported Warn). The ramp moves again once the guest has said it
 //! is fine for a few seconds.
+//!
+//! Down is a ramp too, and the host's own numbers count. A guest asking
+//! for its balloon back gets it a 32nd of RAM a second, each second's step
+//! no more than half of what the host has free, because 4 GiB handed back
+//! in one step to a Mac that had been at Warn sixteen seconds earlier had
+//! the Mac paging the guest for thirty seconds: every vCPU and the stream
+//! reactor faulting into the compressor, an RCU stall, and a build's
+//! session lost (2026-09-20). A Warn is remembered for a minute, and a
+//! compressor holding a quarter of RAM or swap half used is pressure
+//! whatever level the Mac reports, since it reports Normal for seconds at
+//! a time while deeply overcommitted.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -107,6 +118,23 @@ const GUEST_RESERVE_FRACTION: u64 = 16;
 /// recovers. Time, not lines: the agent sends a line only when its numbers
 /// change, so an idle guest is silent, and silence is no verdict.
 const HOLD_PATIENCE: Duration = Duration::from_secs(5);
+/// How long a Warn or Critical is remembered: a Normal within it is the
+/// level bouncing, not the host recovered, and a guest asking for its
+/// memory back then is answered as it would be under pressure. On an
+/// overcommitted Mac the level read Normal for sixteen seconds between two
+/// Warns while 53 GB sat compressed (2026-09-20).
+const PRESSURE_MEMORY: Duration = Duration::from_secs(60);
+/// A guest asking for its balloon back gets it down a ramp, never in one
+/// step: a 32nd of RAM a second, the Warn ramp's pace, so a balloon that
+/// took eight seconds to inflate takes eight to give back. The 4 GiB that
+/// went back in one step at 13:41 on 2026-09-20 had the host paging the
+/// guest for thirty seconds.
+const RELEASE_STEP_FRACTION: u64 = 32;
+/// A host is overcommitted when its compressor holds more than this share
+/// of RAM, or more than half its swap is in use: memory the guest is handed
+/// then comes out of other processes' compressed pages, whatever level the
+/// Mac reports.
+const OVERCOMMITTED_COMPRESSOR_FRACTION: u64 = 4;
 /// An inflation that has made next to no progress toward its target for
 /// this long is one the guest cannot make: its driver is retrying an
 /// allocation that fails, five times a second, each try a reclaim pass that
@@ -217,6 +245,7 @@ impl MemoryPolicy {
                         }
                         steering.resize_again();
                         let Some(now) = host.sample() else { continue };
+                        steering.observe(&now);
                         if let Some(then) = last {
                             steering.steer(now.compressed.saturating_sub(then.compressed));
                         }
@@ -311,6 +340,18 @@ struct CompressionState {
     /// Whether the last `apply` reported the ramp held, so the transitions
     /// are logged once each way rather than every poll.
     hold_reported: bool,
+    /// The guest asked for its balloon back with no host pressure: the
+    /// ramp comes down a step a poll until it is gone or the guest says
+    /// otherwise.
+    releasing: bool,
+    /// What the host has free, from the last sample; deflation is paced by
+    /// it. All of it until the first sample.
+    host_free: Option<u64>,
+    /// Whether the host's compressor or swap says it is overcommitted,
+    /// whatever level it reports.
+    overcommitted: bool,
+    /// Until when a Warn or Critical is remembered.
+    pressure_until: Option<Instant>,
 }
 
 impl CompressionState {
@@ -321,6 +362,14 @@ impl CompressionState {
             || self
                 .healthy_since
                 .is_none_or(|since| now.duration_since(since) < HOLD_PATIENCE)
+    }
+
+    /// Whether the host is under pressure by any of its signs: the level,
+    /// a level within the last minute, or its compressor and swap.
+    fn pressed(&self, level: u32, now: Instant) -> bool {
+        level != Pressure::Normal as u32
+            || self.overcommitted
+            || self.pressure_until.is_some_and(|until| now < until)
     }
 }
 
@@ -414,6 +463,7 @@ impl Steering {
                 .compression
                 .lock()
                 .expect("compression policy poisoned");
+            let now = Instant::now();
             let total = self.total_bytes();
             let shrunk = total < state.last_total;
             state.last_total = total;
@@ -422,18 +472,62 @@ impl Steering {
             } else {
                 0
             };
-            if !state.held(Instant::now()) {
+            let level = self.level.load(Ordering::Relaxed);
+            // An overcommitted host, or one that was at Warn a moment ago,
+            // is steered as at Warn whatever it reports now; and it is not
+            // quiet, so the grace before easing counts from when that ends.
+            let level = if level == Pressure::Normal as u32 && state.pressed(level, now) {
+                state.quiet_polls = 0;
+                Pressure::Warn as u32
+            } else {
+                level
+            };
+            if state.releasing {
+                // Down the ramp a step a poll, whatever else holds it;
+                // `apply` paces each step by what the host has free.
+                let step = as_pages((total / RELEASE_STEP_FRACTION).max(STEP_MIN_BYTES));
+                state.pages = state.pages.saturating_sub(step);
+                if state.pages == 0 {
+                    state.releasing = false;
+                }
+            } else if !state.held(now) {
                 state.pages = steer(
                     state.pages,
                     compressed,
                     state.quiet_polls,
                     total,
-                    self.level.load(Ordering::Relaxed),
+                    level,
                     shrunk,
                 );
             }
         }
         self.apply();
+    }
+
+    /// The host's own numbers, each poll: what it has free paces
+    /// deflation, and a full compressor or half-used swap is pressure
+    /// whatever level it reports.
+    fn observe(&self, sample: &HostSample) {
+        let mut state = self
+            .compression
+            .lock()
+            .expect("compression policy poisoned");
+        state.host_free = Some(sample.free);
+        let compressor_full =
+            sample.ram > 0 && sample.compressor > sample.ram / OVERCOMMITTED_COMPRESSOR_FRACTION;
+        let swapping = sample.swap_total > 0 && sample.swap_used * 2 > sample.swap_total;
+        let overcommitted = compressor_full || swapping;
+        if overcommitted != state.overcommitted {
+            tracing::info!(
+                overcommitted,
+                compressor_mib = sample.compressor >> 20,
+                swap_used_mib = sample.swap_used >> 20,
+                swap_total_mib = sample.swap_total >> 20,
+                free_mib = sample.free >> 20,
+                "host overcommitment changed"
+            );
+        }
+        state.overcommitted = overcommitted;
     }
 
     /// A line from the guest. `need` (busy, under an eighth available) holds
@@ -447,9 +541,16 @@ impl Steering {
     /// cold cache to give — a hold on it kept two gigabytes back from a
     /// host that was swapping, and the host asked again a minute later.
     fn guest_demand(&self, need: bool, release: bool) {
-        let normal = self.level.load(Ordering::Relaxed) == Pressure::Normal as u32;
+        let now = Instant::now();
+        let normal = {
+            let state = self
+                .compression
+                .lock()
+                .expect("compression policy poisoned");
+            !state.pressed(self.level.load(Ordering::Relaxed), now)
+        };
         let short = need || (release && normal);
-        self.guest_short(short, short && normal, Instant::now());
+        self.guest_short(short, short && normal, now);
     }
 
     /// The balloon's own progress, from the policy's poll: a target the
@@ -507,8 +608,18 @@ impl Steering {
             }
             let changed = state.guest_short != short;
             state.guest_short = short;
+            // The guest wants its memory back and the host has it to give:
+            // down the ramp from the next poll, never in one step.
+            if withdraw && !state.releasing && state.pages > 0 {
+                tracing::info!(
+                    ramp_mib = (u64::from(state.pages) * BALLOON_PAGE_SIZE) >> 20,
+                    "the guest asks for its memory back; the ramp comes down"
+                );
+            }
             if withdraw {
-                state.pages = 0;
+                state.releasing = true;
+            } else if !short {
+                state.releasing = false;
             }
             changed || withdraw || held != state.held(now)
         };
@@ -623,7 +734,21 @@ impl Steering {
             }
             state.pages
         };
-        let pages = ramp.max(self.guest_pages.load(Ordering::Relaxed));
+        let mut pages = ramp.max(self.guest_pages.load(Ordering::Relaxed));
+        // Deflation paced by what the host has free: the guest is never
+        // handed more a second than the host can give without paging, half
+        // its free memory, and at least the small step.
+        if pages < actual {
+            let free = self
+                .compression
+                .lock()
+                .expect("compression policy poisoned")
+                .host_free;
+            if let Some(free) = free {
+                let allowed = as_pages((free / 2).max(STEP_MIN_BYTES));
+                pages = pages.max(actual.saturating_sub(allowed));
+            }
+        }
         let before = self.balloon.target_pages();
         if pages == before {
             return;
@@ -786,11 +911,14 @@ impl Observer for Levels {
                 cap_mib = (u64::from(cap_pages(level as u32, steering.total_bytes())) * BALLOON_PAGE_SIZE) >> 20,
                 "host memory pressure changed"
             );
-            steering
+            let mut state = steering
                 .compression
                 .lock()
-                .expect("compression policy poisoned")
-                .quiet_polls = 0;
+                .expect("compression policy poisoned");
+            state.quiet_polls = 0;
+            if level != Pressure::Normal {
+                state.pressure_until = Some(Instant::now() + PRESSURE_MEMORY);
+            }
         }
         steering.apply();
     }
@@ -799,6 +927,7 @@ impl Observer for Levels {
 /// What the host has compressed, read the way `vm_stat` reads it.
 struct HostMemory {
     page: u64,
+    ram: u64,
 }
 
 #[repr(C)]
@@ -837,11 +966,63 @@ unsafe extern "C" {
     fn host_statistics64(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
 }
 
+/// `struct xsw_usage`, as `sysctl vm.swapusage` reads it.
+#[repr(C)]
+#[derive(Default)]
+struct XswUsage {
+    total: u64,
+    avail: u64,
+    used: u64,
+    pagesize: u32,
+    encrypted: bool,
+}
+
+fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: an output of the size given, for a name that yields a u64.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(value)
+}
+
+/// Swap in use and swap in total, in bytes; zeros when the Mac will not say.
+fn swap_usage() -> (u64, u64) {
+    let mut usage = XswUsage::default();
+    let mut len = std::mem::size_of::<XswUsage>();
+    // SAFETY: the struct is `struct xsw_usage` field for field, and the
+    // length says so.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"vm.swapusage".as_ptr(),
+            (&mut usage as *mut XswUsage).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        (usage.used, usage.total)
+    } else {
+        (0, 0)
+    }
+}
+
 impl HostMemory {
     fn new() -> HostMemory {
         // SAFETY: a plain query with no pointers of ours involved.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
-        HostMemory { page }
+        HostMemory {
+            page,
+            ram: sysctl_u64(c"hw.memsize").unwrap_or(0),
+        }
     }
 
     fn sample(&self) -> Option<HostSample> {
@@ -860,16 +1041,28 @@ impl HostMemory {
         if rc != 0 {
             return None;
         }
+        let (swap_used, swap_total) = swap_usage();
         Some(HostSample {
             compressed: stats.compressions * self.page,
+            free: u64::from(stats.free_count) * self.page,
+            compressor: u64::from(stats.compressor_page_count) * self.page,
+            swap_used,
+            swap_total,
+            ram: self.ram,
         })
     }
 }
 
-/// One reading: how much the host has compressed since boot.
+/// One reading: how much the host has compressed since boot, what it has
+/// free, what its compressor holds, and its swap.
 #[derive(Clone, Copy)]
 struct HostSample {
     compressed: u64,
+    free: u64,
+    compressor: u64,
+    swap_used: u64,
+    swap_total: u64,
+    ram: u64,
 }
 
 #[cfg(test)]
@@ -1056,7 +1249,11 @@ mod tests {
     /// What `Levels::pressure` does, for a `Steering` held by value.
     fn pressure(steering: &Steering, level: Pressure) {
         if steering.level.swap(level as u32, Ordering::Relaxed) != level as u32 {
-            steering.compression.lock().unwrap().quiet_polls = 0;
+            let mut state = steering.compression.lock().unwrap();
+            state.quiet_polls = 0;
+            if level != Pressure::Normal {
+                state.pressure_until = Some(Instant::now() + PRESSURE_MEMORY);
+            }
         }
         steering.apply();
     }
@@ -1133,10 +1330,135 @@ mod tests {
             "quiet polls under Warn do not ease"
         );
         pressure(&steering, Pressure::Normal);
+        polls(&steering, QUIET_POLLS_BEFORE_DEFLATE as usize + 3);
+        assert_eq!(
+            target_mib(&transport),
+            4096,
+            "a Normal within a minute of the Warn is the level bouncing: steered as at Warn"
+        );
+        steering.compression.lock().unwrap().pressure_until = None;
         polls(&steering, QUIET_POLLS_BEFORE_DEFLATE as usize - 1);
         assert_eq!(target_mib(&transport), 4096, "grace");
         polls(&steering, 1);
         assert_eq!(target_mib(&transport), 4096 - 64, "then a 256th a second");
+    }
+
+    /// A release the moment the level reads Normal after a Warn is what
+    /// handed 4 GiB back in one step on 2026-09-20: answered as under
+    /// pressure, ignored, for as long as the Warn is remembered.
+    #[test]
+    fn a_release_within_a_minute_of_a_warn_is_ignored() {
+        let (steering, transport) = steering_for_tests(16 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
+        assert_eq!(target_mib(&transport), 4096);
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(4 << 30));
+        pressure(&steering, Pressure::Normal);
+        steering.guest_demand(false, true);
+        polls(&steering, 3);
+        assert_eq!(target_mib(&transport), 4096, "the release is ignored");
+        assert!(!steering.compression.lock().unwrap().releasing);
+    }
+
+    /// With no pressure by any sign, a release comes down the ramp a 32nd
+    /// of RAM a second: 4 GiB in eight polls, never in one.
+    #[test]
+    fn a_release_with_no_pressure_comes_down_the_ramp() {
+        let (steering, transport) = steering_for_tests(16 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(4 << 30));
+        pressure(&steering, Pressure::Normal);
+        steering.compression.lock().unwrap().pressure_until = None;
+        steering.guest_demand(false, true);
+        let mut last = target_mib(&transport);
+        assert_eq!(last, 4096, "from the next poll");
+        for expected in [3584, 3072, 2560, 2048, 1536, 1024, 512, 0] {
+            polls(&steering, 1);
+            let now = target_mib(&transport);
+            assert!(last - now <= 512, "never more than a step: {last} -> {now}");
+            assert_eq!(now, expected);
+            last = now;
+        }
+    }
+
+    /// Each step down is no more than half of what the host has free: a
+    /// guest is never handed memory the Mac would have to page for.
+    #[test]
+    fn deflation_is_paced_by_what_the_host_has_free() {
+        let (steering, transport) = steering_for_tests(16 << 30);
+        healthy(&steering);
+        pressure(&steering, Pressure::Warn);
+        polls(&steering, 8);
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(4 << 30));
+        pressure(&steering, Pressure::Normal);
+        steering.compression.lock().unwrap().pressure_until = None;
+        steering.observe(&HostSample {
+            compressed: 0,
+            free: 256 << 20,
+            compressor: 0,
+            swap_used: 0,
+            swap_total: 0,
+            ram: 48 << 30,
+        });
+        steering.guest_demand(false, true);
+        polls(&steering, 1);
+        assert_eq!(
+            target_mib(&transport),
+            4096 - 128,
+            "half of 256 MiB free, not the ramp's 512"
+        );
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages((4096 - 128) << 20));
+        polls(&steering, 1);
+        assert_eq!(
+            target_mib(&transport),
+            4096 - 256,
+            "and again as the driver follows"
+        );
+    }
+
+    /// A Mac reporting Normal with a quarter of its RAM in the compressor,
+    /// or half its swap in use, is under pressure: the ramp climbs the
+    /// Warn cap at the Warn pace.
+    #[test]
+    fn an_overcommitted_host_is_pressure_whatever_it_reports() {
+        let (steering, transport) = steering_for_tests(16 << 30);
+        healthy(&steering);
+        steering.observe(&HostSample {
+            compressed: 0,
+            free: 1 << 30,
+            compressor: 13 << 30,
+            swap_used: 0,
+            swap_total: 0,
+            ram: 48 << 30,
+        });
+        polls(&steering, 8);
+        assert_eq!(target_mib(&transport), 4096, "the Warn cap, at Normal");
+        steering.observe(&HostSample {
+            compressed: 0,
+            free: 1 << 30,
+            compressor: 0,
+            swap_used: 6 << 30,
+            swap_total: 9 << 30,
+            ram: 48 << 30,
+        });
+        steering.guest_demand(false, true);
+        polls(&steering, 2);
+        assert_eq!(
+            target_mib(&transport),
+            4096,
+            "swapping: a release is ignored too"
+        );
     }
 
     /// `need` holds the ramp where the balloon is, at any level, and follows
@@ -1151,20 +1473,24 @@ mod tests {
             steering.steer(64 << 20);
         }
         assert_eq!(target_mib(&transport), 1024, "the Normal cap, compressing");
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(1 << 30));
         steering.guest_demand(true, false);
         assert_eq!(
             target_mib(&transport),
-            0,
-            "no host pressure: withdrawn at once"
+            1024,
+            "no host pressure: the ramp comes down from the next poll, not at once"
         );
-        for _ in 0..8 {
+        for expected in [768, 512, 256, 0, 0, 0, 0, 0] {
             steering.steer(u64::MAX);
             assert_eq!(
                 target_mib(&transport),
-                0,
-                "compression must not refill it while short"
+                expected,
+                "a 32nd of RAM a poll, and compression must not refill it while short"
             );
         }
+        steering.balloon.set_actual_pages_for_test(0);
         // Fine again, and long enough: the ramp climbs the Warn cap.
         healthy(&steering);
         pressure(&steering, Pressure::Warn);
@@ -1220,10 +1546,20 @@ mod tests {
             steering.steer(64 << 20);
         }
         assert_eq!(target_mib(&transport), 1024);
+        steering
+            .balloon
+            .set_actual_pages_for_test(as_pages(1 << 30));
         steering.guest_demand(false, true);
-        assert_eq!(target_mib(&transport), 0, "withdrawn");
+        assert_eq!(target_mib(&transport), 1024, "released from the next poll");
         steering.steer(u64::MAX);
-        assert_eq!(target_mib(&transport), 0, "and held");
+        assert_eq!(
+            target_mib(&transport),
+            768,
+            "a step down, compression or not"
+        );
+        polls(&steering, 3);
+        assert_eq!(target_mib(&transport), 0, "and gone in four");
+        steering.balloon.set_actual_pages_for_test(0);
         healthy(&steering);
         pressure(&steering, Pressure::Warn);
         polls(&steering, 2);

@@ -914,11 +914,55 @@ fn serve_tcp_proxy(port: u16) -> std::process::ExitCode {
 static HOST_TIMEOUTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static HOST_LOST_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long a stream keeps trying to reach the host before it is refused.
+///
+/// A host that is paging its guest, or otherwise not running the VMM's
+/// threads, answers nothing for tens of seconds and then everything: on
+/// 2026-09-20 the M5 stopped for thirty seconds while macOS faulted the
+/// guest's memory back in, and every connect in that window failed at the
+/// kernel's two-second vsock timeout, twenty-five of them, one of which was
+/// BuildKit's session, which it then deregistered and the export failed.
+/// The container's connection is already accepted and its client waiting,
+/// so the right answer to a slow host is to keep trying for as long as a
+/// client would wait, and refuse only after that.
+const HOST_CONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Dials the host's stream port, retrying with a growing pause for the
+/// window; a refused host (anything but a timeout) is refused at once.
+fn connect_host(port: u32) -> std::io::Result<OwnedFd> {
+    let started = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(250);
+    let mut attempts = 0u32;
+    loop {
+        match vsock::connect(port) {
+            Ok(fd) => {
+                if attempts > 0 {
+                    eprintln!(
+                        "lighter-agent: stream to host connected after {} attempts over {:.1}s",
+                        attempts + 1,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(fd);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT)
+                && started.elapsed() < HOST_CONNECT_WINDOW =>
+            {
+                attempts += 1;
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_secs(4));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// A host that stops answering vsock connects is, from inside, a stall with
 /// no visible cause: the control channel that would carry a diagnosis rides
-/// the same device. So after a few consecutive timeouts the guest reports
-/// its own state the one way that still reaches the host — the console:
-/// sysrq's memory summary, blocked tasks, and every task's stack, once.
+/// the same device. So after a few streams have each tried for the whole
+/// window (`HOST_CONNECT_WINDOW`) the guest reports its own state the one
+/// way that still reaches the host — the console: sysrq's memory summary,
+/// blocked tasks, and every task's stack, once.
 fn host_lost() {
     use std::sync::atomic::Ordering;
     if HOST_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1 < 3 {
@@ -954,7 +998,7 @@ fn forward_outbound(tcp: std::net::TcpStream) {
     // The vCPUs may poll rather than sleep between a model's messages, for
     // as long as this stream is open.
     let _wide = accelerator::Wide::open(port);
-    let host = match vsock::connect(STREAM_PORT) {
+    let host = match connect_host(STREAM_PORT) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("lighter-agent: stream to host refused: {e}");

@@ -100,25 +100,35 @@ fn serve(
     cache: Option<&std::path::Path>,
 ) {
     let _ = stream.set_nodelay(true);
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let mut sessions: HashMap<u64, ort::Session> = HashMap::new();
     let mut next_id = 1u64;
+    let mut frames = 0u64;
     loop {
         let (kind, payload) = match read_frame(&mut stream) {
             Ok(Some(f)) => f,
             Ok(None) => return,
             Err(e) => {
-                tracing::debug!(%e, "neural engine stream ended");
+                // At info, not debug: a client that sees this end reports
+                // only that the service went away, and four such reports
+                // on 2026-09-20 never explained themselves.
+                tracing::info!(%peer, frames, sessions = sessions.len(), %e, "neural engine stream ended in the middle of a frame");
                 return;
             }
         };
+        frames += 1;
         let reply = match handle(kind, &payload, runtime, cache, &mut sessions, &mut next_id) {
             Ok(body) => protocol::frame(kind, &body),
             Err(msg) => {
-                tracing::debug!(kind, %msg, "neural engine request failed");
+                tracing::info!(%peer, kind, %msg, "neural engine request failed");
                 protocol::frame(protocol::ERR, msg.as_bytes())
             }
         };
         if stream.write_all(&reply).is_err() {
+            tracing::info!(%peer, frames, "neural engine stream: the client went away before its reply");
             return;
         }
     }
