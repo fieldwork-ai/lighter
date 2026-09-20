@@ -1,0 +1,28 @@
+From: lighter <build@invalid>
+Subject: virtio_balloon: free page reporting at four host pages
+
+Free page reporting reports free runs of the pageblock order, 2 MiB, by
+default. The host releases 16 KiB pages, so any aligned run of four is worth
+reporting, and a guest that has run containers for days has few whole
+pageblocks free: at the pageblock order it reported almost nothing of what
+it freed once its memory was one zone (0.7.2) and no range unplugged it.
+The driver registers with an order of 4 (64 KiB); the core honours the
+driver's order when the `page_reporting_order` parameter is unset.
+
+---
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -1119,6 +1119,13 @@
+ #if defined(CONFIG_ARM64) && defined(CONFIG_ARM64_64K_PAGES)
+ 		vb->pr_dev_info.order = 5;
+ #endif
++		/* lighter: report at four host pages, 64 KiB, not a 2 MiB
++		 * pageblock. The host releases 16 KiB pages, so a run of four
++		 * is worth reporting, and a guest that has run containers for
++		 * days has few whole pageblocks free: at the pageblock order
++		 * it reported almost nothing of what it freed.
++		 */
++		vb->pr_dev_info.order = 4;
+ 
+ 		err = page_reporting_register(&vb->pr_dev_info);
+ 		if (err)
