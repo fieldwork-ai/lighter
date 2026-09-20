@@ -142,6 +142,12 @@ const OVERCOMMITTED_COMPRESSOR_FRACTION: u64 = 4;
 /// what is in use, so used-over-total read 83% on a Mac that had drained
 /// its compressor by half, and kept the balloon pinned for nothing.
 const OVERCOMMITTED_SWAP_FRACTION: u64 = 8;
+/// Overcommitment ends only once the compressor or swap is under this
+/// fraction of RAM, a fifth below where it began: an 8 GB Mac sat within a
+/// few megabytes of the quarter for a minute and read as overcommitted and
+/// not eight times (the M1, 2026-09-20 22:50Z), each flip resetting the
+/// ramp's patience.
+const OVERCOMMITTED_RELEASE_FRACTION_NUM: u64 = 5;
 /// An inflation that has made next to no progress toward its target for
 /// this long is one the guest cannot make: its driver is retrying an
 /// allocation that fails, five times a second, each try a reclaim pass that
@@ -464,10 +470,19 @@ impl Steering {
             .lock()
             .expect("compression policy poisoned");
         state.host_free = Some(sample.free);
+        // In at a quarter (an eighth for swap), out a fifth below that:
+        // hysteresis against a host sitting on the line.
+        let line = |fraction: u64| {
+            let on = sample.ram / fraction;
+            if state.overcommitted {
+                on - on / OVERCOMMITTED_RELEASE_FRACTION_NUM
+            } else {
+                on
+            }
+        };
         let compressor_full =
-            sample.ram > 0 && sample.compressor > sample.ram / OVERCOMMITTED_COMPRESSOR_FRACTION;
-        let swapping =
-            sample.ram > 0 && sample.swap_used > sample.ram / OVERCOMMITTED_SWAP_FRACTION;
+            sample.ram > 0 && sample.compressor > line(OVERCOMMITTED_COMPRESSOR_FRACTION);
+        let swapping = sample.ram > 0 && sample.swap_used > line(OVERCOMMITTED_SWAP_FRACTION);
         let overcommitted = compressor_full || swapping;
         if overcommitted != state.overcommitted {
             tracing::info!(
@@ -1428,6 +1443,22 @@ mod tests {
             ram: 48 << 30,
         });
         assert!(!steering.compression.lock().unwrap().overcommitted);
+        // Hysteresis: in at a quarter of RAM compressed, out only a fifth
+        // below it, so a Mac sitting on the line does not flip each poll.
+        let sample = |compressor: u64| HostSample {
+            compressed: 0,
+            free: 1 << 30,
+            compressor,
+            swap_used: 0,
+            swap_total: 0,
+            ram: 8 << 30,
+        };
+        steering.observe(&sample((2 << 30) + (1 << 20)));
+        assert!(steering.compression.lock().unwrap().overcommitted, "over a quarter");
+        steering.observe(&sample((2 << 30) - (100 << 20)));
+        assert!(steering.compression.lock().unwrap().overcommitted, "just under: still in");
+        steering.observe(&sample((2 << 30) - (500 << 20)));
+        assert!(!steering.compression.lock().unwrap().overcommitted, "a fifth below: out");
     }
 
     /// `need` freezes the ramp where the balloon is and brings it down the
