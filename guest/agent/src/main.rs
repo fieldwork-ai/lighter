@@ -951,9 +951,9 @@ fn forward_outbound(tcp: std::net::TcpStream) {
             return;
         }
     }
-    // The vCPUs poll rather than sleep between a model's messages, while
-    // a Metal or PyTorch stream is carrying them.
-    let _watched = accelerator::Watched::open(port, &tcp);
+    // The vCPUs may poll rather than sleep between a model's messages, for
+    // as long as this stream is open.
+    let _wide = accelerator::Wide::open(port);
     let host = match vsock::connect(STREAM_PORT) {
         Ok(fd) => fd,
         Err(e) => {

@@ -29,6 +29,16 @@ After polling with interrupts enabled, return through the generic idle loop
 before WFI so it can reprogram timers queued by an interrupt. A per-CPU
 flag skips polling on the next iteration after a timeout.
 
+The window grows only on a wakeup from outside: at idle entry the CPU
+reads the timer its clock event device has programmed, and a block that
+ends at that time was the timer, which says nothing about how soon the
+next event from a device or another CPU will come, and whose time was
+known, so spinning until it fires gains nothing over WFI. Without this a
+guest that ticks every four milliseconds keeps any cap above 4 ms grown
+for as long as it lives: with the cap at 5 ms for a container's stream to
+the Mac's GPU, and a detector holding its stream for its lifetime, the M1
+spun a full host core for an idle guest.
+
 --- a/arch/arm64/include/asm/thread_info.h
 +++ b/arch/arm64/include/asm/thread_info.h
 @@ -71,6 +71,7 @@
@@ -49,7 +59,7 @@ flag skips polling on the next iteration after a timeout.
  #define _TIF_32BIT		(1 << TIF_32BIT)
 --- a/arch/arm64/kernel/idle.c
 +++ b/arch/arm64/kernel/idle.c
-@@ -5,6 +5,11 @@
+@@ -5,6 +5,13 @@
  
  #include <linux/cpu.h>
  #include <linux/irqflags.h>
@@ -58,10 +68,12 @@ flag skips polling on the next iteration after a timeout.
 +#include <linux/percpu.h>
 +#include <linux/sched/clock.h>
 +#include <linux/sched/idle.h>
++#include <linux/tick.h>
++#include <linux/timekeeping.h>
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +38,107 @@
+@@ -33,13 +40,147 @@
  }
  
  /*
@@ -80,6 +92,15 @@ flag skips polling on the next iteration after a timeout.
 + * wakeup that arrives soon after the CPU gave up polling doubles the window,
 + * a long sleep halves it, so a machine that is really idle stops spinning
 + * within a few rounds and costs the host nothing.
++ *
++ * Only a wakeup from outside counts as soon: an interrupt from a device or
++ * another CPU. The CPU's own timer says nothing about when the next event
++ * will come, and its time is known at idle entry, so spinning until it
++ * fires gains nothing over WFI. Without that distinction a guest that ticks
++ * every four milliseconds keeps any cap above that grown for as long as it
++ * lives, one host core spun per idle vCPU: a container holding a stream to
++ * the Mac's GPU raises the cap to 5 ms, and a detector holds its stream for
++ * its lifetime.
 + */
 +static unsigned int idle_poll_ns = 200000;
 +module_param_named(poll_ns, idle_poll_ns, uint, 0644);
@@ -89,11 +110,39 @@ flag skips polling on the next iteration after a timeout.
 +static DEFINE_PER_CPU(u32, idle_poll_limit_ns);
 +static DEFINE_PER_CPU(bool, idle_poll_halt_next);
 +
-+static void __cpuidle idle_poll_adjust(u64 block_ns)
++/* A wakeup this close to the programmed timer is the timer. */
++#define IDLE_TIMER_SLACK_NS	50000
++
++/*
++ * The next timer interrupt this CPU has programmed, as its clock event
++ * device holds it, KTIME_MAX with none. Read at idle entry, after the tick
++ * was stopped or kept, so it is the timer WFI would wake to.
++ */
++static u64 __cpuidle idle_next_timer_ns(void)
++{
++	u64 next;
++
++	instrumentation_begin();
++	next = ktime_to_ns(tick_nohz_get_next_hrtimer());
++	instrumentation_end();
++	return next;
++}
++
++static bool __cpuidle idle_timer_due(u64 next_timer_ns)
++{
++	u64 now;
++
++	instrumentation_begin();
++	now = ktime_get_mono_fast_ns();
++	instrumentation_end();
++	return now + IDLE_TIMER_SLACK_NS >= next_timer_ns;
++}
++
++static void __cpuidle idle_poll_adjust(u64 block_ns, bool timer_due)
 +{
 +	u32 limit = __this_cpu_read(idle_poll_limit_ns);
 +
-+	if (block_ns <= idle_poll_ns) {
++	if (!timer_due && block_ns <= idle_poll_ns) {
 +		if (limit < idle_poll_grow_start_ns)
 +			limit = idle_poll_grow_start_ns;
 +		else
@@ -139,20 +188,22 @@ flag skips polling on the next iteration after a timeout.
   */
  void __cpuidle arch_cpu_idle(void)
  {
-+	u64 start;
++	u64 start, next_timer;
 +
 +	if (!idle_poll_ns) {
 +		cpu_do_idle();
 +		return;
 +	}
 +
++	next_timer = idle_next_timer_ns();
 +	if (__this_cpu_read(idle_poll_limit_ns) &&
 +	    !__this_cpu_read(idle_poll_halt_next)) {
 +		bool woke = idle_poll(&start);
 +
 +		__this_cpu_write(idle_poll_halt_next, !woke);
 +		if (woke)
-+			idle_poll_adjust(local_clock_noinstr() - start);
++			idle_poll_adjust(local_clock_noinstr() - start,
++					 idle_timer_due(next_timer));
 +		/* Polling enabled IRQs: an interrupt may have queued a timer
 +		 * without setting NEED_RESCHED. Return through do_idle() to
 +		 * reprogram the stopped tick before the next iteration's WFI.
@@ -167,5 +218,6 @@ flag skips polling on the next iteration after a timeout.
  	 * tricks
  	 */
  	cpu_do_idle();
-+	idle_poll_adjust(local_clock_noinstr() - start);
++	idle_poll_adjust(local_clock_noinstr() - start,
++			 idle_timer_due(next_timer));
  }
