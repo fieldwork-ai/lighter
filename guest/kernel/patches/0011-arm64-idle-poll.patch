@@ -44,6 +44,11 @@ resting window. Without both, a guest that ticks every four milliseconds,
 or one busy enough to wake every few, keeps the 5 ms cap grown for as
 long as the stream is open: a detector holds its stream for its
 lifetime, and the M1 spun a full host core for its idle home server.
+A block is judged at the next idle entry rather than on waking: a reply
+from the host arrives as an interrupt whose bytes are counted by the
+worker it wakes, so at the instant of waking the count has not moved and
+the CPU that took the interrupt would read every reply as a wakeup from
+inside the guest; by its next idle entry it has run what it woke for.
 
 --- a/arch/arm64/include/asm/thread_info.h
 +++ b/arch/arm64/include/asm/thread_info.h
@@ -80,7 +85,7 @@ lifetime, and the M1 spun a full host core for its idle home server.
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +41,175 @@
+@@ -33,13 +41,197 @@
  }
  
  /*
@@ -125,6 +130,15 @@ lifetime, and the M1 spun a full host core for its idle home server.
 +static DEFINE_PER_CPU(u32, idle_poll_limit_ns);
 +static DEFINE_PER_CPU(bool, idle_poll_halt_next);
 +DEFINE_PER_CPU(unsigned long, idle_poll_traffic);
++/* The last block, judged at the next idle entry rather than on waking: a
++ * reply from the host arrives as an interrupt whose bytes are counted by
++ * the worker it wakes, so at the instant of waking the count has not moved
++ * and the wakeup would read as one from inside the guest. By the next idle
++ * entry the CPU has run what it woke for. */
++static DEFINE_PER_CPU(u64, idle_poll_block_ns);
++static DEFINE_PER_CPU(bool, idle_poll_block_timer);
++static DEFINE_PER_CPU(bool, idle_poll_block_pending);
++static DEFINE_PER_CPU(u64, idle_poll_traffic_seen);
 +
 +/* Bytes on accelerator streams so far, every CPU's count summed. */
 +static u64 __cpuidle idle_traffic(void)
@@ -186,6 +200,14 @@ lifetime, and the M1 spun a full host core for its idle home server.
 +	__this_cpu_write(idle_poll_limit_ns, limit);
 +}
 +
++/* Keeps a block for judging at the next idle entry. */
++static void __cpuidle idle_poll_record(u64 block_ns, bool timer_due)
++{
++	__this_cpu_write(idle_poll_block_ns, block_ns);
++	__this_cpu_write(idle_poll_block_timer, timer_due);
++	__this_cpu_write(idle_poll_block_pending, true);
++}
++
 +/* Returns true if a wakeup arrived while polling, so WFI is not needed. */
 +static bool __cpuidle idle_poll(u64 *start)
 +{
@@ -228,17 +250,23 @@ lifetime, and the M1 spun a full host core for its idle home server.
 +		return;
 +	}
 +
-+	next_timer = idle_next_timer_ns();
 +	traffic = idle_traffic();
++	if (__this_cpu_read(idle_poll_block_pending)) {
++		__this_cpu_write(idle_poll_block_pending, false);
++		idle_poll_adjust(__this_cpu_read(idle_poll_block_ns),
++				 __this_cpu_read(idle_poll_block_timer),
++				 traffic != __this_cpu_read(idle_poll_traffic_seen));
++	}
++	__this_cpu_write(idle_poll_traffic_seen, traffic);
++	next_timer = idle_next_timer_ns();
 +	if (__this_cpu_read(idle_poll_limit_ns) &&
 +	    !__this_cpu_read(idle_poll_halt_next)) {
 +		bool woke = idle_poll(&start);
 +
 +		__this_cpu_write(idle_poll_halt_next, !woke);
 +		if (woke)
-+			idle_poll_adjust(local_clock_noinstr() - start,
-+					 idle_timer_due(next_timer),
-+					 idle_traffic() != traffic);
++			idle_poll_record(local_clock_noinstr() - start,
++					 idle_timer_due(next_timer));
 +		/* Polling enabled IRQs: an interrupt may have queued a timer
 +		 * without setting NEED_RESCHED. Return through do_idle() to
 +		 * reprogram the stopped tick before the next iteration's WFI.
@@ -253,6 +281,5 @@ lifetime, and the M1 spun a full host core for its idle home server.
  	 * tricks
  	 */
  	cpu_do_idle();
-+	idle_poll_adjust(local_clock_noinstr() - start, idle_timer_due(next_timer),
-+			 idle_traffic() != traffic);
++	idle_poll_record(local_clock_noinstr() - start, idle_timer_due(next_timer));
  }

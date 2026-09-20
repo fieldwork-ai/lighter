@@ -48,6 +48,10 @@ timer_due = added_function(
     "idle_timer_due",
 )
 slack = added_function(r"^#define IDLE_TIMER_SLACK_NS\t\d+$", "IDLE_TIMER_SLACK_NS")
+record = added_function(
+    r"^static void __cpuidle idle_poll_record\(u64 block_ns, bool timer_due\)\n\{.*?^\}",
+    "idle_poll_record",
+)
 template = (root / "guest/kernel/tests/idle-poll.c").read_text()
 with tempfile.TemporaryDirectory(prefix="lighter-idle-poll-") as temp:
     source = Path(temp) / "idle-poll.c"
@@ -58,6 +62,7 @@ with tempfile.TemporaryDirectory(prefix="lighter-idle-poll-") as temp:
         .replace("@IDLE_ADJUST@", adjust)
         .replace("@IDLE_TIMER_DUE@", timer_due)
         .replace("@IDLE_SLACK@", slack)
+        .replace("@IDLE_RECORD@", record)
     )
     subprocess.run(
         shlex.split(os.environ.get("CC", "cc")) + [

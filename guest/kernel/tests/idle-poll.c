@@ -23,6 +23,8 @@ static unsigned sleeps;
 static unsigned idle_poll_grow_start_ns = 50000;
 static unsigned idle_poll_local_ns = 200000;
 static u64 next_timer_mock, now_mock, traffic_mock;
+static u64 idle_poll_block_ns, idle_poll_traffic_seen;
+static bool idle_poll_block_timer, idle_poll_block_pending;
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 static u64 idle_traffic(void) { return traffic_mock; }
@@ -82,6 +84,7 @@ static bool current_clr_polling_and_test(void)
 @IDLE_SLACK@
 @IDLE_TIMER_DUE@
 @IDLE_ADJUST@
+@IDLE_RECORD@
 @IDLE_POLL@
 
 static void cpu_do_idle(void)
@@ -175,6 +178,32 @@ int main(void)
             failures++;
         } else {
             printf("PASS: %s\n", rules[i].name);
+        }
+    }
+    /* A block is judged at the next idle entry, when the CPU has run what
+     * it woke for: a reply's bytes are counted by the worker the interrupt
+     * wakes, after the wakeup itself. */
+    scenario = ENTRY;
+    idle_poll_ns = 5000000;
+    idle_poll_limit_ns = 200000;
+    idle_poll_halt_next = idle_poll_block_pending = false;
+    next_timer_mock = 10000000; now_mock = 1000000; traffic_mock = 10;
+    pending = polling = irq_enabled = ipi = false; clocks = relaxations = 0;
+    arch_cpu_idle();
+    if (!idle_poll_block_pending || idle_poll_limit_ns != 200000) {
+        fprintf(stderr, "FAIL: the block was judged on waking (pending=%d limit=%u)\n",
+            idle_poll_block_pending, idle_poll_limit_ns);
+        failures++;
+    } else {
+        traffic_mock = 20;
+        pending = polling = irq_enabled = ipi = false; clocks = relaxations = 0;
+        arch_cpu_idle();
+        if (idle_poll_limit_ns != 400000) {
+            fprintf(stderr, "FAIL: a reply counted after waking did not earn the window (limit=%u)\n",
+                idle_poll_limit_ns);
+            failures++;
+        } else {
+            printf("PASS: a reply counted after waking earns the window at the next idle entry\n");
         }
     }
     return failures != 0;
