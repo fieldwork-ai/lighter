@@ -356,10 +356,17 @@ settle_host() {
 	for i in $(seq 1 60); do
 		load="$(ps -Ao pcpu,comm | awk '/fseventsd|mds_stores|mds$|mdworker/ {s+=$1} END {printf "%d", s+0}')"
 		if [ "$load" -lt 3 ]; then quiet=$((quiet+1)); else quiet=0; fi
-		[ "$quiet" -ge 3 ] && { [ "$i" -gt 3 ] && echo "    (host settled after $((i*5)) s)"; return; }
+		if [ "$quiet" -ge 3 ]; then
+			# Only worth a line when it took a wait; the return is explicit
+			# because a bare `return` carries the last status, and a host
+			# quiet from the first sample made that a 1 under `set -e`.
+			[ "$i" -gt 3 ] && echo "    (host settled after $((i*5)) s)"
+			return 0
+		fi
 		sleep 5
 	done
 	echo "    (host still indexing after 5 min; measuring anyway)"
+	return 0
 }
 
 run_case_native() {
