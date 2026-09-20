@@ -70,7 +70,7 @@ inside the guest; by its next idle entry it has run what it woke for.
  #define _TIF_32BIT		(1 << TIF_32BIT)
 --- a/arch/arm64/kernel/idle.c
 +++ b/arch/arm64/kernel/idle.c
-@@ -5,6 +5,14 @@
+@@ -5,6 +5,15 @@
  
  #include <linux/cpu.h>
  #include <linux/irqflags.h>
@@ -80,12 +80,13 @@ inside the guest; by its next idle entry it has run what it woke for.
 +#include <linux/sched/clock.h>
 +#include <linux/sched/idle.h>
 +#include <linux/cpumask.h>
++#include <linux/sysfs.h>
 +#include <linux/tick.h>
 +#include <linux/timekeeping.h>
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +41,197 @@
+@@ -33,13 +42,222 @@
  }
  
  /*
@@ -150,6 +151,31 @@ inside the guest; by its next idle entry it has run what it woke for.
 +		total += per_cpu(idle_poll_traffic, cpu);
 +	return total;
 +}
++
++/* Read-only: the count, and each CPU's window, for reading from sysfs. */
++static int idle_poll_traffic_get(char *buffer, const struct kernel_param *kp)
++{
++	return sysfs_emit(buffer, "%llu\n", idle_traffic());
++}
++static const struct kernel_param_ops idle_poll_traffic_ops = {
++	.get = idle_poll_traffic_get,
++};
++module_param_cb(traffic, &idle_poll_traffic_ops, NULL, 0444);
++
++static int idle_poll_limits_get(char *buffer, const struct kernel_param *kp)
++{
++	int cpu, len = 0;
++
++	for_each_online_cpu(cpu)
++		len += sysfs_emit_at(buffer, len, "%s%u", len ? " " : "",
++				     per_cpu(idle_poll_limit_ns, cpu));
++	len += sysfs_emit_at(buffer, len, "\n");
++	return len;
++}
++static const struct kernel_param_ops idle_poll_limits_ops = {
++	.get = idle_poll_limits_get,
++};
++module_param_cb(limits, &idle_poll_limits_ops, NULL, 0444);
 +
 +/* A wakeup this close to the programmed timer is the timer. */
 +#define IDLE_TIMER_SLACK_NS	50000
