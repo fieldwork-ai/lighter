@@ -30,11 +30,13 @@ before WFI so it can reprogram timers queued by an interrupt. A per-CPU
 flag skips polling on the next iteration after a timeout.
 
 What decides is whether a message moved on a container's stream to an
-accelerator within the last window's length, a message being a page or
-less, counted where sockmap moves them on sockets the guest agent marks
-(patch 0032); a tensor's bulk does not count, since a wakeup saved is
-worth nothing to a transfer, and a detector's frame is 3.5 MB of it every
-200 ms. If one did, a model is talking and the window grows to its cap
+accelerator within the last millisecond (`idle.poll_recent_ns`, an RPC
+gap's length: a token loop's messages follow each other closer than
+that, and a model's compute or a frame's bulk take longer), a message
+being a page or less, counted where sockmap moves them on sockets the
+guest agent marks (patch 0032); a tensor's bulk does not count, since a
+wakeup saved is worth nothing to a transfer, and a detector's frame is
+3.5 MB of it every 200 ms. If one did, a model is talking and the window grows to its cap
 whatever woke the CPU: a
 container talking to the Mac's GPU raises the cap to 5 ms (`idle.poll_ns`)
 so its client's threads stay awake between the messages of a token, and
@@ -94,7 +96,7 @@ nothing move in the middle of a token loop.
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,13 +42,279 @@
+@@ -33,13 +42,285 @@
  }
  
  /*
@@ -114,11 +116,11 @@ nothing move in the middle of a token loop.
 + * a long sleep halves it, so a machine that is really idle stops spinning
 + * within a few rounds and costs the host nothing.
 + *
-+ * What decides is whether a byte moved on a container's stream to an
-+ * accelerator within the last window's length, counted where sockmap
-+ * moves them on sockets the guest agent marks (net/core/skmsg.c). If one
-+ * did, a model is talking, and the window grows to its cap whatever woke
-+ * the CPU:
++ * What decides is whether a message moved on a container's stream to an
++ * accelerator within the last millisecond, an RPC gap's length, counted
++ * where sockmap moves them on sockets the guest agent marks
++ * (net/core/skmsg.c). If one did, a model is talking, and the window grows
++ * to its cap whatever woke the CPU:
 + * a container talking to the Mac's GPU raises the cap to 5 ms so its
 + * client's threads stay awake between the messages of a token, and the
 + * tick or a thread's hand-off in the middle of that is no reason to give
@@ -138,6 +140,12 @@ nothing move in the middle of a token loop.
 +/* The most a wakeup from inside the guest earns. */
 +static unsigned int idle_poll_local_ns = 200000;
 +module_param_named(poll_local_ns, idle_poll_local_ns, uint, 0644);
++/* How long after a message on an accelerator stream a model counts as
++ * talking: the length of an RPC's gap, under which a token loop's messages
++ * follow each other, and over which a model computes or a frame's bulk
++ * moves, where a wakeup saved is worth nothing. */
++static unsigned int idle_poll_recent_ns = 1000000;
++module_param_named(poll_recent_ns, idle_poll_recent_ns, uint, 0644);
 +
 +static DEFINE_PER_CPU(u32, idle_poll_limit_ns);
 +static DEFINE_PER_CPU(bool, idle_poll_halt_next);
@@ -167,9 +175,9 @@ nothing move in the middle of a token loop.
 +}
 +
 +/*
-+ * Whether a message moved on an accelerator stream within the last
-+ * window's length (a message being a page or less; a tensor's bulk does
-+ * not count, net/core/skmsg.c). Not "since this CPU last went idle": the
++ * Whether a message moved on an accelerator stream within the last RPC
++ * gap's length (a message being a page or less; a tensor's bulk does not
++ * count, net/core/skmsg.c). Not "since this CPU last went idle": the
 + * tick and hand-offs chop a wait into several idle periods, and judged per
 + * period half of them saw nothing move in the middle of a token loop. A
 + * model that answered within the last cap is talking.
@@ -186,7 +194,7 @@ nothing move in the middle of a token loop.
 +	instrumentation_begin();
 +	now = ktime_get_mono_fast_ns();
 +	instrumentation_end();
-+	return now - latest < idle_poll_ns;
++	return now - latest < idle_poll_recent_ns;
 +}
 +
 +/* Read-only: the count, and each CPU's window, for reading from sysfs. */
