@@ -1,0 +1,50 @@
+From: lighter <build@invalid>
+Subject: vsock/virtio: a packet the allocator refuses is sent shorter, not dropped
+
+A stream's write of 256 KiB is one linear packet (0015), which is one
+allocation above the costly order. A fragmented guest refuses those rather
+than compacting for them, and the refusal ended the stream: sockmap treats
+any error but EAGAIN as a hard error and stops the redirect, and a copying
+proxy takes the write's failure as the end of the peer. Measured on the M5
+on 2026-09-20: the guest short of memory with a 4 GiB balloon in its
+kernel-usable zones, the receive side refusing its large buffers by the
+hundred, and the docker socket's stream, and the BuildKit session on it,
+gone.
+
+A refused packet is now halved down to a page and sent shorter. The header
+carries the packet's length, the caller already reads it back (0018), and
+the rest of the write follows in the next packet. Throughput is unchanged
+while memory is healthy; while it is not, the stream slows instead of
+ending. The receive side posts a small buffer when the large one is
+refused (0021); this is its pair.
+
+---
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -264,7 +264,25 @@
+ 	if (!zcopy)
+ 		skb_len += payload_len;
+ 
+-	skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL);
++	/* lighter: a linear packet of 256 KiB is an allocation above the
++	 * costly order, which a fragmented guest refuses rather than
++	 * compacts for, and a refused packet ended the stream. So a refused
++	 * packet is halved down to a page and sent shorter: the header says
++	 * how long it is, the caller reads that back, and the rest of the
++	 * write follows in the next packet. The receive side posts a small
++	 * buffer when the large one is refused (0021); this is its pair.
++	 */
++	skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL | __GFP_NOWARN);
++	while (!skb && !zcopy && payload_len > PAGE_SIZE) {
++		payload_len = max_t(size_t, payload_len / 2, PAGE_SIZE);
++		skb_len = VIRTIO_VSOCK_SKB_HEADROOM + payload_len;
++		skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL | __GFP_NOWARN);
++		if (skb)
++			pr_info_ratelimited("virtio_vsock: a large packet was refused; sending %zu bytes\n",
++					    payload_len);
++	}
++	if (!skb)
++		skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL);
+ 	if (!skb)
+ 		return NULL;
+ 

@@ -23,6 +23,7 @@ mod udp_inbound;
 mod vsock;
 
 use std::io::{self, Read, Write};
+use std::time::{Duration, Instant};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
@@ -222,11 +223,7 @@ fn main() -> std::process::ExitCode {
 /// trimming waits for an empty container hierarchy: a quiet process can still
 /// need its executable and mapped files, including pages charged to the engine.
 fn bound_container_cache() {
-    let Some(mut total) = mem_total() else { return };
-    // With a virtio-mem range the guest's size is the host's to set, from
-    // the lines this loop sends: they go whatever the size, and `MemTotal`
-    // is read again each tick because it moves.
-    let dynamic = std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem").exists();
+    let Some(total) = mem_total() else { return };
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -346,9 +343,6 @@ fn bound_container_cache() {
                 idle::horizon_text(idle.horizon_secs())
             );
         }
-        if dynamic {
-            total = mem_total().unwrap_or(total);
-        }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
             // The engine's cache (image layers) bounded too, at an eighth of
@@ -436,7 +430,7 @@ fn bound_container_cache() {
         // alone: the peak 600 MB better, the minute reading 500 MB worse,
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
-        if dynamic || total >= balloon_min {
+        if total >= balloon_min {
             offer_memory(
                 &mut memory_stream,
                 &mut last_offer,
@@ -444,20 +438,12 @@ fn bound_container_cache() {
                 active,
                 // Quiet, or nothing running and the containers eight seconds
                 // idle: the quiet rule protects running work from a seesaw,
-                // and with no container there is none to protect — while the
-                // trims and compaction after an install kept the guest's CPU
-                // busy for most of a minute, and the range stayed in for it
-                // (the shrink came 47 s after a seven-second install). Eight
-                // rather than three: three is the benchmark's gap between
-                // two runs of an install, and a shrink that started in it
-                // had the next run begin as three gigabytes of its
-                // predecessor's cache were being unplugged (the M1's installs
-                // a fifth slower); eight is the second trim's moment, when
-                // the cache is already gone and the unplug is cheap.
+                // and with no container there is none to protect; eight is
+                // the second trim's moment, when the cache is already gone.
                 quiet_for >= 3 * TICKS_PER_SEC
                     || (!populated && idle_trim.elapsed_ticks() >= 8 * TICKS_PER_SEC),
                 !populated,
-                dynamic && quiet_for == 0,
+                false,
             );
         }
         // Image extraction charges shared file pages to the engine. A running
@@ -1724,15 +1710,54 @@ fn splice_copy(from: &impl AsRawFd, to: &impl AsRawFd, fallback: impl FnOnce()) 
     }
 }
 
+/// How long a write may keep being refused for want of memory before the
+/// stream is given up: the guest reclaiming under a host that is short.
+const COPY_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
 fn copy(from: &mut impl Read, to: &mut impl Write) {
     let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match from.read(&mut buf) {
+    let mut said = false;
+    'stream: loop {
+        let n = match from.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if to.write_all(&buf[..n]).is_err() {
-                    break;
+            Ok(n) => n,
+        };
+        // Not `write_all`: a write refused for want of memory (a 256 KiB
+        // vsock packet is one linear allocation, and a fragmented guest
+        // refuses those before it is out of memory) is retried with a
+        // growing pause rather than taken as the end of the stream. Only
+        // the peer ends a stream.
+        let mut off = 0;
+        let mut pause = Duration::from_millis(1);
+        let mut refused_since: Option<Instant> = None;
+        while off < n {
+            match to.write(&buf[off..n]) {
+                Ok(0) => break 'stream,
+                Ok(m) => {
+                    off += m;
+                    refused_since = None;
+                    pause = Duration::from_millis(1);
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::OutOfMemory | io::ErrorKind::WouldBlock
+                    ) || e.raw_os_error() == Some(libc::ENOBUFS) =>
+                {
+                    let since = *refused_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > COPY_RETRY_WINDOW {
+                        eprintln!("lighter-agent: a write refused for {}s; giving the stream up: {e}", COPY_RETRY_WINDOW.as_secs());
+                        break 'stream;
+                    }
+                    if !said {
+                        eprintln!("lighter-agent: a write was refused ({e}); retrying while the guest reclaims");
+                        said = true;
+                    }
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(50));
+                }
+                Err(_) => break 'stream,
             }
         }
     }
