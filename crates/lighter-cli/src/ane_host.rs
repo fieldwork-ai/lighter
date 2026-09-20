@@ -38,23 +38,37 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    /// Picks a free loopback port, starts the service on it, and keeps it
-    /// started until dropped.
+    /// Picks a free loopback port and returns it at once; the service is
+    /// started on it from a thread and kept started until dropped. The
+    /// guest only needs the port number on its command line, so the
+    /// machine boots while the service comes up rather than after it.
     pub fn start(cache: &Path) -> std::io::Result<Supervisor> {
         let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
             .local_addr()?
             .port();
         let exe = std::env::current_exe()?;
-        let child = spawn(&exe, port, cache)?;
         let stopping = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(std::sync::Mutex::new(Some(child)));
+        let child = Arc::new(std::sync::Mutex::new(None));
         {
             let stopping = stopping.clone();
             let child = child.clone();
             let cache = cache.to_path_buf();
             std::thread::Builder::new()
                 .name("ane-supervise".into())
-                .spawn(move || supervise(exe, port, cache, stopping, child))?;
+                .spawn(move || {
+                    match spawn(&exe, port, &cache) {
+                        Ok(running) => {
+                            if let Ok(mut c) = child.lock() {
+                                *c = Some(running);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "the neural engine service could not start");
+                            return;
+                        }
+                    }
+                    supervise(exe, port, cache, stopping, child)
+                })?;
         }
         Ok(Supervisor {
             port,
