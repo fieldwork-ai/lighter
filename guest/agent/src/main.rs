@@ -443,7 +443,9 @@ fn bound_container_cache() {
                 quiet_for >= 3 * TICKS_PER_SEC
                     || (!populated && idle_trim.elapsed_ticks() >= 8 * TICKS_PER_SEC),
                 !populated,
-                false,
+                // Busy: the guest's CPU was not quiet this tick. A need
+                // is work that is short, not a guest that is merely low.
+                quiet_for == 0,
             );
         }
         // Image extraction charges shared file pages to the engine. A running

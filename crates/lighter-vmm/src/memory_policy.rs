@@ -777,35 +777,62 @@ fn memory_guest(
     steering: Arc<Steering>,
 ) -> Result<(), String> {
     let accepted = vsock.listen(MEMORY_PORT);
+    // Each connection is read on its own thread, so a new one from the
+    // agent is heard at once whatever became of the last: a guest at its
+    // memory limit lost the connection's close on the way out (m6, the
+    // M1, 2026-09-20 23:00Z), the one reader sat on the dead connection,
+    // and the fresh line that would have ended the hold waited behind it
+    // for good. The hold for a silent guest applies only when no
+    // connection is alive.
+    let live = Arc::new(AtomicU32::new(0));
     std::thread::Builder::new()
         .name("memory-guest".into())
         .spawn(move || {
             for crate::virtio::vsock::Accepted { key } in accepted {
-                while let Some(bytes) = vsock.read_outbound_exact(key, 32) {
-                    let word = |i: usize| {
-                        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
-                    };
-                    let spare_mib = u64::from(word(0));
-                    let flags = word(12);
-                    let (release, need) = (flags & 1 != 0, flags & 2 != 0);
-                    // Pressure stall information, hundredths of a percent
-                    // of the last ten seconds: `some` is the guest's own
-                    // reason for a need; `full` paces how fast it is
-                    // answered.
-                    steering.guest_stall(word(16), word(20));
-                    // The line drives the ramp and, when the guest has
-                    // memory to spare, the balloon's own offer.
-                    steering.guest_demand(need, release);
-                    if release || need {
-                        steering.guest_offers(0, true);
-                    } else {
-                        steering.guest_offers(spare_mib, false);
-                    }
+                let vsock = vsock.clone();
+                let steering = steering.clone();
+                let live = live.clone();
+                live.fetch_add(1, Ordering::AcqRel);
+                let spawned = std::thread::Builder::new()
+                    .name("memory-line".into())
+                    .spawn(move || {
+                        while let Some(bytes) = vsock.read_outbound_exact(key, 32) {
+                            let word = |i: usize| {
+                                u32::from_le_bytes([
+                                    bytes[i],
+                                    bytes[i + 1],
+                                    bytes[i + 2],
+                                    bytes[i + 3],
+                                ])
+                            };
+                            let spare_mib = u64::from(word(0));
+                            let flags = word(12);
+                            let (release, need) = (flags & 1 != 0, flags & 2 != 0);
+                            // Pressure stall information, hundredths of a
+                            // percent of the last ten seconds: `some` is the
+                            // guest's own reason for a need; `full` paces how
+                            // fast it is answered.
+                            steering.guest_stall(word(16), word(20));
+                            // The line drives the ramp and, when the guest
+                            // has memory to spare, the balloon's own offer.
+                            steering.guest_demand(need, release);
+                            if release || need {
+                                steering.guest_offers(0, true);
+                            } else {
+                                steering.guest_offers(spare_mib, false);
+                            }
+                        }
+                        // Without current guest feedback the guest is short
+                        // until it says otherwise: the ramp holds, and its
+                        // offers are withdrawn.
+                        if live.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            steering.guest_demand(true, false);
+                            steering.guest_offers(0, true);
+                        }
+                    });
+                if spawned.is_err() {
+                    live.fetch_sub(1, Ordering::AcqRel);
                 }
-                // Without current guest feedback the guest is short until it
-                // says otherwise: the ramp holds, and its offers are withdrawn.
-                steering.guest_demand(true, false);
-                steering.guest_offers(0, true);
             }
         })
         .map(|_| ())
@@ -1432,14 +1459,15 @@ mod tests {
             "swapping: a release is ignored too"
         );
         assert!(steering.compression.lock().unwrap().overcommitted);
-        // Five of a six-gigabyte swap file is 83% of the file and an eighth
-        // of the Mac's RAM: not overcommitted. The file's size says nothing.
+        // Four of a five-gigabyte swap file is 80% of the file and a twelfth
+        // of the Mac's RAM, under the line to leave (an eighth less a fifth):
+        // not overcommitted. The file's size says nothing.
         steering.observe(&HostSample {
             compressed: 0,
             free: 1 << 30,
             compressor: 0,
-            swap_used: 5 << 30,
-            swap_total: 6 << 30,
+            swap_used: 4 << 30,
+            swap_total: 5 << 30,
             ram: 48 << 30,
         });
         assert!(!steering.compression.lock().unwrap().overcommitted);
