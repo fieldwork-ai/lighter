@@ -117,6 +117,15 @@ above the order, so lowering the order at runtime left the fragments unreported 
 minute measured (1872 MiB against 1349 on the M5); patch 0035 has the order's setter request a
 cycle.
 
+What a minute after an install leaves, on the M5's 16 GiB guest after the filesystem cases
+(1410 MiB against 604 idle, 2026-09-21): the guest keeps a quarter of RAM free when nothing
+runs and the balloon holds the rest, so the remainder is not free memory the host was never
+told about. It is 280 MB of cache (237 in the engine's cgroup, half of it the image layers it
+extracted), 114 of anon, 85 of slab, about 170 MB of free runs under the 32 KiB reporting order
+that compaction did not merge (45 MB when the memory case runs alone), and the page array. The
+engine's resting level after a trim and a pass at order 2 are the levers left, neither taken
+for 0.7.2.
+
 ## The policy
 
 A guest that reports short comes down the paced release ramp at any level
