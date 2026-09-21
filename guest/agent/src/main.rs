@@ -223,7 +223,11 @@ fn main() -> std::process::ExitCode {
 /// trimming waits for an empty container hierarchy: a quiet process can still
 /// need its executable and mapped files, including pages charged to the engine.
 fn bound_container_cache() {
-    let Some(total) = mem_total() else { return };
+    let Some(mut total) = mem_total() else { return };
+    // With a virtio-mem range the guest's size is the host's to set, from
+    // the lines this loop sends: `MemTotal` is read again each tick because
+    // it moves.
+    let dynamic = std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem").exists();
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -342,6 +346,9 @@ fn bound_container_cache() {
                 evicted >> 20,
                 idle::horizon_text(idle.horizon_secs())
             );
+        }
+        if dynamic {
+            total = mem_total().unwrap_or(total);
         }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();

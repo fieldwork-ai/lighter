@@ -11,6 +11,7 @@ pub mod block;
 pub mod disk;
 pub mod fs;
 pub mod gpu;
+pub mod mem;
 pub mod mmio;
 pub mod net;
 pub mod poll;
@@ -32,6 +33,8 @@ pub mod device_type {
     pub const BALLOON: u32 = 5;
     /// virtio-gpu (`gpu`), a render node for Venus and nothing else.
     pub const GPU: u32 = 16;
+    /// virtio-mem (`mem.rs`).
+    pub const MEM: u32 = 24;
     pub const VSOCK: u32 = 19;
     pub const FS: u32 = 26;
 }

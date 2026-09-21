@@ -157,8 +157,6 @@ struct Region {
 #[derive(Debug)]
 struct Deferred {
     ready: AtomicUsize,
-    /// The prefix preparer's lock (`prepare_next`), test-only since 0.7.2.
-    #[cfg(test)]
     preparation: Mutex<()>,
 }
 
@@ -337,7 +335,7 @@ impl GuestMemory {
         Ok(())
     }
 
-    /// Reserve an inaccessible range that preparation exposes later.
+    /// Reserve an inaccessible hotplug range. Only `prepare_next` exposes it.
     pub(crate) fn reserve_region(&mut self, gpa: u64, len: usize) -> Result<()> {
         if self.vm.is_none() {
             return Err(MemoryError::Detached);
@@ -360,7 +358,6 @@ impl GuestMemory {
             _backing: backing,
             deferred: Some(Deferred {
                 ready: AtomicUsize::new(0),
-                #[cfg(test)]
                 preparation: Mutex::new(()),
             }),
             demand: None,
@@ -497,10 +494,6 @@ impl GuestMemory {
 
     /// Prepare one prefix extension, publishing it only after accounting and
     /// the guest mapping are established. Existing pages are never replaced.
-    /// The virtio-mem range was prepared this way until 0.7.2; the demand
-    /// path (`prepare_remaining`) is what runs now, and this stays for the
-    /// tests of the accounting they share.
-    #[cfg(test)]
     pub(crate) fn prepare_next(&self, gpa: u64, amount: usize) -> Result<usize> {
         let region = self
             .regions

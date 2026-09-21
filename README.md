@@ -220,7 +220,7 @@ Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro
 
 #### Memory footprint
 
-macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter returns memory to the Mac within seconds through free page reporting and a cooperative balloon.
+macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter returns memory to the Mac within seconds through free page reporting, the unplugged range and a cooperative balloon.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
@@ -298,9 +298,9 @@ Container writable layers and named volumes live on an internal virtual disk (`~
 
 ### 3. Cooperative memory management
 Virtual machines that hoard allocated RAM starve macOS and trigger disk swapping.
-- **One memory zone, demand-backed:** The guest owns all of its configured RAM from boot as ordinary memory, and the host prepares backing only for pages the guest touches. No hot-plugged range, no movable half: nothing can cap what the guest's kernel has, which is what starved a 16 GiB guest under a 4 GiB balloon before 0.7.2.
+- **Dynamic sizing with `virtio-mem`:** The guest boots from a quarter-sized base and onlines the rest in 128 MiB blocks via `virtio-mem`; with nothing running the range comes back out, page arrays and all. Host backing is prepared on demand; unused blocks and pages are returned to macOS.
 - **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory drops to **372 MiB** (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB). Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at **702 MiB** while OrbStack holds 2,776 MiB, Docker Desktop holds 7,276 MiB, and Colima holds 10,145 MiB.
-- **Compressor-steered ballooning in whole pageblocks:** On memory-constrained Macs, macOS compresses memory before signaling out-of-memory pressure. lighter tracks host memory compression activity and swap against RAM: when macOS begins compressing heavily, lighter first asks the guest to reclaim its coldest container cache, then inflates the balloon in compound units from a whole 2 MiB pageblock down to 16 KiB, movable and migratable, so what the guest keeps stays compactable; it deflates down a paced ramp once compression subsides or the guest reports memory stalls.
+- **Compressor-steered ballooning in whole pageblocks:** On memory-constrained Macs, macOS compresses memory before signaling out-of-memory pressure. lighter tracks host memory compression activity and swap against RAM: when macOS begins compressing heavily, lighter first asks the guest to reclaim its coldest container cache, then inflates the balloon in compound units from a whole 2 MiB pageblock down to 16 KiB, movable and migratable, so it never takes the kernel's own half and what the guest keeps stays compactable; it deflates down a paced ramp once compression subsides or the guest reports memory stalls.
 
 ### 4. The network as streams, not packets
 Other runtimes assign the VM a virtual network interface card and run a userspace TCP/IP stack on the Mac to translate raw packets back into host connections. Every byte is copied and checksummed twice, with round-trip hypervisor context switches on every packet.
@@ -321,7 +321,7 @@ Cold start includes allocating VM metadata, booting Linux, and initializing Dock
 
 ### 6. Minimal Linux LTS kernel strategy
 lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal, audited patch set focused strictly on hypervisor performance:
-- Balloon units from a whole pageblock down to a host page, movable and migratable, and a 64 KiB default for free page reporting before the agent sets its own (`0014`, `0034`); a vsock packet the allocator refuses is sent shorter rather than dropped (`0033`).
+- `virtio-mem` independent block page arrays and auto-movable onlining (`0024`, `0026`); balloon units from a whole pageblock down to a host page, movable and migratable (`0014`); a vsock packet the allocator refuses is sent shorter rather than dropped (`0033`).
 - BPF sockmap backoff to avoid backlog worker spinning (`0025`).
 - Apple Silicon TSO memory ordering for high-speed Rosetta x86-64 execution (`0023`).
 - `btrfs` direct interrupt-context completions (`0009`).

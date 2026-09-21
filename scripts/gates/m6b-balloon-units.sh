@@ -46,8 +46,7 @@ order="$(probe 'cat /sys/module/page_reporting/parameters/page_reporting_order')
 # order while containers churn; the kernel's default (0034) is what holds
 # before it speaks.
 [ "${order:-0}" -ge 4 ] && [ "${order:-0}" -le 9 ] && pass "free page reporting at order ${order}" || fail "reporting order is ${order}"
-movable="$(probe "awk '/^Node/{z=\$4} /managed/{if (z==\"Movable\") print \$2}' /proc/zoneinfo")"
-[ "${movable:-0}" -eq 0 ] && pass "one zone: nothing managed in ZONE_MOVABLE" || fail "ZONE_MOVABLE manages ${movable} pages; the guest should be one zone"
+note "the balloon's units are movable and live in ZONE_MOVABLE where the range is"
 sleep 5
 # A fragmented guest: page cache through most of memory and unmovable
 # pages spread through the pageblocks, so the balloon cannot have whole
