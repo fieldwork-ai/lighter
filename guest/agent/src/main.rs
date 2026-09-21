@@ -499,8 +499,13 @@ fn bound_container_cache() {
         // eighth of RAM — is reporting's: hurried for a while and compacted
         // into reportable runs, as before the balloon. On a 4 GiB guest the
         // reserve alone read 600 MB more at a minute without this.
+        // The burst after a trim reports at order 5 whatever the rest order:
+        // at 3 the walk over a 12 GiB guest's free lists was still under way
+        // fifteen seconds after an install (3803 MiB against 1745 on the M5,
+        // 2026-09-21), where 5 has the bulk back in seconds and the rest
+        // order then takes the fragments once the burst is over.
         if !memory_policy::populated(std::path::Path::new(containers)) {
-            set_reporting(100, rest_order.min(5));
+            set_reporting(100, 5);
             hurried = true;
             compact_until_reportable();
         }
