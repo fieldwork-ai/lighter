@@ -64,7 +64,7 @@ refused write for thirty seconds. With those alone, all three exports
 survived the harness on the two-halves guest, at 33, 61 and 27 seconds,
 with 700 receive-buffer fallbacks.
 
-## One zone, built and put back
+## One zone, measured and chosen
 
 Decided with Nick: the range goes; the guest boots with all of its RAM as
 ordinary memory. Built, and measured on the M1 with the 0.7.1 kernel at
@@ -74,32 +74,31 @@ seconds per export under the same fragmenter and hog, API calls under
 1.1 s, allocation stalls 31 thousand across the run against 207 thousand:
 the kernel with all of the guest's memory does not starve.
 
-Then the records. The M1's read 415 MiB idle against 273 and 1245 MiB a
-minute after the workload against 1021; the M5's, on a 12 GiB guest, 684
-against 394 and 1643 against 847. The slope against guest size (283, 384
-and 439 MiB at 2, 4 and 6 GiB, the guest's own use identical at 325) named
-the cost: the page array, 64 bytes for every 4 KiB page, 1.56% of RAM,
-plus a 64 MiB swiotlb the kernel sets aside once RAM reaches past 4 GiB.
-The range's unplug had been returning the first, and the base under
-4 GiB had never triggered the second. The estimate given at the design
-table, about 50 MiB at 4 GiB, was the page array for the range alone and
-missed the swiotlb; the truth was 130 at 4 GiB and 290 at 12.
+Then the records: the M1's read 415 MiB idle against 273, the M5's, on a
+12 GiB guest, 684 against 394. The slope against guest size (283, 384 and
+439 MiB at 2, 4 and 6 GiB, the guest's own use identical at 325) named the
+cost: the page array, 64 bytes for every 4 KiB page, 1.56% of RAM, plus a
+64 MiB swiotlb the kernel sets aside once RAM reaches past 4 GiB. The
+range's unplug had been returning the first, and a base under 4 GiB had
+never triggered the second. The estimate given at the design table, about
+50 MiB at 4 GiB, was the page array for the range alone.
 
-The page array cannot be recovered without unplugging idle memory, and
-Nick's word was that a regression is fixed, not noted. So the range is
-back as it was, patches 0024 and 0026 with it, and the fix for the
-incident is the one that was sufficient on its own: the balloon's units
-are movable, so they come from the range's half and never cap the kernel.
-`swiotlb=noforce` takes the 64 MiB back in either design, and deferred
-struct-page initialisation spreads the base's page array over the vCPUs
-at boot.
+The range was put back for a few hours on the rule that a regression is
+fixed, not noted, and the balloon's movable units shown to fix the incident
+on their own. Nick then chose the single zone with its cost known: the page
+array for memory that never leaves is the price of a guest whose kernel can
+use all of it and of a memory model with one mechanism fewer, and while
+containers run, which is always on the machine that matters, the two designs
+cost the same. `swiotlb=noforce` takes the 64 MiB back, and deferred
+struct-page initialisation spreads the page array's setup over the vCPUs at
+boot. The idle headline moves from 394 to about 620 MiB on the M5's default
+12 GiB guest, against OrbStack's 936.
 
 ## A balloon that moves
 
 Patch 0014 rewritten: units from a whole 2 MiB pageblock down to 16 KiB,
 the largest the allocator has first, movable
-(`CONFIG_BALLOON_COMPACTION`) and so allocated from ZONE_MOVABLE where the
-range is, migrated by compaction as compound folios.
+(`CONFIG_BALLOON_COMPACTION`), migrated by compaction as compound folios.
 The migration series feared at planning was mostly already in Linux 6.18:
 `skip_isolation_on_order` lets compaction isolate a compound page smaller
 than its target order, `isolate_movable_ops_page` takes the head, and

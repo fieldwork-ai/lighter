@@ -43,7 +43,6 @@ use std::time::{Duration, Instant};
 
 use crate::mempressure::{Observer, Pressure, Watcher};
 use crate::virtio::balloon::{BALLOON_PAGE_SIZE, BalloonState};
-use crate::virtio::mem::{BLOCK_SIZE, MemControl};
 use crate::virtio::mmio::VirtioMmio;
 
 /// How much of guest RAM the ramp may reach at each level, and how fast.
@@ -159,9 +158,6 @@ const OVERCOMMITTED_RELEASE_FRACTION_NUM: u64 = 5;
 /// stopped being scheduled, and its last line had said it was fine.
 const INFLATION_STALL: Duration = Duration::from_secs(3);
 const STALL_PROGRESS_BYTES: u64 = 4 << 20;
-/// The least a range grows by when the guest is short: a small guest
-/// doubles, a tiny one gets this.
-const GROW_STEP_MIN: u64 = 256 << 20;
 
 /// The balloon, and the signals that drive it.
 pub struct MemoryPolicy {
@@ -178,14 +174,11 @@ impl MemoryPolicy {
         transport: Arc<Mutex<VirtioMmio>>,
         ram_bytes: u64,
         vsock: Arc<crate::virtio::vsock::VsockShared>,
-        mem: Option<MemControl>,
     ) -> Result<MemoryPolicy, String> {
         let steering = Arc::new(Steering {
             balloon,
             transport,
             ram_bytes,
-            mem,
-            last_line: Mutex::new((0, false)),
             vsock: Some(vsock.clone()),
             reclaiming: Arc::new(AtomicBool::new(false)),
             level: AtomicU32::new(Pressure::Normal as u32),
@@ -259,7 +252,6 @@ impl MemoryPolicy {
                                 (u64::from(cap_pages(steering.level.load(Ordering::Relaxed), steering.total_bytes())) * BALLOON_PAGE_SIZE) >> 20
                             );
                         }
-                        steering.resize_again();
                         let Some(now) = host.sample() else { continue };
                         steering.observe(&now);
                         if let Some(then) = last {
@@ -277,39 +269,9 @@ impl MemoryPolicy {
         })
     }
 
-    /// A handle for the moment before a container starts.
-    pub fn whole(&self) -> MakeWhole {
-        MakeWhole(self.steering.clone())
-    }
-
     /// The last level the host reported. Diagnostics.
     pub fn level(&self) -> u32 {
         self.steering.level.load(Ordering::Relaxed)
-    }
-}
-
-/// Makes the guest whole before a container starts: the balloon is let go
-/// and the range goes in, and the call waits for the range
-/// (`MemControl::plug_all`). What runs in a container sizes itself from
-/// `MemTotal` as it comes up and can take memory faster than the guest
-/// could ask for more, so the range is in before dockerd sees the request.
-#[derive(Clone)]
-pub struct MakeWhole(Arc<Steering>);
-
-impl MakeWhole {
-    pub fn call(&self) -> std::io::Result<()> {
-        let Some(mem) = &self.0.mem else {
-            return Ok(());
-        };
-        // Backing preparation has its own bounded wait. Do not consume the
-        // guest's plug deadline while the host is still creating that backing.
-        mem.wait_for_backing()?;
-        if mem.state().plugged_bytes() == mem.state().region_bytes() {
-            return Ok(());
-        }
-        self.0.guest_offers(0, true);
-        mem.plug_all();
-        Ok(())
     }
 }
 
@@ -342,8 +304,6 @@ struct CompressionState {
     /// While the balloon is short of its target: what it held, and when it
     /// last grew.
     inflation: Option<(u32, Instant)>,
-    /// What the guest had at the last poll: a shrink clamps the ramp.
-    last_total: u64,
     /// Polls in a row with the host compressing nothing. A level change
     /// restarts it: a level that just dropped gets a few seconds' grace
     /// before the ramp eases, so a host flapping between Warn and Normal
@@ -392,16 +352,8 @@ impl CompressionState {
 struct Steering {
     balloon: Arc<BalloonState>,
     transport: Arc<Mutex<VirtioMmio>>,
-    /// What the guest booted with: the base beside its range.
+    /// What the guest has: its whole RAM, one zone (0.7.2).
     ram_bytes: u64,
-    /// The range, when there is one. The guest's size is then the host's
-    /// to set, and the guest's offers move it rather than the balloon.
-    mem: Option<MemControl>,
-    /// The guest's last line, kept because a line that arrived during the
-    /// hold after a growth is still the guest's position once the hold
-    /// ends, and an idle guest sends nothing new: the policy's loop asks
-    /// again (`resize_again`).
-    last_line: Mutex<(u64, bool)>,
     /// The way to the guest's agent, for a reclaim request ahead of the
     /// balloon; none in the tests.
     vsock: Option<Arc<crate::virtio::vsock::VsockShared>>,
@@ -418,61 +370,9 @@ struct Steering {
 }
 
 impl Steering {
-    /// What the guest has right now, which is what the fractions are of.
+    /// What the guest has, which is what the fractions are of.
     fn total_bytes(&self) -> u64 {
-        self.mem
-            .as_ref()
-            .map_or(self.ram_bytes, |m| m.state().total_bytes())
-    }
-
-    /// The guest's memory line, with a range to size: `need` (work is short
-    /// of memory) doubles what the guest has, up to the range, in one offer
-    /// — a plug lands in tens of milliseconds and the next line says
-    /// whether it was enough; a spare of a block or more, made only once
-    /// the guest has been quiet, takes that many blocks back, and the
-    /// guest migrates what was in them into what it keeps. Nothing moves
-    /// while the guest is still plugging or unplugging the last offer, so
-    /// the next line is measured against memory the guest actually has.
-    ///
-    /// A shrink only with no container running. A process already in a
-    /// container can take memory faster than any line can ask for it — a
-    /// tmpfs writer took a 3 GiB base in 140 ms, and the kernel could not
-    /// then find the pages to add more — so while a container exists the
-    /// guest keeps its whole size, as it always had, and the range is for
-    /// the machine that is running nothing.
-    ///
-    /// Returns whether the line was taken as a resize; a line that was not
-    /// goes to the balloon, which takes what the range cannot: the base's
-    /// free pages, fragmented by what ran, a host page at a time.
-    fn guest_sizes(&self, spare_mib: u64, need: bool, nothing_runs: bool) -> bool {
-        let Some(mem) = &self.mem else { return false };
-        *self.last_line.lock().expect("last line poisoned") = (spare_mib, nothing_runs);
-        let state = mem.state();
-        let (plugged, requested) = (state.plugged_bytes(), state.requested_bytes());
-        if need {
-            // Not while a plug is in flight: the next line says whether the
-            // last doubling was enough.
-            if requested > plugged {
-                return true;
-            }
-            let target = plugged
-                .saturating_add(state.total_bytes().max(GROW_STEP_MIN))
-                .min(state.region_bytes());
-            if target > plugged {
-                mem.request(target);
-            }
-            return true;
-        }
-        if nothing_runs && plugged > 0 && spare_mib << 20 >= BLOCK_SIZE && !mem.held() {
-            // A lower offer during an unplug only extends it, so an unplug
-            // the driver could not finish does not stop the next.
-            let target = plugged.min(requested).saturating_sub(spare_mib << 20);
-            if target < requested {
-                mem.request(target);
-            }
-            return true;
-        }
-        false
+        self.ram_bytes
     }
 
     /// The poll, with what the host compressed since the last one: the
@@ -486,8 +386,6 @@ impl Steering {
                 .expect("compression policy poisoned");
             let now = Instant::now();
             let total = self.total_bytes();
-            let shrunk = total < state.last_total;
-            state.last_total = total;
             state.quiet_polls = if compressed == 0 {
                 state.quiet_polls.saturating_add(1)
             } else {
@@ -517,14 +415,7 @@ impl Steering {
                 }
             } else if !state.held(now) {
                 let before = state.pages;
-                state.pages = steer(
-                    state.pages,
-                    compressed,
-                    state.quiet_polls,
-                    total,
-                    level,
-                    shrunk,
-                );
+                state.pages = steer(state.pages, compressed, state.quiet_polls, total, level);
                 // Cooperative first: a step up under pressure is asked of
                 // the guest as a reclaim of the same amount from the
                 // containers' cgroup, coldest cache first, before the
@@ -773,38 +664,6 @@ impl Steering {
         }
     }
 
-    /// Whether there is no range, or none of it is plugged.
-    fn range_out(&self) -> bool {
-        self.mem
-            .as_ref()
-            .is_none_or(|m| m.state().plugged_bytes() == 0)
-    }
-
-    /// The guest's last line, applied again: for the shrink a hold deferred.
-    fn resize_again(&self) {
-        // An unplug the driver has not finished in a minute is one it cannot
-        // finish — a block holding a page that will not move — and it keeps
-        // trying, at a cost in CPU. The offer goes back up to what is
-        // plugged, and the block stays until the next shrink asks again.
-        if let Some(mem) = &self.mem
-            && mem.stuck()
-        {
-            let plugged = mem.state().plugged_bytes();
-            tracing::info!(
-                plugged_mib = plugged >> 20,
-                "virtio-mem: an unplug the guest could not finish; keeping the block"
-            );
-            mem.request(plugged);
-            return;
-        }
-        if self.mem.as_ref().is_some_and(|m| !m.held()) {
-            let (spare_mib, nothing_runs) = *self.last_line.lock().expect("last line poisoned");
-            if nothing_runs && spare_mib > 0 {
-                let _ = self.guest_sizes(spare_mib, false, nothing_runs);
-            }
-        }
-    }
-
     fn apply(&self) {
         let _apply = self
             .apply_lock
@@ -948,8 +807,7 @@ fn memory_guest(
                             };
                             let spare_mib = u64::from(word(0));
                             let flags = word(12);
-                            let (release, need, nothing_runs) =
-                                (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+                            let (release, need) = (flags & 1 != 0, flags & 2 != 0);
                             // Pressure stall information, hundredths of a
                             // percent of the last ten seconds: `some` is the
                             // guest's own reason for a need; `full` paces how
@@ -958,20 +816,9 @@ fn memory_guest(
                             // The line drives the ramp and, when the guest
                             // has memory to spare, the balloon's own offer.
                             steering.guest_demand(need, release);
-                            // With a range, a line sizes the range first;
-                            // what it does not take (a release, or an offer
-                            // once the range is out) goes to the balloon.
-                            // The balloon's units move since 0.7.2, so one
-                            // inflated into a movable block no longer pins
-                            // that block in; the offer still waits for the
-                            // range to be out, because the range is the
-                            // idle guest's first way of giving memory back
-                            // and the balloon its second.
-                            let taken =
-                                steering.guest_sizes(spare_mib, release || need, nothing_runs);
                             if release || need {
                                 steering.guest_offers(0, true);
-                            } else if !taken && steering.range_out() {
+                            } else {
                                 steering.guest_offers(spare_mib, false);
                             }
                         }
@@ -1019,18 +866,9 @@ fn cap_pages(level: u32, total_bytes: u64) -> u32 {
 /// step once the host has been quiet for a few seconds with no pressure;
 /// nothing in between. A level that drops leaves the ramp where it is, above
 /// the new cap, to ease down: a target that fell to nothing had the guest
-/// refill what the host then compressed again. A guest that shrank (its
-/// range unplugged between polls) is the exception: a target sized for the
-/// old guest must not keep reclaiming from its small base, so it is clamped
-/// to the cap at once. Never past the guest's reserve.
-fn steer(
-    pages: u32,
-    compressed: u64,
-    quiet_for: u32,
-    total_bytes: u64,
-    level: u32,
-    shrunk: bool,
-) -> u32 {
+/// refill what the host then compressed again. Never past the guest's
+/// reserve.
+fn steer(pages: u32, compressed: u64, quiet_for: u32, total_bytes: u64, level: u32) -> u32 {
     let normal = level == Pressure::Normal as u32;
     let cap = cap_pages(level, total_bytes);
     let reserve = as_pages(total_bytes - total_bytes / GUEST_RESERVE_FRACTION);
@@ -1042,11 +880,7 @@ fn steer(
         }
         _ => small,
     };
-    let pages = if shrunk {
-        pages.min(cap)
-    } else {
-        pages.min(reserve)
-    };
+    let pages = pages.min(reserve);
     if !normal || compressed >= COMPRESSING_BYTES_PER_POLL {
         if pages >= cap {
             pages
@@ -1269,26 +1103,26 @@ mod tests {
     fn steering_steps_up_while_compressing_and_eases_when_quiet() {
         let total = 4 << 30;
         let cap = cap_pages(NORMAL, total);
-        let up = steer(0, 64 << 20, 0, total, NORMAL, false);
+        let up = steer(0, 64 << 20, 0, total, NORMAL);
         assert_eq!(mib(up), 32);
         assert_eq!(
-            steer(up, 0, 2, total, NORMAL, false),
+            steer(up, 0, 2, total, NORMAL),
             up,
             "quiet but not for long: held"
         );
         assert_eq!(
-            steer(up, 1 << 20, 0, total, NORMAL, false),
+            steer(up, 1 << 20, 0, total, NORMAL),
             up,
             "a trickle, so no quiet yet: held"
         );
-        let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL, false);
+        let down = steer(up, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL);
         assert_eq!(mib(up - down), 32);
         assert_eq!(
-            steer(cap, 1 << 30, 0, total, NORMAL, false),
+            steer(cap, 1 << 30, 0, total, NORMAL),
             cap,
             "never past the cap"
         );
-        assert_eq!(steer(1, 0, 30, total, NORMAL, false), 0, "never below zero");
+        assert_eq!(steer(1, 0, 30, total, NORMAL), 0, "never below zero");
     }
 
     #[test]
@@ -1297,15 +1131,15 @@ mod tests {
             let total = gib << 30;
             let mut pages = 0;
             for _ in 0..32 {
-                pages = steer(pages, 64 << 20, 0, total, NORMAL, false);
+                pages = steer(pages, 64 << 20, 0, total, NORMAL);
             }
             assert_eq!(u64::from(pages) * BALLOON_PAGE_SIZE, total / 8);
             for _ in 0..32 {
-                pages = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL, false);
+                pages = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL);
             }
             assert_eq!(pages, 0);
         }
-        assert_eq!(mib(steer(0, 64 << 20, 0, 24 << 30, NORMAL, false)), 96);
+        assert_eq!(mib(steer(0, 64 << 20, 0, 24 << 30, NORMAL)), 96);
     }
 
     /// A level raises the cap and the step: a quarter of the guest within
@@ -1317,18 +1151,14 @@ mod tests {
             let mut pages = 0;
             let mut polls = 0;
             while u64::from(pages) * BALLOON_PAGE_SIZE < total / share {
-                pages = steer(pages, 0, 0, total, level, false);
+                pages = steer(pages, 0, 0, total, level);
                 polls += 1;
                 assert!(polls <= 8, "reached in eight polls, not {polls}");
             }
             assert_eq!(u64::from(pages) * BALLOON_PAGE_SIZE, total / share);
+            assert_eq!(steer(pages, 0, 0, total, level), pages, "and no further");
             assert_eq!(
-                steer(pages, 0, 0, total, level, false),
-                pages,
-                "and no further"
-            );
-            assert_eq!(
-                steer(pages, 0, 30, total, level, false),
+                steer(pages, 0, 30, total, level),
                 pages,
                 "a quiet host under pressure does not ease"
             );
@@ -1344,36 +1174,18 @@ mod tests {
         let total: u64 = 16 << 30;
         let mut pages = 0;
         for _ in 0..8 {
-            pages = steer(pages, 0, 0, total, WARN, false);
+            pages = steer(pages, 0, 0, total, WARN);
         }
         assert_eq!(mib(pages), 4096);
-        let held = steer(pages, 0, 0, total, NORMAL, false);
+        let held = steer(pages, 0, 0, total, NORMAL);
         assert_eq!(held, pages, "Normal, not quiet yet: nothing moves");
         assert_eq!(
-            steer(pages, 64 << 20, 0, total, NORMAL, false),
+            steer(pages, 64 << 20, 0, total, NORMAL),
             pages,
             "compressing above the Normal cap: no step up, no step down"
         );
-        let eased = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL, false);
+        let eased = steer(pages, 0, QUIET_POLLS_BEFORE_DEFLATE, total, NORMAL);
         assert_eq!(mib(pages - eased), 64, "a 256th of 16 GiB");
-    }
-
-    /// The exception: a guest whose range unplugged between polls is clamped
-    /// to the cap at once, so a target sized for the old guest does not keep
-    /// reclaiming from its small base. Never past the guest's reserve either.
-    #[test]
-    fn a_shrunk_guest_clamps_the_ramp_to_its_cap() {
-        let old_target = as_pages(3 << 30);
-        assert_eq!(mib(steer(old_target, 0, 1, 6 << 30, NORMAL, true)), 768);
-        assert_eq!(mib(steer(old_target, 0, 1, 6 << 30, WARN, true)), 1536);
-        assert_eq!(steer(u32::MAX, u64::MAX, 0, 0, NORMAL, true), 0);
-        // Not shrunk: a level drop keeps the target, the reserve bounds it.
-        assert_eq!(mib(steer(old_target, 0, 1, 6 << 30, NORMAL, false)), 3072);
-        assert_eq!(
-            mib(steer(u32::MAX, 0, 1, 4 << 30, NORMAL, false)),
-            4096 - 256,
-            "the guest keeps a sixteenth"
-        );
     }
 
     fn steering_for_tests(ram_bytes: u64) -> (Steering, Arc<Mutex<VirtioMmio>>) {
@@ -1391,8 +1203,6 @@ mod tests {
             balloon,
             transport: transport.clone(),
             ram_bytes,
-            mem: None,
-            last_line: Mutex::new((0, false)),
             vsock: None,
             reclaiming: Arc::new(AtomicBool::new(false)),
             level: AtomicU32::new(NORMAL),
@@ -1442,10 +1252,10 @@ mod tests {
     /// shrank between polls sees its target clamped without a new pressure
     /// event.
     #[test]
-    fn the_ramp_reaches_the_device_and_a_shrink_clamps_it() {
+    fn the_ramp_reaches_the_device() {
         use crate::bus::MmioDevice;
 
-        let (mut steering, transport) = steering_for_tests(24 << 30);
+        let (steering, transport) = steering_for_tests(24 << 30);
         healthy(&steering);
         pressure(&steering, Pressure::Warn);
         assert_eq!(
@@ -1455,25 +1265,10 @@ mod tests {
         );
         polls(&steering, 8);
         assert_eq!(target_mib(&transport), 6144);
-        // The range comes out: 24 GiB to its 6 GiB base between two polls.
-        steering.ram_bytes = 6 << 30;
-        steering.steer(0);
-        assert_eq!(
-            target_mib(&transport),
-            1536,
-            "clamped to a quarter of what is left"
-        );
-        steering.ram_bytes = 24 << 30;
-        steering.steer(0);
-        assert_eq!(
-            target_mib(&transport),
-            1536 + 768,
-            "grown again: one step up from there"
-        );
         let mut generation = [0; 4];
         transport.lock().unwrap().read(0xfc, &mut generation);
         assert!(
-            u32::from_le_bytes(generation) >= 10,
+            u32::from_le_bytes(generation) >= 8,
             "each change notified the guest"
         );
     }

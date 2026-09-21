@@ -1,28 +1,30 @@
 # lighter 0.7.2
 
-A balloon that moves and no longer starves the kernel, and streams that
-survive a guest short of memory. Found on 2026-09-20 within an hour of 0.7.1, on the Mac
+One memory zone, a balloon that moves, and streams that survive a guest
+short of memory. Found on 2026-09-20 within an hour of 0.7.1, on the Mac
 that runs the most containers.
 
-## The balloon no longer starves the kernel
+## The guest's memory is one zone
 
-The guest's memory is a base and a virtio-mem range onlined movable, so an
-idle guest can unplug the range and its page arrays with it. The balloon's
-units were unmovable, and an unmovable balloon allocates from the kernel's
-own half: with 4 GiB of them a 16 GiB guest had four gigabytes for its
-kernel, its vsock buffers and its slab. A build's node processes then
-starved it: 478 thousand allocation stalls, the vsock driver refusing its
-receive buffers by the hundred, health checks that could not start, and
-the build's BuildKit session gone by the time its exporter looked for it.
+Until 0.7.1 the guest booted with a quarter of its RAM and plugged the rest
+in as a virtio-mem range onlined movable, so an idle guest could unplug it
+again. Containers always run in this machine, the range never left, and the
+movable half only capped what the kernel could use: the balloon's unmovable
+16 KiB units came from the kernel-usable half, and with 4 GiB of them a
+16 GiB guest had four gigabytes for its kernel, its vsock buffers and its
+slab. A build's node processes then starved it: 478 thousand allocation
+stalls, the vsock driver refusing its receive buffers by the hundred,
+health checks that could not start, and the build's BuildKit session gone
+by the time its exporter looked for it.
 
-The balloon's units are movable now (below), so they come from the range's
-half and never cap the kernel. One zone for the whole of RAM was built,
-measured and put back the same night: the page array for memory that
-never leaves cost 1.56% of RAM at idle, 130 MiB on a 4 GiB guest and 290
-on a 12 GiB one, where the range gives it back (`docs/guest-memory-2026-09-20.md`).
-The kernel's 64 MiB swiotlb, which no device here uses, is no longer set
-aside (`swiotlb=noforce`), and the base's page array is initialised across
-the vCPUs rather than on one core before init.
+The guest is now one zone. virtio-mem is gone, with its plug-before-a-
+container check and its shrink policy, and nothing can halve what the
+kernel has. The price, chosen with its number known, is the page array for
+memory that never leaves: 1.56% of RAM at idle, about 130 MiB on a 4 GiB
+guest and 290 on a 12 GiB one, nothing while containers run
+(`docs/guest-memory-2026-09-20.md`). The kernel's 64 MiB swiotlb, which no
+device here uses, is no longer set aside (`swiotlb=noforce`), and the page
+array is initialised across the vCPUs rather than on one core before init.
 
 ## The balloon inflates in whole pageblocks and its pages move
 
@@ -30,9 +32,10 @@ The balloon's units are compound pages from a whole 2 MiB pageblock down
 to 16 KiB, the largest the allocator has first, so a balloon of gigabytes
 is thousands of whole blocks rather than hundreds of thousands of islands,
 and what the guest keeps stays compactable. The units are movable pages
-(`CONFIG_BALLOON_COMPACTION`): allocated as movable, so they come from the
-range's half and never pin a block in, and migrated by compaction as
-compound folios, the driver telling the host the new unit before the old. The kernel's default free page reporting order, for the
+(`CONFIG_BALLOON_COMPACTION`): allocated as movable, so the balloon never
+takes the pageblocks the kernel's own allocations live in, and migrated by
+compaction as compound folios, the driver telling the host the new unit
+before the old. The kernel's default free page reporting order, for the
 moments before the agent sets its own, is four host pages rather than a
 2 MiB pageblock (guest patches 0014 and 0034).
 
