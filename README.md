@@ -187,7 +187,7 @@ docker run --rm --device lighter.sh/gpu=all alpine:edge sh -c \
 
 All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **618 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
+On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **604 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
@@ -334,7 +334,7 @@ OrbStack, Docker Desktop and Colima leave the Mac's GPU and Neural Engine inacce
 
 lighter exposes the Apple Silicon compute architecture to containers:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
-- **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 618 MiB (+20 MiB over the same guest without the servers).
+- **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 604 MiB (+20 MiB over the same guest without the servers).
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
 - **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`). If traffic pauses, polling drops back immediately to the resting floor within rounds, allowing resident containers (such as Frigate NVR or background speech-to-text) to run at 21–39% CPU during active detection rather than pinning a full host core.
 
