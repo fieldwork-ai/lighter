@@ -18,7 +18,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 - 🔄 **Drop-in Docker replacement:** Works immediately with your existing `docker`, `docker compose`, `kind`, and third-party developer tooling.
 - 🚀 **Full Apple Silicon acceleration:** Run local LLMs, PyTorch (MPS), and computer vision models directly on your Mac's GPU and Neural Engine.
 - ⚡ **Blistering performance:** Cold boots in 715 ms; host file mounts and builds run faster than native APFS.
-- 🪶 **Ultra-lightweight:** Idles at 618 MiB RAM (vs 3.5 GB for Docker Desktop) and surrenders memory back to macOS within seconds of a workload finishing.
+- 🪶 **Ultra-lightweight:** Idles at 604 MiB RAM (vs 3.5 GB for Docker Desktop) and surrenders memory back to macOS within seconds of a workload finishing.
 - 🆓 **100% Free & Open Source:** Dual-licensed MIT / Apache 2.0. No paid subscriptions, no commercial seat licenses, no telemetry, and zero GUI/Electron bloat.
 
 *Requires Apple Silicon and macOS 15+ (Sequoia, Tahoe).*
@@ -34,7 +34,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 | **Telemetry** | **Zero** | Yes | Yes | None |
 | **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
 | **Cold start (to container)** | **715 ms** | 1.4 s | 2.1 s | 9.0 s |
-| **Idle memory** | **618 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
+| **Idle memory** | **604 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
 | **Memory 15s after heavy build** | **1,745 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
 | **`npm ci` (own disk)** | **4.46 s** | 6.83 s | 7.96 s | 7.56 s |
 | **`npm ci` (host share)** | **6.42 s** | 8.53 s | N/A | 17.89 s |
@@ -224,10 +224,10 @@ macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Idle, a minute after start | **618 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
-| Peak through an npm install | **3971 MiB** | 5699 MiB | 10054 MiB | 7339 MiB |
-| 15 s after it ends | **842 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
-| 60 s after it ends | **847 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
+| Idle, a minute after start | **604 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
+| Peak through an npm install | **3852 MiB** | 5699 MiB | 10054 MiB | 7339 MiB |
+| 15 s after it ends | **1464 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
+| 60 s after it ends | **1391 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
 
 #### The network
 
@@ -299,7 +299,7 @@ Container writable layers and named volumes live on an internal virtual disk (`~
 ### 3. Cooperative memory management
 Virtual machines that hoard allocated RAM starve macOS and trigger disk swapping.
 - **One memory zone, demand-backed:** The guest owns all of its configured RAM from boot as ordinary memory, and the host prepares backing only for pages the guest touches. No hot-plugged range, no movable half: nothing can cap what the guest's kernel has, which is what starved a 16 GiB guest under a 4 GiB balloon before 0.7.2.
-- **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory sits at **618 MiB** on a 12 GiB guest (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB); 1.56% of that is the page array for the guest's whole RAM, the price of one memory zone whose kernel can use all of it. Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at **1,745 MiB** while OrbStack holds 2,776 MiB, Docker Desktop holds 7,276 MiB, and Colima holds 10,145 MiB.
+- **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory sits at **604 MiB** on a 12 GiB guest (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB); 1.56% of that is the page array for the guest's whole RAM, the price of one memory zone whose kernel can use all of it. Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at **1,745 MiB** while OrbStack holds 2,776 MiB, Docker Desktop holds 7,276 MiB, and Colima holds 10,145 MiB.
 - **Compressor-steered ballooning in whole pageblocks:** On memory-constrained Macs, macOS compresses memory before signaling out-of-memory pressure. lighter tracks host memory compression activity and swap against RAM: when macOS begins compressing heavily, lighter first asks the guest to reclaim its coldest container cache, then inflates the balloon in compound units from a whole 2 MiB pageblock down to 16 KiB, movable and migratable, so what the guest keeps stays compactable; it deflates down a paced ramp once compression subsides or the guest reports memory stalls.
 
 ### 4. The network as streams, not packets
