@@ -1,0 +1,41 @@
+mm/page_reporting: a lower reporting order requests a cycle
+
+Free page reporting learns of reportable pages one way: a page freed at or
+above the reporting order requests a cycle. Pages already free stay where
+they are until one does. Lowering `page_reporting_order` at runtime makes
+every free run between the old order and the new one reportable at a
+stroke, and nothing requests the cycle that would report them: on an idle
+guest whose agent had just moved the order from 128 KiB runs to 32 KiB
+after a trim, the fragments sat unreported through the minute the Mac was
+measured over (1872 MiB against 1349 with the order left at 32 KiB
+throughout, M5, 2026-09-21), until some later free happened to be large
+enough to ask.
+
+Setting the order requests a cycle. Before the device registers the request
+finds no device and does nothing, as every other notification does then.
+
+--- a/mm/page_reporting.c
++++ b/mm/page_reporting.c
+@@ -16,11 +16,21 @@ unsigned int page_reporting_order = -1;
+ 
+ static int page_order_update_notify(const char *val, const struct kernel_param *kp)
+ {
++	int err;
++
+ 	/*
+ 	 * If param is set beyond this limit, order is set to default
+ 	 * pageblock_order value
+ 	 */
+-	return  param_set_uint_minmax(val, kp, 0, MAX_PAGE_ORDER);
++	err = param_set_uint_minmax(val, kp, 0, MAX_PAGE_ORDER);
++	/* lighter: a lower order makes runs already on the free lists
++	 * reportable, and only a free at or above the order would ask for
++	 * the cycle that reports them. Ask here. Before a device registers
++	 * the request finds none and does nothing.
++	 */
++	if (!err)
++		__page_reporting_notify();
++	return err;
+ }
+ 
+ static const struct kernel_param_ops page_reporting_param_ops = {

@@ -117,7 +117,7 @@ files disposable: image extraction can charge those shared pages to the Docker
 engine rather than the container using them. Empty hierarchies receive cleanup
 passes after approximately three and eight seconds; free-page reporting and
 pressure recovery still operate while workloads run. Unknown population is
-handled conservatively as live work. Compaction gathers freed fragments into reportable runs, and reporting briefly uses its faster idle settings. New work restores the normal reporting rate. There is no default cache ceiling on running containers.
+handled conservatively as live work. Compaction gathers freed fragments into reportable runs, and reporting briefly uses its faster idle settings: 128 KiB runs first for the bulk, then the rest order's 32 KiB for the fragments (lowering the order requests the cycle, guest patch 0035). New work restores the normal reporting rate. There is no default cache ceiling on running containers.
 
 Docker and containerd have OOM protection so a full guest does not lose its engine. BuildKit launches use a runtime wrapper that resets the inherited OOM score before executing runc: the build competes with ordinary containers at score adjustment zero. Without that boundary, an oversized build inherited the daemon's -900 adjustment and Linux killed small application containers instead. The Docker hardware gate checks both worker and daemon scores.
 

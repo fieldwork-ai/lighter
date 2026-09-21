@@ -313,6 +313,10 @@ fn bound_container_cache() {
     // with reporting at 100 ms and compaction at full strength until its
     // next container.
     let mut hurried = always_fast;
+    // The tick at which a trim's burst moves from the bulk to the
+    // fragments: reporting hurried at order 5 first, then at the rest
+    // order. Zero while no burst is in its first phase.
+    let mut fragments_at = 0u32;
     // Quarter-second ticks: the offer to the host waits for two seconds of
     // idle, and a one-second tick put the first offer three seconds after
     // the last container stopped — past the moment anything looking at the
@@ -374,7 +378,17 @@ fn bound_container_cache() {
         {
             set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
             hurried = false;
+            fragments_at = 0;
             at_rest = !heavy;
+        } else if hurried && fragments_at != 0 && idle_trim.elapsed_ticks() >= fragments_at {
+            // The burst's second phase: the bulk is back, the fragments go
+            // at the same pace at the rest order. Lowering the order is
+            // what asks the kernel to report runs already free (patch
+            // 0035); at the rest pace they would wait for the next free
+            // large enough to ask, which on an idle guest was longer than
+            // the minute the Mac is measured over.
+            set_reporting(100, rest_order);
+            fragments_at = 0;
         }
         // The rest order only at rest. Reporting 128 KiB runs while an
         // install runs is a treadmill: every two seconds it hands back what
@@ -499,14 +513,19 @@ fn bound_container_cache() {
         // eighth of RAM — is reporting's: hurried for a while and compacted
         // into reportable runs, as before the balloon. On a 4 GiB guest the
         // reserve alone read 600 MB more at a minute without this.
-        // The burst after a trim reports at order 5 whatever the rest order:
-        // at 3 the walk over a 12 GiB guest's free lists was still under way
-        // fifteen seconds after an install (3803 MiB against 1745 on the M5,
-        // 2026-09-21), where 5 has the bulk back in seconds and the rest
-        // order then takes the fragments once the burst is over.
+        // The burst after a trim reports at order 5 first whatever the rest
+        // order: at 3 the walk over a 12 GiB guest's free lists was still
+        // under way fifteen seconds after an install (3803 MiB against 1745
+        // on the M5, 2026-09-21: four reports for every one at 5, each a
+        // round trip to the host), where 5 has the bulk back in seconds.
+        // Four seconds of ticks later the fragments go at the rest order,
+        // still hurried (the second phase above): left to the rest pace they
+        // read 1872 MiB a minute after the install against 1349 with the
+        // whole burst at 3.
         if !memory_policy::populated(std::path::Path::new(containers)) {
             set_reporting(100, 5);
             hurried = true;
+            fragments_at = idle_trim.elapsed_ticks() + 4 * TICKS_PER_SEC;
             compact_until_reportable();
         }
     }

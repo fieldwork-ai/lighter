@@ -107,6 +107,16 @@ The driver's part is to tell the host in units and keep its accounting in
 each page's order. Patch 0034 makes the kernel's default reporting order four host pages, for
 the moments before the agent sets its own.
 
+The agent's rest order is 3 (32 KiB) since 0.7.2, 5 before: with one zone nothing unplugs the
+fragments an install leaves, and reporting them at 128 KiB left 150 MiB more on the M1 and
+50–90 on the M5 a minute after a build than at 32 KiB (six runs each). The burst after a trim
+is in two phases: order 5 for the bulk (at 3 the walk was still under way fifteen seconds after
+the install, four reports for every one at 5, each a round trip to the host), then the rest
+order for the fragments. Stock page reporting learns of reportable pages only from a free at or
+above the order, so lowering the order at runtime left the fragments unreported through the
+minute measured (1872 MiB against 1349 on the M5); patch 0035 has the order's setter request a
+cycle.
+
 ## The policy
 
 A guest that reports short comes down the paced release ramp at any level

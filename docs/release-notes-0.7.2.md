@@ -37,7 +37,13 @@ takes the pageblocks the kernel's own allocations live in, and migrated by
 compaction as compound folios, the driver telling the host the new unit
 before the old. The kernel's default free page reporting order, for the
 moments before the agent sets its own, is four host pages rather than a
-2 MiB pageblock (guest patches 0014 and 0034).
+2 MiB pageblock (guest patches 0014 and 0034). At rest the agent reports
+runs of 32 KiB, two host pages, where 0.7.1 reported 128 KiB: with one
+zone nothing unplugs the fragments an install leaves. After a trim the
+burst runs at 128 KiB first, for the bulk, then at the rest order for the
+fragments; lowering the order is what asks the kernel to report runs
+already free (patch 0035), which stock Linux reports only when a later
+free happens to be large enough to ask.
 
 ## Streams survive a guest short of memory
 
