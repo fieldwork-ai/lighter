@@ -1,113 +1,246 @@
+From: lighter <build@invalid>
+Subject: virtio_balloon: compound units from the largest aligned order down to a host page, movable and migratable
+
+The balloon inflates in compound units, never in single pages. On Apple
+silicon the host page is 16 KiB and the guest's is 4 KiB, and a balloon that
+hands back single guest pages hands back almost nothing the host can
+release: only an aligned run of four is a host page, and a fragmented guest
+yields few. Measured: three quarters of a gigabyte inflated, the host's
+footprint unmoved, the guest's cache gone. So the smallest unit is an
+order-2 compound page, sixteen aligned kilobytes, always releasable.
+
+Since 0.7.2 the largest unit is tried first: a whole pageblock (order 9,
+2 MiB), the order halving until the allocator gives one, down to 2. A
+balloon of four gigabytes is then a couple of thousand whole pageblocks
+rather than a quarter million 16 KiB islands, so what the guest keeps
+stays compactable and reportable, and the host releases long aligned runs.
+
+And the units are movable pages (CONFIG_BALLOON_COMPACTION): allocated
+from ZONE_MOVABLE, so the balloon never takes the kernel's own zones, and
+migrated by compaction as compound folios. Until 0.7.1 the units were
+unmovable and came from the kernel-usable zones; with a 4 GiB balloon in
+them a 16 GiB guest had four gigabytes for its kernel, its vsock buffers
+and its slab, and stalled (the M5, 2026-09-20: 478k allocation stalls,
+the docker socket's stream lost, a build's session with it). Linux 6.18's
+migration already isolates a compound movable_ops page by its head,
+allocates the destination at the source's order and hands both heads to
+the driver; the driver's part is to tell the host in units and to keep
+its accounting in units of whatever order each page is. The pfn array is
+4096 frames, eight 2 MiB units a round trip: each request is a virtqueue
+round trip (a kick, the host releasing the runs, a completion), and at the
+stock 256 frames inflation ran at about two gigabytes a second, the
+difference between a guest that returns seven gigabytes in four seconds
+and one that does it in one (formerly patch 0022).
+
+---
 --- a/drivers/virtio/virtio_balloon.c
 +++ b/drivers/virtio/virtio_balloon.c
-@@ -25,6 +25,20 @@
+@@ -25,7 +25,38 @@
   * page units.
   */
  #define VIRTIO_BALLOON_PAGES_PER_PAGE (unsigned int)(PAGE_SIZE >> VIRTIO_BALLOON_PFN_SHIFT)
+-#define VIRTIO_BALLOON_ARRAY_PFNS_MAX 256
 +/*
-+ * lighter: the balloon inflates in units of a host page. On Apple silicon
-+ * the host page is 16 KiB and the guest's is 4 KiB, and a balloon that
-+ * hands back single guest pages hands back almost nothing the host can
-+ * release: only an aligned run of four is a host page, and a fragmented
-+ * guest yields few. Measured: three quarters of a gigabyte inflated, the
-+ * host's footprint unmoved, the guest's cache gone. So each unit is an
-+ * order-2 compound page — sixteen aligned kilobytes, always releasable —
-+ * and the balloon's accounting stays in 4 KiB pfns as the device expects.
-+ * Balloon page migration is off in this kernel; a compound page does not
-+ * migrate through the single-page path.
++ * lighter: the balloon inflates in compound units, never in single pages.
++ * On Apple silicon the host page is 16 KiB and the guest's is 4 KiB, and a
++ * balloon that hands back single guest pages hands back almost nothing the
++ * host can release: only an aligned run of four is a host page, and a
++ * fragmented guest yields few (measured: three quarters of a gigabyte
++ * inflated, the host's footprint unmoved, the guest's cache gone). So the
++ * smallest unit is an order-2 compound page, sixteen aligned kilobytes,
++ * always releasable.
++ *
++ * And the largest unit is tried first: a whole pageblock (order 9, 2 MiB),
++ * the order halving until the allocator gives one, down to 2. A balloon of
++ * four gigabytes is then a couple of thousand whole pageblocks rather than
++ * a quarter million 16 KiB islands, so what the guest keeps stays
++ * compactable and reportable, and the host releases long aligned runs.
++ *
++ * Units are movable pages (CONFIG_BALLOON_COMPACTION): allocated from
++ * ZONE_MOVABLE, so the balloon never takes the kernel's own zones — with a
++ * 4 GiB balloon in them a 16 GiB guest stalled on the M5 (2026-09-20) —
++ * and migrated by compaction as compound folios. The kernel's migration
++ * allocates the destination at the source's order and hands both heads to
++ * migratepage below, which tells the host in units; a unit at the
++ * pageblock order is never a compaction candidate, since it already is
++ * what compaction makes. The balloon's accounting stays in 4 KiB pfns as
++ * the device expects, a unit's pfns are told to the host together, and
++ * the array holds eight pageblocks a round trip (measured: at 256 pfns
++ * inflation ran at two gigabytes a second, a round trip per megabyte).
 + */
-+#define VIRTIO_BALLOON_UNIT_ORDER 2
-+#define VIRTIO_BALLOON_PFNS_PER_UNIT (VIRTIO_BALLOON_PAGES_PER_PAGE << VIRTIO_BALLOON_UNIT_ORDER)
- #define VIRTIO_BALLOON_ARRAY_PFNS_MAX 256
++#define VIRTIO_BALLOON_UNIT_MIN_ORDER 2
++#define VIRTIO_BALLOON_UNIT_MAX_ORDER 9
++#define VIRTIO_BALLOON_PFNS_PER_MIN_UNIT (VIRTIO_BALLOON_PAGES_PER_PAGE << VIRTIO_BALLOON_UNIT_MIN_ORDER)
++#define VIRTIO_BALLOON_ARRAY_PFNS_MAX 4096
  /* Maximum number of (4k) pages to deflate on OOM notifications. */
  #define VIRTIO_BALLOON_OOM_NR_PAGES 256
-@@ -228,13 +242,13 @@
+ #define VIRTIO_BALLOON_OOM_NOTIFY_PRIORITY 80
+@@ -143,6 +172,12 @@
+ 	return pfn * VIRTIO_BALLOON_PAGES_PER_PAGE;
+ }
+ 
++/* lighter: the balloon pfns one compound unit spans. */
++static unsigned int unit_pfns(struct page *page)
++{
++	return VIRTIO_BALLOON_PAGES_PER_PAGE << compound_order(page);
++}
++
+ static void start_wakeup_event(struct virtio_balloon *vb, u32 mask)
+ {
+ 	unsigned long flags;
+@@ -228,13 +263,14 @@
  {
  	unsigned int i;
  
 -	BUILD_BUG_ON(VIRTIO_BALLOON_PAGES_PER_PAGE > VIRTIO_BALLOON_ARRAY_PFNS_MAX);
-+	BUILD_BUG_ON(VIRTIO_BALLOON_PFNS_PER_UNIT > VIRTIO_BALLOON_ARRAY_PFNS_MAX);
++	BUILD_BUG_ON((VIRTIO_BALLOON_PAGES_PER_PAGE << VIRTIO_BALLOON_UNIT_MAX_ORDER) >
++		     VIRTIO_BALLOON_ARRAY_PFNS_MAX);
  
  	/*
  	 * Set balloon pfns pointing at this page.
  	 * Note that the first pfn points at start of the page.
  	 */
 -	for (i = 0; i < VIRTIO_BALLOON_PAGES_PER_PAGE; i++)
-+	for (i = 0; i < VIRTIO_BALLOON_PFNS_PER_UNIT; i++)
++	for (i = 0; i < unit_pfns(page); i++)
  		pfns[i] = cpu_to_virtio32(vb->vdev,
  					  page_to_balloon_pfn(page) + i);
  }
-@@ -250,13 +264,16 @@
+@@ -246,23 +282,36 @@
+ 	struct page *page;
+ 	LIST_HEAD(pages);
+ 
++	unsigned int order = VIRTIO_BALLOON_UNIT_MAX_ORDER;
++
+ 	/* We can only do one array worth at a time. */
  	num = min(num, ARRAY_SIZE(vb->pfns));
  
- 	for (num_pfns = 0; num_pfns < num;
+-	for (num_pfns = 0; num_pfns < num;
 -	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
 -		page = balloon_page_alloc();
-+	     num_pfns += VIRTIO_BALLOON_PFNS_PER_UNIT) {
++	for (num_pfns = 0; num_pfns < num;) {
++		/* The largest unit that fits what is still asked for. */
++		while (order > VIRTIO_BALLOON_UNIT_MIN_ORDER &&
++		       (VIRTIO_BALLOON_PAGES_PER_PAGE << order) > num - num_pfns)
++			order--;
 +		page = alloc_pages(balloon_mapping_gfp_mask() |
 +				   __GFP_NOMEMALLOC | __GFP_NORETRY |
-+				   __GFP_NOWARN | __GFP_COMP,
-+				   VIRTIO_BALLOON_UNIT_ORDER);
++				   __GFP_NOWARN | __GFP_COMP, order);
  
  		if (!page) {
++			/* Nothing that large is free: a smaller unit, then. */
++			if (order > VIRTIO_BALLOON_UNIT_MIN_ORDER) {
++				order--;
++				continue;
++			}
  			dev_info_ratelimited(&vb->vdev->dev,
  					     "Out of puff! Can't get %u pages\n",
 -					     VIRTIO_BALLOON_PAGES_PER_PAGE);
-+					     VIRTIO_BALLOON_PFNS_PER_UNIT);
++					     VIRTIO_BALLOON_PFNS_PER_MIN_UNIT);
  			/* Sleep for at least 1/5 of a second before retry. */
  			msleep(200);
  			break;
-@@ -273,11 +290,12 @@
+ 		}
+ 
+ 		balloon_page_push(&pages, page);
++		num_pfns += unit_pfns(page);
+ 	}
+ 
+ 	mutex_lock(&vb->balloon_lock);
+@@ -273,11 +322,12 @@
  		balloon_page_enqueue(&vb->vb_dev_info, page);
  
  		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
 -		vb->num_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
-+		vb->num_pages += VIRTIO_BALLOON_PFNS_PER_UNIT;
++		vb->num_pages += unit_pfns(page);
  		if (!virtio_has_feature(vb->vdev,
  					VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
 -			adjust_managed_page_count(page, -1);
 -		vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE;
 +			adjust_managed_page_count(page,
-+						  -(1 << VIRTIO_BALLOON_UNIT_ORDER));
-+		vb->num_pfns += VIRTIO_BALLOON_PFNS_PER_UNIT;
++						  -(1 << compound_order(page)));
++		vb->num_pfns += unit_pfns(page);
  	}
  
  	num_allocated_pages = vb->num_pfns;
-@@ -297,9 +315,10 @@
+@@ -297,9 +347,10 @@
  	list_for_each_entry_safe(page, next, pages, lru) {
  		if (!virtio_has_feature(vb->vdev,
  					VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
 -			adjust_managed_page_count(page, 1);
 +			adjust_managed_page_count(page,
-+						  1 << VIRTIO_BALLOON_UNIT_ORDER);
++						  1 << compound_order(page));
  		list_del(&page->lru);
 -		put_page(page); /* balloon reference */
 +		put_page(page); /* balloon reference; the whole compound unit */
  	}
  }
  
-@@ -317,13 +336,13 @@
+@@ -316,14 +367,19 @@
+ 	mutex_lock(&vb->balloon_lock);
  	/* We can't release more pages than taken */
  	num = min(num, (size_t)vb->num_pages);
- 	for (vb->num_pfns = 0; vb->num_pfns < num;
+-	for (vb->num_pfns = 0; vb->num_pfns < num;
 -	     vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
-+	     vb->num_pfns += VIRTIO_BALLOON_PFNS_PER_UNIT) {
++	for (vb->num_pfns = 0; vb->num_pfns < num;) {
  		page = balloon_page_dequeue(vb_dev_info);
  		if (!page)
  			break;
++		/* A unit larger than the array has left: back it goes. */
++		if (vb->num_pfns + unit_pfns(page) > ARRAY_SIZE(vb->pfns)) {
++			balloon_page_enqueue(vb_dev_info, page);
++			break;
++		}
  		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
  		list_add(&page->lru, &pages);
 -		vb->num_pages -= VIRTIO_BALLOON_PAGES_PER_PAGE;
-+		vb->num_pages -= VIRTIO_BALLOON_PFNS_PER_UNIT;
++		vb->num_pages -= unit_pfns(page);
++		vb->num_pfns += unit_pfns(page);
  	}
  
  	num_freed_pages = vb->num_pfns;
-@@ -472,7 +491,7 @@
+@@ -472,7 +528,7 @@
  	 * Aligned up to guest page size to avoid inflating and deflating
  	 * balloon endlessly.
  	 */
 -	target = ALIGN(num_pages, VIRTIO_BALLOON_PAGES_PER_PAGE);
-+	target = ALIGN(num_pages, VIRTIO_BALLOON_PFNS_PER_UNIT);
++	target = ALIGN(num_pages, VIRTIO_BALLOON_PFNS_PER_MIN_UNIT);
  	return target - vb->num_pages;
  }
+ 
+@@ -837,6 +893,10 @@
+ 	 * recursion in the case it ends up triggering memory compaction
+ 	 * while it is attempting to inflate the ballon.
+ 	 */
++	/* lighter: the destination is allocated at the source's order. */
++	if (WARN_ON_ONCE(compound_order(newpage) != compound_order(page)))
++		return -EAGAIN;
++
+ 	if (!mutex_trylock(&vb->balloon_lock))
+ 		return -EAGAIN;
+ 
+@@ -849,8 +909,8 @@
+ 	  */
+ 	if (!virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM) &&
+ 	    page_zone(page) != page_zone(newpage)) {
+-		adjust_managed_page_count(page, 1);
+-		adjust_managed_page_count(newpage, -1);
++		adjust_managed_page_count(page, 1 << compound_order(page));
++		adjust_managed_page_count(newpage, -(1 << compound_order(newpage)));
+ 	}
+ 
+ 	/* balloon's page migration 1st step  -- inflate "newpage" */
+@@ -859,12 +919,12 @@
+ 	vb_dev_info->isolated_pages--;
+ 	__count_vm_event(BALLOON_MIGRATE);
+ 	spin_unlock_irqrestore(&vb_dev_info->pages_lock, flags);
+-	vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
++	vb->num_pfns = unit_pfns(newpage);
+ 	set_page_pfns(vb, vb->pfns, newpage);
+ 	tell_host(vb, vb->inflate_vq);
+ 
+ 	/* balloon's page migration 2nd step -- deflate "page" */
+-	vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
++	vb->num_pfns = unit_pfns(page);
+ 	set_page_pfns(vb, vb->pfns, page);
+ 	tell_host(vb, vb->deflate_vq);
  

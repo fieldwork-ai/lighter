@@ -23,6 +23,7 @@ mod udp_inbound;
 mod vsock;
 
 use std::io::{self, Read, Write};
+use std::time::{Duration, Instant};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
@@ -222,11 +223,7 @@ fn main() -> std::process::ExitCode {
 /// trimming waits for an empty container hierarchy: a quiet process can still
 /// need its executable and mapped files, including pages charged to the engine.
 fn bound_container_cache() {
-    let Some(mut total) = mem_total() else { return };
-    // With a virtio-mem range the guest's size is the host's to set, from
-    // the lines this loop sends: they go whatever the size, and `MemTotal`
-    // is read again each tick because it moves.
-    let dynamic = std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem").exists();
+    let Some(total) = mem_total() else { return };
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -276,9 +273,14 @@ fn bound_container_cache() {
     // 966–1033, both creeping the same 67 MB, which is the cache growing);
     // the install cases read level and the memory case 120 MiB lower at
     // rest. The hurried setting after a trim was already five.
+    // Three since 0.7.2, two host pages: with one memory zone nothing
+    // unplugs the fragments an install leaves, and reporting them at 128 KiB
+    // left 150 MiB more on the M1 and 50–90 on the M5 a minute after the
+    // build than at 32 KiB (six runs each, 2026-09-21); 16 KiB gained
+    // nothing further and reports twice as often.
     let rest_order = cmdline_value("lighter.reporting_order")
         .map(|o| o as u32)
-        .unwrap_or(5);
+        .unwrap_or(3);
     // The kernel's own order, two megabytes, while the containers work.
     const CHURN_ORDER: u32 = 9;
     // The rest settings from the start, not from the first trim: the kernel
@@ -302,7 +304,7 @@ fn bound_container_cache() {
     );
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
-    let mut last_offer: Option<[u8; 16]> = None;
+    let mut last_offer: Option<[u8; 32]> = None;
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
     // Whether a trim has left reporting hurried, so the restore below is a
@@ -311,6 +313,10 @@ fn bound_container_cache() {
     // with reporting at 100 ms and compaction at full strength until its
     // next container.
     let mut hurried = always_fast;
+    // The tick at which a trim's burst moves from the bulk to the
+    // fragments: reporting hurried at order 5 first, then at the rest
+    // order. Zero while no burst is in its first phase.
+    let mut fragments_at = 0u32;
     // Quarter-second ticks: the offer to the host waits for two seconds of
     // idle, and a one-second tick put the first offer three seconds after
     // the last container stopped — past the moment anything looking at the
@@ -346,9 +352,6 @@ fn bound_container_cache() {
                 idle::horizon_text(idle.horizon_secs())
             );
         }
-        if dynamic {
-            total = mem_total().unwrap_or(total);
-        }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
             // The engine's cache (image layers) bounded too, at an eighth of
@@ -375,7 +378,17 @@ fn bound_container_cache() {
         {
             set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
             hurried = false;
+            fragments_at = 0;
             at_rest = !heavy;
+        } else if hurried && fragments_at != 0 && idle_trim.elapsed_ticks() >= fragments_at {
+            // The burst's second phase: the bulk is back, the fragments go
+            // at the same pace at the rest order. Lowering the order is
+            // what asks the kernel to report runs already free (patch
+            // 0035); at the rest pace they would wait for the next free
+            // large enough to ask, which on an idle guest was longer than
+            // the minute the Mac is measured over.
+            set_reporting(100, rest_order);
+            fragments_at = 0;
         }
         // The rest order only at rest. Reporting 128 KiB runs while an
         // install runs is a treadmill: every two seconds it hands back what
@@ -436,28 +449,31 @@ fn bound_container_cache() {
         // alone: the peak 600 MB better, the minute reading 500 MB worse,
         // one install a tenth slower; the 16 GiB guest gains on every
         // reading. Below the line reporting and the trims are the policy.
-        if dynamic || total >= balloon_min {
+        // The line goes whatever the guest's size: need, release and the
+        // stall averages are the host's only word from inside, and a ramp
+        // that never hears "fine" never moves (m6, the M1, 2026-09-21).
+        // Only the offer of spare memory is for guests of eight gigabytes
+        // and up, where the balloon beat reporting alone.
+        {
             offer_memory(
                 &mut memory_stream,
                 &mut last_offer,
                 total,
+                // Offers of spare memory to the balloon from eight
+                // gigabytes up, where it beat reporting alone; the line
+                // itself goes at any size.
+                total >= balloon_min,
                 active,
                 // Quiet, or nothing running and the containers eight seconds
                 // idle: the quiet rule protects running work from a seesaw,
-                // and with no container there is none to protect — while the
-                // trims and compaction after an install kept the guest's CPU
-                // busy for most of a minute, and the range stayed in for it
-                // (the shrink came 47 s after a seven-second install). Eight
-                // rather than three: three is the benchmark's gap between
-                // two runs of an install, and a shrink that started in it
-                // had the next run begin as three gigabytes of its
-                // predecessor's cache were being unplugged (the M1's installs
-                // a fifth slower); eight is the second trim's moment, when
-                // the cache is already gone and the unplug is cheap.
+                // and with no container there is none to protect; eight is
+                // the second trim's moment, when the cache is already gone.
                 quiet_for >= 3 * TICKS_PER_SEC
                     || (!populated && idle_trim.elapsed_ticks() >= 8 * TICKS_PER_SEC),
                 !populated,
-                dynamic && quiet_for == 0,
+                // Busy: the guest's CPU was not quiet this tick. A need
+                // is work that is short, not a guest that is merely low.
+                quiet_for == 0,
             );
         }
         // Image extraction charges shared file pages to the engine. A running
@@ -497,9 +513,19 @@ fn bound_container_cache() {
         // eighth of RAM — is reporting's: hurried for a while and compacted
         // into reportable runs, as before the balloon. On a 4 GiB guest the
         // reserve alone read 600 MB more at a minute without this.
+        // The burst after a trim reports at order 5 first whatever the rest
+        // order: at 3 the walk over a 12 GiB guest's free lists was still
+        // under way fifteen seconds after an install (3803 MiB against 1745
+        // on the M5, 2026-09-21: four reports for every one at 5, each a
+        // round trip to the host), where 5 has the bulk back in seconds.
+        // Four seconds of ticks later the fragments go at the rest order,
+        // still hurried (the second phase above): left to the rest pace they
+        // read 1872 MiB a minute after the install against 1349 with the
+        // whole burst at 3.
         if !memory_policy::populated(std::path::Path::new(containers)) {
             set_reporting(100, 5);
             hurried = true;
+            fragments_at = idle_trim.elapsed_ticks() + 4 * TICKS_PER_SEC;
             compact_until_reportable();
         }
     }
@@ -532,8 +558,9 @@ fn guest_cpu_usec() -> u64 {
 /// wakeups a second for nothing. A reconnect resends.
 fn offer_memory(
     stream: &mut Option<OwnedFd>,
-    last: &mut Option<[u8; 16]>,
+    last: &mut Option<[u8; 32]>,
     total: u64,
+    offers: bool,
     active: bool,
     quiet: bool,
     nothing_runs: bool,
@@ -550,18 +577,19 @@ fn offer_memory(
             >> 10
     };
     let (avail, free) = (field("MemAvailable:"), field("MemFree:"));
+    let (psi_some, psi_full) = memory_stall();
     // An eighth of RAM while containers run — a command starting draws on
     // it while the balloon deflates — and a sixteenth when nothing runs at
     // all: a 4 GiB guest with no container kept 512 MiB free that
     // reporting could not return in runs, 600 MB at a minute against the
     // record. A thirty-second was tried: 128 MiB left the container that
     // materializes the next case's tree without room to start.
-    // A quarter, not a sixteenth, with nothing running and a range to
-    // shrink: the unplug migrates what the range held into the base, and a
-    // shrink that left a sixteenth free left the guest under its own need
-    // line while it was still compacting, so the host grew it again and the
-    // range went in and out every six seconds. Free memory in the base costs
-    // the host nothing; the pulse and reporting return it.
+    // A quarter with nothing running was headroom for a virtio-mem shrink to
+    // migrate into. The range went in 0.7.2; a sixteenth was measured in its
+    // place on the M5's 12 GiB guest and read no better a minute after an
+    // install (973/996 MiB against 920/866 at the 128 KiB reporting order,
+    // 869 against 832/859 at 32 KiB), so the quarter stays: the balloon's
+    // take of a fragmented free list is not what the footprint waits on.
     let reserve = (total >> 20) / if nothing_runs { 4 } else { 8 };
     // Release is its own word: an offer of zero means "nothing more", and
     // the balloon holds what it has. Said as one number, the guest asked
@@ -590,8 +618,16 @@ fn offer_memory(
     // guest available asks for more before it is short — available, not
     // free, because the cache it could reclaim is its own working set and
     // reclaiming it is the cost this avoids. The host doubles the guest.
-    let need = busy && avail < (total >> 20) / 8;
-    let spare = if !release && quiet && free > reserve + reserve / 4 {
+    // And by the harm itself: pressure stall information says how much of
+    // the last ten seconds every task spent waiting on memory. A tenth of
+    // it is a guest that is short whatever its free counts say (the M5's
+    // guest at 19:16Z on 2026-09-20 was stalling with gigabytes "free" in
+    // a zone its kernel could not use). `full`, not `some`: `some` counts
+    // one task's reclaim, which is the host's own reclaim request and the
+    // compaction after it, and a need on it handed the balloon back the
+    // moment the host had asked for it (m6b, the M1, 2026-09-21).
+    let need = busy && (avail < (total >> 20) / 8 || psi_full >= 1000);
+    let spare = if offers && !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
         0
@@ -601,25 +637,56 @@ fn offer_memory(
         *last = None;
     }
     let Some(fd) = stream.as_ref() else { return };
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 32];
     // Available and free are rounded to 16 MiB: they drift by a page or two
-    // on an idle guest and would defeat the comparison.
+    // on an idle guest and would defeat the comparison; the stall averages
+    // to whole percent, for the same reason.
     let coarse = |v: u64| (v & !15) as u32;
     let flags = u32::from(release) | (u32::from(need) << 1) | (u32::from(nothing_runs) << 2);
-    for (i, v) in [spare as u32, coarse(avail), coarse(free), flags].iter().enumerate() {
+    let words = [
+        spare as u32,
+        coarse(avail),
+        coarse(free),
+        flags,
+        psi_some / 100 * 100,
+        psi_full / 100 * 100,
+        0,
+        0,
+    ];
+    for (i, v) in words.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     if *last == Some(bytes) {
         return;
     }
     // SAFETY: a plain write of a stack buffer to a descriptor we own.
-    let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), 16) };
-    if n != 16 {
+    let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), 32) };
+    if n != 32 {
         *stream = None;
         *last = None;
     } else {
         *last = Some(bytes);
     }
+}
+
+/// Pressure stall information for memory, in hundredths of a percent of
+/// the last ten seconds: `some` (any task stalled) and `full` (every task
+/// stalled). Zero when the kernel does not account it.
+fn memory_stall() -> (u32, u32) {
+    let text = std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default();
+    (psi_avg10(&text, "some"), psi_avg10(&text, "full"))
+}
+
+fn psi_avg10(text: &str, line: &str) -> u32 {
+    text.lines()
+        .find(|l| l.starts_with(line))
+        .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix("avg10=")))
+        .and_then(|v| {
+            let (whole, frac) = v.split_once('.').unwrap_or((v, "0"));
+            let frac = format!("{frac:0<2}");
+            Some(whole.parse::<u32>().ok()? * 100 + frac[..2].parse::<u32>().ok()?)
+        })
+        .unwrap_or(0)
 }
 
 /// `MemTotal`, in bytes.
@@ -1372,11 +1439,22 @@ fn handle_control(line: &str) -> String {
         // pages never were.
         (Some("reclaim"), Some(amount)) => match amount.parse::<u64>() {
             Err(_) => "error bad amount\n".into(),
-            Ok(mib) => match std::fs::write("/sys/fs/cgroup/docker/memory.reclaim", format!("{mib}M")) {
-                Ok(()) => "ok\n".into(),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => "partial\n".into(),
-                Err(e) => format!("error {e}\n"),
-            },
+            Ok(mib) => {
+                let current = || {
+                    std::fs::read_to_string("/sys/fs/cgroup/docker/memory.current")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                let before = current();
+                let result = std::fs::write("/sys/fs/cgroup/docker/memory.reclaim", format!("{mib}M"));
+                let reclaimed = before.saturating_sub(current()) >> 20;
+                match result {
+                    Ok(()) => format!("reclaimed {reclaimed}\n"),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => format!("reclaimed {reclaimed} partial\n"),
+                    Err(e) => format!("error {e}\n"),
+                }
+            }
         },
         // Diagnostics that touch no disk: procfs, sysfs and the kernel log
         // stay readable when a block device has wedged.
@@ -1724,15 +1802,54 @@ fn splice_copy(from: &impl AsRawFd, to: &impl AsRawFd, fallback: impl FnOnce()) 
     }
 }
 
+/// How long a write may keep being refused for want of memory before the
+/// stream is given up: the guest reclaiming under a host that is short.
+const COPY_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
 fn copy(from: &mut impl Read, to: &mut impl Write) {
     let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match from.read(&mut buf) {
+    let mut said = false;
+    'stream: loop {
+        let n = match from.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if to.write_all(&buf[..n]).is_err() {
-                    break;
+            Ok(n) => n,
+        };
+        // Not `write_all`: a write refused for want of memory (a 256 KiB
+        // vsock packet is one linear allocation, and a fragmented guest
+        // refuses those before it is out of memory) is retried with a
+        // growing pause rather than taken as the end of the stream. Only
+        // the peer ends a stream.
+        let mut off = 0;
+        let mut pause = Duration::from_millis(1);
+        let mut refused_since: Option<Instant> = None;
+        while off < n {
+            match to.write(&buf[off..n]) {
+                Ok(0) => break 'stream,
+                Ok(m) => {
+                    off += m;
+                    refused_since = None;
+                    pause = Duration::from_millis(1);
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::OutOfMemory | io::ErrorKind::WouldBlock
+                    ) || e.raw_os_error() == Some(libc::ENOBUFS) =>
+                {
+                    let since = *refused_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > COPY_RETRY_WINDOW {
+                        eprintln!("lighter-agent: a write refused for {}s; giving the stream up: {e}", COPY_RETRY_WINDOW.as_secs());
+                        break 'stream;
+                    }
+                    if !said {
+                        eprintln!("lighter-agent: a write was refused ({e}); retrying while the guest reclaims");
+                        said = true;
+                    }
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(50));
+                }
+                Err(_) => break 'stream,
             }
         }
     }
@@ -1810,5 +1927,19 @@ impl Write for Fd {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::psi_avg10;
+
+    #[test]
+    fn the_stall_average_is_read_in_hundredths() {
+        let text = "some avg10=12.34 avg60=5.00 avg300=1.20 total=123456\nfull avg10=0.50 avg60=0.10 avg300=0.00 total=9\n";
+        assert_eq!(psi_avg10(text, "some"), 1234);
+        assert_eq!(psi_avg10(text, "full"), 50);
+        assert_eq!(psi_avg10("", "some"), 0, "no accounting reads as no stall");
+        assert_eq!(psi_avg10("some avg10=7 total=1\n", "some"), 700);
     }
 }

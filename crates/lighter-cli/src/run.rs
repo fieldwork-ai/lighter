@@ -110,12 +110,16 @@ pub fn machine() -> anyhow::Result<()> {
     // read here before the kernel starts: the seed for init, which the agent
     // replaces with an answer it asks the VMM for and corrects for the trip
     // (`lighter_vmm::clock`) as soon as it runs.
-    // `psi=0`: nothing in the guest reads pressure stall information (the
-    // host's memory pressure is macOS's own), and its averaging work woke a
-    // CPU every two seconds on an idle machine, on top of its accounting on
-    // every context switch.
+    // Pressure stall information stays on for the whole system and off per
+    // cgroup (`cgroup_disable=pressure`): the agent reads the guest's
+    // memory stalls as its "short of memory" signal (0.7.2), and the
+    // per-cgroup accounting is the part that cost a context switch and a
+    // wakeup every two seconds on an idle machine; `psi=0` until 0.7.1.
+    // `swiotlb=noforce`: no device here bounces, and the 64 MiB the kernel
+    // sets aside for it on any guest whose RAM reaches past 4 GiB was
+    // 64 MiB of idle footprint (measured on the M1, 2026-09-21).
     let mut cmdline = String::from(
-        "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t psi=0",
+        "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t cgroup_disable=pressure swiotlb=noforce",
     );
     cmdline.push_str(&format!(
         " idle.poll_ns={}",
@@ -228,13 +232,9 @@ pub fn machine() -> anyhow::Result<()> {
         }
     }
 
-    // The configured memory is the guest's maximum: it boots with a base
-    // and plugs the rest in as the host offers it (`lighter_vmm::virtio::mem`).
-    let (ram_bytes, hotplug_bytes) = lighter_vmm::virtio::mem::split(config.memory_mib << 20);
     let machine_config = MachineConfig {
         vcpus: config.cpus,
-        ram_bytes,
-        hotplug_bytes,
+        ram_bytes: config.memory_mib << 20,
         kernel: paths::kernel()?,
         initramfs: None,
         cmdline,

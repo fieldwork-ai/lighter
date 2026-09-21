@@ -18,7 +18,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 - 🔄 **Drop-in Docker replacement:** Works immediately with your existing `docker`, `docker compose`, `kind`, and third-party developer tooling.
 - 🚀 **Full Apple Silicon acceleration:** Run local LLMs, PyTorch (MPS), and computer vision models directly on your Mac's GPU and Neural Engine.
 - ⚡ **Blistering performance:** Cold boots in 715 ms; host file mounts and builds run faster than native APFS.
-- 🪶 **Ultra-lightweight:** Idles at just 394 MiB RAM (vs 3.5 GB for Docker Desktop) and surrenders memory back to macOS within seconds of a workload finishing.
+- 🪶 **Ultra-lightweight:** Idles at 604 MiB RAM (vs 3.5 GB for Docker Desktop) and surrenders memory back to macOS within seconds of a workload finishing.
 - 🆓 **100% Free & Open Source:** Dual-licensed MIT / Apache 2.0. No paid subscriptions, no commercial seat licenses, no telemetry, and zero GUI/Electron bloat.
 
 *Requires Apple Silicon and macOS 15+ (Sequoia, Tahoe).*
@@ -34,8 +34,8 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 | **Telemetry** | **Zero** | Yes | Yes | None |
 | **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
 | **Cold start (to container)** | **715 ms** | 1.4 s | 2.1 s | 9.0 s |
-| **Idle memory** | **394 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
-| **Memory 15s after heavy build** | **842 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
+| **Idle memory** | **604 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
+| **Memory 15s after heavy build** | **1,464 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
 | **`npm ci` (own disk)** | **4.46 s** | 6.83 s | 7.96 s | 7.56 s |
 | **`npm ci` (host share)** | **6.42 s** | 8.53 s | N/A | 17.89 s |
 | **Host share copy (`cp -a`)** | **4.58 s** | 9.58 s | N/A | 41.95 s |
@@ -51,7 +51,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 
 ## Why switch to lighter?
 
-- 🚫 **Escape Docker Desktop's bloat & licensing fees:** Docker Desktop consumes 3.5–7+ GB of RAM, runs Electron in the background, spins laptop fans, and charges $9–$24/user/month for commercial teams. lighter is a lean terminal daemon using under 400 MiB RAM, with zero licensing costs forever.
+- 🚫 **Escape Docker Desktop's bloat & licensing fees:** Docker Desktop consumes 3.5–7+ GB of RAM, runs Electron in the background, spins laptop fans, and charges $9–$24/user/month for commercial teams. lighter is a lean terminal daemon using ~600 MiB RAM at idle (~350 MiB on an 8 GB Mac), with zero licensing costs forever.
 - 🔓 **Free & Open Source forever:** OrbStack transitioned to a closed-source, paid subscription model ($8–$10/user/month). lighter is dual-licensed MIT / Apache 2.0 with zero commercial seat limits, no "free during beta" bait-and-switch, and zero telemetry.
 - 🧠 **Unlock Apple Silicon AI & GPU acceleration:** Docker Desktop, OrbStack, and Colima offer *zero* Apple Silicon GPU or Neural Engine support. lighter gives your containers native Metal (93 t/s on M1, 299 t/s on M5), PyTorch MPS training, and Neural Engine inference at <1% CPU.
 - ⚡ **Shared folders faster than native macOS:** Bind-mounting code into containers on macOS is historically painful. `lighter-fs` uses an in-memory page cache with real-time `FSEvents` invalidation, making `npm ci` and `ripgrep` faster inside containers than native APFS.
@@ -114,7 +114,7 @@ lighter is the first container runtime for macOS to put the Neural Engine and Py
 | `lighter.sh/ane` | ONNX models on Neural Engine, GPU or CPU (fastest chosen) | ResNet-50 2.2 ms vs 29 ms on container CPU |
 | `lighter.sh/mps` | PyTorch on the Mac's GPU | Training step 14 ms on M1, 7 ms on M5 |
 
-Two documented costs (`docs/gpu.md`): cold start is ~50 ms longer with accelerator devices enabled (564 / 715 ms vs 517 / 664 ms on M5), and idle memory is ~20 MiB higher (394 vs 372 MiB) for the in-process servers' readiness. Devices can be disabled individually if desired (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off`).
+Two documented costs (`docs/gpu.md`): cold start is ~50 ms longer with accelerator devices enabled (564 / 715 ms vs 517 / 664 ms on M5), and idle memory is ~20 MiB higher for the in-process servers' readiness. Devices can be disabled individually if desired (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off`).
 
 A resident accelerator client (such as Frigate NVR or a continuous speech service) no longer burns a host core at idle: with lighter's 1 ms message-horizon polling rule, CPU usage is 21–39% during active detection (compared to a full pinned core before) and returns to rest between requests.
 
@@ -187,7 +187,7 @@ docker run --rm --device lighter.sh/gpu=all alpine:edge sh -c \
 
 All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **394 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
+On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **604 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
@@ -220,14 +220,14 @@ Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro
 
 #### Memory footprint
 
-macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac immediately via `virtio-mem` and cooperative reclamation.
+macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter returns memory to the Mac within seconds through free page reporting and a cooperative balloon.
 
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
-| Idle, a minute after start | **394 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
-| Peak through an npm install | **3971 MiB** | 5699 MiB | 10054 MiB | 7339 MiB |
-| 15 s after it ends | **842 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
-| 60 s after it ends | **847 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
+| Idle, a minute after start | **604 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
+| Peak through an npm install | **3852 MiB** | 5699 MiB | 10054 MiB | 7339 MiB |
+| 15 s after it ends | **1464 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
+| 60 s after it ends | **1391 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
 
 #### The network
 
@@ -298,9 +298,9 @@ Container writable layers and named volumes live on an internal virtual disk (`~
 
 ### 3. Cooperative memory management
 Virtual machines that hoard allocated RAM starve macOS and trigger disk swapping.
-- **Dynamic sizing with `virtio-mem`:** The guest boots from a quarter-sized base and onlines additional memory in 128 MiB blocks via `virtio-mem` as containers demand it. Host backing is prepared concurrently in the background; unused blocks and pages are returned to macOS.
-- **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory drops to **372 MiB** (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB). Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at **702 MiB** while OrbStack holds 2,776 MiB, Docker Desktop holds 7,276 MiB, and Colima holds 10,145 MiB.
-- **Compressor-steered ballooning:** On memory-constrained Macs, macOS compresses memory before signaling out-of-memory pressure. lighter tracks host memory compression activity: when macOS begins compressing heavily, lighter's balloon inflates in aligned 16 KiB blocks to yield host physical memory, deflating once compression subsides.
+- **One memory zone, demand-backed:** The guest owns all of its configured RAM from boot as ordinary memory, and the host prepares backing only for pages the guest touches. No hot-plugged range, no movable half: nothing can cap what the guest's kernel has, which is what starved a 16 GiB guest under a 4 GiB balloon before 0.7.2.
+- **Free page reporting:** `CONFIG_PAGE_REPORTING` surrenders unused guest pages directly to the host. Idle memory sits at **604 MiB** on a 16 GiB guest (compared to OrbStack's 936 MiB and Docker Desktop's 3,493 MiB); 1.56% of that is the page array for the guest's whole RAM, the price of one memory zone whose kernel can use all of it. Within 15 seconds of completing a heavy build, lighter returns physical RAM to the host, resting at **1,464 MiB** while OrbStack holds 2,776 MiB, Docker Desktop holds 7,276 MiB, and Colima holds 10,145 MiB.
+- **Compressor-steered ballooning in whole pageblocks:** On memory-constrained Macs, macOS compresses memory before signaling out-of-memory pressure. lighter tracks host memory compression activity and swap against RAM: when macOS begins compressing heavily, lighter first asks the guest to reclaim its coldest container cache, then inflates the balloon in compound units from a whole 2 MiB pageblock down to 16 KiB, movable and migratable, so what the guest keeps stays compactable; it deflates down a paced ramp once compression subsides or the guest reports memory stalls.
 
 ### 4. The network as streams, not packets
 Other runtimes assign the VM a virtual network interface card and run a userspace TCP/IP stack on the Mac to translate raw packets back into host connections. Every byte is copied and checksummed twice, with round-trip hypervisor context switches on every packet.
@@ -321,7 +321,7 @@ Cold start includes allocating VM metadata, booting Linux, and initializing Dock
 
 ### 6. Minimal Linux LTS kernel strategy
 lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal, audited patch set focused strictly on hypervisor performance:
-- `virtio-mem` independent block page arrays and auto-movable onlining (`0024`, `0026`).
+- Balloon units from a whole pageblock down to a host page, movable and migratable, and a 64 KiB default for free page reporting before the agent sets its own (`0014`, `0034`); a vsock packet the allocator refuses is sent shorter rather than dropped (`0033`).
 - BPF sockmap backoff to avoid backlog worker spinning (`0025`).
 - Apple Silicon TSO memory ordering for high-speed Rosetta x86-64 execution (`0023`).
 - `btrfs` direct interrupt-context completions (`0009`).
@@ -334,7 +334,7 @@ OrbStack, Docker Desktop and Colima leave the Mac's GPU and Neural Engine inacce
 
 lighter exposes the Apple Silicon compute architecture to containers:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
-- **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 394 MiB (+20 MiB over baseline).
+- **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 604 MiB (+20 MiB over the same guest without the servers).
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
 - **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`). If traffic pauses, polling drops back immediately to the resting floor within rounds, allowing resident containers (such as Frigate NVR or background speech-to-text) to run at 21–39% CPU during active detection rather than pinning a full host core.
 
