@@ -21,7 +21,7 @@ The guest is now one zone. virtio-mem is gone, with its plug-before-a-
 container check and its shrink policy, and nothing can halve what the
 kernel has. The price, chosen with its number known, is the page array for
 memory that never leaves: 1.56% of RAM at idle, about 130 MiB on a 4 GiB
-guest and 290 on a 12 GiB one, nothing while containers run
+guest and 256 on a 16 GiB one, nothing while containers run
 (`docs/guest-memory-2026-09-20.md`). The kernel's 64 MiB swiotlb, which no
 device here uses, is no longer set aside (`swiotlb=noforce`), and the page
 array is initialised across the vCPUs rather than on one core before init.

@@ -75,7 +75,7 @@ seconds per export under the same fragmenter and hog, API calls under
 the kernel with all of the guest's memory does not starve.
 
 Then the records: the M1's read 415 MiB idle against 273, the M5's, on a
-12 GiB guest, 684 against 394. The slope against guest size (283, 384 and
+16 GiB guest, 684 against 394. The slope against guest size (283, 384 and
 439 MiB at 2, 4 and 6 GiB, the guest's own use identical at 325) named the
 cost: the page array, 64 bytes for every 4 KiB page, 1.56% of RAM, plus a
 64 MiB swiotlb the kernel sets aside once RAM reaches past 4 GiB. The
@@ -91,8 +91,8 @@ use all of it and of a memory model with one mechanism fewer, and while
 containers run, which is always on the machine that matters, the two designs
 cost the same. `swiotlb=noforce` takes the 64 MiB back, and deferred
 struct-page initialisation spreads the page array's setup over the vCPUs at
-boot. The idle headline moves from 394 to about 620 MiB on the M5's default
-12 GiB guest, against OrbStack's 936.
+boot. The idle headline moves from 394 to about 604 MiB on the M5's default
+16 GiB guest (half of its 48 GB, the benchmark's cap), against OrbStack's 936.
 
 ## A balloon that moves
 
