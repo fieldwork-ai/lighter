@@ -116,7 +116,7 @@ fi
 
 FOOTPRINT_BIN="$ROOT/target/benchmarks/task-footprint"
 if [ "$TARGET" != native ]; then
-	case " $CASES " in *" memory "*|*" boot "*)
+	case " $CASES " in *" memory "*|*" boot "*|*" warm "*)
 		mkdir -p "$(dirname "$FOOTPRINT_BIN")"
 		if [ ! -x "$FOOTPRINT_BIN" ] || [ benchmarks/task-footprint.c -nt "$FOOTPRINT_BIN" ]; then
 			cc -O2 -Wall -Wextra -Werror benchmarks/task-footprint.c -o "$FOOTPRINT_BIN"
@@ -541,7 +541,7 @@ setup_lighter() {
 		${LIGHTER_BENCH_DEV_AGENT:+--share "dev:$(dirname "$LIGHTER_BENCH_DEV_AGENT")"} \
 		${ROSETTA_DIR:+--share "rosetta:$ROSETTA_DIR"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init psi=0 swiotlb=noforce idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")}${ROSETTA_DIR:+ lighter.rosetta} ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init cgroup_disable=pressure swiotlb=noforce idle.poll_ns=$(bench_idle_poll_ns) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")}${ROSETTA_DIR:+ lighter.rosetta} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
@@ -658,7 +658,7 @@ for warm in npm-install pnpm-install yarn-install; do
 done
 # `rm-rf` and `copy-tree` need a tree to work on, whichever installs ran.
 case " $CASES " in
-*rm-rf*|*copy-tree*|*ripgrep*|*find-walk*)
+*rm-rf*|*copy-tree*|*ripgrep*|*find-walk*|*warm*)
 	if [ ! -d "$WORK/npm/node_modules" ]; then
 		mkdir -p .logs
 		if ! REPS=1 run_case npm-install > ".logs/warmup-${LABEL:-$TARGET}-tree.out" 2>&1; then
@@ -764,6 +764,109 @@ run_memory_case() {
 	echo "memory-peak,1,$peak" >> "$RESULTS"
 	echo "memory-after-15s,1,$after15" >> "$RESULTS"
 	echo "memory-after-60s,1,$after60" >> "$RESULTS"
+}
+
+# A stack that is up all day and never idle, which is what a daily driver
+# is and what no other case here measures: every other memory reading is
+# taken with nothing running. A writer of a gigabyte of write-once data in
+# the first two minutes and a steady third of a core throughout (a build's
+# cache, a log shipper's morning; what is left of it at the end is what the
+# policy took in the three minutes after), a reader of a tree on
+# the runtime's own disk and one of a tree on the share, which is the work a
+# cache policy must not hurt and the dearer refault of the two, and a probe
+# into a container every five seconds, as a health check is. Read at the
+# end: what the runtime costs the Mac, what the guest still caches, how long
+# the re-reads took, and the host's CPU for each second of the guest's.
+#
+# Not in the default set: it is five minutes, and it is lighter's own
+# question. `LIGHTER_WARM_GAIN=<n>` has the host say that gain whatever the
+# Mac's pressure, and `LIGHTER_CMDLINE_EXTRA=lighter.warm=0` leaves the loop
+# off, which are the two arms it is run with (`docs/warm-guest-memory`).
+warm_ctl() {
+	[ "$TARGET" = lighter ] || return 0
+	# One line to the agent's control port and what comes back.
+	printf '%s\n' "$1" | nc -U -w 3 "$RUN_DIR/control.sock" 2>/dev/null || true
+}
+warm_guest_cpu_ticks() {
+	warm_ctl 'read /proc/stat' | awk '$1 == "cpu" { print $2 + $3 + $4 + $7 + $8; exit }'
+}
+warm_median() { sort -n | awk '{ v[NR] = $1 } END { if (NR) print v[int((NR + 1) / 2)]; else print "timeout" }'; }
+run_warm_case() {
+	[ "$TARGET" != native ] || return 0
+	local seconds="${BENCH_WARM_SECONDS:-300}" rate="${BENCH_WARM_MIB_S:-8}" every="${BENCH_WARM_REREAD_S:-20}" total="${BENCH_WARM_MIB:-1024}"
+	printf '==> %s: warm (%ss, %s MiB write-once at %s MiB/s)' "$TARGET" "$seconds" "$total" "$rate"
+	local js vol="lighter-bench-warm-$TARGET$CACHE_SUFFIX" names="" name
+	js="$(cat benchmarks/cases/warm.js)"
+	for name in writer disk share; do
+		dk rm -f "lighter-bench-warm-$name-$TARGET" >/dev/null 2>&1 || true
+	done
+	dk volume rm "$vol" >/dev/null 2>&1 || true
+	dk volume create "$vol" >/dev/null
+	# The tree the disk reader reads: the share's, copied onto the runtime's
+	# own disk, before anything is timed.
+	if ! dk run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} -v "$(work_mount)":/work -v "$vol":/data "$IMAGE" \
+		sh -c 'cp -a /work/npm/node_modules /data/tree' >/dev/null 2>&1; then
+		FAILED=1; printf '\n    FAILED: no package tree to re-read (npm-install warm-up)\n'; return
+	fi
+	sleep 5
+	local cpu0 guest0 t0
+	cpu0="$(ps -o cputime= -p ${VMM_PID:-0} 2>/dev/null | awk -F'[:.]' '{ print ($1 * 60 + $2) * 100 + $3 }')"
+	guest0="$(warm_guest_cpu_ticks)"
+	t0="$(date +%s)"
+	dk run -d --name "lighter-bench-warm-writer-$TARGET" ${PLATFORM[@]+"${PLATFORM[@]}"} -v "$vol":/data \
+		"$IMAGE" node -e "$js" writer /data/segments "$rate" "$seconds" "$total" >/dev/null
+	dk run -d --name "lighter-bench-warm-disk-$TARGET" ${PLATFORM[@]+"${PLATFORM[@]}"} -v "$vol":/data \
+		"$IMAGE" node -e "$js" reader disk /data/tree "$every" "$seconds" >/dev/null
+	dk run -d --name "lighter-bench-warm-share-$TARGET" ${PLATFORM[@]+"${PLATFORM[@]}"} -v "$(work_mount)":/work \
+		"$IMAGE" node -e "$js" reader share /work/npm/node_modules "$every" "$seconds" >/dev/null
+	local peak=0 now
+	while [ $(( $(date +%s) - t0 )) -lt "$seconds" ]; do
+		dk exec "lighter-bench-warm-writer-$TARGET" true >/dev/null 2>&1 || true
+		now="$(runtime_footprint_mib 2>/dev/null || echo 0)"
+		[ "$now" -le "$peak" ] || peak="$now"
+		sleep 5
+	done
+	for name in writer disk share; do
+		dk wait "lighter-bench-warm-$name-$TARGET" >/dev/null 2>&1 || true
+	done
+	local footprint cache cpu1 guest1 ratio disk share report
+	footprint="$(runtime_footprint_mib 2>/dev/null || echo timeout)"
+	cpu1="$(ps -o cputime= -p ${VMM_PID:-0} 2>/dev/null | awk -F'[:.]' '{ print ($1 * 60 + $2) * 100 + $3 }')"
+	guest1="$(warm_guest_cpu_ticks)"
+	ratio="$(awk -v h="$(( ${cpu1:-0} - ${cpu0:-0} ))" -v g="$(( ${guest1:-0} - ${guest0:-0} ))" 'BEGIN { if (g > 0) printf "%d", h * 100 / g; else print "timeout" }')"
+	cache="$(warm_ctl 'read /sys/fs/cgroup/docker/memory.stat' | awk '$1 == "inactive_file" || $1 == "active_file" { s += $2 } END { if (NR) printf "%d", s / 1048576; else print "timeout" }')"
+	report="$(warm_ctl warm | head -1)"
+	mkdir -p .logs
+	for name in writer disk share; do
+		dk logs "lighter-bench-warm-$name-$TARGET" > ".logs/case-${LABEL:-$TARGET}-warm-$name.out" 2>&1 || true
+	done
+	# The first pass of each reader fills the cache; the rest are the re-reads.
+	disk="$(awk '$1 == "READ" { n++; if (n > 1) print $3 }' ".logs/case-${LABEL:-$TARGET}-warm-disk.out" | warm_median)"
+	share="$(awk '$1 == "READ" { n++; if (n > 1) print $3 }' ".logs/case-${LABEL:-$TARGET}-warm-share.out" | warm_median)"
+	grep -q '^WROTE ' ".logs/case-${LABEL:-$TARGET}-warm-writer.out" || { FAILED=1; printf '\n    FAILED: the writer did not finish'; }
+	printf ' footprint=%s peak=%s cache=%s MiB reread disk=%s share=%s ms host/guest cpu=%s%%\n' \
+		"$footprint" "$peak" "$cache" "$disk" "$share" "$ratio"
+	[ -z "$report" ] || printf '    %s\n' "$report"
+	# The gain the host was told to say is the gain the agent must report:
+	# the one check that the host's words reach the guest at all. For all of
+	# 0.7.2 they did not (`ask_agent`), and nothing noticed.
+	if [ "$TARGET" = lighter ] && [ -n "${LIGHTER_WARM_GAIN:-}" ] && [[ "$report" == "warm on "* ]] \
+		&& [[ "$report" != *" gain=$LIGHTER_WARM_GAIN "* ]]; then
+		FAILED=1; printf '    FAILED: the host said gain %s and the agent heard otherwise\n' "$LIGHTER_WARM_GAIN"
+	fi
+	{
+		echo "warm-footprint,1,$footprint"
+		echo "warm-footprint-peak,1,$peak"
+		echo "warm-cache,1,$cache"
+		echo "warm-reread-disk,1,$disk"
+		echo "warm-reread-share,1,$share"
+		echo "warm-cpu-ratio,1,$ratio"
+	} >> "$RESULTS"
+	[ -z "$report" ] || echo "$report" > ".logs/case-${LABEL:-$TARGET}-warm-report.out"
+	for name in writer disk share; do
+		dk rm -f "lighter-bench-warm-$name-$TARGET" >/dev/null 2>&1 || true
+	done
+	dk volume rm "$vol" >/dev/null 2>&1 || true
 }
 
 
@@ -1157,6 +1260,10 @@ run_container_start_case() {
 for name in $CASES; do
 	if [ "$name" = memory ]; then
 		run_memory_case
+		continue
+	fi
+	if [ "$name" = warm ]; then
+		run_warm_case
 		continue
 	fi
 	case "$NET_CASES" in *" $name "*) run_net_case "$name"; continue ;; esac

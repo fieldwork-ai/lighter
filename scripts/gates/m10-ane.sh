@@ -106,4 +106,39 @@ docker rm "$container" >/dev/null 2>&1 || true
 grep -q "neural engine model loaded" "$LOG" && pass "the host loaded the model" || fail "the host never loaded a model"
 
 echo
+echo "==> What the host costs between frames (a client at 5 Hz for 24 s)"
+# A camera sends a frame every 200 ms and the Neural Engine answers in
+# milliseconds; the rest of the time the host has nothing to do and must
+# cost nothing. ONNX Runtime's workers spin between tasks by default, which
+# read 43 to 53% of a core under Frigate on 0.7.2. The whole VMM is read,
+# guest included: the client is a sleep and a small copy, so what is left
+# above a few percent is the host waiting loudly.
+container="$(docker create --device lighter.sh/ane=all "$IMAGE" sh -c \
+	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn-init.onnx paced 5 24 2>&1')"
+docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
+docker start "$container" >/dev/null
+waited=0
+until docker logs "$container" 2>&1 | grep -q '^PACING'; do
+	[ "$waited" -lt 120 ] || break
+	[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" = true ] || break
+	sleep 1; waited=$((waited + 1))
+done
+if docker logs "$container" 2>&1 | grep -q '^PACING'; then
+	sleep 3
+	# top's first sample is since the process began; the mean of the next six.
+	cpu="$(top -l 7 -s 2 -pid "$VMM_PID" -stats cpu 2>/dev/null | awk '/^[0-9.]+ *$/{n++; if (n>1) {s+=$1; c++}} END{if (c) printf "%.1f", s/c}')"
+	docker wait "$container" >/dev/null 2>&1 || true
+	paced="$(docker logs "$container" 2>&1 | grep '^PACED' | tail -1)"
+	limit="${LIGHTER_GATE_ANE_IDLE_CPU:-15}"
+	if [ -n "$cpu" ] && awk -v c="$cpu" -v l="$limit" 'BEGIN{exit !(c < l)}'; then
+		pass "the VMM read ${cpu}% of a core between frames (under ${limit}%; $paced)"
+	else
+		fail "the VMM read ${cpu:-?}% of a core between frames (limit ${limit}%; $paced)"
+	fi
+else
+	fail "the paced client never started"; docker logs "$container" 2>&1 | tail -8 | sed 's/^/    /'
+fi
+docker rm -f "$container" >/dev/null 2>&1 || true
+
+echo
 exit "$FAILED"

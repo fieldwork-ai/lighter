@@ -181,6 +181,8 @@ impl MemoryPolicy {
             ram_bytes,
             vsock: Some(vsock.clone()),
             reclaiming: Arc::new(AtomicBool::new(false)),
+            warm_gain: Arc::new(Mutex::new(None)),
+            saying_gain: Arc::new(AtomicBool::new(false)),
             level: AtomicU32::new(Pressure::Normal as u32),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
@@ -359,6 +361,10 @@ struct Steering {
     vsock: Option<Arc<crate::virtio::vsock::VsockShared>>,
     /// A reclaim request in flight: one at a time.
     reclaiming: Arc<AtomicBool>,
+    /// The warm loop's gain as last said to the agent, and when.
+    warm_gain: Arc<Mutex<Option<(u32, Instant)>>>,
+    /// A gain on its way to the agent: one at a time.
+    saying_gain: Arc<AtomicBool>,
     /// The host's pressure level: the ramp's cap and step.
     level: AtomicU32,
     // Keep the ramp and its hold together: a poll must not restore a
@@ -379,6 +385,7 @@ impl Steering {
     /// ramp moves unless held. A held ramp is frozen where the balloon is
     /// by `apply`.
     fn steer(&self, compressed: u64) {
+        let gain;
         {
             let mut state = self
                 .compression
@@ -392,6 +399,11 @@ impl Steering {
                 0
             };
             let level = self.level.load(Ordering::Relaxed);
+            gain = warm_gain(
+                level,
+                state.pressed(level, now),
+                state.quiet_polls < QUIET_POLLS_BEFORE_DEFLATE,
+            );
             // An overcommitted host, or one that was at Warn a moment ago,
             // is steered as at Warn whatever it reports now; and it is not
             // quiet, so the grace before easing counts from when that ends.
@@ -427,7 +439,54 @@ impl Steering {
                 }
             }
         }
+        self.say_gain(warm_gain_forced().unwrap_or(gain));
         self.apply();
+    }
+
+    /// Tells the agent's warm loop how hard to push, when that changes and
+    /// once a minute besides, off the poll's thread like a reclaim request
+    /// and one at a time. Said is said only once the agent has answered: the
+    /// first poll comes before the agent listens, and a gain recorded then
+    /// left a guest at 1 for its first minute under a Mac at Warn. An agent
+    /// that predates the loop answers with an error, which is an answer.
+    fn say_gain(&self, gain: u32) {
+        let Some(vsock) = &self.vsock else { return };
+        {
+            let said = self.warm_gain.lock().expect("warm gain poisoned");
+            if said.is_some_and(|(g, at)| g == gain && at.elapsed() < WARM_GAIN_REFRESH) {
+                return;
+            }
+        }
+        if self
+            .saying_gain
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let (vsock, said, saying) = (
+            vsock.clone(),
+            self.warm_gain.clone(),
+            self.saying_gain.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("warm-gain".into())
+            .spawn(move || {
+                match ask_agent(&vsock, &format!("gain {gain}\n")) {
+                    Ok(_) => {
+                        let mut said = said.lock().expect("warm gain poisoned");
+                        if said.is_none_or(|(g, _)| g != gain) {
+                            tracing::info!(gain, "warm loop gain");
+                        }
+                        *said = Some((gain, Instant::now()));
+                    }
+                    Err(e) => tracing::debug!(gain, %e, "the agent did not take the warm gain"),
+                }
+                saying.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.saying_gain.store(false, Ordering::Release);
+        }
     }
 
     /// Asks the agent to reclaim `mib` from the containers' cgroup
@@ -436,6 +495,9 @@ impl Steering {
     /// balloon's next step finds the pages free.
     fn ask_reclaim(&self, mib: u64) {
         let Some(vsock) = &self.vsock else { return };
+        if !reclaim_ahead_enabled() {
+            return;
+        }
         if mib == 0
             || self
                 .reclaiming
@@ -754,8 +816,7 @@ fn ask_agent(
     vsock: &Arc<crate::virtio::vsock::VsockShared>,
     line: &str,
 ) -> std::io::Result<String> {
-    use std::io::{BufRead, Write};
-    let (mut mine, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let (mine, theirs) = std::os::unix::net::UnixStream::pair()?;
     let host_port = vsock.open(AGENT_CONTROL_PORT, theirs);
     if !vsock.await_established(host_port, Duration::from_secs(4)) {
         return Err(std::io::Error::new(
@@ -763,13 +824,45 @@ fn ask_agent(
             "the agent did not accept",
         ));
     }
-    mine.write_all(line.as_bytes())?;
-    mine.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut reader = std::io::BufReader::new(mine.try_clone()?);
-    let mut answer = String::new();
-    reader.read_line(&mut answer)?;
-    let _ = mine.shutdown(std::net::Shutdown::Both);
-    Ok(answer.trim().to_string())
+    // Both directions go through the device, not the pair: nothing forwards
+    // what is written into a socket handed to `open`, and what the guest
+    // says is queued on the connection, not written to it (a proxy's pump
+    // does both for its client). 0.7.2 wrote the line into the pair and read
+    // the pair for the answer, so no line ever left the Mac: every reclaim
+    // asked of the guest ahead of the balloon timed out thirty seconds later
+    // at debug level, and no machine ever logged one that worked. Found
+    // 2026-09-21, when the warm loop's gain went the same way and the agent's
+    // own report said it had heard nothing.
+    let gone = || {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the agent's connection went",
+        )
+    };
+    if !vsock.send(host_port, line.as_bytes()) {
+        return Err(gone());
+    }
+    // A reclaim answers when the reclaim is done, which can be seconds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut answer = Vec::new();
+    let result = loop {
+        match vsock.try_read_outbound(host_port, 1) {
+            Ok(Some(byte)) if byte == *b"\n" => break Ok(()),
+            Ok(Some(byte)) => answer.extend_from_slice(&byte),
+            Ok(None) if Instant::now() >= deadline => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the agent did not answer",
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => break Err(gone()),
+        }
+    };
+    vsock.shutdown(host_port);
+    drop(mine);
+    result?;
+    Ok(String::from_utf8_lossy(&answer).trim().to_string())
 }
 
 fn memory_guest(
@@ -852,6 +945,50 @@ fn as_pages(bytes: u64) -> u32 {
 }
 
 /// How much of the guest the ramp may reach at a level.
+/// How hard the guest's warm loop may push (`guest/agent/src/warm.rs`): a
+/// multiple of the sliver of cache it asks its kernel for every six seconds.
+/// The loop's own limit is the guest's measured stall, so this is need and
+/// not permission: 1 on a Mac with memory to spare, 8 while it compresses,
+/// swaps, or is at Warn or was a minute ago (the ramp's own tests, with the
+/// hysteresis they already carry), 20, the loop's ceiling of a hundredth of
+/// the cache a period, at Critical. A gain that is wrong costs the guest
+/// minutes of convergence and never a stalled container.
+const WARM_GAIN_PRESSED: u32 = 8;
+const WARM_GAIN_CRITICAL: u32 = 20;
+/// Said again this often: the agent forgets a gain nobody repeats, so a
+/// host that went away is not a host under pressure for ever.
+const WARM_GAIN_REFRESH: Duration = Duration::from_secs(60);
+
+/// `level` is what the Mac reports; `pressed` is the ramp's wider test (a
+/// level, one within the last minute, or an overcommitted host);
+/// `compressing` is the compressor having moved within the ramp's grace.
+fn warm_gain(level: u32, pressed: bool, compressing: bool) -> u32 {
+    if level == Pressure::Critical as u32 {
+        WARM_GAIN_CRITICAL
+    } else if pressed || compressing {
+        WARM_GAIN_PRESSED
+    } else {
+        1
+    }
+}
+
+/// `LIGHTER_RECLAIM_AHEAD=0` leaves the balloon to take its step with no
+/// reclaim asked of the guest first, which is what every 0.7.2 machine did
+/// whatever this file said (`ask_agent`), and so is the arm to measure the
+/// request against now that it arrives.
+fn reclaim_ahead_enabled() -> bool {
+    std::env::var("LIGHTER_RECLAIM_AHEAD")
+        .ok()
+        .is_none_or(|v| v != "0")
+}
+
+/// `LIGHTER_WARM_GAIN=<n>` says that gain whatever the Mac's pressure is, so
+/// the warm case can be measured at a known one: the benchmark host's own
+/// pressure is weather.
+fn warm_gain_forced() -> Option<u32> {
+    std::env::var("LIGHTER_WARM_GAIN").ok()?.parse().ok()
+}
+
 fn cap_pages(level: u32, total_bytes: u64) -> u32 {
     let fraction = match level {
         level if level == Pressure::Warn as u32 => WARN_FRACTION,
@@ -1188,6 +1325,17 @@ mod tests {
         assert_eq!(mib(pages - eased), 64, "a 256th of 16 GiB");
     }
 
+    #[test]
+    fn the_warm_gain_follows_the_hosts_need() {
+        let (warn, critical) = (Pressure::Warn as u32, Pressure::Critical as u32);
+        assert_eq!(warm_gain(NORMAL, false, false), 1);
+        // Compressing, or a Warn remembered, at a level that reads Normal.
+        assert_eq!(warm_gain(NORMAL, false, true), WARM_GAIN_PRESSED);
+        assert_eq!(warm_gain(NORMAL, true, false), WARM_GAIN_PRESSED);
+        assert_eq!(warm_gain(warn, true, true), WARM_GAIN_PRESSED);
+        assert_eq!(warm_gain(critical, true, true), WARM_GAIN_CRITICAL);
+    }
+
     fn steering_for_tests(ram_bytes: u64) -> (Steering, Arc<Mutex<VirtioMmio>>) {
         use crate::irq::NullIrq;
         use crate::memory::GuestMemory;
@@ -1205,6 +1353,8 @@ mod tests {
             ram_bytes,
             vsock: None,
             reclaiming: Arc::new(AtomicBool::new(false)),
+            warm_gain: Arc::new(Mutex::new(None)),
+            saying_gain: Arc::new(AtomicBool::new(false)),
             level: AtomicU32::new(NORMAL),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
