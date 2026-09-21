@@ -187,7 +187,7 @@ docker run --rm --device lighter.sh/gpu=all alpine:edge sh -c \
 
 All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **394 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
+On Apple Silicon, lighter launches containers cold in **715 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **6.42 s** (faster than native APFS, beating OrbStack's 8.53 s), completes directory copies **2.1x faster**, idles at **618 MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
