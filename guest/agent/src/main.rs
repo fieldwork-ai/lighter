@@ -273,9 +273,14 @@ fn bound_container_cache() {
     // 966–1033, both creeping the same 67 MB, which is the cache growing);
     // the install cases read level and the memory case 120 MiB lower at
     // rest. The hurried setting after a trim was already five.
+    // Three since 0.7.2, two host pages: with one memory zone nothing
+    // unplugs the fragments an install leaves, and reporting them at 128 KiB
+    // left 150 MiB more on the M1 and 50–90 on the M5 a minute after the
+    // build than at 32 KiB (six runs each, 2026-09-21); 16 KiB gained
+    // nothing further and reports twice as often.
     let rest_order = cmdline_value("lighter.reporting_order")
         .map(|o| o as u32)
-        .unwrap_or(5);
+        .unwrap_or(3);
     // The kernel's own order, two megabytes, while the containers work.
     const CHURN_ORDER: u32 = 9;
     // The rest settings from the start, not from the first trim: the kernel
@@ -495,7 +500,7 @@ fn bound_container_cache() {
         // into reportable runs, as before the balloon. On a 4 GiB guest the
         // reserve alone read 600 MB more at a minute without this.
         if !memory_policy::populated(std::path::Path::new(containers)) {
-            set_reporting(100, 5);
+            set_reporting(100, rest_order.min(5));
             hurried = true;
             compact_until_reportable();
         }
@@ -555,12 +560,12 @@ fn offer_memory(
     // reporting could not return in runs, 600 MB at a minute against the
     // record. A thirty-second was tried: 128 MiB left the container that
     // materializes the next case's tree without room to start.
-    // A quarter, not a sixteenth, with nothing running and a range to
-    // shrink: the unplug migrates what the range held into the base, and a
-    // shrink that left a sixteenth free left the guest under its own need
-    // line while it was still compacting, so the host grew it again and the
-    // range went in and out every six seconds. Free memory in the base costs
-    // the host nothing; the pulse and reporting return it.
+    // A quarter with nothing running was headroom for a virtio-mem shrink to
+    // migrate into. The range went in 0.7.2; a sixteenth was measured in its
+    // place on the M5's 12 GiB guest and read no better a minute after an
+    // install (973/996 MiB against 920/866 at the 128 KiB reporting order,
+    // 869 against 832/859 at 32 KiB), so the quarter stays: the balloon's
+    // take of a fragmented free list is not what the footprint waits on.
     let reserve = (total >> 20) / if nothing_runs { 4 } else { 8 };
     // Release is its own word: an offer of zero means "nothing more", and
     // the balloon holds what it has. Said as one number, the guest asked
