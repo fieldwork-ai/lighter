@@ -35,7 +35,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 | **GUI overhead** | **None (Headless)** | Menu bar / App | Electron app | None (Lima) |
 | **Cold start (to container)** | **715 ms** | 1.4 s | 2.1 s | 9.0 s |
 | **Idle memory** | **604 MiB** | 936 MiB | 3,493 MiB | 1,302 MiB |
-| **Memory 15s after heavy build** | **1,745 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
+| **Memory 15s after heavy build** | **1,464 MiB** | 2,776 MiB | 7,276 MiB | 10,145 MiB |
 | **`npm ci` (own disk)** | **4.46 s** | 6.83 s | 7.96 s | 7.56 s |
 | **`npm ci` (host share)** | **6.42 s** | 8.53 s | N/A | 17.89 s |
 | **Host share copy (`cp -a`)** | **4.58 s** | 9.58 s | N/A | 41.95 s |
@@ -51,7 +51,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 
 ## Why switch to lighter?
 
-- 🚫 **Escape Docker Desktop's bloat & licensing fees:** Docker Desktop consumes 3.5–7+ GB of RAM, runs Electron in the background, spins laptop fans, and charges $9–$24/user/month for commercial teams. lighter is a lean terminal daemon using under 400 MiB RAM, with zero licensing costs forever.
+- 🚫 **Escape Docker Desktop's bloat & licensing fees:** Docker Desktop consumes 3.5–7+ GB of RAM, runs Electron in the background, spins laptop fans, and charges $9–$24/user/month for commercial teams. lighter is a lean terminal daemon using ~600 MiB RAM at idle (~350 MiB on an 8 GB Mac), with zero licensing costs forever.
 - 🔓 **Free & Open Source forever:** OrbStack transitioned to a closed-source, paid subscription model ($8–$10/user/month). lighter is dual-licensed MIT / Apache 2.0 with zero commercial seat limits, no "free during beta" bait-and-switch, and zero telemetry.
 - 🧠 **Unlock Apple Silicon AI & GPU acceleration:** Docker Desktop, OrbStack, and Colima offer *zero* Apple Silicon GPU or Neural Engine support. lighter gives your containers native Metal (93 t/s on M1, 299 t/s on M5), PyTorch MPS training, and Neural Engine inference at <1% CPU.
 - ⚡ **Shared folders faster than native macOS:** Bind-mounting code into containers on macOS is historically painful. `lighter-fs` uses an in-memory page cache with real-time `FSEvents` invalidation, making `npm ci` and `ripgrep` faster inside containers than native APFS.
