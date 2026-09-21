@@ -447,7 +447,13 @@ fn bound_container_cache() {
                 &mut memory_stream,
                 &mut last_offer,
                 total,
-                total >= balloon_min,
+                // Offers of spare memory: always with a range to shrink
+                // (the idle guest's first way of giving memory back), and
+                // to the balloon alone from eight gigabytes up, where it
+                // beat reporting alone. Without this the m6 guest, 7930 MiB
+                // of 8192 configured, never offered and its range never
+                // left (2026-09-21).
+                dynamic || total >= balloon_min,
                 active,
                 // Quiet, or nothing running and the containers eight seconds
                 // idle: the quiet rule protects running work from a seesaw,
