@@ -1,0 +1,13 @@
+# The virtio device id virtio-media binds to, merged upstream after 6.18.
+diff --git a/include/uapi/linux/virtio_ids.h b/include/uapi/linux/virtio_ids.h
+index 6c12db1..f9056af 100644
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@ -69,6 +69,7 @@
+ #define VIRTIO_ID_BT			40 /* virtio bluetooth */
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
+ #define VIRTIO_ID_SPI			45 /* virtio spi */
++#define VIRTIO_ID_MEDIA			48 /* virtio media */
+ 
+ /*
+  * Virtio Transitional IDs

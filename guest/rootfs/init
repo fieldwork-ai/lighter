@@ -70,6 +70,24 @@ if [ -e /dev/dri/renderD128 ]; then
 	echo "INIT gpu=/dev/dri/renderD128"
 fi
 
+# The video decoder, when the machine has one (a virtio-media device the
+# kernel registers as a V4L2 node): `docker run --device lighter.sh/video=all`
+# gets /dev/video0, and stock ffmpeg's h264_v4l2m2m decodes on the Mac's
+# media engine through it.
+if [ -e /dev/video0 ]; then
+	mkdir -p /etc/cdi
+	cat > /etc/cdi/lighter-video.yaml <<-EOF
+	cdiVersion: "0.6.0"
+	kind: lighter.sh/video
+	devices:
+	  - name: all
+	    containerEdits:
+	      deviceNodes:
+	        - path: /dev/video0
+	EOF
+	echo "INIT video=/dev/video0"
+fi
+
 # The Neural Engine, when the host serves one (`lighter.ane=<port>`): a CDI
 # device that gives a container lighter's ONNX Runtime plugin provider and
 # the address it forwards to, the Mac's loopback through the streams.

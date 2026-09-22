@@ -59,6 +59,7 @@ fn main() -> ExitCode {
                     );
                 }
             }
+            "--video" => config.video = true,
             "--ane" => ane = true,
             "--metal" => metal = true,
             // Logs the process's own physical footprint on an interval. The

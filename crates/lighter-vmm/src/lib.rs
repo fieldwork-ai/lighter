@@ -54,6 +54,7 @@ pub mod sockbuf;
 pub mod streams;
 pub mod sysreg;
 pub mod vcpu;
+pub mod video;
 pub mod virtio;
 pub mod vsock_proxy;
 pub mod wake;

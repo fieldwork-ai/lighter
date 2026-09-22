@@ -43,6 +43,11 @@ pub struct Config {
     /// the RPC backend) on the Mac's GPU with ggml's own Metal kernels
     /// (`docker run --device lighter.sh/metal=all`). On by default.
     pub metal: bool,
+    /// Whether containers get a V4L2 video decoder (`docker run --device
+    /// lighter.sh/video=all`, `/dev/video0`): H.264 decoded by VideoToolbox
+    /// on the Mac's media engine, for stock ffmpeg's `h264_v4l2m2m`. On by
+    /// default; costs nothing until a container opens it.
+    pub video: bool,
 }
 
 /// A switch on the command line: `--gpu on`, `--gpu off`.
@@ -95,6 +100,7 @@ impl Default for Config {
             mps: true,
             torch_python: String::new(),
             metal: true,
+            video: true,
         }
     }
 }
@@ -210,6 +216,7 @@ mod tests {
             mps: false,
             torch_python: String::new(),
             metal: false,
+            video: false,
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         assert!(

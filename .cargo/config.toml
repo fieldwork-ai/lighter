@@ -1,3 +1,5 @@
 [env]
 # lighter runs on macOS 15 and later; the renderer libraries are built for it too.
 MACOSX_DEPLOYMENT_TARGET = "15.0"
+# V4L2 bindings for virtio-media: see crates/lighter-vmm/uapi/README.md.
+V4L2R_VIDEODEV2_H_PATH = { value = "crates/lighter-vmm/uapi", relative = true }

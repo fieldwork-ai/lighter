@@ -17,6 +17,7 @@ libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 vm-fdt = "0.3"
+virtio-media = { version = "0.0.8", default-features = false }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
