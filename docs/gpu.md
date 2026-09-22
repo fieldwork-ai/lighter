@@ -95,6 +95,26 @@ How it works: the extension occupies the MPS dispatch key, which a Linux build o
 
 Eager mode is one round trip per operator over the streams. A 60-step training loop of a small MLP costs a few milliseconds a step; large models spend their time on the GPU and the round trips disappear into it.
 
+## Video decode on the media engine: `--device lighter.sh/video=all`
+
+A container gets `/dev/video0`, a V4L2 memory-to-memory H.264 decoder of the kind a Raspberry Pi or a phone has, and whatever already speaks that decodes on the Mac's media engine through VideoToolbox: ffmpeg's `h264_v4l2m2m`, GStreamer's `v4l2h264dec`, and Frigate's own Raspberry Pi build of ffmpeg. Nothing is installed in the container and nothing is bundled on the host.
+
+```bash
+docker run --rm --device lighter.sh/video=all debian:bookworm-slim sh -c '
+  apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null &&
+  ffmpeg -c:v h264_v4l2m2m -i input.mkv -f null -'
+```
+
+Measured on the M5 with 1080p at 6 Mbps: 1.13 ms of the Mac's CPU a frame, against 4.87 decoding in software in the same container, and the frames are identical to software decode's, byte for byte.
+
+**How it works.** The guest's driver is virtio-media (the v9 series on the kernel list, carried as patches 0036 and 0037), which relays V4L2 to the host rather than implementing a decoder. The host device is the `virtio-media` crate's stateful decoder (`third_party/`) behind lighter's adapters (`crates/lighter-vmm/src/virtio/media.rs`), and the decoder is VideoToolbox (`src/video/`): each access unit is split at its start codes, the parameter sets become a format description, the slices go to VideoToolbox length-prefixed, and the frame comes back as NV12 into a buffer the guest has mapped. VideoToolbox returns frames in decode order (asynchronous decode with temporal processing was tried and changes nothing), so the device reorders them itself, by the picture order count in each slice header and never by the guest's timestamps, which a client may set to anything: the Pi ffmpeg Frigate ships stamps packets with decode-order sequence numbers. It holds back as many frames as the stream's SPS declares (`src/video/sps.rs`), or learns the depth from the stream when it declares nothing, which costs a camera without B-frames no latency.
+
+**Frigate.** Pass the decoder as `ffmpeg.hwaccel_args: -c:v h264_v4l2m2m` on the camera and give the container `lighter.sh/video=all`. Not `preset-rpi-64-h264`: it expands to `-c:v:1 h264_v4l2m2m`, which names the second video stream, and a camera has one, so it silently decodes in software.
+
+**Timestamps.** A container over RTSP, MP4 or Matroska carries a timestamp on every frame, and the device returns each frame with its own. A bare `.h264` file has none: ffmpeg then sends zero for every frame and drops all but the first as duplicates, which is ffmpeg's behaviour with any V4L2 decoder. Wrap it (`-f matroska`) first.
+
+**Limits.** H.264 in, NV12 out, up to 8192 pixels a side. Each frame is copied once, from VideoToolbox's buffer into the guest's; zero copy waits on the driver's DMA-BUF support upstream. The buffers live in their own address-space aperture beside the GPU's and cost nothing until used. `lighter config --video off` removes the device.
+
 ## Gates
 
-`make gate-m9` (Vulkan: vulkaninfo through the CDI device), `make gate-m10` (an ONNX model through the plugin provider, outputs checked against the CPU), `make gate-m11` (a container's PyTorch training a model and running a convolution on `mps`), `make gate-m12` (llama-bench in a container over RPC to Metal, at least 80% of native generation when a native `llama-bench` is given). All need `docker` on the Mac and pull an image; m11 needs a Python with torch and MPS on the Mac (`LIGHTER_GATE_TORCH_PYTHON`); m12 needs an image with llama.cpp built with `GGML_RPC` (`LIGHTER_GATE_LLAMA_IMAGE_TAR`).
+`make gate-m9` (Vulkan: vulkaninfo through the CDI device), `make gate-m10` (an ONNX model through the plugin provider, outputs checked against the CPU), `make gate-m11` (a container's PyTorch training a model and running a convolution on `mps`), `make gate-m13` (a container's ffmpeg decoding 1080p with B-frames through `/dev/video0`, every frame compared with software decode, and the Mac's CPU a frame measured against software), `make gate-m12` (llama-bench in a container over RPC to Metal, at least 80% of native generation when a native `llama-bench` is given). All need `docker` on the Mac and pull an image; m11 needs a Python with torch and MPS on the Mac (`LIGHTER_GATE_TORCH_PYTHON`); m12 needs an image with llama.cpp built with `GGML_RPC` (`LIGHTER_GATE_LLAMA_IMAGE_TAR`).

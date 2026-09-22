@@ -9,16 +9,19 @@
 //! event the guest must answer with new CAPTURE buffers before anything
 //! more is read back), and the rest goes to the session as one sample.
 //! Decoding is synchronous, and VideoToolbox driven a sample at a time
-//! hands frames back in decode order, so the session reorders them itself,
-//! as ffmpeg's own VideoToolbox path does: frames wait in a buffer sorted by
-//! presentation time until it holds more than the stream's reorder depth
+//! hands frames back in decode order, so the session reorders them itself:
+//! frames wait in a buffer sorted by picture order count, read from each
+//! slice header, until it holds more than the stream's reorder depth
 //! (`sps.rs`), then the earliest goes out, into a CAPTURE buffer large
-//! enough to take it.
+//! enough to take it, carrying the timestamp its access unit came with.
+//! The order is the stream's and never the timestamps': a guest may stamp
+//! packets with anything (the Raspberry Pi ffmpeg Frigate ships stamps them
+//! with decode-order sequence numbers), as a hardware decoder allows.
 //!
 //! What this mirrors is `extras/ffmpeg-decoder` in the virtio-media tree,
 //! the reference backend, with VideoToolbox where it has libavcodec.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
@@ -32,6 +35,7 @@ use virtio_media::v4l2r::bindings;
 use virtio_media::v4l2r::ioctl::V4l2MplaneFormat;
 use virtio_media::v4l2r::{PixelFormat, QueueClass, QueueDirection, QueueType, Rect};
 
+use super::sps::{self, PocCounter, Sps};
 use super::vt_sys as vt;
 use crate::memory::HOST_PAGE;
 
@@ -196,8 +200,17 @@ fn nal_type(nal: &[u8]) -> u8 {
 /// A frame VideoToolbox handed back, held until a CAPTURE buffer takes it.
 struct Decoded {
     pixels: vt::CVPixelBufferRef,
-    pts: vt::CMTime,
+    /// The access unit's sequence number, which is what VideoToolbox was
+    /// given as its presentation time and hands back.
+    seq: i64,
+    /// Where it sorts, and the guest's timestamp, looked up by `seq` once
+    /// the frame is collected.
+    order: Order,
+    timestamp: bindings::timeval,
 }
+
+/// Presentation order: IDR epoch, then picture order count within it.
+type Order = (u64, i64);
 
 unsafe impl Send for Decoded {}
 
@@ -226,14 +239,22 @@ unsafe extern "C" fn on_frame(
         tracing::debug!(status, "VideoToolbox produced no frame");
         return;
     }
-    tracing::trace!(pts = pts.as_micros(), "VideoToolbox frame out");
+    tracing::trace!(seq = pts.value, "VideoToolbox frame out");
     // SAFETY: `refcon` is the `Arc<Sink>` pointer the session registered and
     // keeps alive until it is invalidated and drained.
     let sink = unsafe { &*(refcon as *const Sink) };
     unsafe { vt::CVPixelBufferRetain(image) };
     sink.lock()
         .expect("decoder sink poisoned")
-        .push_back(Decoded { pixels: image, pts });
+        .push_back(Decoded {
+            pixels: image,
+            seq: pts.value,
+            order: (0, 0),
+            timestamp: bindings::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        });
 }
 
 /// One decompression session for one set of parameter sets.
@@ -320,8 +341,9 @@ impl VtSession {
         })
     }
 
-    /// Decodes one access unit, its NALs length-prefixed in `avcc`.
-    fn decode(&self, avcc: &mut [u8], pts_us: i64) -> Result<(), vt::OSStatus> {
+    /// Decodes one access unit, its NALs length-prefixed in `avcc`; `seq`
+    /// comes back with the frame.
+    fn decode(&self, avcc: &mut [u8], seq: i64) -> Result<(), vt::OSStatus> {
         let mut block: vt::CMBlockBufferRef = std::ptr::null();
         let st = unsafe {
             vt::CMBlockBufferCreateWithMemoryBlock(
@@ -341,7 +363,7 @@ impl VtSession {
         }
         let timing = vt::CMSampleTimingInfo {
             duration: vt::CMTime::INVALID,
-            presentation_time_stamp: vt::CMTime::micros(pts_us),
+            presentation_time_stamp: vt::CMTime::micros(seq),
             decode_time_stamp: vt::CMTime::INVALID,
         };
         let size = avcc.len();
@@ -363,9 +385,10 @@ impl VtSession {
             unsafe { vt::CFRelease(block) };
             return Err(st);
         }
-        // Synchronous, and reordered into presentation order: the callback
-        // runs on this thread before the call returns, for this frame or
-        // for an earlier one the reordering released.
+        // Synchronous: the callback runs on this thread before the call
+        // returns, in decode order whatever the flags ask for (asynchronous
+        // decompression with temporal processing was measured to change
+        // nothing), hence the session's own reordering.
         let mut info = 0u32;
         let st = unsafe {
             vt::VTDecompressionSessionDecodeFrame(
@@ -413,11 +436,14 @@ struct Available {
 
 unsafe impl Send for Available {}
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Drain {
-    None,
-    /// The pipeline is flushed; the next free CAPTURE buffer carries LAST.
-    AwaitingLast,
+/// What the next free CAPTURE buffer is for.
+enum Ready {
+    /// A frame, and the coded size CAPTURE was formatted for when it was
+    /// decoded, which is the layout the guest reads it with.
+    Frame(Decoded, (u32, u32)),
+    /// An empty buffer flagged LAST: the end of a drain, or of the frames
+    /// of the old resolution when it changes while CAPTURE streams.
+    Last,
 }
 
 pub struct Session {
@@ -433,21 +459,31 @@ pub struct Session {
     stream: StreamParams,
     /// CAPTURE buffers the guest has queued, ready for a frame.
     available: VecDeque<Available>,
+    /// The current SPS, parsed, for reading slice headers.
+    sps_info: Option<Sps>,
+    /// Access units sent to VideoToolbox, numbered in decode order.
+    seq: i64,
+    /// What each access unit still in VideoToolbox's hands sorts as and
+    /// was stamped with, by sequence number.
+    in_flight: BTreeMap<i64, (Order, bindings::timeval)>,
+    /// IDRs seen: each restarts the picture order count.
+    epoch: u64,
+    poc: PocCounter,
     /// Frames VideoToolbox has returned, held until the reorder depth says
-    /// the earliest of them can go; sorted by presentation time.
+    /// the earliest of them can go; sorted by presentation order.
     reorder: Vec<Decoded>,
     /// Frames in presentation order, waiting for a CAPTURE buffer.
-    ready: VecDeque<Decoded>,
+    ready: VecDeque<Ready>,
     /// How many frames to hold back: the SPS's word, or learned.
     depth: u32,
     /// Whether `depth` came from the SPS, which is then never second-guessed.
     depth_declared: bool,
-    /// The presentation time of the last frame handed on, to notice a
-    /// stream that reorders more than was assumed.
-    last_out: Option<i64>,
+    /// Where the last frame handed on sorted, to notice a stream that
+    /// reorders more than was assumed.
+    last_out: Option<Order>,
     events: VecDeque<VideoDecoderBackendEvent>,
     accepting_output: bool,
-    drain: Drain,
+    capture_streaming: bool,
 }
 
 impl Session {
@@ -464,6 +500,11 @@ impl Session {
                 visible_rect: Rect::new(0, 0, DEFAULT_CODED_SIZE.0, DEFAULT_CODED_SIZE.1),
             },
             available: VecDeque::new(),
+            sps_info: None,
+            seq: 0,
+            in_flight: BTreeMap::new(),
+            epoch: 0,
+            poc: PocCounter::default(),
             reorder: Vec::new(),
             ready: VecDeque::new(),
             depth: 0,
@@ -471,7 +512,7 @@ impl Session {
             last_out: None,
             events: VecDeque::new(),
             accepting_output: true,
-            drain: Drain::None,
+            capture_streaming: false,
         }
     }
 
@@ -510,7 +551,7 @@ impl Session {
     }
 
     /// Decodes one access unit.
-    fn feed(&mut self, data: Vec<u8>, index: u32, pts_us: i64) -> IoctlResult<()> {
+    fn feed(&mut self, data: Vec<u8>, index: u32, timestamp: bindings::timeval) -> IoctlResult<()> {
         let nals = annexb_nals(&data);
         let changed = self.absorb_parameter_sets(&nals);
         if (changed || self.vt.is_none()) && !self.sps.is_empty() && !self.pps.is_empty() {
@@ -518,8 +559,9 @@ impl Session {
                 old.flush();
                 self.collect(true);
             }
-            match super::sps::parse(&self.sps) {
-                Some(super::sps::Sps {
+            self.sps_info = sps::parse(&self.sps);
+            match self.sps_info {
+                Some(Sps {
                     reorder: Some(n), ..
                 }) => {
                     self.depth = n;
@@ -551,6 +593,12 @@ impl Session {
                             to = format_args!("{}x{}", dims.0, dims.1),
                             "video stream resolution"
                         );
+                        // Mid-stream, the old resolution's frames (all
+                        // flushed above) end with a LAST buffer before any
+                        // of the new one.
+                        if self.capture_streaming {
+                            self.ready.push_back(Ready::Last);
+                        }
                         self.stream.coded_size = dims;
                         self.stream.visible_rect = Rect::new(0, 0, dims.0, dims.1);
                         if dims.0 > self.coded_size.0 || dims.1 > self.coded_size.1 {
@@ -573,7 +621,7 @@ impl Session {
                 }
             }
         }
-        let Some(vt) = &self.vt else {
+        if self.vt.is_none() {
             // Nothing decodable yet (no parameter sets): the buffer is
             // consumed and nothing comes of it.
             self.events
@@ -582,35 +630,58 @@ impl Session {
                     error: 0,
                 });
             return Ok(());
-        };
+        }
         let mut avcc = Session::avcc(&nals);
-        tracing::trace!(
-            index,
-            pts_us,
-            nals = nals.len(),
-            bytes = avcc.len(),
-            "video decode in"
-        );
-        let error = if avcc.is_empty() {
-            0
-        } else {
-            match vt.decode(&mut avcc, pts_us) {
-                Ok(()) => 0,
-                Err(st) => {
-                    tracing::debug!(st, "VideoToolbox rejected a frame");
-                    // A bad unit in a live stream is skipped, not fatal.
-                    0
-                }
+        if !avcc.is_empty() {
+            let seq = self.seq;
+            self.seq += 1;
+            let order = self.order_of(&nals, seq);
+            tracing::trace!(
+                index,
+                seq,
+                ?order,
+                nals = nals.len(),
+                bytes = avcc.len(),
+                "video decode in"
+            );
+            self.in_flight.insert(seq, (order, timestamp));
+            let vt = self.vt.as_ref().expect("checked above");
+            if let Err(st) = vt.decode(&mut avcc, seq) {
+                // A bad unit in a live stream is skipped, not fatal.
+                tracing::debug!(st, "VideoToolbox rejected a frame");
+                self.in_flight.remove(&seq);
             }
-        };
+        }
         self.events
             .push_back(VideoDecoderBackendEvent::InputBufferDone {
                 buffer_id: index,
-                error,
+                error: 0,
             });
         self.collect_decoded();
         self.emit_frames();
         Ok(())
+    }
+
+    /// Where an access unit sorts, from its first slice header: by picture
+    /// order count for type 0, and by decode order otherwise, which is
+    /// presentation order for type 2 by definition. Type 1 derives the
+    /// count from `frame_num` and offsets in the SPS, and nothing seen in
+    /// practice uses it with B-frames; it is left in decode order.
+    fn order_of(&mut self, nals: &[&[u8]], seq: i64) -> Order {
+        let Some(info) = self.sps_info else {
+            return (self.epoch, seq);
+        };
+        let Some(slice) = nals.iter().find_map(|n| sps::slice(n, &info)) else {
+            return (self.epoch, seq);
+        };
+        if slice.idr {
+            self.epoch += 1;
+        }
+        if info.poc_type == 0 {
+            (self.epoch, self.poc.next(&slice, info.log2_max_poc_lsb))
+        } else {
+            (self.epoch, seq)
+        }
     }
 
     /// Moves frames from the callback's sink into the reorder buffer, and
@@ -627,10 +698,18 @@ impl Session {
             .expect("decoder sink poisoned")
             .drain(..)
             .collect();
-        for frame in arrived {
-            let pts = frame.pts.as_micros().unwrap_or(0);
+        for mut frame in arrived {
+            let Some((order, timestamp)) = self.in_flight.remove(&frame.seq) else {
+                tracing::debug!(seq = frame.seq, "video frame for no access unit");
+                continue;
+            };
+            // Units VideoToolbox dropped without a callback never come back;
+            // anything older than a frame that did is one of them.
+            self.in_flight = self.in_flight.split_off(&frame.seq);
+            frame.order = order;
+            frame.timestamp = timestamp;
             if let Some(last) = self.last_out
-                && pts < last
+                && order < last
                 && !self.depth_declared
                 && self.depth < 16
             {
@@ -640,62 +719,52 @@ impl Session {
                     "video stream reorders; holding back one more frame"
                 );
             }
-            let at = self
-                .reorder
-                .partition_point(|f| f.pts.as_micros().unwrap_or(0) <= pts);
+            let at = self.reorder.partition_point(|f| f.order <= order);
             self.reorder.insert(at, frame);
         }
         while !self.reorder.is_empty() && (flush || self.reorder.len() as u32 > self.depth) {
             let frame = self.reorder.remove(0);
-            self.last_out = frame.pts.as_micros();
-            self.ready.push_back(frame);
+            self.last_out = Some(frame.order);
+            self.ready.push_back(Ready::Frame(frame, self.coded_size));
         }
     }
 
-    /// Copies ready frames into queued CAPTURE buffers, oldest first.
+    /// Fills queued CAPTURE buffers from `ready`, oldest first.
     fn emit_frames(&mut self) {
-        loop {
-            if self.ready.is_empty() {
-                if self.drain == Drain::AwaitingLast
-                    && let Some(out) = self.available.pop_front()
-                {
-                    self.drain = Drain::None;
-                    self.events
-                        .push_back(VideoDecoderBackendEvent::FrameCompleted {
-                            buffer_id: out.index,
-                            timestamp: bindings::timeval {
-                                tv_sec: 0,
-                                tv_usec: 0,
-                            },
-                            bytes_used: vec![],
-                            is_last: true,
-                        });
-                }
-                return;
-            }
+        while let Some(next) = self.ready.front() {
             let Some(out) = self.available.pop_front() else {
                 return;
             };
-            // A buffer from before a resolution change is too small for
-            // what is now decoded: the frame waits for the new ones.
-            if out.len < nv12_size(self.coded_size.0, self.coded_size.1) {
+            if let Ready::Frame(_, coded) = next
+                && out.len < nv12_size(coded.0, coded.1)
+            {
+                // A buffer from before a resolution change is too small for
+                // what is now decoded: the frame waits for the new ones.
                 self.available.push_front(out);
                 return;
             }
-            let frame = self.ready.pop_front().expect("checked");
-            let used = copy_nv12(&frame, self.coded_size, out.ptr, out.len);
-            let pts = frame.pts.as_micros().unwrap_or(0);
-            tracing::trace!(buffer = out.index, pts, used, "video frame out");
-            self.events
-                .push_back(VideoDecoderBackendEvent::FrameCompleted {
+            let event = match self.ready.pop_front().expect("checked") {
+                Ready::Frame(frame, coded) => {
+                    let used = copy_nv12(&frame, coded, out.ptr, out.len);
+                    tracing::trace!(buffer = out.index, order = ?frame.order, used, "video frame out");
+                    VideoDecoderBackendEvent::FrameCompleted {
+                        buffer_id: out.index,
+                        timestamp: frame.timestamp,
+                        bytes_used: vec![used as u32],
+                        is_last: false,
+                    }
+                }
+                Ready::Last => VideoDecoderBackendEvent::FrameCompleted {
                     buffer_id: out.index,
                     timestamp: bindings::timeval {
-                        tv_sec: pts.div_euclid(1_000_000),
-                        tv_usec: pts.rem_euclid(1_000_000),
+                        tv_sec: 0,
+                        tv_usec: 0,
                     },
-                    bytes_used: vec![used as u32],
-                    is_last: false,
-                });
+                    bytes_used: vec![],
+                    is_last: true,
+                },
+            };
+            self.events.push_back(event);
         }
     }
 
@@ -805,8 +874,7 @@ impl VideoDecoderBackendSession for Session {
         let plane = input.planes.first().ok_or(libc::EINVAL)?;
         let len = (bytes_used as usize).min(plane.len);
         let data = plane.bytes()[..len].to_vec();
-        let pts_us = timestamp.tv_sec.saturating_mul(1_000_000) + timestamp.tv_usec;
-        self.feed(data, index, pts_us)
+        self.feed(data, index, timestamp)
     }
 
     fn use_as_output(&mut self, index: u32, backing: &mut Backing) -> IoctlResult<()> {
@@ -840,7 +908,7 @@ impl VideoDecoderBackendSession for Session {
             buffers = self.available.len(),
             "video drain"
         );
-        self.drain = Drain::AwaitingLast;
+        self.ready.push_back(Ready::Last);
         self.emit_frames();
         Ok(())
     }
@@ -869,8 +937,11 @@ impl VideoDecoderBackendSession for Session {
     }
 
     fn streaming_state(&mut self, direction: QueueDirection, streaming: bool) {
-        if direction == QueueDirection::Capture && streaming {
-            self.accepting_output = true;
+        if direction == QueueDirection::Capture {
+            self.capture_streaming = streaming;
+            if streaming {
+                self.accepting_output = true;
+            }
         }
     }
 }
@@ -1012,7 +1083,15 @@ mod tests {
     #[test]
     fn a_unit_before_any_parameter_set_is_consumed_and_produces_nothing() {
         let mut s = Session::new();
-        s.feed(vec![0, 0, 1, 0x65, 1, 2], 3, 40_000).unwrap();
+        s.feed(
+            vec![0, 0, 1, 0x65, 1, 2],
+            3,
+            bindings::timeval {
+                tv_sec: 0,
+                tv_usec: 40_000,
+            },
+        )
+        .unwrap();
         assert!(matches!(
             s.events.pop_front(),
             Some(VideoDecoderBackendEvent::InputBufferDone {
@@ -1023,17 +1102,35 @@ mod tests {
         assert!(s.events.is_empty());
     }
 
-    fn frame(pts_ms: i64) -> Decoded {
-        Decoded {
+    /// An access unit VideoToolbox has returned: `poc` is where it sorts,
+    /// `stamp` the guest's timestamp for it, in seconds.
+    fn returned(s: &mut Session, poc: i64, stamp: i64) {
+        let seq = s.seq;
+        s.seq += 1;
+        let timestamp = bindings::timeval {
+            tv_sec: stamp,
+            tv_usec: 0,
+        };
+        s.in_flight.insert(seq, ((1, poc), timestamp));
+        s.sink.lock().unwrap().push_back(Decoded {
             pixels: std::ptr::null(),
-            pts: vt::CMTime::micros(pts_ms * 1000),
-        }
+            seq,
+            order: (0, 0),
+            timestamp: bindings::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        });
+        s.collect_decoded();
     }
 
-    fn ready_pts(s: &Session) -> Vec<i64> {
+    fn ready_stamps(s: &Session) -> Vec<i64> {
         s.ready
             .iter()
-            .map(|f| f.pts.as_micros().unwrap() / 1000)
+            .filter_map(|r| match r {
+                Ready::Frame(f, _) => Some(f.timestamp.tv_sec),
+                Ready::Last => None,
+            })
             .collect()
     }
 
@@ -1042,28 +1139,92 @@ mod tests {
         let mut s = Session::new();
         s.depth = 2;
         s.depth_declared = true;
-        // I P B B as x264 -bf 2 emits them: 0, 100, 33, 67 in decode order.
-        for pts in [0, 100, 33, 67] {
-            s.sink.lock().unwrap().push_back(frame(pts));
-            s.collect_decoded();
+        // I P B B as x264 -bf 2 emits them, stamped as a camera's RTSP
+        // does: in presentation time.
+        for (poc, stamp) in [(0, 0), (6, 100), (2, 33), (4, 67)] {
+            returned(&mut s, poc, stamp);
         }
-        assert_eq!(ready_pts(&s), vec![0, 33]);
+        assert_eq!(ready_stamps(&s), vec![0, 33]);
         s.collect(true);
-        assert_eq!(ready_pts(&s), vec![0, 33, 67, 100]);
+        assert_eq!(ready_stamps(&s), vec![0, 33, 67, 100]);
+    }
+
+    #[test]
+    fn order_comes_from_the_stream_not_the_guests_timestamps() {
+        // The Raspberry Pi ffmpeg Frigate ships stamps each packet with a
+        // sequence number in decode order and expects it back on the frame
+        // it became: sorting by timestamp would hand the frames out as they
+        // were decoded.
+        let mut s = Session::new();
+        s.depth = 2;
+        s.depth_declared = true;
+        for (seq, poc) in [0, 6, 2, 4, 12, 8, 10].into_iter().enumerate() {
+            returned(&mut s, poc, seq as i64);
+        }
+        s.collect(true);
+        assert_eq!(ready_stamps(&s), vec![0, 2, 3, 1, 5, 6, 4]);
     }
 
     #[test]
     fn an_undeclared_depth_is_learned_from_the_first_late_frame() {
         let mut s = Session::new();
-        for pts in [0, 100, 33, 67, 200, 133, 167] {
-            s.sink.lock().unwrap().push_back(frame(pts));
-            s.collect_decoded();
+        for (poc, stamp) in [
+            (0, 0),
+            (6, 100),
+            (2, 33),
+            (4, 67),
+            (12, 200),
+            (8, 133),
+            (10, 167),
+        ] {
+            returned(&mut s, poc, stamp);
         }
         // Both B-frames of the first group arrived behind 100, each raising
         // the depth by one, to the 2 this stream's SPS would have declared;
         // the frames before that are lost to order, those after are not.
         assert_eq!(s.depth, 2);
-        assert_eq!(ready_pts(&s), vec![0, 100, 33, 67, 133]);
+        assert_eq!(ready_stamps(&s), vec![0, 100, 33, 67, 133]);
+    }
+
+    #[test]
+    fn a_drain_ends_with_an_empty_last_buffer_once_one_is_queued() {
+        let mut s = Session::new();
+        s.drain().unwrap();
+        assert!(s.events.is_empty());
+        let mut shm = Shm::new(1).unwrap();
+        s.available.push_back(Available {
+            index: 5,
+            ptr: shm.bytes_mut().as_mut_ptr(),
+            len: shm.len,
+        });
+        s.emit_frames();
+        assert!(matches!(
+            s.events.pop_front(),
+            Some(VideoDecoderBackendEvent::FrameCompleted {
+                buffer_id: 5,
+                is_last: true,
+                ..
+            })
+        ));
+        assert!(s.ready.is_empty());
+    }
+
+    #[test]
+    fn a_unit_videotoolbox_dropped_is_forgotten() {
+        let mut s = Session::new();
+        s.in_flight.insert(
+            0,
+            (
+                (1, 0),
+                bindings::timeval {
+                    tv_sec: 9,
+                    tv_usec: 0,
+                },
+            ),
+        );
+        s.seq = 1;
+        returned(&mut s, 2, 1);
+        assert!(s.in_flight.is_empty());
     }
 
     #[test]

@@ -29,6 +29,11 @@ impl CtrlId {
             Ok(CtrlId(ctrl))
         }
     }
+
+    /// The control's id, as a device answering the ioctl needs it.
+    pub fn id(&self) -> u32 {
+        self.0
+    }
 }
 
 bitflags! {

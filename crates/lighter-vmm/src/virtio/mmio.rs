@@ -86,6 +86,8 @@ pub struct VirtioMmio {
     config_generation: u32,
     /// Set once `DRIVER_OK` has been seen, so activation happens exactly once.
     activated: bool,
+    /// Queues the driver notified before `DRIVER_OK`, serviced on it.
+    early_kicks: u64,
     /// Called when the guest writes the notification register. See
     /// [`VirtioMmio::set_kick_observer`].
     kick_observer: Option<Arc<dyn Fn(u16) + Send + Sync>>,
@@ -222,6 +224,7 @@ impl VirtioMmio {
             line,
             config_generation: 0,
             activated: false,
+            early_kicks: 0,
             kick_observer: None,
             signals,
         }
@@ -246,6 +249,7 @@ impl VirtioMmio {
         self.line.acknowledge(u32::MAX);
         self.queue_sel = 0;
         self.activated = false;
+        self.early_kicks = 0;
     }
 
     /// Handles the driver writing device status.
@@ -276,6 +280,10 @@ impl VirtioMmio {
             }
             self.device.activate(self.memory.clone());
             tracing::debug!(device = self.device.name(), "driver ready");
+            let early = std::mem::take(&mut self.early_kicks);
+            for index in (0..64u16).filter(|i| early & (1 << i) != 0) {
+                self.notify_queue(index);
+            }
         }
     }
 
@@ -285,13 +293,18 @@ impl VirtioMmio {
         NOTIFIES_BY_KIND[notify_kind(self.device.name())]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.activated {
-            // A notification before DRIVER_OK is a driver bug, not something to
-            // service: the device has no memory to work against yet.
-            tracing::warn!(
+            // A driver may fill a queue during probe and kick it before
+            // DRIVER_OK (virtio-media's event queue, virtio-balloon's stats
+            // queue); the device must not touch it until then, and must not
+            // lose the kick either, so it is serviced on activation.
+            tracing::debug!(
                 device = self.device.name(),
                 index,
-                "queue notified before the driver was ready"
+                "queue notified before the driver was ready; deferred"
             );
+            if index < 64 {
+                self.early_kicks |= 1 << index;
+            }
             return;
         }
 
@@ -720,7 +733,7 @@ mod tests {
     use crate::virtio::{Serviced, device_type};
 
     struct Fake {
-        notified: Vec<u16>,
+        notified: Arc<std::sync::Mutex<Vec<u16>>>,
         activated: bool,
         reset_count: u32,
     }
@@ -742,7 +755,7 @@ mod tests {
             self.activated = true;
         }
         fn notify(&mut self, queue: u16, _q: &mut [Virtqueue], _m: &GuestMemory) -> Serviced {
-            self.notified.push(queue);
+            self.notified.lock().unwrap().push(queue);
             Serviced::NONE
         }
         fn reset(&mut self) {
@@ -751,9 +764,13 @@ mod tests {
     }
 
     fn transport() -> VirtioMmio {
+        transport_with(Arc::default())
+    }
+
+    fn transport_with(notified: Arc<std::sync::Mutex<Vec<u16>>>) -> VirtioMmio {
         VirtioMmio::new(
             Box::new(Fake {
-                notified: Vec::new(),
+                notified,
                 activated: false,
                 reset_count: 0,
             }),
@@ -861,12 +878,18 @@ mod tests {
     }
 
     /// Servicing a queue before the driver is ready would run the device
-    /// against memory it has not been given.
+    /// against memory it has not been given; dropping the kick would leave
+    /// what the driver queued during probe unseen until its next kick.
     #[test]
-    fn notifications_before_driver_ok_are_refused() {
-        let mut t = transport();
+    fn notifications_before_driver_ok_wait_for_it() {
+        let notified = Arc::<std::sync::Mutex<Vec<u16>>>::default();
+        let mut t = transport_with(notified.clone());
+        write32(&mut t, QUEUE_NOTIFY, 0);
         write32(&mut t, QUEUE_NOTIFY, 0);
         assert!(!t.is_activated());
+        assert!(notified.lock().unwrap().is_empty());
+        write32(&mut t, STATUS, status::DRIVER_OK);
+        assert_eq!(*notified.lock().unwrap(), vec![0]);
     }
 
     #[test]
