@@ -63,3 +63,4 @@ benchmarks/results/gate-*.csv
 /guest/torch-mps/lighter_mps/*.so
 __pycache__/
 *.pyc
+benchmarks/RESULTS.md

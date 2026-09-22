@@ -94,7 +94,7 @@ These are standard kind configuration options; see the upstream
 
 ## Tested scope
 
-The [0.5.0 qualification record](release-0.5.0.md) tracks release readiness and
+The 0.5.0 qualification record (in the worklog) tracks release readiness and
 links the evidence. The version matrix uses these exact node digests:
 
 | Kubernetes | kindest/node digest | Topology |

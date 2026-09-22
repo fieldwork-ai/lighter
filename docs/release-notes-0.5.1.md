@@ -29,5 +29,4 @@ installation-ownership behaviour remain supported. Updates preserve VM
 configuration and container data; Homebrew installations remain managed by
 Homebrew.
 
-[Qualification and artifact details](release-0.5.1.md) ·
-[Performance measurements](../benchmarks/RELEASE-0.5.1.md)
+Qualification, artifact details and measurements: the worklog's 0.5.1 rows.

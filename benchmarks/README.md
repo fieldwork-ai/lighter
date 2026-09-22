@@ -12,11 +12,12 @@ python3 benchmarks/report.py
 
 Use `latency.sh` to investigate individual operations and the full workload suite
 to measure application-level effects. Each has its own run-to-run variation;
-see [repeatability](REPEATABILITY.md) before interpreting a difference.
+read a release's record rows in `../docs/worklog.md` for what a workload's
+fresh-run spread looks like before interpreting a difference.
 
 Selected CSVs and their small `.tree` environment descriptions live in
 `results/` and `results/machines/<machine>/`. The selection manifests identify
-the inputs for `report.py`, which generates `RESULTS.md`. Keep labelled scratch
+the inputs for `report.py`, which writes `RESULTS.md` (untracked). Keep labelled scratch
 runs separate; update selected inputs deliberately when publishing new figures.
 A directory without a selection manifest reads its local CSVs.
 
@@ -81,8 +82,7 @@ Controlled release runs also load identical prebuilt arm64/amd64 image archives
 through `LIGHTER_BENCH_IMAGE_DIR`; each archive hash and loaded image ID is
 verified, and the native tool versions and image ID accompany each CSV.
 
-Use the workload-specific, fresh-run CVs in [REPEATABILITY.md](REPEATABILITY.md),
-not a universal five-percent cutoff. The 0.5.0 record runs three full suites on
+Use the workload's own fresh-run variation, not a universal five-percent cutoff. The 0.5.0 record runs three full suites on
 each host, five additional fresh storage suites, and a separate old/new/new/old
 comparison. Each storage case contributes the median of three ordered timings.
 The between-run CV uses the sample standard deviation divided by the mean of
@@ -105,8 +105,8 @@ throughout a workload, so the continuous observations matter too.
 Alternate version order when checking an apparent change, preserve the original
 record, and disclose any follow-up selected after seeing its result. Alternation
 reduces some order effects; it cannot ensure interference affects both versions
-equally. The [0.5.0 report](RELEASE-0.5.0.md) records the complete comparison and
-its limits, including the unusually variable M1 read case.
+equally. The worklog's 0.5.0 rows record the complete comparison and its
+limits, including the unusually variable M1 read case.
 
 ## Historical filesystem investigations
 

@@ -164,7 +164,7 @@ for 4 GiB on M1 took 0.227 s and increased global wired pages by about 55.7 MiB.
 On M5, 1,572,864 objects for 24 GiB took 1.004 s and increased global wired pages
 by about 230 MiB. These are separate kernel allocations; the probe did not
 map them into a VM or touch guest RAM. Kernel zones may retain freed metadata
-for reuse. The [release measurements](../benchmarks/RELEASE-0.4.1.md) record the startup cost and full workload results for this tradeoff.
+for reuse. The 0.4.1 record (the worklog) records the startup cost and full workload results for this tradeoff.
 
 ## Smaller configurations and build OOM priority
 

@@ -97,7 +97,7 @@ with the VMM.
 ## Final release qualification
 
 The frozen runtime and final signed, notarized archive have completed
-qualification. [The release report](release-0.5.1.md) records all three full M1
+qualification. The 0.5.1 record rows in the worklog record all three full M1
 suites, separate comparisons of the signed release archives, installation,
 rollback, kind and Homebrew checks. The final image-only signed comparison
 measures Docker readiness at 716.5 → 536.3 ms and first-container completion at

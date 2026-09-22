@@ -42,7 +42,7 @@ mkdir -p "$STAGE/bin" "$STAGE/share/lighter"
 CERT_ITEM="y5xjyzmpol4yyhknepjgr3sejm"   # Apple Developer ID Application cert
 ASC_ITEM="uepybi2uwfzpv7wlnyoeiuidse"    # App Store Connect API key (notarization)
 CACHE="$ROOT/.context"
-APP_CACHE="/Users/nick/git/app/.context"
+APP_CACHE="${LIGHTER_RELEASE_CREDENTIAL_CACHE:-$HOME/.lighter-release-credentials}"
 
 KEYCHAIN=""
 ORIGINAL_KEYCHAINS=()

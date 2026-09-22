@@ -237,8 +237,8 @@ notarized-archive qualification remains outstanding.
 
 ## Release qualification
 
-The [0.5.1 performance report](../benchmarks/RELEASE-0.5.1.md) owns the final
+The 0.5.1 record (the worklog's rows for it) owns the final
 full-suite results, selection/exclusions, cache-matched follow-ups and their
-interpretation. The [release qualification](release-0.5.1.md) owns correctness,
+interpretation. The release qualification, likewise, owns correctness,
 signed-artifact validation and publication readiness. The experiments above
 explain the design choice; they are not additional release benchmark suites.

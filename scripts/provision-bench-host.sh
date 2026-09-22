@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepare another Mac to run the benchmarks.
 #
-#   scripts/provision-bench-host.sh admin@192.168.50.21
+#   scripts/provision-bench-host.sh user@bench-host
 #
 # A benchmark host has to be quiet, and the machine you work on is not. This
 # sets up a second one: toolchain, the fixture's dependencies, the repository,

@@ -1,6 +1,6 @@
 # lighter 0.7.0: the GPU, the Neural Engine and PyTorch in containers
 
-Status: built. Approved 2026-09-19, spikes passed the same day, all three devices working end to end on the M1 by the evening (gates m9, m10, m11), and a fourth added the same night on the numbers: `lighter.sh/metal`, ggml's RPC server on the Metal backend, because the Vulkan device's generation speed is a MoltenVK ceiling (gate m12). 0.7.0 is the release (`release-notes-0.7.0.md`, `gpu.md`; the latter also records why the fourth device's generation gap was thread scheduling on the Mac and what holds it closed). This note stays as the record of the decisions and the spikes. Three tracks, one release, one qualification. Experiments land as rows in `worklog.md` as they happen.
+Status: built. Approved 2026-09-19, spikes passed the same day (their code was kept in the tree until 0.7.3 and is in the history before it), all three devices working end to end on the M1 by the evening (gates m9, m10, m11), and a fourth added the same night on the numbers: `lighter.sh/metal`, ggml's RPC server on the Metal backend, because the Vulkan device's generation speed is a MoltenVK ceiling (gate m12). 0.7.0 is the release (`release-notes-0.7.0.md`, `gpu.md`; the latter also records why the fourth device's generation gap was thread scheduling on the Mac and what holds it closed). This note stays as the record of the decisions and the spikes. Three tracks, one release, one qualification. Experiments land as rows in `worklog.md` as they happen.
 
 ## What ships
 
