@@ -61,6 +61,50 @@ use crate::virtio::mmio::VirtioMmio;
 /// Zero turns it off, which is what `LIGHTER_HOST_POLL_US=0` is for.
 const IDLE_WINDOW: std::time::Duration = std::time::Duration::from_micros(200);
 
+/// Whether watching is paying, from what the last windows caught.
+///
+/// A window that catches a request saves the guest a trap (about two and a
+/// half microseconds) for up to [`IDLE_WINDOW`] of a core. In a package
+/// install every window catches dozens; under a trickle (a home server's
+/// camera frames, a heartbeat) nearly none catch anything, and a window per
+/// kick was a percent and a half of a core spent watching an empty ring. So
+/// after [`MISSES`] empty windows in a row the poller stops watching for a
+/// while, doubling from 10 ms to [`BACKOFF_MAX`] as it keeps not paying, and
+/// the first window that catches something puts it straight back.
+#[derive(Debug, Default)]
+pub(crate) struct Payoff {
+    misses: u32,
+    backoff: std::time::Duration,
+    off_until: Option<std::time::Instant>,
+}
+
+const MISSES: u32 = 4;
+const BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(10);
+const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl Payoff {
+    pub(crate) fn should_watch(&self, now: std::time::Instant) -> bool {
+        self.off_until.is_none_or(|until| now >= until)
+    }
+
+    pub(crate) fn record(&mut self, caught: usize, now: std::time::Instant) {
+        if caught > 0 {
+            *self = Payoff::default();
+            return;
+        }
+        self.misses += 1;
+        if self.misses >= MISSES {
+            self.misses = 0;
+            self.backoff = if self.backoff.is_zero() {
+                BACKOFF_MIN
+            } else {
+                (self.backoff * 2).min(BACKOFF_MAX)
+            };
+            self.off_until = Some(now + self.backoff);
+        }
+    }
+}
+
 /// The handle a poller parks on, and that the transport pokes.
 #[derive(Default)]
 pub struct Kicks {
@@ -165,6 +209,8 @@ pub(crate) fn spawn_with_window(
         .name(format!("poll-{name}"))
         .spawn(move || {
             crate::virtio::fs::raise_server_qos();
+            let adapt = std::env::var("LIGHTER_HOST_POLL_ADAPT").as_deref() != Ok("0");
+            let mut payoff = Payoff::default();
             loop {
                 let deadline = transport
                     .lock()
@@ -184,6 +230,9 @@ pub(crate) fn spawn_with_window(
                         continue;
                     }
                 }
+                if adapt && !payoff.should_watch(std::time::Instant::now()) {
+                    continue;
+                }
                 // The kick that woke us has already been serviced by the vCPU
                 // that made it; from here the guest is told to stop bothering.
                 //
@@ -199,7 +248,8 @@ pub(crate) fn spawn_with_window(
                     }
                 }
 
-                watch(&transport, &signals, &memory, window);
+                let caught = watch(&transport, &signals, &memory, window);
+                payoff.record(caught, std::time::Instant::now());
 
                 // Clearing, then looking again — repeatedly. A driver that saw
                 // the flag set and skipped its kick is relying on this, and one
@@ -238,7 +288,8 @@ pub(crate) fn spawn_with_window(
         })
 }
 
-/// Spins on the ring until it has been quiet for `window`.
+/// Spins on the ring until it has been quiet for `window`; returns how many
+/// times it found work.
 ///
 /// The probe is lock-free and the spin has no syscall in it. Both matter: the
 /// thread being waited on is a vCPU, and anything this loop does that the
@@ -249,7 +300,8 @@ fn watch(
     signals: &[(u16, Arc<crate::virtio::mmio::QueueSignal>)],
     memory: &GuestMemory,
     window: std::time::Duration,
-) {
+) -> usize {
+    let mut caught = 0;
     // The clock is read only on an empty iteration. While every look finds
     // work there is no quiet to time, and a sample of the egress case had
     // `Instant::now` at a quarter of this thread's busy samples.
@@ -269,13 +321,14 @@ fn watch(
             }
         }
         if found {
+            caught += 1;
             idle_since = None;
             continue;
         }
         let now = std::time::Instant::now();
         match idle_since {
             None => idle_since = Some(now),
-            Some(since) if now.duration_since(since) >= window => return,
+            Some(since) if now.duration_since(since) >= window => return caught,
             Some(_) => {}
         }
         std::hint::spin_loop();
@@ -304,6 +357,32 @@ mod tests {
         let kicks = Kicks::new();
         kicks.kicked();
         assert!(kicks.wait());
+    }
+
+    #[test]
+    fn empty_windows_back_off_and_a_catch_resumes() {
+        let t0 = std::time::Instant::now();
+        let mut p = Payoff::default();
+        for _ in 0..MISSES - 1 {
+            p.record(0, t0);
+            assert!(p.should_watch(t0));
+        }
+        p.record(0, t0);
+        assert!(!p.should_watch(t0));
+        assert!(p.should_watch(t0 + BACKOFF_MIN));
+        for _ in 0..MISSES {
+            p.record(0, t0);
+        }
+        assert!(!p.should_watch(t0 + BACKOFF_MIN), "the backoff doubles");
+        for _ in 0..64 {
+            p.record(0, t0);
+        }
+        assert!(p.should_watch(t0 + BACKOFF_MAX), "and is capped");
+        p.record(3, t0);
+        assert!(
+            p.should_watch(t0),
+            "a window that catches something resumes"
+        );
     }
 
     #[test]
