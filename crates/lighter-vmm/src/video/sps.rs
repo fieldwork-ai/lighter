@@ -13,13 +13,23 @@
 //!   (output order is decode order, by definition) or a Baseline profile,
 //!   which has no B-slices; cameras are mostly one or the other;
 //! - otherwise unknown, and the decoder learns it from the stream.
+//!
+//! What that order IS comes from each slice header's picture order count
+//! (8.2.1), not from the timestamps the guest put on the packets, which a
+//! client may set to anything.
 
 /// What the decoder needs from an SPS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Sps {
     pub profile_idc: u8,
     /// Frames to hold back; `None` when the SPS does not say.
     pub reorder: Option<u32>,
+    /// What a slice header is read with (7.3.3).
+    pub separate_colour_plane: bool,
+    pub log2_max_frame_num: u32,
+    pub poc_type: u32,
+    pub log2_max_poc_lsb: u32,
+    pub frame_mbs_only: bool,
 }
 
 /// Parses an SPS NAL (header byte included). `None` if it is not one, or
@@ -34,13 +44,14 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
     r.bits(8)?; // constraint flags
     r.bits(8)?; // level_idc
     r.ue()?; // seq_parameter_set_id
+    let mut separate_colour_plane = false;
     if matches!(
         profile_idc,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
     ) {
         let chroma_format_idc = r.ue()?;
         if chroma_format_idc == 3 {
-            r.bit()?; // separate_colour_plane_flag
+            separate_colour_plane = r.bit()?;
         }
         r.ue()?; // bit_depth_luma_minus8
         r.ue()?; // bit_depth_chroma_minus8
@@ -55,11 +66,12 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
             }
         }
     }
-    r.ue()?; // log2_max_frame_num_minus4
+    let log2_max_frame_num = r.ue()? + 4;
     let poc_type = r.ue()?;
+    let mut log2_max_poc_lsb = 0;
     match poc_type {
         0 => {
-            r.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+            log2_max_poc_lsb = r.ue()? + 4;
         }
         1 => {
             r.bit()?; // delta_pic_order_always_zero_flag
@@ -76,8 +88,8 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
     r.bit()?; // gaps_in_frame_num_value_allowed_flag
     r.ue()?; // pic_width_in_mbs_minus1
     r.ue()?; // pic_height_in_map_units_minus1
-    if !r.bit()? {
-        // frame_mbs_only_flag
+    let frame_mbs_only = r.bit()?;
+    if !frame_mbs_only {
         r.bit()?; // mb_adaptive_frame_field_flag
     }
     r.bit()?; // direct_8x8_inference_flag
@@ -96,7 +108,91 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
     Some(Sps {
         profile_idc,
         reorder: vui.or(implied),
+        separate_colour_plane,
+        log2_max_frame_num,
+        poc_type,
+        log2_max_poc_lsb,
+        frame_mbs_only,
     })
+}
+
+/// What presentation order needs from a slice header (7.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slice {
+    pub idr: bool,
+    /// `nal_ref_idc` is nonzero.
+    pub reference: bool,
+    /// `pic_order_cnt_lsb`, when the SPS counts in type 0; else 0.
+    pub poc_lsb: u32,
+}
+
+/// Reads a coded slice NAL's header (header byte included). `None` for any
+/// other NAL, or one that ends first.
+pub fn slice(nal: &[u8], sps: &Sps) -> Option<Slice> {
+    let header = *nal.first()?;
+    let kind = header & 0x1f;
+    if kind != 1 && kind != 5 {
+        return None;
+    }
+    // The fields sit in the first few bytes; 64 is generous.
+    let rbsp = unescape(&nal[1..nal.len().min(64)]);
+    let mut r = Bits::new(&rbsp);
+    r.ue()?; // first_mb_in_slice
+    r.ue()?; // slice_type
+    r.ue()?; // pic_parameter_set_id
+    if sps.separate_colour_plane {
+        r.bits(2)?; // colour_plane_id
+    }
+    r.bits(sps.log2_max_frame_num)?; // frame_num
+    if !sps.frame_mbs_only && r.bit()? {
+        // field_pic_flag
+        r.bit()?; // bottom_field_flag
+    }
+    if kind == 5 {
+        r.ue()?; // idr_pic_id
+    }
+    let poc_lsb = if sps.poc_type == 0 {
+        r.bits(sps.log2_max_poc_lsb)? as u32
+    } else {
+        0
+    };
+    Some(Slice {
+        idr: kind == 5,
+        reference: header & 0x60 != 0,
+        poc_lsb,
+    })
+}
+
+/// Picture order count, type 0 (8.2.1.1): the slice header's lsb, and an msb
+/// carried from the previous reference picture across the lsb's wrap, both
+/// reset by an IDR.
+#[derive(Debug, Default)]
+pub struct PocCounter {
+    prev_msb: i64,
+    prev_lsb: i64,
+}
+
+impl PocCounter {
+    pub fn next(&mut self, slice: &Slice, log2_max_lsb: u32) -> i64 {
+        if slice.idr {
+            self.prev_msb = 0;
+            self.prev_lsb = 0;
+        }
+        let max = 1i64 << log2_max_lsb;
+        let lsb = i64::from(slice.poc_lsb);
+        let msb = if lsb < self.prev_lsb && self.prev_lsb - lsb >= max / 2 {
+            self.prev_msb + max
+        } else if lsb > self.prev_lsb && lsb - self.prev_lsb > max / 2 {
+            self.prev_msb - max
+        } else {
+            self.prev_msb
+        };
+        if slice.reference {
+            self.prev_msb = msb;
+            self.prev_lsb = lsb;
+        }
+        msb + lsb
+    }
 }
 
 /// `max_num_reorder_frames`, if the VUI carries a bitstream restriction.
@@ -283,8 +379,8 @@ mod tests {
 
     #[test]
     fn baseline_without_vui_reorders_nothing() {
-        // Baseline, level 3.0, sps_id 0, log2_max_frame_num 0 (ue 1), poc
-        // type 0, lsb 0, 1 ref, no gaps, 40x30 MBs, frame_mbs_only,
+        // Baseline, level 3.0, sps_id 0, log2_max_frame_num 4, poc
+        // type 0, log2_max_poc_lsb 4, 1 ref, no gaps, 40x30 MBs, frame_mbs_only,
         // direct_8x8, no cropping, no VUI.
         let mut w = Writer::default();
         w.bits(66, 8);
@@ -304,21 +400,57 @@ mod tests {
         w.bits(0, 1);
         let mut nal = vec![0x67];
         nal.extend(w.finish());
+        let sps = parse(&nal).expect("parses");
+        assert_eq!((sps.profile_idc, sps.reorder), (66, Some(0)));
         assert_eq!(
-            parse(&nal),
-            Some(Sps {
-                profile_idc: 66,
-                reorder: Some(0)
-            })
+            (sps.log2_max_frame_num, sps.poc_type, sps.log2_max_poc_lsb),
+            (4, 0, 4)
         );
         nal[1] = 77; // Main: may carry B-frames, and says nothing
+        assert_eq!(parse(&nal).map(|s| s.reorder), Some(None));
+    }
+
+    #[test]
+    fn picture_order_wraps_and_resets() {
+        let s = |idr, reference, poc_lsb| Slice {
+            idr,
+            reference,
+            poc_lsb,
+        };
+        let mut poc = PocCounter::default();
+        // A 4-bit lsb wraps at 16: I0 P4 b2 P12, then P2 is 18 and b0 is 16.
+        assert_eq!(poc.next(&s(true, true, 0), 4), 0);
+        assert_eq!(poc.next(&s(false, true, 4), 4), 4);
+        assert_eq!(poc.next(&s(false, false, 2), 4), 2);
+        assert_eq!(poc.next(&s(false, true, 12), 4), 12);
+        assert_eq!(poc.next(&s(false, true, 2), 4), 18);
+        assert_eq!(poc.next(&s(false, false, 0), 4), 16);
+        assert_eq!(poc.next(&s(true, true, 0), 4), 0);
+    }
+
+    #[test]
+    fn a_slice_header_reads_to_its_lsb() {
+        let sps = parse(X264_HIGH_BF2).expect("parses");
+        assert_eq!(sps.poc_type, 0);
+        // A non-IDR reference slice: first_mb 0, P (5), pps 0, frame_num 3,
+        // lsb 6.
+        let mut w = Writer::default();
+        w.ue(0);
+        w.ue(5);
+        w.ue(0);
+        w.bits(3, sps.log2_max_frame_num);
+        w.bits(6, sps.log2_max_poc_lsb);
+        let mut nal = vec![0x41];
+        nal.extend(w.finish());
         assert_eq!(
-            parse(&nal),
-            Some(Sps {
-                profile_idc: 77,
-                reorder: None
+            slice(&nal, &sps),
+            Some(Slice {
+                idr: false,
+                reference: true,
+                poc_lsb: 6
             })
         );
+        assert_eq!(slice(&[0x68, 0xff], &sps), None);
     }
 
     #[test]
