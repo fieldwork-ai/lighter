@@ -1,6 +1,6 @@
 # Memory for a guest that is never idle: 2026-09-21
 
-Status: proposal for 0.7.3, nothing built. Written after an evening on the
+Status: built and measured for 0.7.3 (results at the end); the design as proposed, with one correction about what the cache was. Written after an evening on the
 M5 (48 GB, 0.7.2, the daily stack: Frigate on the Neural Engine, Home
 Assistant, Whisper, Piper, Mosquitto, and the app's dev stack of Postgres,
 MinIO, Mailpit, a query runner and seven s3-brokers) that began as "lighter
@@ -447,3 +447,82 @@ over an hour with the loop off.
   `Documentation/admin-guide/mm/damon/usage.rst` (online `commit`).
 - ONNX Runtime, `onnxruntime_session_options_config_keys.h`
   (`session.intra_op.allow_spinning`, `session.inter_op.allow_spinning`).
+
+## Results, 2026-09-22
+
+Built as proposed: the loop (`guest/agent/src/warm.rs`), the gain on the
+control channel, the doctor row, the `warm` case, the helper's spinning
+fix and its gate. Two things the building found that the proposal did not.
+
+**The host's word had never reached the guest.** `ask_agent` wrote its line
+into the host end of the socket pair it handed to `vsock.open`, which
+nothing forwards, and read the pair for an answer the device had queued on
+the connection instead. Every reclaim asked ahead of a balloon step since
+0.7.2 timed out after thirty seconds at debug level, and no machine ever
+logged one that worked. Found when the gain went the same way and the
+agent's report said `gain=1`. Both directions now go through the device,
+and the warm case fails if the gain the host said is not the gain the
+agent reports. The reclaim-ahead is therefore new in 0.7.3 and was run as
+its own arm.
+
+**The recordings were not the cache.** Files written through the share are
+not held in the guest's page cache (a 300 MB write charged 1 MiB; the read
+back charged 301), and an hour's sampling with Frigate recording had its
+cgroup flat at 300 to 550 MiB. The guest's cache was the engine's image
+builds and the dev stack's own writes, which the loop reaches.
+
+The warm case, one gigabyte written to the guest's disk in the first two
+minutes and held for three more, the two re-readers every 20 s, 300 s,
+one run per arm (`benchmarks/results/machines/*-warm-0.7.3/`):
+
+| machine, guest | arm | footprint MiB | cache MiB | re-read disk / share ms | reclaimed MiB | held (periods) |
+|---|---|---|---|---|---|---|
+| M5, 16 GiB | loop off | 4524 | 2999 | 289 / 521 | 0 | |
+| M5, 16 GiB | gain 8 | 4137 | 2514 | 292 / 541 | 582 | 0 of 58 |
+| M5, 16 GiB | gain 20 | 4030 | 2043 | 315 / 561 | 1255 | 2 of 58 |
+| M1, 4 GiB | loop off | 3023 | 2070 | 1047 / 2003 | 0 | |
+| M1, 4 GiB | gain 8 | 2964 | 2003 | 1086 / 1991 | 372 | 10 of 62 |
+| M1, 4 GiB | gain 20 | 3093 | 1921 | 1236 / 2212 | 778 | 18 of 62 |
+
+On the 16 GiB guest the drain is what the table above predicted (gain 20:
+a third of the cache in three minutes, a half-life near seven), the
+re-readers move under 10%, and the loop was held by the guest's own stall
+twice in five minutes. On the M1's 4 GiB guest the cache is bounded by the
+guest, not by the policy, the loop is held a third of the time by the
+writer's own reclaim pressure (correctly), and the footprint barely moves
+because the Mac's 8 GB, not the guest's cache, decides it; the re-readers
+at gain 20 read 18% and 10% slower than off, inside what that machine's
+single runs show run to run (the first chain's share re-reads ranged 6.5
+to 9.0 s across four arms at the old writer shape), but not something to
+claim as nothing. The 4 GiB guest is where the constants would be
+tightened first if a second run agrees.
+
+The storage and memory suite, three reps, the loop off (0.7.2 as it ran)
+against on at the gain each Mac's own pressure gave it (both were
+overcommitted: gain 8):
+
+| case | M5 off | M5 on | M1 off | M1 on |
+|---|---|---|---|---|
+| npm-install s | 7.3 / 7.2 / 6.5 | 6.7 / 6.6 / 6.5 | 16.9 / 14.8 / 13.1 | 12.8 / 12.5 / 12.4 |
+| pnpm-install s | 4.8 / 4.0 / 3.9 | 5.6 / 3.9 / 3.9 | 8.3 / 6.5 / 7.2 | 7.7 / 6.3 / 6.8 |
+| yarn-install s | 5.8 / 5.8 / 5.6 | 5.4 / 5.1 / 5.7 | 15.7 / 15.9 / 12.9 | 15.7 / 15.1 / 11.8 |
+| ripgrep ms | 1715 / 85 / 80 | 1711 / 87 / 81 | 6439 / 363 / 143 | 6309 / 203 / 132 |
+| copy-tree s | 4.8 / 3.5 / 4.2 | 4.8 / 3.3 / 4.3 | 8.4 / 11.1 / 8.4 | 9.1 / 11.6 / 7.8 |
+| rm-rf s | 3.6 / 2.4 / 2.6 | 2.6 / 3.4 / 2.5 | 3.1 / 2.8 / 2.8 | 2.9 / 3.0 / 2.9 |
+| memory peak / 15 s / 60 s MiB | 8804 / 1583 / 1543 | 8502 / 1392 / 1341 | 3275 / 3216 / 916 | 3164 / 916 / 847 |
+
+Nothing slower outside run-to-run noise on either machine; the minute-after
+footprint 200 MiB lower on the M5 and the M1's fifteen-second reading a
+third of what it was. The reclaim-ahead arm alone (M1, `s-ahead`) read
+3439 / 1235 / 1092.
+
+The helper: the m10 gate's client at 5 Hz reads the VMM at 2.6% of a core
+with spinning off against 31.1% with `LIGHTER_ANE_SPIN=1`, inference 0.80
+ms against 1.76. The m6 gate's idle-pass boot passes with the ramp off;
+its ease check still fails on the M5 tonight because the Mac is
+overcommitted (7.6 GB in swap) and is steered as at Warn whatever the test
+file says, which is the rule 0.7.2 added and not something 0.7.3 changed.
+
+Decisions 1 to 6 as recommended. The offer's new gate stays held for
+0.7.4, with the M1's gain-20 re-reads as the first thing to re-measure.
+

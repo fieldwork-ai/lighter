@@ -1,0 +1,7 @@
+case,rep,ms
+warm-footprint,1,4200
+warm-footprint-peak,1,4680
+warm-cache,1,2525
+warm-reread-disk,1,309
+warm-reread-share,1,561
+warm-cpu-ratio,1,113
