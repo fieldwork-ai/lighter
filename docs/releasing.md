@@ -51,6 +51,8 @@ original attempt, record both hashes, and qualify the final archive.
 
 ## After
 
+A release's paperwork is its release notes (`docs/release-notes-<version>.md`), the worklog rows for its record and its packaging, and the selected CSVs in `benchmarks/results/`. Nothing else: the per-release qualification reports and artifact manifests kept until 0.5.1 were retired in 0.7.3.
+
 - A worklog row for the release: what the gates said, the tarball's hash, what was skipped and why.
 - The daily driver moved onto the release build.
 - `docs/worklog.md` keeps running; the README's numbers change only with the next record.

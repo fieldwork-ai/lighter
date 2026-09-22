@@ -192,7 +192,7 @@ On Apple Silicon, lighter launches containers cold in **770 ms** (over 2x faster
 <details>
 <summary>Benchmark methodology & test environment</summary>
 
-Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26 Tahoe). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta. Raw observations, environment fingerprints, and individual repetition timings are preserved in [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26 Tahoe). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta. Raw observations, environment fingerprints, and individual repetition timings are in `benchmarks/results/`; `python3 benchmarks/report.py` prints them.
 </details>
 
 ### MacBook Pro: Apple M5 Pro (18 cores, 48 GB RAM)
@@ -274,7 +274,7 @@ Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` 
 | `sha256sum` of 1 GiB | 2.99 s | **4.11 s** | 7.92 s | 4.26 s | 4.39 s |
 | container start, `alpine true` | 137 ms | **152 ms** | 244 ms | 185 ms | 170 ms |
 
-[0.5.1 release records](benchmarks/RELEASE-0.5.1.md) and [retained competitor records](benchmarks/RELEASE-0.5.0-COMPETITORS.md) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.
+The selected CSVs, their `.tree` environment descriptions and the selection manifests are in `benchmarks/results/`; `python3 benchmarks/report.py` prints every repetition. Each release's record is a row in [the worklog](docs/worklog.md).
 
 ---
 

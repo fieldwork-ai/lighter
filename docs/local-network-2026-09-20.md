@@ -4,13 +4,13 @@ Status: diagnosed on the M5 on 2026-09-20, confirmed from the permission list; f
 
 ## What it looks like
 
-A Reolink camera at `192.168.1.120` fed Frigate in a container for twenty minutes, then stopped, and every later attempt from a container returned nothing. The camera was idle, healthy, and answering the Mac throughout. Measured, in both directions, with the camera holding no other connections:
+A Reolink camera at `<camera>` fed Frigate in a container for twenty minutes, then stopped, and every later attempt from a container returned nothing. The camera was idle, healthy, and answering the Mac throughout. Measured, in both directions, with the camera holding no other connections:
 
 | from | to | result |
 |---|---|---|
 | Mac shell | camera:554 | `RTSP/1.0 200 OK` |
 | container | camera:554 | no reply; ffmpeg reports "Invalid data found when processing input" |
-| container | gateway `192.168.1.254`:80 | `HTTP/1.1 200 OK` |
+| container | gateway `<gateway>`:80 | `HTTP/1.1 200 OK` |
 | container | the Mac's own LAN address | works |
 | container | the internet | works |
 | container | a relay on the Mac forwarding to camera:554 | works, pulls frames |

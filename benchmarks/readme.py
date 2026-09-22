@@ -18,7 +18,7 @@ README = report.HERE.parent / "README.md"
 
 # Which results directory is which machine, and the heading it gets.
 MACHINES = [
-    (report.RESULTS, "MacBook Pro — Apple M5 Pro (18 cores, 48 GB RAM)"),
+    (report.RESULTS, "MacBook Pro: Apple M5 Pro (18 cores, 48 GB RAM)"),
 ]
 
 STORAGE = [
@@ -43,18 +43,16 @@ def intro():
     orb = report.load("orbstack", report.RESULTS)
     return f"""All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
 
-On Apple Silicon, lighter launches containers cold in **664 ms** (over 2x faster than OrbStack), runs `npm ci` on host shares in **{ms(lighter['npm-install'])}** (faster than native APFS, beating OrbStack's {ms(orb['npm-install'])}), completes directory copies **{orb['copy-tree'] / lighter['copy-tree']:.1f}x faster**, idles at **{lighter['memory-idle']:.0f} MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
+On Apple Silicon, lighter launches containers cold in **{ms(lighter['boot-first-container'])}** (over 2x faster than OrbStack), runs `npm ci` on host shares in **{ms(lighter['npm-install'])}** (faster than native APFS, beating OrbStack's {ms(orb['npm-install'])}), completes directory copies **{orb['copy-tree'] / lighter['copy-tree']:.1f}x faster**, idles at **{lighter['memory-idle']:.0f} MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
 
 <details>
 <summary>Benchmark methodology & test environment</summary>
 
-Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26 Tahoe). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta.
-
-Lighter measurements reflect the 0.5.1 release; competitor measurements retain their 0.5.0-release suite. Docker Desktop's host-share cleanup failed during testing; affected install timings are excluded. Raw observations, environment fingerprints, and full M1 results are preserved in [the 0.5.1 measurements](benchmarks/RELEASE-0.5.1.md), [the retained 0.5.0 comparison](benchmarks/RELEASE-0.5.0.md), and [benchmarks/RESULTS.md](benchmarks/RESULTS.md). See [repeatability](benchmarks/REPEATABILITY.md) for workload-specific variation.
+Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26 Tahoe). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta. Raw observations, environment fingerprints, and individual repetition timings are in `benchmarks/results/`; `python3 benchmarks/report.py` prints them.
 </details>"""
 
 
-MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter releases memory back to the Mac immediately via `virtio-mem` and cooperative reclamation."""
+MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter returns memory to the Mac within seconds through free page reporting, proactive cache reclamation, and a cooperative balloon."""
 
 NETWORK_INTRO = """Throughput and latency between container and host measured with `iperf3`, keep-alive HTTP GET latency, connection setup rate, and container DNS resolution time. Bold marks best result."""
 
@@ -67,7 +65,7 @@ BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima
 
 def ms(value):
     if value is None:
-        return "—"
+        return "N/A"
     if value >= 1000:
         return f"{value / 1000:.2f} s"
     return f"{int(value)} ms"
@@ -102,7 +100,7 @@ def storage_table(results, where):
         cells = [label, ms(native.get(case))]
         for value in values:
             if value is None:
-                cells.append("—")
+                cells.append("N/A")
                 continue
             cell = ms(value)
             if value == best and len(present) > 1:
@@ -133,7 +131,7 @@ def memory_table(results):
         best = min(present)
         cells = [label[0].upper() + label[1:]]
         for value in values:
-            cell = "—" if value is None else f"{int(value)} MiB"
+            cell = "N/A" if value is None else f"{int(value)} MiB"
             if value == best and len(present) > 1:
                 cell = f"**{cell}**"
             cells.append(cell)
@@ -192,7 +190,7 @@ def power_table(results):
         best = min(present)
         cells = [label[0].upper() + label[1:]]
         for value in values:
-            cell = "—" if value is None else f"{value / scale:.0f}"
+            cell = "N/A" if value is None else f"{value / scale:.0f}"
             if value == best and len(present) > 1:
                 cell = f"**{cell}**"
             cells.append(cell)
@@ -255,9 +253,9 @@ def amd64_table(results):
             continue
         best = min(present)
         reference = scale.get(case)
-        cells = [label, "—" if reference is None else ms(reference)]
+        cells = [label, "N/A" if reference is None else ms(reference)]
         for value in values:
-            cell = "—" if value is None else ms(value)
+            cell = "N/A" if value is None else ms(value)
             if value == best and len(present) > 1:
                 cell = f"**{cell}**"
             cells.append(cell)
@@ -293,7 +291,7 @@ def section():
         if amd64:
             out += ["#### x86-64 images", "", AMD64_INTRO, "", amd64, ""]
     out += [
-        "[0.5.1 release records](benchmarks/RELEASE-0.5.1.md) and [retained competitor records](benchmarks/RELEASE-0.5.0-COMPETITORS.md) retain raw CSVs, case diagnostics, selection decisions and environment evidence. `benchmarks/RESULTS.md` contains individual repetition timings and methodology.",
+        "The selected CSVs, their `.tree` environment descriptions and the selection manifests are in `benchmarks/results/`; `python3 benchmarks/report.py` prints every repetition. Each release's record is a row in [the worklog](docs/worklog.md).",
         "",
         "---",
     ]

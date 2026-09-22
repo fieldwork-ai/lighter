@@ -2,7 +2,9 @@
 # Copied from .logs/m1-record-vmem.sh on 2026-09-06: run it from the repo root on the M5; it ships the remote script over ssh and starts the record on the M1 (archive results under benchmarks/records/ and update the M1 selection manifest explicitly).
 # The M1's lighter records on the virtio-mem tree: fetched from GitHub and built there, nothing rsynced.
 set -u
-ssh -o ConnectTimeout=20 -o BatchMode=yes admin@100.125.161.101 'cat > ~/remote-record.sh <<'"'"'EOS'"'"'
+# The bench host, user@address.
+M1="${LIGHTER_BENCH_HOST:?set LIGHTER_BENCH_HOST=user@host}"
+ssh -o ConnectTimeout=20 -o BatchMode=yes "$M1" 'cat > ~/remote-record.sh <<'"'"'EOS'"'"'
 #!/bin/bash
 set -u; cd ~/lighter; mkdir -p .logs
 export PATH=$HOME/.orbstack/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH

@@ -72,7 +72,7 @@ def network_cell(value, divisor):
     """A network reading in the table's unit: one decimal where the CSV's
     unit was divided down, whole otherwise."""
     if value is None:
-        return "—"
+        return "N/A"
     return f"{value / divisor:.1f}" if divisor != 1 else f"{int(value)}"
 
 
@@ -219,10 +219,8 @@ def main():
         "can come from different sessions. Selected .tree files retain the actual",
         "recording dates, tool versions, sources and runtime fingerprints; the",
         "machine and tools running this report do not determine those inputs.",
-        "[0.5.1 measurements](RELEASE-0.5.1.md), [retained 0.5.0 records](RELEASE-0.5.0.md),",
-        "[repeatability](REPEATABILITY.md)",
-        "and [competitor exclusions](RELEASE-0.5.0-COMPETITORS.md) explain selection,",
-        "background observations and the limits of these comparisons.",
+        "Selection, background observations and the limits of these comparisons",
+        "are recorded per release in ../docs/worklog.md.",
         "",
     ]
     rendered = 0
@@ -297,7 +295,7 @@ def render(results, description, _primary):
         cells = []
         for _, values in columns:
             value = values.get(case)
-            cells.append("—" if value is None else f"{int(value)}")
+            cells.append("N/A" if value is None else f"{int(value)}")
         lines.append(f"| {case} | " + " | ".join(cells) + " |")
     lines.append("")
 
@@ -326,7 +324,7 @@ def render(results, description, _primary):
             cells = []
             for _, values in memory_columns:
                 value = values.get(case)
-                cells.append("—" if value is None else f"{int(value)}")
+                cells.append("N/A" if value is None else f"{int(value)}")
             lines.append(f"| {label} | " + " | ".join(cells) + " |")
         lines.append("")
 
@@ -385,7 +383,7 @@ def render(results, description, _primary):
             for _, values in power_columns:
                 value = values.get(case)
                 if value is None:
-                    cells.append("—")
+                    cells.append("N/A")
                 elif scale == 1:
                     cells.append(f"{int(value)}")
                 else:
@@ -414,7 +412,7 @@ def render(results, description, _primary):
             cells = []
             for _, values in boot_columns:
                 value = values.get(case)
-                cells.append("—" if value is None else f"{value / 1000:.1f}")
+                cells.append("N/A" if value is None else f"{value / 1000:.1f}")
             lines.append(f"| {label} | " + " | ".join(cells) + " |")
         lines.append("")
 
@@ -438,7 +436,7 @@ def render(results, description, _primary):
             cells = []
             for _, values in ratioed:
                 value = values.get(case)
-                cells.append("—" if not value else f"{base / value * 100:.0f}%")
+                cells.append("N/A" if not value else f"{base / value * 100:.0f}%")
             lines.append(f"| {case} | " + " | ".join(cells) + " |")
         lines.append("")
 
