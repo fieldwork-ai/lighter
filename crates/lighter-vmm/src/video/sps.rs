@@ -30,6 +30,8 @@ pub struct Sps {
     pub poc_type: u32,
     pub log2_max_poc_lsb: u32,
     pub frame_mbs_only: bool,
+    /// Where `vui_parameters_present_flag` sits, in bits into the RBSP.
+    vui_at: usize,
 }
 
 /// Parses an SPS NAL (header byte included). `None` if it is not one, or
@@ -100,6 +102,7 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
         }
     }
     let implied = (poc_type == 2 || profile_idc == 66).then_some(0);
+    let vui_at = r.pos;
     let vui = if r.bit().unwrap_or(false) {
         vui_reorder(&mut r)
     } else {
@@ -113,7 +116,63 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
         poc_type,
         log2_max_poc_lsb,
         frame_mbs_only,
+        vui_at,
     })
+}
+
+/// The SPS with its VUI taken out: everything up to the VUI flag, the flag
+/// cleared, and the stop bit. The VUI is colour, timing and buffering
+/// advice the decoder does not need, and some cameras write it wrong: the
+/// Reolink E1 Pro's runs 8 bits past its end, which ffmpeg shrugs off and
+/// VideoToolbox refuses the whole stream over (-12710, native ffmpeg
+/// included).
+pub fn without_vui(nal: &[u8]) -> Option<Vec<u8>> {
+    let sps = parse(nal)?;
+    let rbsp = unescape(&nal[1..]);
+    let mut r = Bits::new(&rbsp);
+    let mut out = BitWriter::default();
+    for _ in 0..sps.vui_at {
+        out.bit(r.bit()?);
+    }
+    out.bit(false); // vui_parameters_present_flag
+    out.bit(true); // rbsp_stop_one_bit
+    let mut nal_out = vec![nal[0]];
+    nal_out.extend(escape(&out.bytes));
+    Some(nal_out)
+}
+
+#[derive(Default)]
+struct BitWriter {
+    bytes: Vec<u8>,
+    n: usize,
+}
+
+impl BitWriter {
+    fn bit(&mut self, b: bool) {
+        if self.n.is_multiple_of(8) {
+            self.bytes.push(0);
+        }
+        if b {
+            *self.bytes.last_mut().expect("pushed") |= 1 << (7 - self.n % 8);
+        }
+        self.n += 1;
+    }
+}
+
+/// The payload with emulation-prevention bytes put back: a 3 after any two
+/// zeros that a byte of 3 or less would follow.
+fn escape(rbsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rbsp.len() + 4);
+    let mut zeros = 0;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 3 {
+            out.push(3);
+            zeros = 0;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        out.push(b);
+    }
+    out
 }
 
 /// What presentation order needs from a slice header (7.3.3).
@@ -339,7 +398,7 @@ impl<'a> Bits<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // x264 (ffmpeg 8's libx264), High profile, 1920x1080, `-bf 2`, taken
@@ -451,6 +510,52 @@ mod tests {
             })
         );
         assert_eq!(slice(&[0x68, 0xff], &sps), None);
+    }
+
+    // The Reolink E1 Pro's sub stream: High, 896x512, and a VUI that ends
+    // 8 bits early.
+    pub(crate) const REOLINK_SPS: &[u8] = &[
+        0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xe0, 0x10, 0x68, 0x40, 0x00, 0x01, 0x3d,
+        0x80, 0x00, 0x18, 0xce,
+    ];
+    pub(crate) const REOLINK_PPS: &[u8] = &[0x68, 0xee, 0x3c, 0xb0];
+
+    #[test]
+    fn a_vui_comes_out_and_the_rest_stays() {
+        let before = parse(REOLINK_SPS).expect("parses up to the VUI");
+        let stripped = without_vui(REOLINK_SPS).expect("strips");
+        let after = parse(&stripped).expect("still an SPS");
+        assert_eq!(after.vui_at, before.vui_at);
+        assert_eq!(
+            (
+                after.profile_idc,
+                after.poc_type,
+                after.log2_max_frame_num,
+                after.frame_mbs_only
+            ),
+            (
+                before.profile_idc,
+                before.poc_type,
+                before.log2_max_frame_num,
+                before.frame_mbs_only
+            )
+        );
+        // Nothing after the flag but the stop bit and padding.
+        let rbsp = unescape(&stripped[1..]);
+        let mut r = Bits::new(&rbsp);
+        r.bits(after.vui_at as u32).unwrap();
+        assert_eq!(r.bit(), Some(false));
+        assert_eq!(r.bit(), Some(true));
+        while let Some(b) = r.bit() {
+            assert!(!b);
+        }
+    }
+
+    #[test]
+    fn escaping_undoes_unescaping() {
+        let raw = [0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x03, 0x00, 0x05];
+        assert_eq!(escape(&unescape(&raw)), raw);
+        assert_eq!(escape(&[0, 0, 0, 0]), vec![0, 0, 3, 0, 0]);
     }
 
     #[test]

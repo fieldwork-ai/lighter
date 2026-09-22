@@ -580,7 +580,18 @@ impl Session {
                 declared = self.depth_declared,
                 "video reorder depth"
             );
-            match VtSession::new(&self.sps, &self.pps, self.sink.clone()) {
+            let created = VtSession::new(&self.sps, &self.pps, self.sink.clone()).or_else(
+                |st| -> Result<VtSession, vt::OSStatus> {
+                    let stripped = sps::without_vui(&self.sps).ok_or(st)?;
+                    let vt = VtSession::new(&stripped, &self.pps, self.sink.clone())?;
+                    tracing::info!(
+                        st,
+                        "VideoToolbox refused the stream's SPS; decoding it without its VUI"
+                    );
+                    Ok(vt)
+                },
+            );
+            match created {
                 Ok(vt) => {
                     let dims = vt.dims;
                     self.vt = Some(vt);
@@ -1184,6 +1195,16 @@ mod tests {
         // the frames before that are lost to order, those after are not.
         assert_eq!(s.depth, 2);
         assert_eq!(ready_stamps(&s), vec![0, 100, 33, 67, 133]);
+    }
+
+    #[test]
+    fn a_camera_sps_videotoolbox_refuses_decodes_without_its_vui() {
+        use crate::video::sps::tests::{REOLINK_PPS, REOLINK_SPS};
+        let sink = Arc::new(Mutex::new(VecDeque::new()));
+        assert!(VtSession::new(REOLINK_SPS, REOLINK_PPS, sink.clone()).is_err());
+        let stripped = sps::without_vui(REOLINK_SPS).unwrap();
+        let vt = VtSession::new(&stripped, REOLINK_PPS, sink).expect("accepted without the VUI");
+        assert_eq!(vt.dims, (896, 512));
     }
 
     #[test]
