@@ -18,5 +18,16 @@ diff = max(float(np.abs(a - b).max()) for a, b in zip(out, ref))
 t = time.perf_counter(); n = 20
 for _ in range(n): s.run(None, {inp.name: x})
 ms = (time.perf_counter() - t) / n * 1000
-print(f"RESULT shapes={[o.shape for o in out]} max_abs_diff={diff:.3g} ms_per_run={ms:.2f}")
+print(f"RESULT shapes={[o.shape for o in out]} max_abs_diff={diff:.3g} ms_per_run={ms:.2f}", flush=True)
+# `paced <hz> <seconds>`: a camera's cadence, a frame and then nothing, which
+# is when a host that spins between requests shows. The gate reads the host's
+# CPU while this runs.
+if len(sys.argv) > 4 and sys.argv[2] == "paced":
+    hz, seconds = float(sys.argv[3]), float(sys.argv[4])
+    print("PACING", flush=True)
+    end = time.perf_counter() + seconds; runs = 0; spent = 0.0
+    while time.perf_counter() < end:
+        t = time.perf_counter(); s.run(None, {inp.name: x}); spent += time.perf_counter() - t
+        runs += 1; time.sleep(max(0.0, 1.0 / hz - (time.perf_counter() - t)))
+    print(f"PACED runs={runs} ms_per_run={spent / runs * 1000:.2f}", flush=True)
 sys.exit(0 if diff < 1e-2 else 2)

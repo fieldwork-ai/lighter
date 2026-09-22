@@ -64,3 +64,5 @@ jobs:
         run: bash scripts/test-inbound-fallback.sh
       - name: The idle pass is one pageout scheme with three filters, in order
         run: bash scripts/test-idle-pass.sh
+      - name: The warm loop stops on the guest's stall and never runs blind
+        run: bash scripts/test-warm-loop.sh

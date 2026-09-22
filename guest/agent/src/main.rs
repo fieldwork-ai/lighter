@@ -21,6 +21,7 @@ mod sockmap;
 mod udp;
 mod udp_inbound;
 mod vsock;
+mod warm;
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
@@ -302,6 +303,20 @@ fn bound_container_cache() {
         cmdline_value("lighter.idle_age").unwrap_or(idle::IDLE_HORIZON_SECS),
         TICKS_PER_SEC,
     );
+    // The loop that keeps the containers' cache near their working set
+    // while they run (`warm.rs`): the one policy here that does not wait
+    // for them to stop. The floors are the trims' resting levels, so what
+    // an empty guest is trimmed to is what a busy one is never taken under.
+    // `lighter.warm=0` leaves it off, for the A/B.
+    if cmdline_value("lighter.warm").is_none_or(|v| v != 0) {
+        warm::start(
+            vec![
+                warm::Group { path: containers.into(), floor: total / 64 },
+                warm::Group { path: engine.into(), floor: 8 << 20 },
+            ],
+            compact_once,
+        );
+    }
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 32]> = None;
@@ -734,6 +749,12 @@ fn compact_until_reportable() {
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+}
+
+/// One pass, for the warm loop: it runs beside working containers, and a
+/// pass is paid for by whatever allocates next.
+fn compact_once() {
+    let _ = std::fs::write("/proc/sys/vm/compact_memory", "1");
 }
 
 /// Bytes free in orders below nine, from /proc/buddyinfo, across all zones.
@@ -1432,6 +1453,16 @@ fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
         (Some("ping"), _) => "pong\n".into(),
+        // How hard the warm loop may push: the host's need, which the
+        // guest's own stall then limits (`warm.rs`).
+        (Some("gain"), Some(gain)) => match gain.parse::<u32>() {
+            Ok(gain) => {
+                warm::SHARED.set_gain(gain);
+                "ok\n".into()
+            }
+            Err(_) => "error bad gain\n".into(),
+        },
+        (Some("warm"), _) => warm::SHARED.report(),
         // The host is compressing our pages: give back that much page cache,
         // coldest first, from the cgroup every container lives in. The
         // kernel frees it in bulk and free page reporting returns it to the
@@ -1447,7 +1478,11 @@ fn handle_control(line: &str) -> String {
                         .unwrap_or(0)
                 };
                 let before = current();
+                let began = Instant::now();
                 let result = std::fs::write("/sys/fs/cgroup/docker/memory.reclaim", format!("{mib}M"));
+                // This reclaim stalled this task, not a container: the warm
+                // loop must not read it as the guest being short.
+                warm::SHARED.charge_own(began.elapsed());
                 let reclaimed = before.saturating_sub(current()) >> 20;
                 match result {
                     Ok(()) => format!("reclaimed {reclaimed}\n"),

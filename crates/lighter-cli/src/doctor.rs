@@ -239,6 +239,20 @@ pub fn run() -> Vec<Finding> {
         }
     });
 
+    // The loop that gives a working machine's idle cache back to the Mac
+    // (`guest/agent/src/warm.rs`). A machine at 12 GiB "while idle" is the
+    // report this row exists to answer in one read: whether the loop runs,
+    // how hard the Mac is asking, and how often the guest's own stall held
+    // it. An agent that predates the loop answers with an error: no row.
+    if matches!(crate::machine::running_pid(), Ok(Some(_)))
+        && let Some(finding) = crate::machine::control("warm")
+            .ok()
+            .as_deref()
+            .and_then(warm_finding)
+    {
+        findings.push(finding);
+    }
+
     // A custom home never owns the global context; its machine is reached
     // by DOCKER_HOST, and telling someone to `docker context use lighter`
     // would point them at a machine this doctor is not examining.
@@ -263,6 +277,42 @@ pub fn run() -> Vec<Finding> {
     }
 
     findings
+}
+
+/// The agent's `warm` line, as a row. `None` for anything that is not one.
+fn warm_finding(line: &str) -> Option<Finding> {
+    let mut words = line.split_whitespace();
+    if words.next()? != "warm" {
+        return None;
+    }
+    let state = words.next()?;
+    let field = |name: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some(match state {
+        "on" => {
+            let (periods, paused) = (field("periods")?, field("paused")?);
+            Finding::good(
+                "idle cache",
+                format!(
+                    "{} MiB returned since start; the Mac's need is {} of 20; the guest's own stall held it {} of {} periods",
+                    field("reclaimed_mib")?,
+                    field("gain")?,
+                    paused,
+                    periods,
+                ),
+            )
+        }
+        "no-psi" => Finding::warn(
+            "idle cache",
+            "not returned while containers run: the guest has no pressure stall information",
+            "remove `psi=0` from the guest's command line",
+        ),
+        _ => Finding::good("idle cache", "kept while containers run (`lighter.warm=0`)"),
+    })
 }
 
 /// Formats the findings the way `lighter doctor` prints them.
@@ -328,6 +378,25 @@ fn free_space_gib() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agents_warm_line_becomes_a_row() {
+        let on = warm_finding("warm on gain=8 some_ppm=120 step_kib=4096 periods=400 paused=3 reclaimed_mib=1234 compactions=2").unwrap();
+        assert!(on.ok && !on.warn);
+        assert!(
+            on.detail.contains("1234 MiB")
+                && on.detail.contains("8 of 20")
+                && on.detail.contains("3 of 400"),
+            "{}",
+            on.detail
+        );
+        let blind = warm_finding("warm no-psi gain=1 some_ppm=0 step_kib=0 periods=0 paused=0 reclaimed_mib=0 compactions=0").unwrap();
+        assert!(blind.warn && blind.remedy.is_some());
+        assert!(warm_finding("warm off gain=1").is_some());
+        // An agent from before the loop, and anything else, is no row.
+        assert!(warm_finding("error unknown").is_none());
+        assert!(warm_finding("").is_none());
+    }
 
     #[test]
     fn the_report_names_a_remedy_for_every_failure() {

@@ -328,10 +328,14 @@ wait "$VMM_PID" 2>/dev/null || true
 VMM_PID=""
 mkdir -p .logs && cp "$LOG" .logs/m6-last-boot-1.log 2>/dev/null || true
 : > "$LOG"
-# The level stays Normal whatever the Mac is doing: a real Warn during the
-# section would have the pressure ramp inflating.
+# The ramp stays out of it whatever the Mac is doing. The level file alone
+# was not enough: an overcommitted Mac (a daily driver with seven gigabytes
+# in swap, 2026-09-21) is steered as at Warn whatever level it reports, and
+# the ramp then has the guest reclaim its coldest cache ahead of each
+# balloon step, which is the cold container's, before the pass reaches it.
+# Right, and not what this section measures.
 echo normal > "$PRESSURE_FILE"
-LIGHTER_PRESSURE_TEST_FILE="$PRESSURE_FILE" "$BIN" \
+LIGHTER_MEMORY_STEER=0 "$BIN" \
 	--kernel "$KERNEL" \
 	--disk "$ROOTFS" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \

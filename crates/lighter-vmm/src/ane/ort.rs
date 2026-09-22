@@ -153,6 +153,49 @@ macro_rules! check {
     }};
 }
 
+/// The session's CPU thread pools, told to sleep when they have nothing to do.
+///
+/// ONNX Runtime's workers spin for a while after each task so the next one
+/// starts sooner, and a client that sends a frame every 100 to 200 ms never
+/// lets them stop: with Frigate attached at five frames a second the helper
+/// read 43 to 53% of a core, 1,449 of a three-second profile's samples in
+/// `ThreadPoolTempl::WorkerLoop` and `SpinPause` against 16 in CoreML's
+/// prediction (the M5, 2026-09-21). With CoreML as the provider the compute
+/// is the Neural Engine's or the GPU's and the pool is waiting for work that
+/// never comes, so it also gets one thread. A CPU session does its real work
+/// on the pool and keeps its width; it only stops spinning between runs. The
+/// price is a futex wake per inference, tens of microseconds against
+/// milliseconds.
+fn quiet_threads(
+    api: &sys::OrtApi,
+    options: *mut sys::OrtSessionOptions,
+    units: Units,
+) -> Result<(), String> {
+    // `LIGHTER_ANE_SPIN=1` keeps ONNX Runtime's defaults, for the A/B.
+    if std::env::var_os("LIGHTER_ANE_SPIN").is_some() {
+        return Ok(());
+    }
+    for key in QUIET_THREAD_KEYS {
+        let key = CString::new(*key).unwrap();
+        let off = CString::new("0").unwrap();
+        check!(
+            api,
+            (api.AddSessionConfigEntry.unwrap())(options, key.as_ptr(), off.as_ptr())
+        );
+    }
+    if units != Units::Cpu {
+        check!(api, (api.SetIntraOpNumThreads.unwrap())(options, 1));
+    }
+    Ok(())
+}
+
+/// `onnxruntime_session_options_config_keys.h`: "0" has a pool's workers
+/// block as soon as their queue is empty.
+const QUIET_THREAD_KEYS: &[&str] = &[
+    "session.intra_op.allow_spinning",
+    "session.inter_op.allow_spinning",
+];
+
 impl Runtime {
     /// Whether the runtime was linked in at all.
     pub const fn linked() -> bool {
@@ -295,6 +338,10 @@ impl Runtime {
         let api = self.api;
         let mut options: *mut sys::OrtSessionOptions = ptr::null_mut();
         check!(api, (api.CreateSessionOptions.unwrap())(&mut options));
+        if let Err(msg) = quiet_threads(api, options, units) {
+            unsafe { (api.ReleaseSessionOptions.unwrap())(options) };
+            return Err(msg);
+        }
         if units != Units::Cpu {
             let (format, compute) = match units {
                 Units::NeuralEngine => ("NeuralNetwork", "ALL"),
