@@ -227,9 +227,9 @@ macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle
 | Reading | lighter | OrbStack | Colima | Docker Desktop |
 |---|---|---|---|---|
 | Idle, a minute after start | **604 MiB** | 936 MiB | 1302 MiB | 3493 MiB |
-| Peak through an npm install | 8821 MiB | **5699 MiB** | 10054 MiB | 7339 MiB |
-| 15 s after it ends | **1605 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
-| 60 s after it ends | **1492 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
+| Peak through an npm install | **2609 MiB** | 5699 MiB | 10054 MiB | 7339 MiB |
+| 15 s after it ends | **854 MiB** | 2776 MiB | 10145 MiB | 7276 MiB |
+| 60 s after it ends | **813 MiB** | 1720 MiB | 10149 MiB | 7276 MiB |
 
 #### The network
 

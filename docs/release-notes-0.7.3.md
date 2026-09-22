@@ -67,11 +67,9 @@ at 5 Hz: 2.6% of a core against 31% before.
   Mac is steered as at Warn whatever level it reports, and the ramp then
   reclaims the cold container's cache before the pass can.
 - The README's tables are regenerated from the 0.7.3 records on both
-  machines. One row moves for a reason worth knowing: the footprint's peak
-  through an npm install reads 8821 MiB on the M5's 16 GiB guest, against
-  the 3852 published for 0.7.2, which was measured on a 12 GiB guest. A
-  single-zone guest holds the whole install as cache until the trims run
-  fifteen seconds later; 0.7.2 reads the same at 16 GiB (8804 on the same
-  night with the loop off). The readings that follow, 1605 and 1492 MiB,
-  and the idle 604, are unchanged or better.
+  machines. The memory rows through an npm install are measured on a 12 GiB
+  guest, as 0.7.2's were: 2609 / 854 / 813 MiB against 3852 / 1464 / 1391.
+  On a 16 GiB guest the same case peaks at 8821 (0.7.2: 8804), because a
+  single-zone guest holds the whole install as cache until the trims run;
+  that reading is in the worklog, not the table.
 - Linux remains **6.18.52**; the data epoch remains **1**.

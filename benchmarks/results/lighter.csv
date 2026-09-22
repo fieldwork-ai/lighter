@@ -29,9 +29,9 @@ container-start,3,137
 watch-latency,1,57
 watch-latency,2,2
 watch-latency,3,2
-memory-peak,1,8821
-memory-after-15s,1,1605
-memory-after-60s,1,1492
+memory-peak,1,2609
+memory-after-15s,1,854
+memory-after-60s,1,813
 net-tcp-egress,1,102929
 net-tcp-egress,2,86228
 net-tcp-egress,3,103476
