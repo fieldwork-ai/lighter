@@ -170,6 +170,14 @@ pub fn run() -> Vec<Finding> {
             "run `make metal` and rebuild, or reinstall a release build",
         ),
     });
+    findings.push(if config.video {
+        Finding::good(
+            "lighter.sh/video",
+            "H.264 decode in containers, on the Mac's media engine (V4L2, /dev/video0)",
+        )
+    } else {
+        Finding::good("lighter.sh/video", "off in the configuration")
+    });
     findings.push(if !config.mps {
         Finding::good("lighter.sh/mps", "off in the configuration")
     } else {

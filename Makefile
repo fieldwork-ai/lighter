@@ -151,6 +151,10 @@ gate-m11: ## M11: a container's PyTorch runs on the Mac's GPU
 gate-m12: ## M12: a container's llama.cpp runs on the Mac's GPU with Metal kernels
 	@scripts/gates/m12-metal.sh
 
+.PHONY: gate-m13
+gate-m13: ## M13: a container decodes H.264 on the Mac's media engine
+	@scripts/gates/m13-video.sh
+
 .PHONY: dogfood
 dogfood: ## Rebuild the guest using lighter itself, not somebody else's VM
 	@scripts/dogfood.sh

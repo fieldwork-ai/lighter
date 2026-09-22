@@ -11,6 +11,7 @@ pub mod block;
 pub mod disk;
 pub mod fs;
 pub mod gpu;
+pub mod media;
 pub mod mmio;
 pub mod net;
 pub mod poll;
@@ -34,6 +35,8 @@ pub mod device_type {
     pub const GPU: u32 = 16;
     pub const VSOCK: u32 = 19;
     pub const FS: u32 = 26;
+    /// virtio-media (the virtio-media spec's `VIRTIO_ID_MEDIA`).
+    pub const MEDIA: u32 = 48;
 }
 
 /// Transport feature bits, shared by every device.

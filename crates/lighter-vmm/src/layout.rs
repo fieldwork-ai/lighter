@@ -75,6 +75,10 @@ pub struct GuestLayout {
     /// maps a blob and the host puts that blob's pages there (`virtio::gpu`).
     /// Address space only; it costs nothing until used.
     pub gpu: Option<Window>,
+    /// The video decoder's aperture (`virtio::media`), above the GPU's when
+    /// there is one: where the guest maps the decoder's buffers. Address
+    /// space only, as the GPU's.
+    pub video: Option<Window>,
 }
 
 impl GuestLayout {
@@ -102,6 +106,7 @@ impl GuestLayout {
         vcpus: u32,
         ram_bytes: u64,
         gpu_bytes: u64,
+        video_bytes: u64,
     ) -> Result<GuestLayout, LayoutError> {
         if ram_bytes < 64 * 1024 * 1024 {
             return Err(LayoutError::RamTooSmall(ram_bytes));
@@ -147,12 +152,14 @@ impl GuestLayout {
         // The aperture sits past whatever RAM can reach, on a 1 GiB boundary:
         // the host maps blobs into it in 16 KiB pages, and a large alignment
         // keeps it clear of everything below.
-        let gpu = (gpu_bytes > 0).then(|| {
-            let align = 1u64 << 30;
-            Window {
-                base: ram.end().div_ceil(align) * align,
-                size: gpu_bytes.div_ceil(align) * align,
-            }
+        let align = 1u64 << 30;
+        let gpu = (gpu_bytes > 0).then(|| Window {
+            base: ram.end().div_ceil(align) * align,
+            size: gpu_bytes.div_ceil(align) * align,
+        });
+        let video = (video_bytes > 0).then(|| Window {
+            base: gpu.map_or(ram.end(), |w| w.end()).div_ceil(align) * align,
+            size: video_bytes.div_ceil(align) * align,
         });
 
         Ok(GuestLayout {
@@ -162,6 +169,7 @@ impl GuestLayout {
             virtio_mmio,
             ram,
             gpu,
+            video,
         })
     }
 
@@ -205,7 +213,7 @@ mod tests {
 
     #[test]
     fn windows_do_not_overlap() {
-        let l = GuestLayout::new(&params(), 4, 2 << 30, 0).unwrap();
+        let l = GuestLayout::new(&params(), 4, 2 << 30, 0, 0).unwrap();
         assert!(l.gicd.end() <= l.gicr.base);
         assert!(l.gicr.end() <= l.uart.base);
         assert!(l.uart.end() <= l.virtio_mmio.base);
@@ -216,7 +224,7 @@ mod tests {
     fn device_window_clears_the_maximum_redistributor_region() {
         // Not just this machine's vCPU count: the map must not move when the
         // core count changes, so it clears the largest region the host allows.
-        let l = GuestLayout::new(&params(), 1, 2 << 30, 0).unwrap();
+        let l = GuestLayout::new(&params(), 1, 2 << 30, 0, 0).unwrap();
         let max_end = GuestLayout::GICR_BASE + params().redistributor_region_size as u64;
         assert!(l.uart.base >= max_end);
     }
@@ -226,14 +234,14 @@ mod tests {
         let mut p = params();
         p.redistributor_region_size = 0x1000_0000; // 256 MiB
         assert!(matches!(
-            GuestLayout::new(&p, 4, 2 << 30, 0),
+            GuestLayout::new(&p, 4, 2 << 30, 0, 0),
             Err(LayoutError::GicOverlapsDevices { .. })
         ));
     }
 
     #[test]
     fn virtio_slots_tile_their_window_without_gaps() {
-        let l = GuestLayout::new(&params(), 4, 2 << 30, 0).unwrap();
+        let l = GuestLayout::new(&params(), 4, 2 << 30, 0, 0).unwrap();
         for i in 0..VIRTIO_MMIO_SLOTS {
             let w = l.virtio_slot(i).unwrap();
             assert!(w.base >= l.virtio_mmio.base && w.end() <= l.virtio_mmio.end());

@@ -34,3 +34,8 @@ panic = "abort"
 [profile.bench]
 lto = "fat"
 codegen-units = 1
+
+# Linux-only as published; see third_party/README.md.
+[patch.crates-io]
+v4l2r = { path = "third_party/v4l2r" }
+virtio-media = { path = "third_party/virtio-media" }

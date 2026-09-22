@@ -104,6 +104,11 @@ pub struct MachineConfig {
     /// Address space reserved for blobs the GPU maps into the guest; costs
     /// nothing until a blob lands there.
     pub gpu_aperture_bytes: u64,
+    /// A video decoder (`virtio::media`): a V4L2 node the guest decodes
+    /// H.264 through, on VideoToolbox.
+    pub video: bool,
+    /// Address space for the decoder's buffers; costs nothing until used.
+    pub video_aperture_bytes: u64,
 }
 
 impl Default for MachineConfig {
@@ -125,6 +130,8 @@ impl Default for MachineConfig {
             tso: false,
             gpu: false,
             gpu_aperture_bytes: 8 << 30,
+            video: false,
+            video_aperture_bytes: 1 << 30,
         }
     }
 }
@@ -201,6 +208,11 @@ impl Machine {
             config.ram_bytes,
             if config.gpu {
                 config.gpu_aperture_bytes
+            } else {
+                0
+            },
+            if config.video {
+                config.video_aperture_bytes
             } else {
                 0
             },
@@ -326,6 +338,13 @@ impl Machine {
             virtio.push(Box::new(gpu));
             (slot, fences)
         });
+
+        if let Some(aperture) = layout.video {
+            virtio.push(Box::new(crate::virtio::media::Media::new(
+                aperture,
+                memory.clone(),
+            )));
+        }
 
         let virtio_slots = virtio.len();
         let mut virtio_devices = Vec::with_capacity(virtio_slots);

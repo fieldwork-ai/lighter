@@ -251,6 +251,8 @@ pub fn machine() -> anyhow::Result<()> {
         // comes, and every boot would pay that. Doctor says what is missing.
         gpu: config.gpu && lighter_vmm::virtio::gpu::virgl::linked(),
         gpu_aperture_bytes: 8 << 30,
+        video: config.video,
+        video_aperture_bytes: 1 << 30,
     };
 
     let mut machine = Machine::start(&machine_config)?;
