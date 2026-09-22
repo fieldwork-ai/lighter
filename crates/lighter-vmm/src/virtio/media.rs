@@ -142,6 +142,17 @@ impl Media {
         while let Some(chain) = queue.pop(mem) {
             let head = chain.head();
             let (request, reply) = Media::split(mem, chain);
+            let word = |i: usize| {
+                request
+                    .get(i * 4..i * 4 + 4)
+                    .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+            };
+            tracing::trace!(
+                cmd = word(0),
+                session = word(2),
+                code = format_args!("{:#x}", word(3)),
+                "virtio-media command"
+            );
             let mut reader = std::io::Cursor::new(request);
             let mut writer = Vec::new();
             self.runner.handle_command(&mut reader, &mut writer);
@@ -172,7 +183,13 @@ impl Media {
     fn serve_events(&mut self, queue: &mut Virtqueue, mem: &GuestMemory) -> bool {
         let mut used = false;
         while !self.pending.is_empty() {
-            let Some(chain) = queue.pop(mem) else { break };
+            let Some(chain) = queue.pop(mem) else {
+                tracing::trace!(
+                    pending = self.pending.len(),
+                    "virtio-media events waiting for a descriptor"
+                );
+                break;
+            };
             let head = chain.head();
             let (_, reply) = Media::split(mem, chain);
             let Some(bytes) = self.pending.pop() else {
@@ -180,6 +197,12 @@ impl Media {
                 break;
             };
             let len = Media::scatter(mem, &reply, &bytes);
+            tracing::trace!(
+                kind = u32::from_le_bytes(bytes[..4].try_into().unwrap_or_default()),
+                bytes = bytes.len(),
+                left = self.pending.len(),
+                "virtio-media event out"
+            );
             if (len as usize) < bytes.len() {
                 tracing::warn!(
                     len,
