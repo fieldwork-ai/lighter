@@ -1,0 +1,183 @@
+arm64: idle polling only while it pays
+
+Patch 0011 grows the poll window whenever a CPU is woken soon after it
+gave up polling, on the reasoning that a longer window would have caught
+that wakeup. Under a trickle of wakeups that reasoning runs away: Frigate
+on one camera woke each vCPU about 300 times a second, most polls timed
+out, the short sleep after each grew the window back, and polling was 60
+to 80 ms of every second across four vCPUs, a third of the VMM's CPU for
+the whole stack (20.7% of a core against 13.9% without, on 16 vCPUs).
+
+So only a poll that another CPU ended grows the window (an interrupt
+reaches a CPU in WFI as fast, so a poll one ended bought nothing), a poll
+that timed out halves it, and every `idle.poll_epoch` polls (16) each CPU
+weighs what it spent spinning against the wakeups it caught: more than
+`idle.poll_cost_ns` (20 us) a catch, or none at all, and it stops polling
+for a backoff doubling from 10 ms to `idle.poll_backoff_max_ns` (250 ms).
+A thread pool's handoffs pay every epoch and never back off: the
+cross-vCPU pipe round trip stays at 2.2 us (8.5 us without polling), and
+comes back within about a fifth of a second from a backed-off CPU.
+
+`idle.polled` reports, per CPU, how many polls timed out, were ended by
+an interrupt, or by another CPU, and the nanoseconds each kind spent.
+diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
+--- a/arch/arm64/kernel/idle.c
++++ b/arch/arm64/kernel/idle.c
+@@ -13,6 +13,7 @@
+ #include <linux/cpumask.h>
+ #include <linux/sysfs.h>
+ #include <linux/tick.h>
++#include <linux/kernel_stat.h>
+ #include <linux/timekeeping.h>
+ 
+ #include <asm/barrier.h>
+@@ -100,6 +101,32 @@
+ static DEFINE_PER_CPU(u64, idle_poll_block_ns);
+ static DEFINE_PER_CPU(bool, idle_poll_block_timer);
+ static DEFINE_PER_CPU(bool, idle_poll_block_pending);
++/*
++ * Whether polling pays. A poll another CPU ends saves that CPU an IPI and
++ * this one a trip out of WFI, a few microseconds of the host's time; a poll
++ * that times out saves nothing, nor does one an interrupt ends, since the
++ * interrupt reaches a CPU in WFI as fast. Under a trickle of wakeups (a home
++ * server's camera frames and its Python threads) most polls time out, and
++ * the window grown by each short sleep after them was a third of the VMM's
++ * CPU. So only a poll another CPU ended grows the window, a poll that timed
++ * out halves it, and every poll_epoch polls the CPU weighs the spinning
++ * against the wakeups it caught: more than poll_cost_ns a catch, or none,
++ * and it stops polling for a backoff that doubles from 10 ms to
++ * poll_backoff_max_ns while polling keeps not paying. A thread pool's
++ * handoffs, which polling exists for, pay every epoch and never back off.
++ */
++static DEFINE_PER_CPU(bool, idle_poll_block_grow);
++static unsigned int idle_poll_epoch = 16;
++module_param_named(poll_epoch, idle_poll_epoch, uint, 0644);
++static unsigned int idle_poll_cost_ns = 20000;
++module_param_named(poll_cost_ns, idle_poll_cost_ns, uint, 0644);
++static unsigned int idle_poll_backoff_max_ns = 250 * NSEC_PER_MSEC;
++module_param_named(poll_backoff_max_ns, idle_poll_backoff_max_ns, uint, 0644);
++static DEFINE_PER_CPU(u32, idle_poll_epoch_n);
++static DEFINE_PER_CPU(u32, idle_poll_epoch_hits);
++static DEFINE_PER_CPU(u64, idle_poll_epoch_ns);
++static DEFINE_PER_CPU(u64, idle_poll_off_until);
++static DEFINE_PER_CPU(u64, idle_poll_backoff_ns);
+ DEFINE_PER_CPU(u64, idle_poll_traffic_at);
+ /* How each block was judged, per CPU, for reading from sysfs. */
+ enum { JUDGED_TIMER, JUDGED_LONG, JUDGED_TRAFFIC, JUDGED_LOCAL, JUDGED_KINDS };
+@@ -235,6 +262,9 @@
+ 		limit = max(limit / 2, local);
+ 	} else if (timer_due) {
+ 		limit /= 2;
++	} else if (limit && !__this_cpu_read(idle_poll_block_grow)) {
++		/* A sleep after a timed-out poll, or a poll an interrupt
++		 * ended: nothing says a longer window would have paid. */
+ 	} else if (limit < idle_poll_grow_start_ns) {
+ 		limit = idle_poll_grow_start_ns;
+ 	} else {
+@@ -252,14 +282,81 @@
+ }
+ 
+ /* Returns true if a wakeup arrived while polling, so WFI is not needed. */
++/* Per CPU: how each poll ended (timed out; woken with an interrupt taken on
++ * this CPU during it; woken with none, the case polling exists for), and the
++ * nanoseconds each kind spent. */
++enum { POLLED_TIMEOUT, POLLED_IRQ, POLLED_REMOTE, POLLED_KINDS };
++static DEFINE_PER_CPU(u64, idle_polled_n[POLLED_KINDS]);
++static DEFINE_PER_CPU(u64, idle_polled_ns[POLLED_KINDS]);
++
++static int idle_polled_get(char *buffer, const struct kernel_param *kp)
++{
++	int cpu, len = 0;
++
++	for_each_possible_cpu(cpu)
++		len += sysfs_emit_at(buffer, len, "%llu/%llu/%llu/%llu/%llu/%llu ",
++				     per_cpu(idle_polled_n[POLLED_TIMEOUT], cpu),
++				     per_cpu(idle_polled_ns[POLLED_TIMEOUT], cpu),
++				     per_cpu(idle_polled_n[POLLED_IRQ], cpu),
++				     per_cpu(idle_polled_ns[POLLED_IRQ], cpu),
++				     per_cpu(idle_polled_n[POLLED_REMOTE], cpu),
++				     per_cpu(idle_polled_ns[POLLED_REMOTE], cpu));
++	len += sysfs_emit_at(buffer, len, "\n");
++	return len;
++}
++
++static const struct kernel_param_ops idle_polled_ops = {
++	.get = idle_polled_get,
++};
++module_param_cb(polled, &idle_polled_ops, NULL, 0444);
++
++/* Books a finished poll and, every poll_epoch, decides whether to go on. */
++static void __cpuidle idle_poll_account(unsigned int kind, u64 spent_ns, u64 now)
++{
++	u32 limit = __this_cpu_read(idle_poll_limit_ns);
++	u32 n, hits;
++	u64 spent;
++
++	__this_cpu_inc(idle_polled_n[kind]);
++	__this_cpu_add(idle_polled_ns[kind], spent_ns);
++	__this_cpu_write(idle_poll_block_grow, kind == POLLED_REMOTE);
++	if (kind == POLLED_TIMEOUT)
++		__this_cpu_write(idle_poll_limit_ns, limit / 2);
++
++	n = __this_cpu_inc_return(idle_poll_epoch_n);
++	hits = __this_cpu_read(idle_poll_epoch_hits) + (kind == POLLED_REMOTE);
++	spent = __this_cpu_read(idle_poll_epoch_ns) + spent_ns;
++	__this_cpu_write(idle_poll_epoch_hits, hits);
++	__this_cpu_write(idle_poll_epoch_ns, spent);
++	if (n < idle_poll_epoch)
++		return;
++	if (!hits || spent > (u64)hits * idle_poll_cost_ns) {
++		u64 backoff = __this_cpu_read(idle_poll_backoff_ns);
++
++		backoff = backoff ? min_t(u64, backoff * 2, idle_poll_backoff_max_ns) :
++				    min_t(u64, 10 * NSEC_PER_MSEC, idle_poll_backoff_max_ns);
++		__this_cpu_write(idle_poll_backoff_ns, backoff);
++		__this_cpu_write(idle_poll_off_until, now + backoff);
++	} else {
++		__this_cpu_write(idle_poll_backoff_ns, 0);
++	}
++	__this_cpu_write(idle_poll_epoch_n, 0);
++	__this_cpu_write(idle_poll_epoch_hits, 0);
++	__this_cpu_write(idle_poll_epoch_ns, 0);
++}
++
+ static bool __cpuidle idle_poll(u64 *start)
+ {
++	unsigned int kind = POLLED_TIMEOUT;
++	u64 irqs, now;
++	bool woke;
+ 	u32 limit = __this_cpu_read(idle_poll_limit_ns);
+ 
+ 	*start = local_clock_noinstr();
+ 	if (!limit)
+ 		return false;
+ 
++	irqs = kstat_cpu_irqs_sum(smp_processor_id());
+ 	raw_local_irq_enable();
+ 	if (!current_set_polling_and_test()) {
+ 		unsigned int count = 0;
+@@ -278,7 +375,13 @@
+ 	/* A waker observing polling sends no IPI. Clear, order, then test
+ 	 * NEED_RESCHED so work arriving at the deadline also prevents WFI.
+ 	 */
+-	return current_clr_polling_and_test();
++	woke = current_clr_polling_and_test();
++	if (woke)
++		kind = kstat_cpu_irqs_sum(smp_processor_id()) != irqs ?
++			POLLED_IRQ : POLLED_REMOTE;
++	now = local_clock_noinstr();
++	idle_poll_account(kind, now - *start, now);
++	return woke;
+ }
+ 
+ /*
+@@ -301,7 +404,8 @@
+ 	}
+ 	next_timer = idle_next_timer_ns();
+ 	if (__this_cpu_read(idle_poll_limit_ns) &&
+-	    !__this_cpu_read(idle_poll_halt_next)) {
++	    !__this_cpu_read(idle_poll_halt_next) &&
++	    local_clock_noinstr() >= __this_cpu_read(idle_poll_off_until)) {
+ 		bool woke = idle_poll(&start);
+ 
+ 		__this_cpu_write(idle_poll_halt_next, !woke);
