@@ -24,7 +24,11 @@ class BootMemory(unittest.TestCase):
     def gate(self, target):
         return subprocess.run(
             ['/bin/sh', str(SCRIPT), str(target), str(self.root)],
-            capture_output=True, text=True, timeout=30,
+            # The script's own budget is ten seconds of sleep across 200 attempts;
+            # each attempt also forks grep and wc, which a loaded CI runner has
+            # taken over 100 ms for (2026-09-22: 30 s was not enough for the
+            # timeout case). Generous here: the script's budget is the product's.
+            capture_output=True, text=True, timeout=180,
         )
 
     def test_waits_for_online_memory_not_just_present_blocks(self):
