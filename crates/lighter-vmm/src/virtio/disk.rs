@@ -83,11 +83,13 @@ fn advance(iovs: &mut [libc::iovec], mut n: usize) -> usize {
 
 impl Disk {
     /// Opens an existing image, or creates a sparse one of `len` bytes.
+    /// With `grow`, an existing image smaller than `len` is extended to it
+    /// (never shrunk: the filesystem inside may use every block).
     ///
     /// Creation writes nothing: `set_len` extends the file logically, and macOS
     /// allocates blocks only where data is written. A freshly created 64 GiB
-    /// disk occupies zero bytes.
-    pub fn open_or_create(path: &Path, len: u64, read_only: bool) -> io::Result<Disk> {
+    /// disk occupies zero bytes, and growing one costs nothing either.
+    pub fn open_or_create(path: &Path, len: u64, read_only: bool, grow: bool) -> io::Result<Disk> {
         let file = OpenOptions::new()
             .read(true)
             .write(!read_only)
@@ -110,7 +112,24 @@ impl Disk {
             }
             file.set_len(len)?;
             len
+        } else if grow && !read_only && actual_len < len {
+            file.set_len(len)?;
+            tracing::info!(
+                path = %path.display(),
+                from_mib = actual_len >> 20,
+                to_mib = len >> 20,
+                "disk image grown"
+            );
+            len
         } else {
+            if grow && actual_len > len {
+                tracing::warn!(
+                    path = %path.display(),
+                    image_mib = actual_len >> 20,
+                    configured_mib = len >> 20,
+                    "disk image is larger than configured; images never shrink"
+                );
+            }
             actual_len
         };
 
@@ -487,8 +506,26 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&path);
-        let disk = Disk::open_or_create(&path, len, false).unwrap();
+        let disk = Disk::open_or_create(&path, len, false, false).unwrap();
         (disk, path)
+    }
+
+    #[test]
+    fn a_growable_image_follows_a_larger_size_and_never_shrinks() {
+        let (disk, path) = temp_disk(64 << 20);
+        drop(disk);
+        // Reopened without `grow`, a configured size changes nothing.
+        let disk = Disk::open_or_create(&path, 128 << 20, false, false).unwrap();
+        assert_eq!(disk.len(), 64 << 20);
+        drop(disk);
+        let disk = Disk::open_or_create(&path, 128 << 20, false, true).unwrap();
+        assert_eq!(disk.len(), 128 << 20);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 128 << 20);
+        drop(disk);
+        let disk = Disk::open_or_create(&path, 32 << 20, false, true).unwrap();
+        assert_eq!(disk.len(), 128 << 20, "never shrunk");
+        drop(disk);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -573,7 +610,7 @@ mod tests {
     fn read_only_disks_refuse_every_mutation() {
         let (disk, path) = temp_disk(1 << 20);
         drop(disk);
-        let disk = Disk::open_or_create(&path, 0, true).unwrap();
+        let disk = Disk::open_or_create(&path, 0, true, false).unwrap();
         assert!(disk.write_at(0, &[1u8; 512]).is_err());
         assert!(disk.punch_hole(0, 512).is_err());
         assert!(disk.flush().is_ok(), "flushing a read-only disk is a no-op");

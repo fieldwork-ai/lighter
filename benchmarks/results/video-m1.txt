@@ -1,0 +1,32 @@
+# lighter video, Apple M1, 26.6.2, 7097859a benchmarks/video.sh: decode and encode on the media, 4 vCPUs
+idle VMM: 2.7% of a core
+
+## Decode (Mac CPU per frame flat out; share of a core at the stream's rate)
+h264-uhd30.mkv software               142 fps   20.30 ms/frame   real time:  68.7% of a core
+h264-uhd30.mkv V4L2                    79 fps    5.10 ms/frame   real time:  15.9% of a core
+h264-uhd30.mkv native VideoToolbox     54 fps    3.73 ms/frame   real time:  11.8% of a core
+h264-fhd60.mkv software               619 fps    4.47 ms/frame   real time:  50.3% of a core
+h264-fhd60.mkv V4L2                   252 fps    1.65 ms/frame   real time:  13.3% of a core
+h264-fhd60.mkv native VideoToolbox    166 fps    1.68 ms/frame   real time:  11.3% of a core
+hevc10-uhd30.mkv software             101 fps   36.00 ms/frame   real time:  99.7% of a core
+hevc10-uhd30.mkv V4L2                  83 fps    6.03 ms/frame   real time:  29.8% of a core
+hevc10-uhd30.mkv native VideoToolbox     91 fps    4.39 ms/frame   real time:  14.9% of a core
+vp9-fhd30.webm software               390 fps    5.13 ms/frame   real time:  43.9% of a core
+vp9-fhd30.webm V4L2                   231 fps    1.77 ms/frame   real time:   8.5% of a core
+vp9-fhd30.webm native VideoToolbox    163 fps    1.60 ms/frame   real time:   6.1% of a core
+
+## Encode, 300 frames at 30 fps (software: libx264 veryfast, libx265 ultrafast)
+h264 1920x1080 software               124 fps   24.43 ms/frame   real time:  78.4% of a core
+h264 1920x1080 V4L2                   171 fps    3.93 ms/frame   real time:  21.6% of a core
+h264 1920x1080 native VideoToolbox    185 fps    2.21 ms/frame   real time:   9.1% of a core
+hevc 1920x1080 software                28 fps  141.00 ms/frame   real time: 380.1% of a core
+hevc 1920x1080 V4L2                   170 fps    3.97 ms/frame   real time:  20.8% of a core
+hevc 1920x1080 native VideoToolbox    169 fps    2.38 ms/frame   real time:   9.0% of a core
+hevc 3840x2160 software                 7 fps  537.23 ms/frame   real time: 382.8% of a core
+hevc 3840x2160 V4L2                    51 fps    9.23 ms/frame   real time:  41.5% of a core
+hevc 3840x2160 native VideoToolbox     50 fps    8.30 ms/frame   real time:  26.4% of a core
+
+## Transcode: H.264 4K30 to HEVC 1080p, 300 frames
+software                               28 fps  134.00 ms/frame   real time: 373.6% of a core
+V4L2 both ways                         69 fps   14.93 ms/frame   real time:  93.5% of a core
+native VideoToolbox                    64 fps   20.91 ms/frame   real time:  90.6% of a core

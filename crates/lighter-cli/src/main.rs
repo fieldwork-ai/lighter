@@ -481,6 +481,15 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
     }
     if let Some(disk) = disk {
         config.disk_gib = disk;
+        let image = paths::data_disk()?
+            .metadata()
+            .map(|m| m.len() >> 30)
+            .unwrap_or(0);
+        if image > disk {
+            println!(
+                "The disk is already {image} GiB and disks never shrink; it stays {image} GiB."
+            );
+        }
     }
     if let Some(publish) = publish {
         config.publish = publish;

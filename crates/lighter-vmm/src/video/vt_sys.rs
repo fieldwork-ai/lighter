@@ -30,9 +30,40 @@ pub type VTDecodeInfoFlags = u32;
 pub type CVReturn = i32;
 
 pub const kCFNumberSInt32Type: CFIndex = 3;
+pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
+pub type CFDataRef = *const c_void;
+pub type CFArrayRef = *const c_void;
+pub type CFBooleanRef = *const c_void;
+pub type VTCompressionSessionRef = *const c_void;
+pub type VTEncodeInfoFlags = u32;
+pub type CVPixelBufferPoolRef = *const c_void;
+pub const kCFNumberSInt64Type: CFIndex = 4;
+pub const kCFNumberFloat64Type: CFIndex = 13;
+/// 'avc1', 'hvc1'.
+pub const kCMVideoCodecType_H264: CMVideoCodecType = 0x6176_6331;
+pub const kCMVideoCodecType_HEVC: CMVideoCodecType = 0x6876_6331;
+/// 'y420': three-plane 4:2:0, what a V4L2 YU12 buffer is.
+pub const kCVPixelFormatType_420YpCbCr8Planar: u32 = 0x7934_3230;
+
+pub type VTCompressionOutputCallback = Option<
+    unsafe extern "C" fn(
+        output_callback_refcon: *mut c_void,
+        source_frame_refcon: *mut c_void,
+        status: OSStatus,
+        info_flags: VTEncodeInfoFlags,
+        sample_buffer: CMSampleBufferRef,
+    ),
+>;
 
 /// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`, '420v': NV12.
 pub const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = 0x3432_3076;
+/// `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`, 'x420': P010's
+/// layout, ten bits in the top of each sixteen.
+pub const kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: u32 = 0x7834_3230;
+
+pub type CMVideoCodecType = u32;
+/// 'vp09'.
+pub const kCMVideoCodecType_VP9: CMVideoCodecType = 0x7670_3039;
 
 pub const kCVPixelBufferLock_ReadOnly: u64 = 1;
 
@@ -118,6 +149,19 @@ unsafe extern "C" {
     pub static kCFTypeDictionaryKeyCallBacks: c_void;
     pub static kCFTypeDictionaryValueCallBacks: c_void;
     pub fn CFRelease(cf: CFTypeRef);
+    pub static kCFBooleanTrue: CFBooleanRef;
+    pub static kCFBooleanFalse: CFBooleanRef;
+    pub static kCFTypeArrayCallBacks: c_void;
+    pub fn CFBooleanGetValue(boolean: CFBooleanRef) -> Boolean;
+    pub fn CFArrayCreate(
+        allocator: CFAllocatorRef,
+        values: *const *const c_void,
+        num_values: CFIndex,
+        callbacks: *const c_void,
+    ) -> CFArrayRef;
+    pub fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
+    pub fn CFArrayGetValueAtIndex(array: CFArrayRef, index: CFIndex) -> *const c_void;
+    pub fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
     pub fn CFDictionaryCreate(
         allocator: CFAllocatorRef,
         keys: *const *const c_void,
@@ -126,6 +170,12 @@ unsafe extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> CFDictionaryRef;
+    pub fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
+    pub fn CFStringCreateWithCString(
+        allocator: CFAllocatorRef,
+        c_str: *const std::ffi::c_char,
+        encoding: u32,
+    ) -> CFStringRef;
     pub fn CFNumberCreate(
         allocator: CFAllocatorRef,
         kind: CFIndex,
@@ -143,6 +193,24 @@ unsafe extern "C" {
         nal_unit_header_length: i32,
         format_description_out: *mut CMFormatDescriptionRef,
     ) -> OSStatus;
+    pub static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CFStringRef;
+    pub fn CMVideoFormatDescriptionCreate(
+        allocator: CFAllocatorRef,
+        codec_type: CMVideoCodecType,
+        width: i32,
+        height: i32,
+        extensions: CFDictionaryRef,
+        format_description_out: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
+    pub fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+        allocator: CFAllocatorRef,
+        parameter_set_count: usize,
+        parameter_set_pointers: *const *const u8,
+        parameter_set_sizes: *const usize,
+        nal_unit_header_length: i32,
+        extensions: CFDictionaryRef,
+        format_description_out: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
     pub fn CMVideoFormatDescriptionGetDimensions(
         desc: CMVideoFormatDescriptionRef,
     ) -> CMVideoDimensions;
@@ -156,6 +224,38 @@ unsafe extern "C" {
         data_length: usize,
         flags: u32,
         block_buffer_out: *mut CMBlockBufferRef,
+    ) -> OSStatus;
+    pub static kCMSampleAttachmentKey_NotSync: CFStringRef;
+    pub fn CMFormatDescriptionGetMediaSubType(desc: CMFormatDescriptionRef) -> u32;
+    pub fn CMSampleBufferGetDataBuffer(sbuf: CMSampleBufferRef) -> CMBlockBufferRef;
+    pub fn CMSampleBufferGetFormatDescription(sbuf: CMSampleBufferRef) -> CMFormatDescriptionRef;
+    pub fn CMSampleBufferGetPresentationTimeStamp(sbuf: CMSampleBufferRef) -> CMTime;
+    pub fn CMSampleBufferGetSampleAttachmentsArray(
+        sbuf: CMSampleBufferRef,
+        create: Boolean,
+    ) -> CFArrayRef;
+    pub fn CMBlockBufferGetDataLength(buffer: CMBlockBufferRef) -> usize;
+    pub fn CMBlockBufferCopyDataBytes(
+        buffer: CMBlockBufferRef,
+        offset: usize,
+        length: usize,
+        destination: *mut c_void,
+    ) -> OSStatus;
+    pub fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        desc: CMFormatDescriptionRef,
+        index: usize,
+        pointer_out: *mut *const u8,
+        size_out: *mut usize,
+        count_out: *mut usize,
+        nal_header_length_out: *mut i32,
+    ) -> OSStatus;
+    pub fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        desc: CMFormatDescriptionRef,
+        index: usize,
+        pointer_out: *mut *const u8,
+        size_out: *mut usize,
+        count_out: *mut usize,
+        nal_header_length_out: *mut i32,
     ) -> OSStatus;
     pub fn CMSampleBufferCreateReady(
         allocator: CFAllocatorRef,
@@ -178,6 +278,12 @@ unsafe extern "C" {
     pub fn CVPixelBufferLockBaseAddress(pb: CVPixelBufferRef, flags: u64) -> CVReturn;
     pub fn CVPixelBufferUnlockBaseAddress(pb: CVPixelBufferRef, flags: u64) -> CVReturn;
     pub fn CVPixelBufferGetWidth(pb: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetPixelFormatType(pb: CVPixelBufferRef) -> u32;
+    pub fn CVPixelBufferPoolCreatePixelBuffer(
+        allocator: CFAllocatorRef,
+        pool: CVPixelBufferPoolRef,
+        pixel_buffer_out: *mut CVPixelBufferRef,
+    ) -> CVReturn;
     pub fn CVPixelBufferGetHeight(pb: CVPixelBufferRef) -> usize;
     pub fn CVPixelBufferGetPlaneCount(pb: CVPixelBufferRef) -> usize;
     pub fn CVPixelBufferGetBaseAddressOfPlane(pb: CVPixelBufferRef, plane: usize) -> *mut c_void;
@@ -214,4 +320,58 @@ unsafe extern "C" {
         new_format_desc: CMFormatDescriptionRef,
     ) -> Boolean;
     pub fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
+    pub fn VTRegisterSupplementalVideoDecoderIfAvailable(codec_type: CMVideoCodecType);
+    pub static kVTCompressionPropertyKey_RealTime: CFStringRef;
+    pub static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
+    pub static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
+    pub static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
+    pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
+    pub static kVTCompressionPropertyKey_ConstantBitRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_MinAllowedFrameQP: CFStringRef;
+    pub static kVTCompressionPropertyKey_MaxAllowedFrameQP: CFStringRef;
+    pub static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
+    pub static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
+    pub static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
+    pub static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
+    pub static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
+    pub static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
+    pub static kVTProfileLevel_HEVC_Main10_AutoLevel: CFStringRef;
+    pub fn VTSessionSetProperty(
+        session: *const c_void,
+        key: CFStringRef,
+        value: CFTypeRef,
+    ) -> OSStatus;
+    pub fn VTCompressionSessionCreate(
+        allocator: CFAllocatorRef,
+        width: i32,
+        height: i32,
+        codec_type: CMVideoCodecType,
+        encoder_specification: CFDictionaryRef,
+        source_image_buffer_attributes: CFDictionaryRef,
+        compressed_data_allocator: CFAllocatorRef,
+        output_callback: VTCompressionOutputCallback,
+        output_callback_refcon: *mut c_void,
+        compression_session_out: *mut VTCompressionSessionRef,
+    ) -> OSStatus;
+    pub fn VTCompressionSessionPrepareToEncodeFrames(session: VTCompressionSessionRef) -> OSStatus;
+    pub fn VTCompressionSessionGetPixelBufferPool(
+        session: VTCompressionSessionRef,
+    ) -> CVPixelBufferPoolRef;
+    pub fn VTCompressionSessionEncodeFrame(
+        session: VTCompressionSessionRef,
+        image_buffer: CVImageBufferRef,
+        presentation_time_stamp: CMTime,
+        duration: CMTime,
+        frame_properties: CFDictionaryRef,
+        source_frame_refcon: *mut c_void,
+        info_flags_out: *mut VTEncodeInfoFlags,
+    ) -> OSStatus;
+    pub fn VTCompressionSessionCompleteFrames(
+        session: VTCompressionSessionRef,
+        complete_until_presentation_time_stamp: CMTime,
+    ) -> OSStatus;
+    pub fn VTCompressionSessionInvalidate(session: VTCompressionSessionRef);
+    pub fn VTIsHardwareDecodeSupported(codec_type: CMVideoCodecType) -> Boolean;
 }

@@ -1,14 +1,16 @@
-//! virtio-media: a V4L2 stateful decoder, decoded on the Mac.
+//! virtio-media: V4L2 stateful codecs, run on the Mac.
 //!
-//! The guest sees `/dev/video0`, a memory-to-memory H.264 decoder of the
-//! kind a Raspberry Pi or a phone has, and stock ffmpeg (`h264_v4l2m2m`),
-//! GStreamer and Frigate's own ffmpeg drive it unchanged. virtio-media is
-//! V4L2 as a virtio protocol (the guest driver is a relay; the v9 series on
-//! the kernel list, carried as guest patch 0036), and the `virtio-media`
-//! crate does the protocol, the ioctl dispatch and the stateful-decoder
-//! state machine; what this module adds is the four adapters that crate
-//! needs from a VMM, and what `crate::video` adds is the decoder behind it,
-//! VideoToolbox.
+//! The guest sees `/dev/video0`, a memory-to-memory decoder of the kind a
+//! Raspberry Pi or a phone has, and `/dev/video1`, the matching encoder;
+//! stock ffmpeg (`h264_v4l2m2m` and friends), GStreamer and Frigate's own
+//! ffmpeg drive them unchanged. virtio-media is V4L2 as a virtio protocol
+//! (the guest driver is a relay; the v9 series on the kernel list, carried
+//! as guest patch 0036), and the `virtio-media` crate does the protocol,
+//! the ioctl dispatch and the stateful-decoder state machine; what this
+//! module adds is the adapters that crate needs from a VMM, and what
+//! `crate::video` adds is the codecs behind them, on VideoToolbox, and the
+//! encoder device the crate does not have. Each device is its own virtio
+//! device, the decoder first.
 //!
 //! # Memory
 //!
@@ -28,13 +30,18 @@
 //!
 //! Everything happens in `notify`, under the transport lock, as the GPU
 //! does it: a command is read from the chain, dispatched, its response
-//! scattered back, and any events the decoder produced are written into
+//! scattered back, and any events the device produced are written into
 //! the descriptors the driver keeps posted on the event queue. Decoding is
 //! synchronous inside the command that queued the bitstream, a few
-//! milliseconds for a 1080p frame.
+//! milliseconds for a 1080p frame. Encoding is not: VideoToolbox returns
+//! frames on its own thread and rings the device's doorbell, and a thread
+//! of the device's takes the transport lock and services the event queue,
+//! which collects them.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+
+use std::sync::Arc;
 
 use virtio_media::devices::video_decoder::VideoDecoder;
 use virtio_media::io::WriteToDescriptorChain;
@@ -46,6 +53,8 @@ use virtio_media::{
 use crate::layout::Window;
 use crate::memory::{GuestMemory, HOST_PAGE};
 use crate::video::decoder::VideoToolboxDecoder;
+use crate::video::encoder::Doorbell;
+use crate::video::encoder_device::VideoEncoder;
 use crate::virtio::mmio::COMMON_FEATURES;
 use crate::virtio::queue::{Descriptor, Virtqueue};
 use crate::virtio::{Serviced, ShmRegion, VirtioDevice, device_type};
@@ -56,9 +65,6 @@ pub const EVENT_QUEUE: u16 = 1;
 /// The shared-memory region MMAP buffers are mapped through, by the id the
 /// driver asks for (`VIRTIO_MEDIA_SHM_MMAP`).
 const SHM_ID_MMAP: u8 = 0;
-
-/// What the guest sees in `VIDIOC_QUERYCAP`.
-const CARD: &[u8] = b"lighter VideoToolbox decoder";
 
 // V4L2 capability bits, as `videodev2.h` has them.
 const V4L2_CAP_VIDEO_M2M_MPLANE: u32 = 0x0000_4000;
@@ -71,22 +77,23 @@ type Reader = std::io::Cursor<Vec<u8>>;
 /// The response, accumulated and scattered into the writable descriptors.
 type Writer = Vec<u8>;
 
-type Runner = VirtioMediaDeviceRunner<
-    Reader,
-    Writer,
-    VideoDecoder<VideoToolboxDecoder, Events, Aperture>,
-    NoPoller,
->;
+pub type Decoder = Media<VideoDecoder<VideoToolboxDecoder, Events, Aperture>>;
+pub type Encoder = Media<VideoEncoder<Events, Aperture>>;
 
-pub struct Media {
-    runner: Runner,
+pub struct Media<D: VirtioMediaDevice<Reader, Writer>> {
+    runner: VirtioMediaDeviceRunner<Reader, Writer, D, NoPoller>,
     aperture: Window,
-    /// Events the decoder produced, waiting for event-queue descriptors.
+    /// What the guest sees in `VIDIOC_QUERYCAP`.
+    card: &'static [u8],
+    /// Events the device produced, waiting for event-queue descriptors.
     pending: PendingEvents,
+    /// Rung when the device has work that arrived on its own; `None` for a
+    /// device that only ever answers commands.
+    doorbell: Option<Arc<Doorbell>>,
 }
 
-impl Media {
-    pub fn new(aperture: Window, memory: std::sync::Arc<GuestMemory>) -> Media {
+impl Decoder {
+    pub fn decoder(aperture: Window, memory: Arc<GuestMemory>) -> Decoder {
         let pending = PendingEvents::default();
         let device = VideoDecoder::new(
             VideoToolboxDecoder::new(),
@@ -96,7 +103,53 @@ impl Media {
         Media {
             runner: VirtioMediaDeviceRunner::new(device, NoPoller),
             aperture,
+            card: b"lighter VideoToolbox decoder",
             pending,
+            doorbell: None,
+        }
+    }
+}
+
+impl Encoder {
+    pub fn encoder(aperture: Window, memory: Arc<GuestMemory>) -> Encoder {
+        let pending = PendingEvents::default();
+        let doorbell = Arc::new(Doorbell::default());
+        let device = VideoEncoder::new(
+            Events(pending.clone()),
+            Aperture::new(aperture, memory),
+            doorbell.clone(),
+        );
+        Media {
+            runner: VirtioMediaDeviceRunner::new(device, NoPoller),
+            aperture,
+            card: b"lighter VideoToolbox encoder",
+            pending,
+            doorbell: Some(doorbell),
+        }
+    }
+}
+
+impl<D: VirtioMediaDevice<Reader, Writer>> Media<D> {
+    /// What the device's own thread waits on before servicing the event
+    /// queue.
+    pub fn doorbell(&self) -> Option<Arc<Doorbell>> {
+        self.doorbell.clone()
+    }
+
+    /// Collects whatever every session has produced into `pending`.
+    fn pump(&mut self) {
+        let sessions: Vec<u32> = self.runner.sessions.keys().copied().collect();
+        for id in sessions {
+            if let Some(session) = self.runner.sessions.get_mut(&id) {
+                loop {
+                    let before = self.pending.len();
+                    if self.runner.device.process_events(session).is_err()
+                        || self.pending.len() == before
+                    {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -141,7 +194,7 @@ impl Media {
         let mut used = false;
         while let Some(chain) = queue.pop(mem) {
             let head = chain.head();
-            let (request, reply) = Media::split(mem, chain);
+            let (request, reply) = Self::split(mem, chain);
             let word = |i: usize| {
                 request
                     .get(i * 4..i * 4 + 4)
@@ -159,20 +212,8 @@ impl Media {
             // The decoder answers synchronously, so whatever it produced
             // (a frame back, an input buffer released, a resolution change)
             // is ready the moment the command is.
-            let sessions: Vec<u32> = self.runner.sessions.keys().copied().collect();
-            for id in sessions {
-                if let Some(session) = self.runner.sessions.get_mut(&id) {
-                    loop {
-                        let before = self.pending.len();
-                        if <VideoDecoder<VideoToolboxDecoder, Events, Aperture> as VirtioMediaDevice<Reader, Writer>>::process_events(&mut self.runner.device, session).is_err()
-                            || self.pending.len() == before
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-            let len = Media::scatter(mem, &reply, &writer);
+            self.pump();
+            let len = Self::scatter(mem, &reply, &writer);
             queue.push_used(mem, head, len);
             used = true;
         }
@@ -191,12 +232,12 @@ impl Media {
                 break;
             };
             let head = chain.head();
-            let (_, reply) = Media::split(mem, chain);
+            let (_, reply) = Self::split(mem, chain);
             let Some(bytes) = self.pending.pop() else {
                 queue.push_used(mem, head, 0);
                 break;
             };
-            let len = Media::scatter(mem, &reply, &bytes);
+            let len = Self::scatter(mem, &reply, &bytes);
             tracing::trace!(
                 kind = u32::from_le_bytes(bytes[..4].try_into().unwrap_or_default()),
                 bytes = bytes.len(),
@@ -217,7 +258,11 @@ impl Media {
     }
 }
 
-impl VirtioDevice for Media {
+impl<D> VirtioDevice for Media<D>
+where
+    D: VirtioMediaDevice<Reader, Writer> + Send,
+    D::Session: Send,
+{
     fn device_type(&self) -> u32 {
         device_type::MEDIA
     }
@@ -244,7 +289,7 @@ impl VirtioDevice for Media {
 
     fn config_read(&self, offset: u64, data: &mut [u8]) {
         let mut card = [0u8; 32];
-        card[..CARD.len()].copy_from_slice(CARD);
+        card[..self.card.len()].copy_from_slice(self.card);
         let config = VirtioMediaDeviceConfig {
             device_caps: V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING,
             device_type: VFL_TYPE_VIDEO,
@@ -267,7 +312,12 @@ impl VirtioDevice for Media {
         {
             serviced.queues |= Serviced::queue(COMMAND_QUEUE).queues;
         }
-        // Whichever queue was kicked, events wait only for descriptors.
+        // Whichever queue was kicked, events wait only for descriptors; and
+        // the device's own thread services the event queue when the doorbell
+        // rings, so collect first.
+        if queue == EVENT_QUEUE && self.doorbell.is_some() {
+            self.pump();
+        }
         if let Some(q) = queues.get_mut(EVENT_QUEUE as usize)
             && self.serve_events(q, mem)
         {
@@ -301,7 +351,7 @@ impl PendingEvents {
 }
 
 /// The crate's event sink: serializes each event as the driver reads it.
-struct Events(PendingEvents);
+pub struct Events(PendingEvents);
 
 impl VirtioMediaEventQueue for Events {
     fn send_event(&mut self, event: V4l2Event) {
@@ -321,7 +371,7 @@ impl VirtioMediaEventQueue for Events {
 /// The decoder has no file descriptor to poll: it answers within the
 /// command, and its events are collected right after it.
 #[derive(Clone)]
-struct NoPoller;
+pub struct NoPoller;
 
 impl virtio_media::poll::SessionPoller for NoPoller {
     fn add_session(&self, _session: BorrowedFd, _session_id: u32) -> Result<(), i32> {

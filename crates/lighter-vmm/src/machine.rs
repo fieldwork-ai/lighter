@@ -87,6 +87,10 @@ pub struct MachineConfig {
     pub disks: Vec<PathBuf>,
     /// Logical size for a disk image that has to be created.
     pub disk_size_bytes: u64,
+    /// Images that also grow to `disk_size_bytes` when they are smaller, so
+    /// a configured size applies to a disk that already exists. The guest
+    /// grows the filesystem to fill it as it mounts it.
+    pub grow_to_size: Vec<PathBuf>,
     /// Whether the machine has a network device. Off builds one with no card
     /// at all, which is what the boot and device gates want: they are testing
     /// something else.
@@ -104,10 +108,11 @@ pub struct MachineConfig {
     /// Address space reserved for blobs the GPU maps into the guest; costs
     /// nothing until a blob lands there.
     pub gpu_aperture_bytes: u64,
-    /// A video decoder (`virtio::media`): a V4L2 node the guest decodes
-    /// H.264 through, on VideoToolbox.
+    /// A video decoder and encoder (`virtio::media`): V4L2 nodes the guest
+    /// decodes and encodes through, on VideoToolbox.
     pub video: bool,
-    /// Address space for the decoder's buffers; costs nothing until used.
+    /// Address space for their buffers, split between the two; costs
+    /// nothing until used.
     pub video_aperture_bytes: u64,
 }
 
@@ -124,6 +129,7 @@ impl Default for MachineConfig {
             interactive: true,
             disks: Vec::new(),
             disk_size_bytes: 64 << 30,
+            grow_to_size: Vec::new(),
             network: false,
             run_dir: std::env::temp_dir().join("lighter"),
             shares: Vec::new(),
@@ -131,7 +137,7 @@ impl Default for MachineConfig {
             gpu: false,
             gpu_aperture_bytes: 8 << 30,
             video: false,
-            video_aperture_bytes: 1 << 30,
+            video_aperture_bytes: 2 << 30,
         }
     }
 }
@@ -283,7 +289,13 @@ impl Machine {
         crate::exitstats::spawn_reporter_if_enabled();
         let mut block_slots = Vec::with_capacity(config.disks.len());
         for path in &config.disks {
-            let disk = Arc::new(Disk::open_or_create(path, config.disk_size_bytes, false)?);
+            let grow = config.grow_to_size.contains(path);
+            let disk = Arc::new(Disk::open_or_create(
+                path,
+                config.disk_size_bytes,
+                false,
+                grow,
+            )?);
             tracing::info!(
                 path = %path.display(),
                 capacity_mib = disk.len() / (1 << 20),
@@ -339,12 +351,29 @@ impl Machine {
             (slot, fences)
         });
 
-        if let Some(aperture) = layout.video {
-            virtio.push(Box::new(crate::virtio::media::Media::new(
-                aperture,
+        // The decoder first, so it is /dev/video0 as it always was, then
+        // the encoder, each with half the aperture.
+        let encoder = layout.video.map(|aperture| {
+            let half = aperture.size / 2;
+            virtio.push(Box::new(crate::virtio::media::Media::decoder(
+                crate::layout::Window {
+                    base: aperture.base,
+                    size: half,
+                },
                 memory.clone(),
             )));
-        }
+            let encoder = crate::virtio::media::Media::encoder(
+                crate::layout::Window {
+                    base: aperture.base + half,
+                    size: aperture.size - half,
+                },
+                memory.clone(),
+            );
+            let doorbell = encoder.doorbell().expect("the encoder has a doorbell");
+            let slot = virtio.len();
+            virtio.push(Box::new(encoder));
+            (slot, doorbell)
+        });
 
         let virtio_slots = virtio.len();
         let mut virtio_devices = Vec::with_capacity(virtio_slots);
@@ -376,6 +405,25 @@ impl Machine {
                     }
                 })
                 .map_err(|e| MachineError::Thread("gpu-fences", e))?;
+        }
+
+        // VideoToolbox hands encoded frames back on its own threads and rings
+        // the encoder's doorbell; this thread takes the transport lock and
+        // services the event queue, which delivers them.
+        if let Some((slot, doorbell)) = encoder {
+            let transport = virtio_devices[slot].clone();
+            std::thread::Builder::new()
+                .name("video-encode".into())
+                .spawn(move || {
+                    loop {
+                        doorbell.wait();
+                        transport
+                            .lock()
+                            .expect("video encoder transport poisoned")
+                            .service_queue(crate::virtio::media::EVENT_QUEUE);
+                    }
+                })
+                .map_err(|e| MachineError::Thread("video-encode", e))?;
         }
 
         // vsock queues packets from host threads and must be able to deliver
