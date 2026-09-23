@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use virtio_media::controls::{Control, ControlSubscriptions, Controls, Kind};
 use virtio_media::io::{ReadFromDescriptorChain, WriteToDescriptorChain};
 use virtio_media::ioctl::{IoctlResult, VirtioMediaIoctlHandler, virtio_media_dispatch_ioctl};
 use virtio_media::mmap::MmapMappingManager;
@@ -54,6 +55,7 @@ const RAW_FORMATS: [u32; 3] = [NV12, YU12, P010];
 const CODED_FORMATS: [u32; 2] = [H264, HEVC];
 
 const DEFAULT_SIZE: (u32, u32) = (640, 480);
+const MIN_DIMENSION: u32 = 16;
 const MAX_DIMENSION: u32 = 8192;
 /// Room for one encoded frame: half a raw frame, which even a 4K keyframe
 /// at a high bitrate stays well inside, with a floor for small pictures.
@@ -70,24 +72,6 @@ const MIN_CAPTURE_BUFFERS: u32 = 12;
 const REORDER_OUTPUT_BUFFERS: i64 = 16;
 
 // ------------------------------------------------------------ controls ---
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Int,
-    Bool,
-    Menu(&'static [&'static str]),
-    Button,
-}
-
-struct Control {
-    id: u32,
-    name: &'static str,
-    kind: Kind,
-    min: i64,
-    max: i64,
-    default: i64,
-    read_only: bool,
-}
 
 const H264_LEVELS: &[&str] = &[
     "1", "1b", "1.1", "1.2", "1.3", "2", "2.1", "2.2", "3", "3.1", "3.2", "4", "4.1", "4.2", "5",
@@ -123,21 +107,23 @@ macro_rules! control {
 }
 
 /// Every control, sorted by id, which is the order `NEXT` walks them in.
-const CONTROLS: &[Control] = &[
+static CONTROLS: Controls = Controls(&[
+    Control::class(bindings::V4L2_CID_USER_CLASS, "User Controls"),
     Control {
         id: bindings::V4L2_CID_MIN_BUFFERS_FOR_OUTPUT,
         name: "Min Number of Output Buffers",
-        kind: Kind::Int,
+        kind: Kind::Integer,
         min: 1,
         max: 32,
         default: 2,
         read_only: true,
     },
+    Control::class(bindings::V4L2_CID_CODEC_CLASS, "Codec Controls"),
     // B-frames are off unless asked for; VideoToolbox then chooses how many.
     control!(
         V4L2_CID_MPEG_VIDEO_B_FRAMES,
         "Number of B-Frames",
-        Kind::Int,
+        Kind::Integer,
         0,
         3,
         0
@@ -145,7 +131,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_GOP_SIZE,
         "GOP Size",
-        Kind::Int,
+        Kind::Integer,
         0,
         1 << 16,
         60
@@ -161,7 +147,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_BITRATE,
         "Video Bitrate",
-        Kind::Int,
+        Kind::Integer,
         1_000,
         400_000_000,
         4_000_000
@@ -169,7 +155,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE,
         "Frame Level Rate Control Enable",
-        Kind::Bool,
+        Kind::Boolean,
         0,
         1,
         1
@@ -185,7 +171,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER,
         "Repeat Sequence Header",
-        Kind::Bool,
+        Kind::Boolean,
         0,
         1,
         1
@@ -201,7 +187,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
         "H264 Minimum QP Value",
-        Kind::Int,
+        Kind::Integer,
         0,
         51,
         0
@@ -209,7 +195,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
         "H264 Maximum QP Value",
-        Kind::Int,
+        Kind::Integer,
         0,
         51,
         51
@@ -235,7 +221,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP,
         "HEVC Minimum QP Value",
-        Kind::Int,
+        Kind::Integer,
         0,
         51,
         0
@@ -243,7 +229,7 @@ const CONTROLS: &[Control] = &[
     control!(
         V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
         "HEVC Maximum QP Value",
-        Kind::Int,
+        Kind::Integer,
         0,
         51,
         51
@@ -264,33 +250,10 @@ const CONTROLS: &[Control] = &[
         12,
         5
     ),
-];
+]);
 
 fn control(id: u32) -> Option<&'static Control> {
-    CONTROLS.iter().find(|c| c.id == id)
-}
-
-impl Control {
-    fn v4l2_type(&self) -> u32 {
-        match self.kind {
-            Kind::Int => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER,
-            Kind::Bool => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_BOOLEAN,
-            Kind::Menu(_) => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU,
-            Kind::Button => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_BUTTON,
-        }
-    }
-
-    /// The value as it would be stored, or `None` for a menu entry that
-    /// is not offered. Integers are clamped, as the V4L2 core does.
-    fn validate(&self, value: i64) -> Option<i64> {
-        match self.kind {
-            Kind::Menu(names) => (value >= self.min
-                && value <= self.max
-                && names.get(value as usize).is_some_and(|n| !n.is_empty()))
-            .then_some(value),
-            _ => Some(value.clamp(self.min, self.max)),
-        }
-    }
+    CONTROLS.get(id)
 }
 
 // ------------------------------------------------------------- buffers ---
@@ -344,6 +307,7 @@ pub struct EncoderSession {
     bytesperline: u32,
     coded_sizeimage: u32,
     frame_interval: (u32, u32),
+    colorimetry: Colorimetry,
     controls: BTreeMap<u32, i64>,
     force_keyframe: bool,
     input: Vec<Buffer>,
@@ -365,6 +329,7 @@ pub struct EncoderSession {
     stamps: HashMap<i64, bindings::timeval>,
     headers_sent: bool,
     eos_subscribed: bool,
+    ctrl_subscriptions: ControlSubscriptions,
     sequence: u32,
 }
 
@@ -388,7 +353,8 @@ impl EncoderSession {
             bytesperline: DEFAULT_SIZE.0.next_multiple_of(16),
             coded_sizeimage: coded_size(DEFAULT_SIZE),
             frame_interval: (1, 30),
-            controls: CONTROLS.iter().map(|c| (c.id, c.default)).collect(),
+            colorimetry: Colorimetry::default(),
+            controls: CONTROLS.0.iter().map(|c| (c.id, c.default)).collect(),
             force_keyframe: false,
             input: Vec::new(),
             output: Vec::new(),
@@ -404,12 +370,22 @@ impl EncoderSession {
             stamps: HashMap::new(),
             headers_sent: false,
             eos_subscribed: false,
+            ctrl_subscriptions: ControlSubscriptions::default(),
             sequence: 0,
         }
     }
 
     fn control(&self, id: u32) -> i64 {
         self.controls.get(&id).copied().unwrap_or(0)
+    }
+
+    /// What a control reads as now.
+    fn current(&self, c: &Control) -> i64 {
+        if c.id == bindings::V4L2_CID_MIN_BUFFERS_FOR_OUTPUT {
+            self.min_output_buffers()
+        } else {
+            self.control(c.id)
+        }
     }
 
     /// OUTPUT buffers a client must have for frames to keep flowing. A
@@ -490,14 +466,14 @@ impl EncoderSession {
 
     fn format(&self, direction: QueueDirection) -> bindings::v4l2_format {
         let queue = QueueType::from_dir_and_class(direction, QueueClass::VideoMplane);
+        let mut pix_mp = match direction {
+            QueueDirection::Output => self.raw_format(),
+            QueueDirection::Capture => self.coded_format(),
+        };
+        self.colorimetry.apply(&mut pix_mp);
         bindings::v4l2_format {
             type_: queue as u32,
-            fmt: bindings::v4l2_format__bindgen_ty_1 {
-                pix_mp: match direction {
-                    QueueDirection::Output => self.raw_format(),
-                    QueueDirection::Capture => self.coded_format(),
-                },
-            },
+            fmt: bindings::v4l2_format__bindgen_ty_1 { pix_mp },
         }
     }
 
@@ -545,10 +521,56 @@ fn pix_mp(
         height: h,
         pixelformat: fourcc,
         field: bindings::v4l2_field_V4L2_FIELD_NONE,
-        colorspace: bindings::v4l2_colorspace_V4L2_COLORSPACE_DEFAULT,
         plane_fmt,
         num_planes: 1,
         ..Default::default()
+    }
+}
+
+/// What the client says its frames' colours are. A stateful encoder takes
+/// it on OUTPUT and reports it on CAPTURE too; it does not yet reach
+/// VideoToolbox, so the stream's VUI leaves it unspecified.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Colorimetry {
+    colorspace: u32,
+    xfer_func: u8,
+    ycbcr_enc: u8,
+    quantization: u8,
+}
+
+impl Colorimetry {
+    /// Values V4L2 does not define read as the default (0).
+    fn of(pix: &bindings::v4l2_pix_format_mplane) -> Colorimetry {
+        let known = |v: u32, last: u32| if v <= last { v } else { 0 };
+        // SAFETY: a YUV format's union member is `ycbcr_enc`.
+        let ycbcr_enc = unsafe { pix.__bindgen_anon_1.ycbcr_enc };
+        Colorimetry {
+            colorspace: known(
+                pix.colorspace,
+                bindings::v4l2_colorspace_V4L2_COLORSPACE_DCI_P3,
+            ),
+            xfer_func: known(
+                pix.xfer_func.into(),
+                bindings::v4l2_xfer_func_V4L2_XFER_FUNC_SMPTE2084,
+            ) as u8,
+            ycbcr_enc: known(
+                ycbcr_enc.into(),
+                bindings::v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_SMPTE240M,
+            ) as u8,
+            quantization: known(
+                pix.quantization.into(),
+                bindings::v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE,
+            ) as u8,
+        }
+    }
+
+    fn apply(self, pix: &mut bindings::v4l2_pix_format_mplane) {
+        pix.colorspace = self.colorspace;
+        pix.xfer_func = self.xfer_func;
+        pix.__bindgen_anon_1 = bindings::v4l2_pix_format_mplane__bindgen_ty_1 {
+            ycbcr_enc: self.ycbcr_enc,
+        };
+        pix.quantization = self.quantization;
     }
 }
 
@@ -563,7 +585,14 @@ fn coded_size((w, h): (u32, u32)) -> u32 {
 }
 
 fn even_dimension(v: u32) -> u32 {
-    (v.clamp(16, MAX_DIMENSION) + 1) & !1
+    (v.clamp(MIN_DIMENSION, MAX_DIMENSION) + 1) & !1
+}
+
+/// Whether a size is one of those `enum_framesizes` offers.
+fn frame_size_is_valid(width: u32, height: u32) -> bool {
+    [width, height]
+        .iter()
+        .all(|v| (MIN_DIMENSION..=MAX_DIMENSION).contains(v) && v % 2 == 0)
 }
 
 // -------------------------------------------------------------- device ---
@@ -793,7 +822,9 @@ where
                     // arm64, where its buffer pools align to NEON's 16.
                     min.next_multiple_of(16)
                 };
-                pix_mp(w, h, fourcc, bpl, raw_size(bpl, h))
+                let mut pix = pix_mp(w, h, fourcc, bpl, raw_size(bpl, h));
+                Colorimetry::of(&asked).apply(&mut pix);
+                pix
             }
             QueueDirection::Capture => {
                 let fourcc = if CODED_FORMATS.contains(&{ asked.pixelformat }) {
@@ -804,7 +835,9 @@ where
                 let size = asked.plane_fmt[0]
                     .sizeimage
                     .clamp(coded_size(session.size), 64 << 20);
-                pix_mp(session.size.0, session.size.1, fourcc, 0, size)
+                let mut pix = pix_mp(session.size.0, session.size.1, fourcc, 0, size);
+                session.colorimetry.apply(&mut pix);
+                pix
             }
         };
         Ok(bindings::v4l2_format {
@@ -934,10 +967,10 @@ where
             type_: bindings::v4l2_frmsizetypes_V4L2_FRMSIZE_TYPE_STEPWISE,
             __bindgen_anon_1: bindings::v4l2_frmsizeenum__bindgen_ty_1 {
                 stepwise: bindings::v4l2_frmsize_stepwise {
-                    min_width: 16,
+                    min_width: MIN_DIMENSION,
                     max_width: MAX_DIMENSION,
                     step_width: 2,
-                    min_height: 16,
+                    min_height: MIN_DIMENSION,
                     max_height: MAX_DIMENSION,
                     step_height: 2,
                 },
@@ -954,7 +987,8 @@ where
         width: u32,
         height: u32,
     ) -> IoctlResult<bindings::v4l2_frmivalenum> {
-        if index != 0 || !RAW_FORMATS.contains(&pixel_format) {
+        if index != 0 || !RAW_FORMATS.contains(&pixel_format) || !frame_size_is_valid(width, height)
+        {
             return Err(libc::EINVAL);
         }
         let fract = |numerator, denominator| bindings::v4l2_fract {
@@ -1016,6 +1050,7 @@ where
                     (pix.width, pix.height),
                     pix.plane_fmt[0].bytesperline,
                 );
+                session.colorimetry = Colorimetry::of(&pix);
                 if (raw, size, bpl) != (session.raw, session.size, session.bytesperline) {
                     session.raw = raw;
                     session.size = size;
@@ -1046,7 +1081,7 @@ where
         queue: QueueType,
         memory: MemoryType,
         count: u32,
-        flags: MemoryConsistency,
+        _flags: MemoryConsistency,
     ) -> IoctlResult<bindings::v4l2_requestbuffers> {
         if memory != MemoryType::Mmap {
             return Err(libc::EINVAL);
@@ -1095,7 +1130,8 @@ where
             capabilities: (BufferCapabilities::SUPPORTS_MMAP
                 | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
                 .bits(),
-            flags: flags.bits(),
+            // No cache hints, so V4L2_MEMORY_FLAG_NON_COHERENT is not echoed.
+            flags: 0,
             reserved: Default::default(),
         })
     }
@@ -1217,11 +1253,21 @@ where
         &mut self,
         session: &mut EncoderSession,
         event: EventType,
-        _flags: SubscribeEventFlags,
+        flags: SubscribeEventFlags,
     ) -> IoctlResult<()> {
         match event {
             EventType::Eos => {
                 session.eos_subscribed = true;
+                Ok(())
+            }
+            EventType::Ctrl(id) => {
+                let value = control(id).map_or(0, |c| session.current(c));
+                if let Some(event) =
+                    CONTROLS.subscribe(&mut session.ctrl_subscriptions, id, flags, value)?
+                {
+                    self.event_queue
+                        .send_event(V4l2Event::Event(SessionEvent::new(session.id, event)));
+                }
                 Ok(())
             }
             _ => Err(libc::EINVAL),
@@ -1233,12 +1279,18 @@ where
         session: &mut EncoderSession,
         event: bindings::v4l2_event_subscription,
     ) -> IoctlResult<()> {
-        if event.type_ == 0 || event.type_ == bindings::V4L2_EVENT_EOS {
-            session.eos_subscribed = false;
-            Ok(())
-        } else {
-            Err(libc::EINVAL)
+        match event.type_ {
+            0 => {
+                session.eos_subscribed = false;
+                Controls::unsubscribe(&mut session.ctrl_subscriptions, 0);
+            }
+            bindings::V4L2_EVENT_EOS => session.eos_subscribed = false,
+            bindings::V4L2_EVENT_CTRL => {
+                Controls::unsubscribe(&mut session.ctrl_subscriptions, event.id)
+            }
+            _ => return Err(libc::EINVAL),
         }
+        Ok(())
     }
 
     fn g_parm(
@@ -1246,7 +1298,9 @@ where
         session: &EncoderSession,
         queue: QueueType,
     ) -> IoctlResult<bindings::v4l2_streamparm> {
-        if queue.class() != QueueClass::VideoMplane {
+        // The frame rate is set on OUTPUT, where the frames arrive; CAPTURE
+        // has none of its own (no V4L2_FMT_FLAG_ENC_CAP_FRAME_INTERVAL).
+        if queue != QueueType::VideoOutputMplane {
             return Err(libc::EINVAL);
         }
         let (numerator, denominator) = session.frame_interval;
@@ -1272,6 +1326,9 @@ where
         parm: bindings::v4l2_streamparm,
     ) -> IoctlResult<bindings::v4l2_streamparm> {
         let queue = QueueType::n(parm.type_).ok_or(libc::EINVAL)?;
+        if queue != QueueType::VideoOutputMplane {
+            return Err(libc::EINVAL);
+        }
         // SAFETY: both variants start with capability, mode, timeperframe.
         let tpf = unsafe { parm.parm.output.timeperframe };
         if tpf.numerator > 0 && tpf.denominator > 0 {
@@ -1301,7 +1358,8 @@ where
         }
     }
 
-    /// The whole frame is always encoded.
+    /// The whole frame is always encoded; the crop is the one settable
+    /// target, and setting it changes nothing.
     fn s_selection(
         &mut self,
         session: &mut EncoderSession,
@@ -1310,68 +1368,28 @@ where
         _sel_rect: bindings::v4l2_rect,
         _sel_flags: SelectionFlags,
     ) -> IoctlResult<bindings::v4l2_rect> {
+        if (sel_type, sel_target) != (SelectionType::Output, SelectionTarget::Crop) {
+            return Err(libc::EINVAL);
+        }
         self.g_selection(session, sel_type, sel_target)
     }
 
     fn query_ext_ctrl(
         &mut self,
-        session: &EncoderSession,
+        _session: &EncoderSession,
         id: CtrlId,
         flags: QueryCtrlFlags,
     ) -> IoctlResult<bindings::v4l2_query_ext_ctrl> {
-        let wanted = id.id();
-        let c = if flags.contains(QueryCtrlFlags::NEXT) {
-            CONTROLS.iter().find(|c| c.id > wanted)
-        } else {
-            control(wanted)
-        }
-        .ok_or(libc::EINVAL)?;
-        let mut name = [0; 32];
-        for (d, s) in name.iter_mut().zip(c.name.bytes()) {
-            *d = s as _;
-        }
-        let mut ctrl_flags = 0;
-        if c.read_only {
-            ctrl_flags |= bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE;
-        }
-        if c.kind == Kind::Button {
-            ctrl_flags |=
-                bindings::V4L2_CTRL_FLAG_WRITE_ONLY | bindings::V4L2_CTRL_FLAG_EXECUTE_ON_WRITE;
-        }
-        let _ = session;
-        Ok(bindings::v4l2_query_ext_ctrl {
-            id: c.id,
-            type_: c.v4l2_type(),
-            name,
-            minimum: c.min,
-            maximum: c.max,
-            step: 1,
-            default_value: c.default,
-            flags: ctrl_flags,
-            elem_size: 4,
-            elems: 1,
-            ..Default::default()
-        })
+        CONTROLS.query_ext(id, flags)
     }
 
     fn queryctrl(
         &mut self,
-        session: &EncoderSession,
+        _session: &EncoderSession,
         id: CtrlId,
         flags: QueryCtrlFlags,
     ) -> IoctlResult<bindings::v4l2_queryctrl> {
-        let q = self.query_ext_ctrl(session, id, flags)?;
-        Ok(bindings::v4l2_queryctrl {
-            id: q.id,
-            type_: q.type_,
-            name: q.name.map(|c| c as u8),
-            minimum: q.minimum as i32,
-            maximum: q.maximum as i32,
-            step: q.step as i32,
-            default_value: q.default_value as i32,
-            flags: q.flags,
-            ..Default::default()
-        })
+        CONTROLS.query(id, flags)
     }
 
     fn querymenu(
@@ -1380,24 +1398,7 @@ where
         id: u32,
         index: u32,
     ) -> IoctlResult<bindings::v4l2_querymenu> {
-        let c = control(id).ok_or(libc::EINVAL)?;
-        let Kind::Menu(names) = c.kind else {
-            return Err(libc::EINVAL);
-        };
-        let label = names
-            .get(index as usize)
-            .filter(|n| !n.is_empty())
-            .ok_or(libc::EINVAL)?;
-        let mut name = [0u8; 32];
-        for (d, s) in name.iter_mut().zip(label.bytes()) {
-            *d = s;
-        }
-        Ok(bindings::v4l2_querymenu {
-            id,
-            index,
-            __bindgen_anon_1: bindings::v4l2_querymenu__bindgen_ty_1 { name },
-            reserved: 0,
-        })
+        CONTROLS.query_menu(id, index)
     }
 
     fn g_ext_ctrls(
@@ -1408,42 +1409,18 @@ where
         ctrl_array: &mut Vec<bindings::v4l2_ext_control>,
         _user_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<()> {
-        for (i, ctrl) in ctrl_array.iter_mut().enumerate() {
-            let Some(c) = control(ctrl.id).filter(|c| c.kind != Kind::Button) else {
-                ctrls.error_idx = i as u32;
-                return Err(libc::EINVAL);
-            };
-            let value = if matches!(which, CtrlWhich::Default) {
-                c.default
-            } else if c.id == bindings::V4L2_CID_MIN_BUFFERS_FOR_OUTPUT {
-                session.min_output_buffers()
-            } else {
-                session.control(c.id)
-            };
-            ctrl.__bindgen_anon_1.value = value as i32;
-        }
-        Ok(())
+        CONTROLS.get_values(which, ctrls, ctrl_array, |c| session.current(c))
     }
 
     fn try_ext_ctrls(
         &mut self,
         _session: &EncoderSession,
-        _which: CtrlWhich,
+        which: CtrlWhich,
         ctrls: &mut bindings::v4l2_ext_controls,
         ctrl_array: &mut Vec<bindings::v4l2_ext_control>,
         _user_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<()> {
-        for (i, ctrl) in ctrl_array.iter_mut().enumerate() {
-            let c = control(ctrl.id).filter(|c| !c.read_only);
-            // SAFETY: every control here is a 32-bit value.
-            let value = i64::from(unsafe { ctrl.__bindgen_anon_1.value });
-            let Some(v) = c.and_then(|c| c.validate(value)) else {
-                ctrls.error_idx = i as u32;
-                return Err(libc::EINVAL);
-            };
-            ctrl.__bindgen_anon_1.value = v as i32;
-        }
-        Ok(())
+        CONTROLS.try_values(which, ctrls, ctrl_array)
     }
 
     fn s_ext_ctrls(
@@ -1452,12 +1429,11 @@ where
         which: CtrlWhich,
         ctrls: &mut bindings::v4l2_ext_controls,
         ctrl_array: &mut Vec<bindings::v4l2_ext_control>,
-        user_regions: Vec<Vec<SgEntry>>,
+        _user_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<()> {
-        // All or nothing, as the V4L2 core does it.
-        self.try_ext_ctrls(session, which, ctrls, ctrl_array, user_regions)?;
+        CONTROLS.set_values(which, ctrls, ctrl_array)?;
         for ctrl in ctrl_array.iter() {
-            // SAFETY: as in `try_ext_ctrls`.
+            // SAFETY: every control here is a 32-bit value.
             let value = i64::from(unsafe { ctrl.__bindgen_anon_1.value });
             tracing::debug!(
                 id = format_args!("{:#x}", { ctrl.id }),
@@ -1466,6 +1442,10 @@ where
             );
             session.controls.insert(ctrl.id, value);
             self.control_changed(session, ctrl.id);
+        }
+        for event in CONTROLS.feedback(&session.ctrl_subscriptions, ctrl_array) {
+            self.event_queue
+                .send_event(V4l2Event::Event(SessionEvent::new(session.id, event)));
         }
         Ok(())
     }
@@ -1515,7 +1495,7 @@ mod tests {
 
     #[test]
     fn controls_are_sorted_for_next_and_their_defaults_are_valid() {
-        for pair in CONTROLS.windows(2) {
+        for pair in CONTROLS.0.windows(2) {
             assert!(
                 pair[0].id < pair[1].id,
                 "{} before {}",
@@ -1523,21 +1503,29 @@ mod tests {
                 pair[1].name
             );
         }
-        for c in CONTROLS {
-            assert_eq!(c.validate(c.default), Some(c.default), "{}", c.name);
+        for c in CONTROLS.0 {
+            assert_eq!(c.validate(c.default), Ok(c.default), "{}", c.name);
         }
     }
 
     #[test]
     fn menus_refuse_what_is_not_offered_and_integers_clamp() {
         let profile = control(bindings::V4L2_CID_MPEG_VIDEO_H264_PROFILE).unwrap();
-        assert_eq!(profile.validate(2), Some(2));
-        assert_eq!(profile.validate(3), None, "Extended is not offered");
-        assert_eq!(profile.validate(5), None);
+        assert_eq!(profile.validate(2), Ok(2));
+        assert_eq!(
+            profile.validate(3),
+            Err(libc::EINVAL),
+            "Extended is not offered"
+        );
+        assert_eq!(profile.validate(5), Err(libc::ERANGE));
         let hevc = control(bindings::V4L2_CID_MPEG_VIDEO_HEVC_PROFILE).unwrap();
-        assert_eq!(hevc.validate(1), None, "Main Still Picture is not offered");
+        assert_eq!(
+            hevc.validate(1),
+            Err(libc::EINVAL),
+            "Main Still Picture is not offered"
+        );
         let bframes = control(bindings::V4L2_CID_MPEG_VIDEO_B_FRAMES).unwrap();
-        assert_eq!(bframes.validate(7), Some(3));
+        assert_eq!(bframes.validate(7), Ok(3));
     }
 
     fn session() -> EncoderSession {
@@ -1594,7 +1582,112 @@ mod tests {
         s.collect();
         assert_eq!(sizes(&s), vec![15, 5]);
         let header_mode = control(bindings::V4L2_CID_MPEG_VIDEO_HEADER_MODE).unwrap();
-        assert_eq!(header_mode.validate(0), None, "SEPARATE is refused");
+        assert!(header_mode.validate(0).is_err(), "SEPARATE is refused");
+    }
+
+    #[derive(Default)]
+    struct Sent(Vec<V4l2Event>);
+
+    impl VirtioMediaEventQueue for Sent {
+        fn send_event(&mut self, event: V4l2Event) {
+            self.0.push(event);
+        }
+    }
+
+    fn encoder() -> VideoEncoder<Sent, ()> {
+        VideoEncoder::new(Sent::default(), (), Arc::new(Doorbell::default()))
+    }
+
+    #[test]
+    fn frame_intervals_exist_only_for_sizes_the_encoder_offers() {
+        let mut e = encoder();
+        let s = session();
+        assert!(e.enum_frameintervals(&s, 0, NV12, 16, 16).is_ok());
+        assert!(
+            e.enum_frameintervals(&s, 0, NV12, MAX_DIMENSION, MAX_DIMENSION)
+                .is_ok()
+        );
+        for (w, h) in [
+            (15, 16),
+            (16, 15),
+            (17, 16),
+            (MAX_DIMENSION, MAX_DIMENSION + 1),
+        ] {
+            assert_eq!(
+                e.enum_frameintervals(&s, 0, NV12, w, h).err(),
+                Some(libc::EINVAL),
+                "{w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_frame_rate_lives_on_output_only() {
+        let mut e = encoder();
+        let mut s = session();
+        assert!(e.g_parm(&s, QueueType::VideoOutputMplane).is_ok());
+        assert_eq!(
+            e.g_parm(&s, QueueType::VideoCaptureMplane).err(),
+            Some(libc::EINVAL)
+        );
+        let parm = bindings::v4l2_streamparm {
+            type_: QueueType::VideoCaptureMplane as u32,
+            ..Default::default()
+        };
+        assert_eq!(e.s_parm(&mut s, parm).err(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn only_the_output_crop_is_settable() {
+        let mut e = encoder();
+        let mut s = session();
+        let rect = bindings::v4l2_rect::default();
+        let flags = SelectionFlags::empty();
+        assert!(
+            e.s_selection(
+                &mut s,
+                SelectionType::Output,
+                SelectionTarget::Crop,
+                rect,
+                flags
+            )
+            .is_ok()
+        );
+        for target in [SelectionTarget::CropDefault, SelectionTarget::CropBounds] {
+            assert_eq!(
+                e.s_selection(&mut s, SelectionType::Output, target, rect, flags)
+                    .err(),
+                Some(libc::EINVAL)
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_subscription_sends_its_initial_value() {
+        let mut e = encoder();
+        let mut s = session();
+        let gop = bindings::V4L2_CID_MPEG_VIDEO_GOP_SIZE;
+        e.subscribe_event(
+            &mut s,
+            EventType::Ctrl(gop),
+            SubscribeEventFlags::SEND_INITIAL,
+        )
+        .unwrap();
+        e.subscribe_event(
+            &mut s,
+            EventType::Ctrl(bindings::V4L2_CID_CODEC_CLASS),
+            SubscribeEventFlags::SEND_INITIAL,
+        )
+        .unwrap();
+        assert_eq!(e.event_queue.0.len(), 1, "a class never signals");
+        assert!(matches!(
+            e.subscribe_event(
+                &mut s,
+                EventType::Ctrl(0x0098_0999),
+                SubscribeEventFlags::empty()
+            ),
+            Err(libc::EINVAL)
+        ));
     }
 
     #[test]
