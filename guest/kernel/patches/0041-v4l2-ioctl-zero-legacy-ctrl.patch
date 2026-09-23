@@ -1,0 +1,30 @@
+# V4L2 core: VIDIOC_G_CTRL and VIDIOC_S_CTRL, translated for a driver with no control handler, hand it an extended
+# control whose size (and the rest of both structures) is stack garbage; virtio-media then takes size as a payload to
+# copy and fails with EINVAL, so GStreamer cannot set an encoder's profile. Sent upstream 23 Sep 2026:
+# https://lore.kernel.org/all/20260923160936.33445-1-nick@getfieldwork.ai/
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 17ba1ae70..b7d248ab7 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -2357,8 +2357,8 @@ static int v4l_g_ctrl(const struct v4l2_ioctl_ops *ops, struct file *file,
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_control *p = arg;
+ 	struct v4l2_fh *vfh = file_to_v4l2_fh(file);
+-	struct v4l2_ext_controls ctrls;
+-	struct v4l2_ext_control ctrl;
++	struct v4l2_ext_controls ctrls = {};
++	struct v4l2_ext_control ctrl = {};
+ 
+ 	if (vfh && vfh->ctrl_handler)
+ 		return v4l2_g_ctrl(vfh->ctrl_handler, p);
+@@ -2388,8 +2388,8 @@ static int v4l_s_ctrl(const struct v4l2_ioctl_ops *ops, struct file *file,
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_control *p = arg;
+ 	struct v4l2_fh *vfh = file_to_v4l2_fh(file);
+-	struct v4l2_ext_controls ctrls;
+-	struct v4l2_ext_control ctrl;
++	struct v4l2_ext_controls ctrls = {};
++	struct v4l2_ext_control ctrl = {};
+ 	int ret;
+ 
+ 	if (vfh && vfh->ctrl_handler)
