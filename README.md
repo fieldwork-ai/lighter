@@ -46,6 +46,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 | **Apple Neural Engine (ANE)** | **Yes** | No | No | No |
 | **PyTorch on Mac GPU (MPS)** | **Yes** | No | No | No |
 | **llama.cpp / whisper on Metal** | **Yes** (93 t/s on M1, 299 on M5) | No | No | No |
+| **Hardware video decode (H.264)** | **Yes** (4K30 at 8% of a core, 41% in software) | No | No | No |
 
 ---
 
@@ -105,7 +106,7 @@ Direct installations can opt into background update downloads with `lighter upda
 
 ## Hardware & AI Acceleration
 
-lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, and it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All four devices use Docker's standard Container Device Interface (CDI) via `--device` and need no flags to enable.
+lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels, and it decodes H.264 on the Mac's media engine for anything that speaks V4L2. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All five devices use Docker's standard Container Device Interface (CDI) via `--device` and need no flags to enable.
 
 | Device | What a container gets | Measured performance |
 |---|---|---|
@@ -113,10 +114,11 @@ lighter is the first container runtime for macOS to put the Neural Engine and Py
 | `lighter.sh/metal` | ggml's Metal kernels over RPC | 93 t/s on M1 (85% of native); 299 on M5 |
 | `lighter.sh/ane` | ONNX models on Neural Engine, GPU or CPU (fastest chosen) | ResNet-50 2.2 ms vs 29 ms on container CPU |
 | `lighter.sh/mps` | PyTorch on the Mac's GPU | Training step 14 ms on M1, 7 ms on M5 |
+| `lighter.sh/video` | A V4L2 H.264 decoder (`/dev/video0`) on the Mac's media engine | 4K30 in real time at 8% of a core, 41% in software (M5) |
 
-Two documented costs (`docs/gpu.md`): cold start is ~50 ms longer with accelerator devices enabled (564 / 715 ms vs 517 / 664 ms on M5), and idle memory is ~20 MiB higher for the in-process servers' readiness. Devices can be disabled individually if desired (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off`).
+Two documented costs (`docs/gpu.md`): cold start is ~50 ms longer with accelerator devices enabled (564 / 715 ms vs 517 / 664 ms on M5), and idle memory is ~20 MiB higher for the in-process servers' readiness. Devices can be disabled individually if desired (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off`, `--video off`).
 
-A resident accelerator client (such as Frigate NVR or a continuous speech service) no longer burns a host core at idle: with lighter's 1 ms message-horizon polling rule, CPU usage is 21–39% during active detection (compared to a full pinned core before) and returns to rest between requests.
+A resident accelerator client (such as Frigate NVR or a continuous speech service) costs the Mac what its work costs: an idle vCPU spins for a wakeup only while spinning is catching them, so Frigate on one camera, detecting on the Neural Engine, runs at 14.5% of a core on a 16-vCPU guest (20.7% in 0.7.3), and lighter's own share of that is a few points; the rest is Frigate's Python.
 
 See [`docs/gpu.md`](docs/gpu.md) for complete technical documentation and architecture.
 
@@ -168,7 +170,27 @@ session = ort.InferenceSession("model.onnx", options)
 - **Frigate NVR**: YOLO11n object detection runs at **7.6 ms/frame at <1% CPU** (vs 15.1 ms and 36% CPU on container CPU).
 - Automatic tiering: Model loads across Neural Engine, GPU, and CPU paths on first run; fastest candidate is automatically chosen and CoreML compiled models are cached in `coreml-cache`.
 
-### 4. General-Purpose Vulkan (`--device lighter.sh/gpu=all`)
+### 4. Hardware video decode (`--device lighter.sh/video=all`)
+
+A container gets `/dev/video0`, a V4L2 stateful H.264 decoder of the kind a Raspberry Pi has, backed by VideoToolbox. Stock ffmpeg, GStreamer and Frigate's own ffmpeg use it unchanged:
+
+```bash
+docker run --rm --device lighter.sh/video=all -v "$PWD:/w" debian:bookworm-slim sh -c \
+  'apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null &&
+   ffmpeg -c:v h264_v4l2m2m -i /w/input.mkv -f null -'
+```
+
+| Stream, decoded in real time (M5) | Software | `h264_v4l2m2m` |
+|---|---|---|
+| 4K at 30 fps, 25 Mbps | 41% of a core | **8%** |
+| 1080p at 60 fps, 12 Mbps | 29% | **6%** |
+| A camera's 2880x1616 at 20 fps | 17% | **4%** |
+
+- Every frame is identical to software decode's, byte for byte (checked frame by frame on all three).
+- **Frigate NVR**: `ffmpeg.hwaccel_args: -c:v h264_v4l2m2m` on the camera. Detecting on a 5 MP main stream: 32% of a core to 22%, of which Frigate's own downscale is most of the rest.
+- H.264 in, NV12 out; one copy a frame into the guest. HEVC and encode are not in 0.8.0.
+
+### 5. General-Purpose Vulkan (`--device lighter.sh/gpu=all`)
 
 Exposes a virtio-gpu Venus render node decoded on macOS by `virglrenderer` over `MoltenVK`:
 
@@ -337,13 +359,13 @@ lighter exposes the Apple Silicon compute architecture to containers:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
 - **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 604 MiB (+20 MiB over the same guest without the servers).
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
-- **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`). If traffic pauses, polling drops back immediately to the resting floor within rounds, allowing resident containers (such as Frigate NVR or background speech-to-text) to run at 21–39% CPU during active detection rather than pinning a full host core.
+- **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`), and every vCPU weighs what it spends spinning against the wakeups it catches, backing off when polling does not pay. A resident container (Frigate NVR, background speech-to-text) costs what its own work costs rather than a vCPU's spinning: Frigate on one camera, 14.5% of a core (20.7% in 0.7.3).
 
 ---
 
 ## Features
 
-- **Apple Silicon hardware acceleration:** Native access to Apple Silicon GPU (Vulkan and Metal/ggml), Neural Engine (ANE via ONNX Runtime), and PyTorch MPS in containers via standard Docker CDI (`--device lighter.sh/...`). See the [Hardware & AI Acceleration guide](docs/gpu.md).
+- **Apple Silicon hardware acceleration:** Native access to Apple Silicon GPU (Vulkan and Metal/ggml), Neural Engine (ANE via ONNX Runtime), PyTorch MPS, and the media engine (H.264 decode over V4L2) in containers via standard Docker CDI (`--device lighter.sh/...`). See the [Hardware & AI Acceleration guide](docs/gpu.md).
 - **Docker CLI & Compose compatibility:** Works seamlessly as a registered Docker context with existing `docker`, `docker compose`, and third-party developer tooling.
 - **x86-64 containers under Rosetta:** Run `linux/amd64` images on Apple Silicon with near-native performance via Apple Rosetta (`lighter rosetta --install`). See [x86-64 architecture and performance](docs/x86-64.md).
 - **Local Kubernetes with kind:** Spin up single-node and multi-node arm64 Kubernetes clusters with standard `kind`, `kubectl`, and `helm` commands without control-plane overhead when idle. See the [Kubernetes guide](docs/kubernetes.md).
