@@ -44,6 +44,13 @@ fn main() -> ExitCode {
             "--disk" => config
                 .disks
                 .push(PathBuf::from(args.next().unwrap_or_default())),
+            // The last `--disk` grows to `--disk-size-gib` if it is smaller,
+            // as `lighter` does with its data disk.
+            "--disk-grow" => {
+                if let Some(last) = config.disks.last().cloned() {
+                    config.grow_to_size.push(last);
+                }
+            }
             "--disk-size-gib" => {
                 let gib: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(64);
                 config.disk_size_bytes = gib << 30;

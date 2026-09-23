@@ -260,6 +260,21 @@ if [ -b "$DATA_DEV" ]; then
 	echo none > "/sys/block/${DATA_DEV#/dev/}/queue/scheduler" 2>/dev/null
 	if mount -o "$DATA_OPTS" "$DATA_DEV" /mnt/data; then
 		echo "INIT data=mounted"
+		# The host grows the image when `lighter config --disk` asks for
+		# more; the filesystem follows it here, online, and is left alone
+		# when it already fills the device.
+		# Never fatal: init is `set -e`, and a disk that could not grow still
+		# boots at the size it had.
+		before=$(df -k /mnt/data 2>/dev/null | awk 'NR==2 {print $2}') || true
+		case "$DATA_TYPE" in
+		btrfs) btrfs filesystem resize max /mnt/data >/dev/null 2>&1 || echo "INIT data_grow=failed" ;;
+		xfs) xfs_growfs /mnt/data >/dev/null 2>&1 || echo "INIT data_grow=failed" ;;
+		ext4) resize2fs "$DATA_DEV" >/dev/null 2>&1 || echo "INIT data_grow=failed" ;;
+		esac
+		after=$(df -k /mnt/data 2>/dev/null | awk 'NR==2 {print $2}') || true
+		if [ "$before" != "$after" ]; then
+			echo "INIT data_grown=${before}KiB->${after}KiB"
+		fi
 		# `lighter.data_warm=<GiB>`: an experiment's knob. btrfs allocates
 		# its block groups on first use, a gigabyte of data at a time with
 		# the chunk, device and free-space trees written for each; a file

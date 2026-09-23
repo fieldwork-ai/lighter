@@ -214,7 +214,13 @@ pub fn start_registered() -> anyhow::Result<bool> {
         .success();
     if loaded {
         let out = std::process::Command::new("/bin/launchctl")
-            .args(["kickstart", &target])
+            // `-k`: the caller has established that no machine owns the home,
+            // but launchd may not yet have reaped the one that just exited (a
+            // `restart` gets here within milliseconds), and a plain kickstart
+            // of a job it still counts as running does nothing. It then sees
+            // a clean exit, which `KeepAlive: SuccessfulExit=false` does not
+            // restart, and the machine stays down.
+            .args(["kickstart", "-k", &target])
             .output()?;
         anyhow::ensure!(
             out.status.success(),

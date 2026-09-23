@@ -658,7 +658,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&path);
-        let disk = Disk::open_or_create(&path, 16 << 20, false).unwrap();
+        let disk = Disk::open_or_create(&path, 16 << 20, false, false).unwrap();
         let _ = std::fs::remove_file(&path);
         Arc::new(disk)
     }
@@ -685,7 +685,7 @@ mod tests {
     fn a_read_only_disk_advertises_ro() {
         let path = std::env::temp_dir().join(format!("lighter-ro-{}.img", std::process::id()));
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
-        let disk = Arc::new(Disk::open_or_create(&path, 0, true).unwrap());
+        let disk = Arc::new(Disk::open_or_create(&path, 0, true, false).unwrap());
         let block = Block::new(disk, 1);
         assert_ne!(block.features() & F_RO, 0);
         let _ = std::fs::remove_file(path);

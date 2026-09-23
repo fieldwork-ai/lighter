@@ -240,6 +240,31 @@ table inet sandbox {
 EOF' 2>&1)"
 echo "$nft_out" | grep -q NFT-OK && pass "a container loads an nftables firewall (ct state, log, limit, reject, dnat, masquerade)" || fail "nftables in a container: $(echo "$nft_out" | grep -m1 -i "error\|No such" || echo "$nft_out" | tail -1)"
 
+# A larger configured disk applies to one that already exists: `lighter config
+# --disk` once only sized an image as it was created. Power off, boot again at
+# 20 GiB with the data disk growable, and the image, the filesystem inside it
+# and everything on it follow.
+images_before="$(docker images -q | sort | tr '\n' ' ')"
+booted="$(grep -c "AGENT listening port=2375" "$LOG" || true)"
+kill -TERM "$VMM_PID"
+for _ in $(seq 1 60); do kill -0 "$VMM_PID" 2>/dev/null || break; sleep 1; done
+kill -0 "$VMM_PID" 2>/dev/null && { kill -9 "$VMM_PID"; fail "the machine did not power off within 60s"; }
+"$BIN" --kernel "$KERNEL" --disk "$ROOTFS" --disk "$DATA" --disk-size-gib 20 --disk-grow \
+	--net --run-dir "$RUN_DIR" --vsock "$SOCKET:2375" --docker-ports "$SOCKET" \
+	--no-tty --cpus 4 --memory-mib 4096 \
+	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
+	>>"$LOG" 2>&1 &
+VMM_PID=$!
+for _ in $(seq 1 "$BOOT_TIMEOUT"); do [ "$(grep -c "AGENT listening port=2375" "$LOG" || true)" -gt "$booted" ] && break; sleep 1; done
+image_gib=$(( $(stat -f %z "$DATA") >> 30 ))
+grown="$(grep -a "INIT data_grow" "$LOG" | tail -1 || true)"
+if [ "$image_gib" = 20 ] && [ -n "$grown" ] && [ "$(docker images -q | sort | tr '\n' ' ')" = "$images_before" ]; then
+	pass "a larger disk applies to the existing image: 16 to 20 GiB, btrfs grown online (${grown#*=}), images kept"
+else
+	fail "disk growth: image ${image_gib} GiB, ${grown:-no INIT data_grown}, images before [$images_before] after [$(docker images -q | sort | tr '\n' ' ')]"
+	grep -a "INIT data\|disk image\|AGENT listening" "$LOG" | tail -8 | sed 's/^/    /' || true
+fi
+
 for signature in "Kernel panic" "Internal error: Oops" "INIT dockerd=exited"; do
 	if grep -qF "$signature" "$LOG"; then
 		fail "guest reported: $signature"

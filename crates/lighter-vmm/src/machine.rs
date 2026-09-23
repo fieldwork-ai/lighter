@@ -87,6 +87,10 @@ pub struct MachineConfig {
     pub disks: Vec<PathBuf>,
     /// Logical size for a disk image that has to be created.
     pub disk_size_bytes: u64,
+    /// Images that also grow to `disk_size_bytes` when they are smaller, so
+    /// a configured size applies to a disk that already exists. The guest
+    /// grows the filesystem to fill it as it mounts it.
+    pub grow_to_size: Vec<PathBuf>,
     /// Whether the machine has a network device. Off builds one with no card
     /// at all, which is what the boot and device gates want: they are testing
     /// something else.
@@ -125,6 +129,7 @@ impl Default for MachineConfig {
             interactive: true,
             disks: Vec::new(),
             disk_size_bytes: 64 << 30,
+            grow_to_size: Vec::new(),
             network: false,
             run_dir: std::env::temp_dir().join("lighter"),
             shares: Vec::new(),
@@ -284,7 +289,13 @@ impl Machine {
         crate::exitstats::spawn_reporter_if_enabled();
         let mut block_slots = Vec::with_capacity(config.disks.len());
         for path in &config.disks {
-            let disk = Arc::new(Disk::open_or_create(path, config.disk_size_bytes, false)?);
+            let grow = config.grow_to_size.contains(path);
+            let disk = Arc::new(Disk::open_or_create(
+                path,
+                config.disk_size_bytes,
+                false,
+                grow,
+            )?);
             tracing::info!(
                 path = %path.display(),
                 capacity_mib = disk.len() / (1 << 20),

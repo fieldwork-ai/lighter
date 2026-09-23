@@ -242,6 +242,7 @@ pub fn machine() -> anyhow::Result<()> {
         interactive: false,
         disks: vec![private_rootfs()?, paths::data_disk()?],
         disk_size_bytes: config.disk_gib << 30,
+        grow_to_size: vec![paths::data_disk()?],
         network: true,
         run_dir: home.clone(),
         shares,
