@@ -331,7 +331,7 @@ Other runtimes assign the VM a virtual network interface card and run a userspac
 lighter avoids packet transport across the VM boundary entirely:
 - **Direct stream bridging:** When a container opens a TCP connection, the guest kernel redirects it to lighter's agent, which establishes a single vsock stream to the host. The host opens a native macOS socket to the destination and copies bytes between the two. The Mac's native network stack handles routing, VPNs, and proxies automatically.
 - **In-kernel BPF sockmap:** The container socket and the vsock stream are joined directly in the guest kernel via a BPF sockmap. The data path is a zero-process kernel-to-kernel copy.
-- **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency drops to **40 µs**, over six times faster than OrbStack (262 µs) and nearly thirteen times faster than Docker Desktop (513 µs).
+- **Native host DNS resolution:** Container DNS queries are resolved directly by the macOS host resolver. Lookup latency drops to **39 µs**, over six times faster than OrbStack (262 µs) and nearly thirteen times faster than Docker Desktop (513 µs).
 - **Low-latency polling:** After every network event, the host transport thread polls briefly before sleeping, servicing immediate request-response replies without scheduler wake latency.
 
 ### 5. Sub-second startup (709 ms cold start)
@@ -395,13 +395,13 @@ lighter (CLI)  ──spawns──▶  lighter run
                                  ├── lighter-vmm      vCPUs, GICv3, device tree, memory layout, virtio
                                  ├── lighter-fs       virtio-fs host implementation, caching, FSEvents
                                  ├── lighter-docker   Docker socket bridge and port forwarder
-                                 └── Accelerators     In-process Metal (ggml), Venus/MoltenVK, CoreML (ANE), MPS
+                                 └── Accelerators     Metal (ggml), Venus/MoltenVK, CoreML (ANE), MPS, VideoToolbox (V4L2)
 ```
 
 The guest environment consists of:
 - A custom 6.18 longterm Linux kernel booting uncompressed directly from memory (no bootloader).
 - Minimal Alpine-based root filesystem with `dockerd` and a lightweight Rust guest agent.
-- Host-accelerated virtio-gpu (Venus), ANE CoreML bridge, in-process Metal ggml RPC, and PyTorch MPS server.
+- Host-accelerated virtio-gpu (Venus), ANE CoreML bridge, in-process Metal ggml RPC, PyTorch MPS server, and V4L2 VideoToolbox decoder.
 
 See [`docs/architecture.md`](docs/architecture.md) and [`docs/gpu.md`](docs/gpu.md) for detailed internals.
 
