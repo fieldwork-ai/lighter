@@ -12,11 +12,11 @@
 //! the only things it needs from the operating system are a socket, some
 //! memory and the environment, which are syscalls (`sys`). Memory is a
 //! linked-list heap over an anonymous mapping.
-#![no_std]
+// `cargo test` builds it with std, on the Mac, for the parts that are pure.
+#![cfg_attr(not(test), no_std)]
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, clippy::missing_safety_doc)]
 
 extern crate alloc;
-
 mod pb;
 mod sys;
 mod ort_sys;
@@ -33,6 +33,7 @@ use pb::Pb;
 
 // ---------------- runtime scaffolding ----------------
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     sys::exit_group(134)
@@ -62,6 +63,7 @@ unsafe impl core::alloc::GlobalAlloc for Heap {
     }
 }
 
+#[cfg(not(test))]
 #[global_allocator]
 static HEAP: Heap = Heap {
     inner: linked_list_allocator::LockedHeap::empty(),
@@ -838,8 +840,14 @@ fn bind(s: &mut Session, dims: &[Vec<i64>]) -> Result<(), String> {
 }
 
 unsafe extern "C" fn ci_compute(_this: *mut OrtNodeComputeInfo, state: *mut c_void, ctx: *mut OrtKernelContext) -> OrtStatusPtr {
-    let a = api();
     let ci = unsafe { &*(state as *const ComputeInfo) };
+    unsafe { compute(&ci.lock, &ci.session, ctx) }
+}
+
+/// One run: the kernel's inputs to the host, its outputs back. The plugin
+/// provider's fused node and the custom op (`custom_op`) both run this.
+unsafe fn compute(lock: &Lock, session: &core::cell::UnsafeCell<Session>, ctx: *mut OrtKernelContext) -> OrtStatusPtr {
+    let a = api();
     let mut nin = 0usize;
     ort_call!(KernelContext_GetInputCount, ctx, &mut nin);
     let mut dims_all: Vec<Vec<i64>> = Vec::with_capacity(nin);
@@ -852,16 +860,23 @@ unsafe extern "C" fn ci_compute(_this: *mut OrtNodeComputeInfo, state: *mut c_vo
         ort_call!(GetTensorTypeAndShape, v, &mut tsi);
         let (mut et, mut nd) = (0u32, 0usize);
         ort_call!(GetTensorElementType, tsi, &mut et);
+        if elem_size(et) == 0 {
+            unsafe { (a.ReleaseTensorTypeAndShapeInfo.unwrap())(tsi) };
+            let mut m = String::new();
+            let _ = write!(m, "input {i} is a tensor of ONNX type {et}, which the Neural Engine does not take");
+            return fail(&m);
+        }
         ort_call!(GetDimensionsCount, tsi, &mut nd);
         let mut dims = vec![0i64; nd];
         if nd > 0 {
             ort_call!(GetDimensions, tsi, dims.as_mut_ptr(), nd);
         }
         unsafe { (a.ReleaseTensorTypeAndShapeInfo.unwrap())(tsi) };
-        let mut size = 0usize;
-        ort_call!(GetTensorSizeInBytes, v, &mut size);
-        let mut data: *const c_void = ptr::null();
-        ort_call!(GetTensorData, v, &mut data);
+        // Only calls in every C API since 1.16: the custom-op path runs this
+        // on runtimes whose table ends before GetTensorSizeInBytes (1.23).
+        let size = dims.iter().map(|d| *d as usize).product::<usize>() * elem_size(et);
+        let mut data: *mut c_void = ptr::null_mut();
+        ort_call!(GetTensorMutableData, v as *mut OrtValue, &mut data);
         body.extend_from_slice(&et.to_le_bytes());
         body.extend_from_slice(&(nd as u32).to_le_bytes());
         for d in &dims {
@@ -871,8 +886,8 @@ unsafe extern "C" fn ci_compute(_this: *mut OrtNodeComputeInfo, state: *mut c_vo
         body.extend_from_slice(unsafe { core::slice::from_raw_parts(data as *const u8, size) });
         dims_all.push(dims);
     }
-    ci.lock.acquire();
-    let s = unsafe { &mut *ci.session.get() };
+    lock.acquire();
+    let s = unsafe { &mut *session.get() };
     let result = (|| -> Result<Vec<u8>, String> {
         if s.id == 0 || s.bound != dims_all {
             bind(s, &dims_all)?;
@@ -882,7 +897,7 @@ unsafe extern "C" fn ci_compute(_this: *mut OrtNodeComputeInfo, state: *mut c_vo
         req.extend_from_slice(&body);
         s.link.as_mut().unwrap().call(KIND_RUN, &req)
     })();
-    ci.lock.release();
+    lock.release();
     let reply = match result {
         Ok(r) => r,
         Err(e) => return fail(&e),
@@ -974,3 +989,6 @@ pub unsafe extern "C" fn ReleaseEpFactory(f: *mut OrtEpFactory) -> OrtStatusPtr 
     drop(unsafe { alloc::boxed::Box::from_raw(f as *mut Factory) });
     ptr::null_mut()
 }
+
+// Declared last so the `ort_call!` macro above is in scope.
+mod custom_op;
