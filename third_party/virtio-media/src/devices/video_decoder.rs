@@ -28,6 +28,10 @@ use v4l2r::QueueType;
 use v4l2r::XferFunc;
 use v4l2r::YCbCrEncoding;
 
+use crate::controls::Control;
+use crate::controls::ControlSubscriptions;
+use crate::controls::Controls;
+use crate::controls::Kind;
 use crate::io::ReadFromDescriptorChain;
 use crate::io::WriteToDescriptorChain;
 use crate::ioctl::virtio_media_dispatch_ioctl;
@@ -363,6 +367,19 @@ impl V4l2FormatColorspace {
     }
 }
 
+static DECODER_CONTROLS: Controls = Controls(&[
+    Control::class(bindings::V4L2_CID_USER_CLASS, "User Controls"),
+    Control {
+        id: bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+        name: "Min Number of Capture Buffers",
+        kind: Kind::Integer,
+        min: 1,
+        max: 32,
+        default: 1,
+        read_only: true,
+    },
+]);
+
 pub struct VideoDecoderSession<S: VideoDecoderBackendSession> {
     id: u32,
 
@@ -382,6 +399,7 @@ pub struct VideoDecoderSession<S: VideoDecoderBackendSession> {
     /// Whether the EOS event has been subscribed to by the driver. If `true` then the device will
     /// emit EOS events.
     eos_subscribed: bool,
+    ctrl_subscriptions: ControlSubscriptions,
 
     crop_rectangle: CropRectangle,
 
@@ -467,7 +485,10 @@ impl<S: VideoDecoderBackendSession> VideoDecoderSession<S> {
         }
 
         for i in self.pending_output_buffers.drain(..) {
-            let buffer = self.output_buffers.get_mut(i as usize).unwrap();
+            // A REQBUFS that shrank the queue since took the buffer with it.
+            let Some(buffer) = self.output_buffers.get_mut(i as usize) else {
+                continue;
+            };
             self.backend_session
                 .use_as_output(buffer.index(), &mut buffer.backing)?;
         }
@@ -536,15 +557,6 @@ where
     Q: VirtioMediaEventQueue,
     HM: VirtioMediaHostMemoryMapper,
 {
-    /// What the two minimum-buffers controls report.
-    fn min_buffers(&self, session: &VideoDecoderSession<B::Session>, cid: u32) -> u32 {
-        if cid == bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE {
-            session.backend_session.stream_params().min_output_buffers
-        } else {
-            1
-        }
-    }
-
     pub fn new(backend: B, event_queue: Q, host_mapper: HM) -> Self {
         Self {
             backend,
@@ -622,6 +634,7 @@ where
             sequence_cpt: 0,
             src_change_subscribed: false,
             eos_subscribed: false,
+            ctrl_subscriptions: Default::default(),
             crop_rectangle: CropRectangle::Settable(v4l2r::Rect::new(0, 0, 0, 0)),
             colorspace: Default::default(),
             format_change_pending: false,
@@ -836,96 +849,73 @@ where
 {
     type Session = VideoDecoderSession<B::Session>;
 
-    // The two controls every stateful decoder has and clients ask for:
+    // The control every stateful decoder has and clients ask for:
     // ffmpeg's h264_v4l2m2m in the Raspberry Pi build (what Frigate ships)
     // will not open a decoder whose VIDIOC_QUERYCTRL answers ENOTTY.
+    // Linux 6.18's V4L2 core answers VIDIOC_QUERYCTRL, G_CTRL and S_CTRL
+    // through the extended ioctls, so those are the ones that arrive here.
     // Added for lighter; see third_party/README.md.
-    fn queryctrl(
-        &mut self,
-        session: &Self::Session,
-        id: v4l2r::ioctl::CtrlId,
-        flags: v4l2r::ioctl::QueryCtrlFlags,
-    ) -> IoctlResult<bindings::v4l2_queryctrl> {
-        const CONTROLS: [(u32, &[u8]); 2] = [
-            (bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, b"Min Number of Capture Buffers"),
-            (bindings::V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, b"Min Number of Output Buffers"),
-        ];
-        let wanted = id.id();
-        let found = if flags.contains(v4l2r::ioctl::QueryCtrlFlags::NEXT) {
-            CONTROLS.iter().find(|(cid, _)| *cid > wanted)
-        } else {
-            CONTROLS.iter().find(|(cid, _)| *cid == wanted)
-        };
-        let (cid, name) = found.ok_or(libc::EINVAL)?;
-        let mut ctrl = bindings::v4l2_queryctrl {
-            id: *cid,
-            type_: bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER,
-            minimum: 1,
-            maximum: 32,
-            step: 1,
-            default_value: self.min_buffers(session, *cid) as i32,
-            flags: bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE,
-            ..Default::default()
-        };
-        for (d, s) in ctrl.name.iter_mut().zip(name.iter()) {
-            *d = *s;
-        }
-        Ok(ctrl)
-    }
-
-    // Linux 6.18's V4L2 core answers VIDIOC_QUERYCTRL through the driver's
-    // VIDIOC_QUERY_EXT_CTRL, so that is the one that arrives here.
     fn query_ext_ctrl(
         &mut self,
-        session: &Self::Session,
+        _session: &Self::Session,
         id: v4l2r::ioctl::CtrlId,
         flags: v4l2r::ioctl::QueryCtrlFlags,
     ) -> IoctlResult<bindings::v4l2_query_ext_ctrl> {
-        let q = self.queryctrl(session, id, flags)?;
-        Ok(bindings::v4l2_query_ext_ctrl {
-            id: q.id,
-            type_: q.type_,
-            name: q.name.map(|c| c as _),
-            minimum: i64::from(q.minimum),
-            maximum: i64::from(q.maximum),
-            step: q.step as u64,
-            default_value: i64::from(q.default_value),
-            flags: q.flags,
-            elem_size: 4,
-            elems: 1,
-            ..Default::default()
-        })
+        DECODER_CONTROLS.query_ext(id, flags)
+    }
+
+    fn queryctrl(
+        &mut self,
+        _session: &Self::Session,
+        id: v4l2r::ioctl::CtrlId,
+        flags: v4l2r::ioctl::QueryCtrlFlags,
+    ) -> IoctlResult<bindings::v4l2_queryctrl> {
+        DECODER_CONTROLS.query(id, flags)
+    }
+
+    fn querymenu(
+        &mut self,
+        _session: &Self::Session,
+        id: u32,
+        index: u32,
+    ) -> IoctlResult<bindings::v4l2_querymenu> {
+        DECODER_CONTROLS.query_menu(id, index)
     }
 
     fn g_ext_ctrls(
         &mut self,
         session: &Self::Session,
-        _which: v4l2r::ioctl::CtrlWhich,
+        which: v4l2r::ioctl::CtrlWhich,
         ctrls: &mut bindings::v4l2_ext_controls,
         ctrl_array: &mut Vec<bindings::v4l2_ext_control>,
         _user_regions: Vec<Vec<crate::protocol::SgEntry>>,
     ) -> IoctlResult<()> {
-        for (i, ctrl) in ctrl_array.iter_mut().enumerate() {
-            match ctrl.id {
-                bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE | bindings::V4L2_CID_MIN_BUFFERS_FOR_OUTPUT => {
-                    ctrl.__bindgen_anon_1.value = self.min_buffers(session, ctrl.id) as i32;
-                }
-                _ => {
-                    ctrls.error_idx = i as u32;
-                    return Err(libc::EINVAL);
-                }
-            }
-        }
-        Ok(())
+        // MIN_BUFFERS_FOR_CAPTURE is the one control with a value.
+        let min_capture = session.backend_session.stream_params().min_output_buffers;
+        DECODER_CONTROLS.get_values(which, ctrls, ctrl_array, |_| i64::from(min_capture))
     }
 
-    fn g_ctrl(&mut self, session: &Self::Session, id: u32) -> IoctlResult<bindings::v4l2_control> {
-        match id {
-            bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE | bindings::V4L2_CID_MIN_BUFFERS_FOR_OUTPUT => {
-                Ok(bindings::v4l2_control { id, value: self.min_buffers(session, id) as i32 })
-            }
-            _ => Err(libc::EINVAL),
-        }
+    fn try_ext_ctrls(
+        &mut self,
+        _session: &Self::Session,
+        which: v4l2r::ioctl::CtrlWhich,
+        ctrls: &mut bindings::v4l2_ext_controls,
+        ctrl_array: &mut Vec<bindings::v4l2_ext_control>,
+        _user_regions: Vec<Vec<crate::protocol::SgEntry>>,
+    ) -> IoctlResult<()> {
+        DECODER_CONTROLS.try_values(which, ctrls, ctrl_array)
+    }
+
+    /// Every control is read-only, so this only ever refuses, or accepts none.
+    fn s_ext_ctrls(
+        &mut self,
+        _session: &mut Self::Session,
+        which: v4l2r::ioctl::CtrlWhich,
+        ctrls: &mut bindings::v4l2_ext_controls,
+        ctrl_array: &mut Vec<bindings::v4l2_ext_control>,
+        _user_regions: Vec<Vec<crate::protocol::SgEntry>>,
+    ) -> IoctlResult<()> {
+        DECODER_CONTROLS.set_values(which, ctrls, ctrl_array)
     }
 
     fn enum_fmt(
@@ -1029,7 +1019,7 @@ where
         queue: QueueType,
         memory: MemoryType,
         count: u32,
-        flags: MemoryConsistency,
+        _flags: MemoryConsistency,
     ) -> IoctlResult<bindings::v4l2_requestbuffers> {
         if memory != MemoryType::Mmap {
             return Err(libc::EINVAL);
@@ -1102,7 +1092,9 @@ where
             capabilities: (BufferCapabilities::SUPPORTS_MMAP
                 | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
                 .bits(),
-            flags: flags.bits(),
+            // Without SUPPORTS_MMAP_CACHE_HINTS, V4L2_MEMORY_FLAG_NON_COHERENT
+            // is not honored and must not be echoed back.
+            flags: 0,
             reserved: Default::default(),
         })
     }
@@ -1127,7 +1119,7 @@ where
         &mut self,
         session: &mut Self::Session,
         event: v4l2r::ioctl::EventType,
-        _flags: v4l2r::ioctl::SubscribeEventFlags,
+        flags: v4l2r::ioctl::SubscribeEventFlags,
     ) -> IoctlResult<()> {
         match event {
             EventType::SourceChange(0) => {
@@ -1136,6 +1128,20 @@ where
             }
             EventType::Eos => {
                 session.eos_subscribed = true;
+                Ok(())
+            }
+            EventType::Ctrl(id) => {
+                let value = session.backend_session.stream_params().min_output_buffers;
+                let initial = DECODER_CONTROLS.subscribe(
+                    &mut session.ctrl_subscriptions,
+                    id,
+                    flags,
+                    i64::from(value),
+                )?;
+                if let Some(event) = initial {
+                    self.event_queue
+                        .send_event(V4l2Event::Event(SessionEvent::new(session.id, event)));
+                }
                 Ok(())
             }
             _ => Err(libc::EINVAL),
@@ -1157,6 +1163,10 @@ where
         }
         if event.type_ == 0 || matches!(EventType::try_from(&event), Ok(EventType::Eos)) {
             session.eos_subscribed = false;
+            valid = true;
+        }
+        if event.type_ == 0 || event.type_ == bindings::V4L2_EVENT_CTRL {
+            Controls::unsubscribe(&mut session.ctrl_subscriptions, event.id);
             valid = true;
         }
 
@@ -1277,8 +1287,14 @@ where
                 .size();
             sel_rect.left = std::cmp::max(0, sel_rect.left);
             sel_rect.top = std::cmp::max(0, sel_rect.top);
-            sel_rect.width = std::cmp::min(coded_size.0, sel_rect.width - sel_rect.left as u32);
-            sel_rect.height = std::cmp::min(coded_size.0, sel_rect.height - sel_rect.top as u32);
+            sel_rect.width = std::cmp::min(
+                coded_size.0,
+                sel_rect.width.saturating_sub(sel_rect.left as u32),
+            );
+            sel_rect.height = std::cmp::min(
+                coded_size.1,
+                sel_rect.height.saturating_sub(sel_rect.top as u32),
+            );
 
             *rect = sel_rect.into();
         }

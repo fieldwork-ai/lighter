@@ -185,8 +185,8 @@ echo "==> ffmpeg 7.1 and GStreamer (${TRIXIE})"
 tx="$(docker create --device lighter.sh/video=all "$TRIXIE" sleep infinity)"
 docker start "$tx" >/dev/null
 in_tx() { docker exec "$tx" bash -c "$HELPERS$1" 2>&1; }
-if ! in_tx 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends ffmpeg gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-base >/dev/null 2>&1' >/dev/null; then
-	fail "the container could not install ffmpeg and GStreamer (network?)"
+if ! in_tx 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends ffmpeg gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-base v4l-utils >/dev/null 2>&1' >/dev/null; then
+	fail "the container could not install ffmpeg, GStreamer and v4l-utils (network?)"
 else
 	out="$(in_tx '
 # ffmpeg 7.1 drains until no CAPTURE buffer is queued; with its default
@@ -208,6 +208,27 @@ echo "GST10 $(frames /tmp/g10.mp4) $(ffprobe -v error -show_entries stream=profi
 	[ "$(grep ^GST264 <<<"$out")" = "GST264 120 Main" ] && pass "GStreamer: 120 frames, the profile it negotiated" || fail "GStreamer H.264: $(grep ^GST264 <<<"$out")"
 	[ "$(grep ^GSTBF <<<"$out")" = "GSTBF 120 2" ] && pass "B-frames on request, with GStreamer holding every frame's buffer" || fail "GStreamer B-frames: $(grep ^GSTBF <<<"$out")"
 	[ "$(grep ^GST10 <<<"$out")" = "GST10 60 Main 10,yuv420p10le" ] && pass "HEVC Main 10 on request" || fail "GStreamer Main 10: $(grep ^GST10 <<<"$out")"
+	# v4l2-compliance holds both devices to what V4L2 promises clients. The
+	# encoder passes it whole. The decoder fails one test the host cannot
+	# answer: the guest driver takes VIDIOC_G_PARM for every device, so the
+	# V4L2 core refuses a bad buffer type with EINVAL before the device can
+	# say ENOTTY, which is what a stateful decoder must answer.
+	for dev in video0 video1; do
+		# It exits nonzero on any failure, including the one allowed.
+		report="$(in_tx "v4l2-compliance -d /dev/$dev 2>&1" || true)"
+		failures="$(grep -E "^[[:space:]]*fail:" <<<"$report" | sed "s/^[[:space:]]*//" || true)"
+		total="$(grep "^Total" <<<"$report" || true)"
+		if [ "$dev" = video0 ]; then
+			allowed="fail: v4l2-test-formats.cpp(1445): node->is_m2m && !is_stateful_enc"
+		else
+			allowed=""
+		fi
+		if [ -n "$total" ] && [ "$failures" = "$allowed" ]; then
+			pass "v4l2-compliance /dev/$dev: ${total#*: }"
+		else
+			fail "v4l2-compliance /dev/$dev: ${total:-no report}"; grep -E "fail:|FAIL" <<<"$report" | sed 's/^/    /'
+		fi
+	done
 fi
 docker rm -f "$tx" >/dev/null 2>&1 || true
 

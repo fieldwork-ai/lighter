@@ -45,6 +45,7 @@
 //! * A device that proxies any host V4L2 device into the guest, in the `crate::v4l2_device_proxy`
 //!   module.
 
+pub mod controls;
 pub mod devices;
 pub mod io;
 pub mod ioctl;

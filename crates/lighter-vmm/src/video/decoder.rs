@@ -755,6 +755,9 @@ impl Session {
     }
 }
 
+const MIN_DIMENSION: u32 = 16;
+const MAX_DIMENSION: u32 = 8192;
+
 /// Bytes a sample takes in `fourcc`: one for NV12, two for P010.
 fn sample_bytes(fourcc: u32) -> usize {
     if fourcc == P010 { 2 } else { 1 }
@@ -988,11 +991,11 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
     fn frame_sizes(&self, pixel_format: u32) -> Option<bindings::v4l2_frmsize_stepwise> {
         (matches!(pixel_format, NV12 | P010) || Codec::from_fourcc(pixel_format).is_some())
             .then_some(bindings::v4l2_frmsize_stepwise {
-                min_width: 16,
-                max_width: 8192,
+                min_width: MIN_DIMENSION,
+                max_width: MAX_DIMENSION,
                 step_width: 2,
-                min_height: 16,
-                max_height: 8192,
+                min_height: MIN_DIMENSION,
+                max_height: MAX_DIMENSION,
                 step_height: 2,
             })
     }
@@ -1023,9 +1026,19 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
                 } else {
                     f.pixelformat
                 };
+                // Bounded by what `frame_sizes` offers: a guest's size is
+                // multiplied into buffer sizes, and one past u32 once
+                // wrapped them small enough that the first frame's copy
+                // indexed past its buffer and aborted the VMM.
                 let (w, h) = (
-                    asked.width.max(session.stream.coded_size.0),
-                    asked.height.max(session.stream.coded_size.1),
+                    asked
+                        .width
+                        .clamp(MIN_DIMENSION, MAX_DIMENSION)
+                        .max(session.stream.coded_size.0),
+                    asked
+                        .height
+                        .clamp(MIN_DIMENSION, MAX_DIMENSION)
+                        .max(session.stream.coded_size.1),
                 );
                 f.pixelformat = fourcc;
                 f.width = w;
@@ -1065,6 +1078,26 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capture_format_is_held_to_the_sizes_offered() {
+        let d = VideoToolboxDecoder::new();
+        let s = Session::new(Codec::H264);
+        let mut asked = s.capture_format();
+        asked.width = u32::MAX;
+        asked.height = u32::MAX - 1;
+        let f = d.adjust_format(
+            &s,
+            QueueDirection::Capture,
+            V4l2MplaneFormat::from((QueueDirection::Capture, asked)),
+        );
+        let f: &bindings::v4l2_pix_format_mplane = f.as_ref();
+        assert_eq!((f.width, f.height), (MAX_DIMENSION, MAX_DIMENSION));
+        assert_eq!(
+            f.plane_fmt[0].sizeimage as usize,
+            frame_size((MAX_DIMENSION, MAX_DIMENSION), NV12)
+        );
+    }
 
     #[test]
     fn a_unit_before_any_parameter_set_is_consumed_and_produces_nothing() {

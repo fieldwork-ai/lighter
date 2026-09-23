@@ -598,7 +598,6 @@ struct Factory {
     name: Vec<u8>,
     vendor: Vec<u8>,
     version: Vec<u8>,
-    hw: *mut OrtHardwareDevice,
 }
 
 #[repr(C)]
@@ -637,37 +636,30 @@ unsafe extern "C" fn f_get_version(this: *const OrtEpFactory) -> *const c_char {
 
 unsafe extern "C" fn f_get_supported_devices(
     this: *mut OrtEpFactory,
-    _devices: *const *const OrtHardwareDevice,
-    _n: usize,
+    devices: *const *const OrtHardwareDevice,
+    n: usize,
     ep_devices: *mut *mut OrtEpDevice,
     max: usize,
     num: *mut usize,
 ) -> OrtStatusPtr {
-    // What ORT found in the container is a CPU. The device advertised is the
-    // Neural Engine on the other side of the stream.
-    let f = unsafe { &mut *(this as *mut Factory) };
+    // What ORT found in the container is a CPU; the work goes to the Neural
+    // Engine on the other side of the stream. The EP device hangs off that CPU
+    // rather than a hardware device of our own: creating one
+    // (OrtEpApi::CreateHardwareDevice) needs ONNX Runtime 1.25, and this
+    // library is built against 1.23's API so that any runtime from 1.23 on
+    // loads it. Callers choose the EP by name, never by device type.
     unsafe { *num = 0 };
-    if max == 0 {
+    if max == 0 || devices.is_null() {
         return ptr::null_mut();
     }
-    let vendor = cstring("lighter");
-    let mut hw: *mut OrtHardwareDevice = ptr::null_mut();
-    let st = unsafe {
-        (ep_api().CreateHardwareDevice.unwrap())(
-            OrtHardwareDeviceType_OrtHardwareDeviceType_NPU,
-            0x1167,
-            0,
-            vendor.as_ptr() as *const c_char,
-            ptr::null(),
-            &mut hw,
-        )
+    let devices = unsafe { core::slice::from_raw_parts(devices, n) };
+    let Some(&cpu) = devices.iter().find(|&&d| unsafe {
+        (api().HardwareDevice_Type.unwrap())(d) == OrtHardwareDeviceType_OrtHardwareDeviceType_CPU
+    }) else {
+        return ptr::null_mut();
     };
-    if !st.is_null() {
-        return st;
-    }
-    f.hw = hw;
     let mut dev: *mut OrtEpDevice = ptr::null_mut();
-    let st = unsafe { (ep_api().CreateEpDevice.unwrap())(this, hw, ptr::null(), ptr::null(), &mut dev) };
+    let st = unsafe { (ep_api().CreateEpDevice.unwrap())(this, cpu, ptr::null(), ptr::null(), &mut dev) };
     if !st.is_null() {
         return st;
     }
@@ -955,7 +947,6 @@ pub unsafe extern "C" fn CreateEpFactories(
         name: cstring("LighterANE"),
         vendor: cstring("lighter"),
         version: cstring("0.7.0"),
-        hw: ptr::null_mut(),
     });
     f.base.ort_version_supported = ORT_API_VERSION;
     f.base.GetName = Some(f_get_name);
@@ -980,9 +971,6 @@ pub unsafe extern "C" fn CreateEpFactories(
 
 #[no_mangle]
 pub unsafe extern "C" fn ReleaseEpFactory(f: *mut OrtEpFactory) -> OrtStatusPtr {
-    let fb = unsafe { alloc::boxed::Box::from_raw(f as *mut Factory) };
-    if !fb.hw.is_null() {
-        unsafe { (ep_api().ReleaseHardwareDevice.unwrap())(fb.hw) };
-    }
+    drop(unsafe { alloc::boxed::Box::from_raw(f as *mut Factory) });
     ptr::null_mut()
 }
