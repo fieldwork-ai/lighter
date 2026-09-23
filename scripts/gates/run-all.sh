@@ -29,6 +29,7 @@ GATES=(
 	"m11 pytorch:m11-mps.sh"
 	"m12 metal:m12-metal.sh"
 	"m13 video:m13-video.sh"
+	"m14 encode:m14-encode.sh"
 )
 
 only="${1:-}"
