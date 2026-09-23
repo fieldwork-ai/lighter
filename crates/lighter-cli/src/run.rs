@@ -125,6 +125,7 @@ pub fn machine() -> anyhow::Result<()> {
         " idle.poll_ns={}",
         crate::config::idle_poll_ns(config.cpus)
     ));
+    cmdline.push_str(crate::config::idle_poll_args(config.cpus));
     cmdline.push_str(&format!(
         " lighter.time={}",
         std::time::SystemTime::now()

@@ -1,18 +1,18 @@
-commit=1097665-dirty
-date=2026-09-23T01:57Z
+commit=8a4dfe1-dirty
+date=2026-09-23T02:24Z
 host=NicksFWMBP
 host.node=v24.18.0
 host.npm=11.16.0
 host.pnpm=11.23.0
 host.yarn=1.22.22
 extra_warm_cases=
-image_id=sha256:3f7c8cff568fb2de8f0b208f5a98f878f3723314e1a375734eaa6eb4ab8325bf
-runtime_source=1097665d011b24ffd88d11007dc5d46050d91b28
+image_id=sha256:0228d332a0cd0bf8c6cf5c24170d2e8bb0d01ae729f41c4a2fa09ba11ced744f
+runtime_source=8a4dfe12aa205056ef9d879e601f7750167aa627
 cpus=8 memory_mib=16384 disk_gib=240
 lighter-bench=577c3bfe70ca3881b29e6c8b652a5079
 lighter-bench.sha256=0522a95611774464ed632cbc5adc73a613deaeaf59a076adfec8dbd7cd90cb74
-Image.0039-anycatch=741298725936163a2dc0ad49d505492b
-Image.0039-anycatch.sha256=408322222dda52dbf8500670e8398e7bfeb6e37ae77d0c5e9221e619058020b8
+Image=34412e8230202c72e7049ec0c8df8900
+Image.sha256=5473e8e39e6ec22eefadb6217ef6884b25f27a6573a6a4c353c9450d6f099c92
 rootfs.ext4=0d2ca5655da55c2a9149e625409e590e
 rootfs.ext4.sha256=5eb2927cd9670b931ab9ee116bab10769d8be1a010573a4c1f34ad3df3fbc3a0
 lighter-agent=6359fe4c9758835c77120aaf7ef2aa6c

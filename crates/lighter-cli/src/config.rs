@@ -141,6 +141,24 @@ pub fn idle_poll_ns(cpus: u32) -> u32 {
     if cpus >= num_cpus() { 50_000 } else { 200_000 }
 }
 
+/// The rest of the idle poll's policy for the same machine, as kernel
+/// command-line arguments (guest patch 0039).
+///
+/// Where the vCPUs leave cores free, a poll that times out halves the
+/// window and polling backs off above 50 µs of spinning a wakeup caught:
+/// Frigate on one camera, 16 vCPUs of 18, went from about 20% of a core to
+/// 15. Where they fill the cores the window is already short, and halving
+/// it on every timeout cost an eight-core M1's npm install on the guest's
+/// disk 12% (8.75 s against 7.8); there the window keeps 0011's rules and
+/// the backoff waits for 100 µs a catch (8.2 s, pnpm unchanged).
+pub fn idle_poll_args(cpus: u32) -> &'static str {
+    if cpus >= num_cpus() {
+        " idle.poll_timeouts=0 idle.poll_cost_ns=100000"
+    } else {
+        ""
+    }
+}
+
 pub fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)

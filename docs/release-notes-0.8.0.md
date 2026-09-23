@@ -62,6 +62,10 @@ an accelerator, a poll its reply ends counts as a catch, so llama.cpp over
 Metal keeps its rate (293 t/s on the M5), at about a point of Frigate's
 detector traffic. The host's queue poller does the
 same with its windows, and `idle.polled` reports how each poll ended.
+Where the vCPUs fill the Mac's cores, as on an eight-core M1 with eight,
+the window is already short and a timeout no longer shrinks it; there
+only the backoff is new, at 100 µs a catch, and installs on the guest's
+disk stay where 0.7.3 had them.
 
 What Frigate costs now is mostly Frigate: its motion detection and Python
 processes are most of the guest's time, and entering and leaving the
