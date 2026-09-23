@@ -30,6 +30,8 @@ pub type VTDecodeInfoFlags = u32;
 pub type CVReturn = i32;
 
 pub const kCFNumberSInt32Type: CFIndex = 3;
+pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
+pub type CFDataRef = *const c_void;
 
 /// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`, '420v': NV12.
 pub const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = 0x3432_3076;
@@ -133,6 +135,12 @@ unsafe extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> CFDictionaryRef;
+    pub fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
+    pub fn CFStringCreateWithCString(
+        allocator: CFAllocatorRef,
+        c_str: *const std::ffi::c_char,
+        encoding: u32,
+    ) -> CFStringRef;
     pub fn CFNumberCreate(
         allocator: CFAllocatorRef,
         kind: CFIndex,
@@ -148,6 +156,15 @@ unsafe extern "C" {
         parameter_set_pointers: *const *const u8,
         parameter_set_sizes: *const usize,
         nal_unit_header_length: i32,
+        format_description_out: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
+    pub static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CFStringRef;
+    pub fn CMVideoFormatDescriptionCreate(
+        allocator: CFAllocatorRef,
+        codec_type: CMVideoCodecType,
+        width: i32,
+        height: i32,
+        extensions: CFDictionaryRef,
         format_description_out: *mut CMFormatDescriptionRef,
     ) -> OSStatus;
     pub fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(

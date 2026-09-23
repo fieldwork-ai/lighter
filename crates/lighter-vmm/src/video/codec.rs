@@ -88,6 +88,64 @@ impl FormatDescription {
     }
 }
 
+impl FormatDescription {
+    /// A VP9 stream's, from its size and `vpcC` record, which VideoToolbox
+    /// reads from the sample description's extension atoms.
+    pub fn vp9(width: u32, height: u32, vpcc: &[u8]) -> Result<FormatDescription, vt::OSStatus> {
+        let mut desc: vt::CMFormatDescriptionRef = std::ptr::null();
+        let st = unsafe {
+            let data = vt::CFDataCreate(
+                vt::kCFAllocatorDefault,
+                vpcc.as_ptr(),
+                vpcc.len() as vt::CFIndex,
+            );
+            let key = vt::CFStringCreateWithCString(
+                vt::kCFAllocatorDefault,
+                c"vpcC".as_ptr(),
+                vt::kCFStringEncodingUTF8,
+            );
+            let atoms = dictionary(&[key], &[data]);
+            let extensions = dictionary(
+                &[vt::kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms],
+                &[atoms],
+            );
+            let st = vt::CMVideoFormatDescriptionCreate(
+                vt::kCFAllocatorDefault,
+                vt::kCMVideoCodecType_VP9,
+                width as i32,
+                height as i32,
+                extensions,
+                &mut desc,
+            );
+            for owned in [extensions, atoms, key, data] {
+                vt::CFRelease(owned);
+            }
+            st
+        };
+        if st != 0 || desc.is_null() {
+            return Err(st);
+        }
+        Ok(FormatDescription(desc))
+    }
+}
+
+/// A CFDictionary of CF objects; the caller releases it.
+unsafe fn dictionary(
+    keys: &[*const std::ffi::c_void],
+    values: &[*const std::ffi::c_void],
+) -> vt::CFDictionaryRef {
+    unsafe {
+        vt::CFDictionaryCreate(
+            vt::kCFAllocatorDefault,
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len() as vt::CFIndex,
+            &raw const vt::kCFTypeDictionaryKeyCallBacks,
+            &raw const vt::kCFTypeDictionaryValueCallBacks,
+        )
+    }
+}
+
 impl Drop for FormatDescription {
     fn drop(&mut self) {
         if !self.0.is_null() {

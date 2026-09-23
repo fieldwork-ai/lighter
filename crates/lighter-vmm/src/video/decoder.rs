@@ -37,11 +37,12 @@ use virtio_media::v4l2r::{PixelFormat, QueueClass, QueueDirection, QueueType, Re
 
 use super::codec::{FormatDescription, Order, Parser};
 use super::vt_sys as vt;
-use super::{h264, hevc};
+use super::{h264, hevc, vp9};
 use crate::memory::HOST_PAGE;
 
 const H264: u32 = PixelFormat::from_fourcc(b"H264").to_u32();
 const HEVC: u32 = PixelFormat::from_fourcc(b"HEVC").to_u32();
+const VP9: u32 = PixelFormat::from_fourcc(b"VP90").to_u32();
 const NV12: u32 = PixelFormat::from_fourcc(b"NV12").to_u32();
 const P010: u32 = PixelFormat::from_fourcc(b"P010").to_u32();
 
@@ -398,6 +399,7 @@ enum Ready {
 pub enum Codec {
     H264,
     Hevc,
+    Vp9,
 }
 
 impl Codec {
@@ -405,6 +407,7 @@ impl Codec {
         match self {
             Codec::H264 => H264,
             Codec::Hevc => HEVC,
+            Codec::Vp9 => VP9,
         }
     }
 
@@ -412,6 +415,7 @@ impl Codec {
         match fourcc {
             H264 => Some(Codec::H264),
             HEVC => Some(Codec::Hevc),
+            VP9 if vp9::available() => Some(Codec::Vp9),
             _ => None,
         }
     }
@@ -420,12 +424,18 @@ impl Codec {
         match self {
             Codec::H264 => Box::<h264::Stream>::default(),
             Codec::Hevc => Box::<hevc::Stream>::default(),
+            Codec::Vp9 => Box::<vp9::Stream>::default(),
         }
     }
 
-    /// The codecs this Mac decodes, in the order they are offered.
+    /// The codecs this Mac decodes, in the order they are offered: VP9
+    /// only where VideoToolbox has it in hardware.
     fn all() -> &'static [Codec] {
-        &[Codec::H264, Codec::Hevc]
+        if vp9::available() {
+            &[Codec::H264, Codec::Hevc, Codec::Vp9]
+        } else {
+            &[Codec::H264, Codec::Hevc]
+        }
     }
 }
 
