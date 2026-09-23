@@ -1,20 +1,19 @@
-commit=0e529e6-dirty
-date=2026-09-22T05:13Z
+commit=1097665-dirty
+date=2026-09-23T01:57Z
 host=NicksFWMBP
 host.node=v24.18.0
 host.npm=11.16.0
 host.pnpm=11.23.0
 host.yarn=1.22.22
 extra_warm_cases=
-image_id=sha256:77348106b871b911a5fc8943ce39b4b4091565c66a388f8264af7e619e2130b8
-runtime_source=0e529e64000bbab118e589ff9612a8621a6b1e01
-cpus=8 memory_mib=16384 disk_gib=294
-lighter-bench=1ead7910ac9998c509fd82e5c29f4236
-lighter-bench.sha256=661e35fe200d1ba319399f9760d4015fa492b7bd1a1fa4351aefbf6653aa8716
-Image=9a997ae5f0944650526daa23e003b0dc
-Image.sha256=bf3daac849fc4a8ddc0961ee5a05944595c34504fac672579fb1c8d7c6ff7d05
-rootfs.ext4=024efc96d6a9431e945ee25c6c512d1e
-rootfs.ext4.sha256=758cd7d3cb251efa794b7bffe123b61689d5304e13706667e7bae3096c0b5691
-lighter-agent=5c15239c58990b9a338fb10dc0ea6fe5
-lighter-agent.sha256=d1eb72d0b55f6aded5f435c4354ad743fdc705f362d66a11783e7048f9cc052c
-memory_case=12288 MiB guest, the size the 0.7.2 memory rows were published at; the other rows are the 16 GiB record
+image_id=sha256:3f7c8cff568fb2de8f0b208f5a98f878f3723314e1a375734eaa6eb4ab8325bf
+runtime_source=1097665d011b24ffd88d11007dc5d46050d91b28
+cpus=8 memory_mib=16384 disk_gib=240
+lighter-bench=577c3bfe70ca3881b29e6c8b652a5079
+lighter-bench.sha256=0522a95611774464ed632cbc5adc73a613deaeaf59a076adfec8dbd7cd90cb74
+Image.0039-anycatch=741298725936163a2dc0ad49d505492b
+Image.0039-anycatch.sha256=408322222dda52dbf8500670e8398e7bfeb6e37ae77d0c5e9221e619058020b8
+rootfs.ext4=0d2ca5655da55c2a9149e625409e590e
+rootfs.ext4.sha256=5eb2927cd9670b931ab9ee116bab10769d8be1a010573a4c1f34ad3df3fbc3a0
+lighter-agent=6359fe4c9758835c77120aaf7ef2aa6c
+lighter-agent.sha256=d1ab8c476907f7ccb0117247bab4c034623896a6245ca7cbbbe44f348a0b9c68
