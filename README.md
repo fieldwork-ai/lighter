@@ -118,7 +118,7 @@ lighter is the first container runtime for macOS to put the Neural Engine and Py
 
 Two documented costs (`docs/gpu.md`): cold start is ~50 ms longer with accelerator devices enabled (564 / 715 ms vs 517 / 664 ms on M5), and idle memory is ~20 MiB higher for the in-process servers' readiness. Devices can be disabled individually if desired (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off`, `--video off`).
 
-A resident accelerator client (such as Frigate NVR or a continuous speech service) costs the Mac what its work costs: an idle vCPU spins for a wakeup only while spinning is catching them, so Frigate on one camera, detecting on the Neural Engine, runs at 15.4% of a core on a 16-vCPU guest (20.7% in 0.7.3), and lighter's own share of that is a few points; the rest is Frigate's Python.
+Persistent background services (such as Frigate NVR or continuous speech recognition) do not waste host CPU while waiting for work. Adaptive idle polling backs off whenever vCPUs are not actively catching events, allowing Frigate on a camera stream with Neural Engine detection to consume just 15.4% of a core on a 16-vCPU guest.
 
 See [`docs/gpu.md`](docs/gpu.md) for complete technical documentation and architecture.
 
@@ -359,7 +359,7 @@ lighter exposes the Apple Silicon compute architecture to containers:
 - **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
 - **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 617 MiB (+20 MiB over the same guest without the servers).
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
-- **Message-horizon polling & idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without spinning idle CPU, the guest kernel polls for 1 ms following any small RPC message (`qos::Boost`), and every vCPU weighs what it spends spinning against the wakeups it catches, backing off when polling does not pay. A resident container (Frigate NVR, background speech-to-text) costs what its own work costs rather than a vCPU's spinning: Frigate on one camera, 15.4% of a core (20.7% in 0.7.3).
+- **Message-horizon polling and idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without wasting idle CPU, the guest kernel polls for 1 ms following small RPC messages (`qos::Boost`) and automatically backs off when polling does not catch events. Background containers like Frigate NVR run at just 15.4% of a core instead of spinning host CPU.
 
 ---
 
