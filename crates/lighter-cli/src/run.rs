@@ -253,7 +253,7 @@ pub fn machine() -> anyhow::Result<()> {
         gpu: config.gpu && lighter_vmm::virtio::gpu::virgl::linked(),
         gpu_aperture_bytes: 8 << 30,
         video: config.video,
-        video_aperture_bytes: 1 << 30,
+        video_aperture_bytes: 2 << 30,
     };
 
     let mut machine = Machine::start(&machine_config)?;

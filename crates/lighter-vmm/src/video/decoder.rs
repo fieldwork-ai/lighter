@@ -121,12 +121,12 @@ impl Shm {
         })
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         // SAFETY: the mapping is `len` bytes for the life of `self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    fn bytes_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above, and `&mut self` is the only writer on this side.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
@@ -140,7 +140,7 @@ impl Drop for Shm {
 
 /// A V4L2 buffer's planes.
 pub struct Backing {
-    planes: Vec<Shm>,
+    pub(crate) planes: Vec<Shm>,
 }
 
 impl VideoDecoderBufferBacking for Backing {
