@@ -22,6 +22,7 @@ echo "==> $("$L" --version) from $TARBALL"
 "$L" start --timeout 120 >"$ROOT/start.log" 2>&1 && ok "start: $(grep -m1 Docker "$ROOT/start.log")" || { bad "start: $(tail -2 "$ROOT/start.log" | tr '\n' ' ')"; exit 1; }
 out="$($D run --rm alpine:3.21 uname -m 2>/dev/null)"; [ "$out" = aarch64 ] && ok "arm64 container: $out" || bad "arm64: $out"
 out="$($D run --rm --platform linux/amd64 alpine:3.21 uname -m 2>/dev/null)"; [ "$out" = x86_64 ] && ok "amd64 container: $out" || bad "amd64: $out"
+out="$($D run --rm --device lighter.sh/video=all alpine:3.21 ls /dev/video0 2>/dev/null)"; [ "$out" = /dev/video0 ] && ok "video device: $out" || bad "video device: $out"
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)"
 $D run -d --rm --name smoke-http -p 18098:80 alpine:3.21 sh -c 'while true; do printf "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 80; done' >/dev/null 2>&1; sleep 3
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$LAN_IP:18098/")"; [ "$code" = 200 ] && ok "published TCP on $LAN_IP" || bad "TCP publish: $code"
