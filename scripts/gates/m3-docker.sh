@@ -138,6 +138,21 @@ else
 	fail "BuildKit worker OOM score"
 	tail -15 "$RUN_DIR/build-oom-score.log"
 fi
+
+# BuildKit fetches a git source itself, in the guest: Frigate's documented
+# model exports ADD their repositories this way.
+mkdir -p "$RUN_DIR/git-build"
+cat >"$RUN_DIR/git-build/Dockerfile" <<'DOCKERFILE'
+FROM alpine:3.21
+ADD https://github.com/octocat/Hello-World.git /src
+RUN test -s /src/README
+DOCKERFILE
+if scripts/capped.sh 120 docker build --no-cache --progress=plain -t lighter-gate-git-add \
+	"$RUN_DIR/git-build" >"$RUN_DIR/build-git-add.log" 2>&1; then
+	pass "a Dockerfile can ADD a git repository"
+else
+	fail "ADD of a git repository: $(grep -m1 -iE 'error|not found' "$RUN_DIR/build-git-add.log")"
+fi
 if docker run --rm --pid=host alpine:3.21 sh -c '
 	for name in dockerd containerd; do
 		pid=$(pidof "$name") || exit 1

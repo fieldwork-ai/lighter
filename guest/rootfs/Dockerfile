@@ -13,7 +13,11 @@ FROM alpine:3.22 AS rootfs
 #
 # No emulator: `--platform linux/amd64` runs under Rosetta, served from the
 # Mac, or not at all. See `docs/x86-64.md`.
+#
+# git is BuildKit's, not a user's: a Dockerfile's `ADD https://….git` and a
+# build context that is a git URL are fetched by the daemon, in here.
 RUN apk add --no-cache \
+	git \
 	iproute2 \
 	docker-engine \
 	containerd \
