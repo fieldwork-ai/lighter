@@ -406,6 +406,11 @@ impl<S: VideoDecoderBackendSession> VirtioMediaDeviceSession for VideoDecoderSes
 }
 
 impl<S: VideoDecoderBackendSession> VideoDecoderSession<S> {
+    /// The backend's own session.
+    pub fn backend_session(&self) -> &S {
+        &self.backend_session
+    }
+
     /// Returns the current format for `direction`.
     ///
     /// This is essentially like calling the backend's corresponding

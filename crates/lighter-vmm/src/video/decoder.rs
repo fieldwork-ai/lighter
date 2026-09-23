@@ -35,12 +35,15 @@ use virtio_media::v4l2r::bindings;
 use virtio_media::v4l2r::ioctl::V4l2MplaneFormat;
 use virtio_media::v4l2r::{PixelFormat, QueueClass, QueueDirection, QueueType, Rect};
 
-use super::sps::{self, PocCounter, Sps};
+use super::codec::{FormatDescription, Order, Parser};
 use super::vt_sys as vt;
+use super::{h264, hevc};
 use crate::memory::HOST_PAGE;
 
 const H264: u32 = PixelFormat::from_fourcc(b"H264").to_u32();
+const HEVC: u32 = PixelFormat::from_fourcc(b"HEVC").to_u32();
 const NV12: u32 = PixelFormat::from_fourcc(b"NV12").to_u32();
+const P010: u32 = PixelFormat::from_fourcc(b"P010").to_u32();
 
 /// Room for one access unit of input: a 4K keyframe at a high bitrate is
 /// a couple of megabytes.
@@ -153,48 +156,6 @@ impl VideoDecoderBufferBacking for Backing {
     }
 }
 
-// ------------------------------------------------------------ bitstream --
-
-const NAL_SPS: u8 = 7;
-const NAL_PPS: u8 = 8;
-const NAL_AUD: u8 = 9;
-
-/// The NAL units of an Annex B byte stream, without their start codes.
-pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
-    let mut nals = Vec::new();
-    let mut i = 0usize;
-    let mut start: Option<usize> = None;
-    while i + 2 < data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            if let Some(s) = start {
-                // Trim the zero byte of a four-byte start code, and any
-                // trailing zero bytes, which the standard allows.
-                let mut end = i;
-                while end > s && data[end - 1] == 0 {
-                    end -= 1;
-                }
-                if end > s {
-                    nals.push(&data[s..end]);
-                }
-            }
-            i += 3;
-            start = Some(i);
-            continue;
-        }
-        i += 1;
-    }
-    if let Some(s) = start
-        && s < data.len()
-    {
-        nals.push(&data[s..]);
-    }
-    nals
-}
-
-fn nal_type(nal: &[u8]) -> u8 {
-    nal.first().map_or(0, |b| b & 0x1f)
-}
-
 // ------------------------------------------------------- VideoToolbox ----
 
 /// A frame VideoToolbox handed back, held until a CAPTURE buffer takes it.
@@ -208,9 +169,6 @@ struct Decoded {
     order: Order,
     timestamp: bindings::timeval,
 }
-
-/// Presentation order: IDR epoch, then picture order count within it.
-type Order = (u64, i64);
 
 unsafe impl Send for Decoded {}
 
@@ -260,7 +218,7 @@ unsafe extern "C" fn on_frame(
 /// One decompression session for one set of parameter sets.
 struct VtSession {
     session: vt::VTDecompressionSessionRef,
-    desc: vt::CMFormatDescriptionRef,
+    desc: FormatDescription,
     /// Kept alive for the callback's sake: its address is the refcon.
     _sink: Arc<Sink>,
     /// The coded picture size the SPS declares.
@@ -270,28 +228,19 @@ struct VtSession {
 unsafe impl Send for VtSession {}
 
 impl VtSession {
-    fn new(sps: &[u8], pps: &[u8], sink: Arc<Sink>) -> Result<VtSession, vt::OSStatus> {
-        let ptrs = [sps.as_ptr(), pps.as_ptr()];
-        let sizes = [sps.len(), pps.len()];
-        let mut desc: vt::CMFormatDescriptionRef = std::ptr::null();
-        let st = unsafe {
-            vt::CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                vt::kCFAllocatorDefault,
-                2,
-                ptrs.as_ptr(),
-                sizes.as_ptr(),
-                4,
-                &mut desc,
-            )
-        };
-        if st != 0 || desc.is_null() {
-            return Err(st);
-        }
-        let d = unsafe { vt::CMVideoFormatDescriptionGetDimensions(desc) };
-        let dims = (d.width.max(0) as u32, d.height.max(0) as u32);
-
-        // NV12 out, whatever the stream's own layout.
-        let format = vt::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange as i32;
+    /// A session for `desc`, handing frames back as NV12, or as P010 for a
+    /// stream of more than eight bits.
+    fn new(
+        desc: FormatDescription,
+        ten_bit: bool,
+        sink: Arc<Sink>,
+    ) -> Result<VtSession, vt::OSStatus> {
+        let dims = desc.dimensions();
+        let format = if ten_bit {
+            vt::kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        } else {
+            vt::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        } as i32;
         let (attrs, number) = unsafe {
             let number = vt::CFNumberCreate(
                 vt::kCFAllocatorDefault,
@@ -318,7 +267,7 @@ impl VtSession {
         let st = unsafe {
             vt::VTDecompressionSessionCreate(
                 vt::kCFAllocatorDefault,
-                desc,
+                desc.0,
                 std::ptr::null(),
                 attrs,
                 &record,
@@ -330,7 +279,6 @@ impl VtSession {
             vt::CFRelease(number);
         }
         if st != 0 || session.is_null() {
-            unsafe { vt::CFRelease(desc) };
             return Err(st);
         }
         Ok(VtSession {
@@ -372,7 +320,7 @@ impl VtSession {
             vt::CMSampleBufferCreateReady(
                 vt::kCFAllocatorDefault,
                 block,
-                self.desc,
+                self.desc.0,
                 1,
                 1,
                 &timing,
@@ -420,7 +368,6 @@ impl Drop for VtSession {
         unsafe {
             vt::VTDecompressionSessionInvalidate(self.session);
             vt::CFRelease(self.session);
-            vt::CFRelease(self.desc);
         }
     }
 }
@@ -438,20 +385,59 @@ unsafe impl Send for Available {}
 
 /// What the next free CAPTURE buffer is for.
 enum Ready {
-    /// A frame, and the coded size CAPTURE was formatted for when it was
-    /// decoded, which is the layout the guest reads it with.
-    Frame(Decoded, (u32, u32)),
+    /// A frame, and the coded size and pixel format CAPTURE was formatted
+    /// for when it was decoded, which is the layout the guest reads it with.
+    Frame(Decoded, (u32, u32), u32),
     /// An empty buffer flagged LAST: the end of a drain, or of the frames
     /// of the old resolution when it changes while CAPTURE streams.
     Last,
 }
 
+/// The codecs the decoder takes, by their V4L2 pixel format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    H264,
+    Hevc,
+}
+
+impl Codec {
+    fn fourcc(self) -> u32 {
+        match self {
+            Codec::H264 => H264,
+            Codec::Hevc => HEVC,
+        }
+    }
+
+    fn from_fourcc(fourcc: u32) -> Option<Codec> {
+        match fourcc {
+            H264 => Some(Codec::H264),
+            HEVC => Some(Codec::Hevc),
+            _ => None,
+        }
+    }
+
+    fn parser(self) -> Box<dyn Parser> {
+        match self {
+            Codec::H264 => Box::<h264::Stream>::default(),
+            Codec::Hevc => Box::<hevc::Stream>::default(),
+        }
+    }
+
+    /// The codecs this Mac decodes, in the order they are offered.
+    fn all() -> &'static [Codec] {
+        &[Codec::H264, Codec::Hevc]
+    }
+}
+
 pub struct Session {
-    /// The parameter sets the stream last carried; a change rebuilds the
-    /// session.
-    sps: Vec<u8>,
-    pps: Vec<u8>,
+    codec: Codec,
+    /// The bitstream's own syntax: parameter sets, samples, order.
+    parser: Box<dyn Parser>,
     vt: Option<VtSession>,
+    /// Whether the stream decodes to ten bits, and what the guest asked
+    /// CAPTURE for: P010 keeps them, NV12 takes the top eight.
+    ten_bit: bool,
+    capture_fourcc: u32,
     sink: Arc<Sink>,
     /// What the CAPTURE queue is formatted for. Follows the stream unless
     /// the guest set something larger.
@@ -459,16 +445,11 @@ pub struct Session {
     stream: StreamParams,
     /// CAPTURE buffers the guest has queued, ready for a frame.
     available: VecDeque<Available>,
-    /// The current SPS, parsed, for reading slice headers.
-    sps_info: Option<Sps>,
     /// Access units sent to VideoToolbox, numbered in decode order.
     seq: i64,
     /// What each access unit still in VideoToolbox's hands sorts as and
     /// was stamped with, by sequence number.
     in_flight: BTreeMap<i64, (Order, bindings::timeval)>,
-    /// IDRs seen: each restarts the picture order count.
-    epoch: u64,
-    poc: PocCounter,
     /// Frames VideoToolbox has returned, held until the reorder depth says
     /// the earliest of them can go; sorted by presentation order.
     reorder: Vec<Decoded>,
@@ -487,11 +468,13 @@ pub struct Session {
 }
 
 impl Session {
-    fn new() -> Session {
+    fn new(codec: Codec) -> Session {
         Session {
-            sps: Vec::new(),
-            pps: Vec::new(),
+            codec,
+            parser: codec.parser(),
             vt: None,
+            ten_bit: false,
+            capture_fourcc: NV12,
             sink: Arc::new(Mutex::new(VecDeque::new())),
             coded_size: DEFAULT_CODED_SIZE,
             stream: StreamParams {
@@ -500,11 +483,8 @@ impl Session {
                 visible_rect: Rect::new(0, 0, DEFAULT_CODED_SIZE.0, DEFAULT_CODED_SIZE.1),
             },
             available: VecDeque::new(),
-            sps_info: None,
             seq: 0,
             in_flight: BTreeMap::new(),
-            epoch: 0,
-            poc: PocCounter::default(),
             reorder: Vec::new(),
             ready: VecDeque::new(),
             depth: 0,
@@ -516,113 +496,24 @@ impl Session {
         }
     }
 
-    /// Takes the parameter sets out of an access unit and reports whether
-    /// they changed.
-    fn absorb_parameter_sets(&mut self, nals: &[&[u8]]) -> bool {
-        let mut changed = false;
-        for nal in nals {
-            match nal_type(nal) {
-                NAL_SPS if self.sps.as_slice() != *nal => {
-                    self.sps = nal.to_vec();
-                    changed = true;
-                }
-                NAL_PPS if self.pps.as_slice() != *nal => {
-                    self.pps = nal.to_vec();
-                    changed = true;
-                }
-                _ => {}
-            }
-        }
-        changed
-    }
-
-    /// The access unit as VideoToolbox takes it: every slice NAL (and SEI)
-    /// with a four-byte length in front.
-    fn avcc(nals: &[&[u8]]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(nals.iter().map(|n| n.len() + 4).sum());
-        for nal in nals {
-            if matches!(nal_type(nal), NAL_SPS | NAL_PPS | NAL_AUD) {
-                continue;
-            }
-            out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            out.extend_from_slice(nal);
-        }
-        out
-    }
-
     /// Decodes one access unit.
     fn feed(&mut self, data: Vec<u8>, index: u32, timestamp: bindings::timeval) -> IoctlResult<()> {
-        let nals = annexb_nals(&data);
-        let changed = self.absorb_parameter_sets(&nals);
-        if (changed || self.vt.is_none()) && !self.sps.is_empty() && !self.pps.is_empty() {
-            if let Some(old) = self.vt.take() {
-                old.flush();
-                self.collect(true);
-            }
-            self.sps_info = sps::parse(&self.sps);
-            match self.sps_info {
-                Some(Sps {
-                    reorder: Some(n), ..
-                }) => {
-                    self.depth = n;
-                    self.depth_declared = true;
-                }
-                // Unsaid: start at none, which costs a camera without
-                // B-frames nothing, and learn from the first frame that
-                // arrives behind one already handed on.
-                _ => {
-                    self.depth = 0;
-                    self.depth_declared = false;
-                }
-            }
-            tracing::debug!(
-                depth = self.depth,
-                declared = self.depth_declared,
-                "video reorder depth"
-            );
-            let created = VtSession::new(&self.sps, &self.pps, self.sink.clone()).or_else(
-                |st| -> Result<VtSession, vt::OSStatus> {
-                    let stripped = sps::without_vui(&self.sps).ok_or(st)?;
-                    let vt = VtSession::new(&stripped, &self.pps, self.sink.clone())?;
-                    tracing::info!(
-                        st,
-                        "VideoToolbox refused the stream's SPS; decoding it without its VUI"
-                    );
-                    Ok(vt)
-                },
-            );
-            match created {
-                Ok(vt) => {
-                    let dims = vt.dims;
-                    self.vt = Some(vt);
-                    if dims != self.stream.coded_size {
-                        tracing::info!(
-                            from = format_args!(
-                                "{}x{}",
-                                self.stream.coded_size.0, self.stream.coded_size.1
-                            ),
-                            to = format_args!("{}x{}", dims.0, dims.1),
-                            "video stream resolution"
-                        );
-                        // Mid-stream, the old resolution's frames (all
-                        // flushed above) end with a LAST buffer before any
-                        // of the new one.
-                        if self.capture_streaming {
-                            self.ready.push_back(Ready::Last);
-                        }
-                        self.stream.coded_size = dims;
-                        self.stream.visible_rect = Rect::new(0, 0, dims.0, dims.1);
-                        if dims.0 > self.coded_size.0 || dims.1 > self.coded_size.1 {
-                            self.coded_size = dims;
-                        }
-                        // The guest answers with buffers of the new size;
-                        // frames decoded meanwhile wait for them.
-                        self.events
-                            .push_back(VideoDecoderBackendEvent::StreamFormatChanged);
+        let seq = self.seq;
+        let unit = self.parser.unit(&data, seq);
+        if unit.changed || self.vt.is_none() {
+            match self.parser.format_description() {
+                // Nothing decodable yet (no parameter sets): the buffer is
+                // consumed and nothing comes of it.
+                None => {}
+                Some(Ok(desc)) => {
+                    if let Some(old) = self.vt.take() {
+                        old.flush();
+                        self.collect(true);
                     }
+                    self.start_session(desc);
                 }
-                Err(st) => {
-                    tracing::warn!(st, "VideoToolbox refused the stream's parameter sets");
+                Some(Err(st)) => {
+                    tracing::warn!(st, codec = ?self.codec, "VideoToolbox refused the stream's parameter sets");
                     self.events
                         .push_back(VideoDecoderBackendEvent::InputBufferDone {
                             buffer_id: index,
@@ -632,32 +523,20 @@ impl Session {
                 }
             }
         }
-        if self.vt.is_none() {
-            // Nothing decodable yet (no parameter sets): the buffer is
-            // consumed and nothing comes of it.
-            self.events
-                .push_back(VideoDecoderBackendEvent::InputBufferDone {
-                    buffer_id: index,
-                    error: 0,
-                });
-            return Ok(());
-        }
-        let mut avcc = Session::avcc(&nals);
-        if !avcc.is_empty() {
-            let seq = self.seq;
+        if let Some(vt) = &self.vt
+            && !unit.sample.is_empty()
+        {
             self.seq += 1;
-            let order = self.order_of(&nals, seq);
+            let mut sample = unit.sample;
             tracing::trace!(
                 index,
                 seq,
-                ?order,
-                nals = nals.len(),
-                bytes = avcc.len(),
+                order = ?unit.order,
+                bytes = sample.len(),
                 "video decode in"
             );
-            self.in_flight.insert(seq, (order, timestamp));
-            let vt = self.vt.as_ref().expect("checked above");
-            if let Err(st) = vt.decode(&mut avcc, seq) {
+            self.in_flight.insert(seq, (unit.order, timestamp));
+            if let Err(st) = vt.decode(&mut sample, seq) {
                 // A bad unit in a live stream is skipped, not fatal.
                 tracing::debug!(st, "VideoToolbox rejected a frame");
                 self.in_flight.remove(&seq);
@@ -673,25 +552,71 @@ impl Session {
         Ok(())
     }
 
-    /// Where an access unit sorts, from its first slice header: by picture
-    /// order count for type 0, and by decode order otherwise, which is
-    /// presentation order for type 2 by definition. Type 1 derives the
-    /// count from `frame_num` and offsets in the SPS, and nothing seen in
-    /// practice uses it with B-frames; it is left in decode order.
-    fn order_of(&mut self, nals: &[&[u8]], seq: i64) -> Order {
-        let Some(info) = self.sps_info else {
-            return (self.epoch, seq);
-        };
-        let Some(slice) = nals.iter().find_map(|n| sps::slice(n, &info)) else {
-            return (self.epoch, seq);
-        };
-        if slice.idr {
-            self.epoch += 1;
+    /// A VideoToolbox session for the stream as the parser now describes
+    /// it, and what that changes for the guest.
+    fn start_session(&mut self, desc: FormatDescription) {
+        match self.parser.reorder_depth() {
+            Some(n) => {
+                self.depth = n;
+                self.depth_declared = true;
+            }
+            // Unsaid: start at none, which costs a camera without B-frames
+            // nothing, and learn from the first frame that arrives behind
+            // one already handed on.
+            None => {
+                self.depth = 0;
+                self.depth_declared = false;
+            }
         }
-        if info.poc_type == 0 {
-            (self.epoch, self.poc.next(&slice, info.log2_max_poc_lsb))
-        } else {
-            (self.epoch, seq)
+        let ten_bit = self.parser.ten_bit();
+        tracing::debug!(
+            codec = ?self.codec,
+            depth = self.depth,
+            declared = self.depth_declared,
+            ten_bit,
+            "video stream"
+        );
+        let vt = match VtSession::new(desc, ten_bit, self.sink.clone()) {
+            Ok(vt) => vt,
+            Err(st) => {
+                tracing::warn!(st, codec = ?self.codec, "VideoToolbox could not decode the stream");
+                return;
+            }
+        };
+        let dims = vt.dims;
+        self.vt = Some(vt);
+        let bits_changed = ten_bit != self.ten_bit;
+        if bits_changed {
+            self.ten_bit = ten_bit;
+            // NV12 by default even for a ten-bit stream: ffmpeg's V4L2
+            // wrapper takes the format the device reports after a source
+            // change and has no P010, so a P010 default leaves it without a
+            // pixel format at all. P010 is enumerated for clients that ask.
+            if !ten_bit {
+                self.capture_fourcc = NV12;
+            }
+        }
+        if dims != self.stream.coded_size || bits_changed {
+            tracing::info!(
+                from = format_args!("{}x{}", self.stream.coded_size.0, self.stream.coded_size.1),
+                to = format_args!("{}x{}", dims.0, dims.1),
+                ten_bit,
+                "video stream resolution"
+            );
+            // Mid-stream, the old resolution's frames (all flushed) end
+            // with a LAST buffer before any of the new one.
+            if self.capture_streaming {
+                self.ready.push_back(Ready::Last);
+            }
+            self.stream.coded_size = dims;
+            self.stream.visible_rect = Rect::new(0, 0, dims.0, dims.1);
+            if dims.0 > self.coded_size.0 || dims.1 > self.coded_size.1 {
+                self.coded_size = dims;
+            }
+            // The guest answers with buffers of the new size; frames
+            // decoded meanwhile wait for them.
+            self.events
+                .push_back(VideoDecoderBackendEvent::StreamFormatChanged);
         }
     }
 
@@ -736,7 +661,8 @@ impl Session {
         while !self.reorder.is_empty() && (flush || self.reorder.len() as u32 > self.depth) {
             let frame = self.reorder.remove(0);
             self.last_out = Some(frame.order);
-            self.ready.push_back(Ready::Frame(frame, self.coded_size));
+            self.ready
+                .push_back(Ready::Frame(frame, self.coded_size, self.capture_fourcc));
         }
     }
 
@@ -746,8 +672,8 @@ impl Session {
             let Some(out) = self.available.pop_front() else {
                 return;
             };
-            if let Ready::Frame(_, coded) = next
-                && out.len < nv12_size(coded.0, coded.1)
+            if let Ready::Frame(_, coded, fourcc) = next
+                && out.len < frame_size(*coded, *fourcc)
             {
                 // A buffer from before a resolution change is too small for
                 // what is now decoded: the frame waits for the new ones.
@@ -755,8 +681,8 @@ impl Session {
                 return;
             }
             let event = match self.ready.pop_front().expect("checked") {
-                Ready::Frame(frame, coded) => {
-                    let used = copy_nv12(&frame, coded, out.ptr, out.len);
+                Ready::Frame(frame, coded, fourcc) => {
+                    let used = copy_frame(&frame, coded, fourcc, out.ptr, out.len);
                     tracing::trace!(buffer = out.index, order = ?frame.order, used, "video frame out");
                     VideoDecoderBackendEvent::FrameCompleted {
                         buffer_id: out.index,
@@ -781,17 +707,18 @@ impl Session {
 
     fn capture_format(&self) -> bindings::v4l2_pix_format_mplane {
         let (w, h) = self.coded_size;
+        let fourcc = self.capture_fourcc;
         let mut plane_fmt: [bindings::v4l2_plane_pix_format; bindings::VIDEO_MAX_PLANES as usize] =
             Default::default();
         plane_fmt[0] = bindings::v4l2_plane_pix_format {
-            bytesperline: w,
-            sizeimage: nv12_size(w, h) as u32,
+            bytesperline: w * sample_bytes(fourcc) as u32,
+            sizeimage: frame_size((w, h), fourcc) as u32,
             reserved: Default::default(),
         };
         bindings::v4l2_pix_format_mplane {
             width: w,
             height: h,
-            pixelformat: NV12,
+            pixelformat: fourcc,
             plane_fmt,
             num_planes: 1,
             ..format_filler()
@@ -810,7 +737,7 @@ impl Session {
         bindings::v4l2_pix_format_mplane {
             width: w,
             height: h,
-            pixelformat: H264,
+            pixelformat: self.codec.fourcc(),
             plane_fmt,
             num_planes: 1,
             ..format_filler()
@@ -818,44 +745,89 @@ impl Session {
     }
 }
 
-fn nv12_size(w: u32, h: u32) -> usize {
-    (w as usize) * (h as usize) * 3 / 2
+/// Bytes a sample takes in `fourcc`: one for NV12, two for P010.
+fn sample_bytes(fourcc: u32) -> usize {
+    if fourcc == P010 { 2 } else { 1 }
 }
 
-/// Copies a frame into a CAPTURE buffer laid out as NV12 at `coded`, and
-/// returns the bytes used. Rows beyond the frame are left as they were.
-fn copy_nv12(frame: &Decoded, coded: (u32, u32), dst: *mut u8, dst_len: usize) -> usize {
+/// A 4:2:0 two-plane frame's size at `coded` in `fourcc`.
+fn frame_size(coded: (u32, u32), fourcc: u32) -> usize {
+    (coded.0 as usize) * (coded.1 as usize) * 3 / 2 * sample_bytes(fourcc)
+}
+
+/// Copies a frame into a CAPTURE buffer laid out as `fourcc` at `coded`,
+/// and returns the bytes used. Rows beyond the frame are left as they
+/// were. A ten-bit frame going out as NV12 keeps the top eight bits of each
+/// sample, for the clients (ffmpeg's V4L2 wrapper among them) that have no
+/// P010; an eight-bit one going out as P010 sits at the top of sixteen.
+fn copy_frame(
+    frame: &Decoded,
+    coded: (u32, u32),
+    fourcc: u32,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
     let (cw, ch) = (coded.0 as usize, coded.1 as usize);
-    let need = cw * ch * 3 / 2;
+    let need = frame_size(coded, fourcc);
     if dst_len < need {
         tracing::warn!(dst_len, need, "CAPTURE buffer smaller than the frame");
         return 0;
     }
+    let out_bytes = sample_bytes(fourcc);
     let pb = frame.pixels;
     unsafe {
         vt::CVPixelBufferLockBaseAddress(pb, vt::kCVPixelBufferLock_ReadOnly);
         let planes = vt::CVPixelBufferGetPlaneCount(pb);
         let dst = std::slice::from_raw_parts_mut(dst, dst_len);
+        let dst_stride = cw * out_bytes;
         for plane in 0..planes.min(2) {
             let src = vt::CVPixelBufferGetBaseAddressOfPlane(pb, plane) as *const u8;
             let stride = vt::CVPixelBufferGetBytesPerRowOfPlane(pb, plane);
-            let w = vt::CVPixelBufferGetWidthOfPlane(pb, plane).min(cw);
+            // Samples in a row: the luma plane's width, or the chroma
+            // plane's interleaved pairs.
+            let samples = if plane == 0 {
+                vt::CVPixelBufferGetWidthOfPlane(pb, plane).min(cw)
+            } else {
+                (vt::CVPixelBufferGetWidthOfPlane(pb, plane) * 2).min(cw)
+            };
+            let src_bytes = if vt_is_ten_bit(pb) { 2 } else { 1 };
             let rows = vt::CVPixelBufferGetHeightOfPlane(pb, plane);
             let (dst_off, dst_rows) = if plane == 0 {
                 (0, ch)
             } else {
-                (cw * ch, ch / 2)
+                (dst_stride * ch, ch / 2)
             };
-            let bytes = if plane == 0 { w } else { w * 2 };
             for row in 0..rows.min(dst_rows) {
-                let s = std::slice::from_raw_parts(src.add(row * stride), bytes.min(cw));
-                let d = &mut dst[dst_off + row * cw..dst_off + row * cw + s.len()];
-                d.copy_from_slice(s);
+                let s = std::slice::from_raw_parts(src.add(row * stride), samples * src_bytes);
+                let d = &mut dst
+                    [dst_off + row * dst_stride..dst_off + row * dst_stride + samples * out_bytes];
+                if src_bytes == out_bytes {
+                    d.copy_from_slice(s);
+                } else if src_bytes == 2 {
+                    // Sixteen-bit little-endian samples, ten bits at the
+                    // top: the high byte is the top eight.
+                    for (o, pair) in d.iter_mut().zip(s.as_chunks::<2>().0) {
+                        *o = pair[1];
+                    }
+                } else {
+                    // Eight bits to P010: the sample at the top of sixteen.
+                    for (o, &v) in d.as_chunks_mut::<2>().0.iter_mut().zip(s) {
+                        o[0] = 0;
+                        o[1] = v;
+                    }
+                }
             }
         }
         vt::CVPixelBufferUnlockBaseAddress(pb, vt::kCVPixelBufferLock_ReadOnly);
     }
     need
+}
+
+/// Whether a pixel buffer holds sixteen-bit samples (VideoToolbox's
+/// 'x420', asked for for a ten-bit stream).
+fn vt_is_ten_bit(pb: vt::CVPixelBufferRef) -> bool {
+    let format = unsafe { vt::CVPixelBufferGetPixelFormatType(pb) };
+    format == vt::kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
 }
 
 fn format_filler() -> bindings::v4l2_pix_format_mplane {
@@ -978,7 +950,7 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
     type Session = Session;
 
     fn new_session(&mut self, _id: u32) -> IoctlResult<Session> {
-        Ok(Session::new())
+        Ok(Session::new(Codec::H264))
     }
 
     fn close_session(&mut self, _session: Session) {}
@@ -989,12 +961,11 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
         direction: QueueDirection,
         index: u32,
     ) -> Option<bindings::v4l2_fmtdesc> {
-        if index != 0 {
-            return None;
-        }
         let pixelformat = match direction {
-            QueueDirection::Output => H264,
-            QueueDirection::Capture => NV12,
+            QueueDirection::Output => Codec::all().get(index as usize)?.fourcc(),
+            // Both, whatever the stream: GStreamer builds its caps from
+            // this list once, before any stream exists.
+            QueueDirection::Capture => *[NV12, P010].get(index as usize)?,
         };
         Some(bindings::v4l2_fmtdesc {
             index,
@@ -1005,14 +976,15 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
     }
 
     fn frame_sizes(&self, pixel_format: u32) -> Option<bindings::v4l2_frmsize_stepwise> {
-        (pixel_format == NV12 || pixel_format == H264).then_some(bindings::v4l2_frmsize_stepwise {
-            min_width: 16,
-            max_width: 8192,
-            step_width: 2,
-            min_height: 16,
-            max_height: 8192,
-            step_height: 2,
-        })
+        (matches!(pixel_format, NV12 | P010) || Codec::from_fourcc(pixel_format).is_some())
+            .then_some(bindings::v4l2_frmsize_stepwise {
+                min_width: 16,
+                max_width: 8192,
+                step_width: 2,
+                min_height: 16,
+                max_height: 8192,
+                step_height: 2,
+            })
     }
 
     fn adjust_format(
@@ -1021,21 +993,35 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
         direction: QueueDirection,
         format: V4l2MplaneFormat,
     ) -> V4l2MplaneFormat {
+        let asked: &bindings::v4l2_pix_format_mplane = format.as_ref();
         let pix_mp = match direction {
-            QueueDirection::Output => session.output_format(),
+            QueueDirection::Output => {
+                // Any codec this Mac decodes; anything else keeps the
+                // current one.
+                let mut f = session.output_format();
+                if Codec::from_fourcc(asked.pixelformat).is_some() {
+                    f.pixelformat = asked.pixelformat;
+                }
+                f
+            }
             QueueDirection::Capture => {
                 // The guest may ask for larger buffers than the stream
-                // needs, never smaller.
+                // needs, never smaller, and for either format.
                 let mut f = session.capture_format();
-                let asked: &bindings::v4l2_pix_format_mplane = format.as_ref();
+                let fourcc = if matches!(asked.pixelformat, NV12 | P010) {
+                    asked.pixelformat
+                } else {
+                    f.pixelformat
+                };
                 let (w, h) = (
                     asked.width.max(session.stream.coded_size.0),
                     asked.height.max(session.stream.coded_size.1),
                 );
+                f.pixelformat = fourcc;
                 f.width = w;
                 f.height = h;
-                f.plane_fmt[0].bytesperline = w;
-                f.plane_fmt[0].sizeimage = nv12_size(w, h) as u32;
+                f.plane_fmt[0].bytesperline = w * sample_bytes(fourcc) as u32;
+                f.plane_fmt[0].sizeimage = frame_size((w, h), fourcc) as u32;
                 f
             }
         };
@@ -1048,9 +1034,20 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
         direction: QueueDirection,
         format: &V4l2MplaneFormat,
     ) {
-        if direction == QueueDirection::Capture {
-            let pix_mp: &bindings::v4l2_pix_format_mplane = format.as_ref();
-            session.coded_size = (pix_mp.width, pix_mp.height);
+        let pix_mp: &bindings::v4l2_pix_format_mplane = format.as_ref();
+        match direction {
+            QueueDirection::Capture => {
+                session.coded_size = (pix_mp.width, pix_mp.height);
+                session.capture_fourcc = pix_mp.pixelformat;
+            }
+            QueueDirection::Output => {
+                if let Some(codec) = Codec::from_fourcc(pix_mp.pixelformat)
+                    && codec != session.codec
+                {
+                    tracing::debug!(?codec, "video session codec");
+                    *session = Session::new(codec);
+                }
+            }
         }
     }
 }
@@ -1060,40 +1057,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn annex_b_splits_at_both_start_codes_and_drops_trailing_zeros() {
-        let data = [
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 0, 1, 0x65, 4, 5,
-        ];
-        let nals = annexb_nals(&data);
-        assert_eq!(
-            nals,
-            vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4, 5][..]]
-        );
-        assert_eq!(nal_type(nals[0]), NAL_SPS);
-        assert_eq!(nal_type(nals[1]), NAL_PPS);
-        assert_eq!(nal_type(nals[2]), 5);
-        assert!(annexb_nals(&[]).is_empty());
-        assert!(annexb_nals(&[0, 0, 1]).is_empty());
-    }
-
-    #[test]
-    fn avcc_prefixes_lengths_and_leaves_parameter_sets_out() {
-        let nals: Vec<&[u8]> = vec![
-            &[0x67, 9],
-            &[0x68, 9],
-            &[0x09, 0xf0],
-            &[0x65, 1, 2, 3],
-            &[0x06, 7],
-        ];
-        assert_eq!(
-            Session::avcc(&nals),
-            vec![0, 0, 0, 4, 0x65, 1, 2, 3, 0, 0, 0, 2, 0x06, 7]
-        );
-    }
-
-    #[test]
     fn a_unit_before_any_parameter_set_is_consumed_and_produces_nothing() {
-        let mut s = Session::new();
+        let mut s = Session::new(Codec::H264);
         s.feed(
             vec![0, 0, 1, 0x65, 1, 2],
             3,
@@ -1139,7 +1104,7 @@ mod tests {
         s.ready
             .iter()
             .filter_map(|r| match r {
-                Ready::Frame(f, _) => Some(f.timestamp.tv_sec),
+                Ready::Frame(f, _, _) => Some(f.timestamp.tv_sec),
                 Ready::Last => None,
             })
             .collect()
@@ -1147,7 +1112,7 @@ mod tests {
 
     #[test]
     fn decode_order_comes_out_in_presentation_order_at_the_declared_depth() {
-        let mut s = Session::new();
+        let mut s = Session::new(Codec::H264);
         s.depth = 2;
         s.depth_declared = true;
         // I P B B as x264 -bf 2 emits them, stamped as a camera's RTSP
@@ -1166,7 +1131,7 @@ mod tests {
         // sequence number in decode order and expects it back on the frame
         // it became: sorting by timestamp would hand the frames out as they
         // were decoded.
-        let mut s = Session::new();
+        let mut s = Session::new(Codec::H264);
         s.depth = 2;
         s.depth_declared = true;
         for (seq, poc) in [0, 6, 2, 4, 12, 8, 10].into_iter().enumerate() {
@@ -1178,7 +1143,7 @@ mod tests {
 
     #[test]
     fn an_undeclared_depth_is_learned_from_the_first_late_frame() {
-        let mut s = Session::new();
+        let mut s = Session::new(Codec::H264);
         for (poc, stamp) in [
             (0, 0),
             (6, 100),
@@ -1199,17 +1164,25 @@ mod tests {
 
     #[test]
     fn a_camera_sps_videotoolbox_refuses_decodes_without_its_vui() {
-        use crate::video::sps::tests::{REOLINK_PPS, REOLINK_SPS};
+        use crate::video::h264::tests::{REOLINK_PPS, REOLINK_SPS};
+        assert!(
+            FormatDescription::from_parameter_sets(false, &[REOLINK_SPS, REOLINK_PPS]).is_err()
+        );
+        let mut stream = h264::Stream::default();
+        let params = [&[0u8, 0, 0, 1][..], REOLINK_SPS, &[0, 0, 0, 1], REOLINK_PPS].concat();
+        assert!(stream.unit(&params, 0).changed);
+        let desc = stream
+            .format_description()
+            .expect("both sets")
+            .expect("accepted without the VUI");
         let sink = Arc::new(Mutex::new(VecDeque::new()));
-        assert!(VtSession::new(REOLINK_SPS, REOLINK_PPS, sink.clone()).is_err());
-        let stripped = sps::without_vui(REOLINK_SPS).unwrap();
-        let vt = VtSession::new(&stripped, REOLINK_PPS, sink).expect("accepted without the VUI");
+        let vt = VtSession::new(desc, false, sink).expect("a session");
         assert_eq!(vt.dims, (896, 512));
     }
 
     #[test]
     fn a_drain_ends_with_an_empty_last_buffer_once_one_is_queued() {
-        let mut s = Session::new();
+        let mut s = Session::new(Codec::H264);
         s.drain().unwrap();
         assert!(s.events.is_empty());
         let mut shm = Shm::new(1).unwrap();
@@ -1232,7 +1205,7 @@ mod tests {
 
     #[test]
     fn a_unit_videotoolbox_dropped_is_forgotten() {
-        let mut s = Session::new();
+        let mut s = Session::new(Codec::H264);
         s.in_flight.insert(
             0,
             (

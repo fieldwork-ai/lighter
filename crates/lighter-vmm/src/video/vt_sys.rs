@@ -33,6 +33,13 @@ pub const kCFNumberSInt32Type: CFIndex = 3;
 
 /// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`, '420v': NV12.
 pub const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = 0x3432_3076;
+/// `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`, 'x420': P010's
+/// layout, ten bits in the top of each sixteen.
+pub const kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: u32 = 0x7834_3230;
+
+pub type CMVideoCodecType = u32;
+/// 'vp09'.
+pub const kCMVideoCodecType_VP9: CMVideoCodecType = 0x7670_3039;
 
 pub const kCVPixelBufferLock_ReadOnly: u64 = 1;
 
@@ -143,6 +150,15 @@ unsafe extern "C" {
         nal_unit_header_length: i32,
         format_description_out: *mut CMFormatDescriptionRef,
     ) -> OSStatus;
+    pub fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+        allocator: CFAllocatorRef,
+        parameter_set_count: usize,
+        parameter_set_pointers: *const *const u8,
+        parameter_set_sizes: *const usize,
+        nal_unit_header_length: i32,
+        extensions: CFDictionaryRef,
+        format_description_out: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
     pub fn CMVideoFormatDescriptionGetDimensions(
         desc: CMVideoFormatDescriptionRef,
     ) -> CMVideoDimensions;
@@ -178,6 +194,7 @@ unsafe extern "C" {
     pub fn CVPixelBufferLockBaseAddress(pb: CVPixelBufferRef, flags: u64) -> CVReturn;
     pub fn CVPixelBufferUnlockBaseAddress(pb: CVPixelBufferRef, flags: u64) -> CVReturn;
     pub fn CVPixelBufferGetWidth(pb: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetPixelFormatType(pb: CVPixelBufferRef) -> u32;
     pub fn CVPixelBufferGetHeight(pb: CVPixelBufferRef) -> usize;
     pub fn CVPixelBufferGetPlaneCount(pb: CVPixelBufferRef) -> usize;
     pub fn CVPixelBufferGetBaseAddressOfPlane(pb: CVPixelBufferRef, plane: usize) -> *mut c_void;
@@ -214,4 +231,6 @@ unsafe extern "C" {
         new_format_desc: CMFormatDescriptionRef,
     ) -> Boolean;
     pub fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
+    pub fn VTRegisterSupplementalVideoDecoderIfAvailable(codec_type: CMVideoCodecType);
+    pub fn VTIsHardwareDecodeSupported(codec_type: CMVideoCodecType) -> Boolean;
 }

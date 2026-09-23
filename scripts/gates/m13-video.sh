@@ -83,6 +83,15 @@ CAM="$RUN_DIR/cam.mkv"
 ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=20" -t 3 \
 	-c:v libx264 -preset veryfast -pix_fmt yuv420p -g 40 -bf 0 -threads 1 "$CAM" 2>&1 | sed 's/^/    /' || true
 [ -s "$CAM" ] && pass "camera-shaped clip: no B-frames, 60 frames" || { fail "no camera clip"; exit 1; }
+# HEVC: eight bits with B-frames, ten bits, and a camera-shaped one without.
+HEVC8="$RUN_DIR/hevc8.mkv"; HEVC10="$RUN_DIR/hevc10.mkv"; HEVCCAM="$RUN_DIR/hevccam.mkv"
+ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30" -t 2 \
+	-c:v libx265 -preset fast -x265-params "bframes=3:keyint=30:log-level=error" -pix_fmt yuv420p "$HEVC8" 2>&1 | sed 's/^/    /' || true
+ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30" -t 2 \
+	-c:v libx265 -preset fast -x265-params "bframes=3:keyint=30:log-level=error" -pix_fmt yuv420p10le "$HEVC10" 2>&1 | sed 's/^/    /' || true
+ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=20" -t 3 \
+	-c:v libx265 -preset fast -x265-params "bframes=0:keyint=40:log-level=error" -pix_fmt yuv420p "$HEVCCAM" 2>&1 | sed 's/^/    /' || true
+[ -s "$HEVC8" ] && [ -s "$HEVC10" ] && [ -s "$HEVCCAM" ] && pass "HEVC clips: 8-bit and 10-bit with B-frames, a camera-shaped one" || { fail "no HEVC clips (ffmpeg with libx265 needed)"; exit 1; }
 
 echo
 echo "==> Booting the Docker guest with the video decoder"
@@ -117,6 +126,9 @@ container="$(docker create --device lighter.sh/video=all "$IMAGE" sleep infinity
 docker cp "$CLIP" "$container:/clip.mkv" >/dev/null
 docker cp "$LOAD" "$container:/load.mkv" >/dev/null
 docker cp "$CAM" "$container:/cam.mkv" >/dev/null
+docker cp "$HEVC8" "$container:/hevc8.mkv" >/dev/null
+docker cp "$HEVC10" "$container:/hevc10.mkv" >/dev/null
+docker cp "$HEVCCAM" "$container:/hevccam.mkv" >/dev/null
 docker start "$container" >/dev/null
 in_container() { docker exec "$container" bash -c "$1" 2>&1; }
 if ! in_container 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ffmpeg v4l-utils >/dev/null 2>&1' >/dev/null; then
@@ -156,6 +168,30 @@ rm -f /tmp/sw.yuv /tmp/hw.yuv')"
 	else
 		fail "the camera-shaped clip did not finish: $(tr '\n' ' ' <<<"$cam")"
 	fi
+
+	# HEVC: every frame of the 8-bit clip identical to software decode; the
+	# 10-bit one through NV12 (the top eight bits, which is what ffmpeg's
+	# V4L2 wrapper takes), within rounding of software's own conversion.
+	hevc="$(in_container '
+cmpmd5() { grep -v "^#" $1 | awk -F, "{print \$NF}" > /tmp/a; grep -v "^#" $2 | awk -F, "{print \$NF}" > /tmp/b; echo "$(wc -l < /tmp/a) $(cmp -s /tmp/a /tmp/b && echo same || echo differ)"; }
+ffmpeg -y -hide_banner -loglevel error -i /hevc8.mkv -f framemd5 -pix_fmt nv12 /tmp/sw.md5
+timeout -s KILL 60 ffmpeg -y -hide_banner -loglevel error -c:v hevc_v4l2m2m -i /hevc8.mkv -f framemd5 -pix_fmt nv12 /tmp/hw.md5 >/dev/null 2>&1
+echo "HEVC8 $(cmpmd5 /tmp/sw.md5 /tmp/hw.md5)"
+ffmpeg -y -hide_banner -loglevel error -i /hevc10.mkv -f rawvideo -pix_fmt nv12 /tmp/sw.yuv
+timeout -s KILL 60 ffmpeg -y -hide_banner -loglevel error -c:v hevc_v4l2m2m -i /hevc10.mkv -f rawvideo -pix_fmt nv12 /tmp/hw.yuv >/dev/null 2>&1
+ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt nv12 -s 1280x720 -i /tmp/hw.yuv -f rawvideo -pix_fmt nv12 -s 1280x720 -i /tmp/sw.yuv -lavfi "psnr=stats_file=/tmp/p10.log" -f null - 2>&1
+awk "{for(i=1;i<=NF;i++) if(\$i ~ /^psnr_avg:/){split(\$i,a,\":\"); v=(a[2]==\"inf\")?99:a[2]+0; if(n==0||v<min)min=v; n++}} END{printf \"HEVC10 %d %.2f\n\", n, min}" /tmp/p10.log
+timeout -s KILL 30 ffmpeg -hide_banner -loglevel error -c:v hevc_v4l2m2m -i /hevccam.mkv -f framemd5 /tmp/hc.md5 >/dev/null 2>&1; echo "HEVCCAM $? $(grep -vc "^#" /tmp/hc.md5)"
+rm -f /tmp/sw.yuv /tmp/hw.yuv')"
+	echo "$hevc" | sed 's/^/    /'
+	[ "$(awk '/^HEVC8/ {print $2, $3}' <<<"$hevc")" = "60 same" ] && pass "HEVC 8-bit: every frame identical to software decode" || fail "HEVC 8-bit differs from software decode"
+	h10="$(awk '/^HEVC10/ {print $3}' <<<"$hevc")"
+	if [ "$(awk '/^HEVC10/ {print $2}' <<<"$hevc")" = 60 ] && awk -v p="${h10:-0}" -v m="$MIN_PSNR" 'BEGIN{exit !(p >= m)}'; then
+		pass "HEVC 10-bit: 60 frames, worst PSNR ${h10} dB against software's own 10-to-8"
+	else
+		fail "HEVC 10-bit: $(grep HEVC10 <<<"$hevc")"
+	fi
+	[ "$(awk '/^HEVCCAM/ {print $2, $3}' <<<"$hevc")" = "0 60" ] && pass "HEVC with nothing to reorder decodes to its end and exits" || fail "HEVC camera-shaped clip: $(grep HEVCCAM <<<"$hevc")"
 
 	# What the Mac pays: the whole VMM's CPU time across each decode. The
 	# decoder runs inside the VMM, so the container's own CPU time would

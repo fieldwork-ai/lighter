@@ -18,6 +18,10 @@
 //! (8.2.1), not from the timestamps the guest put on the packets, which a
 //! client may set to anything.
 
+use super::bits::{BitWriter, Bits, escape, unescape};
+use super::codec::{FormatDescription, Order, Parser, Unit, annexb_nals, length_prefixed};
+use super::vt_sys as vt;
+
 /// What the decoder needs from an SPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Sps {
@@ -141,40 +145,6 @@ pub fn without_vui(nal: &[u8]) -> Option<Vec<u8>> {
     Some(nal_out)
 }
 
-#[derive(Default)]
-struct BitWriter {
-    bytes: Vec<u8>,
-    n: usize,
-}
-
-impl BitWriter {
-    fn bit(&mut self, b: bool) {
-        if self.n.is_multiple_of(8) {
-            self.bytes.push(0);
-        }
-        if b {
-            *self.bytes.last_mut().expect("pushed") |= 1 << (7 - self.n % 8);
-        }
-        self.n += 1;
-    }
-}
-
-/// The payload with emulation-prevention bytes put back: a 3 after any two
-/// zeros that a byte of 3 or less would follow.
-fn escape(rbsp: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rbsp.len() + 4);
-    let mut zeros = 0;
-    for &b in rbsp {
-        if zeros >= 2 && b <= 3 {
-            out.push(3);
-            zeros = 0;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    out
-}
-
 /// What presentation order needs from a slice header (7.3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slice {
@@ -251,6 +221,109 @@ impl PocCounter {
             self.prev_lsb = lsb;
         }
         msb + lsb
+    }
+}
+
+const NAL_SPS: u8 = 7;
+const NAL_PPS: u8 = 8;
+const NAL_AUD: u8 = 9;
+
+fn nal_type(nal: &[u8]) -> u8 {
+    nal.first().map_or(0, |b| b & 0x1f)
+}
+
+/// An H.264 stream: its parameter sets, and the counting that orders its
+/// pictures.
+#[derive(Default)]
+pub struct Stream {
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+    info: Option<Sps>,
+    /// IDRs seen: each restarts the picture order count.
+    epoch: u64,
+    poc: PocCounter,
+}
+
+impl Stream {
+    /// Where an access unit sorts, from its first slice header: by picture
+    /// order count for type 0, and by decode order otherwise, which is
+    /// presentation order for type 2 by definition. Type 1 derives the
+    /// count from `frame_num` and offsets in the SPS, and nothing seen in
+    /// practice uses it with B-frames; it is left in decode order.
+    fn order_of(&mut self, nals: &[&[u8]], seq: i64) -> Order {
+        let Some(info) = self.info else {
+            return (self.epoch, seq);
+        };
+        let Some(slice) = nals.iter().find_map(|n| slice(n, &info)) else {
+            return (self.epoch, seq);
+        };
+        if slice.idr {
+            self.epoch += 1;
+        }
+        if info.poc_type == 0 {
+            (self.epoch, self.poc.next(&slice, info.log2_max_poc_lsb))
+        } else {
+            (self.epoch, seq)
+        }
+    }
+}
+
+impl Parser for Stream {
+    fn unit(&mut self, data: &[u8], seq: i64) -> Unit {
+        let nals = annexb_nals(data);
+        let mut changed = false;
+        for nal in &nals {
+            match nal_type(nal) {
+                NAL_SPS if self.sps.as_slice() != *nal => {
+                    self.sps = nal.to_vec();
+                    self.info = parse(nal);
+                    changed = true;
+                }
+                NAL_PPS if self.pps.as_slice() != *nal => {
+                    self.pps = nal.to_vec();
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        // Every slice NAL (and SEI) goes to VideoToolbox length-prefixed;
+        // the parameter sets are in the format description.
+        let sample = length_prefixed(
+            nals.iter()
+                .copied()
+                .filter(|n| !matches!(nal_type(n), NAL_SPS | NAL_PPS | NAL_AUD)),
+        );
+        let order = self.order_of(&nals, seq);
+        Unit {
+            changed,
+            sample,
+            order,
+        }
+    }
+
+    fn format_description(&self) -> Option<Result<FormatDescription, vt::OSStatus>> {
+        if self.sps.is_empty() || self.pps.is_empty() {
+            return None;
+        }
+        Some(
+            FormatDescription::from_parameter_sets(false, &[&self.sps, &self.pps]).or_else(|st| {
+                let stripped = without_vui(&self.sps).ok_or(st)?;
+                let desc = FormatDescription::from_parameter_sets(false, &[&stripped, &self.pps])?;
+                tracing::info!(
+                    st,
+                    "VideoToolbox refused the stream's SPS; decoding it without its VUI"
+                );
+                Ok(desc)
+            }),
+        )
+    }
+
+    fn reorder_depth(&self) -> Option<u32> {
+        self.info.and_then(|i| i.reorder)
+    }
+
+    fn ten_bit(&self) -> bool {
+        false
     }
 }
 
@@ -334,67 +407,6 @@ fn skip_scaling_list(r: &mut Bits, size: usize) -> Option<()> {
         last = if next == 0 { last } else { next };
     }
     Some(())
-}
-
-/// The RBSP: the payload with emulation-prevention bytes (`00 00 03`)
-/// removed.
-fn unescape(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut zeros = 0;
-    for &b in data {
-        if zeros >= 2 && b == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    out
-}
-
-struct Bits<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Bits<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Bits { data, pos: 0 }
-    }
-
-    fn bit(&mut self) -> Option<bool> {
-        let byte = *self.data.get(self.pos / 8)?;
-        let b = (byte >> (7 - self.pos % 8)) & 1;
-        self.pos += 1;
-        Some(b == 1)
-    }
-
-    fn bits(&mut self, n: u32) -> Option<u64> {
-        let mut v = 0u64;
-        for _ in 0..n {
-            v = (v << 1) | u64::from(self.bit()?);
-        }
-        Some(v)
-    }
-
-    /// Exp-Golomb, unsigned.
-    fn ue(&mut self) -> Option<u32> {
-        let mut zeros = 0;
-        while !self.bit()? {
-            zeros += 1;
-            if zeros > 31 {
-                return None;
-            }
-        }
-        let rest = self.bits(zeros)?;
-        Some(((1u64 << zeros) - 1 + rest) as u32)
-    }
-
-    /// Exp-Golomb, signed.
-    fn se(&mut self) -> Option<i64> {
-        let k = i64::from(self.ue()?);
-        Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
-    }
 }
 
 #[cfg(test)]
@@ -556,6 +568,24 @@ pub(crate) mod tests {
         let raw = [0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x03, 0x00, 0x05];
         assert_eq!(escape(&unescape(&raw)), raw);
         assert_eq!(escape(&[0, 0, 0, 0]), vec![0, 0, 3, 0, 0]);
+    }
+
+    #[test]
+    fn a_sample_carries_the_slices_and_leaves_parameter_sets_out() {
+        let data = [
+            &[0u8, 0, 0, 1, 0x67, 9][..],
+            &[0, 0, 0, 1, 0x68, 9],
+            &[0, 0, 0, 1, 0x09, 0xf0],
+            &[0, 0, 0, 1, 0x65, 1, 2, 3],
+            &[0, 0, 0, 1, 0x06, 7],
+        ]
+        .concat();
+        let unit = Stream::default().unit(&data, 0);
+        assert!(unit.changed);
+        assert_eq!(
+            unit.sample,
+            vec![0, 0, 0, 4, 0x65, 1, 2, 3, 0, 0, 0, 2, 0x06, 7]
+        );
     }
 
     #[test]
