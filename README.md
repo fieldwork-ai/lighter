@@ -16,7 +16,7 @@ lighter is a high-performance, headless virtual machine monitor built from scrat
 
 A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 - 🔄 **Drop-in Docker replacement:** Works immediately with your existing `docker`, `docker compose`, `kind`, and third-party developer tooling.
-- 🚀 **Full Apple Silicon acceleration:** Run local LLMs, PyTorch (MPS), computer vision models and H.264 decode directly on your Mac's GPU, Neural Engine and media engine.
+- 🚀 **Full Apple Silicon acceleration:** Run local LLMs, PyTorch (MPS), computer vision models and video decode and encode directly on your Mac's GPU, Neural Engine and media engine.
 - ⚡ **Blistering performance:** Cold boots in 709 ms; host file mounts and builds run faster than native APFS.
 - 🪶 **Ultra-lightweight:** Idles at 617 MiB RAM (vs 3.5 GB for Docker Desktop) and surrenders memory back to macOS within seconds of a workload finishing.
 - 🆓 **100% Free & Open Source:** Dual-licensed MIT / Apache 2.0. No paid subscriptions, no commercial seat licenses, no telemetry, and zero GUI/Electron bloat.
@@ -46,7 +46,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 | **Apple Neural Engine (ANE)** | **Yes** | No | No | No |
 | **PyTorch on Mac GPU (MPS)** | **Yes** | No | No | No |
 | **llama.cpp / whisper on Metal** | **Yes** (93 t/s on M1, 299 on M5) | No | No | No |
-| **Hardware video decode (H.264)** | **Yes** (4K30 at 8% of a core, 41% in software) | No | No | No |
+| **Hardware video decode and encode (H.264, HEVC, VP9)** | **Yes** (HEVC 1080p30 encode at 21% of a core; libx265 cannot keep up) | No | No | No |
 
 ---
 
@@ -106,7 +106,7 @@ Direct installations can opt into background update downloads with `lighter upda
 
 ## Hardware & AI Acceleration
 
-lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels, and it decodes H.264 on the Mac's media engine for anything that speaks V4L2. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All five devices use Docker's standard Container Device Interface (CDI) via `--device` and need no flags to enable.
+lighter is the first container runtime for macOS to put the Neural Engine and PyTorch's `mps` device inside Linux containers, it runs llama.cpp and whisper.cpp on the Mac's GPU with ggml's own Metal kernels, and it decodes and encodes video on the Mac's media engine for anything that speaks V4L2. Vulkan in containers follows the libkrun design that Podman's krunkit has shipped since 2024: a virtio-gpu Venus device rendered over MoltenVK. All five devices use Docker's standard Container Device Interface (CDI) via `--device` and need no flags to enable.
 
 | Device | What a container gets | Measured performance |
 |---|---|---|
@@ -114,7 +114,7 @@ lighter is the first container runtime for macOS to put the Neural Engine and Py
 | `lighter.sh/metal` | ggml's Metal kernels over RPC | 93 t/s on M1 (85% of native); 299 on M5 |
 | `lighter.sh/ane` | ONNX models on Neural Engine, GPU or CPU (fastest chosen) | ResNet-50 2.2 ms vs 29 ms on container CPU |
 | `lighter.sh/mps` | PyTorch on the Mac's GPU | Training step 14 ms on M1, 7 ms on M5 |
-| `lighter.sh/video` | A V4L2 H.264 decoder (`/dev/video0`) on the Mac's media engine | 4K30 in real time at 8% of a core, 41% in software (M5) |
+| `lighter.sh/video` | V4L2 decoder (`/dev/video0`: H.264, HEVC, VP9) and encoder (`/dev/video1`: H.264, HEVC) on the Mac's media engine | H.264 4K30 decode at 16% of a core, 69% in software; H.264 1080p30 encode at 22%, 78% in libx264 (M1) |
 
 Two documented costs (`docs/gpu.md`): cold start is ~50 ms longer with accelerator devices enabled (564 / 715 ms vs 517 / 664 ms on M5), and idle memory is ~20 MiB higher for the in-process servers' readiness. Devices can be disabled individually if desired (`lighter config --gpu off`, `--ane off`, `--mps off`, `--metal off`, `--video off`).
 
@@ -170,25 +170,29 @@ session = ort.InferenceSession("model.onnx", options)
 - **Frigate NVR**: YOLO11n object detection runs at **7.6 ms/frame at <1% CPU** (vs 15.1 ms and 36% CPU on container CPU).
 - Automatic tiering: Model loads across Neural Engine, GPU, and CPU paths on first run; fastest candidate is automatically chosen and CoreML compiled models are cached in `coreml-cache`.
 
-### 4. Hardware video decode (`--device lighter.sh/video=all`)
+### 4. Hardware video decode and encode (`--device lighter.sh/video=all`)
 
-A container gets `/dev/video0`, a V4L2 stateful H.264 decoder of the kind a Raspberry Pi has, backed by VideoToolbox. Stock ffmpeg, GStreamer and Frigate's own ffmpeg use it unchanged:
+A container gets `/dev/video0`, a V4L2 stateful decoder (H.264, HEVC in 8 and 10 bits, VP9), and `/dev/video1`, the matching encoder (H.264, HEVC Main and Main 10), of the kind a Raspberry Pi has, backed by VideoToolbox. Stock ffmpeg, GStreamer, Jellyfin, go2rtc and Frigate's own ffmpeg use them unchanged:
 
 ```bash
 docker run --rm --device lighter.sh/video=all -v "$PWD:/w" debian:bookworm-slim sh -c \
   'apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null &&
-   ffmpeg -c:v h264_v4l2m2m -i /w/input.mkv -f null -'
+   ffmpeg -c:v h264_v4l2m2m -i /w/input.mkv -c:v hevc_v4l2m2m -b:v 6M /w/output.mp4'
 ```
 
-| Stream, decoded in real time (M5) | Software | `h264_v4l2m2m` |
-|---|---|---|
-| 4K at 30 fps, 25 Mbps | 41% of a core | **8%** |
-| 1080p at 60 fps, 12 Mbps | 29% | **6%** |
-| A camera's 2880x1616 at 20 fps | 17% | **4%** |
+| In real time, 30 fps (M1) | Software | V4L2 | Native VideoToolbox |
+|---|---|---|---|
+| Decode H.264 4K, 25 Mbps | 69% of a core | **16%** | 12% |
+| Decode HEVC Main 10 4K, 20 Mbps | 100% | **30%** | 15% |
+| Decode VP9 1080p, 6 Mbps | 44% | **9%** | 6% |
+| Encode H.264 1080p, 8 Mbps | 78% (libx264 veryfast) | **22%** | 9% |
+| Encode HEVC 1080p, 6 Mbps | cannot keep up (libx265 ultrafast) | **21%** | 9% |
+| Encode HEVC 4K, 20 Mbps | cannot keep up | **42%** | 26% |
 
-- Every frame is identical to software decode's, byte for byte (checked frame by frame on all three).
-- **Frigate NVR**: `ffmpeg.hwaccel_args: -c:v h264_v4l2m2m` on the camera. Detecting on a 5 MP main stream: 32% of a core to 22%, of which Frigate's own downscale is most of the rest.
-- H.264 in, NV12 out; one copy a frame into the guest. HEVC and encode are not in 0.8.0.
+- Eight-bit decode is identical to software decode's, frame for frame; encode is checked for every frame, the bitrate and keyframes asked for, and quality against the source.
+- **Frigate NVR**: `ffmpeg.hwaccel_args: -c:v h264_v4l2m2m` (or `hevc_v4l2m2m` for an H.265 camera) on the camera. Detecting on a 5 MP main stream: 32% of a core to 22%.
+- **Jellyfin**: V4L2 hardware acceleration transcodes on the encoder. **go2rtc**: `#hardware=v4l2m2m`.
+- One copy a frame each way between the guest and VideoToolbox. No AV1. See [the guide](docs/gpu.md) for the details.
 
 ### 5. General-Purpose Vulkan (`--device lighter.sh/gpu=all`)
 
@@ -365,7 +369,7 @@ lighter exposes the Apple Silicon compute architecture to containers:
 
 ## Features
 
-- **Apple Silicon hardware acceleration:** Native access to Apple Silicon GPU (Vulkan and Metal/ggml), Neural Engine (ANE via ONNX Runtime), PyTorch MPS, and the media engine (H.264 decode over V4L2) in containers via standard Docker CDI (`--device lighter.sh/...`). See the [Hardware & AI Acceleration guide](docs/gpu.md).
+- **Apple Silicon hardware acceleration:** Native access to Apple Silicon GPU (Vulkan and Metal/ggml), Neural Engine (ANE via ONNX Runtime), PyTorch MPS, and the media engine (video decode and encode over V4L2) in containers via standard Docker CDI (`--device lighter.sh/...`). See the [Hardware & AI Acceleration guide](docs/gpu.md).
 - **Docker CLI & Compose compatibility:** Works seamlessly as a registered Docker context with existing `docker`, `docker compose`, and third-party developer tooling.
 - **x86-64 containers under Rosetta:** Run `linux/amd64` images on Apple Silicon with near-native performance via Apple Rosetta (`lighter rosetta --install`). See [x86-64 architecture and performance](docs/x86-64.md).
 - **Local Kubernetes with kind:** Spin up single-node and multi-node arm64 Kubernetes clusters with standard `kind`, `kubectl`, and `helm` commands without control-plane overhead when idle. See the [Kubernetes guide](docs/kubernetes.md).
@@ -401,7 +405,7 @@ lighter (CLI)  ──spawns──▶  lighter run
 The guest environment consists of:
 - A custom 6.18 longterm Linux kernel booting uncompressed directly from memory (no bootloader).
 - Minimal Alpine-based root filesystem with `dockerd` and a lightweight Rust guest agent.
-- Host-accelerated virtio-gpu (Venus), ANE CoreML bridge, in-process Metal ggml RPC, PyTorch MPS server, and V4L2 VideoToolbox decoder.
+- Host-accelerated virtio-gpu (Venus), ANE CoreML bridge, in-process Metal ggml RPC, PyTorch MPS server, and V4L2 VideoToolbox decoder and encoder.
 
 See [`docs/architecture.md`](docs/architecture.md) and [`docs/gpu.md`](docs/gpu.md) for detailed internals.
 
