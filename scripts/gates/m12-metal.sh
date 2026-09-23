@@ -77,6 +77,10 @@ while ! grep -q "AGENT listening" "$LOG" 2>/dev/null; do
 	sleep 1; waited=$((waited + 1))
 done
 pass "guest booted (${waited}s)"
+# The server comes up on its own thread once Metal has compiled its
+# pipelines, which on the first run after a build takes longer than the
+# guest takes to boot.
+for _ in $(seq 1 60); do grep -q "ggml rpc server on the Mac's GPU" "$LOG" && break; sleep 1; done
 grep -q "ggml rpc server on the Mac's GPU" "$LOG" && pass "$(grep -o "ggml rpc server.*" "$LOG" | head -1 | cut -c1-100)" || fail "the ggml server did not start"
 grep -q "INIT metal=port" "$LOG" && pass "init published the device" || fail "init did not publish the device"
 
