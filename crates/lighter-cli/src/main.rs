@@ -219,8 +219,10 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
         }
         Command::Start { timeout } => start(Duration::from_secs(timeout)),
         Command::Stop => stop(),
+        // The context stays on lighter across a restart: going back to the
+        // previous one and returning would lose it if its daemon were down.
         Command::Restart => {
-            stop()?;
+            stop_machine()?;
             start(Duration::from_secs(120))
         }
         Command::Status => status(),
@@ -358,7 +360,7 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     let version = machine::docker_version(&socket)?;
     println!("Docker {version}");
     if paths::is_default_home() && docker_available {
-        context::install(&socket)?;
+        context::install(&socket, &paths::previous_context()?)?;
         println!("Running as pid {pid}; the docker CLI now points at it.");
     } else {
         println!(
@@ -374,8 +376,12 @@ fn stop() -> anyhow::Result<std::process::ExitCode> {
     // vanish fails in a way that reads as Docker being broken. A custom home
     // never owned the context, so it has nothing to put back.
     if paths::is_default_home() {
-        let _ = context::select_default();
+        let _ = context::release(&paths::previous_context()?);
     }
+    stop_machine()
+}
+
+fn stop_machine() -> anyhow::Result<std::process::ExitCode> {
     if machine::stop(Duration::from_secs(30))? {
         println!("Stopped.");
     } else {

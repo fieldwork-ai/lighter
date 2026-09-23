@@ -34,6 +34,11 @@ pub fn docker_socket() -> anyhow::Result<PathBuf> {
     Ok(home()?.join("docker.sock"))
 }
 
+/// The Docker context selected before `lighter start`, to go back to at stop.
+pub fn previous_context() -> anyhow::Result<PathBuf> {
+    Ok(home()?.join("previous-context"))
+}
+
 pub fn log_file() -> anyhow::Result<PathBuf> {
     Ok(home()?.join("machine.log"))
 }
