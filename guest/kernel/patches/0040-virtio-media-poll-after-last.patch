@@ -1,0 +1,20 @@
+# virtio-media v9: report the CAPTURE queue readable once its LAST buffer has been dequeued, as vb2 does.
+# DQBUF then answers EPIPE, which is how ffmpeg's v4l2m2m learns the stream ended; without it, an
+# ffmpeg that polls once more after the drain (Debian's 5.1 on a stream with no frames left to
+# reorder) waits forever.
+diff --git a/drivers/media/virtio/virtio_media_driver.c b/drivers/media/virtio/virtio_media_driver.c
+--- a/drivers/media/virtio/virtio_media_driver.c
++++ b/drivers/media/virtio/virtio_media_driver.c
+@@ -633,7 +633,11 @@
+ 		    (capture_queue->queued_bufs == 0 &&
+ 		     list_empty(&capture_queue->pending_dqbufs)))
+ 			rc |= EPOLLERR;
+-		else if (!list_empty(&capture_queue->pending_dqbufs))
++		else if (!list_empty(&capture_queue->pending_dqbufs) ||
++			 capture_queue->is_capture_last)
++			/* After the LAST buffer, DQBUF answers EPIPE at once;
++			 * say so, as vb2 does, or a client polling for the
++			 * next frame after end of stream waits forever. */
+ 			rc |= EPOLLIN | EPOLLRDNORM;
+ 	}
+ 	if (req_events & (EPOLLOUT | EPOLLWRNORM)) {
