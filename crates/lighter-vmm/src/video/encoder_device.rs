@@ -55,9 +55,15 @@ const CODED_FORMATS: [u32; 2] = [H264, HEVC];
 
 const DEFAULT_SIZE: (u32, u32) = (640, 480);
 const MAX_DIMENSION: u32 = 8192;
-/// Room for one encoded frame: never more than the raw frame in practice,
-/// and a floor for small pictures whose first keyframe carries headers.
+/// Room for one encoded frame: half a raw frame, which even a 4K keyframe
+/// at a high bitrate stays well inside, with a floor for small pictures.
 const MIN_CODED_SIZE: u32 = 1 << 20;
+/// CAPTURE buffers granted however few are asked for. ffmpeg 7.1 asks for
+/// four and, while draining, stops at the first moment none is queued,
+/// dropping what is still to come; its muxer holds packets, and with them
+/// their buffers, long enough for that to be every drain. Twelve was
+/// measured to lose nothing; V4L2 lets a driver grant more than asked.
+const MIN_CAPTURE_BUFFERS: u32 = 12;
 /// OUTPUT buffers asked for when B-frames are on: VideoToolbox was measured
 /// holding up to twelve frames back at 720p with three B-frames between
 /// references, and the client needs one more to fill.
@@ -553,7 +559,7 @@ fn raw_size(bytesperline: u32, h: u32) -> u32 {
 }
 
 fn coded_size((w, h): (u32, u32)) -> u32 {
-    (w * h * 3 / 2).max(MIN_CODED_SIZE)
+    (w * h * 3 / 4).max(MIN_CODED_SIZE)
 }
 
 fn even_dimension(v: u32) -> u32 {
@@ -587,7 +593,7 @@ where
         session.collect();
         while !session.ready.is_empty() {
             let Some(index) = session.available.pop_front() else {
-                return;
+                break;
             };
             let Some(buffer) = session.output.get_mut(index as usize) else {
                 continue;
@@ -648,6 +654,7 @@ where
                     )));
             }
         }
+        self.start(session, false);
     }
 
     /// Encodes the frame in OUTPUT buffer `index`, then returns the buffer.
@@ -704,11 +711,24 @@ where
     }
 
     /// Encodes whatever OUTPUT buffers wait, once both queues stream.
-    fn start(&mut self, session: &mut EncoderSession) {
+    ///
+    /// Not while encoded output waits for a CAPTURE buffer, though, unless
+    /// draining: hardware encodes into a CAPTURE buffer and cannot take a
+    /// frame while none is free, and clients rely on that. ffmpeg 7.1 holds
+    /// all four of its CAPTURE buffers while it muxes; handed every frame
+    /// back at once it runs so far ahead that at the drain it finds none
+    /// queued, takes that for a deadlock and drops what is left. Frames
+    /// VideoToolbox holds back for B-frames are not output yet, so they do
+    /// not count, and lookahead cannot deadlock against this.
+    fn start(&mut self, session: &mut EncoderSession, drain: bool) {
         if !(session.output_streaming && session.capture_streaming) {
             return;
         }
-        while let Some((index, bytes_used)) = session.waiting.pop_front() {
+        session.collect();
+        while drain || session.ready.is_empty() {
+            let Some((index, bytes_used)) = session.waiting.pop_front() else {
+                break;
+            };
             self.encode(session, index, bytes_used);
         }
     }
@@ -1036,6 +1056,11 @@ where
             QueueType::VideoCaptureMplane => session.coded_sizeimage,
             _ => return Err(libc::EINVAL),
         };
+        let count = if queue == QueueType::VideoCaptureMplane && count > 0 {
+            count.max(MIN_CAPTURE_BUFFERS)
+        } else {
+            count
+        };
         let buffers = if queue == QueueType::VideoOutputMplane {
             &mut session.input
         } else {
@@ -1122,7 +1147,7 @@ where
         match queue.direction() {
             QueueDirection::Output => {
                 session.waiting.push_back((index, bytesused as usize));
-                self.start(session);
+                self.start(session, false);
             }
             QueueDirection::Capture => {
                 tracing::trace!(
@@ -1158,7 +1183,6 @@ where
             }
             _ => return Err(libc::EINVAL),
         }
-        self.start(session);
         self.deliver(session);
         Ok(())
     }
@@ -1472,7 +1496,7 @@ where
         if cmd.cmd == bindings::V4L2_ENC_CMD_STOP {
             // Every frame queued so far comes out, then an empty buffer
             // flagged LAST; the next frame continues the stream.
-            self.start(session);
+            self.start(session, true);
             if let Some(vt) = &session.vt {
                 vt.complete();
             }
