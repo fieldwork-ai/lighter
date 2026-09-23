@@ -16,6 +16,8 @@ initramfs*.cpio*
 # Benchmark output: the committed results live in benchmarks/results/, raw runs
 # do not.
 /benchmarks/raw/
+# Models and images the ANE model matrix builds (benchmarks/ane-models/export.sh).
+/benchmarks/.cache/
 
 # The GPU renderer's sources, tools and the libraries they produce: host/gpu/build.sh.
 /host/build/
