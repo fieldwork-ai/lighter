@@ -29,6 +29,12 @@ through the share 8 to 10%. While a container's stream to an accelerator
 has moved a message in the last millisecond (0011's traffic signal), a
 timeout does not shrink the window and the backoff does not apply.
 
+A backoff ends early after `idle.poll_resume_after` (4) short sleeps in
+a row: a burst of back-and-forth work after a quiet spell (a container's
+first DNS queries, a request loop) is over in milliseconds, before a
+250 ms backoff would let polling look again, and read 80 us a DNS round
+trip against 0.7.3's 38. A trickle's short sleeps rarely come in a row.
+
 `idle.poll_timeouts=0` keeps 0011's window rules and leaves only the
 backoff: where the vCPUs fill the host's cores the window is already short
 (50 us), and halving it on each timeout cost an eight-core M1's npm install
@@ -48,7 +54,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  #include <linux/timekeeping.h>
  
  #include <asm/barrier.h>
-@@ -100,6 +101,34 @@
+@@ -100,6 +101,41 @@
  static DEFINE_PER_CPU(u64, idle_poll_block_ns);
  static DEFINE_PER_CPU(bool, idle_poll_block_timer);
  static DEFINE_PER_CPU(bool, idle_poll_block_pending);
@@ -80,10 +86,31 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
 +static DEFINE_PER_CPU(u64, idle_poll_epoch_ns);
 +static DEFINE_PER_CPU(u64, idle_poll_off_until);
 +static DEFINE_PER_CPU(u64, idle_poll_backoff_ns);
++/* A backoff ends early on poll_resume_after short sleeps in a row: work
++ * that hands off back and forth (a DNS query, a request loop) is over in
++ * milliseconds, before a backoff of up to a quarter of a second would let
++ * polling look again, and a trickle's short sleeps rarely come in a row. */
++static unsigned int idle_poll_resume_after = 4;
++module_param_named(poll_resume_after, idle_poll_resume_after, uint, 0644);
++static DEFINE_PER_CPU(u32, idle_poll_short_run);
  DEFINE_PER_CPU(u64, idle_poll_traffic_at);
  /* How each block was judged, per CPU, for reading from sysfs. */
  enum { JUDGED_TIMER, JUDGED_LONG, JUDGED_TRAFFIC, JUDGED_LOCAL, JUDGED_KINDS };
-@@ -235,6 +264,10 @@
+@@ -217,6 +253,13 @@
+ 	u32 limit = __this_cpu_read(idle_poll_limit_ns);
+ 	u32 local = min(idle_poll_ns, idle_poll_local_ns);
+ 
++	if (block_ns <= local && !timer_due) {
++		if (idle_poll_resume_after &&
++		    __this_cpu_inc_return(idle_poll_short_run) >= idle_poll_resume_after)
++			__this_cpu_write(idle_poll_off_until, 0);
++	} else {
++		__this_cpu_write(idle_poll_short_run, 0);
++	}
+ 	__this_cpu_inc(idle_poll_judged[traffic ? JUDGED_TRAFFIC :
+ 				       block_ns > idle_poll_ns ? JUDGED_LONG :
+ 				       timer_due ? JUDGED_TIMER : JUDGED_LOCAL]);
+@@ -235,6 +278,10 @@
  		limit = max(limit / 2, local);
  	} else if (timer_due) {
  		limit /= 2;
@@ -94,7 +121,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  	} else if (limit < idle_poll_grow_start_ns) {
  		limit = idle_poll_grow_start_ns;
  	} else {
-@@ -252,14 +285,88 @@
+@@ -252,14 +299,88 @@
  }
  
  /* Returns true if a wakeup arrived while polling, so WFI is not needed. */
@@ -183,7 +210,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  	raw_local_irq_enable();
  	if (!current_set_polling_and_test()) {
  		unsigned int count = 0;
-@@ -278,7 +385,13 @@
+@@ -278,7 +399,13 @@
  	/* A waker observing polling sends no IPI. Clear, order, then test
  	 * NEED_RESCHED so work arriving at the deadline also prevents WFI.
  	 */
@@ -198,7 +225,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  }
  
  /*
-@@ -301,7 +414,9 @@
+@@ -301,7 +428,9 @@
  	}
  	next_timer = idle_next_timer_ns();
  	if (__this_cpu_read(idle_poll_limit_ns) &&
