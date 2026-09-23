@@ -79,5 +79,8 @@ guest a point and a half.
   dropped with a warning (virtio-media fills its event queue in probe).
 - The media device's commands and events can be traced
   (`LIGHTER_LOG=lighter_vmm::virtio::media=trace`).
+- The README's tables are regenerated from the 0.8.0 records on both
+  machines; the memory rows through an npm install are on a 12 GiB guest,
+  as before (2770 / 726 / 714 MiB against 2609 / 854 / 813).
 - Linux remains **6.18.52**, with guest patches 0036 to 0040; the data
   epoch remains **1**.
