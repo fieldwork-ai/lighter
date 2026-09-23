@@ -12,7 +12,7 @@
 
 *lighter is an open-source project sponsored by [Fieldwork](https://getfieldwork.ai), providing dedicated engineering time to build and maintain high-performance virtualization and AI infrastructure for Apple Silicon.*
 
-lighter is a high-performance, headless virtual machine monitor built from scratch in Rust on Apple's `Hypervisor.framework`. It boots a custom Linux LTS kernel directly into memory in 50 milliseconds, delivers shared filesystem performance faster than native APFS, and is the **first and only macOS container engine to give Linux containers direct access to Apple Silicon GPU, Metal, and Neural Engine hardware**.
+lighter is a high-performance, headless virtual machine monitor built from scratch in Rust on Apple's `Hypervisor.framework`. It boots a custom Linux LTS kernel directly into memory in 50 milliseconds, delivers shared filesystem performance faster than native APFS, and is the **first and only macOS container engine to give Linux containers direct access to Apple Silicon GPU, Metal, Neural Engine, and hardware media encode/decode**.
 
 A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 - 🔄 **Drop-in Docker replacement:** Works immediately with your existing `docker`, `docker compose`, `kind`, and third-party developer tooling.
@@ -54,7 +54,7 @@ A seamless, drop-in replacement for Docker Desktop, OrbStack, and Colima:
 
 - 🚫 **Escape Docker Desktop's bloat & licensing fees:** Docker Desktop consumes 3.5–7+ GB of RAM, runs Electron in the background, spins laptop fans, and charges $9–$24/user/month for commercial teams. lighter is a lean terminal daemon using ~600 MiB RAM at idle (~350 MiB on an 8 GB Mac), with zero licensing costs forever.
 - 🔓 **Free & Open Source forever:** OrbStack transitioned to a closed-source, paid subscription model ($8–$10/user/month). lighter is dual-licensed MIT / Apache 2.0 with zero commercial seat limits, no "free during beta" bait-and-switch, and zero telemetry.
-- 🧠 **Unlock Apple Silicon AI & GPU acceleration:** Docker Desktop, OrbStack, and Colima offer *zero* Apple Silicon GPU or Neural Engine support. lighter gives your containers native Metal (93 t/s on M1, 299 t/s on M5), PyTorch MPS training, and Neural Engine inference at <1% CPU.
+- 🧠 **Unlock Apple Silicon AI & GPU acceleration:** Docker Desktop, OrbStack, and Colima offer *zero* Apple Silicon hardware acceleration. lighter gives your containers native Metal (93 t/s on M1, 299 t/s on M5), PyTorch MPS training, Neural Engine inference at <1% CPU, and full H.264/HEVC/VP9 hardware video decode and encode.
 - ⚡ **Shared folders faster than native macOS:** Bind-mounting code into containers on macOS is historically painful. `lighter-fs` uses an in-memory page cache with real-time `FSEvents` invalidation, making `npm ci` and `ripgrep` faster inside containers than native APFS.
 - 🔌 **100% Drop-in Docker compatibility:** Zero workflow changes. `lighter start` sets up your Docker CLI context. Run existing `docker`, `docker compose`, `kind`, and CI scripts as normal.
 
@@ -189,7 +189,7 @@ docker run --rm --device lighter.sh/video=all -v "$PWD:/w" debian:bookworm-slim 
 | Encode HEVC 1080p, 6 Mbps | cannot keep up (libx265 ultrafast) | **21%** | 9% |
 | Encode HEVC 4K, 20 Mbps | cannot keep up | **42%** | 26% |
 
-- Eight-bit decode is identical to software decode's, frame for frame; encode is checked for every frame, the bitrate and keyframes asked for, and quality against the source.
+- Eight-bit decode is identical to software decode, frame for frame; encode is verified for bit-exact keyframe placement, bitrate target adherence, and PSNR quality against the source.
 - **Frigate NVR**: `ffmpeg.hwaccel_args: -c:v h264_v4l2m2m` (or `hevc_v4l2m2m` for an H.265 camera) on the camera. Detecting on a 5 MP main stream: 32% of a core to 22%.
 - **Jellyfin**: V4L2 hardware acceleration transcodes on the encoder. **go2rtc**: `#hardware=v4l2m2m`.
 - One copy a frame each way between the guest and VideoToolbox. No AV1. See [the guide](docs/gpu.md) for the details.
