@@ -22,7 +22,7 @@ echo "==> $("$L" --version) from $TARBALL"
 "$L" start --timeout 120 >"$ROOT/start.log" 2>&1 && ok "start: $(grep -m1 Docker "$ROOT/start.log")" || { bad "start: $(tail -2 "$ROOT/start.log" | tr '\n' ' ')"; exit 1; }
 out="$($D run --rm alpine:3.21 uname -m 2>/dev/null)"; [ "$out" = aarch64 ] && ok "arm64 container: $out" || bad "arm64: $out"
 out="$($D run --rm --platform linux/amd64 alpine:3.21 uname -m 2>/dev/null)"; [ "$out" = x86_64 ] && ok "amd64 container: $out" || bad "amd64: $out"
-out="$($D run --rm --device lighter.sh/video=all alpine:3.21 ls /dev/video0 2>/dev/null)"; [ "$out" = /dev/video0 ] && ok "video device: $out" || bad "video device: $out"
+out="$($D run --rm --device lighter.sh/video=all alpine:3.21 ls /dev/video0 /dev/video1 2>/dev/null | tr '\n' ' ')"; [ "$out" = "/dev/video0 /dev/video1 " ] && ok "video devices: $out" || bad "video devices: $out"
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)"
 $D run -d --rm --name smoke-http -p 18098:80 alpine:3.21 sh -c 'while true; do printf "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 80; done' >/dev/null 2>&1; sleep 3
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$LAN_IP:18098/")"; [ "$code" = 200 ] && ok "published TCP on $LAN_IP" || bad "TCP publish: $code"
@@ -31,6 +31,14 @@ r="$(python3 -c 'import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_D
 $D run --rm alpine:3.21 sh -c 'ip -6 route show default | grep -q . && echo v6' 2>/dev/null | grep -q v6 && ok "container has a v6 route" || bad "no v6 route"
 $D rm -f smoke-http smoke-udp >/dev/null 2>&1
 "$L" status | head -2
+# A restart comes back, and a larger configured disk applies to the image
+# that already exists.
+IMG="$LIGHTER_HOME/data.img"
+before=$(( $(stat -f %z "$IMG") >> 30 ))
+"$L" config --disk $((before + 1)) >/dev/null 2>&1
+"$L" restart >"$ROOT/restart.log" 2>&1 && [ "$($D run --rm alpine:3.21 echo up 2>/dev/null)" = up ] && ok "restart" || bad "restart: $(tail -2 "$ROOT/restart.log" | tr '\n' ' ')"
+after=$(( $(stat -f %z "$IMG") >> 30 ))
+[ "$after" = $((before + 1)) ] && ok "disk grew on restart: $before to $after GiB" || bad "disk: $before to $after GiB"
 "$L" stop >/dev/null 2>&1 && ok "stop" || bad "stop"
 [ "$FAILED" -eq 0 ] && echo "smoke: all passed" || echo "smoke: FAILED"
 exit $FAILED
