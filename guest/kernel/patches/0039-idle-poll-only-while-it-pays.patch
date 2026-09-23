@@ -18,6 +18,14 @@ A thread pool's handoffs pay every epoch and never back off: the
 cross-vCPU pipe round trip stays at 2.2 us (8.5 us without polling), and
 comes back within about a fifth of a second from a backed-off CPU.
 
+While a container's stream to an accelerator has moved a message in the
+last millisecond (0011's traffic signal), a poll an interrupt ended is a
+catch too, a timeout does not shrink the window, and the backoff does not
+apply: the reply a token loop waits for arrives as an interrupt, and a CPU
+already awake takes it without the host waking a parked thread first.
+Without this, llama.cpp's generation over Metal RPC read 267-273 t/s on
+the M5 against 292-294.
+
 `idle.polled` reports, per CPU, how many polls timed out, were ended by
 an interrupt, or by another CPU, and the nanoseconds each kind spent.
 diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
@@ -74,7 +82,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  	} else if (limit < idle_poll_grow_start_ns) {
  		limit = idle_poll_grow_start_ns;
  	} else {
-@@ -252,14 +282,81 @@
+@@ -252,14 +282,87 @@
  }
  
  /* Returns true if a wakeup arrived while polling, so WFI is not needed. */
@@ -110,17 +118,23 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
 +static void __cpuidle idle_poll_account(unsigned int kind, u64 spent_ns, u64 now)
 +{
 +	u32 limit = __this_cpu_read(idle_poll_limit_ns);
++	/* While a model is talking, the reply it waits for arrives as an
++	 * interrupt, and a CPU already awake takes it without the host waking
++	 * a parked thread first: 8% of a token loop's rate. Then an interrupt
++	 * is a catch too, and a timeout no reason to shrink. */
++	bool traffic = idle_traffic_recent();
++	bool hit = kind == POLLED_REMOTE || (kind == POLLED_IRQ && traffic);
 +	u32 n, hits;
 +	u64 spent;
 +
 +	__this_cpu_inc(idle_polled_n[kind]);
 +	__this_cpu_add(idle_polled_ns[kind], spent_ns);
-+	__this_cpu_write(idle_poll_block_grow, kind == POLLED_REMOTE);
-+	if (kind == POLLED_TIMEOUT)
++	__this_cpu_write(idle_poll_block_grow, hit);
++	if (kind == POLLED_TIMEOUT && !traffic)
 +		__this_cpu_write(idle_poll_limit_ns, limit / 2);
 +
 +	n = __this_cpu_inc_return(idle_poll_epoch_n);
-+	hits = __this_cpu_read(idle_poll_epoch_hits) + (kind == POLLED_REMOTE);
++	hits = __this_cpu_read(idle_poll_epoch_hits) + hit;
 +	spent = __this_cpu_read(idle_poll_epoch_ns) + spent_ns;
 +	__this_cpu_write(idle_poll_epoch_hits, hits);
 +	__this_cpu_write(idle_poll_epoch_ns, spent);
@@ -156,7 +170,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  	raw_local_irq_enable();
  	if (!current_set_polling_and_test()) {
  		unsigned int count = 0;
-@@ -278,7 +375,13 @@
+@@ -278,7 +381,13 @@
  	/* A waker observing polling sends no IPI. Clear, order, then test
  	 * NEED_RESCHED so work arriving at the deadline also prevents WFI.
  	 */
@@ -171,13 +185,14 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  }
  
  /*
-@@ -301,7 +404,8 @@
+@@ -301,7 +410,9 @@
  	}
  	next_timer = idle_next_timer_ns();
  	if (__this_cpu_read(idle_poll_limit_ns) &&
 -	    !__this_cpu_read(idle_poll_halt_next)) {
 +	    !__this_cpu_read(idle_poll_halt_next) &&
-+	    local_clock_noinstr() >= __this_cpu_read(idle_poll_off_until)) {
++	    (local_clock_noinstr() >= __this_cpu_read(idle_poll_off_until) ||
++	     idle_traffic_recent())) {
  		bool woke = idle_poll(&start);
  
  		__this_cpu_write(idle_poll_halt_next, !woke);
