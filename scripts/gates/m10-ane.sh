@@ -80,29 +80,34 @@ pass "guest booted (${waited}s)"
 grep -q "neural engine service listening" "$LOG" && pass "the host service is listening" || fail "no host service"
 grep -q "INIT ane=port" "$LOG" && pass "init published the device" || fail "init did not publish the device"
 
-echo
-echo "==> An ONNX model in a container (${IMAGE}, --device lighter.sh/ane=all)"
-# The fixtures go in by `docker cp`: the daemon is in the guest, so a bind
-# mount of a Mac path would need a share this machine does not have.
-container="$(docker create --device lighter.sh/ane=all "$IMAGE" sh -c \
-	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1 && python /fixtures/ane-client.py /fixtures/tinycnn-init.onnx 2>&1')"
-# Two models: one with its weights as Constant nodes, one with them as
-# initializers, which is what every exporter produces and what the provider
-# once handed to the fused node as inputs (a YOLO export fell back to the
-# CPU with "the model takes 1 inputs, 197 were sent").
-docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
-if out="$(docker start -a "$container" 2>&1)"; then
-	pass "constants: $(grep RESULT <<<"$out" | head -1)"
-	pass "initializers: $(grep RESULT <<<"$out" | tail -1)"
-else
-	status=$?
-	if [ "$status" -eq 97 ]; then
-		fail "the container could not install onnxruntime (network?)"
+# The provider is built against ONNX Runtime 1.23's API, the first with
+# plugin providers, so it must load there as well as in the newest release.
+for ort in "onnxruntime==1.23.*" "onnxruntime"; do
+	echo
+	echo "==> An ONNX model in a container (${IMAGE}, ${ort}, --device lighter.sh/ane=all)"
+	# The fixtures go in by `docker cp`: the daemon is in the guest, so a bind
+	# mount of a Mac path would need a share this machine does not have.
+	container="$(docker create --device lighter.sh/ane=all "$IMAGE" sh -c \
+		"pip install -q '$ort' numpy >/dev/null 2>&1 || exit 97; python -c 'import onnxruntime; print(\"ORT\", onnxruntime.__version__)'; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1 && python /fixtures/ane-client.py /fixtures/tinycnn-init.onnx 2>&1")"
+	# Two models: one with its weights as Constant nodes, one with them as
+	# initializers, which is what every exporter produces and what the provider
+	# once handed to the fused node as inputs (a YOLO export fell back to the
+	# CPU with "the model takes 1 inputs, 197 were sent").
+	docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
+	if out="$(docker start -a "$container" 2>&1)"; then
+		version="$(awk '/^ORT/{print $2}' <<<"$out")"
+		pass "$version constants: $(grep RESULT <<<"$out" | head -1)"
+		pass "$version initializers: $(grep RESULT <<<"$out" | tail -1)"
 	else
-		fail "the client failed ($status)"; tail -15 <<<"$out" | sed 's/^/    /'
+		status=$?
+		if [ "$status" -eq 97 ]; then
+			fail "the container could not install $ort (network?)"
+		else
+			fail "the client failed on $ort ($status)"; tail -15 <<<"$out" | sed 's/^/    /'
+		fi
 	fi
-fi
-docker rm "$container" >/dev/null 2>&1 || true
+	docker rm "$container" >/dev/null 2>&1 || true
+done
 grep -q "neural engine model loaded" "$LOG" && pass "the host loaded the model" || fail "the host never loaded a model"
 
 echo
