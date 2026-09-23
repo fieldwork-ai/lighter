@@ -8,23 +8,26 @@ out, the short sleep after each grew the window back, and polling was 60
 to 80 ms of every second across four vCPUs, a third of the VMM's CPU for
 the whole stack (20.7% of a core against 13.9% without, on 16 vCPUs).
 
-So only a poll that another CPU ended grows the window (an interrupt
-reaches a CPU in WFI as fast, so a poll one ended bought nothing), a poll
-that timed out halves it, and every `idle.poll_epoch` polls (16) each CPU
+So only a poll that caught its wakeup grows the window, a poll that timed
+out halves it, and every `idle.poll_epoch` polls (16) each CPU
 weighs what it spent spinning against the wakeups it caught: more than
-`idle.poll_cost_ns` (20 us) a catch, or none at all, and it stops polling
+`idle.poll_cost_ns` (50 us) a catch, or none at all, and it stops polling
 for a backoff doubling from 10 ms to `idle.poll_backoff_max_ns` (250 ms).
-A thread pool's handoffs pay every epoch and never back off: the
+A thread pool's handoffs pay every epoch and never back off (at 20 us
+an npm install through the share backed off often enough to lose 8%;
+at 50 or 100 it is back to 0.7.3's, and Frigate cannot tell the three
+apart): the
 cross-vCPU pipe round trip stays at 2.2 us (8.5 us without polling), and
 comes back within about a fifth of a second from a backed-off CPU.
 
-While a container's stream to an accelerator has moved a message in the
-last millisecond (0011's traffic signal), a poll an interrupt ended is a
-catch too, a timeout does not shrink the window, and the backoff does not
-apply: the reply a token loop waits for arrives as an interrupt, and a CPU
-already awake takes it without the host waking a parked thread first.
-Without this, llama.cpp's generation over Metal RPC read 267-273 t/s on
-the M5 against 292-294.
+A catch is a catch whatever ended the poll. A first version counted only
+polls another CPU ended, on the reasoning that an interrupt reaches a CPU
+in WFI as fast; it does not, since a CPU already awake takes it without
+the host waking a parked thread, and that version cost llama.cpp's
+generation over Metal 8% (267-273 t/s against 292-294) and an npm install
+through the share 8 to 10%. While a container's stream to an accelerator
+has moved a message in the last millisecond (0011's traffic signal), a
+timeout does not shrink the window and the backoff does not apply.
 
 `idle.polled` reports, per CPU, how many polls timed out, were ended by
 an interrupt, or by another CPU, and the nanoseconds each kind spent.
@@ -60,7 +63,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
 +static DEFINE_PER_CPU(bool, idle_poll_block_grow);
 +static unsigned int idle_poll_epoch = 16;
 +module_param_named(poll_epoch, idle_poll_epoch, uint, 0644);
-+static unsigned int idle_poll_cost_ns = 20000;
++static unsigned int idle_poll_cost_ns = 50000;
 +module_param_named(poll_cost_ns, idle_poll_cost_ns, uint, 0644);
 +static unsigned int idle_poll_backoff_max_ns = 250 * NSEC_PER_MSEC;
 +module_param_named(poll_backoff_max_ns, idle_poll_backoff_max_ns, uint, 0644);
@@ -82,7 +85,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  	} else if (limit < idle_poll_grow_start_ns) {
  		limit = idle_poll_grow_start_ns;
  	} else {
-@@ -252,14 +282,87 @@
+@@ -252,14 +282,88 @@
  }
  
  /* Returns true if a wakeup arrived while polling, so WFI is not needed. */
@@ -118,12 +121,13 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
 +static void __cpuidle idle_poll_account(unsigned int kind, u64 spent_ns, u64 now)
 +{
 +	u32 limit = __this_cpu_read(idle_poll_limit_ns);
-+	/* While a model is talking, the reply it waits for arrives as an
-+	 * interrupt, and a CPU already awake takes it without the host waking
-+	 * a parked thread first: 8% of a token loop's rate. Then an interrupt
-+	 * is a catch too, and a timeout no reason to shrink. */
++	/* A poll that caught its wakeup paid, whatever ended it: another
++	 * CPU's store saves an IPI, and an interrupt reaches a CPU already
++	 * awake without the host waking a parked thread first, which is what
++	 * a filesystem reply or a model's answer waits on. While a model is
++	 * talking, a timeout is no reason to shrink either. */
 +	bool traffic = idle_traffic_recent();
-+	bool hit = kind == POLLED_REMOTE || (kind == POLLED_IRQ && traffic);
++	bool hit = kind != POLLED_TIMEOUT;
 +	u32 n, hits;
 +	u64 spent;
 +
@@ -170,7 +174,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  	raw_local_irq_enable();
  	if (!current_set_polling_and_test()) {
  		unsigned int count = 0;
-@@ -278,7 +381,13 @@
+@@ -278,7 +382,13 @@
  	/* A waker observing polling sends no IPI. Clear, order, then test
  	 * NEED_RESCHED so work arriving at the deadline also prevents WFI.
  	 */
@@ -185,7 +189,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
  }
  
  /*
-@@ -301,7 +410,9 @@
+@@ -301,7 +411,9 @@
  	}
  	next_timer = idle_next_timer_ns();
  	if (__this_cpu_read(idle_poll_limit_ns) &&

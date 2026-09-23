@@ -53,9 +53,9 @@ Frigate on one camera, detecting on the Neural Engine, cost 20.7% of a core
 on a 16-vCPU guest; it costs 15.4%. A third had been idle polling: each
 vCPU went idle about 300 times a second, most polls timed out, and the
 short sleep after each grew the window back. Guest patch 0039 grows the
-window only on a poll another CPU ended, halves it on a timeout, and every
+window only on a poll that caught its wakeup, halves it on a timeout, and every
 16 polls weighs the spinning against the wakeups it caught, backing off
-from 10 ms to 250 ms while that is more than 20 µs a catch. A thread
+from 10 ms to 250 ms while that is more than 50 µs a catch. A thread
 pool's hand-offs, which polling is for, keep it: the cross-vCPU round trip
 stays at 2.5 µs (8.5 without polling). While a container is talking to
 an accelerator, a poll its reply ends counts as a catch, so llama.cpp over
