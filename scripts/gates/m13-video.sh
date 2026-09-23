@@ -76,6 +76,13 @@ ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1920x1080:rate=30
 	-vf "noise=alls=14:allf=t+u" -c:v libx264 -preset veryfast -b:v 6M -maxrate 6M -bufsize 12M \
 	-pix_fmt yuv420p -g 30 -bf 2 -threads 2 "$LOAD" 2>&1 | sed 's/^/    /' || true
 [ -s "$LOAD" ] && pass "load clip: $(du -k "$LOAD" | cut -f1) KiB, 300 frames" || { fail "no load clip"; exit 1; }
+# And one shaped like a camera's: no B-frames, so nothing is left to reorder
+# when the stream ends and the LAST buffer goes out inside the drain itself.
+# A decoder that then never reports the queue readable hangs ffmpeg forever.
+CAM="$RUN_DIR/cam.mkv"
+ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=20" -t 3 \
+	-c:v libx264 -preset veryfast -pix_fmt yuv420p -g 40 -bf 0 -threads 1 "$CAM" 2>&1 | sed 's/^/    /' || true
+[ -s "$CAM" ] && pass "camera-shaped clip: no B-frames, 60 frames" || { fail "no camera clip"; exit 1; }
 
 echo
 echo "==> Booting the Docker guest with the video decoder"
@@ -109,6 +116,7 @@ echo "==> The decoder, from a container (${IMAGE}, --device lighter.sh/video=all
 container="$(docker create --device lighter.sh/video=all "$IMAGE" sleep infinity)"
 docker cp "$CLIP" "$container:/clip.mkv" >/dev/null
 docker cp "$LOAD" "$container:/load.mkv" >/dev/null
+docker cp "$CAM" "$container:/cam.mkv" >/dev/null
 docker start "$container" >/dev/null
 in_container() { docker exec "$container" bash -c "$1" 2>&1; }
 if ! in_container 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ffmpeg v4l-utils >/dev/null 2>&1' >/dev/null; then
@@ -140,6 +148,13 @@ rm -f /tmp/sw.yuv /tmp/hw.yuv')"
 		pass "every frame matches software decode (worst PSNR ${psnr} dB, floor ${MIN_PSNR})"
 	else
 		fail "frames differ from software decode (worst PSNR ${psnr:-?} dB, floor ${MIN_PSNR})"
+	fi
+
+	cam="$(in_container 'timeout -s KILL 30 ffmpeg -hide_banner -loglevel error -c:v h264_v4l2m2m -i /cam.mkv -f framemd5 /tmp/hw.md5 >/dev/null 2>&1; echo "exit=$?"; grep -vc "^#" /tmp/hw.md5')"
+	if [ "$(head -1 <<<"$cam")" = "exit=0" ] && [ "$(tail -1 <<<"$cam")" = 60 ]; then
+		pass "a stream with nothing to reorder decodes to its end and exits"
+	else
+		fail "the camera-shaped clip did not finish: $(tr '\n' ' ' <<<"$cam")"
 	fi
 
 	# What the Mac pays: the whole VMM's CPU time across each decode. The
