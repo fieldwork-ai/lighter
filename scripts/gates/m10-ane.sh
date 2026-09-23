@@ -19,8 +19,11 @@ cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 PROFILE="${PROFILE:-debug}"
 BIN="target/$PROFILE/examples/lighter-bench"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
-IMAGE="${LIGHTER_GATE_PYTHON_IMAGE:-python:3.12-slim}"
+# 3.11: the newest Python ONNX Runtime 1.16, the oldest the custom op serves,
+# has wheels for, and what Frigate runs.
+IMAGE="${LIGHTER_GATE_PYTHON_IMAGE:-python:3.11-slim}"
 
+diff_ok() { awk -v l="$1" 'BEGIN{ if (!match(l, /max_abs_diff=[^ ]+/)) exit 1; d = substr(l, RSTART + 13, RLENGTH - 13) + 0; exit !(d < 0.01) }'; }
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
 FAILED=0
@@ -80,15 +83,20 @@ pass "guest booted (${waited}s)"
 grep -q "neural engine service listening" "$LOG" && pass "the host service is listening" || fail "no host service"
 grep -q "INIT ane=port" "$LOG" && pass "init published the device" || fail "init did not publish the device"
 
-# The provider is built against ONNX Runtime 1.23's API, the first with
-# plugin providers, so it must load there as well as in the newest release.
-for ort in "onnxruntime==1.23.*" "onnxruntime"; do
+# Two routes into the one library. As a plugin provider it is built against
+# ONNX Runtime 1.23's API, the first with plugin providers; as a custom op it
+# asks for 1.16's, so it must run on 1.16, on 1.22 (what Frigate ships) and on
+# the newest. ONNX Runtime before 1.19 was built against numpy 1.
+for run in "plugin onnxruntime==1.23.*" "plugin onnxruntime" \
+	"op onnxruntime==1.16.* numpy<2" "op onnxruntime==1.22.*" "op onnxruntime"; do
+	set -- $run
+	route=$1; ort=$2; numpy=${3:-numpy}
 	echo
-	echo "==> An ONNX model in a container (${IMAGE}, ${ort}, --device lighter.sh/ane=all)"
+	echo "==> An ONNX model in a container (${IMAGE}, ${ort}, ${route}, --device lighter.sh/ane=all)"
 	# The fixtures go in by `docker cp`: the daemon is in the guest, so a bind
 	# mount of a Mac path would need a share this machine does not have.
-	container="$(docker create --device lighter.sh/ane=all "$IMAGE" sh -c \
-		"pip install -q '$ort' numpy >/dev/null 2>&1 || exit 97; python -c 'import onnxruntime; print(\"ORT\", onnxruntime.__version__)'; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1 && python /fixtures/ane-client.py /fixtures/tinycnn-init.onnx 2>&1")"
+	container="$(docker create --device lighter.sh/ane=all -e ANE_ROUTE="$route" "$IMAGE" sh -c \
+		"pip install -q '$ort' '$numpy' >/dev/null 2>&1 || exit 97; python -c 'import onnxruntime; print(\"ORT\", onnxruntime.__version__)'; python /fixtures/ane-client.py /fixtures/tinycnn.onnx 2>&1 && python /fixtures/ane-client.py /fixtures/tinycnn-init.onnx 2>&1")"
 	# Two models: one with its weights as Constant nodes, one with them as
 	# initializers, which is what every exporter produces and what the provider
 	# once handed to the fused node as inputs (a YOLO export fell back to the
@@ -96,8 +104,12 @@ for ort in "onnxruntime==1.23.*" "onnxruntime"; do
 	docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
 	if out="$(docker start -a "$container" 2>&1)"; then
 		version="$(awk '/^ORT/{print $2}' <<<"$out")"
-		pass "$version constants: $(grep RESULT <<<"$out" | head -1)"
-		pass "$version initializers: $(grep RESULT <<<"$out" | tail -1)"
+		for which in constants initializers; do
+			line="$(grep RESULT <<<"$out" | if [ "$which" = constants ]; then head -1; else tail -1; fi)"
+			# fp16 on the Neural Engine against fp32 on the CPU; the fixture's
+			# outputs are of order 1.
+			if diff_ok "$line"; then pass "$version $route $which: $line"; else fail "$version $route $which disagrees with the CPU: $line"; fi
+		done
 	else
 		status=$?
 		if [ "$status" -eq 97 ]; then
