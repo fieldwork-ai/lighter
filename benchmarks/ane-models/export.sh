@@ -15,6 +15,7 @@ build() { # file, output name, build args...
 # onnx-simplifier has x86-64 wheels only (and does not build here): run the
 # recipe as written, as x86-64 under Rosetta, as for RF-DETR below.
 build yolov9.Dockerfile yolov9-t-320.onnx --platform linux/amd64 --build-arg MODEL_SIZE=t --build-arg IMG_SIZE=320
+build yolov9.Dockerfile yolov9-s-320.onnx --platform linux/amd64 --build-arg MODEL_SIZE=s --build-arg IMG_SIZE=320
 build yolov9.Dockerfile yolov9-s-640.onnx --platform linux/amd64 --build-arg MODEL_SIZE=s --build-arg IMG_SIZE=640
 build yolo11.Dockerfile yolo11n-320.onnx
 # Its dependencies have x86-64 wheels and not arm64 ones (onnxsim builds with
