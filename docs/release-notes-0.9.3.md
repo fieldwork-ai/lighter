@@ -15,5 +15,5 @@ Reading a record costs about nine times a plain `stat` on APFS, so lighter reads
 ## Also
 
 - A container asking the size of an extended attribute before reading it, as `getfattr` does, got "Numerical result out of range": an empty buffer reached macOS as a non-null pointer, which it answers with ERANGE. Fixed, with a test.
-- A container listing a file's extended attributes no longer sees macOS's own (`com.apple.*`, such as the `com.apple.provenance` macOS puts on every file lighter writes). They mean nothing to a Linux program, and once listing worked, `cp -a` copied provenance onto every file it made, which cost the copy-tree benchmark up to a tenth of its time. Asked for by name they are still there.
+- A container listing a file's extended attributes no longer sees macOS's own (`com.apple.*`, such as the `com.apple.provenance` macOS puts on every file lighter writes). They mean nothing to a Linux program, and once listing worked, `cp -a` copied provenance onto every file it made, an extra attribute write per file. Asked for by name they are still there.
 - Linux remains **6.18.52**, with guest patches 0036 to 0042; the data epoch remains **1**.
