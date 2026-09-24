@@ -165,9 +165,9 @@ options.add_provider_for_devices(devices, {})
 session = ort.InferenceSession("model.onnx", options)
 ```
 
-- Ships a custom `no_std` ONNX Runtime Execution Provider (`liblighter_ane_ep.so`) linking no libc.
+- Broad runtime compatibility: Works with stock ONNX Runtime from 1.16+ via Custom Operators, or 1.23+ via Execution Provider, linking no libc.
+- **Frigate & YOLO acceleration**: YOLOv9-t in **3.3 ms** (vs 12.4 ms CPU), YOLOv9-s in **13.0 ms** (vs 110.2 ms CPU, 8.5x faster), and YOLO11n in **4.3 ms**.
 - **ResNet-50 in 2.2 ms** on the Neural Engine (vs 29 ms on container CPU).
-- **Frigate NVR**: YOLO11n object detection runs at **7.6 ms/frame at <1% CPU** (vs 15.1 ms and 36% CPU on container CPU).
 - Automatic tiering: Model loads across Neural Engine, GPU, and CPU paths on first run; fastest candidate is automatically chosen and CoreML compiled models are cached in `coreml-cache`.
 
 ### 4. Hardware video decode and encode (`--device lighter.sh/video=all`)
