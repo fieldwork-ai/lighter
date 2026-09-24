@@ -61,7 +61,7 @@ for spec in "${MODELS[@]}"; do
 		docker cp "$CACHE/$file" "$c:/m/$file" >/dev/null
 		if "$HERE/../scripts/capped.sh" 900 docker start -a "$c" > "$OUT/${file%.onnx}-$route.log" 2>&1 &&
 			docker cp "$c:/m/out.json" "$OUT/${file%.onnx}-$route.json" >/dev/null 2>&1; then
-			echo "$(tail -1 "$OUT/${file%.onnx}-$route.log")  [host: $(placed "$mark")]"
+			echo "$(grep -aE '^(op|plugin) ' "$OUT/${file%.onnx}-$route.log" | tail -1)  [host: $(placed "$mark")]"
 			results+=("$OUT/${file%.onnx}-$route.json")
 		else
 			echo "FAIL $file $route: $(grep -aE 'Error|error' "$OUT/${file%.onnx}-$route.log" | tail -1)"
