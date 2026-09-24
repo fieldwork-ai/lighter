@@ -2,7 +2,7 @@
 
 **The fast, open-source container engine for macOS, with native Apple Silicon GPU, Neural Engine, and PyTorch acceleration.**
 
-<a href="https://getfieldwork.ai">
+<a href="https://fieldwork.ai">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/fieldwork-logo-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/fieldwork-logo-light.svg">
@@ -10,7 +10,7 @@
   </picture>
 </a>
 
-*lighter is an open-source project sponsored by [Fieldwork](https://getfieldwork.ai), providing dedicated engineering time to build and maintain high-performance virtualization and AI infrastructure for Apple Silicon.*
+*lighter is an open-source project sponsored by [Fieldwork](https://fieldwork.ai), providing dedicated engineering time to build and maintain high-performance virtualization and AI infrastructure for Apple Silicon.*
 
 lighter is a high-performance, headless virtual machine monitor built from scratch in Rust on Apple's `Hypervisor.framework`. It boots a custom Linux LTS kernel directly into memory in 50 milliseconds, delivers shared filesystem performance faster than native APFS, and is the **first and only macOS container engine to give Linux containers direct access to Apple Silicon GPU, Metal, Neural Engine, and hardware media encode/decode**.
 
