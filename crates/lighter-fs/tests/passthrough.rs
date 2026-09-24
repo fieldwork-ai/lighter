@@ -2389,3 +2389,31 @@ fn a_record_is_read_only_where_its_directory_is_marked() {
     let config = again.lookup(volume, "config.yml").unwrap();
     assert_eq!(owner_of(&mut again, config), (1000, 1000));
 }
+
+/// macOS's own attributes are left out of a listing, so that `cp -a` does not
+/// copy `com.apple.provenance` onto every file for nothing; by name they are
+/// still there.
+#[test]
+fn macos_attributes_are_not_listed_but_can_be_read() {
+    let mut guest = Guest::new("apple");
+    std::fs::write(guest.host("f"), b"x").unwrap();
+    let path = std::ffi::CString::new(guest.host("f").as_os_str().as_encoded_bytes()).unwrap();
+    lighter_fs::sys::set_xattr(&path, c"com.apple.lighter-test", b"mac", 0).unwrap();
+    lighter_fs::sys::set_xattr(&path, c"user.kept", b"linux", 0).unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+
+    let mut list = 4096u32.to_le_bytes().to_vec();
+    list.extend_from_slice(&0u32.to_le_bytes());
+    let names = guest.call(op::LISTXATTR, nodeid, &list).unwrap();
+    let names: Vec<&[u8]> = names.split(|&b| b == 0).filter(|n| !n.is_empty()).collect();
+    assert!(names.contains(&b"user.kept".as_slice()), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with(b"com.apple.")),
+        "{names:?}"
+    );
+
+    let mut get = 64u32.to_le_bytes().to_vec();
+    get.extend_from_slice(&0u32.to_le_bytes());
+    get.extend_from_slice(&name_body("com.apple.lighter-test"));
+    assert_eq!(guest.call(op::GETXATTR, nodeid, &get).unwrap(), b"mac");
+}
