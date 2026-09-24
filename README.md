@@ -357,10 +357,10 @@ lighter runs an official Longterm Support kernel (`6.18-lighter`) with a minimal
 Kernel releases track upstream Linux LTS point updates, ensuring ongoing security patches and driver fixes without architectural churn.
 
 ### 7. Apple Silicon hardware acceleration with a small idle tax
-OrbStack, Docker Desktop and Colima leave the Mac's GPU and Neural Engine inaccessible from Linux containers; Podman's krunkit reaches the GPU through Vulkan alone, and nothing else reaches the Neural Engine or gives PyTorch its `mps` device.
+OrbStack, Docker Desktop and Colima leave the Mac's GPU, Neural Engine, and hardware media engine inaccessible from Linux containers; Podman's krunkit reaches the GPU through Vulkan alone, and nothing else reaches the Neural Engine, gives PyTorch its `mps` device, or accelerates video encode and decode.
 
 lighter exposes the Apple Silicon compute architecture to containers:
-- **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, and ggml are linked directly into the single `lighter` binary. No background helper processes, no network daemons.
+- **In-process static linking:** `virglrenderer`, `MoltenVK`, ONNX Runtime CoreML, VideoToolbox, and ggml are integrated directly into the single `lighter` binary. No background helper processes, no network daemons.
 - **Minimal idle footprint:** Accelerators initialise strictly on demand. The GPU renderer uses ~10 MB and two threads at boot; the ANE, MPS, and Metal servers cost nothing until invoked. Idle memory sits at 617 MiB (+20 MiB over the same guest without the servers).
 - **Unified memory apertures:** Guest GPU blobs are mapped directly into an 8 GiB host Metal aperture above RAM, eliminating guest memory bloat. Alignment is matched to Apple Silicon's 16 KiB pages.
 - **Message-horizon polling and idle protection:** During active inference streams, lighter dynamically elevates vCPU threads and accelerator workers to `QoS::UserInteractive`. To eliminate round-trip latency without wasting idle CPU, the guest kernel polls for 1 ms following small RPC messages (`qos::Boost`) and automatically backs off when polling does not catch events. Background containers like Frigate NVR run at just 15.4% of a core instead of spinning host CPU.
