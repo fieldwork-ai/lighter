@@ -6,10 +6,12 @@ RUN apt-get update && apt-get install --no-install-recommends -y libgl1 && rm -r
 # imports it without declaring it.
 # albumentations 1.4 changed the classes super-gradients (unmaintained since 2024)
 # registers at import; 1.3.1 is what it was written against.
-RUN pip install -q "jedi>=0.16" requests git+https://github.com/Deci-AI/super-gradients.git "albumentations==1.3.1"
+# PyTorch from super-gradients' own time: 2.8's dynamo exporter makes a graph its
+# NMS surgery rejects ("Cycle detected in graph"), and the NumPy it predates.
+RUN pip install -q "jedi>=0.16" requests git+https://github.com/Deci-AI/super-gradients.git "albumentations==1.3.1" "torch==2.1.2" "torchvision==0.16.2" "numpy<2"
 # What super-gradients asks for when export is called. It names NVIDIA's own index,
 # which no longer resolves (NXDOMAIN); the package is on PyPI now.
-RUN pip install -q onnx_graphsurgeon
+RUN pip install -q onnx_graphsurgeon "numpy<2"
 RUN sed -i 's/sghub\.deci\.ai/d2gjn4b69gu75n.cloudfront.net/g; s/sg-hub-nv\.s3\.amazonaws\.com/d2gjn4b69gu75n.cloudfront.net/g' \
       /usr/local/lib/python3.10/site-packages/super_gradients/training/pretrained_models.py \
       /usr/local/lib/python3.10/site-packages/super_gradients/training/utils/checkpoint_utils.py

@@ -26,6 +26,8 @@ failed=0
 for spec in "${MODELS[@]}"; do
 	set -- $spec
 	file=$1
+	# ONLY=<regex> runs the models whose file matches it.
+	[[ -z "${ONLY:-}" || $file =~ $ONLY ]] || continue
 	[ -s "$CACHE/$file" ] || { echo "skip $file: not exported"; continue; }
 	dir=$(mktemp -d)
 	mkdir "$dir/config"
