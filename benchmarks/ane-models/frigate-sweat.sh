@@ -16,6 +16,9 @@ set -uo pipefail
 IMAGE="${FRIGATE_IMAGE:?}"; CLIP="${CLIP:?}"; MODEL="${MODEL:?}"
 HOME_DIR="${LIGHTER_HOME:?}"
 SETTLE="${SETTLE:-90}"
+# Stats samples per level and the seconds between them, and how many failed
+# levels end the run (one past the first confirms the wall is a wall).
+SAMPLES="${SAMPLES:-3}"; SAMPLE_GAP="${SAMPLE_GAP:-20}"; WALLS="${WALLS:-2}"
 # The model's device (onnx runs on the Neural Engine when the ANE device is
 # passed, NO_ANE=1 keeps it on the container's CPU; zmq:tcp://... is Frigate's
 # Apple Silicon detector on the Mac), and the decode args (-c:v h264 for
@@ -90,9 +93,9 @@ for level in "$@"; do
 	since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 	sleep "$SETTLE"
 	samples=""
-	for i in 1 2 3; do
+	for _ in $(seq 1 "$SAMPLES"); do
 		samples="$samples$(docker exec "$c" curl -s http://127.0.0.1:5000/api/stats)"$'\n'
-		sleep 20
+		sleep "$SAMPLE_GAP"
 	done
 	cpu=$(docker stats --no-stream --format '{{.CPUPerc}}' "$c")
 	host=$(host_cpu)
@@ -120,7 +123,6 @@ PY
 	docker logs --since "$since" "$c" 2>&1 | grep -iE "error|traceback" | grep -v "go2rtc" | tail -3 | sed 's/^/    /'
 	docker rm -f "$c" >/dev/null
 	rm -rf "$dir"
-	# One level past the first that failed, to see the wall is a wall.
 	case "$line" in WALL*) walls=$(( ${walls:-0} + 1 )) ;; esac
-	[ "${walls:-0}" -ge 2 ] && break
+	[ "${walls:-0}" -ge "$WALLS" ] && break
 done
