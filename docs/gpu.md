@@ -61,23 +61,57 @@ whisper.cpp is the second worked example (`examples/whisper-metal`): a Wyoming s
 
 ## The Neural Engine: `--device lighter.sh/ane=all`
 
-A container's ONNX Runtime loads lighter's plugin execution provider, `/usr/lib/lighter/liblighter_ane_ep.so`, which claims the model's graph, serialises it and sends it to the host, where ONNX Runtime's CoreML provider runs it. The provider links no libc, so the one file loads in any image, and it is built against ONNX Runtime 1.23's API, the first with plugin providers, so any ONNX Runtime from 1.23 on loads it (it presents the Neural Engine as a CPU-type device, since naming a device of its own needs 1.25).
+A container's ONNX Runtime loads lighter's library, `/usr/lib/lighter/liblighter_ane_ep.so`, which sends the model to the host, where ONNX Runtime's CoreML provider runs it. The library links no libc, so the one file loads in any image, and ONNX Runtime can load it two ways:
+
+- **As a custom operator, from ONNX Runtime 1.16.** `lighter_ane_wrap` turns a model into one node, `lighter.ane:Model`, carrying the original, and `register_custom_ops_library` registers the op; the whole model runs on the host. This is the route for an image whose ONNX Runtime predates plugin providers (Frigate ships 1.22). The library asks for 1.16's C API on this route, and a test reads the source to hold every call inside that table.
+- **As a plugin execution provider, from ONNX Runtime 1.23**, the first with plugin providers. It claims the graph's nodes and leaves any with subgraphs (`If`, `Loop`) to the container's CPU provider. It presents the Neural Engine as a CPU-type device, since naming a device of its own needs 1.25.
+
+Both reach the same host service and cost the same: YOLO11n at 320 px ran at 2.1 ms either way on ONNX Runtime 1.23 in a container on an M5, against 6.3 ms on the container's CPU.
 
 **Where a model runs.** The device is ONNX to CoreML, and CoreML covers the Mac's GPU and CPU as well as the Neural Engine, so the host loads a model three ways and the first run decides: the `NeuralNetwork` format with every compute unit, which is what reaches the Neural Engine; `MLProgram` with the CPU and GPU, for a graph the Neural Engine will not take whole; and ONNX Runtime's own CPU as the floor. Each is timed on the run's real inputs after a warm-up, the fastest is kept, and the choice is a line in the machine log with the three numbers. `LIGHTER_ANE_UNITS=ane|gpu|cpu` pins one. CoreML's compiled models are cached in `coreml-cache` under the lighter home, so a model, or a shape of it, compiles once. On an M1, against the container's own CPU provider: ResNet-50 29 → 2.2 ms (the Neural Engine), MiniLM-L6 at 128 tokens 10.8 → 6.3 ms (the GPU; the Neural Engine took the graph in pieces at 23 ms), Piper's voice model no faster (its graph crashes CoreML's Neural Engine path, fails on the GPU path, and runs on the host's CPU, which the log says). The first load of a model pays the compiles, 4 s for ResNet-50 and 21 s for MiniLM; after that the cache.
 
 **A process of its own.** Apple's frameworks crash on some graphs: Piper's voice model took a machine down through a segfault in a CoreML convolution kernel. So the service runs as a child of `lighter start`, the same binary with a hidden `ane-host` subcommand, on a loopback port the parent chose and the guest was told. When it dies it is started again on that port; the container's request fails once and its ONNX Runtime falls back to the CPU provider for that run. The runner writes a marker for the candidate it is about to run for the first time and removes it after, so a model that crashed one candidate skips it at the next load. The PyTorch device is arranged the same way; the ggml server stays in-process, which `gpu.md`'s Metal section says.
 
-The worked example is Frigate (`examples/frigate-ane`): a forty-line detector plugin and a derived image with a newer ONNX Runtime, and YOLO11n runs at 7.6–7.9 ms a frame on the Neural Engine with the detector process at under one percent CPU, against 15.1 ms and 36% for Frigate's own CPU detector on the same clip, on an M1.
+The worked example is Frigate (`examples/frigate-ane`): Frigate's own image with one detector plugin added, which runs the model through the custom op on the ONNX Runtime Frigate ships. `benchmarks/ane-models.sh` runs every model type that detector takes through Frigate's own pipeline, exported with Frigate's documented recipes, and holds each confident detection to the container's CPU. On an M1, milliseconds a detection including Frigate's pre- and post-processing, the custom op on ONNX Runtime 1.22 (the plugin provider on 1.23 is within 0.3 ms of it on every model):
+
+| Model | Container CPU | lighter | Where the host ran it |
+|---|---:|---:|---|
+| YOLOv9-t, 320 | 12.4 | 3.3 | Neural Engine |
+| YOLOv9-s, 640 | 110.2 | 13.0 | Neural Engine |
+| YOLO11n, 320 | 10.9 | 4.3 | Neural Engine |
+| YOLOX-tiny, 416 | 31.3 | 12.1 | Neural Engine |
+| YOLO-NAS-S, 320 | 32.0 | 6.6 | Neural Engine |
+| RF-DETR Nano, 320 | 82.3 | 38.3 | GPU |
+| D-FINE-S, 640 | 119.9 | 120.4 | the host's CPU: CoreML refuses it, so no faster |
+
+Every confident detection matched the CPU's on both routes (`benchmarks/results/ane-models-m1.txt`).
+
+**When CoreML fails a run.** A CoreML partition can fail on one input and run the next: YOLO-NAS carries its own NMS, and on a frame with nothing in it the NMS leaves an empty tensor its CoreML partition will not take. The host keeps the CPU candidate loaded when another unit wins and answers any run the winner fails from it (logged once), and a candidate that fails on the first run's input races again on the next runs', so a detector warmed up on a blank frame still reaches the Neural Engine.
 
 ```python
-import onnxruntime as ort
-ort.register_execution_provider_library("lighter", "/usr/lib/lighter/liblighter_ane_ep.so")
+import ctypes, onnxruntime as ort
+LIB = "/usr/lib/lighter/liblighter_ane_ep.so"
+
+# Any ONNX Runtime from 1.16: the custom op.
+lib = ctypes.CDLL(LIB)
+lib.lighter_ane_wrap.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)), ctypes.POINTER(ctypes.c_size_t)]
+lib.lighter_ane_free.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+model = open("model.onnx", "rb").read()
+out, n = ctypes.POINTER(ctypes.c_uint8)(), ctypes.c_size_t()
+assert lib.lighter_ane_wrap(model, len(model), ctypes.byref(out), ctypes.byref(n)) == 0  # -2: external weights
+wrapped = ctypes.string_at(out, n.value); lib.lighter_ane_free(out, n.value)
+options = ort.SessionOptions(); options.register_custom_ops_library(LIB)
+session = ort.InferenceSession(wrapped, options, providers=["CPUExecutionProvider"])
+
+# ONNX Runtime 1.23 on: the plugin execution provider.
+ort.register_execution_provider_library("lighter", LIB)
 devices = [d for d in ort.get_ep_devices() if d.ep_name == "LighterANE"]
 options = ort.SessionOptions(); options.add_provider_for_devices(devices, {})
 session = ort.InferenceSession("model.onnx", options)
 ```
 
-The model crosses at the first run, when its input shapes are known: the Neural Engine takes only bound shapes, so the provider binds the model's inputs to that run's dims (and rebinds if they change). Nodes with subgraphs (`If`, `Loop`) stay on the container's CPU provider. ResNet-50 on an M1: 1.76 ms an inference on the Neural Engine, against 30 ms on the CPU and 7.9 ms on the GPU through CoreML.
+The model crosses at the first run, when its input shapes are known: the Neural Engine takes only bound shapes, so the library binds the model's inputs to that run's dims (and rebinds if they change). On the custom-op route a model whose weights are kept in files beside it (ONNX external data) cannot cross, since the host cannot see those files, and `lighter_ane_wrap` refuses it with -2; the plugin provider sends the weights ONNX Runtime has already read, so it takes such a model. ResNet-50 on an M1: 1.76 ms an inference on the Neural Engine, against 30 ms on the CPU and 7.9 ms on the GPU through CoreML.
 
 **How it is built.** `host/ane/build.sh` builds ONNX Runtime with the CoreML provider as static archives into `host/out/ort`; `guest/ane-ep/build.sh` builds the provider. The host service is a loopback TCP port the container reaches through the streams (`lighter.ane=<port>` on the kernel command line, `LIGHTER_ANE` in the container); ONNX Runtime is loaded on the host at the first model, not at boot.
 
