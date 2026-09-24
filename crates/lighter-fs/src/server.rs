@@ -4688,28 +4688,22 @@ impl Server {
         let size = get_u32(body, 0).ok_or(linux::EINVAL)? as usize;
         let inode = self.inode(nodeid)?;
         let path = self.path(&inode)?;
-        // `cp -a` lists every file it copies, so a share with nothing of ours
-        // on it keeps the one-syscall answer.
-        if !self.ownership.load(Ordering::Relaxed) {
-            if size == 0 {
-                let len = sys::list_xattr(&path, &mut [])?;
-                return Ok(size_reply(len));
-            }
-            let mut buf = vec![0u8; size];
-            let len = sys::list_xattr(&path, &mut buf)?;
-            buf.truncate(len);
-            return Ok(buf);
-        }
         // Read whole and filtered, so that the size the guest is told is the
-        // size of what it will get: our own names are not its to see.
-        let len = sys::list_xattr(&path, &mut [])?;
-        let mut all = vec![0u8; len];
-        let len = sys::list_xattr(&path, &mut all)?;
+        // size of what it will get. One syscall for almost every file: `cp -a`
+        // lists each one it copies.
+        let mut all = vec![0u8; 4096];
+        let len = match sys::list_xattr(&path, &mut all) {
+            Err(errno) if errno == linux::ERANGE => {
+                all = vec![0u8; sys::list_xattr(&path, &mut [])?];
+                sys::list_xattr(&path, &mut all)?
+            }
+            other => other?,
+        };
         all.truncate(len);
         let mut names = Vec::with_capacity(all.len());
         for name in all.split_inclusive(|&b| b == 0) {
             let bare = name.strip_suffix(&[0]).unwrap_or(name);
-            if !crate::ownership::is_ours(bare) {
+            if !is_hidden_from_listing(bare) {
                 names.extend_from_slice(name);
             }
         }
@@ -4745,6 +4739,16 @@ impl Server {
 /// attribute someone actually set still works.
 fn is_linux_only_namespace(name: &[u8]) -> bool {
     name.starts_with(b"security.") || name.starts_with(b"system.posix_acl_")
+}
+
+/// Whether a container's listing leaves an attribute out: our own, and the
+/// ones macOS keeps for itself (`com.apple.provenance` is on every file this
+/// process writes). Neither means anything to a Linux program, and listing
+/// them turned every file `cp -a` copied into a read of the attribute and a
+/// write of it onto the copy, for nothing. Asked for by name, macOS's are
+/// still served.
+fn is_hidden_from_listing(name: &[u8]) -> bool {
+    crate::ownership::is_ours(name) || name.starts_with(b"com.apple.")
 }
 
 /// Mixes a device and inode number into one that cannot collide with either.
