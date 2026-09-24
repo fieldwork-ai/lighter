@@ -1,10 +1,10 @@
 # Frigate on the Mac's Neural Engine
 
 Frigate's object detector, running on the Mac's Neural Engine through
-`lighter.sh/ane`. Frigate 0.18 ships ONNX Runtime 1.18, which predates the
-plugin provider API, so the image is derived: the runtime upgraded and one
-detector plugin added (`lighter_ane.py`, forty lines; everything else is
-Frigate's own ONNX detector).
+`lighter.sh/ane`. The image is Frigate's own with one detector plugin added
+(`lighter_ane.py`; everything else is Frigate's own ONNX detector). It runs the
+model through lighter's library as an ONNX Runtime custom op, so Frigate's
+ONNX Runtime stays as it ships (1.18 in Frigate 0.18); lighter 0.9.2 or newer.
 
 ```bash
 docker build -t frigate-ane .

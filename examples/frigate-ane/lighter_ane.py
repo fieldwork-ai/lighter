@@ -1,11 +1,13 @@
 """Frigate detector: an ONNX model on the Mac's Neural Engine through lighter.
 
-Runs the model with ONNX Runtime's plugin execution provider that lighter
-ships into containers started with `--device lighter.sh/ane=all`. Everything
-else is Frigate's own ONNX detector: the same model types, the same
-post-processing.
+Runs the model through the library lighter places in containers started with
+`--device lighter.sh/ane=all`, as an ONNX Runtime custom op: the library wraps
+the model into one node that runs it on the Neural Engine, which works with the
+ONNX Runtime Frigate already ships. Everything else is Frigate's own ONNX
+detector: the same model types, the same post-processing.
 """
 
+import ctypes
 import logging
 import os
 from typing import Literal
@@ -31,8 +33,8 @@ class LighterANEDetectorConfig(BaseDetectorConfig):
     type: Literal[DETECTOR_KEY]
     library: str = Field(
         default=os.environ.get("LIGHTER_ANE_EP", "/usr/lib/lighter/liblighter_ane_ep.so"),
-        title="Provider library",
-        description="lighter's ONNX Runtime plugin provider, placed in the container by the device.",
+        title="Neural Engine library",
+        description="lighter's Neural Engine library, placed in the container by the device.",
     )
 
 
@@ -43,16 +45,29 @@ class LighterANEDetector(DetectionApi):
     def __init__(self, detector_config: LighterANEDetectorConfig):
         super().__init__(detector_config)
         path = detector_config.model.path
-        ort.register_execution_provider_library("lighter", detector_config.library)
-        devices = [d for d in ort.get_ep_devices() if d.ep_name == "LighterANE"]
-        if not devices:
+        if not os.path.exists(detector_config.library):
             raise RuntimeError(
-                "no Neural Engine device: start the container with --device lighter.sh/ane=all"
+                "no Neural Engine library: start the container with --device lighter.sh/ane=all"
             )
+        lib = ctypes.CDLL(detector_config.library)
+        lib.lighter_ane_wrap.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        lib.lighter_ane_free.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+        with open(path, "rb") as f:
+            model = f.read()
+        out, size = ctypes.POINTER(ctypes.c_uint8)(), ctypes.c_size_t()
+        if lib.lighter_ane_wrap(model, len(model), ctypes.byref(out), ctypes.byref(size)):
+            raise RuntimeError(f"{path} is not an ONNX model lighter can run")
+        wrapped = ctypes.string_at(out, size.value)
+        lib.lighter_ane_free(out, size.value)
         options = ort.SessionOptions()
         options.log_severity_level = 3
-        options.add_provider_for_devices(devices, {})
-        session = ort.InferenceSession(path, options)
+        options.register_custom_ops_library(detector_config.library)
+        session = ort.InferenceSession(wrapped, options, providers=["CPUExecutionProvider"])
         self.runner = ONNXModelRunner(session, detector_config.model.model_type)
         self.onnx_model_type = detector_config.model.model_type
         self.onnx_model_px = detector_config.model.input_pixel_format
