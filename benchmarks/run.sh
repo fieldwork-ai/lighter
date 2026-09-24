@@ -150,6 +150,7 @@ fi
 VMM_PID=""
 HELPER_PID=""
 ROOTFS=""
+ROOTFS_DIR=""
 RUN_DIR=""
 CASE_OUT=""
 FAILED=0
@@ -186,7 +187,7 @@ cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	[ "$KEEP" -eq 1 ] || rm -rf "$WORK"
 	[ -z "$RUN_DIR" ] || rm -rf "$RUN_DIR"
-	[ -z "$ROOTFS" ] || rm -f "$ROOTFS"
+	[ -z "$ROOTFS_DIR" ] || rm -rf "$ROOTFS_DIR"
 	[ -z "$CASE_OUT" ] || rm -f "$CASE_OUT"
 }
 trap cleanup EXIT
@@ -506,7 +507,8 @@ setup_lighter() {
 	# driver, another gate — corrupts both. clonefile makes the copy free.
 	ROOTFS_MASTER="${LIGHTER_BENCH_GUEST_DIR:-guest/out}/rootfs.ext4"
 	[ -f "$ROOTFS_MASTER" ] || ./guest/rootfs/build.sh
-	ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+	ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+	ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 	cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 	# Release, because a debug VMM is measuring the compiler.
 	if [ -z "${LIGHTER_BENCH_BIN:-}" ]; then
