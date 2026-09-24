@@ -374,7 +374,7 @@ lighter exposes the Apple Silicon compute architecture to containers:
 - **x86-64 containers under Rosetta:** Run `linux/amd64` images on Apple Silicon with near-native performance via Apple Rosetta (`lighter rosetta --install`). See [x86-64 architecture and performance](docs/x86-64.md).
 - **Local Kubernetes with kind:** Spin up single-node and multi-node arm64 Kubernetes clusters with standard `kind`, `kubectl`, and `helm` commands without control-plane overhead when idle. See the [Kubernetes guide](docs/kubernetes.md).
 - **Bidirectional port forwarding & IPv6:** Published ports (`-p 8080:80` or `-p 127.0.0.1:8080:80`) bind directly on the Mac. Full IPv6 routing is supported whenever the host network supports it.
-- **Native file sharing:** Mount host directories into containers with automatic UID/GID ownership translation and real-time cache synchronization.
+- **Native file sharing and ownership:** Mount host directories into containers with real-time cache synchronization and full support for container `chown` and unprivileged users (e.g. Postgres, MySQL, Frigate) via Docker-compatible xattr ownership tracking.
 - **Headless background operation:** Runs as a lean terminal daemon or background `launchd` service with zero menu bar clutter and virtually zero idle CPU usage (~0.2%).
 
 ---
