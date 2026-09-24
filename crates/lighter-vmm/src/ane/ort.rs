@@ -252,6 +252,7 @@ impl Runtime {
     pub fn load(&self, model: &[u8]) -> Result<Session, String> {
         let api = self.api;
         let mut made: Vec<(Units, *mut sys::OrtSession)> = Vec::new();
+        let mut refused = Vec::new();
         let mut last_err = String::new();
         let markers = self
             .markers
@@ -266,12 +267,14 @@ impl Runtime {
                     "neural engine: candidate crashed on this model before; skipped"
                 );
                 last_err = format!("{} crashed on this model before", units.label());
+                refused.push(format!("{}: crashed before", units.label()));
                 continue;
             }
             match self.create(model, units) {
                 Ok(session) => made.push((units, session)),
                 Err(e) => {
                     tracing::debug!(units = units.label(), %e, "neural engine: candidate refused");
+                    refused.push(format!("{}: refused", units.label()));
                     last_err = e;
                 }
             }
@@ -280,6 +283,13 @@ impl Runtime {
             return Err(last_err);
         };
         let pending = made[1..].to_vec();
+        // With one candidate there is no race at the first run, so the
+        // placement is logged here, or a model CoreML will not take would
+        // leave no line saying where it runs.
+        if pending.is_empty() {
+            refused.push(format!("{}: the only one", units.label()));
+            tracing::info!(chosen = units.label(), candidates = %refused.join(", "), "neural engine model placed");
+        }
         let markers = markers.map(|(dir, hash)| Markers { dir, hash });
         let mut allocator: *mut sys::OrtAllocator = ptr::null_mut();
         check!(
