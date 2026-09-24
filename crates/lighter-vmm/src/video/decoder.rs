@@ -47,7 +47,10 @@ const NV12: u32 = PixelFormat::from_fourcc(b"NV12").to_u32();
 const P010: u32 = PixelFormat::from_fourcc(b"P010").to_u32();
 
 /// Room for one access unit of input: a 4K keyframe at a high bitrate is
-/// a couple of megabytes.
+/// a couple of megabytes. What a guest that names no size gets, and the
+/// most one may ask for: every OUTPUT buffer is mapped through the
+/// aperture, and ffmpeg's sixteen of these at 4 MiB each filled it at
+/// thirteen cameras when each needed a few hundred kilobytes.
 const INPUT_SIZE: u32 = 4 << 20;
 /// Before the stream has said, and what an ffmpeg that never sets a size
 /// gets: any real stream then changes it with a source-change event.
@@ -452,6 +455,8 @@ pub struct Session {
     /// What the CAPTURE queue is formatted for. Follows the stream unless
     /// the guest set something larger.
     coded_size: (u32, u32),
+    /// The size of an OUTPUT buffer: the guest's, within bounds.
+    input_size: u32,
     stream: StreamParams,
     /// CAPTURE buffers the guest has queued, ready for a frame.
     available: VecDeque<Available>,
@@ -487,6 +492,7 @@ impl Session {
             capture_fourcc: NV12,
             sink: Arc::new(Mutex::new(VecDeque::new())),
             coded_size: DEFAULT_CODED_SIZE,
+            input_size: INPUT_SIZE,
             stream: StreamParams {
                 min_output_buffers: MIN_OUTPUT_BUFFERS,
                 coded_size: DEFAULT_CODED_SIZE,
@@ -741,7 +747,7 @@ impl Session {
             Default::default();
         plane_fmt[0] = bindings::v4l2_plane_pix_format {
             bytesperline: 0,
-            sizeimage: INPUT_SIZE,
+            sizeimage: self.input_size,
             reserved: Default::default(),
         };
         bindings::v4l2_pix_format_mplane {
@@ -752,6 +758,16 @@ impl Session {
             num_planes: 1,
             ..format_filler()
         }
+    }
+}
+
+/// An OUTPUT buffer the size the guest asked for, which knows its stream
+/// (ffmpeg asks for three quarters of a frame): at least a page, at most
+/// `INPUT_SIZE`, and `INPUT_SIZE` when it asked for nothing.
+fn input_size(asked: u32) -> u32 {
+    match asked {
+        0 => INPUT_SIZE,
+        n => n.clamp(HOST_PAGE as u32, INPUT_SIZE),
     }
 }
 
@@ -1015,6 +1031,7 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
                 if Codec::from_fourcc(asked.pixelformat).is_some() {
                     f.pixelformat = asked.pixelformat;
                 }
+                f.plane_fmt[0].sizeimage = input_size(asked.plane_fmt[0].sizeimage);
                 f
             }
             QueueDirection::Capture => {
@@ -1070,6 +1087,7 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
                     tracing::debug!(?codec, "video session codec");
                     *session = Session::new(codec);
                 }
+                session.input_size = input_size(pix_mp.plane_fmt[0].sizeimage);
             }
         }
     }
@@ -1078,6 +1096,39 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_output_buffer_is_the_size_the_guest_asked_for_within_bounds() {
+        let d = VideoToolboxDecoder::new();
+        let mut s = Session::new(Codec::Hevc);
+        let size = |s: &Session| {
+            let f = s.current_format(QueueDirection::Output);
+            let f: &bindings::v4l2_pix_format_mplane = f.as_ref();
+            f.plane_fmt[0].sizeimage
+        };
+        assert_eq!(size(&s), INPUT_SIZE);
+        let set = |d: &VideoToolboxDecoder, s: &mut Session, fourcc: u32, sizeimage: u32| {
+            let mut asked = s.output_format();
+            asked.pixelformat = fourcc;
+            asked.plane_fmt[0].sizeimage = sizeimage;
+            let f = d.adjust_format(
+                s,
+                QueueDirection::Output,
+                V4l2MplaneFormat::from((QueueDirection::Output, asked)),
+            );
+            d.apply_format(s, QueueDirection::Output, &f);
+        };
+        // ffmpeg's ask for 896x512, made with the codec switch that resets
+        // the session: the size survives it.
+        set(&d, &mut s, H264, 344_192);
+        assert_eq!((s.codec, size(&s)), (Codec::H264, 344_192));
+        set(&d, &mut s, H264, 1);
+        assert_eq!(size(&s), HOST_PAGE as u32);
+        set(&d, &mut s, H264, u32::MAX);
+        assert_eq!(size(&s), INPUT_SIZE);
+        set(&d, &mut s, H264, 0);
+        assert_eq!(size(&s), INPUT_SIZE);
+    }
 
     #[test]
     fn a_capture_format_is_held_to_the_sizes_offered() {
