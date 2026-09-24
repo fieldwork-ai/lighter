@@ -185,6 +185,11 @@ pub struct Inode {
     /// inode: its own create or writes, or — for a directory — the naming
     /// operations inside it. A barrier waits to here and no further.
     settle_seq: AtomicU64,
+    /// Who a container says owns this file ([`crate::ownership`]), read at
+    /// most once while the share records owners at all.
+    owner: Mutex<crate::ownership::Owner>,
+    /// For a directory: whether anything directly inside it may have one.
+    mark: Mutex<crate::ownership::Mark>,
     /// Our own nodeid, once the registry has issued it: what a queued job
     /// names to be ordered against the other jobs on this inode.
     id: AtomicU64,
@@ -345,6 +350,8 @@ impl Inode {
             gone_count: AtomicUsize::new(0),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
+            owner: Mutex::new(crate::ownership::Owner::Unknown),
+            mark: Mutex::new(crate::ownership::Mark::Unknown),
             id: AtomicU64::new(0),
             extra_links: AtomicU32::new(0),
             attr_pending: AtomicU32::new(0),
@@ -389,6 +396,8 @@ impl Inode {
             gone_count: AtomicUsize::new(0),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
+            owner: Mutex::new(crate::ownership::Owner::Unknown),
+            mark: Mutex::new(crate::ownership::Mark::Unknown),
             id: AtomicU64::new(0),
             extra_links: AtomicU32::new(0),
             attr_pending: AtomicU32::new(0),
@@ -765,6 +774,22 @@ impl Inode {
 
     pub fn settle_seq(&self) -> u64 {
         self.settle_seq.load(Ordering::Relaxed)
+    }
+
+    pub fn owner(&self) -> crate::ownership::Owner {
+        *self.owner.lock().expect("owner poisoned")
+    }
+
+    pub fn set_owner(&self, owner: crate::ownership::Owner) {
+        *self.owner.lock().expect("owner poisoned") = owner;
+    }
+
+    pub fn mark(&self) -> crate::ownership::Mark {
+        *self.mark.lock().expect("mark poisoned")
+    }
+
+    pub fn set_mark(&self, mark: crate::ownership::Mark) {
+        *self.mark.lock().expect("mark poisoned") = mark;
     }
 
     /// A queued operation will change this inode's metadata when it applies.

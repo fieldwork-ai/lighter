@@ -316,6 +316,12 @@ impl crate::fsevents::Observer for Invalidator {
         if let Some((dev, ino)) = Invalidator::identity(path) {
             self.policy.touched(dev, ino);
             if let Some(nodeid) = self.registry.nodeid_for(dev, ino) {
+                // An ownership record set or cleared on the Mac is a change
+                // like any other; the owner is read again when next asked.
+                if let Some(inode) = self.registry.get(nodeid) {
+                    inode.set_owner(crate::ownership::Owner::Unknown);
+                    inode.set_mark(crate::ownership::Mark::Unknown);
+                }
                 self.sink
                     .push(crate::notify::Notification::Inode { nodeid });
             }

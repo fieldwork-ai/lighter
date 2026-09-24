@@ -23,12 +23,12 @@
 //! direction — host user to guest root, and back — and everything else passes
 //! through unchanged so that a genuinely foreign uid still looks foreign.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::cache::{Answer, Invalidator, Policy, Timings};
 use crate::errno::linux;
@@ -547,6 +547,9 @@ pub struct Server {
     /// Whether extended attributes are served at all (`LIGHTER_FS_XATTR=0`
     /// disclaims them, see `dispatch`).
     xattrs: bool,
+    /// Whether anything on this share has a container owner recorded
+    /// ([`crate::ownership`]). Until it does, no reply reads a record.
+    ownership: AtomicBool,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -748,6 +751,13 @@ impl Server {
                 .ok()
                 .map(|n| n.into_bytes()),
             xattrs: std::env::var("LIGHTER_FS_XATTR").as_deref() != Ok("0"),
+            ownership: AtomicBool::new(
+                std::ffi::CString::new(root.as_os_str().as_encoded_bytes())
+                    .ok()
+                    .is_some_and(|root| {
+                        sys::get_xattr(&root, crate::ownership::MARKER, &mut []).is_ok()
+                    }),
+            ),
             settler_stop,
             settler: std::sync::Mutex::new(Some(settler)),
             _watcher: watcher,
@@ -959,9 +969,9 @@ impl Server {
             op::GETATTR => self.getattr(nodeid, body),
             op::SETATTR => self.setattr(nodeid, body),
             op::READLINK => self.readlink(nodeid),
-            op::SYMLINK => self.symlink(nodeid, body),
-            op::MKNOD => self.mknod(nodeid, body),
-            op::MKDIR => self.mkdir(nodeid, body),
+            op::SYMLINK => self.symlink(nodeid, body, (header.uid, header.gid)),
+            op::MKNOD => self.mknod(nodeid, body, (header.uid, header.gid)),
+            op::MKDIR => self.mkdir(nodeid, body, (header.uid, header.gid)),
             op::UNLINK => self.unlink(nodeid, body, false),
             op::RMDIR => self.unlink(nodeid, body, true),
             op::RENAME => self.rename(nodeid, body, false),
@@ -973,7 +983,7 @@ impl Server {
             // buys and what it costs.
             op::OPEN | op::OPENDIR => Err(linux::ENOSYS),
 
-            op::CREATE => self.create(nodeid, body),
+            op::CREATE => self.create(nodeid, body, (header.uid, header.gid)),
             op::LIGHTER_CLONE => self.clone_over(header.nodeid, body),
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
@@ -1655,6 +1665,11 @@ impl Server {
                 attr = self.attr(&self.stat_inode(nodeid, &inode)?);
             }
         }
+        if self.ownership.load(Ordering::Relaxed)
+            && let Some(inode) = self.registry.get(nodeid)
+        {
+            self.own(&inode, Some(parent), &mut attr);
+        }
         Ok(EntryOut {
             nodeid,
             generation: 0,
@@ -1719,13 +1734,199 @@ impl Server {
         if gid == self.host_gid { 0 } else { gid }
     }
 
-    /// Guest uid to the one a syscall should use.
-    fn to_host_uid(&self, uid: u32) -> u32 {
-        if uid == 0 { self.host_uid } else { uid }
+    /// The owner a container recorded for this inode, if any
+    /// ([`crate::ownership`]). One atomic load on a share with no records,
+    /// and no read for a file whose directory has no owned entries.
+    ///
+    /// `parent` is the directory the inode was just reached through, where
+    /// the caller has it: a first lookup replies before the inode's place is
+    /// set. Otherwise the place is used, and with neither the record is read.
+    fn recorded_owner(&self, inode: &Inode, parent: Option<&Inode>) -> Option<(u32, u32)> {
+        use crate::ownership::Owner;
+        if !self.ownership.load(Ordering::Relaxed) {
+            return None;
+        }
+        let owner = match inode.owner() {
+            // A pending inode has no host file to read yet. Only a root
+            // caller's create is ever acknowledged ahead of the host (see
+            // `recording_creator`), so it has no record to read either.
+            Owner::Unknown if inode.is_pending() => return None,
+            Owner::Unknown => {
+                let unmarked = match parent {
+                    Some(parent) => !self.may_hold_owned(parent),
+                    None => inode
+                        .place()
+                        .is_some_and(|(parent, _)| !self.may_hold_owned(&parent)),
+                };
+                let owner = if unmarked {
+                    Owner::Mac
+                } else {
+                    self.read_owner(inode)?
+                };
+                inode.set_owner(owner);
+                owner
+            }
+            known => known,
+        };
+        owner.recorded()
     }
 
-    fn to_host_gid(&self, gid: u32) -> u32 {
-        if gid == 0 { self.host_gid } else { gid }
+    /// Whether anything directly inside a directory may have a record: its
+    /// [`crate::ownership::MARKER`], read once. Unreadable reads as marked,
+    /// so a directory that cannot be asked costs a read rather than an owner.
+    fn may_hold_owned(&self, dir: &Inode) -> bool {
+        use crate::ownership::{MARKER, Mark};
+        match dir.mark() {
+            Mark::Marked => return true,
+            Mark::Unmarked => return false,
+            Mark::Unknown => {}
+        }
+        if dir.is_pending() {
+            // Made by a root caller and not on the host yet: nothing in it
+            // has been given an owner (that takes a synchronous create).
+            return false;
+        }
+        let Ok(path) = self.path(dir) else {
+            return true;
+        };
+        let mark = match sys::get_xattr(&path, MARKER, &mut []) {
+            Ok(_) => Mark::Marked,
+            Err(errno) if errno == linux::ENODATA => Mark::Unmarked,
+            Err(_) => return true,
+        };
+        dir.set_mark(mark);
+        mark == Mark::Marked
+    }
+
+    /// `None` if the file cannot be reached right now, which is not the
+    /// same as having no record and so is not remembered.
+    fn read_owner(&self, inode: &Inode) -> Option<crate::ownership::Owner> {
+        use crate::ownership::{Owner, RECORD, parse};
+        let path = self.path(inode).ok()?;
+        let mut record = [0u8; 128];
+        Some(match sys::get_xattr(&path, RECORD, &mut record) {
+            Ok(len) => parse(&record[..len]).map_or(Owner::Mac, |(uid, gid)| Owner::Set(uid, gid)),
+            Err(errno) if errno == linux::ENODATA || errno == linux::ERANGE => Owner::Mac,
+            Err(_) => return None,
+        })
+    }
+
+    /// A recorded owner laid over what the host stat says.
+    fn own(&self, inode: &Inode, parent: Option<&Inode>, attr: &mut Attr) {
+        if let Some((uid, gid)) = self.recorded_owner(inode, parent) {
+            attr.uid = uid;
+            attr.gid = gid;
+        }
+    }
+
+    /// Records a container's owner for a file, or clears the record when the
+    /// owner is root again, which the Mac user already appears as. The file's
+    /// directory is marked, so that the record is looked for.
+    fn record_owner(
+        &self,
+        inode: &Inode,
+        parent: Option<&Inode>,
+        path: &CStr,
+        (uid, gid): (u32, u32),
+        mode: u32,
+    ) -> Result<(), i32> {
+        use crate::ownership::{MARKER, Mark, Owner, RECORD, encode};
+        if (uid, gid) == (0, 0) {
+            match sys::remove_xattr(path, RECORD) {
+                Err(errno) if errno != linux::ENODATA => return Err(errno),
+                _ => {}
+            }
+            inode.set_owner(Owner::Mac);
+            return Ok(());
+        }
+        self.records_owners();
+        let place = if parent.is_none() {
+            inode.place()
+        } else {
+            None
+        };
+        let parent = parent.or(place.as_ref().map(|(parent, _)| &**parent));
+        if let Some(parent) = parent
+            && parent.mark() != Mark::Marked
+        {
+            // Before the record: a record in an unmarked directory would be
+            // one nothing reads after a restart.
+            sys::set_xattr(&self.path(parent)?, MARKER, b"1", 0)?;
+            parent.set_mark(Mark::Marked);
+        }
+        sys::set_xattr(path, RECORD, &encode(uid, gid, mode), 0)?;
+        inode.set_owner(Owner::Set(uid, gid));
+        Ok(())
+    }
+
+    /// From the first record on, this share reads them, now and after a
+    /// restart: the marker on its root is what a new server looks for.
+    fn records_owners(&self) {
+        if self.ownership.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let marked = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes())
+            .map_err(|_| linux::EINVAL)
+            .and_then(|root| sys::set_xattr(&root, crate::ownership::MARKER, b"1", 0));
+        match marked {
+            Ok(()) => {
+                if let Some(root) = self.registry.get(1) {
+                    root.set_mark(crate::ownership::Mark::Marked);
+                }
+            }
+            Err(errno) => tracing::warn!(
+                root = %self.root.display(),
+                errno,
+                "could not mark the share as recording owners; they will be read again only after the next chown"
+            ),
+        }
+    }
+
+    /// The owner to record for a file a container creates: its caller,
+    /// unless that is root, which the Mac user already appears as.
+    fn recording_creator(caller: (u32, u32)) -> Option<(u32, u32)> {
+        (caller != (0, 0)).then_some(caller)
+    }
+
+    /// Records a non-root caller as the owner of what it has just created,
+    /// and says so in the reply.
+    fn record_creator(
+        &self,
+        parent: &Inode,
+        name: &CStr,
+        entry: &mut EntryOut,
+        owner: (u32, u32),
+    ) -> Result<(), i32> {
+        let mut path = self.path(parent)?.into_bytes();
+        path.push(b'/');
+        path.extend_from_slice(name.to_bytes());
+        let path = std::ffi::CString::new(path).map_err(|_| linux::EINVAL)?;
+        let inode = self.registry.get(entry.nodeid).ok_or(linux::ESTALE)?;
+        self.record_owner(&inode, Some(parent), &path, owner, entry.attr.mode)?;
+        (entry.attr.uid, entry.attr.gid) = owner;
+        Ok(())
+    }
+
+    /// The owner a SETATTR asks for, in the guest's numbering: each half the
+    /// request leaves out stays as it is.
+    fn requested_owner(
+        &self,
+        valid: u32,
+        body: &[u8],
+        (uid, gid): (u32, u32),
+    ) -> Result<(u32, u32), i32> {
+        Ok((
+            if valid & fuse::fattr::UID != 0 {
+                get_u32(body, 76).ok_or(linux::EINVAL)?
+            } else {
+                uid
+            },
+            if valid & fuse::fattr::GID != 0 {
+                get_u32(body, 80).ok_or(linux::EINVAL)?
+            } else {
+                gid
+            },
+        ))
     }
 
     fn attr(&self, st: &libc::stat) -> Attr {
@@ -1913,9 +2114,13 @@ impl Server {
             self.stat_inode(nodeid, &inode)?
         };
         let mut out = self.attr_reply(&st);
-        if !overlay.is_empty() {
+        let owned = self.ownership.load(Ordering::Relaxed);
+        if !overlay.is_empty() || owned {
             let mut attr = self.attr(&st);
             self.overlay_attr(&overlay, &mut attr);
+            if let Some(inode) = &inode {
+                self.own(inode, None, &mut attr);
+            }
             out.truncate(16);
             attr.encode(&mut out);
         }
@@ -1949,17 +2154,8 @@ impl Server {
             // A pending file that has had nothing written is empty already.
             size == 0 && inode.is_pending() && !inode.is_dirty() && inode.overlay_size(0) == 0
         } else if effective & !OWNERSHIP == 0 && effective != 0 {
-            let uid = if valid & fuse::fattr::UID != 0 {
-                self.to_host_uid(get_u32(body, 76).ok_or(linux::EINVAL)?)
-            } else {
-                self.host_uid
-            };
-            let gid = if valid & fuse::fattr::GID != 0 {
-                self.to_host_gid(get_u32(body, 80).ok_or(linux::EINVAL)?)
-            } else {
-                self.host_gid
-            };
-            uid == self.host_uid && gid == self.host_gid
+            let owner = self.recorded_owner(inode, None).unwrap_or((0, 0));
+            self.requested_owner(valid, body, owner)? == owner
         } else {
             false
         };
@@ -2238,25 +2434,15 @@ impl Server {
         }
 
         if valid & (fuse::fattr::UID | fuse::fattr::GID) != 0 {
-            let uid = if valid & fuse::fattr::UID != 0 {
-                self.to_host_uid(get_u32(body, 76).ok_or(linux::EINVAL)?)
-            } else {
-                u32::MAX
-            };
-            let gid = if valid & fuse::fattr::GID != 0 {
-                self.to_host_gid(get_u32(body, 80).ok_or(linux::EINVAL)?)
-            } else {
-                u32::MAX
-            };
-            // A container chowning a file to root is asking for what it already
-            // has once the map is applied. Doing nothing is the honest answer;
-            // issuing the syscall would fail with EPERM for an unprivileged
-            // host process and turn every `npm install --unsafe-perm` into an
-            // error about a change that was not needed.
-            let uid_change = uid != u32::MAX && uid != self.host_uid;
-            let gid_change = gid != u32::MAX && gid != self.host_gid;
-            if uid_change || gid_change {
-                sys::chown_at(libc::AT_FDCWD, &path, uid, gid)?;
+            // Never a host chown: this process cannot give a Mac file away,
+            // and the file must stay its user's on the Mac. The container's
+            // owner is recorded instead (`crate::ownership`); a chown back to
+            // root clears the record, root being how the Mac user appears.
+            let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
+            let wanted = self.requested_owner(valid, body, owner)?;
+            if wanted != owner {
+                let mode = self.stat_of(&inode)?.st_mode as u32;
+                self.record_owner(&inode, None, &path, wanted, mode)?;
             }
         }
 
@@ -2304,7 +2490,14 @@ impl Server {
         }
 
         let st = self.stat_of(&inode)?;
-        Ok(self.attr_reply(&st))
+        let mut out = self.attr_reply(&st);
+        if self.ownership.load(Ordering::Relaxed) {
+            let mut attr = self.attr(&st);
+            self.own(&inode, None, &mut attr);
+            out.truncate(16);
+            attr.encode(&mut out);
+        }
+        Ok(out)
     }
 
     fn readlink(&self, nodeid: u64) -> Result<Vec<u8>, i32> {
@@ -2319,28 +2512,34 @@ impl Server {
         sys::readlink_at(libc::AT_FDCWD, &path)
     }
 
-    fn symlink(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn symlink(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let (name, rest) = get_name(body).ok_or(linux::EINVAL)?;
         let (target, _) = get_name(rest).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let target = CString::new(target).map_err(|_| linux::EINVAL)?;
-        if let Some(reply) = self.name_pending(
-            &parent,
-            &name,
-            crate::inode::PendingKind::Symlink,
-            libc::S_IFLNK as u32 | 0o777,
-            Some(target.clone()),
-        )? {
+        let creator = Self::recording_creator(caller);
+        if creator.is_none()
+            && let Some(reply) = self.name_pending(
+                &parent,
+                &name,
+                crate::inode::PendingKind::Symlink,
+                libc::S_IFLNK as u32 | 0o777,
+                Some(target.clone()),
+            )?
+        {
             return Ok(reply);
         }
         self.settle_while(&parent, |parent| parent.is_pending());
         sys::symlink_at(&target, parent.reference()?.raw_fd(), &name)?;
-        let entry = self.entry(&parent, &name)?;
+        let mut entry = self.entry(&parent, &name)?;
+        if let Some(owner) = creator {
+            self.record_creator(&parent, &name, &mut entry, owner)?;
+        }
         Ok(self.entry_reply(&entry))
     }
 
-    fn mknod(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn mknod(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         self.settle_while(&parent, |parent| parent.is_pending());
         let mode = get_u32(body, 0).ok_or(linux::EINVAL)?;
@@ -2349,29 +2548,40 @@ impl Server {
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         parent.under_name(&name, |dir, at| sys::mknod_at(dir, at, mode & !umask, rdev))?;
-        let entry = self.entry(&parent, &name)?;
+        let mut entry = self.entry(&parent, &name)?;
+        if let Some(owner) = Self::recording_creator(caller) {
+            self.record_creator(&parent, &name, &mut entry, owner)?;
+        }
         Ok(self.entry_reply(&entry))
     }
 
-    fn mkdir(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn mkdir(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let mode = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let umask = get_u32(body, 4).unwrap_or(0);
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let mode = mode & 0o7777 & !umask;
-        if let Some(reply) = self.name_pending(
-            &parent,
-            &name,
-            crate::inode::PendingKind::Directory,
-            libc::S_IFDIR as u32 | mode,
-            None,
-        )? {
+        // A non-root caller's create is made on the host before the reply,
+        // so that its owner is on the file before anything can ask.
+        let creator = Self::recording_creator(caller);
+        if creator.is_none()
+            && let Some(reply) = self.name_pending(
+                &parent,
+                &name,
+                crate::inode::PendingKind::Directory,
+                libc::S_IFDIR as u32 | mode,
+                None,
+            )?
+        {
             return Ok(reply);
         }
         self.settle_while(&parent, |parent| parent.is_pending());
         parent.under_name(&name, |dir, at| sys::mkdir_at(dir, at, mode))?;
-        let entry = self.entry(&parent, &name)?;
+        let mut entry = self.entry(&parent, &name)?;
+        if let Some(owner) = creator {
+            self.record_creator(&parent, &name, &mut entry, owner)?;
+        }
         Ok(self.entry_reply(&entry))
     }
 
@@ -3787,6 +3997,7 @@ impl Server {
         let overlay = inode.overlay();
         let mut attr = self.attr(&self.stat_inode(nodeid, inode)?);
         self.overlay_attr(&overlay, &mut attr);
+        self.own(inode, None, &mut attr);
         Ok(attr)
     }
 
@@ -3892,7 +4103,7 @@ impl Server {
         }
     }
 
-    fn create(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
+    fn create(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let flags = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let mode = get_u32(body, 4).ok_or(linux::EINVAL)?;
@@ -3913,7 +4124,9 @@ impl Server {
         const LINUX_O_CREAT: u32 = 0o100;
         const LINUX_O_EXCL: u32 = 0o200;
         const LINUX_O_NOFOLLOW: u32 = 0o400000;
-        if self.apply.accepting()
+        let creator = Self::recording_creator(caller);
+        if creator.is_none()
+            && self.apply.accepting()
             && let Some(reply) =
                 self.create_pending(&parent, &name, flags, mode & 0o7777 & !umask)?
         {
@@ -3973,8 +4186,11 @@ impl Server {
         if st.st_mode & 0o170000 == 0o040000 {
             return Err(linux::EISDIR);
         }
-        let entry =
+        let mut entry =
             self.entry_with_reference(&parent, st, self.apply.applied(), || sys::dup(&fd))?;
+        if created && let Some(owner) = creator {
+            self.record_creator(&parent, &name, &mut entry, owner)?;
+        }
         let fh = self.registry.add_handle(Handle::File(Arc::new(OpenFile {
             fd,
             readable: true,
@@ -4435,7 +4651,7 @@ impl Server {
     fn getxattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let size = get_u32(body, 0).ok_or(linux::EINVAL)? as usize;
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
-        if is_linux_only_namespace(name) {
+        if is_linux_only_namespace(name) || crate::ownership::is_ours(name) {
             return Err(linux::ENODATA);
         }
         let name = CString::new(name).map_err(|_| linux::EINVAL)?;
@@ -4458,6 +4674,9 @@ impl Server {
         let flags = get_u32(body, 4).ok_or(linux::EINVAL)?;
         let (name, rest) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let value = rest.get(..size).ok_or(linux::EINVAL)?;
+        if crate::ownership::is_ours(name) {
+            return Err(linux::EPERM);
+        }
         let name = CString::new(name).map_err(|_| linux::EINVAL)?;
         let inode = self.inode(nodeid)?;
         let path = self.path(&inode)?;
@@ -4469,18 +4688,45 @@ impl Server {
         let size = get_u32(body, 0).ok_or(linux::EINVAL)? as usize;
         let inode = self.inode(nodeid)?;
         let path = self.path(&inode)?;
-        if size == 0 {
-            let len = sys::list_xattr(&path, &mut [])?;
-            return Ok(size_reply(len));
+        // `cp -a` lists every file it copies, so a share with nothing of ours
+        // on it keeps the one-syscall answer.
+        if !self.ownership.load(Ordering::Relaxed) {
+            if size == 0 {
+                let len = sys::list_xattr(&path, &mut [])?;
+                return Ok(size_reply(len));
+            }
+            let mut buf = vec![0u8; size];
+            let len = sys::list_xattr(&path, &mut buf)?;
+            buf.truncate(len);
+            return Ok(buf);
         }
-        let mut buf = vec![0u8; size];
-        let len = sys::list_xattr(&path, &mut buf)?;
-        buf.truncate(len);
-        Ok(buf)
+        // Read whole and filtered, so that the size the guest is told is the
+        // size of what it will get: our own names are not its to see.
+        let len = sys::list_xattr(&path, &mut [])?;
+        let mut all = vec![0u8; len];
+        let len = sys::list_xattr(&path, &mut all)?;
+        all.truncate(len);
+        let mut names = Vec::with_capacity(all.len());
+        for name in all.split_inclusive(|&b| b == 0) {
+            let bare = name.strip_suffix(&[0]).unwrap_or(name);
+            if !crate::ownership::is_ours(bare) {
+                names.extend_from_slice(name);
+            }
+        }
+        if size == 0 {
+            return Ok(size_reply(names.len()));
+        }
+        if names.len() > size {
+            return Err(linux::ERANGE);
+        }
+        Ok(names)
     }
 
     fn removexattr(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let (name, _) = get_name(body).ok_or(linux::EINVAL)?;
+        if crate::ownership::is_ours(name) {
+            return Err(linux::ENODATA);
+        }
         let name = CString::new(name).map_err(|_| linux::EINVAL)?;
         let inode = self.inode(nodeid)?;
         let path = self.path(&inode)?;

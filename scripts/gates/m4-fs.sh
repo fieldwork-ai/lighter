@@ -319,6 +319,37 @@ else
 			sed 's/^/    /' "$RUN_DIR/docker.err"
 			tail -15 "$LOG" | sed 's/^/    /'
 		fi
+
+		# A container's chown is recorded, not applied: what an image that
+		# drops root does to its volumes (Frigate from 0.19, Postgres), and
+		# then everything it writes has to be its own. The directory is the
+		# volume itself, as `-v ./frigate-config:/config` is.
+		mkdir -p "$SHARE/owned"
+		printf 'x' > "$SHARE/owned/config.yml"
+		if docker run --rm -v "$MOUNT/owned:/data" alpine:3.21 chown -R 1000:1000 /data 2>"$RUN_DIR/docker.err" \
+			&& owned="$(docker run --rm --user 1000:1000 -v "$MOUNT/owned:/data" alpine:3.21 sh -c '
+				echo more >> /data/config.yml &&
+				mkdir /data/recordings &&
+				echo segment > /data/recordings/1.mp4 &&
+				echo again >> /data/recordings/1.mp4 &&
+				stat -c "%u:%g" /data /data/config.yml /data/recordings /data/recordings/1.mp4 | sort -u' \
+				2>>"$RUN_DIR/docker.err")"; then
+			if [ "$owned" = "1000:1000" ]; then
+				pass "a container chowned its volume, and its user wrote, created and reopened files in it"
+			else
+				fail "owners inside the container: ${owned:-none}"
+			fi
+		else
+			fail "a non-root container could not use a volume chowned to it"
+			sed 's/^/    /' "$RUN_DIR/docker.err"
+		fi
+		if [ "$(stat -f %u "$SHARE/owned/config.yml")" = "$(id -u)" ] \
+			&& [ "$(xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/config.yml" 2>/dev/null)" = '{"UID":1000,"GID":1000,"mode":644}' ] \
+			&& [ -n "$(xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/recordings/1.mp4" 2>/dev/null)" ]; then
+			pass "on the Mac the files stay yours, the owner recorded as Docker Desktop records it"
+		else
+			fail "Mac owner $(stat -f %u "$SHARE/owned/config.yml"), record: $(xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/config.yml" 2>&1)"
+		fi
 		unset DOCKER_HOST
 	else
 		fail "the Docker guest did not come up"

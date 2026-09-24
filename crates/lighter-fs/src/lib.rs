@@ -32,6 +32,7 @@ pub mod fuse;
 pub mod inode;
 pub mod notify;
 pub mod opencache;
+pub mod ownership;
 pub mod server;
 pub mod stats;
 pub mod sys;

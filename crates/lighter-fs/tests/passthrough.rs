@@ -93,6 +93,11 @@ struct Guest {
     server: Server,
     unique: u64,
     root: PathBuf,
+    /// The uid and gid every request carries: root unless a test says not.
+    caller: (u32, u32),
+    /// Whether dropping this guest removes the share, which a second server
+    /// on the same share must not do.
+    owns_root: bool,
 }
 
 impl Guest {
@@ -106,11 +111,22 @@ impl Guest {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        Guest::serve(root, true)
+    }
+
+    /// A second server on this guest's share, as a restarted VM would have.
+    fn another(&self) -> Guest {
+        Guest::serve(self.root.clone(), false)
+    }
+
+    fn serve(root: PathBuf, owns_root: bool) -> Guest {
         let server = Server::new(&root).unwrap();
         let mut guest = Guest {
             server,
             unique: 1,
             root,
+            caller: (0, 0),
+            owns_root,
         };
         // Every real guest opens with INIT, and several replies depend on what
         // was negotiated there.
@@ -141,8 +157,8 @@ impl Guest {
         request.extend_from_slice(&opcode.to_le_bytes());
         request.extend_from_slice(&self.unique.to_le_bytes());
         request.extend_from_slice(&nodeid.to_le_bytes());
-        request.extend_from_slice(&0u32.to_le_bytes()); // uid: the guest is root
-        request.extend_from_slice(&0u32.to_le_bytes()); // gid
+        request.extend_from_slice(&self.caller.0.to_le_bytes()); // uid
+        request.extend_from_slice(&self.caller.1.to_le_bytes()); // gid
         request.extend_from_slice(&1u32.to_le_bytes()); // pid
         request.extend_from_slice(&0u32.to_le_bytes()); // total_extlen
         request.extend_from_slice(body);
@@ -287,7 +303,9 @@ impl Guest {
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        if self.owns_root {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 }
 
@@ -2089,4 +2107,285 @@ fn a_parked_directory_is_not_revived_by_creating_inside_it() {
         );
     }
     unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+}
+
+/// The owner GETATTR reports: uid and gid sit 68 and 72 into `fuse_attr`,
+/// which follows 16 bytes of validity.
+fn owner_of(guest: &mut Guest, nodeid: u64) -> (u32, u32) {
+    let reply = guest.call(op::GETATTR, nodeid, &[0u8; 16]).unwrap();
+    (
+        u32::from_le_bytes(reply[84..88].try_into().unwrap()),
+        u32::from_le_bytes(reply[88..92].try_into().unwrap()),
+    )
+}
+
+/// SETATTR of uid and gid, as `chown` sends it.
+fn chown(guest: &mut Guest, nodeid: u64, uid: u32, gid: u32) -> Result<Vec<u8>, i32> {
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&(fuse::fattr::UID | fuse::fattr::GID).to_le_bytes());
+    body[76..80].copy_from_slice(&uid.to_le_bytes());
+    body[80..84].copy_from_slice(&gid.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body)
+}
+
+/// The ownership record on the Mac file, as Docker Desktop would read it.
+fn record_on_host(path: &Path) -> Option<String> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let mut buf = [0u8; 256];
+    let len = lighter_fs::sys::get_xattr(&path, lighter_fs::ownership::RECORD, &mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
+
+fn host_uid(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).unwrap().uid()
+}
+
+/// A container's chown is what the container sees afterwards, and nothing
+/// the Mac notices: the file stays its user's, with the owner recorded
+/// where Docker Desktop records it.
+#[test]
+fn a_chown_is_recorded_not_applied() {
+    let mut guest = Guest::new("chown");
+    std::fs::write(guest.host("config.yml"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "config.yml").unwrap();
+
+    chown(&mut guest, nodeid, 1000, 1000).expect("a chown to another user succeeds");
+
+    assert_eq!(owner_of(&mut guest, nodeid), (1000, 1000));
+    // SAFETY: takes no arguments and cannot fail.
+    assert_eq!(host_uid(&guest.host("config.yml")), unsafe {
+        libc::geteuid()
+    });
+    assert_eq!(
+        record_on_host(&guest.host("config.yml")).as_deref(),
+        Some(r#"{"UID":1000,"GID":1000,"mode":644}"#)
+    );
+}
+
+#[test]
+fn a_chown_back_to_root_clears_the_record() {
+    let mut guest = Guest::new("unchown");
+    std::fs::write(guest.host("f"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    chown(&mut guest, nodeid, 1000, 1000).unwrap();
+
+    chown(&mut guest, nodeid, 0, 0).unwrap();
+
+    assert_eq!(owner_of(&mut guest, nodeid), (0, 0));
+    assert_eq!(record_on_host(&guest.host("f")), None);
+}
+
+/// Half a chown (`chown :group`) keeps the other half.
+#[test]
+fn a_chown_of_the_group_alone_keeps_the_owner() {
+    let mut guest = Guest::new("chgrp");
+    std::fs::write(guest.host("f"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    chown(&mut guest, nodeid, 1000, 1000).unwrap();
+
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&fuse::fattr::GID.to_le_bytes());
+    body[80..84].copy_from_slice(&44u32.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).unwrap();
+
+    assert_eq!(owner_of(&mut guest, nodeid), (1000, 44));
+}
+
+/// What a non-root process creates is its own, or it could not write the
+/// directory it has just made.
+#[test]
+fn what_a_non_root_caller_creates_is_its_own() {
+    let mut guest = Guest::new("creator");
+    guest.caller = (1000, 1000);
+
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("recordings"));
+    let reply = guest.call(op::MKDIR, 1, &body).unwrap();
+    let dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    let (file, _) = guest.create(dir, "segment.mp4", CREATE_RDWR).unwrap();
+
+    assert_eq!(owner_of(&mut guest, dir), (1000, 1000));
+    assert_eq!(owner_of(&mut guest, file), (1000, 1000));
+    assert!(record_on_host(&guest.host("recordings")).is_some());
+    assert!(record_on_host(&guest.host("recordings").join("segment.mp4")).is_some());
+}
+
+/// Root's creations need no record, and a share that never has one never
+/// reads one.
+#[test]
+fn what_root_creates_carries_no_record() {
+    let mut guest = Guest::new("rootcreate");
+    guest.create(1, "plain", CREATE_RDWR).unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert_eq!(record_on_host(&guest.host("plain")), None);
+    let root = std::ffi::CString::new(guest.root.as_os_str().as_encoded_bytes()).unwrap();
+    assert!(
+        lighter_fs::sys::get_xattr(&root, lighter_fs::ownership::MARKER, &mut []).is_err(),
+        "a share with no records must not be marked as having them"
+    );
+}
+
+/// The owner outlives the server, as it must outlive a VM restart.
+#[test]
+fn a_recorded_owner_survives_a_new_server() {
+    let mut guest = Guest::new("restart");
+    std::fs::write(guest.host("frigate.db"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "frigate.db").unwrap();
+    chown(&mut guest, nodeid, 1000, 1000).unwrap();
+
+    let mut again = guest.another();
+    let nodeid = again.lookup(1, "frigate.db").unwrap();
+    assert_eq!(owner_of(&mut again, nodeid), (1000, 1000));
+}
+
+/// A rename moves the file, and the record is the file's.
+#[test]
+fn a_recorded_owner_moves_with_a_rename() {
+    let mut guest = Guest::new("renamed");
+    std::fs::write(guest.host("before"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "before").unwrap();
+    chown(&mut guest, nodeid, 1000, 1000).unwrap();
+
+    std::fs::rename(guest.host("before"), guest.host("after")).unwrap();
+    let mut again = guest.another();
+    let nodeid = again.lookup(1, "after").unwrap();
+    assert_eq!(owner_of(&mut again, nodeid), (1000, 1000));
+}
+
+/// The record is ours: a container can neither see nor forge it.
+#[test]
+fn the_record_is_hidden_from_the_guest() {
+    let mut guest = Guest::new("hidden");
+    std::fs::write(guest.host("f"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    chown(&mut guest, nodeid, 1000, 1000).unwrap();
+
+    let mut list = 4096u32.to_le_bytes().to_vec();
+    list.extend_from_slice(&0u32.to_le_bytes());
+    let names = guest.call(op::LISTXATTR, nodeid, &list).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&names).contains("grpcfuse"),
+        "listed: {names:?}"
+    );
+    let mut size_only = 0u32.to_le_bytes().to_vec();
+    size_only.extend_from_slice(&0u32.to_le_bytes());
+    let size = guest.call(op::LISTXATTR, nodeid, &size_only).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(size[0..4].try_into().unwrap()) as usize,
+        names.len()
+    );
+
+    let mut get = 256u32.to_le_bytes().to_vec();
+    get.extend_from_slice(&0u32.to_le_bytes());
+    get.extend_from_slice(&name_body("com.docker.grpcfuse.ownership"));
+    assert_eq!(guest.call(op::GETXATTR, nodeid, &get), Err(61));
+
+    let forged = br#"{"UID":0,"GID":0}"#;
+    let mut set = (forged.len() as u32).to_le_bytes().to_vec();
+    set.extend_from_slice(&0u32.to_le_bytes());
+    set.extend_from_slice(&name_body("com.docker.grpcfuse.ownership"));
+    set.extend_from_slice(forged);
+    assert_eq!(guest.call(op::SETXATTR, nodeid, &set), Err(1));
+    assert_eq!(owner_of(&mut guest, nodeid), (1000, 1000));
+}
+
+/// A tree chowned under Docker Desktop is honored once the share records
+/// owners, and until then a share reads no records at all.
+#[test]
+fn a_docker_desktop_record_is_read_once_the_share_records_owners() {
+    let mut guest = Guest::new("dockerdesktop");
+    std::fs::write(guest.host("theirs"), b"x").unwrap();
+    std::fs::write(guest.host("ours"), b"x").unwrap();
+    let theirs =
+        std::ffi::CString::new(guest.host("theirs").as_os_str().as_encoded_bytes()).unwrap();
+    lighter_fs::sys::set_xattr(
+        &theirs,
+        lighter_fs::ownership::RECORD,
+        br#"{"UID":405,"GID":82,"mode":755}"#,
+        0,
+    )
+    .unwrap();
+
+    let nodeid = guest.lookup(1, "theirs").unwrap();
+    assert_eq!(
+        owner_of(&mut guest, nodeid),
+        (0, 0),
+        "an unmarked share reads no records"
+    );
+
+    let ours = guest.lookup(1, "ours").unwrap();
+    chown(&mut guest, ours, 1000, 1000).unwrap();
+    let mut again = guest.another();
+    let nodeid = again.lookup(1, "theirs").unwrap();
+    assert_eq!(owner_of(&mut again, nodeid), (405, 82));
+}
+
+/// Linux tools ask an attribute's size before reading it. A size query used to
+/// reach macOS as a zero-length buffer rather than a null one, which it
+/// answers with ERANGE.
+#[test]
+fn an_extended_attributes_size_can_be_asked() {
+    let mut guest = Guest::new("xattrsize");
+    std::fs::write(guest.host("tagged"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "tagged").unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&5u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("user.mark"));
+    body.extend_from_slice(b"value");
+    guest.call(op::SETXATTR, nodeid, &body).unwrap();
+
+    let mut size_of = 0u32.to_le_bytes().to_vec();
+    size_of.extend_from_slice(&0u32.to_le_bytes());
+    size_of.extend_from_slice(&name_body("user.mark"));
+    let reply = guest.call(op::GETXATTR, nodeid, &size_of).unwrap();
+    assert_eq!(u32::from_le_bytes(reply[0..4].try_into().unwrap()), 5);
+
+    let mut list_size = 0u32.to_le_bytes().to_vec();
+    list_size.extend_from_slice(&0u32.to_le_bytes());
+    let reply = guest.call(op::LISTXATTR, nodeid, &list_size).unwrap();
+    assert!(u32::from_le_bytes(reply[0..4].try_into().unwrap()) >= b"user.mark\0".len() as u32);
+}
+
+/// Records are read only in directories marked as holding one, so that a
+/// share where one volume was chowned does not pay a read for every file of
+/// every other tree under it.
+#[test]
+fn a_record_is_read_only_where_its_directory_is_marked() {
+    let mut guest = Guest::new("marked");
+    std::fs::create_dir_all(guest.host("volume")).unwrap();
+    std::fs::create_dir_all(guest.host("elsewhere")).unwrap();
+    std::fs::write(guest.host("volume/config.yml"), b"x").unwrap();
+    std::fs::write(guest.host("elsewhere/stray"), b"x").unwrap();
+
+    let volume = guest.lookup(1, "volume").unwrap();
+    let config = guest.lookup(volume, "config.yml").unwrap();
+    chown(&mut guest, config, 1000, 1000).unwrap();
+    let volume_dir =
+        std::ffi::CString::new(guest.host("volume").as_os_str().as_encoded_bytes()).unwrap();
+    assert!(
+        lighter_fs::sys::get_xattr(&volume_dir, lighter_fs::ownership::MARKER, &mut []).is_ok(),
+        "the chowned file's directory is marked"
+    );
+
+    // A record where nothing marked the directory is not looked for.
+    let stray =
+        std::ffi::CString::new(guest.host("elsewhere/stray").as_os_str().as_encoded_bytes())
+            .unwrap();
+    lighter_fs::sys::set_xattr(
+        &stray,
+        lighter_fs::ownership::RECORD,
+        br#"{"UID":7,"GID":7,"mode":644}"#,
+        0,
+    )
+    .unwrap();
+    let mut again = guest.another();
+    let elsewhere = again.lookup(1, "elsewhere").unwrap();
+    let stray = again.lookup(elsewhere, "stray").unwrap();
+    assert_eq!(owner_of(&mut again, stray), (0, 0));
+    let volume = again.lookup(1, "volume").unwrap();
+    let config = again.lookup(volume, "config.yml").unwrap();
+    assert_eq!(owner_of(&mut again, config), (1000, 1000));
 }
