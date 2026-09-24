@@ -79,7 +79,7 @@ for level in "$@"; do
 	shm=$(( 64 + level * 24 ))
 	devices=()
 	[ "$DEVICE" = onnx ] && [ -z "${NO_ANE:-}" ] && devices+=(--device lighter.sh/ane=all)
-	case "$HWACCEL" in *v4l2m2m* | preset-apple-ne-*) devices+=(--device lighter.sh/video=all) ;; esac
+	case "$HWACCEL" in *v4l2m2m* | preset-apple-*) devices+=(--device lighter.sh/video=all) ;; esac
 	c=$(docker create ${devices[@]+"${devices[@]}"} --shm-size "${shm}m" "$IMAGE")
 	docker cp "$dir/config" "$c:/config" >/dev/null
 	docker start "$c" >/dev/null
