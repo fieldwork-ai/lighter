@@ -14,13 +14,18 @@ set -uo pipefail
 IMAGE="${FRIGATE_IMAGE:?}"; CLIP="${CLIP:?}"; MODEL="${MODEL:?}"
 HOME_DIR="${LIGHTER_HOME:?}"
 SETTLE="${SETTLE:-90}"
+# The detector type (onnx is Frigate's own, on the container's CPU), and the
+# decode args (-c:v h264 for software decode; the video device is passed only
+# for a v4l2m2m decoder).
+DETECTOR="${DETECTOR:-lighter_ane}"
+HWACCEL="${HWACCEL:--c:v h264_v4l2m2m ${DECODER_ARGS:-}}"
 DETECTORS=$1; shift
 
 config() { # cameras, detectors
 	echo "mqtt:"
 	echo "  enabled: false"
 	echo "detectors:"
-	for d in $(seq 1 "$2"); do echo "  ane$d:"; echo "    type: lighter_ane"; done
+	for d in $(seq 1 "$2"); do echo "  det$d:"; echo "    type: $DETECTOR"; done
 	cat <<EOF
 model:
   path: /models/model.onnx
@@ -41,7 +46,7 @@ EOF
 		cat <<EOF
   cam$c:
     ffmpeg:
-      hwaccel_args: -c:v h264_v4l2m2m ${DECODER_ARGS:-}
+      hwaccel_args: $HWACCEL
       inputs:
         - path: /media/frigate/clip.mkv
           input_args: -re -stream_loop -1 -fflags +genpts
@@ -64,7 +69,10 @@ host_cpu() { # %CPU of this home's VM and of its ane-host child, over 20 s
 for level in "$@"; do
 	dir=$(mktemp -d); mkdir "$dir/config"; config "$level" "$DETECTORS" > "$dir/config/config.yml"
 	shm=$(( 64 + level * 24 ))
-	c=$(docker create --device lighter.sh/ane=all --device lighter.sh/video=all --shm-size "${shm}m" "$IMAGE")
+	devices=()
+	[ "$DETECTOR" = lighter_ane ] && devices+=(--device lighter.sh/ane=all)
+	case "$HWACCEL" in *v4l2m2m*) devices+=(--device lighter.sh/video=all) ;; esac
+	c=$(docker create ${devices[@]+"${devices[@]}"} --shm-size "${shm}m" "$IMAGE")
 	docker cp "$dir/config" "$c:/config" >/dev/null
 	docker start "$c" >/dev/null
 	docker exec "$c" mkdir -p /models /media/frigate
