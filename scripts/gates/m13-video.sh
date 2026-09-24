@@ -83,6 +83,11 @@ CAM="$RUN_DIR/cam.mkv"
 ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=20" -t 3 \
 	-c:v libx264 -preset veryfast -pix_fmt yuv420p -g 40 -bf 0 -threads 1 "$CAM" 2>&1 | sed 's/^/    /' || true
 [ -s "$CAM" ] && pass "camera-shaped clip: no B-frames, 60 frames" || { fail "no camera clip"; exit 1; }
+# Raw Annex B for the STREAMOFF client, which feeds access units itself.
+RACE="$RUN_DIR/race.h264"
+ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=640x368:rate=20" -t 3 \
+	-c:v libx264 -preset veryfast -pix_fmt yuv420p -g 40 -bf 0 -threads 1 -f h264 "$RACE" 2>&1 | sed 's/^/    /' || true
+[ -s "$RACE" ] && pass "raw clip for the STREAMOFF client" || { fail "no raw clip"; exit 1; }
 # HEVC: eight bits with B-frames, ten bits, and a camera-shaped one without.
 HEVC8="$RUN_DIR/hevc8.mkv"; HEVC10="$RUN_DIR/hevc10.mkv"; HEVCCAM="$RUN_DIR/hevccam.mkv"
 ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30" -t 2 \
@@ -138,9 +143,11 @@ docker cp "$HEVC10" "$container:/hevc10.mkv" >/dev/null
 docker cp "$HEVCCAM" "$container:/hevccam.mkv" >/dev/null
 docker cp "$VP98" "$container:/vp9_8.webm" >/dev/null
 docker cp "$VP910" "$container:/vp9_10.webm" >/dev/null
+docker cp "$RACE" "$container:/race.h264" >/dev/null
+docker cp "$ROOT/scripts/gates/fixtures/v4l2-streamoff-race.py" "$container:/race.py" >/dev/null
 docker start "$container" >/dev/null
 in_container() { docker exec "$container" bash -c "$1" 2>&1; }
-if ! in_container 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ffmpeg v4l-utils >/dev/null 2>&1' >/dev/null; then
+if ! in_container 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ffmpeg v4l-utils python3 >/dev/null 2>&1' >/dev/null; then
 	fail "the container could not install ffmpeg (network?)"
 else
 	out="$(in_container '
@@ -252,6 +259,27 @@ rm -f /tmp/sw.yuv /tmp/hw.yuv')"
 		pass "the Mac pays $(awk -v h="$hw_ms" -v f="$frames" 'BEGIN{printf "%.2f", h/f}') ms of CPU a frame on the media engine against $(awk -v s="$sw_ms" -v f="$frames" 'BEGIN{printf "%.2f", s/f}') in software"
 	else
 		fail "hardware decode is not cheaper enough: ${hw_ms:-?} ms against ${sw_ms:-?} ms for ${frames} frames"
+	fi
+
+	# Sixteen clients turning CAPTURE off and on while frames complete, with
+	# the vCPUs saturated. Before kernel patch 0042 a completion handled
+	# after its STREAMOFF (events wait for the guest's sixteen event buffers,
+	# replies do not) put a buffer on the done list twice, and the next DQBUF
+	# oopsed holding the device. That takes an event backlog at the wrong
+	# moment and this does not reproduce it reliably; it guards the path.
+	race="$(in_container '
+for i in 1 2 3 4; do timeout -s KILL 50 sh -c "while :; do :; done" & done
+for i in $(seq 16); do timeout -s KILL 90 python3 /race.py /race.h264 45 640 368 > /tmp/race$i.log 2>&1 & done
+wait 2>/dev/null
+echo "RACE $(grep -h "^frames" /tmp/race*.log | wc -l) $(grep -h "^frames" /tmp/race*.log | awk "{c+=\$5} END {print c+0}")"')"
+	clients="$(awk '/^RACE/ {print $2}' <<<"$race")"; cycles="$(awk '/^RACE/ {print $3}' <<<"$race")"
+	if grep -q "Unable to handle kernel\|virtio_media_dqbuf" "$LOG"; then
+		fail "the guest oopsed in the decoder driver under STREAMOFF churn"
+		grep -m3 "Unable to handle kernel\|virtio_media_dqbuf" "$LOG" | sed 's/^/    /'
+	elif [ "${clients:-0}" = 16 ] && [ "${cycles:-0}" -gt 0 ]; then
+		pass "16 clients, ${cycles} CAPTURE STREAMOFF cycles while decoding, no oops"
+	else
+		fail "STREAMOFF clients did not all finish: ${race:-nothing}"
 	fi
 fi
 docker rm -f "$container" >/dev/null 2>&1 || true
