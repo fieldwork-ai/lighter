@@ -1,0 +1,47 @@
+# lighter 0.9.2, the Neural Engine across Frigate's detector models, on an M1
+# (MacBook Air, 8 GB), 2026-09-24. benchmarks/ane-models.sh, lighter 0.9.2
+# candidate (4 vCPUs, 5 GiB), Frigate built from dev (af0ba191) with the
+# lighter_ane detector (custom op route) on its own ONNX Runtime 1.22.1; the
+# plugin route in the same image with ONNX Runtime 1.23.2.
+#
+# Per model and route: "cpu" and "ane" are ms per detection through Frigate's
+# whole pipeline (input transform, inference, Frigate's post-processing), warm,
+# 100 runs, on the container's CPU and through lighter; "load" is the detector's
+# first load with the host's CoreML cache cleared. "host" is where the host
+# placed the model and what each candidate took. Every confident detection
+# (score >= 0.5) on six images is matched on the other side: same class, IoU >=
+# 0.9, score within 0.05 (compare.py).
+#
+# Not in the table: DEIMv2 (HGNetv2-N), whose export with Frigate's documented
+# recipe is killed out of memory at 16 GiB, on arm64 and on x86-64.
+
+op ORT 1.22.1 yolov9-t-320.onnx: cpu 12.37 ms, ane 3.34 ms, load 4687 ms  [host: chosen="neural engine" candidates=neural engine: 1.77 ms, gpu: 5.57 ms, cpu: 13.86 ms]
+plugin ORT 1.23.2 yolov9-t-320.onnx: cpu 12.50 ms, ane 3.23 ms, load 2924 ms  [host: chosen="neural engine" candidates=neural engine: 1.63 ms, gpu: 6.47 ms, cpu: 16.28 ms]
+op ORT 1.22.1 yolov9-s-640.onnx: cpu 110.24 ms, ane 12.99 ms, load 5031 ms  [host: chosen="neural engine" candidates=neural engine: 8.80 ms, gpu: 20.68 ms, cpu: 114.02 ms]
+plugin ORT 1.23.2 yolov9-s-640.onnx: cpu 110.83 ms, ane 12.71 ms, load 4681 ms  [host: chosen="neural engine" candidates=neural engine: 8.70 ms, gpu: 20.85 ms, cpu: 113.51 ms]
+op ORT 1.22.1 yolo11n-320.onnx: cpu 10.92 ms, ane 4.27 ms, load 2057 ms  [host: chosen="neural engine" candidates=neural engine: 2.41 ms, gpu: 4.88 ms, cpu: 11.85 ms]
+plugin ORT 1.23.2 yolo11n-320.onnx: cpu 10.11 ms, ane 4.10 ms, load 2042 ms  [host: chosen="neural engine" candidates=neural engine: 2.45 ms, gpu: 4.84 ms, cpu: 11.83 ms]
+op ORT 1.22.1 yolox_tiny.onnx: cpu 31.34 ms, ane 12.13 ms, load 3621 ms  [host: chosen="neural engine" candidates=neural engine: 6.02 ms, gpu: 7.74 ms, cpu: 31.79 ms]
+plugin ORT 1.23.2 yolox_tiny.onnx: cpu 31.78 ms, ane 12.23 ms, load 2226 ms  [host: chosen="neural engine" candidates=neural engine: 5.81 ms, gpu: 6.89 ms, cpu: 31.74 ms]
+op ORT 1.22.1 yolo_nas_s.onnx: cpu 31.98 ms, ane 6.62 ms, load 6327 ms  [host: chosen="neural engine" candidates=cpu: 34.93 ms, neural engine: 6.23 ms, gpu: 9.37 ms]
+plugin ORT 1.23.2 yolo_nas_s.onnx: cpu 32.23 ms, ane 6.51 ms, load 3127 ms  [host: chosen="neural engine" candidates=neural engine: 6.09 ms, gpu: 9.56 ms, cpu: 35.16 ms]
+op ORT 1.22.1 dfine-s.onnx: cpu 119.92 ms, ane 120.42 ms, load 4507 ms  [host: chosen="cpu" candidates=neural engine: refused, gpu: refused, cpu: the only one]
+plugin ORT 1.23.2 dfine-s.onnx: cpu 119.86 ms, ane 120.69 ms, load 4438 ms  [host: chosen="cpu" candidates=neural engine: refused, gpu: refused, cpu: the only one]
+skip deimv2_hgnetv2_n.onnx: not exported
+op ORT 1.22.1 rfdetr-Nano.onnx: cpu 82.31 ms, ane 38.32 ms, load 54375 ms  [host: chosen="gpu" candidates=neural engine: 112.29 ms, gpu: 29.83 ms, cpu: 91.75 ms]
+plugin ORT 1.23.2 rfdetr-Nano.onnx: cpu 81.74 ms, ane 38.24 ms, load 47747 ms  [host: chosen="gpu" candidates=neural engine: 112.08 ms, gpu: 29.17 ms, cpu: 91.82 ms]
+
+ok   yolov9-t-320.onnx          op     ORT 1.22.1  cpu  12.37 ms  ane   3.34 ms  load   4687 ms  10 confident detections, 0 unmatched
+ok   yolov9-t-320.onnx          plugin ORT 1.23.2  cpu  12.50 ms  ane   3.23 ms  load   2924 ms  10 confident detections, 0 unmatched
+ok   yolov9-s-640.onnx          op     ORT 1.22.1  cpu 110.24 ms  ane  12.99 ms  load   5031 ms  20 confident detections, 0 unmatched
+ok   yolov9-s-640.onnx          plugin ORT 1.23.2  cpu 110.83 ms  ane  12.71 ms  load   4681 ms  20 confident detections, 0 unmatched
+ok   yolo11n-320.onnx           op     ORT 1.22.1  cpu  10.92 ms  ane   4.27 ms  load   2057 ms  11 confident detections, 0 unmatched
+ok   yolo11n-320.onnx           plugin ORT 1.23.2  cpu  10.11 ms  ane   4.10 ms  load   2042 ms  11 confident detections, 0 unmatched
+ok   yolox_tiny.onnx            op     ORT 1.22.1  cpu  31.34 ms  ane  12.13 ms  load   3621 ms  9 confident detections, 0 unmatched
+ok   yolox_tiny.onnx            plugin ORT 1.23.2  cpu  31.78 ms  ane  12.23 ms  load   2226 ms  9 confident detections, 0 unmatched
+ok   yolo_nas_s.onnx            op     ORT 1.22.1  cpu  31.98 ms  ane   6.62 ms  load   6327 ms  15 confident detections, 0 unmatched
+ok   yolo_nas_s.onnx            plugin ORT 1.23.2  cpu  32.23 ms  ane   6.51 ms  load   3127 ms  15 confident detections, 0 unmatched
+ok   dfine-s.onnx               op     ORT 1.22.1  cpu 119.92 ms  ane 120.42 ms  load   4507 ms  42 confident detections, 0 unmatched
+ok   dfine-s.onnx               plugin ORT 1.23.2  cpu 119.86 ms  ane 120.69 ms  load   4438 ms  42 confident detections, 0 unmatched
+ok   rfdetr-Nano.onnx           op     ORT 1.22.1  cpu  82.31 ms  ane  38.32 ms  load  54375 ms  42 confident detections, 0 unmatched
+ok   rfdetr-Nano.onnx           plugin ORT 1.23.2  cpu  81.74 ms  ane  38.24 ms  load  47747 ms  42 confident detections, 0 unmatched
