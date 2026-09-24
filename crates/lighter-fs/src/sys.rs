@@ -753,6 +753,17 @@ const XATTR_NOFOLLOW: libc::c_int = 0x0001;
 const XATTR_CREATE: libc::c_int = 0x0002;
 const XATTR_REPLACE: libc::c_int = 0x0004;
 
+/// Null for an empty buffer. The size of an attribute or a list is asked for
+/// with a null buffer; a zero-length one that is not null (and a Rust slice
+/// always has a pointer) is answered with ERANGE by macOS.
+fn buffer_or_null(buf: &mut [u8]) -> *mut u8 {
+    if buf.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        buf.as_mut_ptr()
+    }
+}
+
 pub fn get_xattr(path: &CStr, name: &CStr, buf: &mut [u8]) -> Result<usize> {
     // SAFETY: two valid NUL-terminated strings and a buffer we own of the
     // length we pass. A null buffer with length zero is how the size is asked
@@ -761,7 +772,7 @@ pub fn get_xattr(path: &CStr, name: &CStr, buf: &mut [u8]) -> Result<usize> {
         libc::getxattr(
             path.as_ptr(),
             name.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
+            buffer_or_null(buf) as *mut libc::c_void,
             buf.len(),
             0,
             XATTR_NOFOLLOW,
@@ -796,7 +807,7 @@ pub fn list_xattr(path: &CStr, buf: &mut [u8]) -> Result<usize> {
     check_size(unsafe {
         libc::listxattr(
             path.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_char,
+            buffer_or_null(buf) as *mut libc::c_char,
             buf.len(),
             XATTR_NOFOLLOW,
         )
