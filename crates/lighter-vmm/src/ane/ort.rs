@@ -118,6 +118,14 @@ fn marker_name(hash: u64, units: Units) -> String {
     format!("{hash:016x}-{}", units.label().replace(' ', "-"))
 }
 
+/// How many runs may race the candidates. A CoreML candidate can fail on one
+/// input and run the next: YOLO-NAS carries its own NMS, and on a frame with
+/// nothing in it (Frigate warms a detector up on zeros) the NMS leaves an
+/// empty tensor its CoreML partition will not take. Failing the first race is
+/// then no verdict, so a candidate that failed races again on the next runs'
+/// inputs, this many races in all.
+const RACES: u32 = 3;
+
 pub struct Session {
     api: &'static sys::OrtApi,
     /// The session in use; while `pending` is not empty, the first candidate.
@@ -126,6 +134,13 @@ pub struct Session {
     /// The other candidates, timed against `session` at the first run and
     /// then released.
     pending: Vec<(Units, *mut sys::OrtSession)>,
+    /// Candidates that failed on a race's input, raced again at the next run.
+    retry: Vec<(Units, *mut sys::OrtSession)>,
+    races: u32,
+    /// The CPU candidate, kept when another unit wins, for the runs the
+    /// winner fails (the same empty tensor, on any frame with nothing in it).
+    fallback: *mut sys::OrtSession,
+    fell_back: bool,
     markers: Option<Markers>,
     inputs: Vec<CString>,
     outputs: Vec<CString>,
@@ -337,6 +352,10 @@ impl Runtime {
             session,
             units,
             pending,
+            retry: Vec::new(),
+            races: 0,
+            fallback: ptr::null_mut(),
+            fell_back: false,
             markers,
             inputs,
             outputs,
@@ -417,10 +436,19 @@ impl Session {
     /// Runs the model. The first run times every candidate on these inputs,
     /// after a warm-up each, and keeps the fastest.
     pub fn run(&mut self, inputs: &[Tensor]) -> Result<Vec<Tensor>, String> {
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || (!self.retry.is_empty() && self.races < RACES) {
             self.choose(inputs);
         }
-        self.run_on(self.session, inputs)
+        match self.run_on(self.session, inputs) {
+            Err(e) if !self.fallback.is_null() => {
+                if !self.fell_back {
+                    self.fell_back = true;
+                    tracing::info!(units = self.units.label(), error = %first_line(&e), "neural engine: a run fell back to the host's CPU");
+                }
+                self.run_on(self.fallback, inputs)
+            }
+            result => result,
+        }
     }
 
     /// Times each candidate: one untimed run to compile and warm, then the
@@ -428,9 +456,20 @@ impl Session {
     /// the choice is a number in the log rather than a guess.
     fn choose(&mut self, inputs: &[Tensor]) {
         let api = self.api;
-        let mut candidates = vec![(self.units, self.session)];
+        // After a race nothing won, `session` is null and is no candidate.
+        let mut candidates = Vec::new();
+        if !self.session.is_null() {
+            candidates.push((self.units, self.session));
+        }
         candidates.append(&mut self.pending);
+        candidates.append(&mut self.retry);
+        if !self.fallback.is_null() {
+            candidates.push((Units::Cpu, self.fallback));
+            self.fallback = ptr::null_mut();
+        }
+        self.races += 1;
         let mut best: Option<(Units, *mut sys::OrtSession, f64)> = None;
+        let mut losers = Vec::new();
         let mut report = Vec::new();
         for (units, session) in candidates {
             // The marker outlives a crash: if CoreML takes the process down
@@ -446,9 +485,13 @@ impl Session {
             if let Some(path) = &marker {
                 let _ = std::fs::remove_file(path);
             }
-            if warmed.is_err() {
-                report.push(format!("{}: failed", units.label()));
-                unsafe { (api.ReleaseSession.unwrap())(session) };
+            if let Err(e) = &warmed {
+                report.push(format!("{}: failed ({})", units.label(), first_line(e)));
+                if self.races < RACES {
+                    self.retry.push((units, session));
+                } else {
+                    unsafe { (api.ReleaseSession.unwrap())(session) };
+                }
                 continue;
             }
             let mut fastest = f64::MAX;
@@ -461,14 +504,21 @@ impl Session {
             }
             report.push(format!("{}: {:.2} ms", units.label(), fastest));
             match best {
-                Some((_, _, ms)) if ms <= fastest => {
-                    unsafe { (api.ReleaseSession.unwrap())(session) };
-                }
-                Some((_, previous, _)) => {
-                    unsafe { (api.ReleaseSession.unwrap())(previous) };
+                Some((_, _, ms)) if ms <= fastest => losers.push((units, session)),
+                Some((previous_units, previous, _)) => {
+                    losers.push((previous_units, previous));
                     best = Some((units, session, fastest));
                 }
                 None => best = Some((units, session, fastest)),
+            }
+        }
+        // The CPU candidate outlives a race it lost, to answer the runs the
+        // winner cannot; the rest are released.
+        for (units, session) in losers {
+            if units == Units::Cpu {
+                self.fallback = session;
+            } else {
+                unsafe { (api.ReleaseSession.unwrap())(session) };
             }
         }
         match best {
@@ -618,11 +668,19 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if !self.session.is_null() {
-            unsafe { (self.api.ReleaseSession.unwrap())(self.session) };
+        for session in [self.session, self.fallback] {
+            if !session.is_null() {
+                unsafe { (self.api.ReleaseSession.unwrap())(session) };
+            }
         }
-        for (_, session) in self.pending.drain(..) {
+        for (_, session) in self.pending.drain(..).chain(self.retry.drain(..)) {
             unsafe { (self.api.ReleaseSession.unwrap())(session) };
         }
     }
+}
+
+/// The first line of an ONNX Runtime error, short enough for a log line and
+/// enough to tell a missing op from an unbounded dimension.
+fn first_line(e: &str) -> String {
+    e.lines().next().unwrap_or("").chars().take(160).collect()
 }
