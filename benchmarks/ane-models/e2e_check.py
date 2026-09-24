@@ -12,7 +12,7 @@ ok = (
     and camera["skipped_fps"] == 0
     and inference > 0
     and "Neural Engine" in loaded
-    and "lighter_ane" in probe
+    and ("lighter_ane" in probe or "Apple Neural Engine" in probe)
 )
 print(
     ("ok  " if ok else "FAIL")

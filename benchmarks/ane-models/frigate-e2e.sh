@@ -12,6 +12,9 @@ CACHE="$HERE/../.cache/ane-models"
 IMAGE="${FRIGATE_IMAGE:?FRIGATE_IMAGE names a Frigate image with the lighter_ane detector}"
 CLIP="${CLIP:?CLIP is a camera clip to replay}"
 SETTLE="${SETTLE:-60}"
+# The detector the model runs on: `onnx` for Frigate with ONNX Runtime 1.23+,
+# which picks up the Neural Engine provider itself.
+export DEVICE="${DEVICE:-lighter_ane}"
 
 MODELS=(
 	"yolov9-t-320.onnx yolo-generic 320 320 float rgb"
@@ -60,7 +63,7 @@ models:
     input_pixel_format: $6
     labelmap_path: /labelmap/coco-80.txt
     devices:
-      - lighter_ane
+      - $DEVICE
 version: 0.19-0
 EOF
 	c=$(docker create --device lighter.sh/ane=all --device lighter.sh/video=all --shm-size 256m "$IMAGE")
