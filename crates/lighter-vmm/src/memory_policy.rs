@@ -475,10 +475,18 @@ impl Steering {
             .compression
             .lock()
             .expect("compression policy poisoned");
-        !state.pressed(self.level.load(Ordering::Relaxed), Instant::now())
-            && state
-                .host_room
-                .is_some_and(|room| room >= bytes.saturating_mul(2))
+        let pressed = state.pressed(self.level.load(Ordering::Relaxed), Instant::now());
+        let room = state.host_room.unwrap_or(0);
+        let yes = !pressed && room >= bytes.saturating_mul(2);
+        if !yes {
+            tracing::debug!(
+                pressed,
+                room_mib = room >> 20,
+                step_mib = bytes >> 20,
+                "cache waits: no room on the Mac for the guest to grow"
+            );
+        }
+        yes
     }
 
     /// The guest's memory line, with a range to size (`size_range`).
