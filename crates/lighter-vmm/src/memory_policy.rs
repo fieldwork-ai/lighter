@@ -159,8 +159,8 @@ const OVERCOMMITTED_RELEASE_FRACTION_NUM: u64 = 5;
 /// stopped being scheduled, and its last line had said it was fine.
 const INFLATION_STALL: Duration = Duration::from_secs(3);
 const STALL_PROGRESS_BYTES: u64 = 4 << 20;
-/// The least a range grows by when the guest is short: a small guest
-/// doubles, a tiny one gets this.
+/// What a range grows by on a need while the Mac is under pressure: the
+/// least step, with the throttle pacing the work meanwhile.
 const GROW_STEP_MIN: u64 = 256 << 20;
 /// Memory a guest with a range keeps available ahead of its work, as a
 /// fraction of what it has: a quarter, and never under `HEADROOM_MIN`. The
@@ -466,6 +466,14 @@ impl Steering {
             .map_or(self.ram_bytes, |m| m.state().total_bytes())
     }
 
+    /// Whether the Mac is under pressure by any of its signs.
+    fn pressed(&self) -> bool {
+        self.compression
+            .lock()
+            .expect("compression policy poisoned")
+            .pressed(self.level.load(Ordering::Relaxed), Instant::now())
+    }
+
     /// Whether the Mac could give the guest `bytes` for its cache: under no
     /// pressure by any sign, and with twice that as room at the last sample.
     /// Room, not free pages: a Mac with a warm file cache of its own shows
@@ -500,7 +508,9 @@ impl Steering {
         let state = mem.state();
         let plugged = state.plugged_bytes();
         let demand = if need {
-            Demand::Need
+            Demand::Need {
+                pressed: self.pressed(),
+            }
         } else if release && self.room_for(headroom(state.total_bytes())) {
             Demand::Room
         } else {
@@ -1466,10 +1476,12 @@ enum Sizing {
 ///
 /// - Nothing moves while the guest is still plugging the last offer, so the
 ///   next line is measured against memory the guest actually has.
-/// - `need` (work short of memory, or its containers stalled at the
-///   throttle) doubles what the guest has, up to the range, in one offer: a
-///   plug lands in tens of milliseconds and the next line says whether it
-///   was enough.
+/// - `Need` (work short of memory, or its containers stalled at the
+///   throttle) grows the guest by a headroom, up to the range, and again on
+///   each line while it lasts: a plug lands in tens of milliseconds and a
+///   busy guest's lines come every quarter-second. With the Mac under
+///   pressure it grows by `GROW_STEP_MIN` instead, and the throttle paces
+///   the work rather than the Mac swapping for it.
 /// - `Room` (free memory low but available memory fine: page cache filling
 ///   the guest, with the Mac under no pressure and memory to spare) grows
 ///   by a headroom, so a working set of files stays cached as it would in
@@ -1508,7 +1520,8 @@ fn size_range(range: Range, line: GuestLine, demand: Demand) -> Sizing {
         }
     };
     match demand {
-        Demand::Need => return grow_to(plugged.saturating_add(total.max(GROW_STEP_MIN))),
+        Demand::Need { pressed: false } => return grow_to(plugged.saturating_add(headroom)),
+        Demand::Need { pressed: true } => return grow_to(plugged.saturating_add(GROW_STEP_MIN)),
         Demand::Room => return grow_to(plugged.saturating_add(headroom)),
         Demand::None => {}
     }
@@ -1536,8 +1549,15 @@ fn size_range(range: Range, line: GuestLine, demand: Demand) -> Sizing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Demand {
     /// Work short of memory: under an eighth available, stalled, or at the
-    /// throttle's edge. Doubles the guest at any host level.
-    Need,
+    /// throttle's edge. Grows the guest at any host level, by less when the
+    /// Mac is `pressed`. It once doubled the guest, sized for bursts before
+    /// the throttle held them at the edge: on an 8 GB M1 a yarn install
+    /// took a 3.5 GiB guest to its 6 GiB ceiling in one offer, the Mac was
+    /// overcommitted six seconds later, and it decompressed 3.4 times the
+    /// pages it did for a fixed 4 GiB guest over the same cases.
+    Need {
+        pressed: bool,
+    },
     /// The guest asking for its reserve back (free memory under half of it)
     /// with available memory fine, which is page cache filling free memory,
     /// on a Mac with room for it. On a Mac without, the guest reclaims its
@@ -1711,6 +1731,7 @@ mod tests {
     }
 
     const GIB: u64 = 1 << 30;
+    const NEED: Demand = Demand::Need { pressed: false };
 
     fn range(plugged: u64, requested: u64) -> Range {
         Range {
@@ -1734,26 +1755,40 @@ mod tests {
     #[test]
     fn a_plug_in_flight_is_waited_for() {
         assert_eq!(
-            size_range(range(GIB, 2 * GIB), line(0, 0), Demand::Need),
+            size_range(range(GIB, 2 * GIB), line(0, 0), NEED),
             Sizing::Wait
         );
     }
 
-    /// A need doubles what the guest has, in whole blocks, up to the range.
+    /// A need grows the guest by a headroom, in whole blocks, up to the
+    /// range; with the Mac under pressure, by the least step.
     #[test]
-    fn a_need_doubles_the_guest() {
-        // 2 GiB base + 2 GiB plugged: 4 GiB more.
+    fn a_need_grows_the_guest_by_a_headroom() {
+        // 2 GiB base + 2 GiB plugged: a quarter of 4 GiB, 1 GiB more.
         assert_eq!(
-            size_range(range(2 * GIB, 2 * GIB), line(0, 4096), Demand::Need),
-            Sizing::Resize(6 * GIB)
+            size_range(range(2 * GIB, 2 * GIB), line(0, 0), NEED),
+            Sizing::Resize(3 * GIB)
+        );
+        // 16 GiB guest (14 plugged): 4 GiB more.
+        assert_eq!(
+            size_range(range(14 * GIB, 14 * GIB), line(0, 0), NEED),
+            Sizing::Resize(18 * GIB)
         );
         let full = Range {
-            region: 3 * GIB,
+            region: 5 * GIB / 2,
             ..range(2 * GIB, 2 * GIB)
         };
         assert_eq!(
-            size_range(full, line(0, 0), Demand::Need),
-            Sizing::Resize(3 * GIB)
+            size_range(full, line(0, 0), NEED),
+            Sizing::Resize(5 * GIB / 2)
+        );
+        assert_eq!(
+            size_range(
+                range(2 * GIB, 2 * GIB),
+                line(0, 0),
+                Demand::Need { pressed: true }
+            ),
+            Sizing::Resize(2 * GIB + GROW_STEP_MIN)
         );
     }
 
@@ -1864,9 +1899,10 @@ mod tests {
             size_range(unplugging, line(4096, 6144), Demand::None),
             Sizing::Wait
         );
+        // An 8 GiB guest: a headroom of 2 GiB on what is plugged.
         assert_eq!(
-            size_range(unplugging, line(0, 0), Demand::Need),
-            Sizing::Resize(14 * GIB)
+            size_range(unplugging, line(0, 0), NEED),
+            Sizing::Resize(8 * GIB)
         );
     }
 

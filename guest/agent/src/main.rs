@@ -663,7 +663,7 @@ fn offer_memory(
     // With a range to grow into, work that has less than a quarter of the
     // guest available asks for more before it is short — available, not
     // free, because the cache it could reclaim is its own working set and
-    // reclaiming it is the cost this avoids. The host doubles the guest.
+    // reclaiming it is the cost this avoids. The host grows the guest.
     // And by the harm itself: pressure stall information says how much of
     // the last ten seconds every task spent waiting on memory. A tenth of
     // it is a guest that is short whatever its free counts say (the M5's
