@@ -1,0 +1,19 @@
+commit=2b6ef0c1-dirty
+date=2026-09-25T16:23Z
+host=homeserver
+host.node=v26.8.1
+host.npm=11.19.0
+host.pnpm=10.28.0
+host.yarn=1.22.22
+extra_warm_cases=
+image_id=sha256:5905c428a3a6ac1c1b57855c79e26f959d107180404a58114f718fbb69d5d58c
+runtime_source=2b6ef0c1de30dbc9357f217a1730c85f2e177c28
+cpus=8 memory_mib=4096 disk_gib=64
+lighter-bench=4f2c64bc231de4f9fe04951f12bfc22e
+lighter-bench.sha256=3fe3176a0973fb96cf79f39107e695be9658b2de1f340751758783299c067e7f
+Image=7779d43a03d6db4cc91f6ed3e1b261c0
+Image.sha256=caf09a88e08eeef2bd66c9381cb5131d1e4319fbc0bfa04318336376c1b6f1e7
+rootfs.ext4=1593b2d3a5b2583e69cf51735d231d3b
+rootfs.ext4.sha256=d9c33cba005a652adebdefdc2cf2286b99faea7844d90ebf3d1bd68c73dc5b52
+lighter-agent=0531e3bf0511b1e5e9d89e7146f400c1
+lighter-agent.sha256=466ac083462418fc93b74158366703c6196b711072bfc7df846357d4b12f6f08
