@@ -35,7 +35,7 @@ services:
     ports:
       - "19000:9000"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "/opt/bitnami/minio-client/bin/mc", "ready", "local"]
       interval: 3s
       timeout: 5s
       retries: 20
