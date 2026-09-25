@@ -362,14 +362,17 @@ impl Machine {
         virtio.push(Box::new(Rng::from_host()?));
         let balloon_slot = virtio.len();
         virtio.push(Box::new(Balloon::new(balloon_state.clone())));
-        // virtio-mem, when the machine has a range: offered whole to begin
-        // with, or `LIGHTER_MEM_PLUG_MIB` of it, until the policy decides.
+        // virtio-mem, when the machine has a range: none of it offered to
+        // begin with (or `LIGHTER_MEM_PLUG_MIB` of it), so the guest boots on
+        // its base and grows by the policy's headroom and its needs. Offered
+        // whole, as before the headroom, a Mac-sized range was plugged at
+        // every boot and only the idle shrink ever took it back.
         let mem_state = layout.hotplug.map(|hotplug| {
             let offered = std::env::var("LIGHTER_MEM_PLUG_MIB")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(|mib| mib << 20)
-                .unwrap_or(hotplug.size);
+                .unwrap_or(0);
             let state = Arc::new(crate::virtio::mem::MemState::new(
                 config.ram_bytes,
                 hotplug.base,
