@@ -64,6 +64,11 @@ pub enum MachineError {
     )]
     NoHypervisor,
     #[error(
+        "the guest's memory map reaches {top:#x}, past the {max_bits}-bit address space \
+         this Mac's hypervisor allows; lower the memory ceiling"
+    )]
+    AddressSpace { top: u64, max_bits: u32 },
+    #[error(
         "{count} virtio devices requested but the memory map has only {} slots",
         crate::layout::VIRTIO_MMIO_SLOTS
     )]
@@ -184,6 +189,39 @@ pub struct Machine {
     memory_preparation: Option<JoinHandle<()>>,
 }
 
+/// Bits of guest-physical address needed to reach `top`.
+fn ipa_bits_for(top: u64) -> u32 {
+    64 - top.saturating_sub(1).leading_zeros()
+}
+
+/// The VM, with the default address space when the map fits in it and the
+/// narrowest wider one that fits otherwise.
+fn create_vm(top: u64) -> Result<Vm, MachineError> {
+    let needed = ipa_bits_for(top);
+    let default = Vm::default_ipa_bits()?;
+    if needed <= default {
+        return Ok(Vm::create()?);
+    }
+    let max_bits = Vm::max_ipa_bits()?;
+    if needed > max_bits {
+        return Err(MachineError::AddressSpace { top, max_bits });
+    }
+    Ok(Vm::create_with_ipa_bits(Some(needed))?)
+}
+
+/// The most RAM, base and range together, a guest can have on this Mac with
+/// windows of `gpu_bytes` and `video_bytes` above it: what the widest
+/// address space the hypervisor allows can hold. `None` when it cannot say.
+pub fn max_ram_bytes(gpu_bytes: u64, video_bytes: u64) -> Option<u64> {
+    let limit = 1u64 << Vm::max_ipa_bits().ok()?;
+    // The windows go above RAM on 1 GiB boundaries; a gigabyte for each
+    // boundary's rounding, and a block for the range's.
+    let above = gpu_bytes.div_ceil(1 << 30) * (1 << 30)
+        + video_bytes.div_ceil(1 << 30) * (1 << 30)
+        + (3 << 30);
+    Some(limit.saturating_sub(GuestLayout::RAM_BASE + above))
+}
+
 impl Machine {
     /// Builds a machine and starts every core.
     pub fn start(config: &MachineConfig) -> Result<Machine, MachineError> {
@@ -192,8 +230,24 @@ impl Machine {
             return Err(MachineError::NoHypervisor);
         }
 
-        // 1. The VM must exist before anything else can be created for it.
-        let vm = Arc::new(Vm::create()?);
+        // 1. The VM must exist before anything else can be created for it,
+        //    and its address space is fixed when it does: wide enough for the
+        //    memory map's top, which a Mac-sized virtio-mem range can put past
+        //    the default (36 bits, 64 GiB, on the M1).
+        let vm = Arc::new(create_vm(GuestLayout::top_for(
+            config.ram_bytes,
+            config.hotplug_bytes,
+            if config.gpu {
+                config.gpu_aperture_bytes
+            } else {
+                0
+            },
+            if config.video {
+                config.video_aperture_bytes
+            } else {
+                0
+            },
+        ))?);
 
         // 2. The GIC comes before the layout, not after. Its windows sit at
         //    fixed addresses that are ours to choose, but its *sizes* are the
@@ -1079,6 +1133,14 @@ fn starts_a_container(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_address_space_reaches_the_top() {
+        assert_eq!(ipa_bits_for(1 << 36), 36);
+        assert_eq!(ipa_bits_for((1 << 36) + 1), 37);
+        assert_eq!(ipa_bits_for(50 << 30), 36);
+        assert_eq!(ipa_bits_for(70 << 30), 37);
+    }
 
     #[test]
     fn container_requests_are_inspected_across_every_socket_boundary() {

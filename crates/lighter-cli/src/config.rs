@@ -159,6 +159,13 @@ impl Config {
             // part of the range costs anything, page array included.
             Resources::Native => {
                 let ceiling = host.saturating_sub(NATIVE_MARGIN_MIB).max(2048);
+                // And what the widest address space this Mac's hypervisor
+                // allows can hold, beside the GPU's and the decoder's windows.
+                let ceiling = lighter_vmm::machine::max_ram_bytes(
+                    crate::run::GPU_APERTURE_BYTES,
+                    crate::run::VIDEO_APERTURE_BYTES,
+                )
+                .map_or(ceiling, |max| ceiling.min(max >> 20));
                 self.memory_mib
                     .map_or(ceiling, |cap| cap.clamp(2048, ceiling))
             }

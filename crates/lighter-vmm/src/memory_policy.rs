@@ -171,6 +171,9 @@ const GROW_STEP_MIN: u64 = 256 << 20;
 /// edge until the plug lands rather than calling the OOM killer. Bigger
 /// guests run bigger work, hence a fraction.
 const HEADROOM_FRACTION: u64 = 4;
+/// How long a floor set by an unplug the guest could not finish holds before
+/// a shrink may try under it again, if the guest has not grown meanwhile.
+const UNPLUG_FLOOR_HOLD: Duration = Duration::from_secs(600);
 const HEADROOM_MIN: u64 = 1 << 30;
 
 /// The headroom for a guest of `total` bytes.
@@ -201,6 +204,7 @@ impl MemoryPolicy {
             ram_bytes,
             mem,
             last_line: Mutex::new(GuestLine::default()),
+            unplug_floor: Mutex::new(None),
             vsock: Some(vsock.clone()),
             reclaiming: Arc::new(AtomicBool::new(false)),
             warm_gain: Arc::new(Mutex::new(None)),
@@ -416,6 +420,13 @@ struct Steering {
     /// ends, and an idle guest sends nothing new: the policy's loop asks
     /// again (`resize_again`).
     last_line: Mutex<GuestLine>,
+    /// What was plugged when an unplug could not finish, and when: blocks
+    /// holding the kernel's pages (auto-movable onlines about half of a big
+    /// growth as kernel memory, the price of a kernel that never starves)
+    /// stay until the guest grows again or the hold has passed, rather than
+    /// the guest's driver retrying a minute's worth of migration every time
+    /// a line has spare.
+    unplug_floor: Mutex<Option<(u64, Instant)>>,
     /// The way to the guest's agent, for a reclaim request ahead of the
     /// balloon; none in the tests.
     vsock: Option<Arc<crate::virtio::vsock::VsockShared>>,
@@ -461,13 +472,23 @@ impl Steering {
         let Some(mem) = &self.mem else { return false };
         *self.last_line.lock().expect("last line poisoned") = line;
         let state = mem.state();
+        let plugged = state.plugged_bytes();
+        let floor = {
+            let mut floor = self.unplug_floor.lock().expect("unplug floor poisoned");
+            if floor.is_some_and(|(at, since)| plugged > at || since.elapsed() >= UNPLUG_FLOOR_HOLD)
+            {
+                *floor = None;
+            }
+            floor.map_or(0, |(at, _)| at)
+        };
         let decision = size_range(
             Range {
-                plugged: state.plugged_bytes(),
+                plugged,
                 requested: state.requested_bytes(),
                 total: state.total_bytes(),
                 region: state.region_bytes(),
                 held: mem.held(),
+                floor,
             },
             line,
             need,
@@ -855,8 +876,10 @@ impl Steering {
             let plugged = mem.state().plugged_bytes();
             tracing::info!(
                 plugged_mib = plugged >> 20,
-                "virtio-mem: an unplug the guest could not finish; keeping the block"
+                "virtio-mem: an unplug the guest could not finish; this is the floor until it grows"
             );
+            *self.unplug_floor.lock().expect("unplug floor poisoned") =
+                Some((plugged, Instant::now()));
             mem.request(plugged);
             return;
         }
@@ -1377,6 +1400,9 @@ struct Range {
     region: u64,
     /// A growth was recent enough that a shrink waits.
     held: bool,
+    /// Plugged size a shrink does not go under (an unplug that could not
+    /// finish); zero for none.
+    floor: u64,
 }
 
 /// What a line does to the range.
@@ -1413,6 +1439,7 @@ fn size_range(range: Range, line: GuestLine, need: bool) -> Sizing {
         total,
         region,
         held,
+        floor,
     } = range;
     if requested > plugged {
         return Sizing::Wait;
@@ -1437,9 +1464,10 @@ fn size_range(range: Range, line: GuestLine, need: bool) -> Sizing {
         return grow_to(plugged + (headroom - avail));
     }
     let spare = line.spare_mib << 20;
-    if plugged > 0 && spare >= BLOCK_SIZE && !held {
+    if plugged > floor && spare >= BLOCK_SIZE && !held {
         let keep = headroom + headroom / 2;
-        let give = spare.min(avail.saturating_sub(keep)) / BLOCK_SIZE * BLOCK_SIZE;
+        let give =
+            spare.min(avail.saturating_sub(keep)).min(plugged - floor) / BLOCK_SIZE * BLOCK_SIZE;
         if give > 0 {
             return Sizing::Resize(plugged.saturating_sub(give));
         }
@@ -1616,6 +1644,7 @@ mod tests {
             total: 2 * GIB + plugged,
             region: 44 * GIB,
             held: false,
+            floor: 0,
         }
     }
 
@@ -1703,6 +1732,24 @@ mod tests {
         );
     }
 
+    /// A floor from an unplug that could not finish bounds the shrink.
+    #[test]
+    fn a_shrink_stops_at_the_floor() {
+        let floored = Range {
+            floor: 5 * GIB,
+            ..range(6 * GIB, 6 * GIB)
+        };
+        assert_eq!(
+            size_range(floored, line(4096, 6144), false),
+            Sizing::Resize(5 * GIB)
+        );
+        let at_floor = Range {
+            floor: 6 * GIB,
+            ..range(6 * GIB, 6 * GIB)
+        };
+        assert_eq!(size_range(at_floor, line(4096, 6144), false), Sizing::Pass);
+    }
+
     /// The top-up and the shrink do not chase each other: a guest topped up
     /// to its headroom has nothing to give back.
     #[test]
@@ -1737,6 +1784,7 @@ mod tests {
             ram_bytes,
             mem: None,
             last_line: Mutex::new(GuestLine::default()),
+            unplug_floor: Mutex::new(None),
             vsock: None,
             reclaiming: Arc::new(AtomicBool::new(false)),
             warm_gain: Arc::new(Mutex::new(None)),

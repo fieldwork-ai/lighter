@@ -73,6 +73,11 @@ fn clonefile(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()>
     Ok(())
 }
 
+/// The GPU's window for host-visible blobs, above the guest's RAM.
+pub const GPU_APERTURE_BYTES: u64 = 8 << 30;
+/// The video decoder's window, above the GPU's.
+pub const VIDEO_APERTURE_BYTES: u64 = 2 << 30;
+
 pub fn machine() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -256,9 +261,9 @@ pub fn machine() -> anyhow::Result<()> {
         // driver would probe it, wait five seconds for a capset that never
         // comes, and every boot would pay that. Doctor says what is missing.
         gpu: config.gpu && lighter_vmm::virtio::gpu::virgl::linked(),
-        gpu_aperture_bytes: 8 << 30,
+        gpu_aperture_bytes: GPU_APERTURE_BYTES,
         video: config.video,
-        video_aperture_bytes: 2 << 30,
+        video_aperture_bytes: VIDEO_APERTURE_BYTES,
     };
 
     let mut machine = Machine::start(&machine_config)?;

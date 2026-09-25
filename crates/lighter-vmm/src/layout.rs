@@ -190,6 +190,37 @@ impl GuestLayout {
         })
     }
 
+    /// The highest guest-physical address in use, past the last window.
+    pub fn top(&self) -> u64 {
+        [Some(self.ram), self.hotplug, self.gpu, self.video]
+            .into_iter()
+            .flatten()
+            .map(|w| w.end())
+            .max()
+            .unwrap_or(self.ram.end())
+    }
+
+    /// `top` for a machine of these sizes, without a GIC to build the rest:
+    /// the address space has to be chosen before the VM exists, and the VM
+    /// before the GIC that the full layout reads. Everything above RAM is
+    /// placed by size alone, so this is the same arithmetic as `new`.
+    pub fn top_for(ram_bytes: u64, hotplug_bytes: u64, gpu_bytes: u64, video_bytes: u64) -> u64 {
+        let block = crate::virtio::mem::BLOCK_SIZE;
+        let align = 1u64 << 30;
+        let ram_end = Self::RAM_BASE + ram_bytes;
+        let above = if hotplug_bytes > 0 {
+            ram_end.div_ceil(block) * block + hotplug_bytes.div_ceil(block) * block
+        } else {
+            ram_end
+        };
+        let gpu_end = (gpu_bytes > 0)
+            .then(|| above.div_ceil(align) * align + gpu_bytes.div_ceil(align) * align);
+        let video_end = (video_bytes > 0).then(|| {
+            gpu_end.unwrap_or(above).div_ceil(align) * align + video_bytes.div_ceil(align) * align
+        });
+        video_end.or(gpu_end).unwrap_or(above)
+    }
+
     /// The MMIO window for one virtio-mmio slot.
     pub fn virtio_slot(&self, index: usize) -> Option<Window> {
         if index >= VIRTIO_MMIO_SLOTS {
@@ -210,6 +241,26 @@ impl GuestLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The top chosen before the VM exists is the top the full layout has.
+    #[test]
+    fn the_top_before_the_vm_is_the_layouts() {
+        const GIB: u64 = 1 << 30;
+        for (ram, hotplug, gpu, video) in [
+            (2 * GIB, 0, 0, 0),
+            (8 * GIB, 0, 4 * GIB, GIB),
+            (2 * GIB, 44 * GIB, 4 * GIB, GIB),
+            ((2 * GIB) + 1, 44 * GIB + 3, 3 * GIB + 7, 0),
+            (2 * GIB, 60 * GIB, 0, 2 * GIB),
+        ] {
+            let layout = GuestLayout::new(&params(), 4, ram, hotplug, gpu, video).unwrap();
+            assert_eq!(
+                GuestLayout::top_for(ram, hotplug, gpu, video),
+                layout.top(),
+                "{ram} {hotplug} {gpu} {video}"
+            );
+        }
+    }
 
     fn params() -> GicParameters {
         // The values this M5 Pro reports; the point of the test is that the
