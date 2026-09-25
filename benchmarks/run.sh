@@ -91,7 +91,7 @@ while [ $# -gt 0 ]; do
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
-[ -n "$TARGET" ] || { echo "--target is required (native|lighter|colima|orbstack|docker-desktop)" >&2; exit 2; }
+[ -n "$TARGET" ] || { echo "--target is required (native|lighter|colima|orbstack|docker-desktop|podman|apple-container)" >&2; exit 2; }
 # A focused repeat can retain the full suite's cache preparation without
 # measuring unrelated package managers again. Selected cases always warm.
 for warm in ${BENCH_EXTRA_WARM_CASES:-}; do
@@ -224,6 +224,13 @@ check_exclusive() {
 	if [ "$TARGET" != orbstack ] \
 		&& { pgrep -x "OrbStack Helper" >/dev/null 2>&1 || pgrep -x "xbin" >/dev/null 2>&1; }; then
 		noisy+=("OrbStack")
+	fi
+	if [ "$TARGET" != podman ] && pgrep -f "/opt/podman/bin/(krunkit|vfkit)" >/dev/null 2>&1; then
+		noisy+=("a Podman machine (podman machine stop)")
+	fi
+	# Apple's services idle once installed; a container is a VM of its own.
+	if [ "$TARGET" != apple-container ] && pgrep -f "container-runtime-linux" >/dev/null 2>&1; then
+		noisy+=("an Apple container (container stop)")
 	fi
 	# Ours too. The `lighter` target starts a machine of its own, and a second
 	# one already running competes with it for exactly the resources being
@@ -386,6 +393,8 @@ docker_context() {
 	colima)         echo "colima" ;;
 	orbstack)       echo "orbstack" ;;
 	docker-desktop) echo "desktop-linux" ;;
+	podman)         echo "${BENCH_PODMAN_CONTEXT:-podman-bench}" ;;
+	apple-container) echo "socktainer" ;;
 	*)              echo "" ;;
 	esac
 }
@@ -409,7 +418,32 @@ PYIMAGE
 	fi
 }
 
+# Podman and Apple's container have no Docker context of their own: one is
+# made here for each, on Podman's API socket and on socktainer's, the bridge
+# that gives Apple's runtime a Docker API. Podman's machine is `BENCH_PODMAN_
+# MACHINE` (default `bench`), made once with `podman machine init --cpus
+# --memory` at the suite's settings.
+PODMAN="${BENCH_PODMAN:-/opt/podman/bin/podman}"
+ensure_target_context() {
+	local host=""
+	case "$TARGET" in
+	podman) host="unix://$("$PODMAN" machine inspect "${BENCH_PODMAN_MACHINE:-bench}" --format '{{.ConnectionInfo.PodmanSocket.Path}}')" ;;
+	apple-container) host="unix://$HOME/.socktainer/container.sock" ;;
+	*) return 0 ;;
+	esac
+	local ctx; ctx="$(docker_context)"
+	docker context inspect "$ctx" >/dev/null 2>&1 \
+		&& docker context update "$ctx" --docker "host=$host" >/dev/null \
+		|| docker context create "$ctx" --docker "host=$host" >/dev/null
+}
+
+RUN_LIMITS=()
+
 setup_container() {
+	ensure_target_context
+	# Apple's container is a VM per container, sized by the run (4 CPUs and
+	# 1 GB unless told), so every run is given the other targets' machine.
+	[ "$TARGET" != apple-container ] || RUN_LIMITS=(--cpus "${BENCH_CPUS:-8}" --memory "$(bench_memory_mib)m")
 	local ctx; ctx="$(docker_context)"
 	SHARE_MOUNT="$WORK"
 	DOCKER_ARGS=()
@@ -432,7 +466,7 @@ run_case_container() {
 	local script
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
-	docker "${DOCKER_ARGS[@]}" run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} \
+	docker "${DOCKER_ARGS[@]}" run --rm ${RUN_LIMITS[@]+"${RUN_LIMITS[@]}"} ${PLATFORM[@]+"${PLATFORM[@]}"} \
 		-v "$(work_mount)":/work \
 		-v "lighter-bench-npm-$TARGET$CACHE_SUFFIX:/root/.npm" \
 		-v "lighter-bench-pnpm-$TARGET$CACHE_SUFFIX:/root/.local/share/pnpm/store" \
@@ -609,7 +643,7 @@ prepare_work
 case "$TARGET" in
 native)                          setup_native;     run_case() { run_case_native "$@"; } ;;
 lighter)                         setup_lighter;    run_case() { run_case_lighter "$@"; } ;;
-colima|orbstack|docker-desktop)  setup_container;  run_case() { run_case_container "$@"; } ;;
+colima|orbstack|docker-desktop|podman|apple-container)  setup_container;  run_case() { run_case_container "$@"; } ;;
 *) echo "unknown target: $TARGET" >&2; exit 2 ;;
 esac
 
@@ -699,6 +733,10 @@ runtime_pids() {
 		if (target=="orbstack") matched=(command ~ /\/OrbStack\.app\/Contents\//)
 		if (target=="colima") matched=(command ~ /\/(limactl|lima-driver|virtiofsd)$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
 		if (target=="docker-desktop") matched=(command ~ /\/com\.docker[^\/]*$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
+		if (target=="podman") matched=(command ~ /^\/opt\/podman\/bin\/(krunkit|vfkit|gvproxy)$/)
+		# Apple container: its services, the runtime helper and VM of each
+		# container, and socktainer, the Docker API it is driven through.
+		if (target=="apple-container") matched=(command ~ /\/(container-apiserver|container-runtime-linux|container-network-vmnet|container-core-images)$/ || command ~ /(^|\/)socktainer$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
 		if (matched) printf "%s ", pid
 	}
 	END { print "" }'
@@ -895,7 +933,14 @@ run_warm_case() {
 # measured against; the egress direction has no native meaning.
 # docker with the target's context, if it has one. bash 3.2 reads an empty
 # array as unbound under `set -u`, and the lighter target's is empty.
-dk() { docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} "$@"; }
+dk() {
+	if [ "${1:-}" = run ] && [ "${#RUN_LIMITS[@]}" -gt 0 ]; then
+		shift
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} run "${RUN_LIMITS[@]}" "$@"
+	else
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} "$@"
+	fi
+}
 NET_CASES=" net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns "
 NET_HOST_PORT="${NET_HOST_PORT:-5399}"
 NET_PUB_PORT="${NET_PUB_PORT:-5398}"
@@ -1111,6 +1156,11 @@ boot_stop() {
 	lighter) LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" stop >/dev/null 2>&1 || true ;;
 	orbstack) orb stop >/dev/null 2>&1 || true ;;
 	colima) colima stop "${BENCH_COLIMA_PROFILE:-default}" >/dev/null 2>&1 || true ;;
+	podman) "$PODMAN" machine stop "${BENCH_PODMAN_MACHINE:-bench}" >/dev/null 2>&1 || true ;;
+	apple-container)
+		pkill -x socktainer 2>/dev/null || true
+		container system stop >/dev/null 2>&1 || true
+		;;
 	docker-desktop)
 		# Wait for Docker Desktop's own graceful shutdown. Broad pkill -f
 		# also matches the guard's --allow-program paths and kills supervision.
@@ -1133,6 +1183,10 @@ boot_start() {
 	orbstack) orb start >>"$BOOT_LOG" 2>&1 & ;;
 	colima) colima start "${BENCH_COLIMA_PROFILE:-default}" --activate=false >>"$BOOT_LOG" 2>&1 & ;;
 	docker-desktop) open -a Docker 2>/dev/null || open -a "Docker Desktop" 2>/dev/null; sleep 0.1 & ;;
+	podman) "$PODMAN" machine start "${BENCH_PODMAN_MACHINE:-bench}" >>"$BOOT_LOG" 2>&1 & ;;
+	# The bridge is part of starting it: after a system restart socktainer
+	# has to be started again (its README).
+	apple-container) { container system start >>"$BOOT_LOG" 2>&1 && exec socktainer --no-docker-context >>"$BOOT_LOG" 2>&1; } & ;;
 	esac
 	BOOT_START_PID=$!
 }
