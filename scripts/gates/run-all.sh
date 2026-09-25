@@ -22,6 +22,7 @@ GATES=(
 	"m4  filesystem:m4-fs.sh"
 	"m5  speed:m5-speed.sh"
 	"m6  memory:m6-memory.sh"
+	"m6n native resources:m6n-native.sh"
 	"m7  x86-64:m7-amd64.sh"
 	"m8  daily driver:m8-daily.sh"
 	"m9  gpu:m9-gpu.sh"

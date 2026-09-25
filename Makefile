@@ -127,6 +127,10 @@ guest: ## Build the guest kernel, agent, initramfs, and root filesystem
 gate-m6-memory: ## M6: memory tracks load, and idling costs nothing
 	@scripts/gates/m6-memory.sh
 
+.PHONY: gate-m6n
+gate-m6n: ## M6n: Mac-native resources: the whole Mac, plugged in as needed
+	@scripts/gates/m6n-native.sh
+
 .PHONY: gate-m7-amd64
 gate-m7-amd64: ## M7: x86-64 containers run
 	@scripts/gates/m7-amd64.sh
