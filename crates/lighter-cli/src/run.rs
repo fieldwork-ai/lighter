@@ -275,6 +275,7 @@ pub fn machine() -> anyhow::Result<()> {
             .cloned()
             .zip(machine.disks().iter().cloned())
             .collect(),
+        machine.mem().cloned(),
     )?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;

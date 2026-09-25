@@ -421,6 +421,13 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
     if let Some(mib) = status.footprint_mib {
         println!("  memory     {mib} MiB");
     }
+    if let Some(memory) = status.memory {
+        println!(
+            "  guest      {} of {} MiB plugged in (Mac-native resources)",
+            memory.base_mib + memory.plugged_mib,
+            memory.base_mib + memory.range_mib
+        );
+    }
     for disk in &status.storage_waiting {
         println!("  storage    Waiting for host disk space; VM running, writes waiting.");
         println!(
