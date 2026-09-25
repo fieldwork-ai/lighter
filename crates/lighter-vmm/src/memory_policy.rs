@@ -174,6 +174,11 @@ const HEADROOM_FRACTION: u64 = 4;
 /// How long a floor set by an unplug the guest could not finish holds before
 /// a shrink may try under it again, if the guest has not grown meanwhile.
 const UNPLUG_FLOOR_HOLD: Duration = Duration::from_secs(600);
+/// While the Mac is under pressure a range grows by `GROW_STEP_MIN` at
+/// most this often, whatever asks: under the throttle's give-up of three
+/// seconds, so a burst held at the edge is still met by growth rather than
+/// the OOM killer, and slow enough that the Mac is not swapping for it.
+const PRESSED_GROW_EVERY: Duration = Duration::from_secs(2);
 const HEADROOM_MIN: u64 = 1 << 30;
 
 /// The headroom for a guest of `total` bytes.
@@ -205,6 +210,7 @@ impl MemoryPolicy {
             mem,
             last_line: Mutex::new(GuestLine::default()),
             unplug_floor: Mutex::new(None),
+            grew_pressed: Mutex::new(None),
             vsock: Some(vsock.clone()),
             reclaiming: Arc::new(AtomicBool::new(false)),
             warm_gain: Arc::new(Mutex::new(None)),
@@ -430,6 +436,8 @@ struct Steering {
     /// the guest's driver retrying a minute's worth of migration every time
     /// a line has spare.
     unplug_floor: Mutex<Option<(u64, Instant)>>,
+    /// When the range last grew while the Mac was under pressure (`Pace`).
+    grew_pressed: Mutex<Option<Instant>>,
     /// The way to the guest's agent, for a reclaim request ahead of the
     /// balloon; none in the tests.
     vsock: Option<Arc<crate::virtio::vsock::VsockShared>>,
@@ -507,10 +515,20 @@ impl Steering {
         *self.last_line.lock().expect("last line poisoned") = line;
         let state = mem.state();
         let plugged = state.plugged_bytes();
+        let pace = if !self.pressed() {
+            Pace::Free
+        } else if self
+            .grew_pressed
+            .lock()
+            .expect("pressed growth poisoned")
+            .is_some_and(|at| at.elapsed() < PRESSED_GROW_EVERY)
+        {
+            Pace::Hold
+        } else {
+            Pace::Step
+        };
         let demand = if need {
-            Demand::Need {
-                pressed: self.pressed(),
-            }
+            Demand::Need
         } else if release && self.room_for(headroom(state.total_bytes())) {
             Demand::Room
         } else {
@@ -532,12 +550,17 @@ impl Steering {
                 region: state.region_bytes(),
                 held: mem.held(),
                 floor,
+                pace,
             },
             line,
             demand,
         );
         match decision {
             Sizing::Resize(target) => {
+                if pace == Pace::Step && target > plugged {
+                    *self.grew_pressed.lock().expect("pressed growth poisoned") =
+                        Some(Instant::now());
+                }
                 mem.request(target);
                 true
             }
@@ -1459,6 +1482,19 @@ struct Range {
     /// Plugged size a shrink does not go under (an unplug that could not
     /// finish); zero for none.
     floor: u64,
+    /// How fast the Mac lets the guest grow.
+    pace: Pace,
+}
+
+/// How fast the Mac lets a range grow, whatever asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    /// The Mac is under no pressure: as far as the line asks.
+    Free,
+    /// Under pressure: `GROW_STEP_MIN`, once per `PRESSED_GROW_EVERY`.
+    Step,
+    /// Under pressure, and the guest grew within the interval: not yet.
+    Hold,
 }
 
 /// What a line does to the range.
@@ -1479,9 +1515,10 @@ enum Sizing {
 /// - `Need` (work short of memory, or its containers stalled at the
 ///   throttle) grows the guest by a headroom, up to the range, and again on
 ///   each line while it lasts: a plug lands in tens of milliseconds and a
-///   busy guest's lines come every quarter-second. With the Mac under
-///   pressure it grows by `GROW_STEP_MIN` instead, and the throttle paces
-///   the work rather than the Mac swapping for it.
+///   busy guest's lines come every quarter-second.
+/// - With the Mac under pressure, any growth is `GROW_STEP_MIN` at most
+///   once per `PRESSED_GROW_EVERY` (`Pace`), and the throttle paces the
+///   work rather than the Mac swapping for it.
 /// - `Room` (free memory low but available memory fine: page cache filling
 ///   the guest, with the Mac under no pressure and memory to spare) grows
 ///   by a headroom, so a working set of files stays cached as it would in
@@ -1502,6 +1539,7 @@ fn size_range(range: Range, line: GuestLine, demand: Demand) -> Sizing {
         region,
         held,
         floor,
+        pace,
     } = range;
     if requested > plugged {
         return Sizing::Wait;
@@ -1509,6 +1547,11 @@ fn size_range(range: Range, line: GuestLine, demand: Demand) -> Sizing {
     let headroom = headroom(total);
     let avail = line.avail_mib << 20;
     let grow_to = |target: u64| {
+        let target = match pace {
+            Pace::Free => target,
+            Pace::Step => target.min(plugged.saturating_add(GROW_STEP_MIN)),
+            Pace::Hold => plugged,
+        };
         let target = target
             .div_ceil(BLOCK_SIZE)
             .saturating_mul(BLOCK_SIZE)
@@ -1520,9 +1563,7 @@ fn size_range(range: Range, line: GuestLine, demand: Demand) -> Sizing {
         }
     };
     match demand {
-        Demand::Need { pressed: false } => return grow_to(plugged.saturating_add(headroom)),
-        Demand::Need { pressed: true } => return grow_to(plugged.saturating_add(GROW_STEP_MIN)),
-        Demand::Room => return grow_to(plugged.saturating_add(headroom)),
+        Demand::Need | Demand::Room => return grow_to(plugged.saturating_add(headroom)),
         Demand::None => {}
     }
     if avail < headroom && plugged < region {
@@ -1549,15 +1590,13 @@ fn size_range(range: Range, line: GuestLine, demand: Demand) -> Sizing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Demand {
     /// Work short of memory: under an eighth available, stalled, or at the
-    /// throttle's edge. Grows the guest at any host level, by less when the
-    /// Mac is `pressed`. It once doubled the guest, sized for bursts before
+    /// throttle's edge. Grows the guest by a headroom at any host level, at
+    /// the Mac's `Pace`. It once doubled the guest, sized for bursts before
     /// the throttle held them at the edge: on an 8 GB M1 a yarn install
     /// took a 3.5 GiB guest to its 6 GiB ceiling in one offer, the Mac was
     /// overcommitted six seconds later, and it decompressed 3.4 times the
     /// pages it did for a fixed 4 GiB guest over the same cases.
-    Need {
-        pressed: bool,
-    },
+    Need,
     /// The guest asking for its reserve back (free memory under half of it)
     /// with available memory fine, which is page cache filling free memory,
     /// on a Mac with room for it. On a Mac without, the guest reclaims its
@@ -1731,7 +1770,7 @@ mod tests {
     }
 
     const GIB: u64 = 1 << 30;
-    const NEED: Demand = Demand::Need { pressed: false };
+    const NEED: Demand = Demand::Need;
 
     fn range(plugged: u64, requested: u64) -> Range {
         Range {
@@ -1741,6 +1780,7 @@ mod tests {
             region: 44 * GIB,
             held: false,
             floor: 0,
+            pace: Pace::Free,
         }
     }
 
@@ -1761,7 +1801,7 @@ mod tests {
     }
 
     /// A need grows the guest by a headroom, in whole blocks, up to the
-    /// range; with the Mac under pressure, by the least step.
+    /// range.
     #[test]
     fn a_need_grows_the_guest_by_a_headroom() {
         // 2 GiB base + 2 GiB plugged: a quarter of 4 GiB, 1 GiB more.
@@ -1782,14 +1822,33 @@ mod tests {
             size_range(full, line(0, 0), NEED),
             Sizing::Resize(5 * GIB / 2)
         );
-        assert_eq!(
-            size_range(
-                range(2 * GIB, 2 * GIB),
-                line(0, 0),
-                Demand::Need { pressed: true }
-            ),
-            Sizing::Resize(2 * GIB + GROW_STEP_MIN)
-        );
+    }
+
+    /// With the Mac under pressure every growth is the least step, once per
+    /// interval: a need, cache, and available memory under the headroom
+    /// alike.
+    #[test]
+    fn a_pressed_mac_paces_every_growth() {
+        let step = Range {
+            pace: Pace::Step,
+            ..range(2 * GIB, 2 * GIB)
+        };
+        let hold = Range {
+            pace: Pace::Hold,
+            ..step
+        };
+        for (demand, avail_mib) in [(NEED, 0), (Demand::Room, 3072), (Demand::None, 256)] {
+            assert_eq!(
+                size_range(step, line(0, avail_mib), demand),
+                Sizing::Resize(2 * GIB + GROW_STEP_MIN),
+                "{demand:?}"
+            );
+            assert_eq!(
+                size_range(hold, line(0, avail_mib), demand),
+                Sizing::Wait,
+                "{demand:?} held"
+            );
+        }
     }
 
     /// Cache filling the guest on a Mac with room grows it by a headroom,
@@ -1962,6 +2021,7 @@ mod tests {
             mem: None,
             last_line: Mutex::new(GuestLine::default()),
             unplug_floor: Mutex::new(None),
+            grew_pressed: Mutex::new(None),
             vsock: None,
             reclaiming: Arc::new(AtomicBool::new(false)),
             warm_gain: Arc::new(Mutex::new(None)),
