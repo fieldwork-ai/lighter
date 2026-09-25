@@ -1193,7 +1193,8 @@ boot_start() {
 	podman) "$PODMAN" machine start "${BENCH_PODMAN_MACHINE:-bench}" >>"$BOOT_LOG" 2>&1 & ;;
 	# The bridge is part of starting it: after a system restart socktainer
 	# has to be started again (its README).
-	apple-container) { container system start >>"$BOOT_LOG" 2>&1 && exec socktainer --no-docker-context >>"$BOOT_LOG" 2>&1; } & ;;
+	# socktainer is a daemon, detached: the start is waited for.
+	apple-container) { container system start >>"$BOOT_LOG" 2>&1 && { nohup socktainer --no-docker-context >>"$BOOT_LOG" 2>&1 </dev/null & }; } & ;;
 	esac
 	BOOT_START_PID=$!
 }
