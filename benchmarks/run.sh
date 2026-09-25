@@ -337,7 +337,14 @@ seed_guest_volume() {
 	"${dk[@]}" volume create "$volume" >/dev/null
 	local id
 	id="$("${dk[@]}" create -v "$volume:/work" "$IMAGE" true)"
-	"${dk[@]}" cp "$WORK/." "$id:/work"
+	if ! "${dk[@]}" cp "$WORK/." "$id:/work" 2>/dev/null; then
+		# Apple's container (through socktainer) has no root filesystem for a
+		# container that has not started, so `docker cp` into one fails; a
+		# running container copies the same tree in from the share instead.
+		# Setup, untimed, so the path does not enter any number.
+		"${dk[@]}" run --rm ${RUN_LIMITS[@]+"${RUN_LIMITS[@]}"} -v "$volume:/work" -v "$SHARE_MOUNT":/src:ro "$IMAGE" \
+			sh -c 'cp -a /src/. /work/'
+	fi
 	"${dk[@]}" rm "$id" >/dev/null
 }
 
