@@ -229,7 +229,11 @@ fn bound_container_cache() {
     // With a virtio-mem range the guest's size is the host's to set, from
     // the lines this loop sends: `MemTotal` is read again each tick because
     // it moves.
-    let dynamic = std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem").exists();
+    // A device bound to the driver, not the driver: every kernel has the
+    // driver, and a fixed machine taken for a range offered its spare to the
+    // balloon below eight gigabytes and throttled its containers (m6, the
+    // M1, 2026-09-25).
+    let dynamic = virtio_mem_bound();
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -731,7 +735,17 @@ fn psi_avg10(text: &str, line: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// `MemTotal`, in bytes.
+/// Whether a virtio-mem device is bound: its driver's directory holds a link
+/// per device (`virtio3`), beside `bind`, `unbind` and `module`.
+fn virtio_mem_bound() -> bool {
+    std::fs::read_dir("/sys/bus/virtio/drivers/virtio_mem").is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("virtio"))
+    })
+}
+
+/// `MemAvailable`, in bytes.
 fn mem_available() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()?
@@ -742,6 +756,7 @@ fn mem_available() -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
+/// `MemTotal`, in bytes.
 fn mem_total() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()?
