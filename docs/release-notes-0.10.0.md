@@ -17,16 +17,19 @@ Every Mac container runtime, lighter included, asks for a CPU count and a memory
 
 **Bursts slow, they do not OOM.** A process can take memory faster than the Mac can be asked for more: a tmpfs writer fills a 3 GiB base in 140 ms, and the kernel's answer to memory it cannot reclaim is the OOM killer. So the containers' `memory.high` follows the edge of what the guest can give them, and a burst that reaches it is slowed in reclaim while the guest grows, which is how Meta's Senpai and TMO steer memory. If the Mac stops giving (the ceiling, or macOS short itself), the throttle lifts after three seconds and the kernel does what it would have done without it. Page cache never meets the edge; only memory nothing can reclaim does.
 
-Measured on an M5 (gate m6n, 18 vCPUs, a 16 GiB ceiling):
+Gate m6n, on each Mac at the ceiling a person would get there (capped at 16 GiB); the M5 was also doing a working day's jobs, which is where its lateness comes from, behind the guest and native threads alike:
 
-| | |
-|---|---|
-| boot | 2 s, 640 MiB of 16384 plugged, footprint 310 MiB |
-| a 6000 MiB tmpfs burst from the base | 4 s, nothing OOM-killed (throttled 127 times), range grew to 6912 MiB |
-| 300,000 files | 1 s, engine answering promptly |
-| after the work | footprint back to 499 MiB within 5 s; range 6912 → 2560 MiB |
-| idle CPU | 0.38% |
-| Mac thread p99 lateness, all vCPUs busy | 3.6 ms (6.0 behind native threads; 1.3 quiet) |
+| | M5 Pro, 18 vCPUs, 16 GiB | M1, 8 vCPUs, 6 GiB |
+|---|---|---|
+| boot, plugged / footprint | 640 of 16384 MiB / 333 MiB | 0 of 6144 MiB / 306 MiB |
+| a tmpfs burst from the base | 6000 MiB in 4 s, nothing OOM-killed (throttled 343 times) | 3072 MiB in 1 s, nothing OOM-killed (throttled 278 times) |
+| the range, peak → after | 11264 → 4736 MiB | 4096 → 1152 MiB |
+| 300,000 files | 1 s | 1 s |
+| footprint after the work | 554 MiB within 5 s | 450 MiB within 5 s |
+| idle CPU | 0.37% | 0.75% |
+| Mac thread p99 lateness, all vCPUs busy | 6.86 ms (6.75 behind native threads) | 2.52 ms (2.52 behind native threads) |
+
+The benchmark record on the M1, native (8 vCPUs, 6 GiB ceiling) against fixed (8 vCPUs, 4 GiB): memory held a minute after a large install is 706 MiB against 1174, and 748 against 1259 after fifteen seconds. Installs, the network and boot are level. A copy through a share is slower (copy-tree 6.8–8.6 s against 5.1–6.0), and so is starting a container straight after one (270–350 ms against 180): the guest starts small, so a burst of page cache meets reclaim before the range has grown, where a fixed guest had the room from boot. That is the first cost to work on.
 
 The real CLI on the M5 reads 18 cores and a 47104 MiB ceiling; `lighter status` shows what is plugged against it.
 
@@ -37,6 +40,12 @@ The real CLI on the M5 reads 18 cores and a 47104 MiB ceiling; `lighter status` 
 - The ceiling is also capped by the guest address space the hypervisor allows on the chip; lighter picks the narrowest one that fits, before the VM exists.
 
 `docs/architecture.md`, "Mac-native resources", has the design.
+
+## A fixed machine is 0.9.3's
+
+The default is unchanged, and measured so: gate m6 passes every check on the M1 (the balloon plateaus at 2048 MiB of an 8 GiB guest and eases to 608, as on 0.9.3), and the M1's record is level with 0.9.3's on the share, the network, memory and boot (npm 11.8–12.3 s against 11.2–12.9, find-walk 108 ms against 107, boot 728/896 ms against 731/906, idle 331 MiB against 330). Two rows read low in the record and were run again, alternating 0.9.3 and 0.10 three times, each on its own kernel and rootfs: reverse egress read 51.3–52.1k on 0.10 against 51.3–52.2k on 0.9.3, and a copy on the guest's own disk 3.32 s on average against 3.72.
+
+On the way it caught one bug of its own: the guest took the virtio-mem driver, which every kernel now has, for a range, so a fixed 8 GiB guest offered its spare memory to the balloon and throttled its containers. It now asks whether a device is bound.
 
 ## Also
 
