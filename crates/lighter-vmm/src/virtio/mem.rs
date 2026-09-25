@@ -251,6 +251,12 @@ impl MemControl {
     /// own time, and `plugged_bytes` says how far it has got.
     pub fn request(&self, bytes: u64) -> u64 {
         let before = self.state.requested_bytes();
+        // The same offer again is no offer: it would restart the clock that
+        // says an unplug is stuck (`stuck`), and wake the guest's driver into
+        // another pass at blocks it could not unplug a second ago.
+        if Self::round_to_blocks(bytes.min(self.state.region_bytes())) == before {
+            return before;
+        }
         let rounded = self.state.set_requested_bytes(bytes);
         let now = monotonic_ms();
         self.state.changed_at.store(now, Ordering::Relaxed);
@@ -267,6 +273,10 @@ impl MemControl {
             "virtio-mem offer"
         );
         rounded
+    }
+
+    fn round_to_blocks(bytes: u64) -> u64 {
+        bytes / BLOCK_SIZE * BLOCK_SIZE
     }
 
     /// Whether the offer went up recently enough that it should not come

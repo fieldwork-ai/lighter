@@ -1463,6 +1463,11 @@ fn size_range(range: Range, line: GuestLine, need: bool) -> Sizing {
     if avail < headroom && plugged < region {
         return grow_to(plugged + (headroom - avail));
     }
+    // An unplug still in flight is waited for, not asked again: the guest's
+    // driver is working through it, and the next line reads what it did.
+    if requested < plugged {
+        return Sizing::Wait;
+    }
     let spare = line.spare_mib << 20;
     if plugged > floor && spare >= BLOCK_SIZE && !held {
         let keep = headroom + headroom / 2;
@@ -1729,6 +1734,20 @@ mod tests {
         assert_eq!(
             size_range(range(6 * GIB, 6 * GIB), line(4096, 3072), false),
             Sizing::Pass
+        );
+    }
+
+    /// An unplug in flight is not asked again, but a need still grows.
+    #[test]
+    fn an_unplug_in_flight_waits_unless_work_needs_more() {
+        let unplugging = range(6 * GIB, 4 * GIB);
+        assert_eq!(
+            size_range(unplugging, line(4096, 6144), false),
+            Sizing::Wait
+        );
+        assert_eq!(
+            size_range(unplugging, line(0, 0), true),
+            Sizing::Resize(14 * GIB)
         );
     }
 

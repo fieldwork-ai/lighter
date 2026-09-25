@@ -174,57 +174,15 @@ else
 fi
 
 # -------------------------------------------------------------------- idle --
-# -------------------------------------------------------------- the range --
-# The guest boots with a base and a virtio-mem range (a quarter of the
-# configured memory and the rest). With nothing running the range comes back
-# out, page arrays and all, and that is the idle floor; a container start
-# makes the guest whole again before dockerd sees the request, so what runs
-# inside sees the configured size.
-echo
-echo "==> The range: out when nothing runs, whole for a container"
-# Not to zero: the range's blocks online by the kernel's auto-movable
-# policy (guest patch 0026), and a block that came up as kernel memory
-# stays plugged for as long as it holds an unmovable page — a few blocks,
-# variable, and plugged is not used: their free pages are reported and
-# their page arrays are 1.5% of them. What must not stay is the range as
-# a whole, so a residue of up to 768 MiB of the 6 GiB is the bound.
-RANGE_RESIDUE_MIB=768
-waited=0
-while [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ] && [ "$waited" -lt 60 ]; do
-	sleep 2
-	waited=$((waited + 2))
-done
-if [ "$(field plugged_mib)" -le "$RANGE_RESIDUE_MIB" ]; then
-	pass "the range came out ${waited}s after the last container left ($(field plugged_mib) MiB of kernel-zone blocks left plugged); footprint $(footprint) MiB"
-else
-	fail "the range is still $(field plugged_mib) MiB plugged after ${waited}s with nothing running"
-fi
+# ------------------------------------------------------------------ whole --
+# One zone since 0.7.2: a container sees the configured memory, always.
 SEEN_KB="$(docker run --rm alpine:3.21 awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 if [ "${SEEN_KB:-0}" -ge $((8192 * 1024 * 95 / 100)) ]; then
 	pass "a container saw MemTotal $((SEEN_KB / 1024)) MiB of the 8192 configured"
 else
-	fail "a container saw MemTotal $((${SEEN_KB:-0} / 1024)) MiB; the guest was not made whole for it"
+	fail "a container saw MemTotal $((${SEEN_KB:-0} / 1024)) MiB"
 fi
-
-# The MemTotal probe just plugged the whole range back in. Its growth hold
-# and subsequent unplug are load transitions, not idle CPU. Wait for that
-# observable transition to end before measuring idle, with the same bounded
-# reclaim requirement as above.
-waited=0
-# Reports arrive every two seconds; the last one may still describe the
-# pre-probe state. Require a new report before trusting its plugged size.
-report_before="$(grep -ac 'FOOTPRINT' "$LOG")"
-while { [ "$(grep -ac 'FOOTPRINT' "$LOG")" -le "$report_before" ] \
-	|| [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ]; } && [ "$waited" -lt 60 ]; do
-	sleep 1
-	waited=$((waited + 1))
-done
-if [ "$(grep -ac 'FOOTPRINT' "$LOG")" -le "$report_before" ] \
-	|| [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ]; then
-	fail "range did not settle after the MemTotal probe"
-else
-	pass "range settled after the MemTotal probe (${waited}s)"
-fi
+sleep 10
 
 echo
 echo "==> Watching an idle machine for ${IDLE_SECONDS}s"
@@ -258,9 +216,7 @@ echo "==> A host pressure floor against a guest with no memory to spare"
 # A tmpfs of most of RAM leaves the guest under an eighth available, which
 # is its own line for "short"; the loop keeps it busy, and counts, so its
 # progress under the floor can be read.
-# An idle container beside it keeps the guest whole, as a daily machine
-# is: with nothing running the range leaves and the guest is its base,
-# where the ramp's smallest step is a large share of a small balloon.
+# An idle container beside it, as a daily machine has.
 docker run -d --name m6-keeper alpine:3.21 sleep 900 >/dev/null 2>&1 || fail "could not start the keeper"
 sleep 5
 SHORT_MIB=7168
@@ -296,24 +252,22 @@ puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
 [ "$puffs" -le 10 ] && pass "${puffs} failed inflations while held" || fail "${puffs} failed inflations: the driver is retrying against a guest with nothing to give"
 docker rm -f m6-short >/dev/null 2>&1
 # With the container gone the guest is fine again and, five seconds later,
-# the ramp climbs: a 32nd of the guest a second to a quarter of what it has
-# by then, which is the base and whatever of the range is still plugged,
-# since with nothing running the range is on its way out. The guest gives
-# cache, not failures. The driver may be a batch short.
+# the ramp climbs: a 32nd of the guest a second to a quarter of it. The
+# guest gives cache, not failures. The driver may be a batch short.
 puffs_before="$(grep -ac 'Out of puff' "$LOG" || true)"
 waited=0
 while :; do
 	held="$(field ballooned_mib)"
-	expected=$(( (2048 + $(field plugged_mib)) / 4 - 64 ))
+	expected=$(( 8192 / 4 - 64 ))
 	[ "${held:-0}" -ge "$expected" ] && break
 	[ "$waited" -ge 60 ] && break
 	sleep 5
 	waited=$((waited + 5))
 done
 if [ "${held:-0}" -ge "$expected" ]; then
-	pass "the ramp climbed once the guest was fine: balloon holds ${held} MiB of a quarter of $(( 2048 + $(field plugged_mib) )) after ${waited}s"
+	pass "the ramp climbed once the guest was fine: balloon holds ${held} MiB of a quarter of 8192 after ${waited}s"
 else
-	fail "the ramp did not climb: balloon holds ${held:-0} MiB, a quarter of $(( 2048 + $(field plugged_mib) )) wanted, after ${waited}s"
+	fail "the ramp did not climb: balloon holds ${held:-0} MiB, a quarter of 8192 wanted, after ${waited}s"
 fi
 puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
 [ "$puffs" -le 10 ] && pass "${puffs} failed inflations on the climb: cache given, not fought for" || fail "${puffs} failed inflations on the climb"
@@ -323,7 +277,7 @@ puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
 # compresses again (the comb of 2026-09-16: eighteen Warn/Normal flips in
 # half an hour, a two-gigabyte inflate-and-deflate on each).
 at_warn="$(field ballooned_mib)"
-guest_mib=$(( 2048 + $(field plugged_mib) ))
+guest_mib=8192
 step=$(( guest_mib / 256 )); [ "$step" -lt 32 ] && step=32
 echo normal > "$PRESSURE_FILE"
 sleep 15
@@ -428,7 +382,6 @@ cold0="$(cgstat m6-cold file)"
 warm0="$(cgstat m6-warm file)"
 mapped0="$(rssfile m6-mapped)"
 reported0="$(field reported_mib)"
-plugged0="$(field plugged_mib)"
 puffs0="$(grep -ac 'Out of puff' "$LOG" || true)"
 [ "${cold0:-0}" -ge 1900 ] && pass "the cold container cached ${cold0} MiB, the warm one ${warm0} MiB, the sleeping process maps ${mapped0} MiB" \
 	|| fail "the cold container cached only ${cold0:-?} MiB"
@@ -453,34 +406,21 @@ mapped1="$(rssfile m6-mapped)"
 [ "${mapped0:-0}" -ge 16 ] && [ "${mapped1:-0}" -ge $(( mapped0 - 4 )) ] && pass "the sleeping process's mapped pages stayed (${mapped0} → ${mapped1} MiB)" \
 	|| fail "the sleeping process lost mapped pages (${mapped0:-?} → ${mapped1:-?} MiB)"
 # What the pass freed comes back through free page reporting alone: the
-# agent compacts, and reporting returns the runs within seconds, with the
-# range in and no balloon inflated for it.
+# agent compacts, and reporting returns the runs within seconds, with no
+# balloon inflated for it.
 waited=0
 while [ $(( $(field reported_mib) - reported0 )) -lt 1500 ] && [ "$waited" -lt 30 ]; do
 	sleep 2
 	waited=$((waited + 2))
 done
 returned=$(( $(field reported_mib) - reported0 ))
-[ "$returned" -ge 1500 ] && pass "${returned} MiB reported back to the host within ${waited}s (footprint $(footprint) MiB, range $(field plugged_mib) MiB plugged)" \
+[ "$returned" -ge 1500 ] && pass "${returned} MiB reported back to the host within ${waited}s (footprint $(footprint) MiB)" \
 	|| fail "only ${returned} MiB reported back within ${waited}s (footprint $(footprint) MiB)"
 [ "$(field ballooned_mib)" -le 64 ] && pass "no balloon inflated for it ($(field ballooned_mib) MiB)" \
 	|| fail "the balloon holds $(field ballooned_mib) MiB after the pass; the pass is reporting's, not the balloon's"
-[ "$(field plugged_mib)" -ge "${plugged0:-0}" ] && pass "the range stayed in through the eviction (${plugged0} MiB plugged)" \
-	|| fail "the range moved during the eviction (${plugged0} → $(field plugged_mib) MiB plugged)"
 puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs0 ))
 [ "$puffs" -le 10 ] && pass "${puffs} failed inflations across the pass" || fail "${puffs} failed inflations across the pass"
-# With everything gone the range comes out as it always did.
 docker rm -f m6-warm m6-cold m6-mapped m6-keeper >/dev/null 2>&1
-waited=0
-while [ "$(field plugged_mib)" -gt "$RANGE_RESIDUE_MIB" ] && [ "$waited" -lt 90 ]; do
-	sleep 2
-	waited=$((waited + 2))
-done
-if [ "$(field plugged_mib)" -le "$RANGE_RESIDUE_MIB" ]; then
-	pass "the range came out ${waited}s after the last container left"
-else
-	fail "the range is still $(field plugged_mib) MiB plugged after ${waited}s with nothing running"
-fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then
