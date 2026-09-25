@@ -4,7 +4,8 @@
 # whichever cases happened to run before it — or fails outright.
 set -eu
 cp "$WORK"/fixture/* "$WORK/npm/"
-rm -rf "$WORK/npm/node_modules"
+. "$WORK/cases/clear.sh"
+clear_tree "$WORK/npm/node_modules"
 
 # The setup is not the measurement: whatever it queued lands before the
 # clock starts, on every runtime alike.

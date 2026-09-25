@@ -1288,6 +1288,22 @@ PYOWNER
 		[ "$TARGET" != lighter ] || VMM_PID=""
 		echo "==> $TARGET: memory idle=$idle MiB, a minute after a cold start"
 		echo "memory-idle,1,$idle" >> "$RESULTS"
+		# And with one idle container: nothing running is not a like-for-like
+		# rest for a runtime that makes a VM per container (Apple's) and so
+		# holds no VM at all until one runs. The image is already present.
+		if dk run -d --name "lighter-bench-idle-$TARGET" alpine:3.21 sleep 3600 >/dev/null 2>&1; then
+			sleep 60
+			[ "$TARGET" != lighter ] || VMM_PID="$(cat "$BOOT_HOME/lighter.pid" 2>/dev/null)"
+			local idle1
+			idle1="$(runtime_footprint_mib)"
+			[ "$TARGET" != lighter ] || VMM_PID=""
+			echo "==> $TARGET: memory idle=$idle1 MiB with one idle container"
+			echo "memory-idle-1,1,$idle1" >> "$RESULTS"
+			dk rm -f "lighter-bench-idle-$TARGET" >/dev/null 2>&1 || true
+		else
+			printf '    FAILED: the idle container did not start\n'
+			FAILED=1
+		fi
 	else
 		printf '    FAILED: idle boot did not answer; logs: %s\n' "$BOOT_LOG_DIR"
 		FAILED=1
