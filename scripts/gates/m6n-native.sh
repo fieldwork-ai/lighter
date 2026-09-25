@@ -37,11 +37,15 @@ BIN="target/$PROFILE/examples/lighter-bench"
 # per-cgroup pressure accounting off above all, which the throttle's stall
 # trigger has to work without.
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
-# A 16 GiB ceiling: large enough for the burst to need the range, small
-# enough for any Mac this runs on. The vCPUs are every core the Mac has.
-CEILING_MIB="${CEILING_MIB:-16384}"
+# The CLI's ceiling, the Mac's RAM less 2 GiB, capped at 16 GiB: large
+# enough for the burst to need the range, and on an 8 GB M1 the 6 GiB a
+# person would get (a fixed 16 GiB there grew the range into swap). The
+# burst is 6000 MiB, or half the ceiling where that is less. The vCPUs are
+# every core the Mac has.
+MAC_MIB=$(( $(sysctl -n hw.memsize) >> 20 ))
+CEILING_MIB="${CEILING_MIB:-$(( MAC_MIB - 2048 < 16384 ? MAC_MIB - 2048 : 16384 ))}"
 VCPUS="$(sysctl -n hw.ncpu)"
-BURST_MIB="${BURST_MIB:-6000}"
+BURST_MIB="${BURST_MIB:-$(( CEILING_MIB / 2 < 6000 ? CEILING_MIB / 2 : 6000 ))}"
 IDLE_SECONDS="${IDLE_SECONDS:-60}"
 MAX_IDLE_CPU=1.0
 # The Mac's own interactive thread, woken every 5 ms: its 99th percentile
