@@ -326,7 +326,7 @@ impl MakeWhole {
         }
         self.0.guest_offers(0, true);
         let line = *self.0.last_line.lock().expect("last line poisoned");
-        let _ = self.0.guest_sizes(line, false);
+        let _ = self.0.guest_sizes(line, false, false);
         Ok(())
     }
 }
@@ -377,6 +377,9 @@ struct CompressionState {
     /// What the host has free, from the last sample; deflation is paced by
     /// it. All of it until the first sample.
     host_free: Option<u64>,
+    /// The host's room (`HostSample::room`), from the last sample; a range
+    /// grows for the guest's cache only into it.
+    host_room: Option<u64>,
     /// Whether the host's compressor or swap says it is overcommitted,
     /// whatever level it reports.
     overcommitted: bool,
@@ -463,16 +466,38 @@ impl Steering {
             .map_or(self.ram_bytes, |m| m.state().total_bytes())
     }
 
+    /// Whether the Mac could give the guest `bytes` for its cache: under no
+    /// pressure by any sign, and with twice that as room at the last sample.
+    /// Room, not free pages: a Mac with a warm file cache of its own shows
+    /// a few hundred megabytes free with gigabytes to give.
+    fn room_for(&self, bytes: u64) -> bool {
+        let state = self
+            .compression
+            .lock()
+            .expect("compression policy poisoned");
+        !state.pressed(self.level.load(Ordering::Relaxed), Instant::now())
+            && state
+                .host_room
+                .is_some_and(|room| room >= bytes.saturating_mul(2))
+    }
+
     /// The guest's memory line, with a range to size (`size_range`).
     ///
     /// Returns whether the line was taken as a resize; a line that was not
     /// goes to the balloon, which takes what the range cannot: the base's
     /// free pages, fragmented by what ran, a host page at a time.
-    fn guest_sizes(&self, line: GuestLine, need: bool) -> bool {
+    fn guest_sizes(&self, line: GuestLine, need: bool, release: bool) -> bool {
         let Some(mem) = &self.mem else { return false };
         *self.last_line.lock().expect("last line poisoned") = line;
         let state = mem.state();
         let plugged = state.plugged_bytes();
+        let demand = if need {
+            Demand::Need
+        } else if release && self.room_for(headroom(state.total_bytes())) {
+            Demand::Room
+        } else {
+            Demand::None
+        };
         let floor = {
             let mut floor = self.unplug_floor.lock().expect("unplug floor poisoned");
             if floor.is_some_and(|(at, since)| plugged > at || since.elapsed() >= UNPLUG_FLOOR_HOLD)
@@ -491,7 +516,7 @@ impl Steering {
                 floor,
             },
             line,
-            need,
+            demand,
         );
         match decision {
             Sizing::Resize(target) => {
@@ -663,6 +688,7 @@ impl Steering {
             .lock()
             .expect("compression policy poisoned");
         state.host_free = Some(sample.free);
+        state.host_room = Some(sample.room);
         // In at a quarter (an eighth for swap), out a fifth below that:
         // hysteresis against a host sitting on the line.
         let line = |fraction: u64| {
@@ -886,7 +912,7 @@ impl Steering {
         if self.mem.as_ref().is_some_and(|m| !m.held()) {
             let line = *self.last_line.lock().expect("last line poisoned");
             if line.spare_mib > 0 {
-                let _ = self.guest_sizes(line, false);
+                let _ = self.guest_sizes(line, false, false);
             }
         }
     }
@@ -1087,7 +1113,7 @@ fn memory_guest(
                                 spare_mib,
                                 avail_mib: u64::from(word(4)),
                             };
-                            let taken = steering.guest_sizes(line, release || need);
+                            let taken = steering.guest_sizes(line, need, release);
                             if release || need {
                                 steering.guest_offers(0, true);
                             } else if !taken && steering.range_out() {
@@ -1367,9 +1393,18 @@ impl HostMemory {
             return None;
         }
         let (swap_used, swap_total) = swap_usage();
+        // Activity Monitor's "Memory Used" is app memory (anonymous, less
+        // what apps have marked purgeable), wired and compressed; the rest,
+        // free pages and cached files, is room. The guest's own memory is
+        // anonymous, so it is used, and the room shrinks as the guest grows.
+        let used = (u64::from(stats.internal_page_count))
+            .saturating_sub(u64::from(stats.purgeable_count))
+            + u64::from(stats.wire_count)
+            + u64::from(stats.compressor_page_count);
         Some(HostSample {
             compressed: stats.compressions * self.page,
             free: u64::from(stats.free_count) * self.page,
+            room: self.ram.saturating_sub(used * self.page),
             compressor: u64::from(stats.compressor_page_count) * self.page,
             swap_used,
             swap_total,
@@ -1384,6 +1419,9 @@ impl HostMemory {
 struct HostSample {
     compressed: u64,
     free: u64,
+    /// RAM less what Activity Monitor calls used: free pages and the Mac's
+    /// own file cache, which gives way to anything that asks.
+    room: u64,
     compressor: u64,
     swap_used: u64,
     swap_total: u64,
@@ -1424,6 +1462,10 @@ enum Sizing {
 ///   throttle) doubles what the guest has, up to the range, in one offer: a
 ///   plug lands in tens of milliseconds and the next line says whether it
 ///   was enough.
+/// - `Room` (free memory low but available memory fine: page cache filling
+///   the guest, with the Mac under no pressure and memory to spare) grows
+///   by a headroom, so a working set of files stays cached as it would in
+///   the Mac's own memory.
 /// - Available memory under the headroom plugs the difference, so work has
 ///   room before it is short.
 /// - A spare of a block or more once the guest has been quiet (the agent
@@ -1432,7 +1474,7 @@ enum Sizing {
 ///   a shrink never plugs back on the next line. With containers running
 ///   too: the throttle, not a whole range, is now what stands between a
 ///   burst and the OOM killer.
-fn size_range(range: Range, line: GuestLine, need: bool) -> Sizing {
+fn size_range(range: Range, line: GuestLine, demand: Demand) -> Sizing {
     let Range {
         plugged,
         requested,
@@ -1457,8 +1499,10 @@ fn size_range(range: Range, line: GuestLine, need: bool) -> Sizing {
             Sizing::Wait
         }
     };
-    if need {
-        return grow_to(plugged.saturating_add(total.max(GROW_STEP_MIN)));
+    match demand {
+        Demand::Need => return grow_to(plugged.saturating_add(total.max(GROW_STEP_MIN))),
+        Demand::Room => return grow_to(plugged.saturating_add(headroom)),
+        Demand::None => {}
     }
     if avail < headroom && plugged < region {
         return grow_to(plugged + (headroom - avail));
@@ -1478,6 +1522,24 @@ fn size_range(range: Range, line: GuestLine, need: bool) -> Sizing {
         }
     }
     Sizing::Pass
+}
+
+/// Why a line asks the range to grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Demand {
+    /// Work short of memory: under an eighth available, stalled, or at the
+    /// throttle's edge. Doubles the guest at any host level.
+    Need,
+    /// The guest asking for its reserve back (free memory under half of it)
+    /// with available memory fine, which is page cache filling free memory,
+    /// on a Mac with room for it. On a Mac without, the guest reclaims its
+    /// own clean cache instead: growing for it once doubled an M1's 2.5 GiB
+    /// guest to 5 GiB mid-copy, put the Mac into pressure, and the pressure
+    /// policy then had the guest evict that cache, so the next pass read
+    /// the whole tree again (16.9 s against a fixed 4 GiB guest's 4.4,
+    /// 2026-09-25).
+    Room,
+    None,
 }
 
 #[cfg(test)]
@@ -1664,7 +1726,7 @@ mod tests {
     #[test]
     fn a_plug_in_flight_is_waited_for() {
         assert_eq!(
-            size_range(range(GIB, 2 * GIB), line(0, 0), true),
+            size_range(range(GIB, 2 * GIB), line(0, 0), Demand::Need),
             Sizing::Wait
         );
     }
@@ -1674,14 +1736,60 @@ mod tests {
     fn a_need_doubles_the_guest() {
         // 2 GiB base + 2 GiB plugged: 4 GiB more.
         assert_eq!(
-            size_range(range(2 * GIB, 2 * GIB), line(0, 4096), true),
+            size_range(range(2 * GIB, 2 * GIB), line(0, 4096), Demand::Need),
             Sizing::Resize(6 * GIB)
         );
         let full = Range {
             region: 3 * GIB,
             ..range(2 * GIB, 2 * GIB)
         };
-        assert_eq!(size_range(full, line(0, 0), true), Sizing::Resize(3 * GIB));
+        assert_eq!(
+            size_range(full, line(0, 0), Demand::Need),
+            Sizing::Resize(3 * GIB)
+        );
+    }
+
+    /// Cache filling the guest on a Mac with room grows it by a headroom,
+    /// not a doubling: a quarter of the guest, a gigabyte at least.
+    #[test]
+    fn room_for_cache_grows_by_a_headroom() {
+        // 2 GiB base + 512 MiB plugged, plenty available: 1 GiB more.
+        assert_eq!(
+            size_range(range(512 << 20, 512 << 20), line(0, 1400), Demand::Room),
+            Sizing::Resize((512 << 20) + GIB)
+        );
+        // 16 GiB guest (14 plugged): 4 GiB more.
+        assert_eq!(
+            size_range(range(14 * GIB, 14 * GIB), line(0, 8192), Demand::Room),
+            Sizing::Resize(18 * GIB)
+        );
+    }
+
+    /// The Mac's room decides whether cache may grow the guest: under no
+    /// pressure, with twice the step as room; free pages alone, which a
+    /// Mac with a warm file cache keeps low, do not decide it.
+    #[test]
+    fn cache_grows_the_guest_only_into_the_macs_room() {
+        let (steering, _transport) = steering_for_tests(4 << 30);
+        let sample = |free: u64, room: u64| HostSample {
+            compressed: 0,
+            free,
+            room,
+            compressor: 0,
+            swap_used: 0,
+            swap_total: 8 << 30,
+            ram: 48 << 30,
+        };
+        assert!(!steering.room_for(GIB), "no sample yet, no room");
+        steering.observe(&sample(256 << 20, 20 * GIB));
+        assert!(steering.room_for(GIB), "few pages free, gigabytes of room");
+        steering.observe(&sample(256 << 20, GIB + GIB / 2));
+        assert!(!steering.room_for(GIB), "under twice the step");
+        steering.observe(&sample(8 * GIB, 20 * GIB));
+        steering
+            .level
+            .store(Pressure::Warn as u32, Ordering::Relaxed);
+        assert!(!steering.room_for(GIB), "the Mac under pressure");
     }
 
     /// Available memory under the headroom plugs the difference, so work has
@@ -1692,13 +1800,13 @@ mod tests {
         // 2 GiB base, nothing plugged: headroom 1 GiB, 256 MiB available:
         // the other 768 MiB.
         assert_eq!(
-            size_range(range(0, 0), line(0, 256), false),
+            size_range(range(0, 0), line(0, 256), Demand::None),
             Sizing::Resize(768 << 20)
         );
         // 16 GiB guest (14 plugged): headroom 4 GiB, 3 GiB available: one
         // more gigabyte, in whole blocks.
         assert_eq!(
-            size_range(range(14 * GIB, 14 * GIB), line(0, 3072), false),
+            size_range(range(14 * GIB, 14 * GIB), line(0, 3072), Demand::None),
             Sizing::Resize(15 * GIB)
         );
         // The range full: nothing to plug, and nothing for the balloon.
@@ -1706,7 +1814,7 @@ mod tests {
             region: 14 * GIB,
             ..range(14 * GIB, 14 * GIB)
         };
-        assert_eq!(size_range(full, line(0, 0), false), Sizing::Pass);
+        assert_eq!(size_range(full, line(0, 0), Demand::None), Sizing::Pass);
     }
 
     /// Spare memory goes back in whole blocks, keeping half as much again as
@@ -1717,22 +1825,25 @@ mod tests {
         // 8 GiB guest (6 plugged): headroom 2 GiB, keep 3; 6 GiB available,
         // 4 GiB spare: give 3.
         assert_eq!(
-            size_range(range(6 * GIB, 6 * GIB), line(4096, 6144), false),
+            size_range(range(6 * GIB, 6 * GIB), line(4096, 6144), Demand::None),
             Sizing::Resize(3 * GIB)
         );
         let held = Range {
             held: true,
             ..range(6 * GIB, 6 * GIB)
         };
-        assert_eq!(size_range(held, line(4096, 6144), false), Sizing::Pass);
+        assert_eq!(
+            size_range(held, line(4096, 6144), Demand::None),
+            Sizing::Pass
+        );
         // Less than a block spare: nothing moves.
         assert_eq!(
-            size_range(range(6 * GIB, 6 * GIB), line(64, 6144), false),
+            size_range(range(6 * GIB, 6 * GIB), line(64, 6144), Demand::None),
             Sizing::Pass
         );
         // Spare, but available only just over what is kept: nothing moves.
         assert_eq!(
-            size_range(range(6 * GIB, 6 * GIB), line(4096, 3072), false),
+            size_range(range(6 * GIB, 6 * GIB), line(4096, 3072), Demand::None),
             Sizing::Pass
         );
     }
@@ -1742,11 +1853,11 @@ mod tests {
     fn an_unplug_in_flight_waits_unless_work_needs_more() {
         let unplugging = range(6 * GIB, 4 * GIB);
         assert_eq!(
-            size_range(unplugging, line(4096, 6144), false),
+            size_range(unplugging, line(4096, 6144), Demand::None),
             Sizing::Wait
         );
         assert_eq!(
-            size_range(unplugging, line(0, 0), true),
+            size_range(unplugging, line(0, 0), Demand::Need),
             Sizing::Resize(14 * GIB)
         );
     }
@@ -1759,14 +1870,17 @@ mod tests {
             ..range(6 * GIB, 6 * GIB)
         };
         assert_eq!(
-            size_range(floored, line(4096, 6144), false),
+            size_range(floored, line(4096, 6144), Demand::None),
             Sizing::Resize(5 * GIB)
         );
         let at_floor = Range {
             floor: 6 * GIB,
             ..range(6 * GIB, 6 * GIB)
         };
-        assert_eq!(size_range(at_floor, line(4096, 6144), false), Sizing::Pass);
+        assert_eq!(
+            size_range(at_floor, line(4096, 6144), Demand::None),
+            Sizing::Pass
+        );
     }
 
     /// The top-up and the shrink do not chase each other: a guest topped up
@@ -1780,7 +1894,7 @@ mod tests {
             size_range(
                 range(plugged, plugged),
                 line(avail >> 20, avail >> 20),
-                false
+                Demand::None
             ),
             Sizing::Pass
         );
@@ -2021,6 +2135,7 @@ mod tests {
         steering.observe(&HostSample {
             compressed: 0,
             free: 256 << 20,
+            room: 256 << 20,
             compressor: 0,
             swap_used: 0,
             swap_total: 0,
@@ -2054,6 +2169,7 @@ mod tests {
         steering.observe(&HostSample {
             compressed: 0,
             free: 1 << 30,
+            room: 1 << 30,
             compressor: 13 << 30,
             swap_used: 0,
             swap_total: 0,
@@ -2064,6 +2180,7 @@ mod tests {
         steering.observe(&HostSample {
             compressed: 0,
             free: 1 << 30,
+            room: 1 << 30,
             compressor: 0,
             swap_used: 7 << 30,
             swap_total: 9 << 30,
@@ -2083,6 +2200,7 @@ mod tests {
         steering.observe(&HostSample {
             compressed: 0,
             free: 1 << 30,
+            room: 1 << 30,
             compressor: 0,
             swap_used: 4 << 30,
             swap_total: 5 << 30,
@@ -2094,6 +2212,7 @@ mod tests {
         let sample = |compressor: u64| HostSample {
             compressed: 0,
             free: 1 << 30,
+            room: 1 << 30,
             compressor,
             swap_used: 0,
             swap_total: 0,
