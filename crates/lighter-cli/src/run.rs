@@ -123,9 +123,9 @@ pub fn machine() -> anyhow::Result<()> {
     );
     cmdline.push_str(&format!(
         " idle.poll_ns={}",
-        crate::config::idle_poll_ns(config.cpus)
+        crate::config::idle_poll_ns(config.vcpus())
     ));
-    cmdline.push_str(crate::config::idle_poll_args(config.cpus));
+    cmdline.push_str(crate::config::idle_poll_args(config.vcpus()));
     cmdline.push_str(&format!(
         " lighter.time={}",
         std::time::SystemTime::now()
@@ -233,9 +233,13 @@ pub fn machine() -> anyhow::Result<()> {
         }
     }
 
+    // Fixed boots with all of it; native boots on a base and plugs the rest
+    // in as the host offers it (`lighter_vmm::virtio::mem`).
+    let (ram_bytes, hotplug_bytes) = config.memory_split();
     let machine_config = MachineConfig {
-        vcpus: config.cpus,
-        ram_bytes: config.memory_mib << 20,
+        vcpus: config.vcpus(),
+        ram_bytes,
+        hotplug_bytes,
         kernel: paths::kernel()?,
         initramfs: None,
         cmdline,
