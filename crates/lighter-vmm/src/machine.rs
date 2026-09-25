@@ -941,11 +941,12 @@ impl Machine {
     }
 
     /// The Docker API's socket has one thing done to it that no other has:
-    /// a guest with a virtio-mem range is made whole before a container is
-    /// created, started, restarted or built, because what runs in it sizes
-    /// itself from `MemTotal` as it comes up and can take memory faster
-    /// than the guest could ask for more (`MemControl::plug_all`). The
-    /// request line is what is looked for, in each chunk as it passes.
+    /// a guest with a virtio-mem range is readied before a container is
+    /// created, started, restarted or built (`MakeWhole`: the balloon let
+    /// go and the headroom topped up). Without a memory policy nothing else
+    /// would ever grow the range, so there the whole range goes in
+    /// (`MemControl::plug_all`). The request line is what is looked for, in
+    /// each chunk as it passes.
     pub fn proxy_socket(&mut self, path: &std::path::Path, guest_port: u32) -> io::Result<()> {
         let inspect: Option<crate::vsock_proxy::Inspector> = match &self.mem {
             Some(mem) if guest_port == DOCKER_PORT => {

@@ -18,6 +18,7 @@ mod idle;
 mod inbound;
 mod memory_policy;
 mod sockmap;
+mod throttle;
 mod udp;
 mod udp_inbound;
 mod vsock;
@@ -321,6 +322,18 @@ fn bound_container_cache() {
             compact_once,
         );
     }
+    // With a range, the containers' throttle and the stall that answers it
+    // (`throttle.rs`); not beside the opt-in cache bound, which owns the
+    // same file.
+    let wake = std::sync::Arc::new(throttle::Wake::default());
+    let (mut edge, stall) = if dynamic && bound == 0 {
+        (
+            Some(throttle::Throttle::new(containers)),
+            Some(throttle::Stall::watch(containers, wake.clone())),
+        )
+    } else {
+        (None, None)
+    };
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 32]> = None;
@@ -348,7 +361,7 @@ fn bound_container_cache() {
         // counters step by four so the marks they are compared against
         // (the trims, the reporting rate at 25 s) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
-        std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
+        wake.sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
         // Under a megabyte is DAMON's own sampling: the ten pages a minute
         // it marks old for the region estimate this does not use, evicted
         // when the pass finds them. Not an eviction, and not an offer.
@@ -373,6 +386,9 @@ fn bound_container_cache() {
         }
         if dynamic {
             total = mem_total().unwrap_or(total);
+        }
+        if let Some(edge) = edge.as_mut() {
+            edge.tick(total, mem_available().unwrap_or(0));
         }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
@@ -499,6 +515,9 @@ fn bound_container_cache() {
                 // Busy: the guest's CPU was not quiet this tick. A need
                 // is work that is short, not a guest that is merely low.
                 quiet_for == 0,
+                // The containers stalled at the throttle's edge: a need
+                // whatever the CPU says, since what is stalled sleeps.
+                stall.as_ref().is_some_and(throttle::Stall::take),
             );
         }
         // Image extraction charges shared file pages to the engine. A running
@@ -590,6 +609,7 @@ fn offer_memory(
     quiet: bool,
     nothing_runs: bool,
     busy: bool,
+    stalled: bool,
 ) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -651,7 +671,7 @@ fn offer_memory(
     // one task's reclaim, which is the host's own reclaim request and the
     // compaction after it, and a need on it handed the balloon back the
     // moment the host had asked for it (m6b, the M1, 2026-09-21).
-    let need = busy && (avail < (total >> 20) / 8 || psi_full >= 1000);
+    let need = stalled || (busy && (avail < (total >> 20) / 8 || psi_full >= 1000));
     let spare = if offers && !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
@@ -715,6 +735,16 @@ fn psi_avg10(text: &str, line: &str) -> u32 {
 }
 
 /// `MemTotal`, in bytes.
+fn mem_available() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("MemAvailable:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+}
+
 fn mem_total() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()?

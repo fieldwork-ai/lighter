@@ -162,6 +162,21 @@ const STALL_PROGRESS_BYTES: u64 = 4 << 20;
 /// The least a range grows by when the guest is short: a small guest
 /// doubles, a tiny one gets this.
 const GROW_STEP_MIN: u64 = 256 << 20;
+/// Memory a guest with a range keeps available ahead of its work, as a
+/// fraction of what it has: a quarter, and never under `HEADROOM_MIN`. The
+/// agent's line comes every quarter-second while the guest works and a plug
+/// lands in tens of milliseconds, so this is what a burst draws on between
+/// a line and the plug it asks for; a burst faster than that meets the
+/// containers' `memory.high` (the agent's throttle), which sleeps it at the
+/// edge until the plug lands rather than calling the OOM killer. Bigger
+/// guests run bigger work, hence a fraction.
+const HEADROOM_FRACTION: u64 = 4;
+const HEADROOM_MIN: u64 = 1 << 30;
+
+/// The headroom for a guest of `total` bytes.
+fn headroom(total: u64) -> u64 {
+    (total / HEADROOM_FRACTION).max(HEADROOM_MIN)
+}
 
 /// The balloon, and the signals that drive it.
 pub struct MemoryPolicy {
@@ -185,7 +200,7 @@ impl MemoryPolicy {
             transport,
             ram_bytes,
             mem,
-            last_line: Mutex::new((0, false)),
+            last_line: Mutex::new(GuestLine::default()),
             vsock: Some(vsock.clone()),
             reclaiming: Arc::new(AtomicBool::new(false)),
             warm_gain: Arc::new(Mutex::new(None)),
@@ -290,27 +305,24 @@ impl MemoryPolicy {
     }
 }
 
-/// Makes the guest whole before a container starts: the balloon is let go
-/// and the range goes in, and the call waits for the range
-/// (`MemControl::plug_all`). What runs in a container sizes itself from
-/// `MemTotal` as it comes up and can take memory faster than the guest
-/// could ask for more, so the range is in before dockerd sees the request.
+/// Readies the guest for a container about to start: the balloon is let go
+/// and the range is topped up to the headroom from the last line, without
+/// waiting for the plug. The whole range used to go in here, because what
+/// runs in a container can take memory faster than the guest could ask; the
+/// headroom and the containers' throttle (the agent's `memory.high`) now
+/// answer that, and a whole range in for every container kept the Mac's
+/// memory, page arrays included, in the guest for as long as anything ran.
 #[derive(Clone)]
 pub struct MakeWhole(Arc<Steering>);
 
 impl MakeWhole {
     pub fn call(&self) -> std::io::Result<()> {
-        let Some(mem) = &self.0.mem else {
-            return Ok(());
-        };
-        // Backing preparation has its own bounded wait. Do not consume the
-        // guest's plug deadline while the host is still creating that backing.
-        mem.wait_for_backing()?;
-        if mem.state().plugged_bytes() == mem.state().region_bytes() {
+        if self.0.mem.is_none() {
             return Ok(());
         }
         self.0.guest_offers(0, true);
-        mem.plug_all();
+        let line = *self.0.last_line.lock().expect("last line poisoned");
+        let _ = self.0.guest_sizes(line, false);
         Ok(())
     }
 }
@@ -403,7 +415,7 @@ struct Steering {
     /// hold after a growth is still the guest's position once the hold
     /// ends, and an idle guest sends nothing new: the policy's loop asks
     /// again (`resize_again`).
-    last_line: Mutex<(u64, bool)>,
+    last_line: Mutex<GuestLine>,
     /// The way to the guest's agent, for a reclaim request ahead of the
     /// balloon; none in the tests.
     vsock: Option<Arc<crate::virtio::vsock::VsockShared>>,
@@ -423,6 +435,15 @@ struct Steering {
     guest_pages: AtomicU32,
 }
 
+/// What the guest's last line said that sizing the range reads.
+#[derive(Debug, Clone, Copy, Default)]
+struct GuestLine {
+    /// Free memory past the guest's reserve, offered back.
+    spare_mib: u64,
+    /// Memory the guest could use without swapping, cache included.
+    avail_mib: u64,
+}
+
 impl Steering {
     /// What the guest has right now, which is what the fractions are of.
     fn total_bytes(&self) -> u64 {
@@ -431,54 +452,34 @@ impl Steering {
             .map_or(self.ram_bytes, |m| m.state().total_bytes())
     }
 
-    /// The guest's memory line, with a range to size: `need` (work is short
-    /// of memory) doubles what the guest has, up to the range, in one offer
-    /// — a plug lands in tens of milliseconds and the next line says
-    /// whether it was enough; a spare of a block or more, made only once
-    /// the guest has been quiet, takes that many blocks back, and the
-    /// guest migrates what was in them into what it keeps. Nothing moves
-    /// while the guest is still plugging or unplugging the last offer, so
-    /// the next line is measured against memory the guest actually has.
-    ///
-    /// A shrink only with no container running. A process already in a
-    /// container can take memory faster than any line can ask for it — a
-    /// tmpfs writer took a 3 GiB base in 140 ms, and the kernel could not
-    /// then find the pages to add more — so while a container exists the
-    /// guest keeps its whole size, as it always had, and the range is for
-    /// the machine that is running nothing.
+    /// The guest's memory line, with a range to size (`size_range`).
     ///
     /// Returns whether the line was taken as a resize; a line that was not
     /// goes to the balloon, which takes what the range cannot: the base's
     /// free pages, fragmented by what ran, a host page at a time.
-    fn guest_sizes(&self, spare_mib: u64, need: bool, nothing_runs: bool) -> bool {
+    fn guest_sizes(&self, line: GuestLine, need: bool) -> bool {
         let Some(mem) = &self.mem else { return false };
-        *self.last_line.lock().expect("last line poisoned") = (spare_mib, nothing_runs);
+        *self.last_line.lock().expect("last line poisoned") = line;
         let state = mem.state();
-        let (plugged, requested) = (state.plugged_bytes(), state.requested_bytes());
-        if need {
-            // Not while a plug is in flight: the next line says whether the
-            // last doubling was enough.
-            if requested > plugged {
-                return true;
-            }
-            let target = plugged
-                .saturating_add(state.total_bytes().max(GROW_STEP_MIN))
-                .min(state.region_bytes());
-            if target > plugged {
+        let decision = size_range(
+            Range {
+                plugged: state.plugged_bytes(),
+                requested: state.requested_bytes(),
+                total: state.total_bytes(),
+                region: state.region_bytes(),
+                held: mem.held(),
+            },
+            line,
+            need,
+        );
+        match decision {
+            Sizing::Resize(target) => {
                 mem.request(target);
+                true
             }
-            return true;
+            Sizing::Wait => true,
+            Sizing::Pass => false,
         }
-        if nothing_runs && plugged > 0 && spare_mib << 20 >= BLOCK_SIZE && !mem.held() {
-            // A lower offer during an unplug only extends it, so an unplug
-            // the driver could not finish does not stop the next.
-            let target = plugged.min(requested).saturating_sub(spare_mib << 20);
-            if target < requested {
-                mem.request(target);
-            }
-            return true;
-        }
-        false
     }
 
     /// The poll, with what the host compressed since the last one: the
@@ -860,9 +861,9 @@ impl Steering {
             return;
         }
         if self.mem.as_ref().is_some_and(|m| !m.held()) {
-            let (spare_mib, nothing_runs) = *self.last_line.lock().expect("last line poisoned");
-            if nothing_runs && spare_mib > 0 {
-                let _ = self.guest_sizes(spare_mib, false, nothing_runs);
+            let line = *self.last_line.lock().expect("last line poisoned");
+            if line.spare_mib > 0 {
+                let _ = self.guest_sizes(line, false);
             }
         }
     }
@@ -1041,8 +1042,7 @@ fn memory_guest(
                             };
                             let spare_mib = u64::from(word(0));
                             let flags = word(12);
-                            let (release, need, nothing_runs) =
-                                (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+                            let (release, need) = (flags & 1 != 0, flags & 2 != 0);
                             // Pressure stall information, hundredths of a
                             // percent of the last ten seconds: `some` is the
                             // guest's own reason for a need; `full` paces how
@@ -1060,8 +1060,11 @@ fn memory_guest(
                             // range to be out, because the range is the
                             // idle guest's first way of giving memory back
                             // and the balloon its second.
-                            let taken =
-                                steering.guest_sizes(spare_mib, release || need, nothing_runs);
+                            let line = GuestLine {
+                                spare_mib,
+                                avail_mib: u64::from(word(4)),
+                            };
+                            let taken = steering.guest_sizes(line, release || need);
                             if release || need {
                                 steering.guest_offers(0, true);
                             } else if !taken && steering.range_out() {
@@ -1364,6 +1367,86 @@ struct HostSample {
     ram: u64,
 }
 
+/// The range as the host sees it when a line arrives.
+#[derive(Debug, Clone, Copy)]
+struct Range {
+    plugged: u64,
+    requested: u64,
+    /// Base plus plugged: what the guest has.
+    total: u64,
+    region: u64,
+    /// A growth was recent enough that a shrink waits.
+    held: bool,
+}
+
+/// What a line does to the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sizing {
+    /// Offer this much of the range.
+    Resize(u64),
+    /// A resize is in flight: the next line is measured against it.
+    Wait,
+    /// Nothing for the range; the balloon may take the line.
+    Pass,
+}
+
+/// How a line sizes the range, in order:
+///
+/// - Nothing moves while the guest is still plugging the last offer, so the
+///   next line is measured against memory the guest actually has.
+/// - `need` (work short of memory, or its containers stalled at the
+///   throttle) doubles what the guest has, up to the range, in one offer: a
+///   plug lands in tens of milliseconds and the next line says whether it
+///   was enough.
+/// - Available memory under the headroom plugs the difference, so work has
+///   room before it is short.
+/// - A spare of a block or more once the guest has been quiet (the agent
+///   sends spare only then, and a growth holds shrinks for a while) takes
+///   blocks back, keeping half as much again as the headroom available so
+///   a shrink never plugs back on the next line. With containers running
+///   too: the throttle, not a whole range, is now what stands between a
+///   burst and the OOM killer.
+fn size_range(range: Range, line: GuestLine, need: bool) -> Sizing {
+    let Range {
+        plugged,
+        requested,
+        total,
+        region,
+        held,
+    } = range;
+    if requested > plugged {
+        return Sizing::Wait;
+    }
+    let headroom = headroom(total);
+    let avail = line.avail_mib << 20;
+    let grow_to = |target: u64| {
+        let target = target
+            .div_ceil(BLOCK_SIZE)
+            .saturating_mul(BLOCK_SIZE)
+            .min(region);
+        if target > plugged {
+            Sizing::Resize(target)
+        } else {
+            Sizing::Wait
+        }
+    };
+    if need {
+        return grow_to(plugged.saturating_add(total.max(GROW_STEP_MIN)));
+    }
+    if avail < headroom && plugged < region {
+        return grow_to(plugged + (headroom - avail));
+    }
+    let spare = line.spare_mib << 20;
+    if plugged > 0 && spare >= BLOCK_SIZE && !held {
+        let keep = headroom + headroom / 2;
+        let give = spare.min(avail.saturating_sub(keep)) / BLOCK_SIZE * BLOCK_SIZE;
+        if give > 0 {
+            return Sizing::Resize(plugged.saturating_sub(give));
+        }
+    }
+    Sizing::Pass
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,6 +1607,119 @@ mod tests {
         );
     }
 
+    const GIB: u64 = 1 << 30;
+
+    fn range(plugged: u64, requested: u64) -> Range {
+        Range {
+            plugged,
+            requested,
+            total: 2 * GIB + plugged,
+            region: 44 * GIB,
+            held: false,
+        }
+    }
+
+    fn line(spare_mib: u64, avail_mib: u64) -> GuestLine {
+        GuestLine {
+            spare_mib,
+            avail_mib,
+        }
+    }
+
+    /// A plug in flight is waited for: the next line is measured against it.
+    #[test]
+    fn a_plug_in_flight_is_waited_for() {
+        assert_eq!(
+            size_range(range(GIB, 2 * GIB), line(0, 0), true),
+            Sizing::Wait
+        );
+    }
+
+    /// A need doubles what the guest has, in whole blocks, up to the range.
+    #[test]
+    fn a_need_doubles_the_guest() {
+        // 2 GiB base + 2 GiB plugged: 4 GiB more.
+        assert_eq!(
+            size_range(range(2 * GIB, 2 * GIB), line(0, 4096), true),
+            Sizing::Resize(6 * GIB)
+        );
+        let full = Range {
+            region: 3 * GIB,
+            ..range(2 * GIB, 2 * GIB)
+        };
+        assert_eq!(size_range(full, line(0, 0), true), Sizing::Resize(3 * GIB));
+    }
+
+    /// Available memory under the headroom plugs the difference, so work has
+    /// room before it is short: the headroom is a quarter of the guest and a
+    /// gigabyte at least.
+    #[test]
+    fn low_available_memory_is_topped_up_to_the_headroom() {
+        // 2 GiB base, nothing plugged: headroom 1 GiB, 256 MiB available:
+        // the other 768 MiB.
+        assert_eq!(
+            size_range(range(0, 0), line(0, 256), false),
+            Sizing::Resize(768 << 20)
+        );
+        // 16 GiB guest (14 plugged): headroom 4 GiB, 3 GiB available: one
+        // more gigabyte, in whole blocks.
+        assert_eq!(
+            size_range(range(14 * GIB, 14 * GIB), line(0, 3072), false),
+            Sizing::Resize(15 * GIB)
+        );
+        // The range full: nothing to plug, and nothing for the balloon.
+        let full = Range {
+            region: 14 * GIB,
+            ..range(14 * GIB, 14 * GIB)
+        };
+        assert_eq!(size_range(full, line(0, 0), false), Sizing::Pass);
+    }
+
+    /// Spare memory goes back in whole blocks, keeping half as much again as
+    /// the headroom available, so the next line does not plug it back; not
+    /// while a growth holds it, and containers running do not stop it.
+    #[test]
+    fn spare_memory_goes_back_keeping_the_headroom() {
+        // 8 GiB guest (6 plugged): headroom 2 GiB, keep 3; 6 GiB available,
+        // 4 GiB spare: give 3.
+        assert_eq!(
+            size_range(range(6 * GIB, 6 * GIB), line(4096, 6144), false),
+            Sizing::Resize(3 * GIB)
+        );
+        let held = Range {
+            held: true,
+            ..range(6 * GIB, 6 * GIB)
+        };
+        assert_eq!(size_range(held, line(4096, 6144), false), Sizing::Pass);
+        // Less than a block spare: nothing moves.
+        assert_eq!(
+            size_range(range(6 * GIB, 6 * GIB), line(64, 6144), false),
+            Sizing::Pass
+        );
+        // Spare, but available only just over what is kept: nothing moves.
+        assert_eq!(
+            size_range(range(6 * GIB, 6 * GIB), line(4096, 3072), false),
+            Sizing::Pass
+        );
+    }
+
+    /// The top-up and the shrink do not chase each other: a guest topped up
+    /// to its headroom has nothing to give back.
+    #[test]
+    fn a_topped_up_guest_does_not_shrink() {
+        let plugged = GIB;
+        let total = 2 * GIB + plugged;
+        let avail = headroom(total);
+        assert_eq!(
+            size_range(
+                range(plugged, plugged),
+                line(avail >> 20, avail >> 20),
+                false
+            ),
+            Sizing::Pass
+        );
+    }
+
     fn steering_for_tests(ram_bytes: u64) -> (Steering, Arc<Mutex<VirtioMmio>>) {
         use crate::irq::NullIrq;
         use crate::memory::GuestMemory;
@@ -1540,7 +1736,7 @@ mod tests {
             transport: transport.clone(),
             ram_bytes,
             mem: None,
-            last_line: Mutex::new((0, false)),
+            last_line: Mutex::new(GuestLine::default()),
             vsock: None,
             reclaiming: Arc::new(AtomicBool::new(false)),
             warm_gain: Arc::new(Mutex::new(None)),
