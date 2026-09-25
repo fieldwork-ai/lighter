@@ -1,14 +1,14 @@
 # Sourced by the setups: `clear_tree <path>` removes a tree left by the last
-# repetition, passing again until it is gone. On Podman's shared folder a
-# single `rm -rf` of a pnpm-installed node_modules fails with "Directory not
-# empty" (2026-09-25, libkrun, reproduced from a clean folder), which failed
-# every case after the first pnpm install. Setups are untimed, so the extra
-# passes enter no number; the timed `rm-rf` case is still one `rm -rf`.
+# repetition. pnpm keeps its store at the root of the share, since its usual
+# one is on another filesystem, and hard-links every installed file to it; on
+# Podman's shared folder (libkrun, 2026-09-25) `rm -rf` of such a tree leaves
+# every hard-linked file behind and fails with "Directory not empty", on every
+# pass. A tree that will not go is renamed into `$WORK/.trash`, which the
+# harness deletes from the Mac after the case. Setups are untimed, so neither
+# enters a number; the timed `rm-rf` case is still one `rm -rf`.
 clear_tree() {
-	i=0
-	while [ -e "$1" ] && [ "$i" -lt 5 ]; do
-		rm -rf "$1" 2>/dev/null || true
-		i=$((i + 1))
-	done
-	[ ! -e "$1" ] || { echo "clear_tree: $1 still there after $i passes" >&2; rm -rf "$1"; }
+	rm -rf "$1" 2>/dev/null || true
+	[ -e "$1" ] || return 0
+	mkdir -p "$WORK/.trash"
+	mv "$1" "$WORK/.trash/$(date +%s)-$$"
 }

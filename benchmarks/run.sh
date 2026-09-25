@@ -482,6 +482,11 @@ run_case_container() {
 		-e "REPS=$REPS" \
 		-e "CASE_TIMEOUT_S=${CASE_TIMEOUT_S:-300}" \
 		"$IMAGE" node $script
+	local status=$?
+	# Trees a setup could not delete inside the container (`cases/clear.sh`),
+	# deleted from the Mac's side.
+	[ "$WHERE" = guest ] || rm -rf "$WORK/.trash"
+	return "$status"
 }
 
 # The guest's memory, matched to OrbStack's on this machine when it is
