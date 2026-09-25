@@ -33,6 +33,9 @@ ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 PROFILE="${PROFILE:-release}"
 BIN="target/$PROFILE/examples/lighter-bench"
+# The command line is the CLI's (run.rs), so what is measured is what ships:
+# per-cgroup pressure accounting off above all, which the throttle's stall
+# trigger has to work without.
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 # A 16 GiB ceiling: large enough for the burst to need the range, small
 # enough for any Mac this runs on. The vCPUs are every core the Mac has.
@@ -93,7 +96,7 @@ LIGHTER_RESOURCES=native LIGHTER_PRESSURE_TEST_FILE="$PRESSURE_FILE" "$BIN" \
 	--vsock "$SOCKET:2375" \
 	--report-memory \
 	--no-tty --cpus "$VCPUS" --memory-mib "$CEILING_MIB" \
-	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
+	--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t cgroup_disable=pressure swiotlb=noforce lighter.time=$(date +%s)" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 disown "$VMM_PID" 2>/dev/null || true

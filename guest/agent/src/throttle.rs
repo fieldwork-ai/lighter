@@ -6,9 +6,11 @@
 //! reclaim is the OOM killer, not a wait. So the containers' `memory.high`
 //! sits at the edge of what the guest can give them, and a burst that
 //! reaches it is slowed in reclaim, as the kernel does to any cgroup above
-//! its high, instead of killed; the stall it causes is what `Stall` hears,
-//! and the host plugs more in answer (the agent's line says `need`), and
-//! the edge moves up with it on the next tick. Meta's Senpai and TMO steer
+//! its high, instead of killed. The stall wakes the agent at once (`Stall`,
+//! a trigger on the guest's memory pressure), the throttle's own count in
+//! the containers' `memory.events` says it was the edge and not some other
+//! reclaim, the agent's line says `need`, the host plugs more, and the edge
+//! moves up with it on the next tick. Meta's Senpai and TMO steer
 //! memory the same way, from pressure stall information and `memory.high`.
 //!
 //! The edge is the containers' usage less their own reclaimable cache, plus
@@ -35,8 +37,12 @@ const GIVE_UP: Duration = Duration::from_secs(3);
 
 /// The trigger: this much stall in a window of this much, in microseconds.
 /// The kernel's smallest window is half a second; 20 ms of it is a burst
-/// already sleeping at the edge, not a page fault's reclaim.
+/// already sleeping at the edge, or some other reclaim, which the throttle's
+/// count tells apart. On the guest's pressure as a whole: per-cgroup
+/// pressure accounting is off (`cgroup_disable=pressure`, for what it cost
+/// an idle guest; see `warm.rs`).
 const TRIGGER: &str = "some 20000 500000";
+const PRESSURE: &str = "/proc/pressure/memory";
 
 /// Wakes the agent's loop early: a stall at the edge, or anything else that
 /// should not wait for the tick.
@@ -63,32 +69,23 @@ impl Wake {
     }
 }
 
-/// The containers stalled at the edge since the loop last asked.
-#[derive(Clone, Default)]
-pub struct Stall(Arc<AtomicBool>);
+/// Wakes the loop the moment the guest stalls on memory.
+pub struct Stall;
 
 impl Stall {
-    /// Watches `cgroup`'s memory pressure with a kernel trigger, marking the
-    /// stall and waking the loop the moment it fires. A kernel without
-    /// pressure accounting, or a cgroup that is not there yet, is retried.
-    pub fn watch(cgroup: &str, wake: Arc<Wake>) -> Stall {
-        let stall = Stall::default();
-        let flag = stall.0.clone();
-        let path = format!("{cgroup}/memory.pressure");
+    /// Watches the guest's memory pressure with a kernel trigger, waking the
+    /// loop the moment it fires. A kernel without pressure accounting is
+    /// retried, in case it is a moment early.
+    pub fn watch(wake: Arc<Wake>) {
         std::thread::spawn(move || {
+            let fired = AtomicBool::new(false);
             loop {
-                if let Some(fd) = arm(&path) {
-                    watch_fd(&fd, &flag, &wake);
+                if let Some(fd) = arm(PRESSURE) {
+                    watch_fd(&fd, &fired, &wake);
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
         });
-        stall
-    }
-
-    /// Whether a stall fired since the last call.
-    pub fn take(&self) -> bool {
-        self.0.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -162,7 +159,9 @@ impl Throttle {
     }
 
     /// One tick: `total` and `available` in bytes, from `/proc/meminfo`.
-    pub fn tick(&mut self, total: u64, available: u64) {
+    /// Returns whether the containers met the edge since the last tick,
+    /// which is a need: work sleeping at the edge until the guest grows.
+    pub fn tick(&mut self, total: u64, available: u64) -> bool {
         let now = Instant::now();
         let grew = total > self.last_total;
         self.last_total = total;
@@ -171,7 +170,7 @@ impl Throttle {
         self.last_events = events;
         if let Some(at) = self.lifted_at {
             if total <= at {
-                return;
+                return false;
             }
             self.lifted_at = None;
         }
@@ -185,9 +184,11 @@ impl Throttle {
             self.high = None;
             self.throttled_since = None;
             self.lifted_at = Some(total);
-            return;
+            return false;
         }
-        let Some((usage, reclaimable)) = self.usage() else { return };
+        let Some((usage, reclaimable)) = self.usage() else {
+            return throttled;
+        };
         let high = edge(usage, reclaimable, available, total);
         // Rounded to a megabyte, and written only when it moves, so an idle
         // guest does not write the file four times a second.
@@ -196,6 +197,7 @@ impl Throttle {
             self.write(&high.to_string());
             self.high = Some(high);
         }
+        throttled
     }
 
     fn write(&self, value: &str) {

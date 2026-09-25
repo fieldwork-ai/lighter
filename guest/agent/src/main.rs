@@ -326,14 +326,11 @@ fn bound_container_cache() {
     // (`throttle.rs`); not beside the opt-in cache bound, which owns the
     // same file.
     let wake = std::sync::Arc::new(throttle::Wake::default());
-    let (mut edge, stall) = if dynamic && bound == 0 {
-        (
-            Some(throttle::Throttle::new(containers)),
-            Some(throttle::Stall::watch(containers, wake.clone())),
-        )
-    } else {
-        (None, None)
-    };
+    let mut edge = (dynamic && bound == 0).then(|| {
+        throttle::Stall::watch(wake.clone());
+        throttle::Throttle::new(containers)
+    });
+    let mut at_edge = false;
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 32]> = None;
@@ -388,7 +385,7 @@ fn bound_container_cache() {
             total = mem_total().unwrap_or(total);
         }
         if let Some(edge) = edge.as_mut() {
-            edge.tick(total, mem_available().unwrap_or(0));
+            at_edge = edge.tick(total, mem_available().unwrap_or(0));
         }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
@@ -515,9 +512,9 @@ fn bound_container_cache() {
                 // Busy: the guest's CPU was not quiet this tick. A need
                 // is work that is short, not a guest that is merely low.
                 quiet_for == 0,
-                // The containers stalled at the throttle's edge: a need
-                // whatever the CPU says, since what is stalled sleeps.
-                stall.as_ref().is_some_and(throttle::Stall::take),
+                // The containers met the throttle's edge: a need whatever
+                // the CPU says, since what is throttled sleeps.
+                at_edge,
             );
         }
         // Image extraction charges shared file pages to the engine. A running
