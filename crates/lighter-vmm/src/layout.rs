@@ -70,6 +70,9 @@ pub struct GuestLayout {
     pub virtio_mmio: Window,
     /// Guest RAM.
     pub ram: Window,
+    /// The range virtio-mem offers above RAM, when the machine has one:
+    /// memory the guest plugs in and out in 128 MiB blocks (`virtio::mem`).
+    pub hotplug: Option<Window>,
     /// The GPU's host-visible aperture, when the machine has a GPU: address
     /// space above everything else, with nothing behind it until the guest
     /// maps a blob and the host puts that blob's pages there (`virtio::gpu`).
@@ -105,6 +108,7 @@ impl GuestLayout {
         gic: &GicParameters,
         vcpus: u32,
         ram_bytes: u64,
+        hotplug_bytes: u64,
         gpu_bytes: u64,
         video_bytes: u64,
     ) -> Result<GuestLayout, LayoutError> {
@@ -149,16 +153,28 @@ impl GuestLayout {
             base: Self::RAM_BASE,
             size: ram_bytes,
         };
+        // The hot-plug range starts at the first block boundary past RAM:
+        // Linux wants both ends of it aligned to its memory block, and RAM
+        // need not be a whole number of blocks.
+        let hotplug = (hotplug_bytes > 0).then(|| {
+            let block = crate::virtio::mem::BLOCK_SIZE;
+            Window {
+                base: ram.end().div_ceil(block) * block,
+                size: hotplug_bytes.div_ceil(block) * block,
+            }
+        });
+
         // The aperture sits past whatever RAM can reach, on a 1 GiB boundary:
         // the host maps blobs into it in 16 KiB pages, and a large alignment
-        // keeps it clear of everything below.
+        // keeps it clear of everything below, block-granular growth included.
         let align = 1u64 << 30;
+        let above = hotplug.map_or(ram.end(), |h| h.end());
         let gpu = (gpu_bytes > 0).then(|| Window {
-            base: ram.end().div_ceil(align) * align,
+            base: above.div_ceil(align) * align,
             size: gpu_bytes.div_ceil(align) * align,
         });
         let video = (video_bytes > 0).then(|| Window {
-            base: gpu.map_or(ram.end(), |w| w.end()).div_ceil(align) * align,
+            base: gpu.map_or(above, |w| w.end()).div_ceil(align) * align,
             size: video_bytes.div_ceil(align) * align,
         });
 
@@ -168,9 +184,41 @@ impl GuestLayout {
             uart,
             virtio_mmio,
             ram,
+            hotplug,
             gpu,
             video,
         })
+    }
+
+    /// The highest guest-physical address in use, past the last window.
+    pub fn top(&self) -> u64 {
+        [Some(self.ram), self.hotplug, self.gpu, self.video]
+            .into_iter()
+            .flatten()
+            .map(|w| w.end())
+            .max()
+            .unwrap_or(self.ram.end())
+    }
+
+    /// `top` for a machine of these sizes, without a GIC to build the rest:
+    /// the address space has to be chosen before the VM exists, and the VM
+    /// before the GIC that the full layout reads. Everything above RAM is
+    /// placed by size alone, so this is the same arithmetic as `new`.
+    pub fn top_for(ram_bytes: u64, hotplug_bytes: u64, gpu_bytes: u64, video_bytes: u64) -> u64 {
+        let block = crate::virtio::mem::BLOCK_SIZE;
+        let align = 1u64 << 30;
+        let ram_end = Self::RAM_BASE + ram_bytes;
+        let above = if hotplug_bytes > 0 {
+            ram_end.div_ceil(block) * block + hotplug_bytes.div_ceil(block) * block
+        } else {
+            ram_end
+        };
+        let gpu_end = (gpu_bytes > 0)
+            .then(|| above.div_ceil(align) * align + gpu_bytes.div_ceil(align) * align);
+        let video_end = (video_bytes > 0).then(|| {
+            gpu_end.unwrap_or(above).div_ceil(align) * align + video_bytes.div_ceil(align) * align
+        });
+        video_end.or(gpu_end).unwrap_or(above)
     }
 
     /// The MMIO window for one virtio-mmio slot.
@@ -194,6 +242,26 @@ impl GuestLayout {
 mod tests {
     use super::*;
 
+    /// The top chosen before the VM exists is the top the full layout has.
+    #[test]
+    fn the_top_before_the_vm_is_the_layouts() {
+        const GIB: u64 = 1 << 30;
+        for (ram, hotplug, gpu, video) in [
+            (2 * GIB, 0, 0, 0),
+            (8 * GIB, 0, 4 * GIB, GIB),
+            (2 * GIB, 44 * GIB, 4 * GIB, GIB),
+            ((2 * GIB) + 1, 44 * GIB + 3, 3 * GIB + 7, 0),
+            (2 * GIB, 60 * GIB, 0, 2 * GIB),
+        ] {
+            let layout = GuestLayout::new(&params(), 4, ram, hotplug, gpu, video).unwrap();
+            assert_eq!(
+                GuestLayout::top_for(ram, hotplug, gpu, video),
+                layout.top(),
+                "{ram} {hotplug} {gpu} {video}"
+            );
+        }
+    }
+
     fn params() -> GicParameters {
         // The values this M5 Pro reports; the point of the test is that the
         // derived map is sane for them, and that a hypothetical much larger
@@ -213,7 +281,7 @@ mod tests {
 
     #[test]
     fn windows_do_not_overlap() {
-        let l = GuestLayout::new(&params(), 4, 2 << 30, 0, 0).unwrap();
+        let l = GuestLayout::new(&params(), 4, 2 << 30, 0, 0, 0).unwrap();
         assert!(l.gicd.end() <= l.gicr.base);
         assert!(l.gicr.end() <= l.uart.base);
         assert!(l.uart.end() <= l.virtio_mmio.base);
@@ -224,7 +292,7 @@ mod tests {
     fn device_window_clears_the_maximum_redistributor_region() {
         // Not just this machine's vCPU count: the map must not move when the
         // core count changes, so it clears the largest region the host allows.
-        let l = GuestLayout::new(&params(), 1, 2 << 30, 0, 0).unwrap();
+        let l = GuestLayout::new(&params(), 1, 2 << 30, 0, 0, 0).unwrap();
         let max_end = GuestLayout::GICR_BASE + params().redistributor_region_size as u64;
         assert!(l.uart.base >= max_end);
     }
@@ -234,14 +302,14 @@ mod tests {
         let mut p = params();
         p.redistributor_region_size = 0x1000_0000; // 256 MiB
         assert!(matches!(
-            GuestLayout::new(&p, 4, 2 << 30, 0, 0),
+            GuestLayout::new(&p, 4, 2 << 30, 0, 0, 0),
             Err(LayoutError::GicOverlapsDevices { .. })
         ));
     }
 
     #[test]
     fn virtio_slots_tile_their_window_without_gaps() {
-        let l = GuestLayout::new(&params(), 4, 2 << 30, 0, 0).unwrap();
+        let l = GuestLayout::new(&params(), 4, 2 << 30, 0, 0, 0).unwrap();
         for i in 0..VIRTIO_MMIO_SLOTS {
             let w = l.virtio_slot(i).unwrap();
             assert!(w.base >= l.virtio_mmio.base && w.end() <= l.virtio_mmio.end());

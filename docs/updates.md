@@ -49,6 +49,12 @@ images, volumes and container data remain in the machine home. The previous
 runtime is retained for recovery if activation fails; this is not a backup of
 container data or a facility for undoing arbitrary future data migrations.
 
+Each release is about 2 GB, so old ones are removed. The download cache keeps
+only a release still waiting for `lighter upgrade`, and deletes it once it is
+installed. Installed releases keep the selected one, the newest other one (the
+recovery target), and any a running process was started from; the rest go
+after each upgrade and each `lighter update` check.
+
 The initial installer downloads a separately signed helper, verifies its
 identity before executing it, and delegates archive validation and installation
 to that helper. Existing executable wrappers on PATH are preserved.

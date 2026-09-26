@@ -81,10 +81,17 @@ enum Command {
     },
     /// Show or change the configuration.
     Config {
-        /// Cores to give the guest.
+        /// How the machine is sized: a fixed slice of the Mac (`fixed`, the
+        /// default), or cooperative resources (`cooperative`, experimental):
+        /// every core, and memory plugged in as it is needed, up to twice the
+        /// Mac's, and given back when it is not.
+        #[arg(long, value_enum)]
+        resources: Option<config::Resources>,
+        /// Cores to give the guest; in `cooperative`, the most it may use.
         #[arg(long)]
         cpus: Option<u32>,
-        /// Memory ceiling, in MiB. The guest gives back what it does not use.
+        /// Memory ceiling, in MiB; in `cooperative`, the most it may use. The
+        /// guest gives back what it does not use.
         #[arg(long)]
         memory: Option<u64>,
         /// Size of the disk images and volumes live on, in GiB.
@@ -271,6 +278,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
         }
         Command::Logs { follow } => logs(follow),
         Command::Config {
+            resources,
             cpus,
             memory,
             disk,
@@ -282,6 +290,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             metal,
             video,
         } => configure(Settings {
+            resources,
             cpus,
             memory,
             disk,
@@ -352,8 +361,13 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     }
 
     println!(
-        "Starting lighter ({} cores, {} MiB)…",
-        config.cpus, config.memory_mib
+        "Starting lighter ({} cores, {} MiB{})…",
+        config.vcpus(),
+        config.memory_mib(),
+        match config.resources {
+            config::Resources::Fixed => "",
+            config::Resources::Cooperative => ", cooperative resources",
+        }
     );
     let pid = machine::start(&config, timeout)?;
     let socket = paths::docker_socket()?;
@@ -408,6 +422,13 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
     if let Some(mib) = status.footprint_mib {
         println!("  memory     {mib} MiB");
     }
+    if let Some(memory) = status.memory {
+        println!(
+            "  guest      {} of {} MiB plugged in (cooperative resources)",
+            memory.base_mib + memory.plugged_mib,
+            memory.base_mib + memory.range_mib
+        );
+    }
     for disk in &status.storage_waiting {
         println!("  storage    Waiting for host disk space; VM running, writes waiting.");
         println!(
@@ -443,6 +464,7 @@ fn logs(follow: bool) -> anyhow::Result<std::process::ExitCode> {
 
 /// What `lighter config` was asked to change; `None` leaves a setting alone.
 struct Settings {
+    resources: Option<config::Resources>,
     cpus: Option<u32>,
     memory: Option<u64>,
     disk: Option<u64>,
@@ -457,6 +479,7 @@ struct Settings {
 
 fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
     let Settings {
+        resources,
         cpus,
         memory,
         disk,
@@ -469,7 +492,8 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         video,
     } = settings;
     let mut config = config::Config::load()?;
-    let changed = cpus.is_some()
+    let changed = resources.is_some()
+        || cpus.is_some()
         || memory.is_some()
         || disk.is_some()
         || publish.is_some()
@@ -479,11 +503,21 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         || torch_python.is_some()
         || metal.is_some()
         || video.is_some();
+    if let Some(resources) = resources
+        && resources != config.resources
+    {
+        // A count chosen for the other mode means something else in this one
+        // (an allocation in fixed, a cap in native), so it does not carry
+        // over; one given alongside the switch is kept below.
+        config.resources = resources;
+        config.cpus = None;
+        config.memory_mib = None;
+    }
     if let Some(cpus) = cpus {
-        config.cpus = cpus;
+        config.cpus = Some(cpus);
     }
     if let Some(memory) = memory {
-        config.memory_mib = memory;
+        config.memory_mib = Some(memory);
     }
     if let Some(disk) = disk {
         config.disk_gib = disk;
@@ -520,8 +554,28 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         config.save()?;
         println!("Saved. Restart for it to take effect: `lighter restart`");
     }
-    println!("  cpus       {}", config.cpus);
-    println!("  memory     {} MiB", config.memory_mib);
+    println!(
+        "  resources  {}",
+        match config.resources {
+            config::Resources::Fixed => "fixed (a slice of the Mac)",
+            config::Resources::Cooperative => "cooperative (the Mac's, shared, experimental)",
+        }
+    );
+    let limit = |set: bool, unset: &'static str| match (config.resources, set) {
+        (config::Resources::Cooperative, true) => " (limit)",
+        (config::Resources::Cooperative, false) => unset,
+        _ => "",
+    };
+    println!(
+        "  cpus       {}{}",
+        config.vcpus(),
+        limit(config.cpus.is_some(), " (the Mac's)")
+    );
+    println!(
+        "  memory     {} MiB{}",
+        config.memory_mib(),
+        limit(config.memory_mib.is_some(), " (twice the Mac's)")
+    );
     println!("  disk       {} GiB", config.disk_gib);
     println!(
         "  publish    {}",

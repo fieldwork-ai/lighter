@@ -76,7 +76,7 @@ cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	rm -rf "$SHARE"
 	rm -rf "${RUN_DIR:-}"
-	rm -f "${ROOTFS:-}"
+	rm -rf "${ROOTFS_DIR:-}"
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM
@@ -255,7 +255,8 @@ echo "==> Boot 4: a macOS directory bind-mounted into a container"
 # A private clone, not the master: the master is an artifact, and any second
 # machine mounting it read-write beside the first corrupts both.
 ROOTFS_MASTER="guest/out/rootfs.ext4"
-ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 if ! command -v docker >/dev/null 2>&1; then
 	echo "  (skipped: no docker client on this machine)"

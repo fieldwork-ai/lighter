@@ -8,6 +8,8 @@ benchmarks/run.sh --target native   --reps 3 # the workloads, 20 min each
 benchmarks/run.sh --target lighter  --reps 3
 benchmarks/run.sh --target orbstack --reps 3
 python3 benchmarks/report.py
+
+benchmarks/compare.sh --machine m1 --gpu --quality   # every runtime, one record
 ```
 
 Use `latency.sh` to investigate individual operations and the full workload suite
@@ -33,6 +35,19 @@ Every target runs the same case scripts against the same fixture — a pinned `n
 `native` is a whole-workload reference on macOS APFS. Native and container runs pin the same package tools, but use different operating systems and may execute different platform-specific package steps. A ratio of 100% does not establish zero filesystem overhead.
 
 `--where guest` runs the cases on the runtime's own disk instead of the share, into `<target>-guest.csv`. `--arch amd64` runs them in the x86-64 build of the image (`--platform linux/amd64`, so under Rosetta on Apple silicon), into `<target>-amd64.csv`; the README's x86-64 table is those runs on the own disk. Two cases exist for that table's sake and run under either architecture: `cpu-sha256`, a gigabyte through `sha256sum` with no disk or network in it, and `container-start`, `docker run --rm alpine true` timed from the host.
+
+## The cross-runtime record
+
+`compare.sh` runs the native target and six runtimes (lighter, OrbStack, Docker Desktop, Colima, Podman, Apple's container) one at a time, each sized alike (`BENCH_CPUS`, `BENCH_MEMORY_MIB`), with the rest stopped and waited for, the Mac settled before every case, and a summary at the end (`compare-summary.py`). `--stages` picks the share suite, the own-disk suite and the media cases; `--gpu` adds `llm-gpu.sh` (Metal on the Mac and through lighter, Vulkan through lighter and Podman) and `--quality` adds `transcode-check.sh`. It stops only what it starts: a lighter machine already running is a refusal, and so is a busy engine unless `--pause-containers` is given.
+
+Every run of `run.sh` also:
+
+- refuses an engine that already has containers running, which is load in the guest nothing on the Mac sees;
+- reads the guest's CPUs (or its cgroup quota) and memory from inside it, records them in the `.tree`, and refuses a guest of another size than `BENCH_CPUS` / `BENCH_MEMORY_MIB` ask for;
+- flags a case whose repetitions differ by more than 20% (`LIGHTER_BENCH_SPREAD_PCT`), in its output and as `spread.<case>` in the `.tree`;
+- with `LIGHTER_BENCH_SETTLE`, waits before each case for Spotlight, `fseventsd`, Photos' daemons and an animated Aerial wallpaper (which decodes video on the media engine behind a locked screen) to go quiet.
+
+The media cases compare like with like. `cpu-zstd-*` and `llm` run the image's release of zstd and llama.cpp on the Mac too, built by `prepare-benchmark-tools.sh` with the image's flags (llama.cpp without Accelerate's BLAS, with OpenMP threads) and checked under `BENCH_REQUIRE_PINNED_TOOLS`. The transcodes encode at 8 Mbit/s on every path, on the media engine where there is one (VideoToolbox on the Mac, V4L2 through `lighter.sh/video`) and in software otherwise; `transcode-check.sh` scores what each path delivers (frames, bitrate, VMAF, PSNR, SSIM) with one scorer, because at one bitrate a hardware encoder's quality is lower than x264's. `llm-gpu.sh`'s Metal rows are one llama.cpp commit on both sides, the one lighter's Metal server is built from.
 
 ## Timing protocol
 
@@ -75,7 +90,8 @@ own disk and hard-links out of it, which it cannot do across a device boundary
 
 Release records use the versions in `toolchain.json` for both native and
 container workloads. Prepare the private native tools with
-`bash scripts/records/prepare-benchmark-tools.sh`, then set
+`bash scripts/records/prepare-benchmark-tools.sh` (node and the package
+managers, and builds of the image's llama.cpp and zstd), then set
 `BENCH_TOOLS_PATH="$PWD/.logs/050/tools/native/bin"` and
 `BENCH_REQUIRE_PINNED_TOOLS=1`. This preserves the Mac's globally installed tools.
 Controlled release runs also load identical prebuilt arm64/amd64 image archives

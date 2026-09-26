@@ -173,7 +173,7 @@ cat >> "$WORK/boot.sh" <<'SH'
 set -euo pipefail
 ROOT="$PWD" TARGET=lighter LABEL=boot-failure REPS=1 FAILED=0 KEEP=1
 BOOT_HOME="" BOOT_START_PID="" BOOT_LOG="" BOOT_LOG_DIR=""
-VMM_PID="" HELPER_PID="" RUN_DIR="" ROOTFS="" CASE_OUT=""
+VMM_PID="" HELPER_PID="" RUN_DIR="" ROOTFS="" ROOTFS_DIR="" CASE_OUT=""
 LIGHTER_CLI="$PWD/fake-lighter" RESULTS="$PWD/boot.csv"
 : > "$RESULTS"
 cargo() { :; }

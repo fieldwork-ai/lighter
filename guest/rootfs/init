@@ -576,6 +576,10 @@ fi
 # flow on its side of the link, so the only thing the number decides is how
 # many frames a byte costs between here and there, and a bridge left at 1500
 # would have every container segment at 1460 whatever the link could carry.
+#
+# --seccomp-profile is Docker's own default with Podman's rule for the NUMA
+# memory-policy calls (scripts/seccomp-profile.py, which says why): Docker's
+# left x265 without a thread pool, 2.7 times slower.
 link_mtu=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1500)
 waited=0
 while [ ! -S /run/containerd/containerd.sock ] && [ "$waited" -lt 200 ]; do
@@ -617,6 +621,7 @@ sh -c '
 		--storage-driver=overlay2 \
 		--mtu="$1" \
 		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
+		--seccomp-profile=/etc/docker/seccomp.json \
 		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
 DOCKERD_PID=$!
 

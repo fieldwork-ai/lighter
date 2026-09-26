@@ -35,17 +35,17 @@ services:
       retries: 30
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
-    command: server /data --console-address ":9001"
+    # Bitnami's archive of the same release; see compose.yml.
+    image: bitnamilegacy/minio:2025.4.22@sha256:50cec18ac4184af4671a78aedd5554942c8ae105d51a465fa82037949046da01
     environment:
       MINIO_ROOT_USER: lighter
       MINIO_ROOT_PASSWORD: lighterlighter
     ports:
       - "19000:9000"
     volumes:
-      - miniodata:/data
+      - miniodata:/bitnami/minio/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "/opt/bitnami/minio-client/bin/mc", "ready", "local"]
       interval: 2s
       timeout: 3s
       retries: 30

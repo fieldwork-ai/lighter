@@ -32,6 +32,10 @@ use std::sync::Mutex;
 /// stack mapping is most of what a spawn costs at thousands a second.
 pub const CONNECTION_STACK: usize = 256 << 10;
 
+/// `QOS_CLASS_DEFAULT`.
+const DEFAULT: u32 = 0x15;
+/// `QOS_CLASS_UTILITY`.
+const UTILITY: u32 = 0x11;
 /// `QOS_CLASS_USER_INTERACTIVE`.
 const USER_INTERACTIVE: u32 = 0x21;
 
@@ -57,6 +61,27 @@ static ACCELERATOR_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 
 /// Called on a vCPU thread before it runs the guest.
 pub fn register_vcpu() {
+    // `LIGHTER_VCPU_QOS=utility` (or `low`: the default class at its lowest
+    // relative priority) runs the vCPUs below the default, for measuring.
+    // Measured on the M5 with 18 vCPUs, every one of them busy: the Mac's
+    // interactive thread woke 6.5 ms late at the 99th percentile behind
+    // default-class vCPUs and 1.3 behind utility ones, but utility cost 20%
+    // of the guest's all-core throughput on an idle Mac (efficiency cores)
+    // and `low` 30%; and 18 native threads at the default class made the
+    // same thread 6.1 ms late. The default class is a native build's, so
+    // the vCPUs stay there: containers compete with the Mac as native work
+    // does, and no harder (gate m6c).
+    match std::env::var("LIGHTER_VCPU_QOS").as_deref() {
+        // SAFETY (both): a plain call on the current thread with constant
+        // arguments.
+        Ok("utility") => unsafe {
+            pthread_set_qos_class_self_np(UTILITY, 0);
+        },
+        Ok("low") => unsafe {
+            pthread_set_qos_class_self_np(DEFAULT, -15);
+        },
+        _ => {}
+    }
     // SAFETY: a plain query of the calling thread.
     let me = unsafe { pthread_self() };
     VCPUS.lock().expect("vcpu registry poisoned").push(me);

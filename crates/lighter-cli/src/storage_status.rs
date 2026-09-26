@@ -22,10 +22,30 @@ pub struct Waiting {
     pub retries: u64,
 }
 
+/// The guest's memory, when it has a virtio-mem range (cooperative resources).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Memory {
+    /// What the guest booted with.
+    pub base_mib: u64,
+    /// How much of the range the guest has plugged in.
+    pub plugged_mib: u64,
+    /// The range's size: base and range together are the ceiling.
+    pub range_mib: u64,
+}
+
+/// What the machine reports on demand.
+#[derive(Debug, Default)]
+pub struct Report {
+    pub waiting: Vec<Waiting>,
+    pub memory: Option<Memory>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Reply {
     version: u32,
     waiting: Vec<Waiting>,
+    #[serde(default)]
+    memory: Option<Memory>,
 }
 
 pub struct Server {
@@ -36,7 +56,11 @@ pub struct Server {
 
 impl Server {
     /// Caller holds the instance lock for this home throughout our lifetime.
-    pub fn start(home: &Path, disks: Vec<(PathBuf, Arc<Disk>)>) -> io::Result<Self> {
+    pub fn start(
+        home: &Path,
+        disks: Vec<(PathBuf, Arc<Disk>)>,
+        mem: Option<lighter_vmm::virtio::mem::MemControl>,
+    ) -> io::Result<Self> {
         let path = home.join(SOCKET);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -74,9 +98,18 @@ impl Server {
                             })
                         })
                         .collect();
+                    let memory = mem.as_ref().map(|mem| {
+                        let state = mem.state();
+                        Memory {
+                            base_mib: state.base_bytes() >> 20,
+                            plugged_mib: state.plugged_bytes() >> 20,
+                            range_mib: state.region_bytes() >> 20,
+                        }
+                    });
                     let reply = Reply {
                         version: 1,
                         waiting,
+                        memory,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&reply) {
                         let _ = stream.write_all(&bytes);
@@ -103,7 +136,7 @@ impl Drop for Server {
     }
 }
 
-pub fn query(home: &Path, pid: u32) -> io::Result<Vec<Waiting>> {
+pub fn query(home: &Path, pid: u32) -> io::Result<Report> {
     let mut stream = UnixStream::connect(home.join(SOCKET))?;
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
     if crate::instance::Identity::peer(home, &stream)?.pid() != pid {
@@ -120,7 +153,10 @@ pub fn query(home: &Path, pid: u32) -> io::Result<Vec<Waiting>> {
     if reply.version != 1 {
         return Err(io::Error::other("unknown storage status version"));
     }
-    Ok(reply.waiting)
+    Ok(Report {
+        waiting: reply.waiting,
+        memory: reply.memory,
+    })
 }
 
 #[cfg(test)]
@@ -132,8 +168,10 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("lighter-storage-status-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        let server = Server::start(&home, Vec::new()).unwrap();
-        assert!(query(&home, std::process::id()).unwrap().is_empty());
+        let server = Server::start(&home, Vec::new(), None).unwrap();
+        let report = query(&home, std::process::id()).unwrap();
+        assert!(report.waiting.is_empty());
+        assert!(report.memory.is_none(), "no range, no memory report");
         assert!(query(&home, std::process::id() + 1).is_err());
         assert_eq!(
             std::fs::metadata(home.join(SOCKET))
