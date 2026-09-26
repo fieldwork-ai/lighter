@@ -608,6 +608,7 @@ setup_lighter() {
 		${LIGHTER_BENCH_DEV_AGENT:+--share "dev:$(dirname "$LIGHTER_BENCH_DEV_AGENT")"} \
 		${ROSETTA_DIR:+--share "rosetta:$ROSETTA_DIR"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
+		${LIGHTER_BENCH_VMM_ARGS:-} \
 		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init cgroup_disable=pressure swiotlb=noforce idle.poll_ns=$(bench_idle_poll_ns) $(bench_idle_poll_args) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")}${ROSETTA_DIR:+ lighter.rosetta} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
