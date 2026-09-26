@@ -31,7 +31,7 @@ cd "$ROOT"
 TARGET=""
 LABEL=""
 REPS=3
-CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf cpu-sha256 container-start watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot"
+CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf cpu-sha256 cpu-multi disk-seq-write container-start watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot"
 # Cases that read a package tree rather than making one. They run after the
 # installs, on a tree materialized once by npm — which installer produced it
 # changes what they see, and pnpm in particular builds a farm of symlinks.
