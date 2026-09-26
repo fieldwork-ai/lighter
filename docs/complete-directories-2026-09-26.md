@@ -60,6 +60,18 @@ Patch 0045 lists a complete directory from the dcache: a snapshot taken when the
 
 The first pass is now the warm one. Gate m4 passed five times running with the coherence checks extended to listings: a guest-made directory lists exactly what the guest made, and after the host adds one file to it and deletes another, it lists exactly the host's.
 
+## On the M5
+
+The same case on the M5 (8 vCPUs, 16 GiB, beside a running daily driver, so with `--allow-noisy`), the two kernels alternated:
+
+| | 0.10.0 | 0043 + 0044 + 0045 |
+|---|---:|---:|
+| ripgrep, first pass after the install | 3,392 / 2,521 ms | 111 / 120 ms |
+| ripgrep, warm | 87–127 ms | 80–94 ms |
+| npm-install, median of five | 7.7 / 7.6 s | 7.3 / 7.0 s |
+
+Every gate passes on the branch's kernel: m1–m7 on the M1 (m5-speed's share ratios up from this afternoon's 0.10.0 run: ripgrep 820 → 992%, find-walk 432 → 448%, npm-install 77 → 82%, copy-tree 466 → 545%), m8–m14 on the M5.
+
 ## Risks, and how they are held
 
 - **A missed invalidation now hides a file, not just stale data.** The same notifications 0043 relies on carry it, and a lost one resets everything; the share server's `IgnoreSelf` stream is what reports Mac edits, and m4's coherence stage exercises every kind. New coherence checks: a file the Mac creates in a directory the guest made is found by name and listed; a file the Mac deletes from it is gone from the listing.
