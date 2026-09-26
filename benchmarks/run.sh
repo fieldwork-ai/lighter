@@ -296,9 +296,12 @@ prepare_work() {
 	# The llm case's model, from outside the repository (491 MB), cloned so
 	# every target's work directory costs nothing more on the Mac's disk.
 	if [ -n "${LIGHTER_BENCH_MODEL_DIR:-}" ]; then
-		mkdir -p "$WORK/models"
+		mkdir -p "$WORK/models" "$WORK/media"
 		cp -c "$LIGHTER_BENCH_MODEL_DIR"/*.gguf "$WORK/models/" 2>/dev/null \
 			|| cp "$LIGHTER_BENCH_MODEL_DIR"/*.gguf "$WORK/models/"
+		# And the transcode cases' clip.
+		cp -c "$LIGHTER_BENCH_MODEL_DIR"/*.mp4 "$WORK/media/" 2>/dev/null \
+			|| cp "$LIGHTER_BENCH_MODEL_DIR"/*.mp4 "$WORK/media/"
 	fi
 
 	printf '' > "$WORK/request"

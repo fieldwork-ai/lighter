@@ -1,5 +1,5 @@
 #!/bin/sh
-# The same five seconds of 1080p30 in x265 (preset fast): HEVC in software.
+# The same clip decoded and encoded with x265 (preset fast), 8 threads.
 set -eu
-ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 5 \
+ffmpeg -hide_banner -loglevel error -i "$WORK/media/bbb-1080p30-10s.mp4" -an \
 	-c:v libx265 -preset fast -x265-params log-level=error:pools=8 -f null -
