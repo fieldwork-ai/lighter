@@ -4,6 +4,7 @@
 # repetitions is the previous tree's deletion still being reclaimed.
 set -eu
 cp "$WORK"/fixture/* "$WORK/npm/"
-rm -rf "$WORK/npm/node_modules"
+. "$WORK/cases/clear.sh"
+clear_tree "$WORK/npm/node_modules"
 sync
 sleep 3
