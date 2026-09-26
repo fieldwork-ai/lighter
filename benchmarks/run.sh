@@ -104,11 +104,21 @@ if [ -n "${BENCH_TOOLS_PATH:-}" ]; then
 	export PATH="$BENCH_TOOLS_PATH:$PATH"
 fi
 if [ "${BENCH_REQUIRE_PINNED_TOOLS:-0}" = 1 ]; then
-	python3 - "$ROOT/benchmarks/toolchain.json" <<'PYTOOLS'
-import json, pathlib, subprocess, sys
+	python3 - "$ROOT/benchmarks/toolchain.json" "$ROOT/benchmarks/Dockerfile" <<'PYTOOLS'
+import json, pathlib, re, subprocess, sys
 expected = json.loads(pathlib.Path(sys.argv[1]).read_text())
-for tool in ['node', 'npm', 'pnpm', 'yarn']:
-    actual = subprocess.check_output([tool, '--version'], text=True).strip()
+# The image's llama.cpp release; a release's build number is its tag's.
+expected['llama-bench'] = re.search(r'--branch b(\d+) ', pathlib.Path(sys.argv[2]).read_text()).group(1)
+def version(tool):
+    out = subprocess.run([tool, '--version'], capture_output=True, text=True)
+    text = out.stdout + out.stderr
+    if tool == 'llama-bench':
+        return (re.search(r'build (\d+)', text) or [None, None])[1]
+    if tool == 'zstd':
+        return (re.search(r' v([0-9.]+),', text) or [None, None])[1]
+    return text.strip()
+for tool in ['node', 'npm', 'pnpm', 'yarn', 'llama-bench', 'zstd']:
+    actual = version(tool)
     if actual != expected[tool]:
         raise SystemExit(f'{tool}: expected {expected[tool]}, got {actual}; run scripts/records/prepare-benchmark-tools.sh')
 PYTOOLS
@@ -474,6 +484,17 @@ setup_container() {
 	SHARE_MOUNT="$WORK"
 	DOCKER_ARGS=()
 	[ -n "$ctx" ] && DOCKER_ARGS=(--context "$ctx")
+	# A container already running on the engine being measured is load inside
+	# the guest, which no check on the Mac sees: a test stack left running once
+	# read as a 19% gap in llama.cpp, its threads preempted six times as often.
+	local others
+	others="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} ps -q 2>/dev/null | wc -l | tr -d ' ')"
+	if [ "${others:-0}" -gt 0 ] && [ "$ALLOW_NOISY" -ne 1 ]; then
+		echo "==> $others container(s) already running on the $TARGET engine:" >&2
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} ps --format '      {{.Names}} ({{.Image}})' >&2
+		echo "    Stop them and run again, or pass --allow-noisy to measure anyway." >&2
+		exit 1
+	fi
 	# The x86-64 build of the image under its own tag: a plain build would
 	# replace the native one, and the next native run would measure Rosetta.
 	[ "$ARCH" = arm64 ] || IMAGE="$IMAGE-$ARCH"
@@ -682,6 +703,33 @@ colima|orbstack|docker-desktop|podman|apple-container)  setup_container;  run_ca
 *) echo "unknown target: $TARGET" >&2; exit 2 ;;
 esac
 
+# The machine the cases run in, read from inside it rather than taken from the
+# settings, which each runtime spells differently and one could ignore. CPUs
+# are the guest's, or its cgroup quota where that is lower (Apple's container
+# gives its VM one more CPU than the run asked for and caps the rest). With
+# BENCH_CPUS / BENCH_MEMORY_MIB given, a guest of another size is refused.
+GUEST_CPUS=""; GUEST_MIB=""; IMAGE_TOOLS=""
+if [ "$TARGET" != native ]; then
+	read -r GUEST_CPUS GUEST_MIB <<<"$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} run --rm ${RUN_LIMITS[@]+"${RUN_LIMITS[@]}"} "$IMAGE" sh -c '
+		n=$(nproc); set -- $(cat /sys/fs/cgroup/cpu.max 2>/dev/null)
+		if [ -n "${1:-}" ] && [ "$1" != max ] && [ $(($1 / $2)) -lt "$n" ]; then n=$(($1 / $2)); fi
+		echo "$n $(awk "/^MemTotal/ {print int(\$2 / 1024)}" /proc/meminfo)"' 2>/dev/null || echo "0 0")"
+	if [ -n "${BENCH_CPUS:-}" ] && [ "$GUEST_CPUS" != "$BENCH_CPUS" ]; then
+		echo "==> the $TARGET guest has $GUEST_CPUS CPUs; BENCH_CPUS asked for $BENCH_CPUS" >&2
+		exit 1
+	fi
+	# MemTotal is what the kernel keeps after its own reservations: 85-101%
+	# of the machine. A guest sized by demand (lighter's native resources)
+	# shows what is plugged, so only a fixed one is held to it.
+	if [ -n "${BENCH_MEMORY_MIB:-}" ] && [ "${LIGHTER_RESOURCES:-fixed}" != native ] \
+		&& { [ "$GUEST_MIB" -lt $((BENCH_MEMORY_MIB * 85 / 100)) ] || [ "$GUEST_MIB" -gt $((BENCH_MEMORY_MIB * 101 / 100)) ]; }; then
+		echo "==> the $TARGET guest has $GUEST_MIB MiB; BENCH_MEMORY_MIB asked for $BENCH_MEMORY_MIB" >&2
+		exit 1
+	fi
+	IMAGE_TOOLS="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} run --rm "$IMAGE" sh -c \
+		'echo "zstd=$(zstd --version 2>/dev/null | head -1)"; echo "llama=$(llama-bench --version 2>&1 | grep -m1 version)"; echo "ffmpeg=$(ffmpeg -version 2>/dev/null | head -1)"' 2>/dev/null || true)"
+fi
+
 mkdir -p "$(dirname "$RESULTS")"
 echo "case,rep,ms" > "$RESULTS"
 # What produced the numbers, beside them: a record ran a stale guest agent for
@@ -696,6 +744,14 @@ echo "case,rep,ms" > "$RESULTS"
 	echo "extra_warm_cases=${BENCH_EXTRA_WARM_CASES:-}"
 	if [ "$TARGET" != native ]; then
 		echo "image_id=$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{.Id}}' "$IMAGE")"
+		echo "guest.cpus=$GUEST_CPUS guest.memory_mib=$GUEST_MIB"
+		printf '%s\n' "$IMAGE_TOOLS" | sed -n 's/^/image./p'
+	else
+		# The Mac's own builds of what the image runs; prepare-benchmark-tools.sh makes
+		# them from the image's versions, and these lines say whether it did.
+		echo "native.zstd=$(zstd --version 2>/dev/null | head -1)"
+		echo "native.llama=$(llama-bench --version 2>&1 | grep -m1 version)"
+		echo "native.ffmpeg=$(ffmpeg -version 2>/dev/null | head -1)"
 	fi
 	if [ "$TARGET" = lighter ]; then
 		echo "runtime_source=${LIGHTER_BENCH_SOURCE_SHA:-$(git rev-parse HEAD)}"
@@ -1495,6 +1551,17 @@ for name in $CASES; do
 		fastest="$(awk -F, -v w="$name" '$1 == w && $3 ~ /^[0-9]+$/ { print $3 }' "$RESULTS" | sort -n | head -1)"
 		if [ "${fastest:-1}" -lt 5 ]; then
 			printf '  <- implausible; the fixture was probably missing'
+		fi
+		# Repetitions that disagree mean something else happened during one
+		# of them: the Mac's first LLM run once read 81 s, 28 s, 16 s and was
+		# recorded without a word. Flagged in the output and the provenance,
+		# not failed; some cases are cold on their first repetition by design.
+		spread="$(awk -F, -v w="$name" '$1 == w && $3 ~ /^[0-9]+$/ { v[n++] = $3 }
+			END { if (n < 2) exit; lo = hi = v[0]; for (i = 1; i < n; i++) { if (v[i] < lo) lo = v[i]; if (v[i] > hi) hi = v[i] }
+			if (lo > 0) printf "%d", 100 * (hi - lo) / lo }' "$RESULTS")"
+		if [ -n "$spread" ] && [ "$spread" -gt "${LIGHTER_BENCH_SPREAD_PCT:-20}" ]; then
+			printf '  <- repetitions differ by %s%%' "$spread"
+			echo "spread.$name=$spread%" >> "${RESULTS%.csv}.tree"
 		fi
 	fi
 	# A partial run is not a record. Preserve its error even if earlier

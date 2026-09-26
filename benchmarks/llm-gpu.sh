@@ -36,7 +36,14 @@ native)
 	echo "native llama.cpp: $("$NATIVE" --version 2>&1 | grep -m1 version)" >&2
 	"$NATIVE" -m "$MODEL_DIR/$MODEL" -ngl 99 "${ARGS[@]}" | row metal ;;
 *)
-	echo "image llama.cpp: $(dk run --rm "$IMAGE" llama-bench --version 2>&1 | grep -m1 version)" >&2
+	# Another container on the engine is load in the guest the rows would not
+	# show; a test stack left running once cost llama.cpp 19%.
+	if [ "$(dk ps -q | wc -l | tr -d ' ')" -gt 0 ]; then
+		echo "containers are running on $CTX; stop them first:" >&2
+		dk ps --format '    {{.Names}}' >&2
+		exit 1
+	fi
+	echo "image llama.cpp:$(dk run --rm "$IMAGE" llama-bench --version 2>&1 | grep -m1 version)" >&2
 	# shellcheck disable=SC2046
 	dk run --rm $(mount_model) "$IMAGE" llama-bench -m /models/$MODEL -ngl 0 -t 8 "${ARGS[@]}" | row cpu
 	case "$TARGET" in

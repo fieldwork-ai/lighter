@@ -53,20 +53,22 @@ An 8 GB M1 Mac mini on macOS 26.6.2, one session. Every runtime at 8 vCPUs and 4
 | DNS lookup | 117 µs | 394 µs | 854 µs | 708 µs | 775 µs | 468 µs |
 | sha256 of 1 GiB (CPU) | 6.3 s | 9.2 s | 6.4 s | 6.5 s | 6.4 s | 6.3 s |
 
-**Media and an LLM** (a second session the same day: lighter 0.10.0 at dee6d28, with the guest's seccomp change; image `lighter-bench:2`, llama.cpp b11191 on the CPU; the Mac itself with Homebrew's ffmpeg 9.0.2 and llama.cpp; files `m1-*-media2.*`)
+**Media and an LLM** (one session with `benchmarks/compare.sh --machine m1 --stages media --gpu --quality`, lighter 0.10.0 at afef66c; image `lighter-bench:2`; files `m1-*-media.*`, `m1-transcode-quality.csv`, `m1-llm-gpu.csv`)
 
 | | Mac itself | lighter | OrbStack | Docker Desktop | Colima | Podman | Apple container |
 |---|---|---|---|---|---|---|---|
-| zstd -9, 256 MiB, 1 thread | 5.28 s | 5.59 s | 5.65 s | 5.66 s | 5.66 s | 5.67 s | 5.64 s |
-| zstd -9, 256 MiB, 8 threads | 1.08 s | 1.21 s | 1.40 s | 1.19 s | 1.22 s | 1.23 s | 1.21 s |
-| transcode to H.264 at 8 Mbit/s, 10 s of 1080p30 | **1.87 s**ᵐ | **1.72 s**ᵐ | 6.83 s | 8.43 s | 6.59 s | 6.62 s | 6.57 s |
-| transcode to HEVC at 8 Mbit/s, the same | **1.94 s**ᵐ | **1.83 s**ᵐ | 10.02 s | 13.46 s | 9.36 s | 9.31 s | 9.33 s |
-| LLM on the CPU: Qwen2.5 0.5B Q4_K_M, 512 in / 128 out, 8 threads | 4.47 s | 6.14 s | 15.89 s | 7.58 s | 6.35 s | 6.64 s | 6.30 s |
+| zstd -9, 256 MiB, 1 thread | 4.99 s | 5.56 s | 5.61 s | 5.68 s | 5.67 s | 5.68 s | 5.64 s |
+| zstd -9, 256 MiB, 8 threads | 1.04 s | 1.21 s | 1.35 s | 1.22 s | 1.22 s | 1.24 s | 1.22 s |
+| transcode to H.264 at 8 Mbit/s, 10 s of 1080p30 | **1.87 s**ᵐ | **1.72 s**ᵐ | 6.83 s | 8.34 s | 6.61 s | 6.61 s | 6.54 s |
+| transcode to HEVC at 8 Mbit/s, the same | **1.94 s**ᵐ | **1.83 s**ᵐ | 10.01 s | 13.43 s | 9.37 s | 9.35 s | 9.35 s |
+| LLM on the CPU: Qwen2.5 0.5B Q4_K_M, 512 in / 128 out, 8 threads | 4.92 s | 5.77 s | 15.68 s | 7.49 s | 6.15 s | 6.50 s | 6.19 s |
 
 ᵐ on the media engine; every other runtime has none, and encodes in software (x264 preset medium, x265 preset fast, 8 threads).
 
-- **The transcodes** (`transcode-h264`, `transcode-hevc`) take Big Buck Bunny, 10 s of 1080p30 H.264 (CC-BY), and encode it again at 8 Mbit/s the fastest way the runtime can: VideoToolbox on the Mac with frames kept on the engine, V4L2 both ways in a container with `lighter.sh/video`, software otherwise. Their rows are a third session the same day, all seven in turn (`m1-*-transcode.*`). lighter is 3.8× faster than the best software runtime at H.264 and 5.1× at HEVC, and a little ahead of the Mac.
-- **What each path delivers**, scored against the source on the Mac by one scorer (`benchmarks/transcode-check.sh`, Homebrew's ffmpeg with libvmaf; `m1-transcode-quality.csv`):
+- **Every guest measured itself** at 8 CPUs and 3,885–4,047 MiB of the 4,096 asked for (`guest.*` in each `.tree`), no engine had a container running, and no case's repetitions differed by more than 20%.
+- **The Mac runs the image's releases**, built for it by `prepare-benchmark-tools.sh`: llama.cpp b11191 (commit 4b1a27f, the image's, with its CPU flags, no BLAS and OpenMP threads) and zstd 1.5.7. A binary cannot be shared between macOS and Linux, so each is its platform's compiler's build of the same source; the guests all run one binary, which is what makes the columns after the first comparable with each other. On that basis the VMs sit within a few percent of each other on the CPU, 11–14% behind the Mac on one thread.
+- **The transcodes** take Big Buck Bunny, 10 s of 1080p30 H.264 (CC-BY), and encode it at 8 Mbit/s the fastest way the runtime can: VideoToolbox on the Mac with frames kept on the engine, V4L2 both ways in a container with `lighter.sh/video`, software otherwise. lighter is 3.8× faster than the best software runtime at H.264 and 5.1× at HEVC, and a little ahead of the Mac.
+- **What each path delivers**, scored against the source on the Mac by one scorer (`benchmarks/transcode-check.sh`, Homebrew's ffmpeg with libvmaf):
 
   | | frames | Mbit/s | VMAF | PSNR (Y) | SSIM |
   |---|---|---|---|---|---|
@@ -78,26 +80,24 @@ An 8 GB M1 Mac mini on macOS 26.6.2, one session. Every runtime at 8 vCPUs and 4
   | HEVC, software (x265, in Podman) | 300 | 7.85 | 95.0 | 41.4 | 0.998 |
 
   lighter's output scores exactly as the Mac's, so its time is the same work. At the same bitrate the media engine's quality is lower than x264's and x265's (VMAF 83 against 94, 90 against 95), as hardware encoders' is: the speed is for the same bitrate, not the same quality. Every container runtime runs the identical software command, so Podman's output stands for all five.
-- **A guest's CPU is the Mac's CPU:** zstd, the same code on both, is 6% slower in every VM on one thread and 10–13% on eight (OrbStack 30%).
-- **The software encodes** set `pools=8`, so x265 has a thread pool on every runtime whatever its seccomp profile (Docker Desktop's was checked: "Thread pool created using 8 threads"). Docker Desktop is slower on both, x264 by 28% and x265 by 45%, with its 8 CPUs confirmed and the result reproduced in two sessions: measured as configured; the cause is inside the runtime.
+- **Docker Desktop is slower on both software encodes** (x264 by 26%, x265 by 44%), and **OrbStack's LLM** is 2.5× the others', both reproduced across sessions with the guests confirmed at 8 CPUs; OrbStack's was level on the M5, whose 18 cores leave room around an 8-vCPU guest. Measured as configured; the cause is inside the runtime.
 
-**The LLM on a GPU** (llama-bench's own tokens a second, three repetitions, every layer offloaded; image `llama-vulkan:arm64`; `benchmarks/llm-gpu.sh`, file `m1-llm-gpu.csv`)
+**The LLM on a GPU** (llama-bench's own tokens a second, three repetitions, every layer offloaded; image `llama-vulkan:arm64`; `benchmarks/llm-gpu.sh`)
 
 | tokens a second | prompt, 512 | generation, 128 |
 |---|---|---|
-| Mac itself, Metal (llama.cpp 1af554f, built for the Mac) | 2033 | 110 |
-| lighter 0.10.0, Metal (`lighter.sh/metal`) | 1938 | 95 |
-| lighter 0.10.0, Vulkan (`lighter.sh/gpu`) | 1250 | 45 |
-| Podman, Vulkan (krunkit's virtio-gpu) | 198 | 47 |
-| lighter, the same image on the CPU, 8 threads | 217 | 76 |
-| Podman, the same image on the CPU, 8 threads | 212 | 76 |
+| Mac itself, Metal (llama.cpp 1af554f, built for the Mac) | 2009 | 109 |
+| lighter 0.10.0, Metal (`lighter.sh/metal`) | 1947 | 94 |
+| lighter 0.10.0, Vulkan (`lighter.sh/gpu`) | 1247 | 45 |
+| Podman, Vulkan (krunkit's virtio-gpu) | 199 | 84 |
+| lighter, the same image on the CPU, 8 threads | 215 | 89 |
+| Podman, the same image on the CPU, 8 threads | 203 | 83 |
 
-- **The Metal rows are one build:** the image's llama.cpp, lighter's Metal server (`host/metal/build.sh`, plus its one RPC patch) and the Mac's llama-bench are all commit 1af554f (b11053); `llm-gpu.sh` logs each side's version. lighter reads the prompt at 95% of the Mac and generates at 86%: every token crosses ggml's RPC between the container and the Mac. Homebrew's llama.cpp (ggml 0.25.3), which disables Metal's tensor API before M5, read 2008 and 74 and is not the reference.
-- **Only lighter and the Mac get the GPU's speed:** lighter reads the prompt at 9× its CPU rate. Podman's Vulkan reads it no faster than its CPU does. OrbStack, Docker Desktop, Colima and Apple container offer no GPU to a container.
-- **On the CPU lighter and Podman are level.** Swept at 1, 4 and 8 threads in the same session, prompt 44.0 / 174.6 / 213.6 tokens a second against 44.4 / 173.2 / 208.3, generation 35.9 / 108.3 / 83.0 against 35.5 / 106.2 / 84.3. Eight threads generate slower than four on both: the M1 has four performance cores and four efficiency cores, and every token waits at a barrier for the slowest.
-- **The M1's own lighter** ran these rows (the release, installed from its notarized archive), at 8 CPUs, with its own containers stopped. One run straight after loading the benchmark image into its 4 GiB guest generated at 11.6 on the CPU and was run again. A first pass left them running (a Frigate and Home Assistant test stack, about 300 ms of CPU a second in the guest) and read lighter's CPU at 174 and 61: llama.cpp's threads, preempted six times as often as in Podman's guest, slept at their barriers fourteen times as often (17,904 voluntary switches a second against 1,278).
-- **OrbStack's LLM** is 2.6× the others', reproduced in a clean session; its VM has the 8 CPUs it was given (in its configuration, in the guest and from the API), its guest reports the same CPU features as the Mac (`asimddp`, `sha2`), and its vCPU threads run at the default priority, yet only seven of them are busy during the run and it spends twice lighter's CPU time. On the M5, whose 18 cores leave room around an 8-vCPU guest, it was level. Measured as configured; the cause is inside the runtime.
-- **A first pass the same morning was discarded.** The Mac was not quiet: the lock screen's Aerial decoding video and Photos' analysis after `photolibraryd` restarted. It moved the Mac's own rows most (media engine 4.0 s, LLM unsettled at 16–81 s) and three runtimes' LLM to about 16 s. Its files are kept on the M1, not here.
+- **The Metal rows are one build:** the image's llama.cpp, lighter's Metal server (`host/metal/build.sh`, plus its one RPC patch) and the Mac's llama-bench are all commit 1af554f (b11053); `llm-gpu.sh` logs each side's version. lighter reads the prompt at 97% of the Mac and generates at 86%: every token crosses ggml's RPC between the container and the Mac.
+- **Only lighter and the Mac get the GPU's speed:** lighter reads the prompt at 9× its CPU rate. Podman's Vulkan reads it at its CPU's rate (its generation read 47 in an earlier session and 84 in this one). OrbStack, Docker Desktop, Colima and Apple container offer no GPU to a container.
+- **On the CPU lighter and Podman are level.** Swept at 1, 4 and 8 threads earlier the same day, prompt 44.0 / 174.6 / 213.6 tokens a second against 44.4 / 173.2 / 208.3, generation 35.9 / 108.3 / 83.0 against 35.5 / 106.2 / 84.3. Eight threads generate slower than four on both: the M1 has four performance cores and four efficiency cores, and every token waits at a barrier for the slowest.
+- **The GPU and quality rows ran through the M1's own lighter** (the release, from its notarized archive, at 8 CPUs), its test stack paused for them (`--pause-containers`). A pass earlier the same day that left the stack running (Frigate and Home Assistant, about 300 ms of CPU a second in the guest) read lighter's CPU at 174 and 61: llama.cpp's threads, preempted six times as often as in Podman's guest, slept at their barriers fourteen times as often.
+- **Earlier passes the same day were discarded:** one on a Mac that was not quiet (the lock screen's Aerial decoding video, Photos' analysis after `photolibraryd` restarted), and the pieces this session replaces, taken before `compare.sh` and the checks it relies on existed. OrbStack's engine then had a Tailscale container running; it has since been removed.
 
 ## Notes
 
