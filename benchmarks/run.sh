@@ -419,7 +419,14 @@ PYIMAGE
 		local expected actual
 		expected="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]]["image_id"])' "$LIGHTER_BENCH_IMAGE_DIR/manifest.json" "$ARCH")"
 		actual="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{.Id}}' "$IMAGE")"
-		[ "$actual" = "$expected" ] || { echo 'benchmark image identity mismatch' >&2; exit 1; }
+		# An engine on the containerd image store (OrbStack's) names the same
+		# image by another digest; its layers are what identify it there.
+		if [ "$actual" != "$expected" ]; then
+			local want got
+			want="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]].get("layers_sha256",""))' "$LIGHTER_BENCH_IMAGE_DIR/manifest.json" "$ARCH")"
+			got="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{json .RootFS.Layers}}' "$IMAGE" | shasum -a 256 | cut -d' ' -f1)"
+			[ -n "$want" ] && [ "$got" = "$want" ] || { echo 'benchmark image identity mismatch' >&2; exit 1; }
+		fi
 	else
 		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} build -q ${PLATFORM[@]+"${PLATFORM[@]}"} -t "$IMAGE" benchmarks >/dev/null
 	fi

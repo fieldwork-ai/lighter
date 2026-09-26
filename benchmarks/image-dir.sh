@@ -22,7 +22,10 @@ for arch in $ARCHES; do
 	docker --context "$CTX" save -o "$OUT/$arch.tar" "$tag"
 	sha="$(shasum -a 256 "$OUT/$arch.tar" | cut -d' ' -f1)"
 	id="$(docker --context "$CTX" image inspect -f '{{.Id}}' "$tag")"
-	manifest="$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); m[sys.argv[2]]={"archive_sha256":sys.argv[3],"image_id":sys.argv[4]}; print(json.dumps(m, indent=2))' "$manifest" "$arch" "$sha" "$id")"
+	# The layers too: an engine on the containerd image store reports another
+	# ID for the same image, and the harness checks these there.
+	layers="$(docker --context "$CTX" image inspect -f '{{json .RootFS.Layers}}' "$tag" | shasum -a 256 | cut -d' ' -f1)"
+	manifest="$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); m[sys.argv[2]]={"archive_sha256":sys.argv[3],"image_id":sys.argv[4],"layers_sha256":sys.argv[5]}; print(json.dumps(m, indent=2))' "$manifest" "$arch" "$sha" "$id" "$layers")"
 	echo "$arch: $tag $id"
 done
 printf '%s\n' "$manifest" > "$OUT/manifest.json"
