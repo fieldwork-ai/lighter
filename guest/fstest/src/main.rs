@@ -524,6 +524,29 @@ fn cross(dir: &Path, report: &mut Report) {
     );
 
     report.check(
+        "host-overwrite-of-guest-write-is-seen",
+        (|| {
+            // A file the guest wrote and read keeps its pages across the
+            // first refresh after the write (kernel patch 0043), so a change
+            // the host makes to it must still drop them. The same length,
+            // so nothing but the host's notification can tell them apart.
+            let path = dir.join("guest-owned");
+            fs::write(&path, b"written by the guest").map_err(|e| e.to_string())?;
+            fs::read(&path).map_err(|e| e.to_string())?;
+            mark(dir, "guest-owned.done")?;
+            await_marker(dir, "host-overwrote-guest.done")?;
+            let content = fs::read(&path).map_err(|e| e.to_string())?;
+            if content != b"rewritten by the Mac" {
+                return Err(format!(
+                    "the guest still sees {:?}",
+                    String::from_utf8_lossy(&content)
+                ));
+            }
+            Ok(())
+        })(),
+    );
+
+    report.check(
         "host-rename-is-seen",
         (|| {
             await_marker(dir, "host-renamed.done")?;

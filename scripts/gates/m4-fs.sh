@@ -191,6 +191,14 @@ printf 'changed on the host' > "$SHARE/host-wrote"
 touch "$SHARE/host-overwrote.done"
 
 await "host-overwrite-is-seen" 60 || true
+# A file the guest wrote itself, rewritten here at the same length: the guest
+# keeps such a file's pages across its own mtime (kernel patch 0043), and only
+# the host's notification may drop them.
+await_file "$SHARE/guest-owned.done" 60 || true
+printf 'rewritten by the Mac' > "$SHARE/guest-owned"
+touch "$SHARE/host-overwrote-guest.done"
+
+await "host-overwrite-of-guest-write-is-seen" 60 || true
 mv "$SHARE/host-wrote" "$SHARE/host-renamed"
 touch "$SHARE/host-renamed.done"
 

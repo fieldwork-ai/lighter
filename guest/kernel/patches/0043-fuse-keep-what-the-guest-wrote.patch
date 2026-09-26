@@ -1,0 +1,103 @@
+fuse: keep what the guest wrote; a build reading an install's tree read it all from the host
+
+Two things made the guest's page cache forget a file it had just written
+through the share. Write-through marks a folio uptodate only when a write
+fills it, so every file's last partial folio, and the whole of any file
+under a page, went back to the server on its first read: a build reading
+the tree an install had just written sent seventy-seven thousand READs
+to the host (5.7 s against 0.13 s warm, on the M1). A folio the write
+covers from its start to the file's end is now zeroed past the end and
+marked uptodate, which is exactly what it holds.
+
+And a write moves the times in place with the guest's own clock (0013),
+which is never the host's mtime to the nanosecond; with auto_inval_data
+the first refresh after a write saw a changed mtime and dropped the pages,
+so the same build a minute later read the whole tree again. That refresh
+now takes the host's mtime and keeps the pages. A change made on the host
+still drops them: it arrives as a notification, which clears the mark,
+and a lost notification resets every inode (0028) whatever the mtime says.
+
+Only for a server that speaks the create dialect.
+
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1148,6 +1148,7 @@ bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written)
+ 		inode_set_mtime_to_ts(inode, now);
+ 		inode_set_ctime_to_ts(inode, now);
+ 		inode->i_blocks = DIV_ROUND_UP(i_size_read(inode), 512);
++		set_bit(FUSE_I_LIGHTER_WROTE, &fi->state);
+ 	}
+ 	spin_unlock(&fi->lock);
+ 
+@@ -1278,6 +1279,21 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
+ 		/* If we copied full folio, mark it uptodate */
+ 		if (tmp == folio_size(folio))
+ 			folio_mark_uptodate(folio);
++		/*
++		 * lighter: so is a folio the write covers from its start to the
++		 * file's end, since past the end of a file is zeroes. Without
++		 * this every file's last partial folio, and the whole of a file
++		 * under a page, went back to the server on its first read, and
++		 * a build reading the tree an install had just written read all
++		 * of it from the host: seventy-seven thousand READs, 5.7 s
++		 * against 0.13 s warm, on the M1. A short or failed write
++		 * clears it again in fuse_send_write_pages.
++		 */
++		else if (fc->lighter_create && !folio_test_uptodate(folio) &&
++			 folio_offset == 0 && pos >= i_size_read(mapping->host)) {
++			folio_zero_segment(folio, tmp, folio_size(folio));
++			folio_mark_uptodate(folio);
++		}
+ 
+ 		if (folio_test_uptodate(folio)) {
+ 			folio_unlock(folio);
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -236,6 +236,8 @@ enum {
+ 	FUSE_I_BTIME,
+ 	/* Wants or already has page cache IO */
+ 	FUSE_I_CACHE_IO_MODE,
++	/* lighter: the cached mtime is the guest's own, from a write */
++	FUSE_I_LIGHTER_WROTE,
+ };
+ 
+ struct fuse_conn;
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -393,6 +393,18 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
+ 
+ 	if (!cache_mask && S_ISREG(inode->i_mode)) {
+ 		bool inval = reset;
++		/*
++		 * lighter: an mtime this guest stamped itself (a write moves the
++		 * times in place) is never the host's to the nanosecond, so the
++		 * first refresh after a write read as the file having changed
++		 * and dropped the pages the write had just filled; a build a
++		 * minute after an install read the whole tree from the host
++		 * again. That refresh takes the host's mtime and keeps the
++		 * pages. A change made on the host still drops them: it arrives
++		 * as a notification, which clears this, and a lost one resets
++		 * every inode above whatever the mtime says.
++		 */
++		bool wrote = test_and_clear_bit(FUSE_I_LIGHTER_WROTE, &fi->state);
+ 
+ 		if (oldsize != attr->size) {
+ 			truncate_pagecache(inode, attr->size);
+@@ -408,7 +420,7 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
+ 			 * Auto inval mode also checks and invalidates if mtime
+ 			 * has changed.
+ 			 */
+-			if (!timespec64_equal(&old_mtime, &new_mtime))
++			if (!wrote && !timespec64_equal(&old_mtime, &new_mtime))
+ 				inval = true;
+ 		}
+ 
+@@ -586,6 +598,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
+ 	spin_lock(&fi->lock);
+ 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+ 	spin_unlock(&fi->lock);
++	/* lighter: the host changed it; the next refresh is the host's word */
++	clear_bit(FUSE_I_LIGHTER_WROTE, &fi->state);
+ 
+ 	fuse_invalidate_attr(inode);
+ 	forget_all_cached_acls(inode);
