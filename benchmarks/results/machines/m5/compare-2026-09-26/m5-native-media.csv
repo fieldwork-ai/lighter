@@ -1,0 +1,10 @@
+case,rep,ms
+transcode-x264,1,1219
+transcode-x264,2,1233
+transcode-x264,3,1200
+transcode-x265,1,1009
+transcode-x265,2,1003
+transcode-x265,3,996
+llm,1,2305
+llm,2,2196
+llm,3,2140
