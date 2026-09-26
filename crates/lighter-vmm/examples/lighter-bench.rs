@@ -41,14 +41,16 @@ fn main() -> ExitCode {
             "--memory-mib" => {
                 let mib: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(2048);
                 // As the CLI: all of it at boot, or with
-                // `LIGHTER_RESOURCES=native` a two-gigabyte base and a
-                // virtio-mem range for the rest.
-                (config.ram_bytes, config.hotplug_bytes) =
-                    if std::env::var("LIGHTER_RESOURCES").as_deref() == Ok("native") {
-                        lighter_vmm::virtio::mem::split(mib << 20, 2 << 30)
-                    } else {
-                        (mib << 20, 0)
-                    };
+                // `LIGHTER_RESOURCES=cooperative` (or its old name, `native`)
+                // a two-gigabyte base and a virtio-mem range for the rest.
+                (config.ram_bytes, config.hotplug_bytes) = if matches!(
+                    std::env::var("LIGHTER_RESOURCES").as_deref(),
+                    Ok("cooperative" | "native")
+                ) {
+                    lighter_vmm::virtio::mem::split(mib << 20, 2 << 30)
+                } else {
+                    (mib << 20, 0)
+                };
             }
             "--disk" => config
                 .disks
@@ -214,7 +216,9 @@ fn main() -> ExitCode {
 
     if !mem_plan.is_empty() {
         let Some(mem) = machine.mem().cloned() else {
-            eprintln!("lighter: --mem-plan needs a virtio-mem range (LIGHTER_RESOURCES=native)");
+            eprintln!(
+                "lighter: --mem-plan needs a virtio-mem range (LIGHTER_RESOURCES=cooperative)"
+            );
             return ExitCode::from(2);
         };
         let started = std::time::Instant::now();

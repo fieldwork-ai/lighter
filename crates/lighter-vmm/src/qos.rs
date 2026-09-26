@@ -70,7 +70,7 @@ pub fn register_vcpu() {
     // and `low` 30%; and 18 native threads at the default class made the
     // same thread 6.1 ms late. The default class is a native build's, so
     // the vCPUs stay there: containers compete with the Mac as native work
-    // does, and no harder (gate m6n).
+    // does, and no harder (gate m6c).
     match std::env::var("LIGHTER_VCPU_QOS").as_deref() {
         // SAFETY (both): a plain call on the current thread with constant
         // arguments.

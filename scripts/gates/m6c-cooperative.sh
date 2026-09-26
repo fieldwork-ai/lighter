@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Gate m6n: Mac-native resources (`lighter config --resources native`).
+# Gate m6c: cooperative resources (`lighter config --resources cooperative`).
 #
-# A native machine is the whole Mac: every core a vCPU, and a memory ceiling
-# of the Mac's own, booted on a small base with the rest a virtio-mem range
-# plugged in as the guest needs it. The claims:
+# A cooperative machine shares the Mac as a native app does: every core a
+# vCPU, and a memory ceiling of twice the Mac's, booted on a small base with
+# the rest a virtio-mem range plugged in as the guest needs it. The claims:
 #
 #   1. It boots on its base: nothing of the range is plugged until wanted.
 #   2. A burst faster than the host can be asked (a tmpfs writer, which the
@@ -19,6 +19,12 @@
 #      every vCPU flat out than behind the same number of native threads:
 #      a container's build competes with the Mac's windows as a native
 #      build does, no harder.
+#   8. Past the Mac's memory: a working set of one and a half times the Mac's
+#      RAM, incompressible, completes in the guest with nothing OOM-killed,
+#      macOS compressing and swapping it as it would a native app's; and the
+#      Mac's interactive thread waits no longer behind it than behind a
+#      native process holding and walking as much. Skipped where the ceiling
+#      cannot hold it or the disk has no room for the swap.
 set -euo pipefail
 if ! command -v cargo >/dev/null 2>&1; then
 	# shellcheck disable=SC1091
@@ -37,15 +43,14 @@ BIN="target/$PROFILE/examples/lighter-bench"
 # per-cgroup pressure accounting off above all, which the throttle's stall
 # trigger has to work without.
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
-# The CLI's ceiling, the Mac's RAM less 2 GiB, capped at 16 GiB: large
-# enough for the burst to need the range, and on an 8 GB M1 the 6 GiB a
-# person would get (a fixed 16 GiB there grew the range into swap). The
-# burst is 6000 MiB, or half the ceiling where that is less. The vCPUs are
-# every core the Mac has.
+# The CLI's ceiling, twice the Mac's RAM, capped at 16 GiB: on an 8 GB M1
+# exactly what a person gets. The burst is 6000 MiB, or half the Mac's
+# memory where that is less: it is the throttle's claim, within the Mac's
+# memory; going past it is claim 8's. The vCPUs are every core the Mac has.
 MAC_MIB=$(( $(sysctl -n hw.memsize) >> 20 ))
-CEILING_MIB="${CEILING_MIB:-$(( MAC_MIB - 2048 < 16384 ? MAC_MIB - 2048 : 16384 ))}"
+CEILING_MIB="${CEILING_MIB:-$(( MAC_MIB * 2 < 16384 ? MAC_MIB * 2 : 16384 ))}"
 VCPUS="$(sysctl -n hw.ncpu)"
-BURST_MIB="${BURST_MIB:-$(( CEILING_MIB / 2 < 6000 ? CEILING_MIB / 2 : 6000 ))}"
+BURST_MIB="${BURST_MIB:-$(( MAC_MIB / 2 < 6000 ? MAC_MIB / 2 : 6000 ))}"
 IDLE_SECONDS="${IDLE_SECONDS:-60}"
 MAX_IDLE_CPU=1.0
 # The Mac's own interactive thread, woken every 5 ms: its 99th percentile
@@ -64,14 +69,14 @@ echo "==> Building and signing the VMM"
 cargo build $([ "$PROFILE" = release ] && echo --release) --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 
-RUN_DIR="$(mktemp -d -t lighter-m6n)"
+RUN_DIR="$(mktemp -d -t lighter-m6c)"
 SOCKET="$RUN_DIR/docker.sock"
 LOG="$RUN_DIR/boot.log"
 PRESSURE_FILE="$RUN_DIR/pressure"
 VMM_PID=""
 cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
-	mkdir -p .logs && cp "$LOG" .logs/m6n-last-boot.log 2>/dev/null || true
+	mkdir -p .logs && cp "$LOG" .logs/m6c-last-boot.log 2>/dev/null || true
 	rm -rf "$RUN_DIR" "${ROOTFS_DIR:-}"
 }
 trap cleanup EXIT
@@ -90,9 +95,9 @@ guest() {
 }
 
 echo
-echo "==> Booting native: ${VCPUS} vCPUs, a ${CEILING_MIB} MiB ceiling"
+echo "==> Booting cooperative: ${VCPUS} vCPUs, a ${CEILING_MIB} MiB ceiling"
 echo normal > "$PRESSURE_FILE"
-LIGHTER_RESOURCES=native LIGHTER_PRESSURE_TEST_FILE="$PRESSURE_FILE" "$BIN" \
+LIGHTER_RESOURCES=cooperative LIGHTER_PRESSURE_TEST_FILE="$PRESSURE_FILE" "$BIN" \
 	--kernel "$KERNEL" \
 	--disk "$ROOTFS" \
 	--disk "$RUN_DIR/data.img" --disk-size-gib 32 \
@@ -175,8 +180,8 @@ note "guest ${slab}"
 
 # ---------------------------------------------------------------- pressure --
 echo
-echo "==> Host pressure: a native guest takes nothing more from the Mac at Warn"
-docker run -d --name m6n-keeper alpine:3.21 sleep 900 >/dev/null 2>&1 || true
+echo "==> Host pressure: a cooperative guest takes nothing more from the Mac at Warn"
+docker run -d --name m6c-keeper alpine:3.21 sleep 900 >/dev/null 2>&1 || true
 sleep 4
 before_fp="$(footprint)"
 echo warn > "$PRESSURE_FILE"
@@ -187,7 +192,7 @@ after_fp="$(footprint)"
 	&& pass "at Warn the balloon holds ${held} MiB and the footprint went ${before_fp} → ${after_fp} MiB" \
 	|| fail "at Warn the balloon holds ${held:-0} MiB and the footprint went ${before_fp} → ${after_fp} MiB"
 echo normal > "$PRESSURE_FILE"
-docker rm -f m6n-keeper >/dev/null 2>&1 || true
+docker rm -f m6c-keeper >/dev/null 2>&1 || true
 
 # ------------------------------------------------------------ giving back --
 echo
@@ -238,13 +243,15 @@ echo "==> The Mac's interactive thread behind ${VCPUS} busy vCPUs, and behind ${
 # main module again, which a script read from stdin cannot be.
 PROBE="$RUN_DIR/probe.py"
 cat > "$PROBE" <<'PY'
-import ctypes, multiprocessing, sys, time
+import ctypes, multiprocessing, os, sys, time
 def burn(sec):
     end = time.monotonic() + sec
     while time.monotonic() < end:
         pass
 if __name__ == "__main__":
     seconds, native = float(sys.argv[1]), int(sys.argv[2])
+    # With a third argument, sample while that file exists instead.
+    stop = sys.argv[3] if len(sys.argv) > 3 else None
     burners = [multiprocessing.Process(target=burn, args=(seconds + 3,)) for _ in range(native)]
     for b in burners:
         b.start()
@@ -253,26 +260,81 @@ if __name__ == "__main__":
     ctypes.CDLL(None).pthread_set_qos_class_self_np(0x21, 0)
     late = []
     end = time.monotonic() + seconds
-    while time.monotonic() < end:
+    while (os.path.exists(stop) if stop else time.monotonic() < end):
         t = time.monotonic()
         time.sleep(0.005)
         late.append((time.monotonic() - t - 0.005) * 1000)
     for b in burners:
         b.terminate()
-    late.sort()
+    late = sorted(late) or [0.0]
     print(f"{late[len(late) * 99 // 100]:.2f}")
 PY
-probe() { /usr/bin/python3 "$PROBE" "$1" "${2:-0}"; }
+probe() { /usr/bin/python3 "$PROBE" "$1" "${2:-0}" ${3:+"$3"}; }
 QUIET_P99="$(probe 10)"
 NATIVE_P99="$(probe 12 "$VCPUS")"
-docker run -d --name m6n-burn alpine:3.21 sh -c "for i in \$(seq 1 $VCPUS); do (while :; do :; done) & done; sleep 60" >/dev/null 2>&1
+docker run -d --name m6c-burn alpine:3.21 sh -c "for i in \$(seq 1 $VCPUS); do (while :; do :; done) & done; sleep 60" >/dev/null 2>&1
 sleep 3
 GUEST_P99="$(probe 12)"
-docker rm -f m6n-burn >/dev/null 2>&1 || true
+docker rm -f m6c-burn >/dev/null 2>&1 || true
 awk -v g="$GUEST_P99" -v n="$NATIVE_P99" -v r="$LATE_RATIO" 'BEGIN { exit !(g <= n * r + 1) }' \
 	&& pass "p99 lateness ${GUEST_P99} ms behind the guest, ${NATIVE_P99} ms behind native threads (${QUIET_P99} ms quiet)" \
 	|| fail "p99 lateness ${GUEST_P99} ms behind the guest against ${NATIVE_P99} ms behind native threads (${QUIET_P99} ms quiet)"
 
+# ------------------------------------------------- past the Mac's memory --
 echo
-[ "$FAILED" -eq 0 ] && echo "m6n: native resources hold" || echo "m6n: FAILED"
+WS_MIB="${OVERCOMMIT_MIB:-$(( MAC_MIB * 3 / 2 ))}"
+# What macOS will write to swap, roughly the working set less the half of the
+# Mac it can find, and room to spare: a Mac that fills its disk to swap is a
+# broken Mac, which is not the claim.
+SWAP_ROOM_MIB=$(( WS_MIB - MAC_MIB / 2 + 4096 ))
+FREE_MIB="$(df -m / | awk 'NR == 2 { print $4 }')"
+echo "==> Past the Mac's memory: ${WS_MIB} MiB of random bytes, in the guest and in a native process"
+if [ "$CEILING_MIB" -lt $(( WS_MIB + 3072 )) ]; then
+	note "skipped: a ${CEILING_MIB} MiB ceiling cannot hold it (CEILING_MIB, OVERCOMMIT_MIB)"
+elif [ "$FREE_MIB" -lt "$SWAP_ROOM_MIB" ]; then
+	note "skipped: ${FREE_MIB} MiB free on disk, and the Mac may need ${SWAP_ROOM_MIB} MiB to swap it"
+else
+	swapouts() { vm_stat | awk '/^Swapouts/ { gsub(/\./, "", $2); print $2 }'; }
+	# The Mac's own: a process holding as many random bytes, reading every
+	# page twice, as the guest's cat does.
+	cat > "$RUN_DIR/hold.py" <<'PY'
+import os, sys
+chunks = [os.urandom(1 << 20) for _ in range(int(sys.argv[1]))]
+for _ in range(2):
+    sum(sum(c[::4096]) for c in chunks)
+PY
+	walk() { # command...: prints its seconds, the probe's p99, the Mac's swapouts, its status
+		local stop="$RUN_DIR/walking" before t0 status=0 prober seconds
+		before="$(swapouts)"; touch "$stop"
+		probe 0 0 "$stop" > "$RUN_DIR/p99" &
+		prober=$!
+		t0="$(date +%s)"
+		"$@" >/dev/null 2>&1 || status=$?
+		seconds=$(( $(date +%s) - t0 ))
+		rm -f "$stop"; wait "$prober"
+		echo "$seconds $(cat "$RUN_DIR/p99") $(( $(swapouts) - before )) $status"
+	}
+	oom_before="$(guest 'dmesg | grep -ciE "out of memory|oom-kill"')"
+	read -r NATIVE_S NATIVE_P99 NATIVE_SWAP native_status <<<"$(walk /usr/bin/python3 "$RUN_DIR/hold.py" "$WS_MIB")"
+	[ "$native_status" = 0 ] || fail "the native process did not finish (exit $native_status)"
+	sleep 10
+	read -r GUEST_S GUEST_P99 GUEST_SWAP guest_status <<<"$(walk docker run --rm --tmpfs "/w:size=$(( WS_MIB + 1024 ))m" alpine:3.21 sh -c \
+		"dd if=/dev/urandom of=/w/f bs=1M count=$WS_MIB 2>/dev/null && cat /w/f >/dev/null && cat /w/f >/dev/null")"
+	oom_after="$(guest 'dmesg | grep -ciE "out of memory|oom-kill"')"
+	if [ "$guest_status" != 0 ]; then
+		fail "the guest's ${WS_MIB} MiB working set did not complete (exit $guest_status)"
+	elif [ "${oom_after:-0}" -gt "${oom_before:-0}" ]; then
+		fail "the guest walked it, and the kernel OOM-killed something"
+	else
+		pass "the guest held and walked ${WS_MIB} MiB in ${GUEST_S} s (native ${NATIVE_S} s), nothing OOM-killed"
+	fi
+	note "the Mac swapped out ${GUEST_SWAP} pages for the guest, ${NATIVE_SWAP} for the native process"
+	docker info >/dev/null 2>&1 && pass "the engine answers after it" || fail "the engine does not answer after it"
+	awk -v g="$GUEST_P99" -v n="$NATIVE_P99" -v r="$LATE_RATIO" 'BEGIN { exit !(g <= n * r + 1) }' \
+		&& pass "p99 lateness ${GUEST_P99} ms behind the guest's working set, ${NATIVE_P99} ms behind the native one" \
+		|| fail "p99 lateness ${GUEST_P99} ms behind the guest's working set against ${NATIVE_P99} ms behind the native one"
+fi
+
+echo
+[ "$FAILED" -eq 0 ] && echo "m6c: cooperative resources hold" || echo "m6c: FAILED"
 exit "$FAILED"

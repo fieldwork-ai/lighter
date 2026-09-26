@@ -22,7 +22,7 @@ pub struct Waiting {
     pub retries: u64,
 }
 
-/// The guest's memory, when it has a virtio-mem range (native resources).
+/// The guest's memory, when it has a virtio-mem range (cooperative resources).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Memory {
     /// What the guest booted with.

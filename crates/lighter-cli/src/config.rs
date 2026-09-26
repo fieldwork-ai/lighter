@@ -61,26 +61,37 @@ pub struct Config {
 ///
 /// `Fixed` is a slice of the Mac chosen up front: half the cores and a
 /// quarter of the memory unless told otherwise, as every Mac container
-/// runtime has always done. `Native` is the whole Mac, as a native app
-/// sees it: every core is a vCPU the Mac schedules like any other thread
+/// runtime has always done. `Cooperative` shares the Mac as a native app
+/// does: every core is a vCPU the Mac schedules like any other thread
 /// (they run at the default QoS class, see `lighter_vmm::qos`), and the
-/// memory ceiling is the Mac's, with the guest booting on a small base and
-/// the rest plugged in through virtio-mem as it is needed and given back
-/// when it is not. Experimental.
+/// guest boots on a small base with the rest plugged in through virtio-mem
+/// as it is needed and given back when it is not, up to twice the Mac's
+/// memory. Experimental.
+///
+/// `native` was this mode's name before 0.10.0 shipped; files and commands
+/// that say it still mean it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Resources {
     #[default]
     Fixed,
-    Native,
+    #[serde(alias = "native")]
+    #[value(alias = "native")]
+    Cooperative,
 }
 
-/// RAM a native machine boots with, beside its virtio-mem range: enough for
-/// the kernel, the engine and a small container without a plug.
-pub const NATIVE_BASE_BYTES: u64 = 2 << 30;
+/// RAM a cooperative machine boots with, beside its virtio-mem range: enough
+/// for the kernel, the engine and a small container without a plug.
+pub const COOPERATIVE_BASE_BYTES: u64 = 2 << 30;
 
-/// Memory a native machine's ceiling leaves to macOS itself.
-const NATIVE_MARGIN_MIB: u64 = 2048;
+/// A cooperative machine's ceiling, as a multiple of the Mac's memory. Past
+/// the Mac's own memory is what macOS compresses and swaps, as it does for a
+/// native app that asks for that much: the policy grows the guest for page
+/// cache only into memory the Mac is not using, and under pressure grows it
+/// a step at a time, so what goes past is memory in use. Twice rather than
+/// unbounded, so that a runaway container is stopped by the guest's OOM
+/// killer before the Mac's swap fills its disk.
+const COOPERATIVE_CEILING_FACTOR: u64 = 2;
 
 /// A switch on the command line: `--gpu on`, `--gpu off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -142,7 +153,7 @@ impl Config {
             Resources::Fixed => self.cpus.unwrap_or((host / 2).max(2)),
             // Every core, at the default QoS class: a build competes with the
             // Mac's windows as a native build does, and loses to them.
-            Resources::Native => self.cpus.map_or(host, |cap| cap.clamp(1, host)),
+            Resources::Cooperative => self.cpus.map_or(host, |cap| cap.clamp(1, host)),
         }
     }
 
@@ -155,10 +166,10 @@ impl Config {
             // Backing-object metadata and initialization still scale with
             // this ceiling, even while the guest is idle.
             Resources::Fixed => self.memory_mib.unwrap_or((host / 4).clamp(2048, 16384)),
-            // The Mac's, less what macOS keeps for itself. Only the plugged
+            // Twice the Mac's (`COOPERATIVE_CEILING_FACTOR`). Only the plugged
             // part of the range costs anything, page array included.
-            Resources::Native => {
-                let ceiling = host.saturating_sub(NATIVE_MARGIN_MIB).max(2048);
+            Resources::Cooperative => {
+                let ceiling = host.saturating_mul(COOPERATIVE_CEILING_FACTOR).max(2048);
                 // And what the widest address space this Mac's hypervisor
                 // allows can hold, beside the GPU's and the decoder's windows.
                 let ceiling = lighter_vmm::machine::max_ram_bytes(
@@ -177,7 +188,9 @@ impl Config {
         let total = self.memory_mib() << 20;
         match self.resources {
             Resources::Fixed => (total, 0),
-            Resources::Native => lighter_vmm::virtio::mem::split(total, NATIVE_BASE_BYTES),
+            Resources::Cooperative => {
+                lighter_vmm::virtio::mem::split(total, COOPERATIVE_BASE_BYTES)
+            }
         }
     }
 
@@ -298,52 +311,75 @@ mod tests {
         assert_eq!(config.memory_split().1, 0, "fixed has no virtio-mem range");
     }
 
-    /// Native is the whole Mac: every core, and a ceiling of the Mac's memory
-    /// less macOS's margin, booted on a small base with the rest a range.
+    /// The ceiling a cooperative machine gets on this Mac: twice its memory,
+    /// within what the hypervisor's address space can hold.
+    fn cooperative_ceiling() -> u64 {
+        let ceiling = physical_memory_mib()
+            .saturating_mul(COOPERATIVE_CEILING_FACTOR)
+            .max(2048);
+        lighter_vmm::machine::max_ram_bytes(
+            crate::run::GPU_APERTURE_BYTES,
+            crate::run::VIDEO_APERTURE_BYTES,
+        )
+        .map_or(ceiling, |max| ceiling.min(max >> 20))
+    }
+
+    /// Cooperative is every core, and a ceiling past the Mac's memory, booted
+    /// on a small base with the rest a range.
     #[test]
-    fn native_is_the_whole_mac() {
+    fn cooperative_shares_the_whole_mac() {
         let config = Config {
-            resources: Resources::Native,
+            resources: Resources::Cooperative,
             ..Config::default()
         };
         assert_eq!(config.vcpus(), num_cpus());
-        let host = physical_memory_mib();
-        assert_eq!(
-            config.memory_mib(),
-            host.saturating_sub(NATIVE_MARGIN_MIB).max(2048)
-        );
+        assert_eq!(config.memory_mib(), cooperative_ceiling());
         let (base, range) = config.memory_split();
         assert_eq!(base + range, config.memory_mib() << 20);
-        assert!(base <= NATIVE_BASE_BYTES.max(config.memory_mib() << 20));
+        assert!(base <= COOPERATIVE_BASE_BYTES.max(config.memory_mib() << 20));
     }
 
-    /// In native, a count is a cap: never above the Mac, never below one core
-    /// or two gigabytes.
+    /// In cooperative, a count is a cap: never above the ceiling, never below
+    /// one core or two gigabytes.
     #[test]
-    fn native_counts_are_caps() {
+    fn cooperative_counts_are_caps() {
         let config = Config {
-            resources: Resources::Native,
+            resources: Resources::Cooperative,
             cpus: Some(2),
             memory_mib: Some(4096),
             ..Config::default()
         };
         assert_eq!(config.vcpus(), 2.min(num_cpus()));
-        let ceiling = physical_memory_mib()
-            .saturating_sub(NATIVE_MARGIN_MIB)
-            .max(2048);
-        assert_eq!(config.memory_mib(), 4096.clamp(2048, ceiling));
+        assert_eq!(config.memory_mib(), 4096.clamp(2048, cooperative_ceiling()));
         let config = Config {
-            resources: Resources::Native,
+            resources: Resources::Cooperative,
             cpus: Some(10_000),
             memory_mib: Some(1 << 30),
             ..Config::default()
         };
         assert_eq!(config.vcpus(), num_cpus());
+        assert_eq!(config.memory_mib(), cooperative_ceiling());
+    }
+
+    /// `native`, the mode's name until 0.10.0 shipped, still reads as it, in a
+    /// file and on the command line; what is written back is the new name.
+    #[test]
+    fn native_is_the_old_name_for_cooperative() {
+        let back: Config = serde_json::from_str(r#"{"resources":"native"}"#).unwrap();
+        assert_eq!(back.resources, Resources::Cooperative);
+        assert!(
+            serde_json::to_string(&back)
+                .unwrap()
+                .contains(r#""resources":"cooperative""#)
+        );
+        use clap::ValueEnum;
         assert_eq!(
-            config.memory_mib(),
-            physical_memory_mib()
-                .saturating_sub(NATIVE_MARGIN_MIB)
-                .max(2048)
+            Resources::from_str("native", false).unwrap(),
+            Resources::Cooperative
+        );
+        assert_eq!(
+            Resources::from_str("cooperative", false).unwrap(),
+            Resources::Cooperative
         );
     }
 
@@ -363,7 +399,7 @@ mod tests {
     #[test]
     fn a_config_round_trips() {
         let config = Config {
-            resources: Resources::Native,
+            resources: Resources::Cooperative,
             cpus: Some(3),
             memory_mib: Some(4096),
             disk_gib: 32,
@@ -386,10 +422,10 @@ mod tests {
         assert!(
             std::str::from_utf8(&bytes)
                 .unwrap()
-                .contains(r#""resources":"native""#)
+                .contains(r#""resources":"cooperative""#)
         );
         let back: Config = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.resources, Resources::Native);
+        assert_eq!(back.resources, Resources::Cooperative);
         assert_eq!(back.cpus, Some(3));
         assert_eq!(back.shares, vec!["/tmp".to_string()]);
         assert_eq!(back.publish, Publish::Localhost);

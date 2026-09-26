@@ -26,7 +26,7 @@ pub struct Status {
     pub docker: Option<String>,
     pub footprint_mib: Option<u64>,
     pub storage_waiting: Vec<crate::storage_status::Waiting>,
-    /// The guest's plugged memory and ceiling, with native resources.
+    /// The guest's plugged memory and ceiling, with cooperative resources.
     pub memory: Option<crate::storage_status::Memory>,
 }
 

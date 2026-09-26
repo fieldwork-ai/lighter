@@ -82,14 +82,15 @@ enum Command {
     /// Show or change the configuration.
     Config {
         /// How the machine is sized: a fixed slice of the Mac (`fixed`, the
-        /// default), or Mac-native resources (`native`, experimental): every
-        /// core, and the Mac's memory plugged in as it is needed.
+        /// default), or cooperative resources (`cooperative`, experimental):
+        /// every core, and memory plugged in as it is needed, up to twice the
+        /// Mac's, and given back when it is not.
         #[arg(long, value_enum)]
         resources: Option<config::Resources>,
-        /// Cores to give the guest; in `native`, the most it may use.
+        /// Cores to give the guest; in `cooperative`, the most it may use.
         #[arg(long)]
         cpus: Option<u32>,
-        /// Memory ceiling, in MiB; in `native`, the most it may use. The
+        /// Memory ceiling, in MiB; in `cooperative`, the most it may use. The
         /// guest gives back what it does not use.
         #[arg(long)]
         memory: Option<u64>,
@@ -365,7 +366,7 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
         config.memory_mib(),
         match config.resources {
             config::Resources::Fixed => "",
-            config::Resources::Native => ", Mac-native resources",
+            config::Resources::Cooperative => ", cooperative resources",
         }
     );
     let pid = machine::start(&config, timeout)?;
@@ -423,7 +424,7 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
     }
     if let Some(memory) = status.memory {
         println!(
-            "  guest      {} of {} MiB plugged in (Mac-native resources)",
+            "  guest      {} of {} MiB plugged in (cooperative resources)",
             memory.base_mib + memory.plugged_mib,
             memory.base_mib + memory.range_mib
         );
@@ -557,23 +558,23 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         "  resources  {}",
         match config.resources {
             config::Resources::Fixed => "fixed (a slice of the Mac)",
-            config::Resources::Native => "native (Mac-native resources, experimental)",
+            config::Resources::Cooperative => "cooperative (the Mac's, shared, experimental)",
         }
     );
-    let limit = |set: bool| match (config.resources, set) {
-        (config::Resources::Native, true) => " (limit)",
-        (config::Resources::Native, false) => " (the Mac's)",
+    let limit = |set: bool, unset: &'static str| match (config.resources, set) {
+        (config::Resources::Cooperative, true) => " (limit)",
+        (config::Resources::Cooperative, false) => unset,
         _ => "",
     };
     println!(
         "  cpus       {}{}",
         config.vcpus(),
-        limit(config.cpus.is_some())
+        limit(config.cpus.is_some(), " (the Mac's)")
     );
     println!(
         "  memory     {} MiB{}",
         config.memory_mib(),
-        limit(config.memory_mib.is_some())
+        limit(config.memory_mib.is_some(), " (twice the Mac's)")
     );
     println!("  disk       {} GiB", config.disk_gib);
     println!(

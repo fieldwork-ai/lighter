@@ -719,9 +719,9 @@ if [ "$TARGET" != native ]; then
 		exit 1
 	fi
 	# MemTotal is what the kernel keeps after its own reservations: 85-101%
-	# of the machine. A guest sized by demand (lighter's native resources)
+	# of the machine. A guest sized by demand (lighter's cooperative resources)
 	# shows what is plugged, so only a fixed one is held to it.
-	if [ -n "${BENCH_MEMORY_MIB:-}" ] && [ "${LIGHTER_RESOURCES:-fixed}" != native ] \
+	if [ -n "${BENCH_MEMORY_MIB:-}" ] && [ "${LIGHTER_RESOURCES:-fixed}" = fixed ] \
 		&& { [ "$GUEST_MIB" -lt $((BENCH_MEMORY_MIB * 85 / 100)) ] || [ "$GUEST_MIB" -gt $((BENCH_MEMORY_MIB * 101 / 100)) ]; }; then
 		echo "==> the $TARGET guest has $GUEST_MIB MiB; BENCH_MEMORY_MIB asked for $BENCH_MEMORY_MIB" >&2
 		exit 1
