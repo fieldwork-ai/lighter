@@ -636,7 +636,10 @@ run_case_lighter() {
 	local script
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
-	docker run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} \
+	# `LIGHTER_BENCH_CASE_ARGS`: extra `docker run` flags for the case's
+	# container, such as `--device lighter.sh/video=all` for the hardware
+	# transcode cases.
+	docker run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} ${LIGHTER_BENCH_CASE_ARGS:-} \
 		-v "$(work_mount)":/work \
 		-v "lighter-bench-npm-$TARGET$CACHE_SUFFIX:/root/.npm" \
 		-v "lighter-bench-pnpm-$TARGET$CACHE_SUFFIX:/root/.local/share/pnpm/store" \

@@ -18,7 +18,7 @@ RUN apk add --no-cache build-base cmake git linux-headers \
 
 FROM node:24.18.0-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd
 
-RUN apk add --no-cache ripgrep git tar iperf3 ffmpeg libstdc++ libgomp \
+RUN apk add --no-cache ripgrep git tar iperf3 ffmpeg zstd libstdc++ libgomp \
 	&& npm install -g --force --no-audit --no-fund npm@11.16.0 pnpm@10.28.0 yarn@1.22.22
 COPY --from=llama /build/bin/llama-bench /usr/local/bin/llama-bench
 
