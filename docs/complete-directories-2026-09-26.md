@@ -1,6 +1,6 @@
 # Complete directories: answering from what the guest made (proposal)
 
-Status: proposed, 2026-09-26. Not built. Follows kernel patch 0043, which keeps the data of files the guest wrote.
+Status: step 1 (missing names) built as kernel patch 0044, 2026-09-26; step 2 (listings) proposed. Follows kernel patch 0043, which keeps the data of files the guest wrote.
 
 ## Where the time still goes
 
@@ -33,6 +33,20 @@ A directory that has been cleared stays cleared until the guest makes it again. 
 ## What it would buy
 
 Both counts above go to zero for a tree the guest wrote, so the cold pass should land near the warm one (0.13–0.24 s against 1.2 s now and OrbStack's 1.1 s). Installs gain too: a package manager checks for names before it creates them, and every one of those is a negative LOOKUP today.
+
+## Step 1, measured
+
+Patch 0044 answers missing names in a complete directory; listings still come from the host. On the M1, in the harness (npm-install, then ripgrep over the tree it wrote):
+
+| | 0.10.0 | 0043 | 0043 + 0044 |
+|---|---:|---:|---:|
+| ripgrep, first pass | 5,794 ms | 1,219 ms | 637 ms |
+| ripgrep, warm | 124–160 ms | 129–158 ms | 123–133 ms |
+| npm-install (five) | 10.5–11.3 s | 10.4–11.1 s | 10.1–10.5 s |
+
+The first pass now asks the host for 15,452 listings, 22 lookups and one read; the install asks for no lookups at all. Gate m4 passed five times in a row with the new coherence check (a name the guest was told is missing, then made on the host, is found; a file deleted on the host from a guest-made directory is gone).
+
+That check first failed twice in eight runs, and the fault was the test's: the share acknowledges a guest's create at once and applies it a moment later, and the host half deleted the file before the create had landed, so the file really did exist afterwards. The host half now waits for the file before deleting it. It is an edge case of the share itself, older than any of this: a program on the Mac deleting a file within milliseconds of a container creating it can have the delete undone by the create landing after it.
 
 ## Risks, and how they are held
 

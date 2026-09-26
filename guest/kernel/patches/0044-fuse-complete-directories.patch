@@ -1,0 +1,162 @@
+fuse: a directory the guest made answers for missing names itself
+
+A tree walk asks every directory for names that are not there: ripgrep
+looks for .gitignore, .ignore, .rgignore and .git in each, and every one
+was a LOOKUP to the host. Over node_modules straight after the install
+that wrote it, on the M1, thirty-seven thousand of them.
+
+A directory this guest made starts empty, and while nothing but the guest
+changes it, the dcache holds every entry in it, so a name with no dentry
+does not exist. Ceph's client keeps complete directories the same way. The
+mark is granted on the guest's own mkdir, only when the server answers it
+with a long entry lifetime (which it does only while it pushes
+invalidations), and ends at the first thing that could put an entry behind
+the guest's back: a notification about the directory or any name in it
+(taken under the directory's lock, which a lookup answering for it holds
+shared), a reset of every cache (the epoch it was granted in), or a
+positive child pruned from the dcache.
+
+Only for a server that speaks the create dialect.
+
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -378,12 +378,28 @@ static struct vfsmount *fuse_dentry_automount(struct path *path)
+ 	return mnt;
+ }
+ 
++/*
++ * lighter: a child the dcache lets go of is one a complete directory can no
++ * longer answer for, so the directory asks again from then on. Only a
++ * positive child: a missing name forgotten is still missing.
++ */
++static void fuse_dentry_prune(struct dentry *dentry)
++{
++	struct dentry *parent = dentry->d_parent;
++
++	if (parent != dentry && d_really_is_positive(dentry) &&
++	    d_really_is_positive(parent))
++		clear_bit(FUSE_I_LIGHTER_COMPLETE,
++			  &get_fuse_inode(d_inode(parent))->state);
++}
++
+ const struct dentry_operations fuse_dentry_operations = {
+ 	.d_revalidate	= fuse_dentry_revalidate,
+ 	.d_delete	= fuse_dentry_delete,
+ 	.d_init		= fuse_dentry_init,
+ 	.d_release	= fuse_dentry_release,
+ 	.d_automount	= fuse_dentry_automount,
++	.d_prune	= fuse_dentry_prune,
+ };
+ 
+ int fuse_valid_type(int m)
+@@ -455,6 +471,27 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
+ 	return err;
+ }
+ 
++/*
++ * lighter: a directory this guest made starts empty, and while nothing but
++ * the guest changes it, its dcache holds every entry in it: a name with no
++ * dentry does not exist. Ceph's client keeps directories the same way. It is
++ * granted on the guest's own mkdir, and only when the server is pushing
++ * invalidations (it answers a mkdir with a short lifetime otherwise), and it
++ * ends at the first thing that could put an entry behind the guest's back: a
++ * notification about the directory or a name in it, a reset of every cache
++ * (the epoch), or a child pruned from the dcache.
++ */
++#define LIGHTER_COMPLETE_MIN_VALID 5	/* seconds of mkdir entry lifetime */
++
++static bool fuse_dir_complete(struct inode *dir)
++{
++	struct fuse_inode *fi = get_fuse_inode(dir);
++
++	return test_bit(FUSE_I_LIGHTER_COMPLETE, &fi->state) &&
++	       READ_ONCE(fi->lighter_complete_epoch) ==
++			atomic_read(&get_fuse_conn(dir)->epoch);
++}
++
+ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
+ 				  unsigned int flags)
+ {
+@@ -472,6 +509,23 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
+ 	fc = get_fuse_conn_super(dir->i_sb);
+ 	epoch = atomic_read(&fc->epoch);
+ 
++	/*
++	 * lighter: a name missing from a complete directory is missing, and the
++	 * server need not be asked. A tree walk asks for names that are not
++	 * there in every directory (ripgrep's .gitignore, .ignore, .rgignore
++	 * and .git): thirty-seven thousand round trips over node_modules on the
++	 * M1, straight after the install that made it.
++	 */
++	if (fuse_dir_complete(dir)) {
++		struct fuse_entry_out missing = {
++			.entry_valid = LIGHTER_COMPLETE_MIN_VALID,
++		};
++
++		entry->d_time = epoch;
++		fuse_change_entry_timeout(entry, &missing);
++		return d_splice_alias(NULL, entry);
++	}
++
+ 	locked = fuse_lock_inode(dir);
+ 	err = fuse_lookup_name(dir->i_sb, get_node_id(dir), &entry->d_name,
+ 			       &outarg, &inode);
+@@ -928,6 +982,14 @@ static struct dentry *create_new_entry(struct mnt_idmap *idmap, struct fuse_moun
+ 		fuse_change_entry_timeout(entry, &outarg);
+ 	}
+ 	fuse_dir_changed(dir);
++	/* lighter: a directory the guest just made; see fuse_dir_complete() */
++	if (args->opcode == FUSE_MKDIR && fm->fc->lighter_create &&
++	    outarg.entry_valid >= LIGHTER_COMPLETE_MIN_VALID) {
++		struct fuse_inode *nfi = get_fuse_inode(inode);
++
++		WRITE_ONCE(nfi->lighter_complete_epoch, epoch);
++		set_bit(FUSE_I_LIGHTER_COMPLETE, &nfi->state);
++	}
+ 	return d;
+ 
+  out_put_forget_req:
+@@ -1496,6 +1558,12 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+ 	inode_lock_nested(parent, I_MUTEX_PARENT);
+ 	if (!S_ISDIR(parent->i_mode))
+ 		goto unlock;
++	/*
++	 * lighter: the host changed a name in it, perhaps one the guest has no
++	 * dentry for, so before looking for one. Under the directory's lock,
++	 * which a lookup answering for it holds shared.
++	 */
++	clear_bit(FUSE_I_LIGHTER_COMPLETE, &get_fuse_inode(parent)->state);
+ 
+ 	err = -ENOENT;
+ 	dir = d_find_alias(parent);
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -144,6 +144,9 @@ struct fuse_inode {
+ 	/** Attribute-request version last used to refresh the page cache. */
+ 	u64 cache_version;
+ 
++	/* lighter: the epoch FUSE_I_LIGHTER_COMPLETE was granted in */
++	int lighter_complete_epoch;
++
+ 	union {
+ 		/* read/write io cache (regular file only) */
+ 		struct {
+@@ -238,6 +241,8 @@ enum {
+ 	FUSE_I_CACHE_IO_MODE,
+ 	/* lighter: the cached mtime is the guest's own, from a write */
+ 	FUSE_I_LIGHTER_WROTE,
++	/* lighter: a directory this guest made, whose dcache is all of it */
++	FUSE_I_LIGHTER_COMPLETE,
+ };
+ 
+ struct fuse_conn;
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -600,6 +600,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
+ 	spin_unlock(&fi->lock);
+ 	/* lighter: the host changed it; the next refresh is the host's word */
+ 	clear_bit(FUSE_I_LIGHTER_WROTE, &fi->state);
++	clear_bit(FUSE_I_LIGHTER_COMPLETE, &fi->state);
+ 
+ 	fuse_invalidate_attr(inode);
+ 	forget_all_cached_acls(inode);
