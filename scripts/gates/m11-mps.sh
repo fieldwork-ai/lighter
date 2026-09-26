@@ -28,13 +28,18 @@ FAILED=0
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }
 
 echo "==> A Python with torch and MPS on this Mac"
+# Found as lighter finds it (`mps::find_python`): the configured
+# `torch_python`, else the first python3 on PATH with torch. A gate that looked
+# elsewhere could pass on a Mac where lighter.sh/mps is absent.
 PY="${LIGHTER_GATE_TORCH_PYTHON:-}"
 if [ -z "$PY" ]; then
-	for candidate in $(which -a python3 2>/dev/null) "$HOME/venv/bin/python3"; do
+	configured="$(python3 -c 'import json, os, sys; print(json.load(open(sys.argv[1])).get("torch_python", ""))' \
+		"${LIGHTER_HOME:-$HOME/.lighter}/config.json" 2>/dev/null || true)"
+	for candidate in ${configured:-$(which -a python3 2>/dev/null)}; do
 		if "$candidate" -c 'import torch; assert torch.backends.mps.is_available()' >/dev/null 2>&1; then PY="$candidate"; break; fi
 	done
 fi
-[ -n "$PY" ] || { echo "no python3 with torch and MPS (set LIGHTER_GATE_TORCH_PYTHON)" >&2; exit 1; }
+[ -n "$PY" ] || { echo "no python3 with torch and MPS: lighter config --torch-python <path>, or LIGHTER_GATE_TORCH_PYTHON" >&2; exit 1; }
 pass "$PY ($("$PY" -c 'import torch; print(torch.__version__)'))"
 
 echo "==> Building guest artifacts if missing"

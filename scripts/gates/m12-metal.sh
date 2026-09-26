@@ -21,8 +21,9 @@ cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 PROFILE="${PROFILE:-debug}"
 BIN="target/$PROFILE/examples/lighter-bench"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
-# An image with llama.cpp built with GGML_RPC (and GGML_VULKAN, for the
-# comparison); LIGHTER_GATE_LLAMA_IMAGE_TAR loads one from a tarball.
+# llama.cpp built with GGML_RPC (and GGML_VULKAN, for the comparison), from
+# scripts/gates/fixtures/llama-vulkan.Dockerfile by scripts/gates/llama-image.sh
+# (LIGHTER_GATE_LLAMA_IMAGE_TAR loads a given tarball instead).
 IMAGE="${LIGHTER_GATE_LLAMA_IMAGE:-llama-vulkan:arm64}"
 MODEL_URL="${LIGHTER_GATE_MODEL_URL:-https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf}"
 MODEL="$(basename "$MODEL_URL")"
@@ -86,10 +87,8 @@ for _ in $(seq 1 60); do grep -q "ggml rpc server on the Mac's GPU" "$LOG" && br
 grep -q "ggml rpc server on the Mac's GPU" "$LOG" && pass "$(grep -o "ggml rpc server.*" "$LOG" | head -1 | cut -c1-100)" || fail "the ggml server did not start"
 grep -q "INIT metal=port" "$LOG" && pass "init published the device" || fail "init did not publish the device"
 
-if [ -n "${LIGHTER_GATE_LLAMA_IMAGE_TAR:-}" ] && ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-	docker load -q -i "$LIGHTER_GATE_LLAMA_IMAGE_TAR" >/dev/null
-fi
-docker image inspect "$IMAGE" >/dev/null 2>&1 || { fail "image $IMAGE is not available in the guest (LIGHTER_GATE_LLAMA_IMAGE_TAR)"; exit 1; }
+LIGHTER_GATE_LLAMA_IMAGE="$IMAGE" scripts/gates/llama-image.sh \
+	|| { fail "could not build or load $IMAGE (scripts/gates/llama-image.sh)"; exit 1; }
 docker volume create models >/dev/null 2>&1 || true
 docker run --rm -v models:/models "$IMAGE" sh -c "[ -f /models/$MODEL ] || curl -sL -o /models/$MODEL $MODEL_URL" >/dev/null
 

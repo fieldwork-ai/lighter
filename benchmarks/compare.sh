@@ -176,10 +176,6 @@ extras_on_lighter() {
 	[ "$QUALITY" = 0 ] || { log "STAGE lighter quality"; LIGHTER_BENCH_CASE_ARGS="--device lighter.sh/video=all" \
 		benchmarks/transcode-check.sh lighter lighter "$OUT/$MACHINE-transcode-quality.csv" > "$OUT/quality-lighter.log" 2>&1; echo "lighter-quality=$?"; }
 	[ "$GPU" = 0 ] || { log "STAGE lighter gpu"; benchmarks/llm-gpu.sh lighter lighter "$OUT/$MACHINE-llm-gpu.csv" > "$OUT/gpu-lighter.log" 2>&1; echo "lighter-gpu=$?"; }
-	# Podman's Vulkan row runs the same image; it goes across from here.
-	if [ "$GPU" = 1 ]; then
-		docker --context lighter save "${LIGHTER_BENCH_LLAMA_IMAGE:-llama-vulkan:arm64}" -o "$HOME/.lighter-bench-llama.tar" 2>/dev/null
-	fi
 	# shellcheck disable=SC2086
 	[ -z "$paused" ] || docker --context lighter start $paused >/dev/null
 	lighter stop >/dev/null 2>&1
@@ -195,8 +191,6 @@ if [ "$GPU$QUALITY" != 00 ]; then
 		[ "$QUALITY" = 0 ] || { log "STAGE podman quality"; benchmarks/transcode-check.sh podman podman-bench "$OUT/$MACHINE-transcode-quality.csv" > "$OUT/quality-podman.log" 2>&1; echo "podman-quality=$?"; }
 		if [ "$GPU" = 1 ]; then
 			log "STAGE podman gpu"
-			[ ! -f "$HOME/.lighter-bench-llama.tar" ] || docker --context podman-bench load -i "$HOME/.lighter-bench-llama.tar" >/dev/null
-			rm -f "$HOME/.lighter-bench-llama.tar"
 			benchmarks/llm-gpu.sh podman podman-bench "$OUT/$MACHINE-llm-gpu.csv" > "$OUT/gpu-podman.log" 2>&1; echo "podman-gpu=$?"
 		fi
 		all_off ;;

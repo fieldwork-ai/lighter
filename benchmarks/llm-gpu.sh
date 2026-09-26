@@ -43,7 +43,8 @@ native)
 		dk ps --format '    {{.Names}}' >&2
 		exit 1
 	fi
-	echo "image llama.cpp:$(dk run --rm "$IMAGE" llama-bench --version 2>&1 | grep -m1 version)" >&2
+	LIGHTER_GATE_LLAMA_IMAGE="$IMAGE" "$(dirname "$0")/../scripts/gates/llama-image.sh" --context "$CTX"
+	echo "image llama.cpp: $(dk run --rm "$IMAGE" llama-bench --version 2>&1 | grep -m1 version)" >&2
 	# shellcheck disable=SC2046
 	dk run --rm $(mount_model) "$IMAGE" llama-bench -m /models/$MODEL -ngl 0 -t 8 "${ARGS[@]}" | row cpu
 	case "$TARGET" in
