@@ -374,12 +374,14 @@ runner_args() {
 }
 
 # Waits, up to five minutes, for three samples five seconds apart in which
-# fseventsd, mds, mds_stores and the mdworkers together use under 3% of a
-# core; says how long it took.
+# fseventsd, mds, mds_stores and the mdworkers, Photos' library and analysis
+# daemons, and an animated Aerial wallpaper (which decodes video on the media
+# engine, behind a locked screen too) together use under 3% of a core; says
+# how long it took.
 settle_host() {
 	local i quiet=0 load
 	for i in $(seq 1 60); do
-		load="$(ps -Ao pcpu,comm | awk '/fseventsd|mds_stores|mds$|mdworker/ {s+=$1} END {printf "%d", s+0}')"
+		load="$(ps -Ao pcpu,comm | awk '/fseventsd|mds_stores|mds$|mdworker|photolibraryd|photoanalysisd|mediaanalysisd|WallpaperAerials/ {s+=$1} END {printf "%d", s+0}')"
 		if [ "$load" -lt 3 ]; then quiet=$((quiet+1)); else quiet=0; fi
 		if [ "$quiet" -ge 3 ]; then
 			# Only worth a line when it took a wait; the return is explicit

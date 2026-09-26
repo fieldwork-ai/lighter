@@ -1,7 +1,7 @@
 case,rep,ms
-transcode-h264,1,2002
-transcode-h264,2,1868
-transcode-h264,3,1865
-transcode-hevc,1,1914
-transcode-hevc,2,1941
-transcode-hevc,3,1943
+transcode-h264,1,1824
+transcode-h264,2,1866
+transcode-h264,3,1874
+transcode-hevc,1,1903
+transcode-hevc,2,1939
+transcode-hevc,3,1946

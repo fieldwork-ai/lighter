@@ -1,0 +1,7 @@
+target,codec,frames,kbps,profile,vmaf,psnr_y,ssim
+native,h264,300,8309,High,83.25,35.47,0.9921
+native,hevc,300,8524,Main,89.66,37.52,0.9953
+podman,h264,300,7977,High,94.26,40.53,0.9979
+podman,hevc,300,7846,Main,95.02,41.43,0.9982
+lighter,h264,300,8309,High,83.25,35.47,0.9921
+lighter,hevc,300,8526,Main,89.66,37.52,0.9953

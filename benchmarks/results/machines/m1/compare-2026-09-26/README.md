@@ -59,31 +59,43 @@ An 8 GB M1 Mac mini on macOS 26.6.2, one session. Every runtime at 8 vCPUs and 4
 |---|---|---|---|---|---|---|---|
 | zstd -9, 256 MiB, 1 thread | 5.28 s | 5.59 s | 5.65 s | 5.66 s | 5.66 s | 5.67 s | 5.64 s |
 | zstd -9, 256 MiB, 8 threads | 1.08 s | 1.21 s | 1.40 s | 1.19 s | 1.22 s | 1.23 s | 1.21 s |
-| transcode to H.264, 10 s of 1080p30 | **1.87 s**ᵐ | **1.71 s**ᵐ | 6.47 s | 7.75 s | 6.22 s | 6.23 s | 6.18 s |
-| transcode to HEVC, the same | **1.94 s**ᵐ | **1.83 s**ᵐ | 8.04 s | 11.31 s | 7.47 s | 7.47 s | 7.54 s |
+| transcode to H.264 at 8 Mbit/s, 10 s of 1080p30 | **1.87 s**ᵐ | **1.72 s**ᵐ | 6.83 s | 8.43 s | 6.59 s | 6.62 s | 6.57 s |
+| transcode to HEVC at 8 Mbit/s, the same | **1.94 s**ᵐ | **1.83 s**ᵐ | 10.02 s | 13.46 s | 9.36 s | 9.31 s | 9.33 s |
 | LLM on the CPU: Qwen2.5 0.5B Q4_K_M, 512 in / 128 out, 8 threads | 4.47 s | 6.14 s | 15.89 s | 7.58 s | 6.35 s | 6.64 s | 6.30 s |
 
 ᵐ on the media engine; every other runtime has none, and encodes in software (x264 preset medium, x265 preset fast, 8 threads).
 
-- **The transcodes** (`transcode-h264`, `transcode-hevc`) take Big Buck Bunny, 10 s of 1080p30 H.264 (CC-BY), and encode it again the fastest way the runtime can: VideoToolbox on the Mac with frames kept on the engine, V4L2 both ways in a container with `lighter.sh/video`, software otherwise. The Mac's row was measured with those cases; the containers' rows are the software and V4L2 commands they run, measured in this session under their earlier names (`transcode-x264`/`-x265`/`-hw-*`). lighter is 3.6–6× faster than every other runtime, and level with the Mac.
+- **The transcodes** (`transcode-h264`, `transcode-hevc`) take Big Buck Bunny, 10 s of 1080p30 H.264 (CC-BY), and encode it again at 8 Mbit/s the fastest way the runtime can: VideoToolbox on the Mac with frames kept on the engine, V4L2 both ways in a container with `lighter.sh/video`, software otherwise. Their rows are a third session the same day, all seven in turn (`m1-*-transcode.*`). lighter is 3.8× faster than the best software runtime at H.264 and 5.1× at HEVC, and a little ahead of the Mac.
+- **What each path delivers**, scored against the source on the Mac by one scorer (`benchmarks/transcode-check.sh`, Homebrew's ffmpeg with libvmaf; `m1-transcode-quality.csv`):
+
+  | | frames | Mbit/s | VMAF | PSNR (Y) | SSIM |
+  |---|---|---|---|---|---|
+  | H.264, Mac (VideoToolbox) | 300 | 8.31 | 83.3 | 35.5 | 0.992 |
+  | H.264, lighter (V4L2 to VideoToolbox) | 300 | 8.31 | 83.3 | 35.5 | 0.992 |
+  | H.264, software (x264, in Podman) | 300 | 7.98 | 94.3 | 40.5 | 0.998 |
+  | HEVC, Mac | 300 | 8.52 | 89.7 | 37.5 | 0.995 |
+  | HEVC, lighter | 300 | 8.53 | 89.7 | 37.5 | 0.995 |
+  | HEVC, software (x265, in Podman) | 300 | 7.85 | 95.0 | 41.4 | 0.998 |
+
+  lighter's output scores exactly as the Mac's, so its time is the same work. At the same bitrate the media engine's quality is lower than x264's and x265's (VMAF 83 against 94, 90 against 95), as hardware encoders' is: the speed is for the same bitrate, not the same quality. Every container runtime runs the identical software command, so Podman's output stands for all five.
 - **A guest's CPU is the Mac's CPU:** zstd, the same code on both, is 6% slower in every VM on one thread and 10–13% on eight (OrbStack 30%).
-- **The software encodes** set `pools=8`, so x265 has a thread pool on every runtime whatever its seccomp profile (Docker Desktop's was checked: "Thread pool created using 8 threads"). Docker Desktop is slower on both, x264 by 27% and x265 by 51%, with its 8 CPUs confirmed; why is not known.
+- **The software encodes** set `pools=8`, so x265 has a thread pool on every runtime whatever its seccomp profile (Docker Desktop's was checked: "Thread pool created using 8 threads"). Docker Desktop is slower on both, x264 by 28% and x265 by 45%, with its 8 CPUs confirmed; why is not known.
 
 **The LLM on a GPU** (llama-bench's own tokens a second, three repetitions, every layer offloaded; image `llama-vulkan:arm64`; `benchmarks/llm-gpu.sh`, file `m1-llm-gpu.csv`)
 
 | tokens a second | prompt, 512 | generation, 128 |
 |---|---|---|
-| Mac itself, Metal (Homebrew's ggml 0.25.3) | 2008 | 74 |
-| lighter 0.10.0, Metal (`lighter.sh/metal`) | 1952 | 93 |
-| lighter 0.10.0, Vulkan (`lighter.sh/gpu`) | 1248 | 45 |
+| Mac itself, Metal (llama.cpp 1af554f, built for the Mac) | 2033 | 110 |
+| lighter 0.10.0, Metal (`lighter.sh/metal`) | 1938 | 95 |
+| lighter 0.10.0, Vulkan (`lighter.sh/gpu`) | 1250 | 45 |
 | Podman, Vulkan (krunkit's virtio-gpu) | 198 | 47 |
-| lighter, the same image on the CPU, 8 threads | 208 | 86 |
+| lighter, the same image on the CPU, 8 threads | 217 | 76 |
 | Podman, the same image on the CPU, 8 threads | 212 | 76 |
 
-- **Only lighter and the Mac get the GPU's speed:** lighter reads the prompt at 9× its CPU rate and within 3% of the Mac. Podman's Vulkan reads the prompt no faster than its CPU does. OrbStack, Docker Desktop, Colima and Apple container offer no GPU to a container.
-- **Generation is faster through lighter than on the Mac** because the builds differ: lighter's Metal server is its own ggml, the Mac's Homebrew's, which disables Metal's tensor API before M5. Not a like-for-like row.
+- **The Metal rows are one build:** the image's llama.cpp, lighter's Metal server (`host/metal/build.sh`, plus its one RPC patch) and the Mac's llama-bench are all commit 1af554f (b11053); `llm-gpu.sh` logs each side's version. lighter reads the prompt at 95% of the Mac and generates at 86%: every token crosses ggml's RPC between the container and the Mac. Homebrew's llama.cpp (ggml 0.25.3), which disables Metal's tensor API before M5, read 2008 and 74 and is not the reference.
+- **Only lighter and the Mac get the GPU's speed:** lighter reads the prompt at 9× its CPU rate. Podman's Vulkan reads it no faster than its CPU does. OrbStack, Docker Desktop, Colima and Apple container offer no GPU to a container.
 - **On the CPU lighter and Podman are level.** Swept at 1, 4 and 8 threads in the same session, prompt 44.0 / 174.6 / 213.6 tokens a second against 44.4 / 173.2 / 208.3, generation 35.9 / 108.3 / 83.0 against 35.5 / 106.2 / 84.3. Eight threads generate slower than four on both: the M1 has four performance cores and four efficiency cores, and every token waits at a barrier for the slowest.
-- **The M1's own lighter** ran these rows (the release, installed from its notarized archive), at 8 CPUs, with its own containers stopped. A first pass left them running (a Frigate and Home Assistant test stack, about 300 ms of CPU a second in the guest) and read lighter's CPU at 174 and 61: llama.cpp's threads, preempted six times as often as in Podman's guest, slept at their barriers fourteen times as often (17,904 voluntary switches a second against 1,278).
+- **The M1's own lighter** ran these rows (the release, installed from its notarized archive), at 8 CPUs, with its own containers stopped. One run straight after loading the benchmark image into its 4 GiB guest generated at 11.6 on the CPU and was run again. A first pass left them running (a Frigate and Home Assistant test stack, about 300 ms of CPU a second in the guest) and read lighter's CPU at 174 and 61: llama.cpp's threads, preempted six times as often as in Podman's guest, slept at their barriers fourteen times as often (17,904 voluntary switches a second against 1,278).
 - **OrbStack's LLM** is 2.6× the others', reproduced in a clean session; its VM has the 8 CPUs it was given (in its configuration, in the guest and from the API), its guest reports the same CPU features as the Mac (`asimddp`, `sha2`), and its vCPU threads run at the default priority, yet only seven of them are busy during the run and it spends twice lighter's CPU time. On the M5, whose 18 cores leave room around an 8-vCPU guest, it was level. The cause is not known.
 - **A first pass the same morning was discarded.** The Mac was not quiet: the lock screen's Aerial decoding video and Photos' analysis after `photolibraryd` restarted. It moved the Mac's own rows most (media engine 4.0 s, LLM unsettled at 16–81 s) and three runtimes' LLM to about 16 s. Its files are kept on the M1, not here.
 

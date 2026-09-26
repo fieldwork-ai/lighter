@@ -7,7 +7,9 @@
 #
 #   benchmarks/llm-gpu.sh <target> <docker context> <out.csv>
 #
-# native: Metal (Homebrew's llama-bench). lighter: Metal through
+# native: Metal, from LIGHTER_BENCH_NATIVE_LLAMA (default: llama-bench on
+# PATH); build it from the commit the image and lighter's Metal server use, or
+# the row compares builds rather than runtimes. lighter: Metal through
 # lighter.sh/metal (ggml RPC to the Mac's GPU) and Vulkan through
 # lighter.sh/gpu. podman: Vulkan through krunkit's virtio-gpu (/dev/dri).
 # Every container target also runs the same image on the CPU, 8 threads, for
@@ -30,8 +32,11 @@ dk() { docker --context "$CTX" "$@"; }
 mount_model() { echo "-v $MODEL_DIR:/models:ro"; }
 case "$TARGET" in
 native)
-	llama-bench -m "$MODEL_DIR/$MODEL" -ngl 99 "${ARGS[@]}" | row metal ;;
+	NATIVE="${LIGHTER_BENCH_NATIVE_LLAMA:-llama-bench}"
+	echo "native llama.cpp: $("$NATIVE" --version 2>&1 | grep -m1 version)" >&2
+	"$NATIVE" -m "$MODEL_DIR/$MODEL" -ngl 99 "${ARGS[@]}" | row metal ;;
 *)
+	echo "image llama.cpp: $(dk run --rm "$IMAGE" llama-bench --version 2>&1 | grep -m1 version)" >&2
 	# shellcheck disable=SC2046
 	dk run --rm $(mount_model) "$IMAGE" llama-bench -m /models/$MODEL -ngl 0 -t 8 "${ARGS[@]}" | row cpu
 	case "$TARGET" in
