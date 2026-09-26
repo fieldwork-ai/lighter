@@ -265,6 +265,58 @@ pub fn fetch(i: &SelfInstallation, download: bool) -> anyhow::Result<Option<Path
     result
 }
 
+/// Activation copies a cached release into the installation's generations, so
+/// the cache holds at most the one release still waiting for `lighter
+/// upgrade`. Each is about 2 GB, and nothing else ever removes them.
+pub fn prune_cache(i: &SelfInstallation) -> anyhow::Result<()> {
+    let mut s = state(i)?;
+    let selected = release::read(&i.ownership.prefix.join("current"))
+        .or_else(|_| release::read(&i.root))
+        .map(|m| m.version)
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
+    let keep = worth_keeping(s.downloaded.as_deref(), &selected);
+    if keep != s.downloaded {
+        s.downloaded = None;
+        save(i, &s)?;
+    }
+    remove_cached_except(&state_dir(i)?, keep.as_deref())
+}
+fn worth_keeping(downloaded: Option<&str>, selected: &str) -> Option<String> {
+    let downloaded = downloaded?;
+    match (
+        release::stable_version(downloaded),
+        release::stable_version(selected),
+    ) {
+        (Ok(d), Ok(s)) if d > s => Some(downloaded.to_owned()),
+        _ => None,
+    }
+}
+fn remove_cached_except(cache: &Path, keep: Option<&str>) -> anyhow::Result<()> {
+    let Ok(entries) = fs::read_dir(cache) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(version) = name.to_str().and_then(|n| n.strip_prefix("release-")) else {
+            continue;
+        };
+        if Some(version) != keep && entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+/// Best effort: reclaiming space never fails the command that triggered it.
+pub fn tidy(i: &SelfInstallation) {
+    if i.ownership.method != Method::Script {
+        return;
+    }
+    if let Err(e) = prune_cache(i).and_then(|_| crate::upgrade::prune(&i.ownership.prefix)) {
+        eprintln!("warning: could not remove old releases: {e:#}");
+    }
+}
+
 pub fn staged(i: &SelfInstallation) -> anyhow::Result<Option<PathBuf>> {
     let s = state(i)?;
     if let Some(version) = s.downloaded
@@ -318,6 +370,7 @@ pub fn run(action: Action) -> anyhow::Result<()> {
             }
         }
     }
+    tidy(&i);
     Ok(())
 }
 
@@ -414,6 +467,33 @@ mod tests {
         assert!(due(&s, 103600));
         s.error = None;
         assert!(!due(&s, 103600));
+    }
+    #[test]
+    fn the_cache_keeps_only_a_release_still_to_install() {
+        assert_eq!(
+            worth_keeping(Some("0.10.1"), "0.10.0").as_deref(),
+            Some("0.10.1")
+        );
+        assert_eq!(worth_keeping(Some("0.10.0"), "0.10.0"), None);
+        assert_eq!(worth_keeping(Some("0.9.3"), "0.10.0"), None);
+        assert_eq!(worth_keeping(None, "0.10.0"), None);
+        assert_eq!(worth_keeping(Some("garbage"), "0.10.0"), None);
+
+        let t = tempfile::tempdir().unwrap();
+        for name in ["release-0.9.2", "release-0.9.3", "release-0.10.1"] {
+            fs::create_dir(t.path().join(name)).unwrap();
+        }
+        fs::write(t.path().join("state.json"), "{}").unwrap();
+        fs::write(t.path().join("operation.lock"), "").unwrap();
+        remove_cached_except(t.path(), Some("0.10.1")).unwrap();
+        let mut left: Vec<_> = fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["operation.lock", "release-0.10.1", "state.json"]);
+        remove_cached_except(t.path(), None).unwrap();
+        assert!(!t.path().join("release-0.10.1").exists());
     }
     #[test]
     fn release_origin_and_channel_are_checked() {

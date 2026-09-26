@@ -59,5 +59,7 @@ Containers may now set their own NUMA memory policy (`get_mempolicy`, `set_mempo
 
 ## Also
 
+- Old releases are removed. Every downloaded update stayed in the update cache after it was installed, and every installed release stayed too, about 2 GB each: an installation that had followed every release since 0.5 held 27 GB of them. The cache now keeps only an update still waiting for `lighter upgrade`, and the installation keeps the selected release, the one before it (what a failed upgrade falls back to), and any a running machine was started from. What has built up is removed by the first `lighter update check` or `lighter upgrade` after this release.
+
 - Gate m3's compose stack pulls MinIO from Bitnami's archive (`bitnamilegacy/minio`, the same 2025-04-22 release, pinned): MinIO withdrew its own images from quay.io and Docker Hub.
 - The guest kernel carries memory hotplug again, with patches 0024 (memmap on memory) and 0026 (auto-movable onlining); a fixed machine never plugs anything and is unaffected. Linux remains **6.18.52**; the data epoch remains **1**.

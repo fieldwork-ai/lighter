@@ -290,6 +290,87 @@ fn legacy(prefix: &Path) -> anyhow::Result<Option<PathBuf>> {
     Ok(Some(root))
 }
 
+/// Removes surplus generations outside an activation, so an installation that
+/// gathered them before any were removed is cleaned up by its first check.
+pub fn prune(prefix: &Path) -> anyhow::Result<()> {
+    let prefix = prefix.canonicalize()?;
+    let _operation = updates::Lock::acquire(&prefix.join(".installer"))?;
+    if prefix.join("upgrade.json").exists() || !prefix.join("current").exists() {
+        return Ok(());
+    }
+    prune_generations(&prefix)
+}
+
+/// Keeps the selected generation, the newest other one (what a failed
+/// activation and recovery fall back to), and any a running process was
+/// started from. Callers hold the installer lock.
+fn prune_generations(prefix: &Path) -> anyhow::Result<()> {
+    // Deleting a generation under a running VM is the one thing this must
+    // never do, so a process table it cannot read means removing nothing.
+    let Some(running) = executables() else {
+        return Ok(());
+    };
+    surplus(prefix, &running)?
+        .iter()
+        .try_for_each(|path| Ok(fs::remove_dir_all(path)?))
+}
+fn surplus(prefix: &Path, running: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let current = prefix.join("current").canonicalize()?;
+    let mut others = Vec::new();
+    for entry in fs::read_dir(prefix.join("releases"))? {
+        let entry = entry?;
+        let path = entry.path();
+        // Dot-named directories are an installer's staging temporaries.
+        if entry.file_name().to_string_lossy().starts_with('.')
+            || !entry.file_type()?.is_dir()
+            || path == current
+        {
+            continue;
+        }
+        // A generation is named for its version; adopted legacy ones rank
+        // below every version.
+        let version = release::stable_version(&entry.file_name().to_string_lossy()).ok();
+        others.push((version, path));
+    }
+    others.sort();
+    others.pop();
+    Ok(others
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| !running.iter().any(|exe| exe.starts_with(path)))
+        .collect())
+}
+/// Every process's executable, resolved as the kernel sees it (a start
+/// through the `current` link reports the generation it resolved to).
+fn executables() -> Option<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: a null buffer asks only for the number of processes.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return None;
+    }
+    let mut pids = vec![0 as libc::c_int; count as usize + 64];
+    let bytes = (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+    // SAFETY: the buffer is `bytes` long; the call returns how many it filled.
+    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if count <= 0 {
+        return None;
+    }
+    pids.truncate(count as usize);
+    Some(
+        pids.into_iter()
+            .filter_map(|pid| {
+                let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                // SAFETY: the buffer is its stated length; a process that
+                // exited or is not ours returns 0 and is skipped.
+                let len =
+                    unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+                (len > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&path[..len as usize])))
+            })
+            .collect(),
+    )
+}
+
 pub fn install(source: &Path, prefix: &Path, restart: bool) -> anyhow::Result<()> {
     install_selected(source, prefix, restart, None)
 }
@@ -429,6 +510,9 @@ fn install_selected(
         "Installed lighter {} (Linux {}).",
         manifest.version, manifest.kernel_version
     );
+    if let Err(e) = prune_generations(&prefix) {
+        eprintln!("warning: could not remove old releases: {e:#}");
+    }
     Ok(())
 }
 
@@ -447,6 +531,9 @@ pub fn run(restart: bool) -> anyhow::Result<()> {
     };
     if let Some(root) = root {
         install_selected(&root, &i.ownership.prefix, restart, Some(&i.root))?;
+    }
+    if let Err(e) = updates::prune_cache(&i) {
+        eprintln!("warning: could not remove old releases: {e:#}");
     }
     Ok(())
 }
@@ -492,6 +579,51 @@ mod tests {
         assert!(unchanged_selection(&prefix, Some(&observed)).is_err());
         assert_eq!(prefix.join("current").canonicalize().unwrap(), newer);
         assert!(unchanged_selection(&prefix, Some(&newer)).is_ok());
+    }
+    #[test]
+    fn generations_keep_the_selected_the_fallback_and_the_running() {
+        let t = tempfile::tempdir().unwrap();
+        let prefix = t.path().canonicalize().unwrap();
+        let releases = prefix.join("releases");
+        for name in [
+            "0.9.2",
+            "0.9.3",
+            "0.10.0",
+            "0.8.0",
+            "legacy-0123456789abcdef",
+            ".tmpAbc",
+        ] {
+            fs::create_dir_all(releases.join(name)).unwrap();
+        }
+        select(&prefix, &releases.join("0.10.0")).unwrap();
+        let running = [releases.join("0.8.0/share/lighter/lighter.app/Contents/MacOS/lighter")];
+        let mut removed = surplus(&prefix, &running).unwrap();
+        removed.sort();
+        assert_eq!(
+            removed,
+            [
+                releases.join("0.9.2"),
+                releases.join("legacy-0123456789abcdef")
+            ]
+        );
+
+        // Numeric order, not text: 0.10.0 is newer than 0.9.3.
+        select(&prefix, &releases.join("0.9.3")).unwrap();
+        let removed = surplus(&prefix, &[]).unwrap();
+        assert!(!removed.contains(&releases.join("0.10.0")));
+        assert!(removed.contains(&releases.join("0.9.2")));
+
+        // Only the selected generation: nothing to remove.
+        let lone = tempfile::tempdir().unwrap();
+        let lone = lone.path().canonicalize().unwrap();
+        fs::create_dir_all(lone.join("releases/0.10.0")).unwrap();
+        select(&lone, &lone.join("releases/0.10.0")).unwrap();
+        assert!(surplus(&lone, &[]).unwrap().is_empty());
+    }
+    #[test]
+    fn this_process_is_among_the_executables() {
+        let me = std::env::current_exe().unwrap().canonicalize().unwrap();
+        assert!(executables().unwrap().contains(&me));
     }
     #[test]
     fn activation_excludes_concurrent_start() {
