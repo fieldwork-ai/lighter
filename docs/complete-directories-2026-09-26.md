@@ -1,6 +1,6 @@
-# Complete directories: answering from what the guest made (proposal)
+# Complete directories: answering from what the guest made
 
-Status: step 1 (missing names) built as kernel patch 0044, 2026-09-26; step 2 (listings) proposed. Follows kernel patch 0043, which keeps the data of files the guest wrote.
+Status: built, 2026-09-26: missing names as kernel patch 0044, listings as 0045. Follows kernel patch 0043, which keeps the data of files the guest wrote.
 
 ## Where the time still goes
 
@@ -47,6 +47,18 @@ Patch 0044 answers missing names in a complete directory; listings still come fr
 The first pass now asks the host for 15,452 listings, 22 lookups and one read; the install asks for no lookups at all. Gate m4 passed five times in a row with the new coherence check (a name the guest was told is missing, then made on the host, is found; a file deleted on the host from a guest-made directory is gone).
 
 That check first failed twice in eight runs, and the fault was the test's: the share acknowledges a guest's create at once and applies it a moment later, and the host half deleted the file before the create had landed, so the file really did exist afterwards. The host half now waits for the file before deleting it. It is an edge case of the share itself, older than any of this: a program on the Mac deleting a file within milliseconds of a container creating it can have the delete undone by the create landing after it.
+
+## Step 2, measured
+
+Patch 0045 lists a complete directory from the dcache: a snapshot taken when the stream starts (opendir or rewinddir), kept on the open file and read with positions of its own, so its positions are never mixed with the server's (a shared cache torn down mid-stream would do exactly that). A directory no longer complete is asked of the server at its next rewind.
+
+| | 0.10.0 | 0043 | 0043 + 0044 | 0043 + 0044 + 0045 |
+|---|---:|---:|---:|---:|
+| ripgrep, first pass after the install | 5,794 ms | 1,219 ms | 637 ms | 154 ms |
+| ripgrep, warm | 124–160 ms | 129–158 ms | 123–133 ms | 119–131 ms |
+| requests to the host in the first pass | 129,000 | 52,600 | 15,475 | none measurable |
+
+The first pass is now the warm one. Gate m4 passed five times running with the coherence checks extended to listings: a guest-made directory lists exactly what the guest made, and after the host adds one file to it and deletes another, it lists exactly the host's.
 
 ## Risks, and how they are held
 

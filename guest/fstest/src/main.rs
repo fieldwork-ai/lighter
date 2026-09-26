@@ -559,6 +559,13 @@ fn cross(dir: &Path, report: &mut Report) {
             if made.join("host-added").exists() {
                 return Err("a name nobody made exists".into());
             }
+            let listed: Vec<String> = fs::read_dir(&made)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect();
+            if listed != ["guest-kept"] {
+                return Err(format!("a directory the guest made lists {listed:?}"));
+            }
             mark(dir, "guest-made.done")?;
             await_marker(dir, "host-added.done")?;
             // The marker is read from the host, and the host's changes reach
@@ -569,14 +576,25 @@ fn cross(dir: &Path, report: &mut Report) {
             loop {
                 let added = fs::read(made.join("host-added")).ok();
                 let kept = made.join("guest-kept").exists();
-                if added.as_deref() == Some(b"added on the Mac".as_slice()) && !kept {
+                // And the listing, which a complete directory serves itself
+                // (kernel patch 0045) until the host changes it.
+                let mut listed: Vec<String> = fs::read_dir(&made)
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                    .collect();
+                listed.sort();
+                if added.as_deref() == Some(b"added on the Mac".as_slice())
+                    && !kept
+                    && listed == ["host-added"]
+                {
                     return Ok(());
                 }
                 if started.elapsed() > Duration::from_secs(2) {
                     return Err(format!(
-                        "after 2 s the guest reads {:?} for the added file, and the deleted one is {}",
+                        "after 2 s the guest reads {:?} for the added file, the deleted one is {}, and it lists {:?}",
                         added.map(|a| String::from_utf8_lossy(&a).into_owned()),
-                        if kept { "still there" } else { "gone" }
+                        if kept { "still there" } else { "gone" },
+                        listed
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(5));
