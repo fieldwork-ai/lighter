@@ -1,0 +1,8 @@
+commit=dee6d28a-dirty
+date=2026-09-26T11:25Z
+host=homeserver
+host.node=v24.9.0
+host.npm=11.6.0
+host.pnpm=10.28.0
+host.yarn=1.22.22
+extra_warm_cases=

@@ -1,0 +1,13 @@
+target,backend,test,tokens_per_s
+lighter,cpu,pp512,173.6
+lighter,cpu,tg128,61.4
+lighter,metal,pp512,1990.2
+lighter,metal,tg128,91.4
+lighter,vulkan,pp512,1252.4
+lighter,vulkan,tg128,44.9
+native,metal,pp512,2007.8
+native,metal,tg128,73.8
+podman,cpu,pp512,211.5
+podman,cpu,tg128,75.8
+podman,vulkan,pp512,198.2
+podman,vulkan,tg128,47.2

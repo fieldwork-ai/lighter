@@ -24,7 +24,7 @@ import csv,sys
 label,target=sys.argv[1],sys.argv[2]
 for r in csv.DictReader(sys.stdin):
     test="pp512" if r["n_prompt"]!="0" else "tg128"
-    print(f"{target},{label},{test},{float(r[\"avg_ts\"]):.1f}")' "$1" "$TARGET" >> "$OUT"
+    print("%s,%s,%s,%.1f" % (target, label, test, float(r["avg_ts"])))' "$1" "$TARGET" >> "$OUT"
 }
 dk() { docker --context "$CTX" "$@"; }
 mount_model() { echo "-v $MODEL_DIR:/models:ro"; }

@@ -59,15 +59,31 @@ An 8 GB M1 Mac mini on macOS 26.6.2, one session. Every runtime at 8 vCPUs and 4
 |---|---|---|---|---|---|---|---|
 | zstd -9, 256 MiB, 1 thread | 5.28 s | 5.59 s | 5.65 s | 5.66 s | 5.66 s | 5.67 s | 5.64 s |
 | zstd -9, 256 MiB, 8 threads | 1.08 s | 1.21 s | 1.40 s | 1.19 s | 1.22 s | 1.23 s | 1.21 s |
-| x264, 10 s of 1080p30, 8 threads | 5.74 s | 6.10 s | 6.47 s | 7.75 s | 6.22 s | 6.23 s | 6.18 s |
-| x265, the same | 8.12 s | 7.53 s | 8.04 s | 11.31 s | 7.47 s | 7.47 s | 7.54 s |
-| H.264 → H.264 on the media engine | 2.05 s | 1.71 s | – | – | – | – | – |
-| H.264 → HEVC on the media engine | 2.09 s | 1.83 s | – | – | – | – | – |
-| LLM: Qwen2.5 0.5B Q4_K_M, 512 in / 128 out, 8 threads | 4.47 s | 6.14 s | 15.89 s | 7.58 s | 6.35 s | 6.64 s | 6.30 s |
+| transcode to H.264, 10 s of 1080p30 | **1.87 s**ᵐ | **1.71 s**ᵐ | 6.47 s | 7.75 s | 6.22 s | 6.23 s | 6.18 s |
+| transcode to HEVC, the same | **1.94 s**ᵐ | **1.83 s**ᵐ | 8.04 s | 11.31 s | 7.47 s | 7.47 s | 7.54 s |
+| LLM on the CPU: Qwen2.5 0.5B Q4_K_M, 512 in / 128 out, 8 threads | 4.47 s | 6.14 s | 15.89 s | 7.58 s | 6.35 s | 6.64 s | 6.30 s |
 
-- **The clip** is Big Buck Bunny, 10 s of 1080p30 H.264 (CC-BY), decoded and re-encoded at 8 Mbit/s. The media engine rows are VideoToolbox on the Mac and V4L2 in a container through `lighter.sh/video`; no other runtime has a hardware transcoder, and the case refuses rather than timing software. The Mac's command copies each decoded frame out to memory and back; kept on the engine (`-hwaccel_output_format videotoolbox_vld`) it takes 1.84 s and 1.91 s, level with lighter.
+ᵐ on the media engine; every other runtime has none, and encodes in software (x264 preset medium, x265 preset fast, 8 threads).
+
+- **The transcodes** (`transcode-h264`, `transcode-hevc`) take Big Buck Bunny, 10 s of 1080p30 H.264 (CC-BY), and encode it again the fastest way the runtime can: VideoToolbox on the Mac with frames kept on the engine, V4L2 both ways in a container with `lighter.sh/video`, software otherwise. The Mac's row was measured with those cases; the containers' rows are the software and V4L2 commands they run, measured in this session under their earlier names (`transcode-x264`/`-x265`/`-hw-*`). lighter is 3.6–6× faster than every other runtime, and level with the Mac.
 - **A guest's CPU is the Mac's CPU:** zstd, the same code on both, is 6% slower in every VM on one thread and 10–13% on eight (OrbStack 30%).
-- **x265 is faster in most containers than on the Mac**, most likely the image's build of it against Homebrew's rather than anything the VMs do. The case sets `pools=8`, so every runtime gets a thread pool whatever its seccomp profile (Docker Desktop's was checked: "Thread pool created using 8 threads"). Docker Desktop is slower on both software encodes, x264 by 27% and x265 by 51%, with its 8 CPUs confirmed; why is not known.
+- **The software encodes** set `pools=8`, so x265 has a thread pool on every runtime whatever its seccomp profile (Docker Desktop's was checked: "Thread pool created using 8 threads"). Docker Desktop is slower on both, x264 by 27% and x265 by 51%, with its 8 CPUs confirmed; why is not known.
+
+**The LLM on a GPU** (llama-bench's own tokens a second, three repetitions, every layer offloaded; image `llama-vulkan:arm64`; `benchmarks/llm-gpu.sh`, file `m1-llm-gpu.csv`)
+
+| tokens a second | prompt, 512 | generation, 128 |
+|---|---|---|
+| Mac itself, Metal (Homebrew's ggml 0.25.3) | 2008 | 74 |
+| lighter 0.10.0, Metal (`lighter.sh/metal`) | 1990 | 91 |
+| lighter 0.10.0, Vulkan (`lighter.sh/gpu`) | 1252 | 45 |
+| Podman, Vulkan (krunkit's virtio-gpu) | 198 | 47 |
+| lighter, the same image on the CPU, 8 threads | 174 | 61 |
+| Podman, the same image on the CPU, 8 threads | 212 | 76 |
+
+- **Only lighter and the Mac get the GPU's speed:** lighter reads the prompt at 11× its CPU rate and within 1% of the Mac. Podman's Vulkan reads the prompt no faster than its CPU does. OrbStack, Docker Desktop, Colima and Apple container offer no GPU to a container.
+- **Generation is faster through lighter than on the Mac** because the builds differ: lighter's Metal server is its own ggml, the Mac's Homebrew's, which disables Metal's tensor API before M5. Not a like-for-like row.
+- **Podman's CPU is ahead of lighter's here** (212 against 174, 76 against 61), both at 8 vCPUs and 4 GiB, where the CPU LLM row above has lighter first (6.14 s against 6.64). That row's time includes loading the model from a shared folder, where lighter is fast; llama-bench's rates are compute alone. It is a gap to explain, not yet explained.
+- **The M1's own lighter** ran these rows (the release, installed from its notarized archive), set to 8 CPUs for them; at its default 4 its CPU row read 148 and 58.
 - **OrbStack's LLM** is 2.6× the others', reproduced in a clean session; its VM has the 8 CPUs it was given (in its configuration, in the guest and from the API), its guest reports the same CPU features as the Mac (`asimddp`, `sha2`), and its vCPU threads run at the default priority, yet only seven of them are busy during the run and it spends twice lighter's CPU time. On the M5, whose 18 cores leave room around an 8-vCPU guest, it was level. The cause is not known.
 - **A first pass the same morning was discarded.** The Mac was not quiet: the lock screen's Aerial decoding video and Photos' analysis after `photolibraryd` restarted. It moved the Mac's own rows most (media engine 4.0 s, LLM unsettled at 16–81 s) and three runtimes' LLM to about 16 s. Its files are kept on the M1, not here.
 
