@@ -74,16 +74,16 @@ An 8 GB M1 Mac mini on macOS 26.6.2, one session. Every runtime at 8 vCPUs and 4
 | tokens a second | prompt, 512 | generation, 128 |
 |---|---|---|
 | Mac itself, Metal (Homebrew's ggml 0.25.3) | 2008 | 74 |
-| lighter 0.10.0, Metal (`lighter.sh/metal`) | 1990 | 91 |
-| lighter 0.10.0, Vulkan (`lighter.sh/gpu`) | 1252 | 45 |
+| lighter 0.10.0, Metal (`lighter.sh/metal`) | 1952 | 93 |
+| lighter 0.10.0, Vulkan (`lighter.sh/gpu`) | 1248 | 45 |
 | Podman, Vulkan (krunkit's virtio-gpu) | 198 | 47 |
-| lighter, the same image on the CPU, 8 threads | 174 | 61 |
+| lighter, the same image on the CPU, 8 threads | 208 | 86 |
 | Podman, the same image on the CPU, 8 threads | 212 | 76 |
 
-- **Only lighter and the Mac get the GPU's speed:** lighter reads the prompt at 11× its CPU rate and within 1% of the Mac. Podman's Vulkan reads the prompt no faster than its CPU does. OrbStack, Docker Desktop, Colima and Apple container offer no GPU to a container.
+- **Only lighter and the Mac get the GPU's speed:** lighter reads the prompt at 9× its CPU rate and within 3% of the Mac. Podman's Vulkan reads the prompt no faster than its CPU does. OrbStack, Docker Desktop, Colima and Apple container offer no GPU to a container.
 - **Generation is faster through lighter than on the Mac** because the builds differ: lighter's Metal server is its own ggml, the Mac's Homebrew's, which disables Metal's tensor API before M5. Not a like-for-like row.
-- **Podman's CPU is ahead of lighter's here** (212 against 174, 76 against 61), both at 8 vCPUs and 4 GiB, where the CPU LLM row above has lighter first (6.14 s against 6.64). That row's time includes loading the model from a shared folder, where lighter is fast; llama-bench's rates are compute alone. It is a gap to explain, not yet explained.
-- **The M1's own lighter** ran these rows (the release, installed from its notarized archive), set to 8 CPUs for them; at its default 4 its CPU row read 148 and 58.
+- **On the CPU lighter and Podman are level.** Swept at 1, 4 and 8 threads in the same session, prompt 44.0 / 174.6 / 213.6 tokens a second against 44.4 / 173.2 / 208.3, generation 35.9 / 108.3 / 83.0 against 35.5 / 106.2 / 84.3. Eight threads generate slower than four on both: the M1 has four performance cores and four efficiency cores, and every token waits at a barrier for the slowest.
+- **The M1's own lighter** ran these rows (the release, installed from its notarized archive), at 8 CPUs, with its own containers stopped. A first pass left them running (a Frigate and Home Assistant test stack, about 300 ms of CPU a second in the guest) and read lighter's CPU at 174 and 61: llama.cpp's threads, preempted six times as often as in Podman's guest, slept at their barriers fourteen times as often (17,904 voluntary switches a second against 1,278).
 - **OrbStack's LLM** is 2.6× the others', reproduced in a clean session; its VM has the 8 CPUs it was given (in its configuration, in the guest and from the API), its guest reports the same CPU features as the Mac (`asimddp`, `sha2`), and its vCPU threads run at the default priority, yet only seven of them are busy during the run and it spends twice lighter's CPU time. On the M5, whose 18 cores leave room around an 8-vCPU guest, it was level. The cause is not known.
 - **A first pass the same morning was discarded.** The Mac was not quiet: the lock screen's Aerial decoding video and Photos' analysis after `photolibraryd` restarted. It moved the Mac's own rows most (media engine 4.0 s, LLM unsettled at 16–81 s) and three runtimes' LLM to about 16 s. Its files are kept on the M1, not here.
 
