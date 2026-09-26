@@ -25,7 +25,7 @@ class Lighter < Formula
   def install
     bin.install "bin/lighter"
     pkgshare.install Dir["share/lighter/*"]
-    prefix.install "LICENSE-MIT", "LICENSE-APACHE", "README.md"
+    prefix.install "LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "README.md"
   end
 
   # Ownership includes a digest of the final canonical Cellar path. This is
