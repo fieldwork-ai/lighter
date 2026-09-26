@@ -120,7 +120,9 @@ Automatic file-cache trimming waits for an empty, idle container hierarchy.
 execution groups. CPU idleness alone does not make a running process's mapped
 files disposable: image extraction can charge those shared pages to the Docker
 engine rather than the container using them. Empty hierarchies receive cleanup
-passes after approximately three and eight seconds; free-page reporting and
+passes after thirty and thirty-five seconds (three and eight until 0.10, which
+threw away the tree an install had just written before the next command could
+read it from the guest); free-page reporting and
 pressure recovery still operate while workloads run. Unknown population is
 handled conservatively as live work. Compaction gathers freed fragments into reportable runs, and reporting briefly uses its faster idle settings: 128 KiB runs first for the bulk, then the rest order's 32 KiB for the fragments (lowering the order requests the cycle, guest patch 0035). New work restores the normal reporting rate. There is no default cache ceiling on running containers.
 

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use memory_policy::{IdleTrim, TICKS_PER_SEC};
+use memory_policy::{IdleTrim, TICKS_PER_SEC, TRIM_AFTER};
 use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
@@ -341,8 +341,8 @@ fn bound_container_cache() {
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
     // Whether a trim has left reporting hurried, so the restore below is a
-    // latch and not a mark: once the counter steps by four it can pass 25 s
-    // without landing on it, and did — a guest that had trimmed sat idle
+    // latch and not a mark: once the counter steps by four it can pass its
+    // mark without landing on it, and did — a guest that had trimmed sat idle
     // with reporting at 100 ms and compaction at full strength until its
     // next container.
     let mut hurried = always_fast;
@@ -360,7 +360,7 @@ fn bound_container_cache() {
         // wakeup for a vCPU and, above eight gigabytes, a message to the
         // host: four a second of each on a machine doing nothing. The
         // counters step by four so the marks they are compared against
-        // (the trims, the reporting rate at 25 s) fall where they did.
+        // (the trims, the reporting rate after them) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
         wake.sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
         // Under a megabyte is DAMON's own sampling: the ten pages a minute
@@ -413,7 +413,7 @@ fn bound_container_cache() {
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
         if hurried && !always_fast
-            && (populated || idle_for == 0 || idle_trim.elapsed_ticks() >= 25 * TICKS_PER_SEC)
+            && (populated || idle_for == 0 || idle_trim.elapsed_ticks() >= TRIM_AFTER[1] + 17 * TICKS_PER_SEC)
         {
             set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
             hurried = false;
@@ -524,7 +524,7 @@ fn bound_container_cache() {
         // Image extraction charges shared file pages to the engine. A running
         // container can map those pages without owning their charge, so neither
         // cgroup's cache is disposable merely because container CPU is quiet.
-        // Trim only after three and eight seconds with no populated descendants.
+        // Trim only after half a minute with no populated descendants (TRIM_AFTER).
         if !trims || !trim_due {
             continue;
         }
