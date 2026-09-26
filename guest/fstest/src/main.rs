@@ -524,6 +524,85 @@ fn cross(dir: &Path, report: &mut Report) {
     );
 
     report.check(
+        "host-overwrite-of-guest-write-is-seen",
+        (|| {
+            // A file the guest wrote and read keeps its pages across the
+            // first refresh after the write (kernel patch 0043), so a change
+            // the host makes to it must still drop them. The same length,
+            // so nothing but the host's notification can tell them apart.
+            let path = dir.join("guest-owned");
+            fs::write(&path, b"written by the guest").map_err(|e| e.to_string())?;
+            fs::read(&path).map_err(|e| e.to_string())?;
+            mark(dir, "guest-owned.done")?;
+            await_marker(dir, "host-overwrote-guest.done")?;
+            let content = fs::read(&path).map_err(|e| e.to_string())?;
+            if content != b"rewritten by the Mac" {
+                return Err(format!(
+                    "the guest still sees {:?}",
+                    String::from_utf8_lossy(&content)
+                ));
+            }
+            Ok(())
+        })(),
+    );
+
+    report.check(
+        "host-create-in-guest-directory-is-seen",
+        (|| {
+            // A directory the guest made answers for missing names itself
+            // (kernel patch 0044), so a name the host adds must still be
+            // found: asked for once while missing, so the guest has cached
+            // that it was, then made on the host.
+            let made = dir.join("guest-made");
+            fs::create_dir(&made).map_err(|e| e.to_string())?;
+            fs::write(made.join("guest-kept"), b"kept").map_err(|e| e.to_string())?;
+            if made.join("host-added").exists() {
+                return Err("a name nobody made exists".into());
+            }
+            let listed: Vec<String> = fs::read_dir(&made)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect();
+            if listed != ["guest-kept"] {
+                return Err(format!("a directory the guest made lists {listed:?}"));
+            }
+            mark(dir, "guest-made.done")?;
+            await_marker(dir, "host-added.done")?;
+            // The marker is read from the host, and the host's changes reach
+            // the guest's caches as notifications a few milliseconds behind
+            // it; the promise is that they arrive, so the guest waits for
+            // them, and not for long.
+            let started = Instant::now();
+            loop {
+                let added = fs::read(made.join("host-added")).ok();
+                let kept = made.join("guest-kept").exists();
+                // And the listing, which a complete directory serves itself
+                // (kernel patch 0045) until the host changes it.
+                let mut listed: Vec<String> = fs::read_dir(&made)
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                    .collect();
+                listed.sort();
+                if added.as_deref() == Some(b"added on the Mac".as_slice())
+                    && !kept
+                    && listed == ["host-added"]
+                {
+                    return Ok(());
+                }
+                if started.elapsed() > Duration::from_secs(2) {
+                    return Err(format!(
+                        "after 2 s the guest reads {:?} for the added file, the deleted one is {}, and it lists {:?}",
+                        added.map(|a| String::from_utf8_lossy(&a).into_owned()),
+                        if kept { "still there" } else { "gone" },
+                        listed
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })(),
+    );
+
+    report.check(
         "host-rename-is-seen",
         (|| {
             await_marker(dir, "host-renamed.done")?;
