@@ -36,7 +36,7 @@ CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf c
 # installs, on a tree materialized once by npm — which installer produced it
 # changes what they see, and pnpm in particular builds a farm of symlinks.
 TREE_CASES=" ripgrep find-walk copy-tree rm-rf "
-IMAGE="lighter-bench:1"
+IMAGE="lighter-bench:2"
 # What the guest is given. Defaults suit the machine this was written on;
 # `BENCH_MEMORY_MIB` and `BENCH_CPUS` are how it runs somewhere smaller.
 #
@@ -293,6 +293,13 @@ prepare_work() {
 	cp "$WORK"/fixture/* "$WORK/npm/"
 	cp benchmarks/cases/*.sh benchmarks/cases/*.js "$WORK/cases/"
 	chmod +x "$WORK/cases"/*.sh
+	# The llm case's model, from outside the repository (491 MB), cloned so
+	# every target's work directory costs nothing more on the Mac's disk.
+	if [ -n "${LIGHTER_BENCH_MODEL_DIR:-}" ]; then
+		mkdir -p "$WORK/models"
+		cp -c "$LIGHTER_BENCH_MODEL_DIR"/*.gguf "$WORK/models/" 2>/dev/null \
+			|| cp "$LIGHTER_BENCH_MODEL_DIR"/*.gguf "$WORK/models/"
+	fi
 
 	printf '' > "$WORK/request"
 	printf '' > "$WORK/reply"
