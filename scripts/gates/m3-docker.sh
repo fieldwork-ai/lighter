@@ -126,6 +126,20 @@ else
 	tail -5 <<<"$out" | sed 's/^/    /'
 fi
 
+# The engine's seccomp profile (scripts/seccomp-profile.py): still a filter,
+# the NUMA memory-policy calls allowed without CAP_SYS_NICE, and moving another
+# process's pages still refused.
+if out="$(docker run --rm alpine:3.21 sh -c '
+	apk add -q numactl-tools >/dev/null 2>&1 || exit 3
+	grep -q "^Seccomp:[[:space:]]*2" /proc/self/status || { echo "no seccomp filter"; exit 1; }
+	numactl --show >/dev/null 2>&1 || { echo "get_mempolicy refused"; exit 1; }
+	migratepages $$ 0 0 >/dev/null 2>&1 && { echo "migrate_pages allowed"; exit 1; }
+	echo SECCOMP-OK' 2>&1)" && grep -q SECCOMP-OK <<<"$out"; then
+	pass "seccomp: a filter, mempolicy calls allowed, migrate_pages refused"
+else
+	fail "seccomp profile: ${out##*$'\n'}"
+fi
+
 echo
 echo "==> Checking build worker OOM isolation"
 mkdir -p "$RUN_DIR/oom-build"

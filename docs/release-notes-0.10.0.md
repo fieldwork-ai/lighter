@@ -53,6 +53,10 @@ The default is unchanged, and measured so: gate m6 passes every check on the M1 
 
 On the way it caught one bug of its own: the guest took the virtio-mem driver, which every kernel now has, for a range, so a fixed 8 GiB guest offered its spare memory to the balloon and throttled its containers. It now asks whether a device is bound.
 
+## x265 gets its threads
+
+Containers may now set their own NUMA memory policy (`get_mempolicy`, `set_mempolicy`, `mbind`), as they can under Podman. Docker's default seccomp profile allows these only with `CAP_SYS_NICE`, and x265, finding libnuma's probe refused, runs without a thread pool: an HEVC encode of five seconds of 1080p took 3.5 s on 8 vCPUs, and takes 1.3 s now. The profile is otherwise Docker's own, and a container's `--security-opt seccomp=` still replaces it. `docs/architecture.md` has the reasoning.
+
 ## Also
 
 - Gate m3's compose stack pulls MinIO from Bitnami's archive (`bitnamilegacy/minio`, the same 2025-04-22 release, pinned): MinIO withdrew its own images from quay.io and Docker Hub.
