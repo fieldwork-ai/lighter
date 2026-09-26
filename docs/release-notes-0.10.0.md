@@ -60,6 +60,16 @@ On the way it caught one bug of its own: the guest took the virtio-mem driver, w
 
 Containers may now set their own NUMA memory policy (`get_mempolicy`, `set_mempolicy`, `mbind`), as they can under Podman. Docker's default seccomp profile allows these only with `CAP_SYS_NICE`, and x265, finding libnuma's probe refused, runs without a thread pool: an HEVC encode of five seconds of 1080p took 3.5 s on 8 vCPUs, and takes 1.3 s now. The profile is otherwise Docker's own, and a container's `--security-opt seccomp=` still replaces it. `docs/architecture.md` has the reasoning.
 
+## Reading a tree a container just wrote is as fast as reading it again
+
+A build or a search that reads what an install has just written to a shared folder used to read all of it back from the Mac: ripgrep over `node_modules` straight after `npm install` took 5.8 s on the M1 and 3.4 s on the M5, against about 0.13 s once warm. It now takes the warm time on both, 154 ms and 111 ms, and asks the Mac for nothing. Three changes to the guest's kernel:
+
+- **It keeps what it wrote.** A file's last partial page was never kept after a write, so every small file went back to the Mac on its first read, and the guest's own clock on a written file made its first refresh throw the rest away.
+- **A folder the guest made knows what is in it.** While nothing but the guest has changed it, a name it has no entry for does not exist, so the checks every tool makes for files that are not there (ripgrep's `.gitignore` in every folder, a package manager's before each create) no longer go to the Mac. Installs are 5–7% faster for it.
+- **Such a folder lists itself**, from a snapshot taken when the listing starts.
+
+A change made on the Mac still reaches the guest as it did: it arrives as a notification and ends all three for what it touched, and a lost one resets everything. Gate m4 checks each case: a file the guest wrote and the Mac rewrote, a file the Mac adds to or deletes from a folder the guest made, by name and in its listing. `docs/complete-directories-2026-09-26.md` has the design.
+
 ## Also
 
 - Old releases are removed. Every downloaded update stayed in the update cache after it was installed, and every installed release stayed too, about 2 GB each: an installation that had followed every release since 0.5 held 27 GB of them. The cache now keeps only an update still waiting for `lighter upgrade`, and the installation keeps the selected release, the one before it (what a failed upgrade falls back to), and any a running machine was started from. What has built up is removed by the first `lighter update check` or `lighter upgrade` after this release.
