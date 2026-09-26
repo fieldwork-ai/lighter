@@ -69,6 +69,19 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, one session, every othe
 
 ¹ x265 under Docker's engine (lighter, OrbStack, Docker Desktop, Colima) runs without a thread pool: Docker's default seccomp profile allows the NUMA memory-policy calls (`get_mempolicy`, `set_mempolicy`, `mbind`) only with `CAP_SYS_NICE`, libnuma's probe fails, and x265 then allocates no pool rather than falling back to the CPU count ("No thread pool allocated, --wpp disabled"). In lighter with `--cap-add SYS_NICE` or `--security-opt seccomp=unconfined` the same encode takes 1.29 s. Podman's and Apple's defaults do not block the calls.
 
+**Media v2, partial (paused when the M5 was needed)**
+
+The second media pass adds a fair CPU case (zstd, the same code on the Mac and in a guest), hardware transcodes (VideoToolbox on the Mac, V4L2 through `lighter.sh/video` in lighter) and a real clip (Big Buck Bunny, 10 s of 1080p30 H.264) in place of ffmpeg's pattern generator, which was the limit. It ran on the Mac and on lighter 0.10.0 with the seccomp change before stopping; OrbStack ran zstd-1 only. The Mac's row (`m5-native-media2.csv`, commit b0336f9) is on the clip; lighter's and OrbStack's (commit d08b4fe) are on the pattern, so their transcodes are not comparable with the Mac's, and only the zstd rows are.
+
+| | Mac itself | lighter | OrbStack |
+|---|---|---|---|
+| zstd -9, 256 MiB, 1 thread | 3.50 s | 3.51 s | 3.55 s |
+| zstd -9, 256 MiB, 8 threads | 0.55 s | 0.55 s | – |
+
+A guest's CPU is the Mac's CPU: on a fair case the three are within 1.5%. The sha256 cases above measure two different sha256 implementations, the Mac's and the image's, not two CPUs.
+
+On lighter, the pattern: x265 1.30 s with the seccomp change (3.5 s in the table above without it), and HEVC on the media engine 0.63 s. Still to run: every container runtime on the clip, then `benchmarks/llm-gpu.sh`.
+
 ## Notes
 
 - **A failure is the runtime's own.** The harness only unblocks untimed setup; a timed workload that fails is reported as failed. Podman's shared folder leaves every hard-linked file of a pnpm tree behind on `rm -rf`, so its rm -rf failed, and its third copy-tree hit the per-case time limit (the first two took 276 s). UDP moved no traffic on Docker Desktop, Podman or Apple container.
