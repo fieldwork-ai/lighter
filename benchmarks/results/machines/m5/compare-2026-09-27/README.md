@@ -48,7 +48,6 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 | memory, one idle container | 687 MiB | 901 MiB | 3,381 MiB | 1,292 MiB | 2,161 MiB | 705 MiB |
 | memory, nothing running | 606 MiB | 894 MiB | 4,271 MiB | 1,300 MiB | 2,149 MiB | 17 MiB† |
 | memory, peak during an install | 9,946 MiB | 5,752 MiB | 6,515 MiB | 8,174 MiB | 14,863 MiB | 3,835 MiB |
-| memory, 15 s after it | 9,413 MiB | 2,711 MiB | 6,447 MiB | 8,174 MiB | 14,865 MiB | 28 MiB† |
 | memory, a minute after it | 1,159 MiB | 1,705 MiB | 6,452 MiB | 8,174 MiB | 14,865 MiB | 28 MiB† |
 | idle CPU | 5 ms/s | 2 ms/s | 39 ms/s | 6 ms/s | 14 ms/s | 1 ms/s |
 | idle wakeups a second | 60 | 74 | 4303 | 50 | 56 | 19 |
@@ -109,14 +108,11 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 ## Notes
 
 - **Every guest measured itself** at 8 CPUs and 15,939–16,107 MiB (`guest.*` in each `.tree`). No engine had a container running. The Mac's llama.cpp (b11191, commit 4b1a27f) and zstd (1.5.7) are the image's releases, built for the Mac.
-- **What lighter trades for its share speed is memory right after work.** The guest keeps its file cache for 30 s after the last container stops, so the next command reads what the last one wrote from memory.
-  - The gain: ripgrep over a freshly installed tree reads at 81 ms, where it took seconds from the Mac on 0.9.3.
-  - The cost: peak memory is higher, and 15 s after an install lighter holds 9.4 GiB against OrbStack's 2.7.
-  - A minute after, it holds 1.2 GiB against OrbStack's 1.7.
+- **lighter holds its file cache for 30 s after the last container stops**, by design, so the next command reads what the last one wrote from memory: ripgrep over a freshly installed tree reads at 81 ms, where it took seconds from the Mac on 0.9.3. The price is a higher peak during work (9.9 GiB here); a minute after the install it holds 1.2 GiB, against OrbStack's 1.7. The CSVs keep a reading 15 s after the install, inside that hold.
 - **First repetitions:** the harness settles the Mac for longer than those 30 s before each case, so lighter's first repetition of a read is a cold one (find-walk 352 ms, then 85 and 84; pnpm 5.9 s, then 4.1 and 3.9). The medians are the warm reads.
 - **The 1 GiB write** varied by up to 153% between repetitions on every runtime, the Mac included. Read it as an order of magnitude.
 - **A failure is the runtime's own.** A timed workload that fails is reported as failed.
   - Podman's shared folder: the tree copy took 274 s twice and then passed the case's 300 s cap, and `rm -rf` of it could not be measured.
   - UDP moved no traffic on Docker Desktop or Podman, and failed on Apple container, whose published-port and HTTP cases also failed through socktainer.
-- **Memory at rest is compared with one idle container running**, the first memory row: lighter holds the least of the seven (687 MiB, Apple container 705, OrbStack 901). † Apple container runs a VM per container and none otherwise, so with nothing running it is its services alone (17 MiB), and after the install the install's VM has exited (28 MiB): those readings are of no VM, not of a smaller one. Its own-disk read cases varied by up to 994% between repetitions.
+- **Memory at rest is compared with one idle container running**, the first memory row: lighter holds the least of the seven (687 MiB, Apple container 705, OrbStack 901). † Apple container runs a VM per container and none otherwise, so with nothing running it is its services alone (17 MiB), and a minute after the install the install's VM has exited (28 MiB): those readings are of no VM, not of a smaller one. Its own-disk read cases varied by up to 994% between repetitions.
 - The 2026-09-26 record beside this one was taken on the 0.10.0 candidate before the share and memory-loop work; this one replaces it for 0.10.0.
