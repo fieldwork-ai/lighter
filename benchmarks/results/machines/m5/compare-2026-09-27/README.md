@@ -45,11 +45,11 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 |---|---|---|---|---|---|---|
 | container start | 148 ms | 297 ms | 154 ms | 163 ms | 188 ms | 1081 ms |
 | boot to first container | 771 ms | 1539 ms | 2231 ms | 8860 ms | 8251 ms | 1440 ms |
-| memory, nothing running | 606 MiB | 894 MiB | 4,271 MiB | 1,300 MiB | 2,149 MiB | 17 MiB |
 | memory, one idle container | 687 MiB | 901 MiB | 3,381 MiB | 1,292 MiB | 2,161 MiB | 705 MiB |
+| memory, nothing running | 606 MiB | 894 MiB | 4,271 MiB | 1,300 MiB | 2,149 MiB | 17 MiB† |
 | memory, peak during an install | 9,946 MiB | 5,752 MiB | 6,515 MiB | 8,174 MiB | 14,863 MiB | 3,835 MiB |
-| memory, 15 s after it | 9,413 MiB | 2,711 MiB | 6,447 MiB | 8,174 MiB | 14,865 MiB | 28 MiB |
-| memory, a minute after it | 1,159 MiB | 1,705 MiB | 6,452 MiB | 8,174 MiB | 14,865 MiB | 28 MiB |
+| memory, 15 s after it | 9,413 MiB | 2,711 MiB | 6,447 MiB | 8,174 MiB | 14,865 MiB | 28 MiB† |
+| memory, a minute after it | 1,159 MiB | 1,705 MiB | 6,452 MiB | 8,174 MiB | 14,865 MiB | 28 MiB† |
 | idle CPU | 5 ms/s | 2 ms/s | 39 ms/s | 6 ms/s | 14 ms/s | 1 ms/s |
 | idle wakeups a second | 60 | 74 | 4303 | 50 | 56 | 19 |
 | TCP, Mac to container | 106.0 Gbit/s | 101.3 Gbit/s | 25.8 Gbit/s | 4.6 Gbit/s | 5.1 Gbit/s | 34.0 Gbit/s |
@@ -118,5 +118,5 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 - **A failure is the runtime's own.** A timed workload that fails is reported as failed.
   - Podman's shared folder: the tree copy took 274 s twice and then passed the case's 300 s cap, and `rm -rf` of it could not be measured.
   - UDP moved no traffic on Docker Desktop or Podman, and failed on Apple container, whose published-port and HTTP cases also failed through socktainer.
-- **Apple container:** with nothing running it has no VM at all (17 MiB of services), and a container's VM goes away when it exits (28 MiB after the install). Its own-disk read cases varied by up to 994% between repetitions.
+- **Memory at rest is compared with one idle container running**, the first memory row: lighter holds the least of the seven (687 MiB, Apple container 705, OrbStack 901). † Apple container runs a VM per container and none otherwise, so with nothing running it is its services alone (17 MiB), and after the install the install's VM has exited (28 MiB): those readings are of no VM, not of a smaller one. Its own-disk read cases varied by up to 994% between repetitions.
 - The 2026-09-26 record beside this one was taken on the 0.10.0 candidate before the share and memory-loop work; this one replaces it for 0.10.0.

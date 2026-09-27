@@ -39,10 +39,10 @@ An 8 GB M1 Mac mini on macOS 26.6.2, one session. Every runtime at 8 vCPUs and 4
 |---|---|---|---|---|---|---|
 | container start | 183 ms | 296 ms | 238 ms | 220 ms | 249 ms | 1611 ms |
 | boot to first container | 921 ms | 1550 ms | 4113 ms | 12473 ms | 9544 ms | 1748 ms |
-| memory, nothing running | 326 MiB | 689 MiB | 4,413 MiB | 1,146 MiB | 1,499 MiB | 17 MiB |
 | memory, one idle container | 398 MiB | 687 MiB | 4,453 MiB | 1,148 MiB | 1,504 MiB | 465 MiB |
+| memory, nothing running | 326 MiB | 689 MiB | 4,413 MiB | 1,146 MiB | 1,499 MiB | 17 MiB† |
 | memory, peak during an install | 3,614 MiB | 5,070 MiB | 4,474 MiB | 4,333 MiB | failed | 2,882 MiB |
-| memory, a minute after it | 1,159 MiB | 1,298 MiB | 4,443 MiB | 4,295 MiB | failed | 24 MiB |
+| memory, a minute after it | 1,159 MiB | 1,298 MiB | 4,443 MiB | 4,295 MiB | failed | 24 MiB† |
 | idle CPU | 7 ms/s | 17 ms/s | 27 ms/s | 10 ms/s | 7 ms/s | 1 ms/s |
 | idle wakeups a second | 60 | 96 | 1762 | 54 | 74 | 9 |
 | TCP, Mac to container | 59.4 Gbit/s | 58.5 Gbit/s | 12.3 Gbit/s | 4.1 Gbit/s | 1.9 Gbit/s | 23.5 Gbit/s |
@@ -108,5 +108,5 @@ An 8 GB M1 Mac mini on macOS 26.6.2, one session. Every runtime at 8 vCPUs and 4
 - **ripgrep on the share:** 0.10.0's kernel keeps what the guest wrote and answers for the folders it made, so a tree an install has just written reads at the warm speed (117 ms; 4.2 s on the kernel this table was first recorded with, which read it back from the Mac). The first repetition is still cold (7.3 s): the harness settles the Mac for longer than the thirty seconds after which the guest gives an idle machine's file cache back, and that pass reads the tree from the Mac, as Podman's and OrbStack's would after their guests had dropped it.
 - **DNS** reads about 60 µs or about 125 µs from one boot to the next on lighter; alternated three times each, 0.10.0's rootfs and the one before it landed in both (59/58/125 against 125/64/65). This pass's 160 is the slower of the two.
 - **OrbStack's sha256** (9.2 s against 6.3–6.5 everywhere else) was reproduced with a plain `sha256sum` of 1 GiB in alpine (9.4 s), with 8 CPUs confirmed in the guest.
-- **Memory:** with nothing running, Apple's runtime has no VM at all (17 MiB of services); with one idle container it holds that container's whole VM (465 MiB), and its VMs attach no memory balloon (`apple/containerization`, `VZVirtualMachineInstance.toVZ`), so a running container keeps its peak until it stops. Its 24 MiB a minute after the install is the install's container having exited.
+- **Memory at rest is compared with one idle container running**, the first memory row: lighter holds the least (398 MiB; Apple container 465, OrbStack 687). † With nothing running, Apple's runtime has no VM at all (17 MiB of services); with one idle container it holds that container's whole VM (465 MiB), and its VMs attach no memory balloon (`apple/containerization`, `VZVirtualMachineInstance.toVZ`), so a running container keeps its peak until it stops. Its 24 MiB a minute after the install is the install's container having exited.
 - **One session on one machine**, a Mac with 8 GB, which runs short of memory under the largest cases; the M5 comparison is still to do.
