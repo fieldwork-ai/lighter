@@ -100,6 +100,9 @@ echo normal > "$PRESSURE_FILE"
 # Starts the VMM on the run directory's disks and waits for the agent. A
 # second call boots the same data disk again, saved containers and all.
 boot() {
+	# Emptied here, not by the redirection below: that happens in the
+	# background child, after the wait has already read the last boot's log.
+	: >"$LOG"
 	LIGHTER_RESOURCES=cooperative LIGHTER_PRESSURE_TEST_FILE="$PRESSURE_FILE" "$BIN" \
 		--kernel "$KERNEL" \
 		--disk "$ROOTFS" \
@@ -349,6 +352,9 @@ fi
 echo
 echo "==> A restart with a saved container"
 docker create --name m6c-saved alpine:3.21 true >/dev/null 2>&1 || fail "could not create the saved container"
+# Stopping the VMM is a power cut to the guest; its disk commits every thirty
+# seconds, so the container is written out first or there is none to restore.
+guest sync
 kill "$VMM_PID" 2>/dev/null; waited=0
 while kill -0 "$VMM_PID" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
 kill -9 "$VMM_PID" 2>/dev/null || true
@@ -359,7 +365,7 @@ until docker info >/dev/null 2>&1 || [ "$waited" -ge "$BOOT_TIMEOUT" ]; do
 	kill -0 "$VMM_PID" 2>/dev/null || break
 	sleep 1; waited=$((waited + 1))
 done
-ready="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -ao 'boot_memory=[a-z]*' | tail -1)"
+ready="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -ao 'boot_memory=[a-z]*' | tail -1 || true)"
 [ "$ready" = "boot_memory=ready" ] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx m6c-saved \
 	&& pass "it booted again in ${waited}s with its container saved (init: ${ready})" \
 	|| fail "the restart with a saved container: ${ready:-no boot_memory line}, engine $(docker info >/dev/null 2>&1 && echo up || echo down)"
