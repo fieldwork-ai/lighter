@@ -44,18 +44,6 @@ A drop-in replacement for Docker Desktop, OrbStack and Colima:
 | **PyTorch on the Mac's GPU (MPS)** | **Yes** | No | No | No | No | No |
 | **Hardware video decode and encode** | **Yes** | No | No | No | No | No |
 
----|---|---|---|---|
-| **Licence** | **MIT / Apache 2.0** | Proprietary | Proprietary | Apache 2.0 |
-| **Commercial use** | **Free** | $8–$10 / user / mo | $9–$24 / user / mo (≥250) | Free |
-| **Telemetry** | **None** | Yes | Yes | None |
-| **GUI** | **None (headless)** | Menu bar app | Electron app | None |
-| **x86-64 images (Rosetta)** | **Yes** | Yes | Yes | Yes |
-| **Kubernetes** | kind, kubectl, Helm | Built-in | Built-in | k3s |
-| **GPU in containers (Vulkan, Metal)** | **Yes** | No | No | No |
-| **Neural Engine (ONNX)** | **Yes** | No | No | No |
-| **PyTorch on the Mac's GPU (MPS)** | **Yes** | No | No | No |
-| **Hardware video decode and encode** | **Yes** | No | No | No |
-
 ---
 
 ## Install
