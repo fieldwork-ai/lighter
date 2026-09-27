@@ -17,14 +17,14 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 
 | | Mac itself | lighter | OrbStack | Docker Desktop | Colima | Podman | Apple container |
 |---|---|---|---|---|---|---|---|
-| npm install | 6.5 s | 6.5 s | 8.8 s | 17.6 s | 17.1 s | 87.8 s | 18.9 s |
-| pnpm install | 4.5 s | 4.1 s | 5.2 s | 27.6 s | 24.7 s | 46.6 s | 25.8 s |
-| yarn install | 5.3 s | 5.3 s | 7.8 s | 24.8 s | 21.2 s | 73.6 s | 24.1 s |
-| ripgrep over the tree | 949 ms | 81 ms | 1023 ms | 3843 ms | 2839 ms | 27376 ms | 3670 ms |
-| find over the tree | 330 ms | 85 ms | 453 ms | 1506 ms | 1378 ms | 38322 ms | 1269 ms |
-| copy the tree | 13.7 s | 3.3 s | 9.3 s | 27.8 s | 39.5 s | failed | 37.5 s |
-| rm -rf the tree | 3.8 s | 2.7 s | 3.2 s | 8.5 s | 8.0 s | failed | 7.7 s |
-| write 1 GiB, fsynced | 139 ms | 268 ms | 261 ms | 704 ms | 791 ms | 482 ms | 825 ms |
+| npm install | 6.5 s | 6.5 s | 8.8 s | 17.6 s | 17.1 s | 87.8 s | 19.3 s |
+| pnpm install | 4.5 s | 4.1 s | 5.2 s | 27.6 s | 24.7 s | 46.6 s | 28.2 s |
+| yarn install | 5.3 s | 5.3 s | 7.8 s | 24.8 s | 21.2 s | 73.6 s | 24.2 s |
+| ripgrep over the tree | 949 ms | 81 ms | 1023 ms | 3843 ms | 2839 ms | 27376 ms | 3700 ms |
+| find over the tree | 330 ms | 85 ms | 453 ms | 1506 ms | 1378 ms | 38322 ms | 1277 ms |
+| copy the tree | 13.7 s | 3.3 s | 9.3 s | 27.8 s | 39.5 s | failed | 37.4 s |
+| rm -rf the tree | 3.8 s | 2.7 s | 3.2 s | 8.5 s | 8.0 s | failed | 7.6 s |
+| write 1 GiB, fsynced | 139 ms | 268 ms | 261 ms | 704 ms | 791 ms | 482 ms | 851 ms |
 
 **On the runtime's own disk**
 
@@ -43,23 +43,23 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 
 | | lighter | OrbStack | Docker Desktop | Colima | Podman | Apple container |
 |---|---|---|---|---|---|---|
-| container start | 148 ms | 297 ms | 154 ms | 163 ms | 188 ms | 1081 ms |
-| boot to first container | 771 ms | 1539 ms | 2231 ms | 8860 ms | 8251 ms | 1440 ms |
+| container start | 148 ms | 297 ms | 154 ms | 163 ms | 188 ms | 970 ms |
+| boot to first container | 771 ms | 1539 ms | 2231 ms | 8860 ms | 8251 ms | 1368 ms |
 | memory, one idle container | 687 MiB | 901 MiB | 3,381 MiB | 1,292 MiB | 2,161 MiB | 705 MiB |
 | memory, nothing running | 606 MiB | 894 MiB | 4,271 MiB | 1,300 MiB | 2,149 MiB | 17 MiB† |
-| memory, peak during an install | 9,946 MiB | 5,752 MiB | 6,515 MiB | 8,174 MiB | 14,863 MiB | 3,835 MiB |
-| memory, a minute after it | 1,159 MiB | 1,705 MiB | 6,452 MiB | 8,174 MiB | 14,865 MiB | 28 MiB† |
+| memory, peak during an install | 9,946 MiB | 5,752 MiB | 6,515 MiB | 8,174 MiB | 14,863 MiB | 3,972 MiB |
+| memory, a minute after it | 1,159 MiB | 1,705 MiB | 6,452 MiB | 8,174 MiB | 14,865 MiB | 26 MiB† |
 | idle CPU | 5 ms/s | 2 ms/s | 39 ms/s | 6 ms/s | 14 ms/s | 1 ms/s |
 | idle wakeups a second | 60 | 74 | 4303 | 50 | 56 | 19 |
-| TCP, Mac to container | 106.0 Gbit/s | 101.3 Gbit/s | 25.8 Gbit/s | 4.6 Gbit/s | 5.1 Gbit/s | 34.0 Gbit/s |
-| TCP, container to Mac | 99.0 Gbit/s | 56.6 Gbit/s | 15.2 Gbit/s | 3.9 Gbit/s | 1.9 Gbit/s | 66.9 Gbit/s |
-| TCP, published port | 99.6 Gbit/s | 55.8 Gbit/s | 14.8 Gbit/s | 4.0 Gbit/s | 1.8 Gbit/s | failed |
+| TCP, Mac to container | 106.0 Gbit/s | 101.3 Gbit/s | 25.8 Gbit/s | 4.6 Gbit/s | 5.1 Gbit/s | 31.5 Gbit/s |
+| TCP, container to Mac | 99.0 Gbit/s | 56.6 Gbit/s | 15.2 Gbit/s | 3.9 Gbit/s | 1.9 Gbit/s | 92.1 Gbit/s |
+| TCP, published port | 99.6 Gbit/s | 55.8 Gbit/s | 14.8 Gbit/s | 4.0 Gbit/s | 1.8 Gbit/s | 61.0 Gbit/s |
 | UDP | 5.1 Gbit/s | 3.0 Gbit/s | failed | 3.4 Gbit/s | failed | failed |
-| connections a second | 17.9k | 18.6k | 18.0k | 18.0k | 16.6k | 21.6k |
-| HTTP GET on a published port, median | 63 µs | 75 µs | 117 µs | 215 µs | 203 µs | failed |
-| the same, p99 | 123 µs | 113 µs | 165 µs | 261 µs | 290 µs | failed |
-| DNS lookup | 38 µs | 245 µs | 446 µs | 446 µs | 546 µs | 222 µs |
-| a host change seen in a container | 2 ms | 10 ms | 11 ms | 2 ms | 2 ms | 2 ms |
+| connections a second | 17.9k | 18.6k | 18.0k | 18.0k | 16.6k | 14.0k |
+| HTTP GET on a published port, median | 63 µs | 75 µs | 117 µs | 215 µs | 203 µs | 110 µs |
+| the same, p99 | 123 µs | 113 µs | 165 µs | 261 µs | 290 µs | 147 µs |
+| DNS lookup | 38 µs | 245 µs | 446 µs | 446 µs | 546 µs | 234 µs |
+| a host change seen in a container | 2 ms | 10 ms | 11 ms | 2 ms | 2 ms | 997 ms‡ |
 | sha256 of 1 GiB (CPU) | 3.0 s | 5.5 s | 3.1 s | 3.1 s | 3.2 s | 3.1 s |
 | eight sha256 streams at once | 1.4 s | 1.7 s | 1.4 s | 1.4 s | 1.5 s | 1.4 s |
 
@@ -113,6 +113,7 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 - **The 1 GiB write** varied by up to 153% between repetitions on every runtime, the Mac included. Read it as an order of magnitude.
 - **A failure is the runtime's own.** A timed workload that fails is reported as failed.
   - Podman's shared folder: the tree copy took 274 s twice and then passed the case's 300 s cap, and `rm -rf` of it could not be measured.
-  - UDP moved no traffic on Docker Desktop or Podman, and failed on Apple container, whose published-port and HTTP cases also failed through socktainer.
+  - UDP moved no traffic on Docker Desktop, Podman or Apple container.
+- **Apple container's shared-folder and engine rows are a second pass** (04:33–05:00), run once macOS's local-network prompt for it had been answered: in the first, unanswered, its published-port, HTTP and UDP cases failed. ‡ Its host-change reading is about 1 ms or about 1 s by repetition (1002, 1 and 997 ms here; 1002, 2 and 2 in the first pass), so the median flips between passes.
 - **Memory at rest is compared with one idle container running**, the first memory row: lighter holds the least of the seven (687 MiB, Apple container 705, OrbStack 901). † Apple container runs a VM per container and none otherwise, so with nothing running it is its services alone (17 MiB), and a minute after the install the install's VM has exited (28 MiB): those readings are of no VM, not of a smaller one. Its own-disk read cases varied by up to 994% between repetitions.
 - The 2026-09-26 record beside this one was taken on the 0.10.0 candidate before the share and memory-loop work; this one replaces it for 0.10.0.
