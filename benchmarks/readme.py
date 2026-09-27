@@ -1,314 +1,250 @@
-"""Writes the README's benchmark section from the CSVs.
+#!/usr/bin/env python3
+"""Writes the README's benchmark section from a compare.sh record.
 
 The README's tables are derived, never typed: `python3 benchmarks/readme.py
---write` replaces everything between `## Benchmarks` and the next top-level
-heading with what the CSVs support, the same medians `report.py` reports.
-The prose around the tables lives here too, so a number in the README that
-no CSV supports cannot exist — the reason `report.py` was written the same way.
+--write` replaces everything from `## Benchmarks` to the next `## ` heading
+with what the newest record's CSVs support (medians, a case failed if any
+repetition did), so a number in the README that no CSV supports cannot
+exist. The prose around the tables lives here too. Without `--write` it
+prints the section.
+
+    benchmarks/readme.py [--write] [<record dir>]
+
+The record is the newest `benchmarks/results/machines/m5/compare-*` unless
+one is named; its own README carries the method and every caveat.
 """
 
-import pathlib
+import csv
 import re
+import statistics
 import sys
+from pathlib import Path
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import report  # noqa: E402
+HERE = Path(__file__).resolve().parent
+README = HERE.parent / "README.md"
+MACHINE = "m5"
 
-README = report.HERE.parent / "README.md"
+NAMES = {
+    "native": "Mac itself",
+    "lighter": "lighter",
+    "orbstack": "OrbStack",
+    "docker-desktop": "Docker Desktop",
+    "colima": "Colima",
+    "podman": "Podman",
+    "apple-container": "Apple container",
+}
+RUNTIMES = ["lighter", "orbstack", "docker-desktop", "colima", "podman", "apple-container"]
+STAGES = {"": "share", "-guest": "guest", "-media": "media"}
 
-# Which results directory is which machine, and the heading it gets.
-MACHINES = [
-    (report.RESULTS, "MacBook Pro: Apple M5 Pro (18 cores, 48 GB RAM)"),
+
+def secs(ms, places=1):
+    return f"{ms / 1000:.{places}f} s"
+
+
+def millis(ms):
+    return f"{ms:.0f} ms"
+
+
+def mib(v):
+    return f"{v:,.0f} MiB"
+
+
+def micros(v):
+    return f"{v:.0f} µs"
+
+
+def gbit(v):
+    return f"{v / 1000:.1f}"
+
+
+def per_second(v):
+    return f"{v:.0f} ms/s"
+
+
+# (case, label, format, lower is better). The Mac itself is a column of the
+# shared-folder and media tables only: its engine rows do not exist.
+SHARE = [
+    ("npm-install", "npm install", secs, True),
+    ("pnpm-install", "pnpm install", secs, True),
+    ("yarn-install", "yarn install", secs, True),
+    ("ripgrep", "ripgrep over the tree", millis, True),
+    ("find-walk", "find over the tree", millis, True),
+    ("copy-tree", "copy the tree", secs, True),
+    ("rm-rf", "rm -rf the tree", secs, True),
+    ("disk-seq-write", "write 1 GiB, fsynced", millis, True),
 ]
-
-STORAGE = [
-    ("npm-install", "`npm ci`"),
-    ("pnpm-install", "`pnpm install`"),
-    ("yarn-install", "`yarn install`"),
-    ("ripgrep", "`ripgrep` (file read)"),
-    ("find-walk", "`find` (metadata walk)"),
-    ("copy-tree", "`cp -a node_modules`"),
-    ("rm-rf", "`rm -rf node_modules`"),
-    ("watch-latency", "Host file edit -> container"),
+GUEST = [
+    ("npm-install", "npm install", secs, True),
+    ("pnpm-install", "pnpm install", secs, True),
+    ("yarn-install", "yarn install", secs, True),
+    ("ripgrep", "ripgrep over the tree", millis, True),
+    ("find-walk", "find over the tree", millis, True),
+    ("copy-tree", "copy the tree", lambda v: secs(v, 2), True),
+    ("rm-rf", "rm -rf the tree", lambda v: secs(v, 2), True),
+    ("disk-seq-write", "write 1 GiB, fsynced", millis, True),
 ]
-RUNTIMES = [
-    ("lighter", "lighter"),
-    ("orbstack", "OrbStack"),
-    ("colima", "Colima"),
-    ("docker-desktop", "Docker Desktop"),
+ENGINE = [
+    ("container-start", "container start", millis, True),
+    ("boot-first-container", "boot to first container", millis, True),
+    ("memory-idle-1", "memory, one idle container", mib, True),
+    ("memory-peak", "memory, peak during an install", mib, True),
+    ("memory-after-60s", "memory, a minute after it", mib, True),
+    ("power-cpu-ms-per-s", "idle CPU", per_second, True),
+    ("net-tcp-egress", "TCP, Mac to container (Gbit/s)", gbit, False),
+    ("net-tcp-egress-r", "TCP, container to Mac (Gbit/s)", gbit, False),
+    ("net-tcp-port", "TCP, published port (Gbit/s)", gbit, False),
+    ("net-udp", "UDP (Gbit/s)", gbit, False),
+    ("net-http-latency", "HTTP GET on a published port, median", micros, True),
+    ("net-dns", "DNS lookup", micros, True),
+    ("watch-latency", "a host change seen in a container", millis, True),
+    ("cpu-sha256", "sha256 of 1 GiB (CPU)", secs, True),
 ]
-
-def intro():
-    lighter = report.load("lighter", report.RESULTS)
-    orb = report.load("orbstack", report.RESULTS)
-    return f"""All benchmarks are measured against identical pinned workloads on Apple Silicon. Higher percentages of native APFS mean faster; **bold** indicates the best runtime result.
-
-On Apple Silicon, lighter launches containers cold in **{ms(lighter['boot-first-container'])}** (over 2x faster than OrbStack), runs `npm ci` on host shares in **{ms(lighter['npm-install'])}** (faster than native APFS, beating OrbStack's {ms(orb['npm-install'])}), completes directory copies **{orb['copy-tree'] / lighter['copy-tree']:.1f}x faster**, idles at **{lighter['memory-idle']:.0f} MiB RAM**, and returns memory to macOS within seconds of a workload finishing.
-
-<details>
-<summary>Benchmark methodology & test environment</summary>
-
-Measured with the pinned 1,232-package fixture in `benchmarks/` on a MacBook Pro (Apple M5 Pro, 18 cores, 48 GB RAM, macOS 26 Tahoe). Timing rows report medians of three measured repetitions. Native and container runs use identical pinned Node, npm, pnpm, and Yarn versions. All runtimes were configured with 8 vCPUs and 16 GiB RAM allocations where supported. Docker Desktop is measured using Virtualization.framework, VirtioFS, and Rosetta. Raw observations, environment fingerprints, and individual repetition timings are in `benchmarks/results/`; `python3 benchmarks/report.py` prints them.
-</details>"""
-
-
-MEMORY_INTRO = """macOS physical footprint (Activity Monitor "Memory") for runtime processes: idle after cold start, peak during `npm ci`, and 15s / 60s after workload completion. Lower is better. lighter returns memory to the Mac within seconds through free page reporting, proactive cache reclamation, and a cooperative balloon."""
-
-NETWORK_INTRO = """Throughput and latency between container and host measured with `iperf3`, keep-alive HTTP GET latency, connection setup rate, and container DNS resolution time. Bold marks best result."""
-
-POWER_INTRO = """Idle CPU consumption and thread wakeups measured via `powermetrics` over a 60-second quiet window. Lower is better."""
-
-AMD64_INTRO = """Running `linux/amd64` images on Apple Silicon via Apple Rosetta (`--vz-rosetta` for Colima). Lower is better."""
-
-BOOT_INTRO = """Time from cold invocation (`lighter start`, `orb start`, `colima start`, Docker Desktop launch) until Docker engine responds, and until the first container completes. Median of three; lower is better."""
+MEDIA = [
+    ("transcode-h264", "transcode to H.264, 10 s of 1080p30", lambda v: secs(v, 2), True),
+    ("transcode-hevc", "transcode to HEVC, the same", lambda v: secs(v, 2), True),
+    ("cpu-zstd-8", "zstd -9, 256 MiB, 8 threads", lambda v: secs(v, 2), True),
+    ("llm", "LLM on the CPU (Qwen2.5 0.5B, 8 threads)", lambda v: secs(v, 2), True),
+]
+# Cells that read as something other than their number.
+# Apple's container runs a VM per container and none once it exits, so its
+# reading a minute after the install is of no VM at all.
+SPECIAL = {("apple-container", "memory-after-60s"): "–†"}
+# A UDP run that moved nothing failed.
+ZERO_FAILS = {"net-udp"}
+# The media engine: the Mac and lighter encode on it, everyone else in software.
+ENGINE_MARK = {("native", "transcode-h264"), ("native", "transcode-hevc"),
+               ("lighter", "transcode-h264"), ("lighter", "transcode-hevc")}
 
 
-def ms(value):
-    if value is None:
-        return "N/A"
-    if value >= 1000:
-        return f"{value / 1000:.2f} s"
-    return f"{int(value)} ms"
-
-
-def storage_table(results, where):
-    """The own-disk or host-share table: native, then each runtime, each
-    figure with its fraction of native."""
-    suffix = "" if where == "share" else "-guest"
-    native = report.load("native", results)
-    runtimes = [
-        (key, name, report.load(f"{key}{suffix}", results)) for key, name in RUNTIMES
-    ]
-    runtimes = [(key, name, values) for key, name, values in runtimes if values]
-    if not runtimes:
-        return ""
-    head = (
-        "| Workload ("
-        + ("host share" if where == "share" else "own disk")
-        + ") | native APFS"
-    )
-    head += "".join(f" | {name}" for _, name, _ in runtimes) + " |"
-    lines = [head, "|---" * (2 + len(runtimes)) + "|"]
-    for case, label in STORAGE:
-        if where != "share" and case == "watch-latency":
+def load(root):
+    """(target, stage) -> case -> median, or None when a repetition failed."""
+    runs = {}
+    for path in sorted(root.glob(f"{MACHINE}-*.csv")):
+        name = path.stem[len(MACHINE) + 1:]
+        for suffix, stage in sorted(STAGES.items(), key=lambda s: -len(s[0])):
+            if suffix and name.endswith(suffix):
+                target = name[: -len(suffix)]
+                break
+        else:
+            target, stage = name, "share"
+        if target not in NAMES:
             continue
-        values = [v.get(case) for _, _, v in runtimes]
-        if all(v is None for v in values) and native.get(case) is None:
+        rows = list(csv.DictReader(path.open()))
+        if not rows or "case" not in rows[0]:
             continue
-        present = [v for v in values if v is not None]
-        best = min(present) if present else None
-        cells = [label, ms(native.get(case))]
-        for value in values:
-            if value is None:
-                cells.append("N/A")
+        cases = {}
+        for row in rows:
+            cases.setdefault(row["case"], []).append(row["ms"])
+        runs[(target, stage)] = {
+            case: None if any(not re.fullmatch(r"[0-9.]+", v) for v in values)
+            else statistics.median(float(v) for v in values)
+            for case, values in cases.items()
+        }
+    return runs
+
+
+def table(runs, stage, rows, columns):
+    out = ["| | " + " | ".join(NAMES[c] for c in columns) + " |", "|---|" + "---|" * len(columns)]
+    for case, label, fmt, lower in rows:
+        values = {}
+        for c in columns:
+            v = runs.get((c, stage), {}).get(case)
+            if v is not None and case in ZERO_FAILS and v == 0:
+                v = None
+            values[c] = v
+        ranked = [values[c] for c in RUNTIMES if c in columns and values[c] is not None and (c, case) not in SPECIAL]
+        best = (min if lower else max)(ranked) if ranked else None
+        cells = []
+        for c in columns:
+            if (c, case) in SPECIAL:
+                cells.append(SPECIAL[(c, case)])
                 continue
-            cell = ms(value)
-            if value == best and len(present) > 1:
-                cell = f"**{cell}**"
-            if native.get(case) and case not in report.UNRATIOED:
-                cell += f" ({native[case] / value * 100:.0f}%)"
-            cells.append(cell)
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
-def memory_table(results):
-    runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [
-        (name, v) for name, v in runtimes if any(c in v for c, _ in report.MEMORY_CASES)
-    ]
-    if not runtimes:
-        return ""
-    lines = [
-        "| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |",
-        "|---" * (1 + len(runtimes)) + "|",
-    ]
-    for case, label in report.MEMORY_CASES:
-        values = [v.get(case) for _, v in runtimes]
-        present = [v for v in values if v is not None]
-        if not present:
-            continue
-        best = min(present)
-        cells = [label[0].upper() + label[1:]]
-        for value in values:
-            cell = "N/A" if value is None else f"{int(value)} MiB"
-            if value == best and len(present) > 1:
-                cell = f"**{cell}**"
-            cells.append(cell)
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
-def network_table(results):
-    native = report.load("native", results)
-    runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [
-        (name, v)
-        for name, v in runtimes
-        if any(c in v for c, _, _, _, _ in report.NETWORK_CASES)
-    ]
-    if not runtimes:
-        return ""
-    lines = [
-        "| Case | unit | native" + "".join(f" | {name}" for name, _ in runtimes) + " |",
-        "|---" * (3 + len(runtimes)) + "|",
-    ]
-    for case, label, unit, direction, divisor in report.NETWORK_CASES:
-        values = [v.get(case) for _, v in runtimes]
-        present = [v for v in values if v is not None]
-        if not present:
-            continue
-        best = max(present) if direction == "higher" else min(present)
-        cells = [label, unit, report.network_cell(native.get(case), divisor)]
-        for value in values:
-            cell = report.network_cell(value, divisor)
-            if value == best and len(present) > 1:
-                cell = f"**{cell}**"
-            cells.append(cell)
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
-def power_table(results):
-    runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [
-        (name, v)
-        for name, v in runtimes
-        if any(c in v for c, _, _ in report.POWER_CASES)
-    ]
-    if not runtimes:
-        return ""
-    lines = [
-        "| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |",
-        "|---" * (1 + len(runtimes)) + "|",
-    ]
-    for case, label, scale in report.POWER_CASES[:2]:
-        values = [v.get(case) for _, v in runtimes]
-        present = [v for v in values if v is not None]
-        if not present:
-            continue
-        best = min(present)
-        cells = [label[0].upper() + label[1:]]
-        for value in values:
-            cell = "N/A" if value is None else f"{value / scale:.0f}"
-            if value == best and len(present) > 1:
-                cell = f"**{cell}**"
-            cells.append(cell)
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
-def boot_table(results):
-    runtimes = [(name, report.load(key, results)) for key, name in RUNTIMES]
-    runtimes = [
-        (name, v) for name, v in runtimes if any(c in v for c, _ in report.BOOT_CASES)
-    ]
-    if not runtimes:
-        return ""
-    lines = [
-        "| Reading" + "".join(f" | {name}" for name, _ in runtimes) + " |",
-        "|---" * (1 + len(runtimes)) + "|",
-    ]
-    for case, label in report.BOOT_CASES:
-        values = [v.get(case) for _, v in runtimes]
-        present = [v for v in values if v is not None]
-        if not present:
-            continue
-        best = min(present)
-        cells = [label[0].upper() + label[1:]]
-        for value in values:
-            cell = ms(value)
-            if value == best and len(present) > 1:
-                cell = f"**{cell}**"
-            cells.append(cell)
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
-def amd64_table(results):
-    # The arm64 reference is lighter's own figure for the same workload: the
-    # own-disk record where the case is an install, the host-timed one where
-    # it is a container start (the own-disk stage does not run that case).
-    scale = report.load("lighter", results) | report.load("lighter-guest", results)
-    runtimes = [
-        (name, report.load(f"{key}-amd64", results))
-        for key, name in RUNTIMES
-        if key != "native"
-    ]
-    runtimes = [
-        (name, v) for name, v in runtimes if any(c in v for c, _ in report.AMD64_CASES)
-    ]
-    if not runtimes:
-        return ""
-    lines = [
-        "| Workload (x86-64 image, own disk) | lighter, arm64"
-        + "".join(f" | {name}" for name, _ in runtimes)
-        + " |",
-        "|---" * (2 + len(runtimes)) + "|",
-    ]
-    for case, label in report.AMD64_CASES:
-        values = [v.get(case) for _, v in runtimes]
-        present = [v for v in values if v is not None]
-        if not present:
-            continue
-        best = min(present)
-        reference = scale.get(case)
-        cells = [label, "N/A" if reference is None else ms(reference)]
-        for value in values:
-            cell = "N/A" if value is None else ms(value)
-            if value == best and len(present) > 1:
-                cell = f"**{cell}**"
-            cells.append(cell)
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
-def section():
-    out = ["## Benchmarks", "", intro(), ""]
-    for results, heading in MACHINES:
-        if not results.exists() or not any(results.glob("*.csv")):
-            continue
-        out += [f"### {heading}", ""]
-        guest = storage_table(results, "guest")
-        if guest:
-            out += [guest, ""]
-        share = storage_table(results, "share")
-        if share:
-            out += [share, ""]
-        memory = memory_table(results)
-        if memory:
-            out += ["#### Memory footprint", "", MEMORY_INTRO, "", memory, ""]
-        network = network_table(results)
-        if network:
-            out += ["#### The network", "", NETWORK_INTRO, "", network, ""]
-        power = power_table(results)
-        if power:
-            out += ["#### Idle power", "", POWER_INTRO, "", power, ""]
-        boot = boot_table(results)
-        if boot:
-            out += ["#### Starting up", "", BOOT_INTRO, "", boot, ""]
-        amd64 = amd64_table(results)
-        if amd64:
-            out += ["#### x86-64 images", "", AMD64_INTRO, "", amd64, ""]
-    out += [
-        "The selected CSVs, their `.tree` environment descriptions and the selection manifests are in `benchmarks/results/`; `python3 benchmarks/report.py` prints every repetition. Each release's record is a row in [the worklog](docs/worklog.md).",
-        "",
-        "---",
-    ]
+            v = values[c]
+            if v is None:
+                cells.append("failed")
+                continue
+            text = fmt(v) + ("ᵐ" if (c, case) in ENGINE_MARK else "")
+            cells.append(f"**{text}**" if c != "native" and v == best else text)
+        out.append(f"| {label} | " + " | ".join(cells) + " |")
     return "\n".join(out)
 
 
+def gpu(root):
+    rows = {}
+    path = root / f"{MACHINE}-llm-gpu.csv"
+    for line in path.read_text().splitlines() if path.exists() else []:
+        parts = line.split(",")
+        if len(parts) == 4 and parts[0] != "target":
+            rows[(parts[0], parts[1], parts[2])] = float(parts[3])
+    out = ["| | prompt | generation |", "|---|---|---|"]
+    for target, backend, label in [
+        ("native", "metal", "Mac itself, Metal"),
+        ("lighter", "metal", "**lighter, Metal**"),
+        ("lighter", "vulkan", "lighter, Vulkan"),
+        ("podman", "vulkan", "Podman, Vulkan"),
+    ]:
+        pp, tg = rows.get((target, backend, "pp512")), rows.get((target, backend, "tg128"))
+        if pp is None or tg is None:
+            continue
+        cells = [f"{pp:,.0f}", f"{tg:,.0f}"]
+        if target == "lighter" and backend == "metal":
+            cells = [f"**{c}**" for c in cells]
+        out.append(f"| {label} | " + " | ".join(cells) + " |")
+    return "\n".join(out)
+
+
+def section(root):
+    runs = load(root)
+    rel = root.relative_to(HERE.parent)
+    everyone = ["native"] + RUNTIMES
+    return f"""## Benchmarks
+
+Seven ways to run a container on a MacBook Pro (M5 Pro, 18 cores, 48 GB, macOS 26), every runtime at 8 vCPUs and 16 GiB, medians of three, recorded with `benchmarks/compare.sh` on lighter 0.10.0. The method, the raw results and every caveat are in [the record]({rel}/README.md).
+
+**On a folder shared from the Mac**
+
+{table(runs, "share", SHARE, everyone)}
+
+**On the runtime's own disk**
+
+{table(runs, "guest", GUEST, RUNTIMES)}
+
+**Engine**
+
+{table(runs, "share", ENGINE, RUNTIMES)}
+
+† Apple container runs a VM per container, and none once it exits.
+
+lighter keeps a container's file cache for 30 s after it stops, so the next command reads what the last one wrote from memory; that is its higher peak, and it has given the memory back a minute later.
+
+**Media and an LLM**
+
+{table(runs, "media", MEDIA, everyone)}
+
+ᵐ on the Mac's media engine, with output identical to the Mac's own; every other runtime encodes in software.
+
+**An LLM on the GPU** (llama.cpp, Qwen2.5 0.5B Q4_K_M, tokens a second)
+
+{gpu(root)}
+
+OrbStack, Docker Desktop, Colima and Apple container give a container no GPU.
+
+---
+
+"""
+
+
 def main():
-    text = section()
-    if "--write" in sys.argv:
-        readme = README.read_text()
-        pattern = re.compile(r"## Benchmarks\n.*?(?=\n## )", re.S)
-        if not pattern.search(readme):
-            sys.exit("README.md has no `## Benchmarks` section to replace")
-        README.write_text(pattern.sub(lambda _: text.rstrip("\n") + "\n", readme, count=1))
-        print(f"wrote {README}")
-    else:
-        print(text)
+    args = [a for a in sys.argv[1:] if a != "--write"]
+    root = Path(args[0]).resolve() if args else sorted((HERE / "results" / "machines" / MACHINE).glob("compare-*"))[-1]
+    text = section(root)
+    if "--write" not in sys.argv:
+        print(text, end="")
+        return
+    readme = README.read_text()
+    start = readme.index("## Benchmarks\n")
+    end = readme.index("\n## ", start + 1) + 1
+    README.write_text(readme[:start] + text + readme[end:])
 
 
 if __name__ == "__main__":

@@ -19,11 +19,11 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 |---|---|---|---|---|---|---|---|
 | npm install | 6.5 s | 6.5 s | 8.8 s | 17.6 s | 17.1 s | 87.8 s | 19.3 s |
 | pnpm install | 4.5 s | 4.1 s | 5.2 s | 27.6 s | 24.7 s | 46.6 s | 28.2 s |
-| yarn install | 5.3 s | 5.3 s | 7.8 s | 24.8 s | 21.2 s | 73.6 s | 24.2 s |
+| yarn install | 5.3 s | 5.3 s | 7.8 s | 24.8 s | 21.2 s | 73.6 s | 24.1 s |
 | ripgrep over the tree | 949 ms | 81 ms | 1023 ms | 3843 ms | 2839 ms | 27376 ms | 3700 ms |
 | find over the tree | 330 ms | 85 ms | 453 ms | 1506 ms | 1378 ms | 38322 ms | 1277 ms |
 | copy the tree | 13.7 s | 3.3 s | 9.3 s | 27.8 s | 39.5 s | failed | 37.4 s |
-| rm -rf the tree | 3.8 s | 2.7 s | 3.2 s | 8.5 s | 8.0 s | failed | 7.6 s |
+| rm -rf the tree | 3.8 s | 2.7 s | 3.2 s | 8.4 s | 8.0 s | failed | 7.6 s |
 | write 1 GiB, fsynced | 139 ms | 268 ms | 261 ms | 704 ms | 791 ms | 482 ms | 851 ms |
 
 **On the runtime's own disk**
@@ -69,9 +69,9 @@ An M5 Pro MacBook Pro (18 cores, 48 GB) on macOS 26.6.2, recorded overnight on 2
 |---|---|---|---|---|---|---|---|
 | zstd -9, 256 MiB, 1 thread | 3.30 s | 3.58 s | 3.53 s | 3.51 s | 3.58 s | 3.68 s | 3.49 s |
 | zstd -9, 256 MiB, 8 threads | 0.50 s | 0.56 s | 0.59 s | 0.55 s | 0.60 s | 0.62 s | 0.56 s |
-| transcode to H.264 at 8 Mbit/s, 10 s of 1080p30 | **1.37 s**ᵐ | **1.24 s**ᵐ | 4.32 s | 4.05 s | 3.99 s | 4.19 s | 3.92 s |
+| transcode to H.264 at 8 Mbit/s, 10 s of 1080p30 | **1.36 s**ᵐ | **1.24 s**ᵐ | 4.32 s | 4.05 s | 3.99 s | 4.19 s | 3.92 s |
 | transcode to HEVC at 8 Mbit/s, the same | **1.42 s**ᵐ | **1.30 s**ᵐ | 5.19 s | 4.96 s | 4.75 s | 4.94 s | 4.50 s |
-| LLM on the CPU: Qwen2.5 0.5B Q4_K_M, 512 in / 128 out, 8 threads | 2.01 s | 2.49 s | 2.58 s | 2.70 s | 2.67 s | 3.24 s | 2.61 s |
+| LLM on the CPU: Qwen2.5 0.5B Q4_K_M, 512 in / 128 out, 8 threads | 2.01 s | 2.49 s | 2.58 s | 2.70 s | 2.67 s | 3.23 s | 2.61 s |
 
 ᵐ on the media engine. Every other runtime has none, and encodes in software (x264 preset medium, x265 preset fast, 8 threads).
 
