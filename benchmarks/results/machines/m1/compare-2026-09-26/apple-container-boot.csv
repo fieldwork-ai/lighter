@@ -1,0 +1,9 @@
+case,rep,ms
+boot-docker,1,304
+boot-first-container,1,1695
+boot-docker,2,308
+boot-first-container,2,1748
+boot-docker,3,307
+boot-first-container,3,1760
+memory-idle,1,17
+memory-idle-1,1,465

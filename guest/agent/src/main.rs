@@ -18,6 +18,7 @@ mod idle;
 mod inbound;
 mod memory_policy;
 mod sockmap;
+mod throttle;
 mod udp;
 mod udp_inbound;
 mod vsock;
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use memory_policy::{IdleTrim, TICKS_PER_SEC};
+use memory_policy::{IdleTrim, TICKS_PER_SEC, TRIM_AFTER};
 use vsock::VsockListener;
 
 fn main() -> std::process::ExitCode {
@@ -224,7 +225,15 @@ fn main() -> std::process::ExitCode {
 /// trimming waits for an empty container hierarchy: a quiet process can still
 /// need its executable and mapped files, including pages charged to the engine.
 fn bound_container_cache() {
-    let Some(total) = mem_total() else { return };
+    let Some(mut total) = mem_total() else { return };
+    // With a virtio-mem range the guest's size is the host's to set, from
+    // the lines this loop sends: `MemTotal` is read again each tick because
+    // it moves.
+    // A device bound to the driver, not the driver: every kernel has the
+    // driver, and a fixed machine taken for a range offered its spare to the
+    // balloon below eight gigabytes and throttled its containers (m6, the
+    // M1, 2026-09-25).
+    let dynamic = virtio_mem_bound();
     let containers = "/sys/fs/cgroup/docker";
     // A bound on the containers' cache while they work, on guests with the
     // RAM for it: a quarter of RAM from eight gigabytes up, none below, and
@@ -299,10 +308,7 @@ fn bound_container_cache() {
     let mut idle_trim = IdleTrim::default();
     // The hourly pass over idle page cache (`idle.rs`); `lighter.idle_age=<s>`
     // shortens the hour for the gate, 0 leaves it off.
-    let mut idle = idle::Idle::start(
-        cmdline_value("lighter.idle_age").unwrap_or(idle::IDLE_HORIZON_SECS),
-        TICKS_PER_SEC,
-    );
+    let idle = idle::Idle::start(cmdline_value("lighter.idle_age").unwrap_or(idle::IDLE_HORIZON_SECS));
     // The loop that keeps the containers' cache near their working set
     // while they run (`warm.rs`): the one policy here that does not wait
     // for them to stop. The floors are the trims' resting levels, so what
@@ -317,14 +323,23 @@ fn bound_container_cache() {
             compact_once,
         );
     }
+    // With a range, the containers' throttle and the stall that answers it
+    // (`throttle.rs`); not beside the opt-in cache bound, which owns the
+    // same file.
+    let wake = std::sync::Arc::new(throttle::Wake::default());
+    let mut edge = (dynamic && bound == 0).then(|| {
+        throttle::Stall::watch(wake.clone());
+        throttle::Throttle::new(containers)
+    });
+    let mut at_edge = false;
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 32]> = None;
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
     // Whether a trim has left reporting hurried, so the restore below is a
-    // latch and not a mark: once the counter steps by four it can pass 25 s
-    // without landing on it, and did — a guest that had trimmed sat idle
+    // latch and not a mark: once the counter steps by four it can pass its
+    // mark without landing on it, and did — a guest that had trimmed sat idle
     // with reporting at 100 ms and compaction at full strength until its
     // next container.
     let mut hurried = always_fast;
@@ -342,13 +357,13 @@ fn bound_container_cache() {
         // wakeup for a vCPU and, above eight gigabytes, a message to the
         // host: four a second of each on a machine doing nothing. The
         // counters step by four so the marks they are compared against
-        // (the trims, the reporting rate at 25 s) fall where they did.
+        // (the trims, the reporting rate after them) fall where they did.
         let step = if idle_for >= 10 * TICKS_PER_SEC && quiet_for >= 10 * TICKS_PER_SEC { 4 } else { 1 };
-        std::thread::sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
+        wake.sleep(std::time::Duration::from_millis(step as u64 * 1000 / TICKS_PER_SEC as u64));
         // Under a megabyte is DAMON's own sampling: the ten pages a minute
         // it marks old for the region estimate this does not use, evicted
         // when the pass finds them. Not an eviction, and not an offer.
-        if let Some(evicted) = idle.tick(step)
+        if let Some(evicted) = idle.take()
             && evicted >= 1 << 20
         {
             // What the pass freed is in pieces the size of the files that
@@ -366,6 +381,12 @@ fn bound_container_cache() {
                 evicted >> 20,
                 idle::horizon_text(idle.horizon_secs())
             );
+        }
+        if dynamic {
+            total = mem_total().unwrap_or(total);
+        }
+        if let Some(edge) = edge.as_mut() {
+            at_edge = edge.tick(total, mem_available().unwrap_or(0));
         }
         if !bounded && std::path::Path::new(containers).exists() {
             bounded = std::fs::write(format!("{containers}/memory.high"), bound.to_string()).is_ok();
@@ -389,7 +410,7 @@ fn bound_container_cache() {
         // hurried throughout, to measure what the churn of an install
         // costs against the footprint it holds while waiting to re-report.
         if hurried && !always_fast
-            && (populated || idle_for == 0 || idle_trim.elapsed_ticks() >= 25 * TICKS_PER_SEC)
+            && (populated || idle_for == 0 || idle_trim.elapsed_ticks() >= TRIM_AFTER[1] + 17 * TICKS_PER_SEC)
         {
             set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
             hurried = false;
@@ -474,27 +495,35 @@ fn bound_container_cache() {
                 &mut memory_stream,
                 &mut last_offer,
                 total,
-                // Offers of spare memory to the balloon from eight
-                // gigabytes up, where it beat reporting alone; the line
-                // itself goes at any size.
-                total >= balloon_min,
+                // Offers of spare memory: always with a range to shrink
+                // (the idle guest's first way of giving memory back), and
+                // to the balloon alone from eight gigabytes up, where it
+                // beat reporting alone. Without this the m6 guest, 7930 MiB
+                // of 8192 configured, never offered and its range never
+                // left (2026-09-21).
+                dynamic || total >= balloon_min,
                 active,
                 // Quiet, or nothing running and the containers eight seconds
                 // idle: the quiet rule protects running work from a seesaw,
-                // and with no container there is none to protect; eight is
-                // the second trim's moment, when the cache is already gone.
+                // and with no container there is none to protect. Eight was
+                // the second trim's moment; the trims now wait half a minute
+                // (TRIM_AFTER) and this does not follow them: it offers only
+                // what is already free, so it need not wait for the cache.
                 quiet_for >= 3 * TICKS_PER_SEC
                     || (!populated && idle_trim.elapsed_ticks() >= 8 * TICKS_PER_SEC),
                 !populated,
                 // Busy: the guest's CPU was not quiet this tick. A need
                 // is work that is short, not a guest that is merely low.
                 quiet_for == 0,
+                // The containers met the throttle's edge: a need whatever
+                // the CPU says, since what is throttled sleeps.
+                at_edge,
             );
         }
         // Image extraction charges shared file pages to the engine. A running
         // container can map those pages without owning their charge, so neither
         // cgroup's cache is disposable merely because container CPU is quiet.
-        // Trim only after three and eight seconds with no populated descendants.
+        // Trim only after half a minute with no populated descendants (TRIM_AFTER).
         if !trims || !trim_due {
             continue;
         }
@@ -580,6 +609,7 @@ fn offer_memory(
     quiet: bool,
     nothing_runs: bool,
     busy: bool,
+    stalled: bool,
 ) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -632,7 +662,7 @@ fn offer_memory(
     // With a range to grow into, work that has less than a quarter of the
     // guest available asks for more before it is short — available, not
     // free, because the cache it could reclaim is its own working set and
-    // reclaiming it is the cost this avoids. The host doubles the guest.
+    // reclaiming it is the cost this avoids. The host grows the guest.
     // And by the harm itself: pressure stall information says how much of
     // the last ten seconds every task spent waiting on memory. A tenth of
     // it is a guest that is short whatever its free counts say (the M5's
@@ -641,7 +671,7 @@ fn offer_memory(
     // one task's reclaim, which is the host's own reclaim request and the
     // compaction after it, and a need on it handed the balloon back the
     // moment the host had asked for it (m6b, the M1, 2026-09-21).
-    let need = busy && (avail < (total >> 20) / 8 || psi_full >= 1000);
+    let need = stalled || (busy && (avail < (total >> 20) / 8 || psi_full >= 1000));
     let spare = if offers && !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {
@@ -702,6 +732,27 @@ fn psi_avg10(text: &str, line: &str) -> u32 {
             Some(whole.parse::<u32>().ok()? * 100 + frac[..2].parse::<u32>().ok()?)
         })
         .unwrap_or(0)
+}
+
+/// Whether a virtio-mem device is bound: its driver's directory holds a link
+/// per device (`virtio3`), beside `bind`, `unbind` and `module`.
+fn virtio_mem_bound() -> bool {
+    std::fs::read_dir("/sys/bus/virtio/drivers/virtio_mem").is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("virtio"))
+    })
+}
+
+/// `MemAvailable`, in bytes.
+fn mem_available() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("MemAvailable:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
 }
 
 /// `MemTotal`, in bytes.

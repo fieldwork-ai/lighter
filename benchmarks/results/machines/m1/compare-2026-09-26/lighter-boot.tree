@@ -1,0 +1,23 @@
+commit=dee6d28a-dirty
+date=2026-09-27T01:29Z
+host=homeserver
+host.node=v26.8.1
+host.npm=11.19.0
+host.pnpm=10.28.0
+host.yarn=1.22.22
+extra_warm_cases=
+image_id=sha256:d0f228e8a2f8013303db97925f80e8c2c288d2d1f586975c9872cda50a9d452b
+guest.cpus=8 guest.memory_mib=3975
+image.zstd=*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***
+image.llama=version: 0.5.0-dev (build 1, commit 4b1a27f)
+image.ffmpeg=ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers
+runtime_source=73da44c
+cpus=8 memory_mib=4096 disk_gib=64
+lighter-bench=808547d6e0801f8cbf8508fb72b5f484
+lighter-bench.sha256=e67c4f3e5e0a251b534de0d14b8aff43544e4a066632eff664b0d8aca0fd9349
+Image=9396cca3ce958515eb1836abaa1b7505
+Image.sha256=e61bbf3171b7e1cd24edb8b5cfa7defb971015c8844d33dddb2ba3297a478635
+rootfs.ext4=c329091068ced0e20237c8daa849c00d
+rootfs.ext4.sha256=703a4acb603bd0ec931a36be713fd9ac1c5cc335301e8920c6f4eb416e684df7
+lighter-agent=f366875d675f39010422dfed082ed728
+lighter-agent.sha256=f23b1caf7941e50cb96776239ac9fdd216c19d13d1d86ebb9a8947d1dfeba011

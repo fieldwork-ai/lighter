@@ -31,12 +31,12 @@ cd "$ROOT"
 TARGET=""
 LABEL=""
 REPS=3
-CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf cpu-sha256 container-start watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot"
+CASES="npm-install pnpm-install yarn-install ripgrep find-walk copy-tree rm-rf cpu-sha256 cpu-multi disk-seq-write container-start watch-latency memory net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns power-idle boot"
 # Cases that read a package tree rather than making one. They run after the
 # installs, on a tree materialized once by npm — which installer produced it
 # changes what they see, and pnpm in particular builds a farm of symlinks.
 TREE_CASES=" ripgrep find-walk copy-tree rm-rf "
-IMAGE="lighter-bench:1"
+IMAGE="lighter-bench:2"
 # What the guest is given. Defaults suit the machine this was written on;
 # `BENCH_MEMORY_MIB` and `BENCH_CPUS` are how it runs somewhere smaller.
 #
@@ -91,7 +91,7 @@ while [ $# -gt 0 ]; do
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
-[ -n "$TARGET" ] || { echo "--target is required (native|lighter|colima|orbstack|docker-desktop)" >&2; exit 2; }
+[ -n "$TARGET" ] || { echo "--target is required (native|lighter|colima|orbstack|docker-desktop|podman|apple-container)" >&2; exit 2; }
 # A focused repeat can retain the full suite's cache preparation without
 # measuring unrelated package managers again. Selected cases always warm.
 for warm in ${BENCH_EXTRA_WARM_CASES:-}; do
@@ -104,11 +104,21 @@ if [ -n "${BENCH_TOOLS_PATH:-}" ]; then
 	export PATH="$BENCH_TOOLS_PATH:$PATH"
 fi
 if [ "${BENCH_REQUIRE_PINNED_TOOLS:-0}" = 1 ]; then
-	python3 - "$ROOT/benchmarks/toolchain.json" <<'PYTOOLS'
-import json, pathlib, subprocess, sys
+	python3 - "$ROOT/benchmarks/toolchain.json" "$ROOT/benchmarks/Dockerfile" <<'PYTOOLS'
+import json, pathlib, re, subprocess, sys
 expected = json.loads(pathlib.Path(sys.argv[1]).read_text())
-for tool in ['node', 'npm', 'pnpm', 'yarn']:
-    actual = subprocess.check_output([tool, '--version'], text=True).strip()
+# The image's llama.cpp release; a release's build number is its tag's.
+expected['llama-bench'] = re.search(r'--branch b(\d+) ', pathlib.Path(sys.argv[2]).read_text()).group(1)
+def version(tool):
+    out = subprocess.run([tool, '--version'], capture_output=True, text=True)
+    text = out.stdout + out.stderr
+    if tool == 'llama-bench':
+        return (re.search(r'build (\d+)', text) or [None, None])[1]
+    if tool == 'zstd':
+        return (re.search(r' v([0-9.]+),', text) or [None, None])[1]
+    return text.strip()
+for tool in ['node', 'npm', 'pnpm', 'yarn', 'llama-bench', 'zstd']:
+    actual = version(tool)
     if actual != expected[tool]:
         raise SystemExit(f'{tool}: expected {expected[tool]}, got {actual}; run scripts/records/prepare-benchmark-tools.sh')
 PYTOOLS
@@ -150,6 +160,7 @@ fi
 VMM_PID=""
 HELPER_PID=""
 ROOTFS=""
+ROOTFS_DIR=""
 RUN_DIR=""
 CASE_OUT=""
 FAILED=0
@@ -186,7 +197,7 @@ cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	[ "$KEEP" -eq 1 ] || rm -rf "$WORK"
 	[ -z "$RUN_DIR" ] || rm -rf "$RUN_DIR"
-	[ -z "$ROOTFS" ] || rm -f "$ROOTFS"
+	[ -z "$ROOTFS_DIR" ] || rm -rf "$ROOTFS_DIR"
 	[ -z "$CASE_OUT" ] || rm -f "$CASE_OUT"
 }
 trap cleanup EXIT
@@ -223,6 +234,13 @@ check_exclusive() {
 	if [ "$TARGET" != orbstack ] \
 		&& { pgrep -x "OrbStack Helper" >/dev/null 2>&1 || pgrep -x "xbin" >/dev/null 2>&1; }; then
 		noisy+=("OrbStack")
+	fi
+	if [ "$TARGET" != podman ] && pgrep -f "/opt/podman/bin/(krunkit|vfkit)" >/dev/null 2>&1; then
+		noisy+=("a Podman machine (podman machine stop)")
+	fi
+	# Apple's services idle once installed; a container is a VM of its own.
+	if [ "$TARGET" != apple-container ] && pgrep -f "container-runtime-linux" >/dev/null 2>&1; then
+		noisy+=("an Apple container (container stop)")
 	fi
 	# Ours too. The `lighter` target starts a machine of its own, and a second
 	# one already running competes with it for exactly the resources being
@@ -285,6 +303,16 @@ prepare_work() {
 	cp "$WORK"/fixture/* "$WORK/npm/"
 	cp benchmarks/cases/*.sh benchmarks/cases/*.js "$WORK/cases/"
 	chmod +x "$WORK/cases"/*.sh
+	# The llm case's model, from outside the repository (491 MB), cloned so
+	# every target's work directory costs nothing more on the Mac's disk.
+	if [ -n "${LIGHTER_BENCH_MODEL_DIR:-}" ]; then
+		mkdir -p "$WORK/models" "$WORK/media"
+		cp -c "$LIGHTER_BENCH_MODEL_DIR"/*.gguf "$WORK/models/" 2>/dev/null \
+			|| cp "$LIGHTER_BENCH_MODEL_DIR"/*.gguf "$WORK/models/"
+		# And the transcode cases' clip.
+		cp -c "$LIGHTER_BENCH_MODEL_DIR"/*.mp4 "$WORK/media/" 2>/dev/null \
+			|| cp "$LIGHTER_BENCH_MODEL_DIR"/*.mp4 "$WORK/media/"
+	fi
 
 	printf '' > "$WORK/request"
 	printf '' > "$WORK/reply"
@@ -329,7 +357,14 @@ seed_guest_volume() {
 	"${dk[@]}" volume create "$volume" >/dev/null
 	local id
 	id="$("${dk[@]}" create -v "$volume:/work" "$IMAGE" true)"
-	"${dk[@]}" cp "$WORK/." "$id:/work"
+	if ! "${dk[@]}" cp "$WORK/." "$id:/work" 2>/dev/null; then
+		# Apple's container (through socktainer) has no root filesystem for a
+		# container that has not started, so `docker cp` into one fails; a
+		# running container copies the same tree in from the share instead.
+		# Setup, untimed, so the path does not enter any number.
+		"${dk[@]}" run --rm ${RUN_LIMITS[@]+"${RUN_LIMITS[@]}"} -v "$volume:/work" -v "$SHARE_MOUNT":/src:ro "$IMAGE" \
+			sh -c 'cp -a /src/. /work/'
+	fi
 	"${dk[@]}" rm "$id" >/dev/null
 }
 
@@ -349,12 +384,14 @@ runner_args() {
 }
 
 # Waits, up to five minutes, for three samples five seconds apart in which
-# fseventsd, mds, mds_stores and the mdworkers together use under 3% of a
-# core; says how long it took.
+# fseventsd, mds, mds_stores and the mdworkers, Photos' library and analysis
+# daemons, and an animated Aerial wallpaper (which decodes video on the media
+# engine, behind a locked screen too) together use under 3% of a core; says
+# how long it took.
 settle_host() {
 	local i quiet=0 load
 	for i in $(seq 1 60); do
-		load="$(ps -Ao pcpu,comm | awk '/fseventsd|mds_stores|mds$|mdworker/ {s+=$1} END {printf "%d", s+0}')"
+		load="$(ps -Ao pcpu,comm | awk '/fseventsd|mds_stores|mds$|mdworker|photolibraryd|photoanalysisd|mediaanalysisd|WallpaperAerials/ {s+=$1} END {printf "%d", s+0}')"
 		if [ "$load" -lt 3 ]; then quiet=$((quiet+1)); else quiet=0; fi
 		if [ "$quiet" -ge 3 ]; then
 			# Only worth a line when it took a wait; the return is explicit
@@ -385,6 +422,8 @@ docker_context() {
 	colima)         echo "colima" ;;
 	orbstack)       echo "orbstack" ;;
 	docker-desktop) echo "desktop-linux" ;;
+	podman)         echo "${BENCH_PODMAN_CONTEXT:-podman-bench}" ;;
+	apple-container) echo "socktainer" ;;
 	*)              echo "" ;;
 	esac
 }
@@ -402,17 +441,60 @@ PYIMAGE
 		local expected actual
 		expected="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]]["image_id"])' "$LIGHTER_BENCH_IMAGE_DIR/manifest.json" "$ARCH")"
 		actual="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{.Id}}' "$IMAGE")"
-		[ "$actual" = "$expected" ] || { echo 'benchmark image identity mismatch' >&2; exit 1; }
+		# An engine on the containerd image store (OrbStack's) names the same
+		# image by another digest; its layers are what identify it there.
+		if [ "$actual" != "$expected" ]; then
+			local want got
+			want="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]].get("layers_sha256",""))' "$LIGHTER_BENCH_IMAGE_DIR/manifest.json" "$ARCH")"
+			got="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{json .RootFS.Layers}}' "$IMAGE" | shasum -a 256 | cut -d' ' -f1)"
+			[ -n "$want" ] && [ "$got" = "$want" ] || { echo 'benchmark image identity mismatch' >&2; exit 1; }
+		fi
 	else
 		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} build -q ${PLATFORM[@]+"${PLATFORM[@]}"} -t "$IMAGE" benchmarks >/dev/null
 	fi
 }
 
+# Podman and Apple's container have no Docker context of their own: one is
+# made here for each, on Podman's API socket and on socktainer's, the bridge
+# that gives Apple's runtime a Docker API. Podman's machine is `BENCH_PODMAN_
+# MACHINE` (default `bench`), made once with `podman machine init --cpus
+# --memory` at the suite's settings.
+PODMAN="${BENCH_PODMAN:-/opt/podman/bin/podman}"
+ensure_target_context() {
+	local host=""
+	case "$TARGET" in
+	podman) host="unix://$("$PODMAN" machine inspect "${BENCH_PODMAN_MACHINE:-bench}" --format '{{.ConnectionInfo.PodmanSocket.Path}}')" ;;
+	apple-container) host="unix://$HOME/.socktainer/container.sock" ;;
+	*) return 0 ;;
+	esac
+	local ctx; ctx="$(docker_context)"
+	docker context inspect "$ctx" >/dev/null 2>&1 \
+		&& docker context update "$ctx" --docker "host=$host" >/dev/null \
+		|| docker context create "$ctx" --docker "host=$host" >/dev/null
+}
+
+RUN_LIMITS=()
+
 setup_container() {
+	ensure_target_context
+	# Apple's container is a VM per container, sized by the run (4 CPUs and
+	# 1 GB unless told), so every run is given the other targets' machine.
+	[ "$TARGET" != apple-container ] || RUN_LIMITS=(--cpus "${BENCH_CPUS:-8}" --memory "$(bench_memory_mib)m")
 	local ctx; ctx="$(docker_context)"
 	SHARE_MOUNT="$WORK"
 	DOCKER_ARGS=()
 	[ -n "$ctx" ] && DOCKER_ARGS=(--context "$ctx")
+	# A container already running on the engine being measured is load inside
+	# the guest, which no check on the Mac sees: a test stack left running once
+	# read as a 19% gap in llama.cpp, its threads preempted six times as often.
+	local others
+	others="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} ps -q 2>/dev/null | wc -l | tr -d ' ')"
+	if [ "${others:-0}" -gt 0 ] && [ "$ALLOW_NOISY" -ne 1 ]; then
+		echo "==> $others container(s) already running on the $TARGET engine:" >&2
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} ps --format '      {{.Names}} ({{.Image}})' >&2
+		echo "    Stop them and run again, or pass --allow-noisy to measure anyway." >&2
+		exit 1
+	fi
 	# The x86-64 build of the image under its own tag: a plain build would
 	# replace the native one, and the next native run would measure Rosetta.
 	[ "$ARCH" = arm64 ] || IMAGE="$IMAGE-$ARCH"
@@ -431,7 +513,7 @@ run_case_container() {
 	local script
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
-	docker "${DOCKER_ARGS[@]}" run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} \
+	docker "${DOCKER_ARGS[@]}" run --rm ${RUN_LIMITS[@]+"${RUN_LIMITS[@]}"} ${PLATFORM[@]+"${PLATFORM[@]}"} \
 		-v "$(work_mount)":/work \
 		-v "lighter-bench-npm-$TARGET$CACHE_SUFFIX:/root/.npm" \
 		-v "lighter-bench-pnpm-$TARGET$CACHE_SUFFIX:/root/.local/share/pnpm/store" \
@@ -440,6 +522,11 @@ run_case_container() {
 		-e "REPS=$REPS" \
 		-e "CASE_TIMEOUT_S=${CASE_TIMEOUT_S:-300}" \
 		"$IMAGE" node $script
+	local status=$?
+	# Trees a setup could not delete inside the container (`cases/clear.sh`),
+	# deleted from the Mac's side.
+	[ "$WHERE" = guest ] || rm -rf "$WORK/.trash"
+	return "$status"
 }
 
 # The guest's memory, matched to OrbStack's on this machine when it is
@@ -506,7 +593,8 @@ setup_lighter() {
 	# driver, another gate — corrupts both. clonefile makes the copy free.
 	ROOTFS_MASTER="${LIGHTER_BENCH_GUEST_DIR:-guest/out}/rootfs.ext4"
 	[ -f "$ROOTFS_MASTER" ] || ./guest/rootfs/build.sh
-	ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+	ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+	ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 	cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 	# Release, because a debug VMM is measuring the compiler.
 	if [ -z "${LIGHTER_BENCH_BIN:-}" ]; then
@@ -546,6 +634,7 @@ setup_lighter() {
 		${LIGHTER_BENCH_DEV_AGENT:+--share "dev:$(dirname "$LIGHTER_BENCH_DEV_AGENT")"} \
 		${ROSETTA_DIR:+--share "rosetta:$ROSETTA_DIR"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
+		${LIGHTER_BENCH_VMM_ARGS:-} \
 		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init cgroup_disable=pressure swiotlb=noforce idle.poll_ns=$(bench_idle_poll_ns) $(bench_idle_poll_args) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")}${ROSETTA_DIR:+ lighter.rosetta} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
@@ -574,7 +663,10 @@ run_case_lighter() {
 	local script
 	script="$(runner_args "$1" /work)"
 	# shellcheck disable=SC2086
-	docker run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} \
+	# `LIGHTER_BENCH_CASE_ARGS`: extra `docker run` flags for the case's
+	# container, such as `--device lighter.sh/video=all` for the hardware
+	# transcode cases.
+	docker run --rm ${PLATFORM[@]+"${PLATFORM[@]}"} ${LIGHTER_BENCH_CASE_ARGS:-} \
 		-v "$(work_mount)":/work \
 		-v "lighter-bench-npm-$TARGET$CACHE_SUFFIX:/root/.npm" \
 		-v "lighter-bench-pnpm-$TARGET$CACHE_SUFFIX:/root/.local/share/pnpm/store" \
@@ -607,9 +699,36 @@ prepare_work
 case "$TARGET" in
 native)                          setup_native;     run_case() { run_case_native "$@"; } ;;
 lighter)                         setup_lighter;    run_case() { run_case_lighter "$@"; } ;;
-colima|orbstack|docker-desktop)  setup_container;  run_case() { run_case_container "$@"; } ;;
+colima|orbstack|docker-desktop|podman|apple-container)  setup_container;  run_case() { run_case_container "$@"; } ;;
 *) echo "unknown target: $TARGET" >&2; exit 2 ;;
 esac
+
+# The machine the cases run in, read from inside it rather than taken from the
+# settings, which each runtime spells differently and one could ignore. CPUs
+# are the guest's, or its cgroup quota where that is lower (Apple's container
+# gives its VM one more CPU than the run asked for and caps the rest). With
+# BENCH_CPUS / BENCH_MEMORY_MIB given, a guest of another size is refused.
+GUEST_CPUS=""; GUEST_MIB=""; IMAGE_TOOLS=""
+if [ "$TARGET" != native ]; then
+	read -r GUEST_CPUS GUEST_MIB <<<"$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} run --rm ${RUN_LIMITS[@]+"${RUN_LIMITS[@]}"} "$IMAGE" sh -c '
+		n=$(nproc); set -- $(cat /sys/fs/cgroup/cpu.max 2>/dev/null)
+		if [ -n "${1:-}" ] && [ "$1" != max ] && [ $(($1 / $2)) -lt "$n" ]; then n=$(($1 / $2)); fi
+		echo "$n $(awk "/^MemTotal/ {print int(\$2 / 1024)}" /proc/meminfo)"' 2>/dev/null || echo "0 0")"
+	if [ -n "${BENCH_CPUS:-}" ] && [ "$GUEST_CPUS" != "$BENCH_CPUS" ]; then
+		echo "==> the $TARGET guest has $GUEST_CPUS CPUs; BENCH_CPUS asked for $BENCH_CPUS" >&2
+		exit 1
+	fi
+	# MemTotal is what the kernel keeps after its own reservations: 85-101%
+	# of the machine. A guest sized by demand (lighter's cooperative resources)
+	# shows what is plugged, so only a fixed one is held to it.
+	if [ -n "${BENCH_MEMORY_MIB:-}" ] && [ "${LIGHTER_RESOURCES:-fixed}" = fixed ] \
+		&& { [ "$GUEST_MIB" -lt $((BENCH_MEMORY_MIB * 85 / 100)) ] || [ "$GUEST_MIB" -gt $((BENCH_MEMORY_MIB * 101 / 100)) ]; }; then
+		echo "==> the $TARGET guest has $GUEST_MIB MiB; BENCH_MEMORY_MIB asked for $BENCH_MEMORY_MIB" >&2
+		exit 1
+	fi
+	IMAGE_TOOLS="$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} run --rm "$IMAGE" sh -c \
+		'echo "zstd=$(zstd --version 2>/dev/null | head -1)"; echo "llama=$(llama-bench --version 2>&1 | grep -m1 version)"; echo "ffmpeg=$(ffmpeg -version 2>/dev/null | head -1)"' 2>/dev/null || true)"
+fi
 
 mkdir -p "$(dirname "$RESULTS")"
 echo "case,rep,ms" > "$RESULTS"
@@ -625,6 +744,14 @@ echo "case,rep,ms" > "$RESULTS"
 	echo "extra_warm_cases=${BENCH_EXTRA_WARM_CASES:-}"
 	if [ "$TARGET" != native ]; then
 		echo "image_id=$(docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} image inspect -f '{{.Id}}' "$IMAGE")"
+		echo "guest.cpus=$GUEST_CPUS guest.memory_mib=$GUEST_MIB"
+		printf '%s\n' "$IMAGE_TOOLS" | sed -n 's/^/image./p'
+	else
+		# The Mac's own builds of what the image runs; prepare-benchmark-tools.sh makes
+		# them from the image's versions, and these lines say whether it did.
+		echo "native.zstd=$(zstd --version 2>/dev/null | head -1)"
+		echo "native.llama=$(llama-bench --version 2>&1 | grep -m1 version)"
+		echo "native.ffmpeg=$(ffmpeg -version 2>/dev/null | head -1)"
 	fi
 	if [ "$TARGET" = lighter ]; then
 		echo "runtime_source=${LIGHTER_BENCH_SOURCE_SHA:-$(git rev-parse HEAD)}"
@@ -697,6 +824,10 @@ runtime_pids() {
 		if (target=="orbstack") matched=(command ~ /\/OrbStack\.app\/Contents\//)
 		if (target=="colima") matched=(command ~ /\/(limactl|lima-driver|virtiofsd)$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
 		if (target=="docker-desktop") matched=(command ~ /\/com\.docker[^\/]*$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
+		if (target=="podman") matched=(command ~ /^\/opt\/podman\/bin\/(krunkit|vfkit|gvproxy)$/)
+		# Apple container: its services, the runtime helper and VM of each
+		# container, and socktainer, the Docker API it is driven through.
+		if (target=="apple-container") matched=(command ~ /\/(container-apiserver|container-runtime-linux|container-network-vmnet|container-core-images)$/ || command ~ /(^|\/)socktainer$/ || command ~ /com\.apple\.Virtualization\.VirtualMachine$/)
 		if (matched) printf "%s ", pid
 	}
 	END { print "" }'
@@ -893,7 +1024,14 @@ run_warm_case() {
 # measured against; the egress direction has no native meaning.
 # docker with the target's context, if it has one. bash 3.2 reads an empty
 # array as unbound under `set -u`, and the lighter target's is empty.
-dk() { docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} "$@"; }
+dk() {
+	if [ "${1:-}" = run ] && [ "${#RUN_LIMITS[@]}" -gt 0 ]; then
+		shift
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} run "${RUN_LIMITS[@]}" "$@"
+	else
+		docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} "$@"
+	fi
+}
 NET_CASES=" net-tcp-egress net-tcp-egress-r net-tcp-port net-tcp-port-r net-udp net-connect-rate net-http-latency net-dns "
 NET_HOST_PORT="${NET_HOST_PORT:-5399}"
 NET_PUB_PORT="${NET_PUB_PORT:-5398}"
@@ -1109,6 +1247,11 @@ boot_stop() {
 	lighter) LIGHTER_HOME="$BOOT_HOME" "$LIGHTER_CLI" stop >/dev/null 2>&1 || true ;;
 	orbstack) orb stop >/dev/null 2>&1 || true ;;
 	colima) colima stop "${BENCH_COLIMA_PROFILE:-default}" >/dev/null 2>&1 || true ;;
+	podman) "$PODMAN" machine stop "${BENCH_PODMAN_MACHINE:-bench}" >/dev/null 2>&1 || true ;;
+	apple-container)
+		pkill -x socktainer 2>/dev/null || true
+		container system stop >/dev/null 2>&1 || true
+		;;
 	docker-desktop)
 		# Wait for Docker Desktop's own graceful shutdown. Broad pkill -f
 		# also matches the guard's --allow-program paths and kills supervision.
@@ -1131,6 +1274,11 @@ boot_start() {
 	orbstack) orb start >>"$BOOT_LOG" 2>&1 & ;;
 	colima) colima start "${BENCH_COLIMA_PROFILE:-default}" --activate=false >>"$BOOT_LOG" 2>&1 & ;;
 	docker-desktop) open -a Docker 2>/dev/null || open -a "Docker Desktop" 2>/dev/null; sleep 0.1 & ;;
+	podman) "$PODMAN" machine start "${BENCH_PODMAN_MACHINE:-bench}" >>"$BOOT_LOG" 2>&1 & ;;
+	# The bridge is part of starting it: after a system restart socktainer
+	# has to be started again (its README).
+	# socktainer is a daemon, detached: the start is waited for.
+	apple-container) { container system start >>"$BOOT_LOG" 2>&1 && { nohup socktainer --no-docker-context >>"$BOOT_LOG" 2>&1 </dev/null & }; } & ;;
 	esac
 	BOOT_START_PID=$!
 }
@@ -1224,6 +1372,22 @@ PYOWNER
 		[ "$TARGET" != lighter ] || VMM_PID=""
 		echo "==> $TARGET: memory idle=$idle MiB, a minute after a cold start"
 		echo "memory-idle,1,$idle" >> "$RESULTS"
+		# And with one idle container: nothing running is not a like-for-like
+		# rest for a runtime that makes a VM per container (Apple's) and so
+		# holds no VM at all until one runs. The image is already present.
+		if dk run -d --name "lighter-bench-idle-$TARGET" alpine:3.21 sleep 3600 >/dev/null 2>&1; then
+			sleep 60
+			[ "$TARGET" != lighter ] || VMM_PID="$(cat "$BOOT_HOME/lighter.pid" 2>/dev/null)"
+			local idle1
+			idle1="$(runtime_footprint_mib)"
+			[ "$TARGET" != lighter ] || VMM_PID=""
+			echo "==> $TARGET: memory idle=$idle1 MiB with one idle container"
+			echo "memory-idle-1,1,$idle1" >> "$RESULTS"
+			dk rm -f "lighter-bench-idle-$TARGET" >/dev/null 2>&1 || true
+		else
+			printf '    FAILED: the idle container did not start\n'
+			FAILED=1
+		fi
 	else
 		printf '    FAILED: idle boot did not answer; logs: %s\n' "$BOOT_LOG_DIR"
 		FAILED=1
@@ -1387,6 +1551,17 @@ for name in $CASES; do
 		fastest="$(awk -F, -v w="$name" '$1 == w && $3 ~ /^[0-9]+$/ { print $3 }' "$RESULTS" | sort -n | head -1)"
 		if [ "${fastest:-1}" -lt 5 ]; then
 			printf '  <- implausible; the fixture was probably missing'
+		fi
+		# Repetitions that disagree mean something else happened during one
+		# of them: the Mac's first LLM run once read 81 s, 28 s, 16 s and was
+		# recorded without a word. Flagged in the output and the provenance,
+		# not failed; some cases are cold on their first repetition by design.
+		spread="$(awk -F, -v w="$name" '$1 == w && $3 ~ /^[0-9]+$/ { v[n++] = $3 }
+			END { if (n < 2) exit; lo = hi = v[0]; for (i = 1; i < n; i++) { if (v[i] < lo) lo = v[i]; if (v[i] > hi) hi = v[i] }
+			if (lo > 0) printf "%d", 100 * (hi - lo) / lo }' "$RESULTS")"
+		if [ -n "$spread" ] && [ "$spread" -gt "${LIGHTER_BENCH_SPREAD_PCT:-20}" ]; then
+			printf '  <- repetitions differ by %s%%' "$spread"
+			echo "spread.$name=$spread%" >> "${RESULTS%.csv}.tree"
 		fi
 	fi
 	# A partial run is not a record. Preserve its error even if earlier

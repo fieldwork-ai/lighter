@@ -8,7 +8,8 @@ set -euo pipefail
 if ! command -v cargo >/dev/null 2>&1; then . "$HOME/.cargo/env"; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$ROOT"
 KERNEL="${LIGHTER_GATE_KERNEL:-guest/out/Image}"
-ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 cp -c guest/out/rootfs.ext4 "$ROOTFS" 2>/dev/null || cp guest/out/rootfs.ext4 "$ROOTFS"
 PROFILE="${PROFILE:-release}"; BIN="target/$PROFILE/examples/lighter-bench"
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
@@ -18,7 +19,7 @@ FAILED=0
 cargo build $([ "$PROFILE" = release ] && echo --release) -q --example lighter-bench -p lighter-vmm
 ./scripts/sign.sh "$BIN" >/dev/null
 RUN_DIR="$(mktemp -d -t lighter-m6b)"; SOCKET="$RUN_DIR/docker.sock"; LOG="$RUN_DIR/boot.log"; VMM_PID=""
-cleanup() { [ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true; mkdir -p .logs && cp "$LOG" .logs/m6b-last-boot.log 2>/dev/null || true; rm -rf "$RUN_DIR" "$ROOTFS"; }
+cleanup() { [ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true; mkdir -p .logs && cp "$LOG" .logs/m6b-last-boot.log 2>/dev/null || true; rm -rf "$RUN_DIR" "$ROOTFS_DIR"; }
 trap cleanup EXIT; trap 'exit 143' INT TERM
 field() { sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a "FOOTPRINT" | tail -1 | sed -n "s/.* $1=\([0-9][0-9]*\).*/\1/p"; }
 PRESSURE_FILE="$RUN_DIR/pressure"; echo normal > "$PRESSURE_FILE"

@@ -1,0 +1,12 @@
+native,metal,pp512,2008.7
+native,metal,tg128,108.6
+lighter,cpu,pp512,214.6
+lighter,cpu,tg128,88.7
+lighter,metal,pp512,1947.0
+lighter,metal,tg128,93.7
+lighter,vulkan,pp512,1247.2
+lighter,vulkan,tg128,44.9
+podman,cpu,pp512,202.9
+podman,cpu,tg128,82.8
+podman,vulkan,pp512,198.6
+podman,vulkan,tg128,83.7

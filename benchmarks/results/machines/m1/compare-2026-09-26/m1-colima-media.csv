@@ -1,0 +1,16 @@
+case,rep,ms
+cpu-zstd-1,1,5667
+cpu-zstd-1,2,5672
+cpu-zstd-1,3,5666
+cpu-zstd-8,1,1223
+cpu-zstd-8,2,1216
+cpu-zstd-8,3,1213
+transcode-h264,1,6691
+transcode-h264,2,6607
+transcode-h264,3,6610
+transcode-hevc,1,9392
+transcode-hevc,2,9314
+transcode-hevc,3,9365
+llm,1,6082
+llm,2,6149
+llm,3,6470

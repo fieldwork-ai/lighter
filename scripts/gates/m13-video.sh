@@ -22,7 +22,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 KERNEL="${LIGHTER_GATE_KERNEL:-guest/out/Image}"
 ROOTFS_MASTER="guest/out/rootfs.ext4"
-ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 PROFILE="${PROFILE:-debug}"
 BIN="target/$PROFILE/examples/lighter-bench"
@@ -57,9 +58,10 @@ export DOCKER_HOST="unix://$SOCKET" DOCKER_CONFIG="$RUN_DIR/dockercfg"
 mkdir -p "$DOCKER_CONFIG"
 cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
-	rm -rf "$RUN_DIR" "$ROOTFS"
+	rm -rf "$RUN_DIR" "$ROOTFS_DIR"
 }
 trap cleanup EXIT
+trap 'exit 143' INT TERM
 
 echo
 echo "==> A clip: 1080p, 4 s, H.264 with B-frames, from the host's ffmpeg"

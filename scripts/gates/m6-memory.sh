@@ -24,7 +24,8 @@ KERNEL="${LIGHTER_GATE_KERNEL:-guest/out/Image}"
 # A private clone, not the master: the master is an artifact, and any second
 # machine mounting it read-write beside the first corrupts both.
 ROOTFS_MASTER="guest/out/rootfs.ext4"
-ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 PROFILE="${PROFILE:-release}"
 BIN="target/$PROFILE/examples/lighter-bench"
@@ -63,7 +64,7 @@ cleanup() {
 	# The VMM's log outlives the run directory, because a failure names it.
 	mkdir -p .logs && cp "$LOG" .logs/m6-last-boot.log 2>/dev/null || true
 	rm -rf "$RUN_DIR"
-	rm -f "${ROOTFS:-}"
+	rm -rf "${ROOTFS_DIR:-}"
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM

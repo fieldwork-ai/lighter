@@ -31,7 +31,8 @@ KERNEL="${LIGHTER_GATE_KERNEL:-guest/out/Image}"
 # A private clone, not the master: the master is an artifact, and any second
 # machine mounting it read-write beside the first corrupts both.
 ROOTFS_MASTER="guest/out/rootfs.ext4"
-ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 COMPOSE="scripts/gates/fixtures/compose.yml"
 PROFILE="${PROFILE:-debug}"
@@ -64,9 +65,10 @@ export DOCKER_HOST="unix://$SOCKET"
 cleanup() {
 	docker compose -f "$COMPOSE" down -v --timeout 5 >/dev/null 2>&1 || true
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
-	rm -rf "$RUN_DIR"
+	rm -rf "$RUN_DIR" "$ROOTFS_DIR"
 }
 trap cleanup EXIT
+trap 'exit 143' INT TERM
 
 echo
 echo "==> Booting the Docker guest"
@@ -122,6 +124,20 @@ if out="$(docker run --rm hello-world 2>&1)"; then
 else
 	fail "docker run hello-world failed"
 	tail -5 <<<"$out" | sed 's/^/    /'
+fi
+
+# The engine's seccomp profile (scripts/seccomp-profile.py): still a filter,
+# the NUMA memory-policy calls allowed without CAP_SYS_NICE, and moving another
+# process's pages still refused.
+if out="$(docker run --rm alpine:3.21 sh -c '
+	apk add -q numactl-tools >/dev/null 2>&1 || exit 3
+	grep -q "^Seccomp:[[:space:]]*2" /proc/self/status || { echo "no seccomp filter"; exit 1; }
+	numactl --show >/dev/null 2>&1 || { echo "get_mempolicy refused"; exit 1; }
+	migratepages $$ 0 0 >/dev/null 2>&1 && { echo "migrate_pages allowed"; exit 1; }
+	echo SECCOMP-OK' 2>&1)" && grep -q SECCOMP-OK <<<"$out"; then
+	pass "seccomp: a filter, mempolicy calls allowed, migrate_pages refused"
+else
+	fail "seccomp profile: ${out##*$'\n'}"
 fi
 
 echo

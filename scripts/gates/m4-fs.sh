@@ -76,7 +76,7 @@ cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	rm -rf "$SHARE"
 	rm -rf "${RUN_DIR:-}"
-	rm -f "${ROOTFS:-}"
+	rm -rf "${ROOTFS_DIR:-}"
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM
@@ -191,6 +191,28 @@ printf 'changed on the host' > "$SHARE/host-wrote"
 touch "$SHARE/host-overwrote.done"
 
 await "host-overwrite-is-seen" 60 || true
+# A file the guest wrote itself, rewritten here at the same length: the guest
+# keeps such a file's pages across its own mtime (kernel patch 0043), and only
+# the host's notification may drop them.
+await_file "$SHARE/guest-owned.done" 60 || true
+printf 'rewritten by the Mac' > "$SHARE/guest-owned"
+touch "$SHARE/host-overwrote-guest.done"
+
+await "host-overwrite-of-guest-write-is-seen" 60 || true
+# A directory the guest made, which answers for missing names itself (kernel
+# patch 0044): a name added here, which the guest has already been told is
+# missing, must be found, and a file deleted here must be gone.
+await_file "$SHARE/guest-made.done" 60 || true
+# The share acknowledges the guest's create at once and applies it a moment
+# later, so the file to delete is waited for: an rm that ran first would find
+# nothing, and the create would land after it.
+await_file "$SHARE/guest-made/guest-kept" 10 \
+	|| fail "a file the guest made never reached the host"
+printf 'added on the Mac' > "$SHARE/guest-made/host-added"
+rm -f "$SHARE/guest-made/guest-kept"
+touch "$SHARE/host-added.done"
+
+await "host-create-in-guest-directory-is-seen" 60 || true
 mv "$SHARE/host-wrote" "$SHARE/host-renamed"
 touch "$SHARE/host-renamed.done"
 
@@ -255,7 +277,8 @@ echo "==> Boot 4: a macOS directory bind-mounted into a container"
 # A private clone, not the master: the master is an artifact, and any second
 # machine mounting it read-write beside the first corrupts both.
 ROOTFS_MASTER="guest/out/rootfs.ext4"
-ROOTFS="$(mktemp -t lighter-rootfs).ext4"
+ROOTFS_DIR="$(mktemp -d -t lighter-rootfs)"
+ROOTFS="$ROOTFS_DIR/rootfs.ext4"
 cp -c "$ROOTFS_MASTER" "$ROOTFS" 2>/dev/null || cp "$ROOTFS_MASTER" "$ROOTFS"
 if ! command -v docker >/dev/null 2>&1; then
 	echo "  (skipped: no docker client on this machine)"

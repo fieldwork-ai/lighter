@@ -73,6 +73,11 @@ fn clonefile(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()>
     Ok(())
 }
 
+/// The GPU's window for host-visible blobs, above the guest's RAM.
+pub const GPU_APERTURE_BYTES: u64 = 8 << 30;
+/// The video decoder's window, above the GPU's.
+pub const VIDEO_APERTURE_BYTES: u64 = 2 << 30;
+
 pub fn machine() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -123,9 +128,9 @@ pub fn machine() -> anyhow::Result<()> {
     );
     cmdline.push_str(&format!(
         " idle.poll_ns={}",
-        crate::config::idle_poll_ns(config.cpus)
+        crate::config::idle_poll_ns(config.vcpus())
     ));
-    cmdline.push_str(crate::config::idle_poll_args(config.cpus));
+    cmdline.push_str(crate::config::idle_poll_args(config.vcpus()));
     cmdline.push_str(&format!(
         " lighter.time={}",
         std::time::SystemTime::now()
@@ -233,9 +238,13 @@ pub fn machine() -> anyhow::Result<()> {
         }
     }
 
+    // Fixed boots with all of it; native boots on a base and plugs the rest
+    // in as the host offers it (`lighter_vmm::virtio::mem`).
+    let (ram_bytes, hotplug_bytes) = config.memory_split();
     let machine_config = MachineConfig {
-        vcpus: config.cpus,
-        ram_bytes: config.memory_mib << 20,
+        vcpus: config.vcpus(),
+        ram_bytes,
+        hotplug_bytes,
         kernel: paths::kernel()?,
         initramfs: None,
         cmdline,
@@ -252,9 +261,9 @@ pub fn machine() -> anyhow::Result<()> {
         // driver would probe it, wait five seconds for a capset that never
         // comes, and every boot would pay that. Doctor says what is missing.
         gpu: config.gpu && lighter_vmm::virtio::gpu::virgl::linked(),
-        gpu_aperture_bytes: 8 << 30,
+        gpu_aperture_bytes: GPU_APERTURE_BYTES,
         video: config.video,
-        video_aperture_bytes: 2 << 30,
+        video_aperture_bytes: VIDEO_APERTURE_BYTES,
     };
 
     let mut machine = Machine::start(&machine_config)?;
@@ -266,6 +275,7 @@ pub fn machine() -> anyhow::Result<()> {
             .cloned()
             .zip(machine.disks().iter().cloned())
             .collect(),
+        machine.mem().cloned(),
     )?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;

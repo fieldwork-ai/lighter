@@ -40,6 +40,8 @@ jobs:
           for script in scripts/*.sh scripts/gates/*.sh benchmarks/*.sh guest/*/build.sh; do
             bash -n "$script"
           done
+      - name: Guest seccomp profile is Docker's default plus the mempolicy rule
+        run: python3 scripts/seccomp-profile.py --check
       - name: Installer preserves existing executables
         run: bash scripts/test-install.sh
       - name: Benchmark rejects incomplete results

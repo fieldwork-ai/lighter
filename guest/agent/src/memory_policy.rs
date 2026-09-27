@@ -35,6 +35,14 @@ fn population(events: &str) -> Option<bool> {
     value
 }
 
+/// When an empty, idle hierarchy's cache is trimmed, in ticks: a second pass
+/// five seconds after the first takes what the first freed only after. Half
+/// a minute, so the next command of a script or of a person still finds the
+/// tree the last one wrote in the guest: at three seconds a build reading an
+/// install's tree over the share read all of it from the Mac again (kernel
+/// patches 0043-0045 keep it only while the cache does).
+pub const TRIM_AFTER: [u32; 2] = [30 * TICKS_PER_SEC, 35 * TICKS_PER_SEC];
+
 /// Two trims after the hierarchy becomes empty and idle. CPU idleness alone
 /// says nothing about whether a process still needs its mapped file pages.
 #[derive(Default)]
@@ -50,7 +58,7 @@ impl IdleTrim {
         } else {
             before.saturating_add(step)
         };
-        [3 * TICKS_PER_SEC, 8 * TICKS_PER_SEC]
+        TRIM_AFTER
             .into_iter()
             .any(|threshold| before < threshold && self.ticks >= threshold)
     }
@@ -114,20 +122,21 @@ mod tests {
         assert!(!trim.tick(populated(&group.0), true, 120 * TICKS_PER_SEC));
         group.events("populated 0\nfrozen 0\n");
         let mut passes = Vec::new();
-        for second in 1..=30 {
+        for second in 1..=60 {
             if trim.tick(populated(&group.0), true, TICKS_PER_SEC) {
                 passes.push(second);
             }
         }
-        assert_eq!(passes, [3, 8]);
+        assert_eq!(passes, TRIM_AFTER.map(|t| t / TICKS_PER_SEC));
     }
 
     #[test]
     fn polling_interval_changes_cannot_skip_or_repeat_a_trim() {
+        let [first, second] = TRIM_AFTER;
         let mut trim = IdleTrim::default();
-        assert!(!trim.tick(false, true, 11));
+        assert!(!trim.tick(false, true, first - 1));
         assert!(trim.tick(false, true, 4));
-        assert!(!trim.tick(false, true, 16));
+        assert!(!trim.tick(false, true, second - first - 4));
         assert!(trim.tick(false, true, 4));
         assert!(!trim.tick(false, true, 4));
         assert!(!trim.tick(false, true, u32::MAX));
@@ -138,10 +147,10 @@ mod tests {
     fn new_work_or_teardown_cpu_restarts_the_empty_interval() {
         for (populated, idle) in [(true, true), (false, false)] {
             let mut trim = IdleTrim::default();
-            assert!(!trim.tick(false, true, 11));
+            assert!(!trim.tick(false, true, TRIM_AFTER[0] - 1));
             assert!(!trim.tick(populated, idle, 4));
             assert_eq!(trim.elapsed_ticks(), 0);
-            assert!(!trim.tick(false, true, 11));
+            assert!(!trim.tick(false, true, TRIM_AFTER[0] - 1));
             assert!(trim.tick(false, true, 1));
         }
     }

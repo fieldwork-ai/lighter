@@ -8,7 +8,7 @@
 #   share/lighter/Image     (guest kernel)
 #   share/lighter/rootfs.ext4 (sparse Alpine rootfs)
 #   share/lighter/entitlements.plist
-#   LICENSE-MIT, LICENSE-APACHE, README.md
+#   LICENSE-MIT, LICENSE-APACHE, NOTICE, README.md
 #
 # The binaries are signed with Apple Developer ID Application and submitted to
 # Apple's notarytool so Gatekeeper accepts them without quarantine blocks.
@@ -133,7 +133,7 @@ done
 
 cp target/release/lighter "$STAGE/bin/lighter"
 cp guest/out/Image guest/out/rootfs.ext4 guest/out/kernel.version "$STAGE/share/lighter/"
-cp LICENSE-MIT LICENSE-APACHE README.md "$STAGE/"
+cp LICENSE-MIT LICENSE-APACHE NOTICE README.md "$STAGE/"
 cp entitlements.plist "$STAGE/share/lighter/"
 # The bundle `lighter start` runs the machine from, shipped rather than
 # built on the user's Mac: Gatekeeper assesses an app bundle at first launch,

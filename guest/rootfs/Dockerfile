@@ -40,6 +40,7 @@ COPY init /sbin/lighter-init
 COPY lighter-agent /sbin/lighter-agent
 COPY build-runc /sbin/lighter-build-runc
 COPY boot-memory /sbin/lighter-boot-memory
+COPY seccomp.json /etc/docker/seccomp.json
 # The Neural Engine's ONNX Runtime plugin provider, handed to containers by
 # CDI (`lighter.sh/ane`); built by guest/ane-ep/build.sh, depends on no libc.
 COPY liblighter_ane_ep.so /usr/lib/lighter/liblighter_ane_ep.so

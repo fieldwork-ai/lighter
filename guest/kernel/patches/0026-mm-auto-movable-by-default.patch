@@ -1,0 +1,42 @@
+mm: online hot-plugged memory by the auto-movable policy at a ratio of one
+
+The virtio-mem range's blocks online movable, so they can come back out,
+and every unmovable allocation — slab above all, the 200k dentries and
+inodes of a package tree — lives in the base. On a 4 GiB guest the base is
+a gigabyte, and after three package installs the kernel reclaimed slab
+from it on every pass over the tree: ripgrep on a shared tree read 2.1 s on
+its second pass against 185 ms with no range at all, cp -a 20 s against 7.
+The kernel has the policy for this: auto-movable onlines a block movable
+only while movable memory is at most the configured ratio of kernel-usable
+memory, and as ordinary memory otherwise. At a ratio of one the same
+guest read 199 and 280 ms and 5.4 s with the range on.
+
+The defaults, rather than the command line or sysfs: the host plugs the
+range before init runs, so a policy written from init was read as set and
+never applied to a block. The default online type is ONLINE (auto) in the
+configuration beside this, since the policy decides the zone.
+495:	default MHP_DEFAULT_ONLINE_TYPE_OFFLINE
+515:config MHP_DEFAULT_ONLINE_TYPE_OFFLINE
+522:config MHP_DEFAULT_ONLINE_TYPE_ONLINE_AUTO
+529:config MHP_DEFAULT_ONLINE_TYPE_ONLINE_KERNEL
+536:config MHP_DEFAULT_ONLINE_TYPE_ONLINE_MOVABLE
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -162,7 +162,7 @@
+  * "auto-movable": online memory to ZONE_MOVABLE if the configuration
+  *                 (auto_movable_ratio, auto_movable_numa_aware) allows for it
+  */
+-static int online_policy __read_mostly = ONLINE_POLICY_CONTIG_ZONES;
++static int online_policy __read_mostly = ONLINE_POLICY_AUTO_MOVABLE;
+ static const struct kernel_param_ops online_policy_ops = {
+ 	.set = set_online_policy,
+ 	.get = get_online_policy,
+@@ -179,7 +179,7 @@
+  * online some memory to ZONE_MOVABLE -- e.g., because hotplugged KERNEL memory
+  * doesn't allow for more MOVABLE memory.
+  */
+-static unsigned int auto_movable_ratio __read_mostly = 301;
++static unsigned int auto_movable_ratio __read_mostly = 100;
+ module_param(auto_movable_ratio, uint, 0644);
+ MODULE_PARM_DESC(auto_movable_ratio,
+ 		"Set the maximum ratio of MOVABLE:KERNEL memory in the system "

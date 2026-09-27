@@ -98,6 +98,13 @@ impl Vm {
         }
     }
 
+    /// The IPA size a VM gets without asking, in bits.
+    pub fn default_ipa_bits() -> Result<u32> {
+        let mut bits = 0u32;
+        unsafe { check(sys::hv_vm_config_get_default_ipa_size(&mut bits))? };
+        Ok(bits)
+    }
+
     /// The largest IPA size this host supports, in bits.
     pub fn max_ipa_bits() -> Result<u32> {
         let mut bits = 0u32;
