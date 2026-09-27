@@ -793,10 +793,7 @@ impl Machine {
         if (background_ram || demand_ram) && layout.hotplug.is_some() {
             // Every caller, including the benchmark VMM, gives guest init the
             // full startup target before Docker can restore saved containers.
-            cmdline.push_str(&format!(
-                " lighter.boot_ram_mib={}",
-                (config.ram_bytes + config.hotplug_bytes) >> 20
-            ));
+            cmdline.push_str(&format!(" lighter.boot_ram_mib={}", boot_ram_mib(config)));
         }
         let dtb = fdt::build(&FdtParams {
             layout: &layout,
@@ -1104,6 +1101,15 @@ impl Drop for Machine {
     }
 }
 
+/// The memory guest init waits to see online before Docker restores saved
+/// containers: the RAM the guest boots with. A virtio-mem range is plugged
+/// on demand after boot, so none of it counts; 0.10.0 counted all of it, and
+/// a cooperative machine with a saved container waited ten seconds for
+/// memory it would never be given, and its init died.
+fn boot_ram_mib(config: &MachineConfig) -> u64 {
+    config.ram_bytes >> 20
+}
+
 /// Whether a chunk of a Docker API stream carries a request that starts a
 /// process in a container: create, start, restart, an exec's start, or a
 /// build (BuildKit runs its steps in containers of its own, reached through
@@ -1133,6 +1139,21 @@ fn starts_a_container(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_waits_for_the_base_not_the_range() {
+        let cooperative = MachineConfig {
+            ram_bytes: 2 << 30,
+            hotplug_bytes: 94 << 30,
+            ..MachineConfig::default()
+        };
+        assert_eq!(boot_ram_mib(&cooperative), 2048);
+        let fixed = MachineConfig {
+            ram_bytes: 16 << 30,
+            ..MachineConfig::default()
+        };
+        assert_eq!(boot_ram_mib(&fixed), 16384);
+    }
 
     #[test]
     fn the_address_space_reaches_the_top() {
