@@ -157,28 +157,44 @@ all_off
 # The extras run through the installed lighter (the release, with Metal and
 # the media engine), which the bench VMM may be built without. They refuse an
 # engine with containers running rather than stop anybody's.
+#
+# LIGHTER_BENCH_EXTRAS_HOME runs them on a machine of their own instead: the
+# installed CLI in that home, on LIGHTER_BENCH_GUEST_DIR's kernel and rootfs,
+# sized like the rest. A daily driver is never started, which on a Mac whose
+# driver is to stay off is the difference between a record and a broken
+# promise; and a candidate rootfs is measured, not the installed release's.
 extras_on_lighter() {
+	local ctx=lighter home="${LIGHTER_BENCH_EXTRAS_HOME:-}"
+	if [ -n "$home" ]; then
+		mkdir -p "$home"
+		export LIGHTER_HOME="$home" LIGHTER_GUEST_DIR="$LIGHTER_BENCH_GUEST_DIR"
+		lighter config --cpus "${BENCH_CPUS:-8}" --memory "${BENCH_MEMORY_MIB:-4096}" >/dev/null
+		ctx=lighter-bench-extras
+		docker context rm -f "$ctx" >/dev/null 2>&1 || true
+		docker context create "$ctx" --docker "host=unix://$home/docker.sock" >/dev/null
+	fi
 	lighter start --timeout 120 >/dev/null 2>&1 || { echo "the installed lighter did not start" >&2; return 1; }
 	local paused=""
-	if [ "$(docker --context lighter ps -q | wc -l | tr -d ' ')" -gt 0 ]; then
+	if [ "$(docker --context "$ctx" ps -q | wc -l | tr -d ' ')" -gt 0 ]; then
 		if [ "$PAUSE" = 0 ]; then
 			echo "containers are running on the installed lighter; stop them, or pass --pause-containers:" >&2
-			docker --context lighter ps --format '    {{.Names}}' >&2
+			docker --context "$ctx" ps --format '    {{.Names}}' >&2
 			lighter stop >/dev/null 2>&1; return 1
 		fi
-		paused="$(docker --context lighter ps -q)"
+		paused="$(docker --context "$ctx" ps -q)"
 		# shellcheck disable=SC2086
-		docker --context lighter stop $paused >/dev/null
+		docker --context "$ctx" stop $paused >/dev/null
 	fi
-	docker --context lighter image inspect lighter-bench:2 >/dev/null 2>&1 \
-		|| docker --context lighter load -i "$LIGHTER_BENCH_IMAGE_DIR/arm64.tar" >/dev/null
+	docker --context "$ctx" image inspect lighter-bench:2 >/dev/null 2>&1 \
+		|| docker --context "$ctx" load -i "$LIGHTER_BENCH_IMAGE_DIR/arm64.tar" >/dev/null
 	sleep 20
 	[ "$QUALITY" = 0 ] || { log "STAGE lighter quality"; LIGHTER_BENCH_CASE_ARGS="--device lighter.sh/video=all" \
-		benchmarks/transcode-check.sh lighter lighter "$OUT/$MACHINE-transcode-quality.csv" > "$OUT/quality-lighter.log" 2>&1; echo "lighter-quality=$?"; }
-	[ "$GPU" = 0 ] || { log "STAGE lighter gpu"; benchmarks/llm-gpu.sh lighter lighter "$OUT/$MACHINE-llm-gpu.csv" > "$OUT/gpu-lighter.log" 2>&1; echo "lighter-gpu=$?"; }
+		benchmarks/transcode-check.sh lighter "$ctx" "$OUT/$MACHINE-transcode-quality.csv" > "$OUT/quality-lighter.log" 2>&1; echo "lighter-quality=$?"; }
+	[ "$GPU" = 0 ] || { log "STAGE lighter gpu"; benchmarks/llm-gpu.sh lighter "$ctx" "$OUT/$MACHINE-llm-gpu.csv" > "$OUT/gpu-lighter.log" 2>&1; echo "lighter-gpu=$?"; }
 	# shellcheck disable=SC2086
-	[ -z "$paused" ] || docker --context lighter start $paused >/dev/null
+	[ -z "$paused" ] || docker --context "$ctx" start $paused >/dev/null
 	lighter stop >/dev/null 2>&1
+	[ -z "$home" ] || { unset LIGHTER_HOME LIGHTER_GUEST_DIR; docker context rm -f "$ctx" >/dev/null 2>&1 || true; }
 }
 if [ "$GPU$QUALITY" != 00 ]; then
 	rm -f "$OUT/$MACHINE-transcode-quality.csv" "$OUT/$MACHINE-llm-gpu.csv"

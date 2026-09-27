@@ -34,6 +34,9 @@
 //! fifteen seconds later, with the virtio-mem range in and no balloon.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// How long a page must go untouched before the pass takes it.
 pub const IDLE_HORIZON_SECS: u64 = 3600;
@@ -131,15 +134,32 @@ pub fn horizon_text(horizon_secs: u64) -> String {
     }
 }
 
-/// The pass, running: what it has evicted so far, read on a schedule.
+/// What the pass has evicted since the last read of it: DAMON's `sz_applied`,
+/// refreshed first, less what the previous read saw. `None` when the stats
+/// cannot be read or nothing moved.
+///
+/// The refresh blocks: `update_schemes_stats` is a request the kdamond
+/// answers at its next sample, up to a minute away at the hour's horizon.
+/// Asked from the memory loop, it held the loop for up to that minute once
+/// a minute, and a trim due in it waited with it: a guest that had stopped
+/// its last container half a minute before still held its cache a minute
+/// after (the M1, 2026-09-27). So it is asked from a thread of its own.
+fn evicted_since(root: &str, applied: &mut u64) -> Option<u64> {
+    std::fs::write(format!("{root}/kdamonds/0/state"), "update_schemes_stats").ok()?;
+    let now = std::fs::read_to_string(format!("{root}/kdamonds/0/contexts/0/schemes/0/stats/sz_applied"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())?;
+    let delta = now.saturating_sub(*applied);
+    *applied = now;
+    (delta > 0).then_some(delta)
+}
+
+/// The pass, running: what it has evicted, read on DAMON's sampling cadence
+/// by a thread of its own and collected by the memory loop.
 pub struct Idle {
-    root: String,
     horizon_secs: u64,
-    /// `sz_applied` at the last read, in bytes.
-    applied: u64,
-    /// Ticks until the next read of the stats.
-    until_poll: u32,
-    poll_ticks: u32,
+    /// Evicted and not yet collected, in bytes.
+    pending: Arc<AtomicU64>,
     running: bool,
 }
 
@@ -147,18 +167,14 @@ impl Idle {
     /// Configures and starts the pass, or says once why it could not
     /// (`horizon_secs` 0 leaves DAMON alone; a kernel without it gets the
     /// line and 0.5.6's behaviour).
-    pub fn start(horizon_secs: u64, ticks_per_sec: u32) -> Idle {
-        Self::start_at(ADMIN, "/proc/iomem", horizon_secs, ticks_per_sec)
+    pub fn start(horizon_secs: u64) -> Idle {
+        Self::start_at(ADMIN, "/proc/iomem", horizon_secs)
     }
 
-    fn start_at(root: &str, iomem_path: &str, horizon_secs: u64, ticks_per_sec: u32) -> Idle {
-        let poll_ticks = (sample_secs(horizon_secs.max(1)) as u32).saturating_mul(ticks_per_sec).max(1);
+    fn start_at(root: &str, iomem_path: &str, horizon_secs: u64) -> Idle {
         let mut idle = Idle {
-            root: root.into(),
             horizon_secs,
-            applied: 0,
-            until_poll: poll_ticks,
-            poll_ticks,
+            pending: Arc::new(AtomicU64::new(0)),
             running: false,
         };
         if horizon_secs == 0 {
@@ -180,6 +196,17 @@ impl Idle {
             }
         }
         idle.running = true;
+        let (root, pending) = (root.to_string(), idle.pending.clone());
+        let cadence = Duration::from_secs(sample_secs(horizon_secs));
+        std::thread::spawn(move || {
+            let mut applied = 0;
+            loop {
+                std::thread::sleep(cadence);
+                if let Some(delta) = evicted_since(&root, &mut applied) {
+                    pending.fetch_add(delta, Ordering::Relaxed);
+                }
+            }
+        });
         println!(
             "AGENT idle: pass every {} over unmapped page cache untouched since the last",
             horizon_text(horizon_secs)
@@ -195,30 +222,11 @@ impl Idle {
         self.horizon_secs
     }
 
-    /// One tick of the memory loop. Returns what the pass evicted since the
-    /// last read, in bytes, when the stats were due and something moved.
-    pub fn tick(&mut self, step: u32) -> Option<u64> {
-        if !self.running {
-            return None;
-        }
-        self.until_poll = self.until_poll.saturating_sub(step);
-        if self.until_poll > 0 {
-            return None;
-        }
-        self.until_poll = self.poll_ticks;
-        let state = format!("{}/kdamonds/0/state", self.root);
-        if std::fs::write(&state, "update_schemes_stats").is_err() {
-            return None;
-        }
-        let applied = std::fs::read_to_string(format!(
-            "{}/kdamonds/0/contexts/0/schemes/0/stats/sz_applied",
-            self.root
-        ))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())?;
-        let delta = applied.saturating_sub(self.applied);
-        self.applied = applied;
-        (delta > 0).then_some(delta)
+    /// What the pass has evicted since the last call, in bytes, if anything.
+    /// Never blocks.
+    pub fn take(&self) -> Option<u64> {
+        let evicted = self.pending.swap(0, Ordering::Relaxed);
+        (evicted > 0).then_some(evicted)
     }
 }
 
@@ -305,42 +313,42 @@ c0000000-c000ffff : virtio-mmio
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let root = dir.to_str().unwrap();
-        let mut idle = Idle::start_at(root, "/nonexistent", 3600, 4);
+        let idle = Idle::start_at(root, "/nonexistent", 3600);
         assert!(!idle.running());
-        assert_eq!(idle.tick(4), None);
-        let idle = Idle::start_at(root, "/nonexistent", 0, 4);
+        assert_eq!(idle.take(), None);
+        let idle = Idle::start_at(root, "/nonexistent", 0);
         assert!(!idle.running());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn the_stats_are_read_on_the_sampling_cadence_and_only_growth_is_reported() {
+    fn the_stats_are_refreshed_before_each_read_and_only_growth_is_reported() {
         let dir = std::env::temp_dir().join(format!("lighter-idle-stats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let scheme = dir.join("kdamonds/0/contexts/0/schemes/0/stats");
         std::fs::create_dir_all(&scheme).unwrap();
         std::fs::write(scheme.join("sz_applied"), "0\n").unwrap();
         std::fs::write(dir.join("kdamonds/0/state"), "off\n").unwrap();
-        let root = dir.to_str().unwrap().to_string();
-        let mut idle = Idle {
-            root: root.clone(),
-            horizon_secs: 40,
-            applied: 0,
-            until_poll: 40,
-            poll_ticks: 40,
-            running: true,
-        };
-        // Ten seconds at four ticks a second before the first read.
-        assert_eq!(idle.tick(36), None);
+        let root = dir.to_str().unwrap();
+        let mut applied = 0;
+        assert_eq!(evicted_since(root, &mut applied), None);
         std::fs::write(scheme.join("sz_applied"), format!("{}\n", 3u64 << 30)).unwrap();
-        assert_eq!(idle.tick(4), Some(3 << 30));
+        assert_eq!(evicted_since(root, &mut applied), Some(3 << 30));
         // The read asked DAMON to refresh its stats first.
         assert_eq!(std::fs::read_to_string(dir.join("kdamonds/0/state")).unwrap(), "update_schemes_stats");
-        // Nothing new: nothing reported, and the next read is a full cadence away.
-        assert_eq!(idle.tick(40), None);
+        assert_eq!(evicted_since(root, &mut applied), None);
         std::fs::write(scheme.join("sz_applied"), format!("{}\n", 4u64 << 30)).unwrap();
-        assert_eq!(idle.tick(39), None);
-        assert_eq!(idle.tick(1), Some(1 << 30));
+        assert_eq!(evicted_since(root, &mut applied), Some(1 << 30));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_the_thread_counted_is_collected_once_without_waiting() {
+        let idle = Idle { horizon_secs: 3600, pending: Arc::new(AtomicU64::new(0)), running: true };
+        assert_eq!(idle.take(), None);
+        idle.pending.fetch_add(2 << 20, Ordering::Relaxed);
+        idle.pending.fetch_add(1 << 20, Ordering::Relaxed);
+        assert_eq!(idle.take(), Some(3 << 20));
+        assert_eq!(idle.take(), None);
     }
 }

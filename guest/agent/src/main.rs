@@ -308,10 +308,7 @@ fn bound_container_cache() {
     let mut idle_trim = IdleTrim::default();
     // The hourly pass over idle page cache (`idle.rs`); `lighter.idle_age=<s>`
     // shortens the hour for the gate, 0 leaves it off.
-    let mut idle = idle::Idle::start(
-        cmdline_value("lighter.idle_age").unwrap_or(idle::IDLE_HORIZON_SECS),
-        TICKS_PER_SEC,
-    );
+    let idle = idle::Idle::start(cmdline_value("lighter.idle_age").unwrap_or(idle::IDLE_HORIZON_SECS));
     // The loop that keeps the containers' cache near their working set
     // while they run (`warm.rs`): the one policy here that does not wait
     // for them to stop. The floors are the trims' resting levels, so what
@@ -366,7 +363,7 @@ fn bound_container_cache() {
         // Under a megabyte is DAMON's own sampling: the ten pages a minute
         // it marks old for the region estimate this does not use, evicted
         // when the pass finds them. Not an eviction, and not an offer.
-        if let Some(evicted) = idle.tick(step)
+        if let Some(evicted) = idle.take()
             && evicted >= 1 << 20
         {
             // What the pass freed is in pieces the size of the files that
@@ -508,8 +505,10 @@ fn bound_container_cache() {
                 active,
                 // Quiet, or nothing running and the containers eight seconds
                 // idle: the quiet rule protects running work from a seesaw,
-                // and with no container there is none to protect; eight is
-                // the second trim's moment, when the cache is already gone.
+                // and with no container there is none to protect. Eight was
+                // the second trim's moment; the trims now wait half a minute
+                // (TRIM_AFTER) and this does not follow them: it offers only
+                // what is already free, so it need not wait for the cache.
                 quiet_for >= 3 * TICKS_PER_SEC
                     || (!populated && idle_trim.elapsed_ticks() >= 8 * TICKS_PER_SEC),
                 !populated,
