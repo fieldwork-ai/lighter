@@ -91,8 +91,8 @@ pub fn guest_dir() -> anyhow::Result<PathBuf> {
     })
 }
 
-/// The guest kernel: one image, at 250 Hz (`docs/architecture.md`, "One
-/// kernel"; a 1000 Hz build was shipped beside it for a day and dropped).
+/// The guest kernel: one image, at 250 Hz (`docs/architecture.md`, "The
+/// guest"; a 1000 Hz build was shipped beside it for a day and dropped).
 pub fn kernel() -> anyhow::Result<PathBuf> {
     Ok(guest_dir()?.join("Image"))
 }

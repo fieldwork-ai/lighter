@@ -27,7 +27,7 @@ docker build -q -t "$IMAGE" "$ROOT/guest/kernel" >/dev/null
 
 # One kernel ships: `Image`, at 250 Hz. A 1000 Hz twin was built and shipped
 # beside it for a day (faster container starts, slower share installs;
-# `docs/architecture.md`, "One kernel") and dropped; `LIGHTER_KERNEL_ONLY=1000`
+# `docs/architecture.md`, "The guest") and dropped; `LIGHTER_KERNEL_ONLY=1000`
 # still builds it, on its own source volume, for an A/B.
 build() {
 	local hz="$1" suffix="$2" volume="$3"
