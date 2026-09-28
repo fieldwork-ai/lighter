@@ -1199,6 +1199,12 @@ fn forward_outbound(tcp: std::net::TcpStream) {
 
 /// The host's vsock port for DNS.
 const DNS_PORT: u32 = 2379;
+/// Where the resolver listens. Not 53: a socket on the guest's port 53, on
+/// any address, keeps Docker from publishing port 53 (it reserves
+/// `0.0.0.0:53`), and a DNS server a container publishes, Pi-hole or
+/// AdGuard Home, is the one thing that must have it. Queries to
+/// `192.168.127.2:53` reach this port through the guest's nat rules (init).
+const DNS_LISTEN: u16 = 15353;
 
 /// DNS for the guest and its containers, answered by the Mac's resolver.
 ///
@@ -1209,10 +1215,10 @@ const DNS_PORT: u32 = 2379;
 /// resolver macOS is configured with — a VPN's, when one is up — so a
 /// container sees the names the Mac sees.
 fn serve_dns(addr: &str) -> std::process::ExitCode {
-    let socket = match std::net::UdpSocket::bind((addr, 53)) {
+    let socket = match std::net::UdpSocket::bind((addr, DNS_LISTEN)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("lighter-agent: cannot bind dns on {addr}:53: {e}");
+            eprintln!("lighter-agent: cannot bind dns on {addr}:{DNS_LISTEN}: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -1227,7 +1233,7 @@ fn serve_dns(addr: &str) -> std::process::ExitCode {
     let Ok(mut host_read) = host_write.try_clone() else {
         return std::process::ExitCode::FAILURE;
     };
-    println!("AGENT dns addr={addr}");
+    println!("AGENT dns addr={addr} port={DNS_LISTEN}");
     // Who asked, by our id, so the reply finds its way back. Bounded and
     // overwritten in order: a reply for a forgotten query is dropped.
     let clients: std::sync::Arc<std::sync::Mutex<[Option<(std::net::SocketAddr, u16)>; 4096]>> =
@@ -1310,6 +1316,17 @@ fn forward_inbound(host: OwnedFd) {
     let Some(dst) = udp::destination_from(&header) else {
         return;
     };
+    // The client's own address follows when the host passes it on; the
+    // container then sees who is calling rather than this guest.
+    let client = if header[0] & 0x80 != 0 {
+        let mut c = [0u8; 19];
+        if host_read.read_exact(&mut c).is_err() {
+            return;
+        }
+        udp::destination_from(&c).filter(|c| c.is_ipv4() == dst.is_ipv4())
+    } else {
+        None
+    };
     // Docker refuses a v6 publish on behalf of a server that binds `0.0.0.0`
     // only, which is most of them, and on a Mac `localhost` is `::1` first.
     // Its DNAT refuses at connect; its proxy accepts and hangs up once its
@@ -1335,7 +1352,19 @@ fn forward_inbound(host: OwnedFd) {
         }
         Some(t)
     };
-    let mut tcp = match std::net::TcpStream::connect(dst) {
+    let as_client = |client: std::net::SocketAddr| -> io::Result<std::net::TcpStream> {
+        let fd = udp::as_client(libc::SOCK_STREAM, client).ok_or_else(|| io::Error::other("cannot act as the client"))?;
+        udp::connect_to(&fd, dst)?;
+        Ok(std::net::TcpStream::from(fd))
+    };
+    let connected = match client {
+        Some(c) => as_client(c).or_else(|e| {
+            eprintln!("lighter-agent: inbound to {dst} as {c}: {e}; as the guest");
+            std::net::TcpStream::connect(dst)
+        }),
+        None => std::net::TcpStream::connect(dst),
+    };
+    let mut tcp = match connected {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused && dst.is_ipv6() => {
             match on_v4("refused", &[]) {

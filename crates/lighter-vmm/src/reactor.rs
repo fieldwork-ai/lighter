@@ -47,7 +47,7 @@ enum Phase {
     Connecting,
     /// A host-opened stream (published port) waiting for the guest's accept,
     /// then owed the guest address to dial as its first bytes.
-    AwaitEstablished(SocketAddr),
+    AwaitEstablished(SocketAddr, Option<SocketAddr>),
     Open,
     /// The guest's UDP, every flow multiplexed on this one stream; the
     /// flows' sockets are in `Loop::udp_flows`.
@@ -332,6 +332,36 @@ pub(crate) fn header_bytes(addr: SocketAddr) -> [u8; HEADER_LEN] {
     }
     header[17..19].copy_from_slice(&addr.port().to_be_bytes());
     header
+}
+
+/// Set in an inbound header's family byte when the client's own address
+/// follows in nineteen more bytes, so the agent can connect as the client
+/// and the container sees who is calling. A header without it is today's.
+pub(crate) const HEADER_CLIENT: u8 = 0x80;
+
+/// An inbound stream's opening bytes: the guest address to dial, and the
+/// client's, when there is one worth passing on.
+pub(crate) fn inbound_header(dst: SocketAddr, client: Option<SocketAddr>) -> Vec<u8> {
+    let mut header = header_bytes(dst).to_vec();
+    if let Some(client) = client {
+        header[0] |= HEADER_CLIENT;
+        header.extend_from_slice(&header_bytes(client));
+    }
+    header
+}
+
+/// The client to pass on for a connection from `peer`: none for the Mac's
+/// own loopback, which the guest cannot usefully claim to be, so such a
+/// connection reaches the container from the guest as it always has.
+pub(crate) fn lan_client(peer: SocketAddr) -> Option<SocketAddr> {
+    let ip = match peer.ip() {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    (!ip.is_loopback() && !ip.is_unspecified()).then(|| SocketAddr::new(ip, peer.port()))
 }
 
 /// Where the guest's header says to go.
@@ -859,6 +889,7 @@ impl Loop {
                 }
             }
             Command::Inbound(dst, mac) => {
+                let client = mac.peer_addr().ok().and_then(lan_client);
                 let _ = mac.set_nodelay(true);
                 crate::sockbuf::widen(&mac);
                 if set_nonblocking(mac.as_raw_fd()).is_err() {
@@ -872,7 +903,7 @@ impl Loop {
                     key,
                     Stream {
                         tcp: Some(mac),
-                        phase: Phase::AwaitEstablished(dst),
+                        phase: Phase::AwaitEstablished(dst, client),
                         to_guest: Vec::new(),
                         to_guest_at: 0,
                         from_guest: VecDeque::new(),
@@ -1164,10 +1195,11 @@ impl Loop {
                     self.udp_inbound_next = self.udp_inbound_next.wrapping_add(1);
                     publish.flows.insert(client, (flow, now));
                     self.udp_inbound_flows.insert(flow, (published, client));
-                    batch.extend_from_slice(&(HEADER_LEN as u16).to_be_bytes());
+                    let open = inbound_header(publish.dst, lan_client(client));
+                    batch.extend_from_slice(&(open.len() as u16).to_be_bytes());
                     batch.extend_from_slice(&flow.to_be_bytes());
                     batch.push(UDP_KIND_OPEN);
-                    batch.extend_from_slice(&header_bytes(publish.dst));
+                    batch.extend_from_slice(&open);
                     tracing::debug!(flow, %client, %published, "udp: inbound flow opened");
                     flow
                 }
@@ -1298,25 +1330,30 @@ impl Loop {
                 Err(Gone) => self.close(key),
             },
             Phase::Connecting => {}
-            Phase::AwaitEstablished(dst) => match self.shared.status(key) {
-                Status::Established => match self.shared.try_send(key, &header_bytes(dst)) {
-                    Ok(HEADER_LEN) => {
-                        let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();
-                        stream.phase = Phase::Open;
-                        stream.reading = true;
-                        self.kq.read(fd, true);
+            Phase::AwaitEstablished(dst, client) => match self.shared.status(key) {
+                Status::Established => {
+                    match self.shared.try_send(key, &inbound_header(dst, client)) {
+                        Ok(n) if n == inbound_header(dst, client).len() => {
+                            let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();
+                            stream.phase = Phase::Open;
+                            stream.reading = true;
+                            self.kq.read(fd, true);
+                        }
+                        Ok(0) => {}
+                        // A header the guest's credit cut in two cannot be
+                        // finished without a second copy of its first bytes;
+                        // a fresh connection has its whole window, so this is
+                        // a connection that is wrong, not one that is slow.
+                        Ok(n) => {
+                            tracing::debug!(
+                                n,
+                                "inbound: the header did not fit the guest's credit"
+                            );
+                            self.close(key);
+                        }
+                        Err(Gone) => self.close(key),
                     }
-                    Ok(0) => {}
-                    // A header the guest's credit cut in two cannot be
-                    // finished without a second copy of its first bytes;
-                    // a fresh connection has its whole window, so this is
-                    // a connection that is wrong, not one that is slow.
-                    Ok(n) => {
-                        tracing::debug!(n, "inbound: the header did not fit the guest's credit");
-                        self.close(key);
-                    }
-                    Err(Gone) => self.close(key),
-                },
+                }
                 Status::Connecting => {}
                 Status::Gone => self.close(key),
             },
@@ -1774,6 +1811,44 @@ mod tests {
             "nothing of the new frame is appended"
         );
         assert!(shared.queued_for_test(key).is_empty());
+    }
+
+    #[test]
+    fn an_inbound_header_carries_its_client_after_the_destination() {
+        let dst: SocketAddr = "192.168.127.2:53".parse().unwrap();
+        assert_eq!(inbound_header(dst, None), header_bytes(dst).to_vec());
+        let client: SocketAddr = "192.168.50.21:60620".parse().unwrap();
+        let header = inbound_header(dst, Some(client));
+        assert_eq!(header.len(), 2 * HEADER_LEN);
+        assert_eq!(header[0], 4 | HEADER_CLIENT);
+        assert_eq!(header[1..HEADER_LEN], header_bytes(dst)[1..]);
+        assert_eq!(header[HEADER_LEN..], header_bytes(client));
+    }
+
+    #[test]
+    fn a_loopback_client_is_not_passed_on() {
+        for peer in [
+            "127.0.0.1:5000",
+            "[::1]:5000",
+            "[::ffff:127.0.0.1]:5000",
+            "0.0.0.0:1",
+        ] {
+            assert_eq!(lan_client(peer.parse().unwrap()), None, "{peer}");
+        }
+        assert_eq!(
+            lan_client("192.168.50.21:6000".parse().unwrap()),
+            Some("192.168.50.21:6000".parse().unwrap())
+        );
+        // A dual-stack listener reports a v4 client as v4-mapped; the guest
+        // binds it as the v4 address it is.
+        assert_eq!(
+            lan_client("[::ffff:192.168.50.21]:6000".parse().unwrap()),
+            Some("192.168.50.21:6000".parse().unwrap())
+        );
+        assert_eq!(
+            lan_client("[fd00::21]:6000".parse().unwrap()),
+            Some("[fd00::21]:6000".parse().unwrap())
+        );
     }
 
     #[test]

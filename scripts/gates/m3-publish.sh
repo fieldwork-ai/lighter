@@ -9,6 +9,10 @@
 #   udp        — `-p 18094:9/udp` echoes a small and an 8 KiB datagram over
 #                v4 and v6, two hundred clients each get their own reply, and
 #                the port refuses once the container is gone
+#   dns        — a DNS server on `-p 53:53` answers over UDP and TCP, and other
+#                containers still resolve through the guest
+#   peer       — a published container sees a LAN client as itself, and
+#                loopback as the guest
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -154,6 +158,52 @@ sleep 2
 r="$(udp_echo ::1 64 18096)"
 [ "$r" = ok ] && pass "IPv6-only UDP publish reaches an IPv6-only service" || fail "IPv6-only UDP: $r"
 $D rm -f m3p-udp6 >/dev/null 2>&1
+
+echo "==> A DNS server published on port 53"
+# The guest's own resolver once held port 53 and nothing could publish it,
+# Pi-hole included (0.10.2). The container answers a name of its own; any
+# other container must still resolve through the guest, not through it.
+# `--interface`: without one dnsmasq answers only its own subnet, and a LAN
+# client now arrives as itself (Pi-hole's "local" listening mode is the same).
+$D run -d --name m3p-dns -p 53:53/udp -p 53:53/tcp alpine:3.21 sh -c \
+	'apk add -q dnsmasq >/dev/null 2>&1 && exec dnsmasq -k -u root --no-resolv --interface=eth0 --address=/lighter.test/10.9.8.7' >/dev/null 2>&1 \
+	|| fail "port 53 could not be published"
+for _ in $(seq 1 40); do [ "$(dig +short +time=1 +tries=1 @127.0.0.1 lighter.test 2>/dev/null)" = 10.9.8.7 ] && break; sleep 0.5; done
+for via in 127.0.0.1 ${LAN_IP:+"$LAN_IP"}; do
+	for mode in notcp tcp; do
+		a="$(dig +short +$mode +time=2 +tries=1 @"$via" lighter.test 2>/dev/null)"
+		[ "$a" = 10.9.8.7 ] && pass "dns on 53: answered over $([ "$mode" = tcp ] && echo tcp || echo udp) via $via" || fail "dns on 53 via $via ($mode): '${a:-no answer}'"
+	done
+done
+own="$($D run --rm alpine:3.21 sh -c 'nslookup lighter.test 2>&1; nslookup example.com 2>&1' 2>&1)"
+if echo "$own" | grep -q 10.9.8.7; then
+	fail "another container resolved through the published server"
+elif echo "$own" | grep -A3 "example.com" | grep -q "Address"; then
+	pass "other containers still resolve through the guest"
+else
+	fail "a container could not resolve example.com beside it"
+fi
+$D rm -f m3p-dns >/dev/null 2>&1
+sleep 1
+[ "$(dig +short +time=1 +tries=1 @127.0.0.1 lighter.test 2>/dev/null)" != 10.9.8.7 ] \
+	&& pass "port 53 closed with its container" || fail "port 53 still answers after its container"
+
+echo "==> Who a published container sees"
+# A client's own address, passed through the stream header and bound
+# transparently in the guest (0.10.2): the LAN address arrives as itself,
+# loopback as the guest.
+$D run -d --name m3p-peer-tcp -p 18095:9 alpine/socat:1.8.0.0 TCP4-LISTEN:9,fork,reuseaddr SYSTEM:'echo $SOCAT_PEERADDR' >/dev/null 2>&1
+$D run -d --name m3p-peer-udp -p 18095:9/udp alpine/socat:1.8.0.0 UDP4-RECVFROM:9,fork SYSTEM:'echo $SOCAT_PEERADDR' >/dev/null 2>&1
+sleep 2
+if [ -n "$LAN_IP" ]; then
+	seen="$(nc -w 3 "$LAN_IP" 18095 </dev/null 2>/dev/null)"
+	[ "$seen" = "$LAN_IP" ] && pass "tcp: a LAN client is seen as itself ($seen)" || fail "tcp: a LAN client was seen as '${seen:-nothing}'"
+	seen="$(echo x | nc -u -w 2 "$LAN_IP" 18095 2>/dev/null)"
+	[ "$seen" = "$LAN_IP" ] && pass "udp: a LAN client is seen as itself ($seen)" || fail "udp: a LAN client was seen as '${seen:-nothing}'"
+fi
+seen="$(nc -w 3 127.0.0.1 18095 </dev/null 2>/dev/null)"
+[ -n "$seen" ] && [ "$seen" != "${LAN_IP:-none}" ] && pass "tcp: loopback is seen as the guest ($seen)" || fail "tcp: loopback was seen as '${seen:-nothing}'"
+$D rm -f m3p-peer-tcp m3p-peer-udp >/dev/null 2>&1
 
 echo "==> HTTP immediately after connection bursts"
 if python3 scripts/test-publish-burst.py --docker-host "unix://$LIGHTER_HOME/docker.sock"; then

@@ -685,7 +685,11 @@ fi
 	"$AGENT" --udp-inbound &
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
-	# container and drops loopback nameservers on the way.
+	# container and drops loopback nameservers on the way. The agent listens
+	# on 15353, and the nat rules below send 192.168.127.2:53 to it, so the
+	# guest's port 53 stays free for a container to publish (Pi-hole); a
+	# query the Mac forwards to that published port carries the inbound mark
+	# and is left for Docker.
 	"$AGENT" --dns 192.168.127.2 &
 	printf 'nameserver 192.168.127.2\n' > /etc/resolv.conf
 	# The ruleset goes through a file: busybox's shell does not take a
@@ -696,10 +700,12 @@ table inet lighter {
 	chain prerouting {
 		type nat hook prerouting priority dstnat - 10; policy accept;
 		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
+		ip daddr 192.168.127.2 udp dport 53 dnat ip to 192.168.127.2:15353
 	}
 	chain output {
 		type nat hook output priority dstnat - 10; policy accept;
 		meta l4proto tcp oifname "eth0" redirect to :15201
+		ip daddr 192.168.127.2 udp dport 53 meta mark != 0x4c494e42 dnat ip to 192.168.127.2:15353
 	}
 	# UDP by TPROXY rather than REDIRECT: a redirected datagram reaches the
 	# agent with its destination already rewritten and no way back to the
@@ -714,16 +720,28 @@ table inet lighter {
 	# those datagrams reached the card and were dropped.
 	chain divert {
 		type filter hook prerouting priority mangle; policy accept;
+		# A container's reply to a client of a published port: the agent
+		# connected as that client (its inbound mark), so the reply is
+		# addressed to the client, and goes back to the agent's socket by
+		# the policy route below instead of out as outbound traffic. A mark
+		# of its own for the route: the agent's socket carries 0x4c494e42,
+		# and a route on that would send its own packets to lo too.
+		ct direction reply ct mark 0x4c494e42 meta mark set 0x4c494e43 accept
 		meta l4proto udp udp dport != { 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
 		meta l4proto udp udp dport != { 546, 547 } fib daddr oif "eth0" tproxy ip6 to :15202 meta mark set 0x1 accept
+	}
+	chain inbound {
+		type route hook output priority mangle; policy accept;
+		meta mark 0x4c494e42 ct mark set meta mark
 	}
 }
 EOF
 	ip rule add fwmark 0x1 lookup 100 2>/dev/null
+	ip rule add fwmark 0x4c494e43 lookup 100 2>/dev/null
 	ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
 	# The same for v6, which needs the kernel's v6 policy routing; a kernel
 	# without it must not take init down with the rule (init is `set -e`).
-	{ ip -6 rule add fwmark 0x1 lookup 100 && ip -6 route add local ::/0 dev lo table 100; } 2>/dev/null \
+	{ ip -6 rule add fwmark 0x1 lookup 100 && ip -6 rule add fwmark 0x4c494e43 lookup 100 && ip -6 route add local ::/0 dev lo table 100; } 2>/dev/null \
 		|| echo "INIT ipv6_policy=failed"
 	if nft -f /run/lighter.nft 2>/dev/console; then
 		echo "INIT streams=on"
