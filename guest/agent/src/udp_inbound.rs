@@ -95,7 +95,11 @@ pub fn serve(host: crate::Fd) -> std::io::Result<()> {
         match kind {
             KIND_OPEN => {
                 let Some(dst) = destination_from(&payload[..len]) else { continue };
-                let Some(socket) = connected(dst) else { continue };
+                let client = (payload[0] & 0x80 != 0 && len >= 38)
+                    .then(|| destination_from(&payload[19..38]))
+                    .flatten()
+                    .filter(|c| c.is_ipv4() == dst.is_ipv4());
+                let Some(socket) = connected(dst, client) else { continue };
                 let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: u64::from(flow) };
                 // SAFETY: a live epoll and a live socket; the event names the flow.
                 if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, socket.as_raw_fd(), &mut ev) } < 0 {
@@ -121,10 +125,43 @@ pub fn serve(host: crate::Fd) -> std::io::Result<()> {
 
 /// A non-blocking socket connected to `dst`, so the container's replies are
 /// what it receives and nothing else.
-fn connected(dst: SocketAddr) -> Option<UdpSocket> {
+fn connected(dst: SocketAddr, client: Option<SocketAddr>) -> Option<UdpSocket> {
+    if let Some(client) = client {
+        // As the client, so the container sees who is asking; the guest's
+        // rules route its replies back here (init, the inbound mark).
+        let fd = crate::udp::as_client(libc::SOCK_DGRAM, client)?;
+        crate::udp::connect_to(&fd, dst).ok()?;
+        let socket = UdpSocket::from(fd);
+        socket.set_nonblocking(true).ok()?;
+        return Some(socket);
+    }
     let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0".parse().ok()? } else { "[::]:0".parse().ok()? };
     let socket = UdpSocket::bind(bind).ok()?;
+    mark_inbound(socket.as_raw_fd());
     socket.connect(dst).ok()?;
     socket.set_nonblocking(true).ok()?;
     Some(socket)
+}
+
+/// The mark on a flow the Mac opened to a published port. The guest's rule
+/// that sends `192.168.127.2:53` to the agent's resolver skips it, so a
+/// query from the LAN to a container publishing port 53 reaches that
+/// container and not the resolver. Not 0x1, which is TPROXY's routing mark.
+pub const SK_MARK_INBOUND: u32 = 0x4c49_4e42;
+
+pub fn mark_inbound(fd: std::os::fd::RawFd) {
+    let mark: libc::c_uint = SK_MARK_INBOUND;
+    // SAFETY: a live socket descriptor; the option value is the size given.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            (&mark as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&mark) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        eprintln!("lighter-agent: cannot mark an inbound flow: {}", std::io::Error::last_os_error());
+    }
 }

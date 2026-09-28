@@ -142,7 +142,8 @@ pub fn destination_from(b: &[u8]) -> Option<SocketAddr> {
         return None;
     }
     let port = u16::from_be_bytes([b[17], b[18]]);
-    let ip: IpAddr = match b[0] {
+    // The top bit of the family byte says a client follows (`as_client`).
+    let ip: IpAddr = match b[0] & 0x7f {
         4 => Ipv4Addr::new(b[1], b[2], b[3], b[4]).into(),
         6 => {
             let mut o = [0u8; 16];
@@ -374,4 +375,41 @@ fn original_destination(msg: &libc::msghdr) -> Option<SocketAddr> {
         }
     }
     None
+}
+
+/// A socket of `kind` that acts as `client` towards a container behind a
+/// published port: transparent, bound to the client's own address and port,
+/// and carrying the inbound mark, which the guest's rules use to route the
+/// container's replies back to this socket rather than out to the network.
+pub fn as_client(kind: libc::c_int, client: SocketAddr) -> Option<std::os::fd::OwnedFd> {
+    let family = if client.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    // SAFETY: plain socket creation.
+    let fd = unsafe { libc::socket(family, kind | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a fresh descriptor we own.
+    let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    transparent(fd, client.is_ipv6()).ok()?;
+    crate::udp_inbound::mark_inbound(fd);
+    let one: libc::c_int = 1;
+    // SAFETY: a live socket and an int-sized option value.
+    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t) };
+    let sa = sockaddr_of(client);
+    // SAFETY: a sockaddr filled for the family, of the length given.
+    if unsafe { libc::bind(fd, sa.0.as_ptr().cast(), sa.1) } < 0 {
+        return None;
+    }
+    Some(owned)
+}
+
+/// Connects a socket made by `as_client`.
+pub fn connect_to(fd: &std::os::fd::OwnedFd, dst: SocketAddr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let sa = sockaddr_of(dst);
+    // SAFETY: a live socket and a sockaddr of the length given.
+    if unsafe { libc::connect(fd.as_raw_fd(), sa.0.as_ptr().cast(), sa.1) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }

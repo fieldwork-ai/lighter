@@ -47,7 +47,13 @@ fn main() -> ExitCode {
                     std::env::var("LIGHTER_RESOURCES").as_deref(),
                     Ok("cooperative" | "native")
                 ) {
-                    lighter_vmm::virtio::mem::split(mib << 20, 2 << 30)
+                    // `LIGHTER_BENCH_COOPERATIVE_BASE_MIB` moves the base, to
+                    // measure a floor under the policy.
+                    let base_mib: u64 = std::env::var("LIGHTER_BENCH_COOPERATIVE_BASE_MIB")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(2048);
+                    lighter_vmm::virtio::mem::split(mib << 20, base_mib << 20)
                 } else {
                     (mib << 20, 0)
                 };
