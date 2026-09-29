@@ -194,8 +194,9 @@ impl Loop {
             let a = unsafe { OwnedFd::from_raw_fd(raw) };
             let id = self.next;
             self.next += 1;
-            if let Some(conn) = Conn::accepted(a, &self.route, &self.env, now) {
-                if let Err(e) = self.watch(conn.a.as_raw_fd(), id << 1) {
+            if let Some(mut conn) = Conn::accepted(a, &self.route, &self.env, now) {
+                conn.watched_a = conn.interest().0;
+                if let Err(e) = self.watch(libc::EPOLL_CTL_ADD, conn.a.as_raw_fd(), id << 1, conn.watched_a) {
                     ran_out("epoll watches", &e);
                     continue;
                 }
@@ -230,14 +231,33 @@ impl Loop {
         }
     }
 
-    fn watch(&self, fd: RawFd, token: u64) -> io::Result<()> {
-        let mut ev = libc::epoll_event {
-            events: (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
-            u64: token,
-        };
+    /// Watches a socket for what its connection's state waits on. A change
+    /// of mask (`EPOLL_CTL_MOD`) looks at the socket again, so nothing that
+    /// happened meanwhile is missed.
+    fn watch(&self, op: libc::c_int, fd: RawFd, token: u64, events: u32) -> io::Result<()> {
+        let mut ev = libc::epoll_event { events: events | libc::EPOLLET as u32, u64: token };
         // SAFETY: live descriptors and an event the call reads.
-        if unsafe { libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } < 0 {
+        if unsafe { libc::epoll_ctl(self.epoll.as_raw_fd(), op, fd, &mut ev) } < 0 {
             return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Brings the watches up to what the connection now waits on.
+    fn rewatch(&mut self, id: u64) -> io::Result<()> {
+        let Some(conn) = self.conns.get_mut(&id) else { return Ok(()) };
+        let (want_a, want_b) = conn.interest();
+        let (a, b) = (conn.a.as_raw_fd(), conn.b.as_ref().map(|b| b.as_raw_fd()));
+        let (had_a, had_b) = (conn.watched_a, conn.watched_b);
+        conn.watched_a = want_a;
+        conn.watched_b = want_b;
+        if want_a != had_a {
+            self.watch(libc::EPOLL_CTL_MOD, a, id << 1, want_a)?;
+        }
+        if let Some(b) = b
+            && want_b != had_b
+        {
+            self.watch(libc::EPOLL_CTL_MOD, b, id << 1 | 1, want_b)?;
         }
         Ok(())
     }
@@ -253,7 +273,9 @@ impl Loop {
             && (after != before || conn.b_new)
         {
             conn.b_new = false;
-            if let Err(e) = self.watch(fd, id << 1 | 1) {
+            conn.watched_b = conn.interest().1;
+            let events = conn.watched_b;
+            if let Err(e) = self.watch(libc::EPOLL_CTL_ADD, fd, id << 1 | 1, events) {
                 ran_out("epoll watches", &e);
                 self.close(id);
                 return;
@@ -263,6 +285,11 @@ impl Loop {
         }
         match step {
             Step::Wait => {
+                if let Err(e) = self.rewatch(id) {
+                    ran_out("epoll watches", &e);
+                    self.close(id);
+                    return;
+                }
                 if let Some(at) = armed {
                     self.timers.push(Reverse((at, id)));
                 }
@@ -311,6 +338,9 @@ struct Conn {
     b: Option<OwnedFd>,
     /// Set when `b` is a fresh socket the loop has not watched yet.
     b_new: bool,
+    /// The epoll masks each socket is watched with now.
+    watched_a: u32,
+    watched_b: u32,
     a_tcp: bool,
     b_tcp: bool,
     state: State,
@@ -342,6 +372,8 @@ impl Conn {
             a,
             b: None,
             b_new: false,
+            watched_a: 0,
+            watched_b: 0,
             a_tcp,
             b_tcp: false,
             state,
@@ -401,6 +433,26 @@ impl Conn {
                     }
                 }
             }
+        }
+    }
+
+    /// What each socket is watched for in this state; hang-ups and errors
+    /// are reported whatever the mask. A joined stream's bytes move in the
+    /// kernel, and a watch for them would wake this thread for every packet
+    /// only to find nothing to do: on the M1 that cost joined streams 2 to 4%
+    /// of their throughput and a kept-alive request 15 µs.
+    fn interest(&self) -> (u32, u32) {
+        const READ: u32 = (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
+        const WRITE: u32 = libc::EPOLLOUT as u32;
+        const END: u32 = libc::EPOLLRDHUP as u32;
+        match self.state {
+            State::Header => (READ, 0),
+            State::Dialing | State::Owed => (0, WRITE),
+            State::Retry => (0, 0),
+            State::V6Check => (0, READ),
+            State::First => (READ, READ),
+            State::Joined => (END, END),
+            State::Copying => (READ | WRITE, READ | WRITE),
         }
     }
 
@@ -722,7 +774,14 @@ impl Conn {
             self.state = State::Copying;
             return Some(Step::Wait);
         };
-        match joiner.join(a, b) {
+        // The TCP socket first. A server that answers and closes at once
+        // leaves it in CLOSE_WAIT, which sockmap refuses to attach; refused
+        // first, the join fails before any verdict is live and the stream
+        // is copied. Refused second, after the vsock's verdict went live, it
+        // can only be closed, and the client gets an empty reply (27 in 600
+        // requests to a published HTTP/1.0 server, until this order).
+        let (tcp, other) = if self.a_tcp { (a, b) } else { (b, a) };
+        match joiner.join(tcp, other) {
             Ok(slots) => {
                 self.slots = Some(slots);
                 self.state = State::Joined;

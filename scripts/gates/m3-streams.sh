@@ -174,6 +174,15 @@ else
 	echo "    container: $($D inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' m3s-v4only 2>&1 | head -1)"
 	$D logs m3s-v4only 2>&1 | tail -3 | sed 's/^/    /'
 fi
+# The same server answers and closes at once (HTTP/1.0), which races the
+# join: 0.10.4's first event loop attached the vsock end first, and a
+# container socket already closing then took the stream down with it, an
+# empty reply to one request in twenty.
+empty=0
+for _ in $(seq 1 200); do
+	[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18093/ 2>/dev/null)" = 200 ] || empty=$((empty + 1))
+done
+[ "$empty" -eq 0 ] && pass "200 requests to a server that answers and closes, every one answered" || fail "$empty of 200 requests to a server that answers and closes got no answer"
 $D stop -t 1 m3s-v4only >/dev/null 2>&1
 
 # integrity: a checksummed quarter gigabyte each way. iperf3 checks
