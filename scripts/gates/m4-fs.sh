@@ -373,6 +373,34 @@ else
 		else
 			fail "Mac owner $(stat -f %u "$SHARE/owned/config.yml"), record: $(xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/config.yml" 2>&1)"
 		fi
+
+		# A Mac file no container has chowned belongs to whoever asks, as
+		# under Docker Desktop: `user: 1000:1000` on a 770 folder works
+		# without a chown first (issue #36). Three users in a row, inside
+		# the attribute cache's lifetime, each see their own.
+		mkdir -p "$SHARE/theirs"
+		printf 'x\n' > "$SHARE/theirs/f"
+		chmod 770 "$SHARE/theirs"
+		chmod 660 "$SHARE/theirs/f"
+		seen=""
+		for who in 1000:1000 2000:2000 0:0; do
+			seen="$seen$(docker run --rm --user "$who" -v "$MOUNT/theirs:/data" alpine:3.21 sh -c '
+				cat /data/f >/dev/null && echo y >> /data/f &&
+				chmod 660 /data/f && touch -d "2020-01-01 00:00:00" /data/f &&
+				stat -c "%u:%g" /data /data/f | sort -u' 2>>"$RUN_DIR/docker.err") "
+		done
+		if [ "$seen" = "1000:1000 2000:2000 0:0 " ]; then
+			pass "an unchowned 770 folder is each caller's own: read, written, chmodded and touched by three users"
+		else
+			fail "owners seen by 1000, 2000 and root: ${seen:-none}"
+			sed 's/^/    /' "$RUN_DIR/docker.err"
+		fi
+		if docker run --rm --user 2000:2000 -v "$MOUNT/owned:/data" alpine:3.21 \
+			sh -c 'echo no >> /data/config.yml' 2>/dev/null; then
+			fail "another user wrote a 644 file recorded as 1000's"
+		else
+			pass "a recorded owner is still the only one who can write its 644 file"
+		fi
 		unset DOCKER_HOST
 	else
 		fail "the Docker guest did not come up"

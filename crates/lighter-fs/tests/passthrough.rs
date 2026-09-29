@@ -2119,6 +2119,12 @@ fn owner_of(guest: &mut Guest, nodeid: u64) -> (u32, u32) {
     )
 }
 
+/// The `fuse_attr.flags` GETATTR reports, 84 into `fuse_attr`.
+fn flags_of(guest: &mut Guest, nodeid: u64) -> u32 {
+    let reply = guest.call(op::GETATTR, nodeid, &[0u8; 16]).unwrap();
+    u32::from_le_bytes(reply[100..104].try_into().unwrap())
+}
+
 /// SETATTR of uid and gid, as `chown` sends it.
 fn chown(guest: &mut Guest, nodeid: u64, uid: u32, gid: u32) -> Result<Vec<u8>, i32> {
     let mut body = vec![0u8; 88];
@@ -2174,6 +2180,31 @@ fn a_chown_back_to_root_clears_the_record() {
 
     assert_eq!(owner_of(&mut guest, nodeid), (0, 0));
     assert_eq!(record_on_host(&guest.host("f")), None);
+}
+
+/// A Mac file has no owner a container would know, so the guest is told it
+/// belongs to whoever asks (guest patch 0046); a recorded owner is its own.
+#[test]
+fn the_mac_users_files_belong_to_whoever_asks() {
+    let caller = fuse::attr::LIGHTER_CALLER_UID | fuse::attr::LIGHTER_CALLER_GID;
+    let mut guest = Guest::new("caller");
+    std::fs::write(guest.host("f"), b"x").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    assert_eq!(flags_of(&mut guest, nodeid), caller);
+
+    chown(&mut guest, nodeid, 1000, 1000).unwrap();
+    assert_eq!(
+        flags_of(&mut guest, nodeid),
+        0,
+        "a recorded owner is the file's own"
+    );
+
+    chown(&mut guest, nodeid, 0, 0).unwrap();
+    assert_eq!(
+        flags_of(&mut guest, nodeid),
+        caller,
+        "and clearing it gives the file back"
+    );
 }
 
 /// Half a chown (`chown :group`) keeps the other half.

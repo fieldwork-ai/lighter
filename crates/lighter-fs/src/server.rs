@@ -1257,6 +1257,7 @@ impl Server {
                 | clone
                 | no_security
                 | fuse::init2::LIGHTER_NOOP_SETATTR
+                | fuse::init2::LIGHTER_CALLER_OWNS
                 | trust)
                 & offered2
         } else {
@@ -1816,6 +1817,7 @@ impl Server {
         if let Some((uid, gid)) = self.recorded_owner(inode, parent) {
             attr.uid = uid;
             attr.gid = gid;
+            attr.flags = 0;
         }
     }
 
@@ -1904,6 +1906,7 @@ impl Server {
         let inode = self.registry.get(entry.nodeid).ok_or(linux::ESTALE)?;
         self.record_owner(&inode, Some(parent), &path, owner, entry.attr.mode)?;
         (entry.attr.uid, entry.attr.gid) = owner;
+        entry.attr.flags = 0;
         Ok(())
     }
 
@@ -1956,6 +1959,15 @@ impl Server {
             gid: self.to_guest_gid(st.st_gid),
             rdev: st.st_rdev as u32,
             blksize: st.st_blksize as u32,
+            flags: if st.st_uid == self.host_uid {
+                fuse::attr::LIGHTER_CALLER_UID
+            } else {
+                0
+            } | if st.st_gid == self.host_gid {
+                fuse::attr::LIGHTER_CALLER_GID
+            } else {
+                0
+            },
         }
     }
 
@@ -4099,6 +4111,7 @@ impl Server {
                 gid: 0,
                 rdev: 0,
                 blksize: 4096,
+                flags: fuse::attr::LIGHTER_CALLER_UID | fuse::attr::LIGHTER_CALLER_GID,
             },
         }
     }
