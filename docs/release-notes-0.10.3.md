@@ -20,4 +20,4 @@ Gate m4-fs runs three users in turn, 1000, 2000 and root, against an unchowned 7
 
 ## Also
 
-- Linux remains **6.18.52**, with patch 0046 added. The root filesystem is 0.10.2's, byte for byte (rootfs 5d4b5934), and the data epoch remains **1**.
+- Linux remains **6.18.52**, with patch 0046 added (kernel 74880743). The root filesystem is 0.10.2's, byte for byte (rootfs 5d4b5934), and the data epoch remains **1**.
