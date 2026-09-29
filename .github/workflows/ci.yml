@@ -60,6 +60,8 @@ jobs:
         run: python3 scripts/test-boot-memory.py
       - name: Guest inbound rules match the agent
         run: python3 scripts/test-inbound-rules.py
+      - name: Every agent init starts is supervised, and the limits are raised
+        run: python3 scripts/test-agent-supervision.py
       - name: Speed gate rejects failed performance floors
         run: bash scripts/test-speed-gate.sh
       - name: Memory policy preserves live nested workloads

@@ -113,6 +113,36 @@ pub fn connect(port: u32) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Starts a non-blocking connect to a port on the host. Its end arrives as
+/// writability, and a timeout as `ETIMEDOUT` in `SO_ERROR`.
+pub fn connect_nonblocking(port: u32) -> io::Result<OwnedFd> {
+    // SAFETY: a plain socket(2) call with constant arguments.
+    let raw = unsafe {
+        libc::socket(AF_VSOCK as libc::c_int, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh fd we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let addr = SockaddrVm::new(VMADDR_CID_HOST, port);
+    // SAFETY: as in `connect`.
+    let rc = unsafe {
+        libc::connect(
+            raw,
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            size_of::<SockaddrVm>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(e);
+        }
+    }
+    Ok(fd)
+}
+
 /// A listening vsock socket.
 pub struct VsockListener {
     fd: OwnedFd,
@@ -151,6 +181,10 @@ impl VsockListener {
             return Err(io::Error::last_os_error());
         }
         Ok(VsockListener { fd })
+    }
+
+    pub fn into_fd(self) -> OwnedFd {
+        self.fd
     }
 
     /// Blocks for the next connection.

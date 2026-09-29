@@ -18,16 +18,16 @@ mod idle;
 mod inbound;
 mod memory_policy;
 mod sockmap;
+mod streams;
 mod throttle;
 mod udp;
 mod udp_inbound;
 mod vsock;
 mod warm;
 
-use std::io::{self, Read, Write};
-use std::time::{Duration, Instant};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
+use std::time::Instant;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use memory_policy::{IdleTrim, TICKS_PER_SEC, TRIM_AFTER};
 use vsock::VsockListener;
@@ -201,6 +201,9 @@ fn main() -> std::process::ExitCode {
     // seeing it means a connection now would be accepted rather than refused.
     println!("AGENT listening port={port}");
 
+    if let Some(path) = target {
+        return streams::serve(listener.into_fd(), streams::Route::Unix(path.into()), stream_env(None));
+    }
     loop {
         let stream = match listener.accept() {
             Ok(s) => s,
@@ -212,12 +215,11 @@ fn main() -> std::process::ExitCode {
         if control {
             let _ = vsock::set_buffer(&stream, STREAM_WINDOW);
         }
-        let target = target.clone();
-        std::thread::spawn(move || match (&target, control) {
-            (Some(path), _) => bridge(stream, path),
-            (None, true) => serve_control(stream),
-            (None, false) => echo_back(stream),
-        });
+        let spawned = std::thread::Builder::new().spawn(move || if control { serve_control(stream) } else { echo_back(stream) });
+        if let Err(e) = spawned {
+            // One request refused; the next may find a thread.
+            eprintln!("lighter-agent: no thread for a request: {e}");
+        }
     }
 }
 
@@ -850,12 +852,12 @@ const STREAM_PORT: u32 = 2377;
 /// kernel patch 0025 for what each retry costs). Data unacknowledged for
 /// thirty seconds ends the connection instead. A peer alive and merely not
 /// reading keeps acknowledging the probes and is not touched.
-fn ends_with_its_peer(tcp: &std::net::TcpStream) {
+fn ends_with_its_peer(fd: libc::c_int) {
     let ms: libc::c_uint = 30_000;
     // SAFETY: a live socket descriptor; the option value is the size given.
     unsafe {
         libc::setsockopt(
-            tcp.as_raw_fd(),
+            fd,
             libc::IPPROTO_TCP,
             libc::TCP_USER_TIMEOUT,
             &ms as *const libc::c_uint as *const libc::c_void,
@@ -886,113 +888,6 @@ fn joiner() -> Option<&'static sockmap::Joiner> {
             }
         })
         .as_ref()
-}
-
-/// Two sockets joined in the kernel until both are done: the kernel moves
-/// the bytes and, when either end's stream ends, shuts the other down for
-/// sending behind the last of them (guest kernel patch 0016). This thread
-/// waits for the first byte, joins, and then only waits for the hangup on
-/// both. Returns the sockets when the stream is one the join cannot carry,
-/// for the copying path.
-fn joined(
-    joiner: &sockmap::Joiner,
-    tcp: std::net::TcpStream,
-    host_read: Fd,
-    host_write: Fd,
-) -> Result<(), (std::net::TcpStream, Fd, Fd)> {
-    let (t, h) = (tcp.as_raw_fd(), host_write.0.as_raw_fd());
-    // Nothing is joined until a byte exists to carry: a connection that is
-    // opened and closed (a probe, a health check) costs the join's ten
-    // syscalls nothing, and one that is opened and left costs no psock.
-    let mut first = [
-        libc::pollfd { fd: t, events: libc::POLLIN | libc::POLLRDHUP, revents: 0 },
-        libc::pollfd { fd: h, events: libc::POLLIN | libc::POLLRDHUP, revents: 0 },
-    ];
-    loop {
-        // SAFETY: two live descriptors in a pollfd array.
-        let n = unsafe { libc::poll(first.as_mut_ptr(), 2, -1) };
-        if n >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            break;
-        }
-    }
-    let ended = libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    let data = (first[0].revents | first[1].revents) & libc::POLLIN != 0;
-    if first[1].revents & ended != 0 {
-        // The host's end of a stream that ended before the join never
-        // reaches the kernel's marker (it is queued only for a socket
-        // already joined). With nothing to carry the stream is simply over;
-        // with bytes queued the copying path carries them.
-        if !data {
-            return Ok(());
-        }
-        return Err((tcp, host_read, host_write));
-    }
-    let slots = match joiner.join(t, h) {
-        Ok(slots) => slots,
-        Err(failure) => {
-            // A peer can close between polling and map insertion. Those
-            // ordinary copying fallbacks must not produce a log per request.
-            static FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let count = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if count.is_power_of_two() || !failure.can_fallback {
-                eprintln!("lighter-agent: sockmap join failed (count={count}, copying={}): {}",
-                    failure.can_fallback, failure.error);
-            }
-            if failure.can_fallback {
-                if let Some(slots) = failure.slots { joiner.release(slots); }
-                return Err((tcp, host_read, host_write));
-            }
-            drop(tcp);
-            drop(host_read);
-            drop(host_write);
-            if let Some(slots) = failure.slots { joiner.release(slots); }
-            return Ok(());
-        }
-    };
-    // A socket reports HUP once both its directions are shut: its peer's
-    // end seen, and its own sent by the kernel behind the redirected bytes.
-    // HUP on both means neither backlog holds anything. An error on either
-    // is an abort, and the other side is closed with whatever it has.
-    let mut fds = [
-        libc::pollfd { fd: t, events: libc::POLLRDHUP, revents: 0 },
-        libc::pollfd { fd: h, events: libc::POLLRDHUP, revents: 0 },
-    ];
-    let mut hups = 0;
-    while hups < 2 {
-        // SAFETY: two descriptors (or -1 for one already done) in a pollfd array.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if n < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        let mut aborted = false;
-        for p in fds.iter_mut() {
-            if p.fd < 0 {
-                continue;
-            }
-            if p.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-                aborted = true;
-            } else if p.revents & libc::POLLHUP != 0 {
-                hups += 1;
-                p.fd = -1;
-            } else if p.revents & libc::POLLRDHUP != 0 {
-                // Level-triggered; the half-close is noted, the HUP is what
-                // is waited for now.
-                p.events = 0;
-            }
-        }
-        if aborted {
-            break;
-        }
-    }
-    // Closed before the slots go back: a closed socket has left the maps.
-    drop(tcp);
-    drop(host_read);
-    drop(host_write);
-    joiner.release(slots);
-    Ok(())
 }
 
 
@@ -1043,11 +938,19 @@ fn serve_tcp_proxy(port: u16) -> std::process::ExitCode {
         }
     };
     println!("AGENT tcp-proxy port={port}");
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        std::thread::spawn(move || forward_outbound(stream));
+    streams::serve(OwnedFd::from(listener), streams::Route::Outbound, stream_env(joiner()))
+}
+
+/// How the stream loop reaches the Mac and reads a redirected connection's
+/// destination, in the guest.
+fn stream_env(joiner: Option<&'static sockmap::Joiner>) -> streams::Env {
+    fn dial_host() -> std::io::Result<OwnedFd> {
+        vsock::connect_nonblocking(STREAM_PORT)
     }
-    std::process::ExitCode::SUCCESS
+    fn destination(fd: libc::c_int) -> Option<std::net::SocketAddr> {
+        original_destination(fd).map(|(ip, port)| std::net::SocketAddr::new(ip, port))
+    }
+    streams::Env { dial_host, destination, joiner, host_window: HOST_CONNECT_WINDOW }
 }
 
 static HOST_TIMEOUTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1065,36 +968,6 @@ static HOST_LOST_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// so the right answer to a slow host is to keep trying for as long as a
 /// client would wait, and refuse only after that.
 const HOST_CONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
-
-/// Dials the host's stream port, retrying with a growing pause for the
-/// window; a refused host (anything but a timeout) is refused at once.
-fn connect_host(port: u32) -> std::io::Result<OwnedFd> {
-    let started = std::time::Instant::now();
-    let mut pause = std::time::Duration::from_millis(250);
-    let mut attempts = 0u32;
-    loop {
-        match vsock::connect(port) {
-            Ok(fd) => {
-                if attempts > 0 {
-                    eprintln!(
-                        "lighter-agent: stream to host connected after {} attempts over {:.1}s",
-                        attempts + 1,
-                        started.elapsed().as_secs_f64()
-                    );
-                }
-                return Ok(fd);
-            }
-            Err(e) if e.raw_os_error() == Some(libc::ETIMEDOUT)
-                && started.elapsed() < HOST_CONNECT_WINDOW =>
-            {
-                attempts += 1;
-                std::thread::sleep(pause);
-                pause = (pause * 2).min(std::time::Duration::from_secs(4));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
 
 /// A host that stops answering vsock connects is, from inside, a stall with
 /// no visible cause: the control channel that would carry a diagnosis rides
@@ -1119,82 +992,6 @@ fn host_lost() {
             eprintln!("lighter-agent: {line}");
         }
     }
-}
-
-fn forward_outbound(tcp: std::net::TcpStream) {
-    let Some((ip, port)) = original_destination(tcp.as_raw_fd()) else {
-        return;
-    };
-    // An accelerator port is reached only by a container that asked for the
-    // device; the connection is dropped otherwise, which the container sees
-    // as a reset.
-    if let Some(kind) = accelerator::kind_of(port) {
-        let Ok(peer) = tcp.peer_addr() else { return };
-        if !accelerator::permitted(kind, peer.ip()) {
-            return;
-        }
-    }
-    // The vCPUs may poll rather than sleep between a model's messages, for
-    // as long as this stream is open.
-    let _wide = accelerator::Wide::open(port);
-    let host = match connect_host(STREAM_PORT) {
-        Ok(fd) => fd,
-        Err(e) => {
-            eprintln!("lighter-agent: stream to host refused: {e}");
-            if e.raw_os_error() == Some(libc::ETIMEDOUT) {
-                host_lost();
-            }
-            return;
-        }
-    };
-    HOST_TIMEOUTS.store(0, std::sync::atomic::Ordering::Relaxed);
-    let _ = vsock::set_buffer(&host, STREAM_WINDOW);
-    let mut header = [0u8; 19];
-    match ip {
-        std::net::IpAddr::V4(a) => {
-            header[0] = 4;
-            header[1..5].copy_from_slice(&a.octets());
-        }
-        std::net::IpAddr::V6(a) => {
-            header[0] = 6;
-            header[1..17].copy_from_slice(&a.octets());
-        }
-    }
-    header[17..19].copy_from_slice(&port.to_be_bytes());
-    let mut host_write = Fd(host);
-    let Ok(host_read) = host_write.try_clone() else { return };
-    if host_write.write_all(&header).is_err() {
-        return;
-    }
-    let _ = tcp.set_nodelay(true);
-    ends_with_its_peer(&tcp);
-    if _wide.is_some() {
-        accelerator::mark(tcp.as_raw_fd());
-        accelerator::mark(host_write.0.as_raw_fd());
-    }
-    let (tcp, host_read, mut host_write) = match joiner() {
-        Some(j) => match joined(j, tcp, host_read, host_write) {
-            Ok(()) => return,
-            Err(back) => back,
-        },
-        None => (tcp, host_read, host_write),
-    };
-    let mut host_read = host_read;
-    let Ok(mut tcp_read) = tcp.try_clone() else { return };
-    let mut tcp_write = tcp;
-
-    // container -> host, spliced through the kernel where it can be
-    let outbound = std::thread::spawn(move || {
-        let (tcp_fd, host_fd) = (tcp_read.as_raw_fd(), host_write.0.as_raw_fd());
-        splice_copy(&tcp_fd, &host_fd, || copy(&mut tcp_read, &mut host_write));
-        // SAFETY: a live descriptor; shutdown of the write half only, so the
-        // reply direction stays open.
-        unsafe { libc::shutdown(host_fd, libc::SHUT_WR) };
-    });
-    // host -> container
-    copy(&mut host_read, &mut tcp_write);
-    let _ = tcp_write.shutdown(std::net::Shutdown::Write);
-    let _ = outbound.join();
 }
 
 /// The host's vsock port for DNS.
@@ -1299,128 +1096,7 @@ fn serve_inbound(port: u32) -> std::process::ExitCode {
         }
     };
     println!("AGENT inbound port={port}");
-    loop {
-        let Ok(stream) = listener.accept() else { continue };
-        let _ = vsock::set_buffer(&stream, STREAM_WINDOW);
-        std::thread::spawn(move || forward_inbound(stream));
-    }
-}
-
-fn forward_inbound(host: OwnedFd) {
-    let mut host_read = Fd(host);
-    let Ok(host_write) = host_read.try_clone() else { return };
-    let mut header = [0u8; 19];
-    if host_read.read_exact(&mut header).is_err() {
-        return;
-    }
-    let Some(dst) = udp::destination_from(&header) else {
-        return;
-    };
-    // The client's own address follows when the host passes it on; the
-    // container then sees who is calling rather than this guest.
-    let client = if header[0] & 0x80 != 0 {
-        let mut c = [0u8; 19];
-        if host_read.read_exact(&mut c).is_err() {
-            return;
-        }
-        udp::destination_from(&c).filter(|c| c.is_ipv4() == dst.is_ipv4())
-    } else {
-        None
-    };
-    // Docker refuses a v6 publish on behalf of a server that binds `0.0.0.0`
-    // only, which is most of them, and on a Mac `localhost` is `::1` first.
-    // Its DNAT refuses at connect; its proxy accepts and hangs up once its
-    // own dial of the container's v6 address is refused, before a byte
-    // comes back. Either way the same port on this interface's v4 address
-    // is Docker's v4 mapping, where the server is (`inbound::v4_sibling`).
-    let on_v4 = |why: &str, queued: &[u8]| -> Option<std::net::TcpStream> {
-        let alt = inbound::v4_sibling(dst, &interfaces())?;
-        let mut t = match std::net::TcpStream::connect(alt) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("lighter-agent: inbound to {dst} {why}; and to {alt}: {e}");
-                return None;
-            }
-        };
-        if t.write_all(queued).is_err() {
-            return None;
-        }
-        static ANNOUNCED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
-            std::sync::Mutex::new(std::collections::BTreeSet::new());
-        if ANNOUNCED.lock().map(|mut a| a.insert(dst.port())).unwrap_or(false) {
-            println!("AGENT inbound port={} v6 {why}; dialling v4 {}", dst.port(), alt.ip());
-        }
-        Some(t)
-    };
-    let as_client = |client: std::net::SocketAddr| -> io::Result<std::net::TcpStream> {
-        let fd = udp::as_client(libc::SOCK_STREAM, client).ok_or_else(|| io::Error::other("cannot act as the client"))?;
-        udp::connect_to(&fd, dst)?;
-        Ok(std::net::TcpStream::from(fd))
-    };
-    let connected = match client {
-        Some(c) => as_client(c).or_else(|e| {
-            eprintln!("lighter-agent: inbound to {dst} as {c}: {e}; as the guest");
-            std::net::TcpStream::connect(dst)
-        }),
-        None => std::net::TcpStream::connect(dst),
-    };
-    let mut tcp = match connected {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused && dst.is_ipv6() => {
-            match on_v4("refused", &[]) {
-                Some(t) => t,
-                None => return,
-            }
-        }
-        Err(e) => {
-            eprintln!("lighter-agent: inbound to {dst} refused: {e}");
-            return;
-        }
-    };
-    let _ = tcp.set_nodelay(true);
-    ends_with_its_peer(&tcp);
-    // Whatever followed the header in the same packet is carried by hand
-    // before the join. The join hands sockmap whole socket buffers, and a
-    // buffer the header was read out of still holds the header: joined as
-    // it stands, the container would see the port bytes ahead of the
-    // request (it did — an HTTP server answered 501 to `;\xc7GET`).
-    let Ok(queued) = take_queued(host_read.0.as_raw_fd()) else {
-        return;
-    };
-    if tcp.write_all(&queued).is_err() {
-        return;
-    }
-    if dst.is_ipv6() && hung_up_before_answering(&tcp) {
-        match on_v4("hung up before answering", &queued) {
-            Some(t) => {
-                tcp = t;
-                let _ = tcp.set_nodelay(true);
-                ends_with_its_peer(&tcp);
-            }
-            None => return,
-        }
-    }
-    let (tcp, host_read, host_write) = match joiner() {
-        Some(j) => match joined(j, tcp, host_read, host_write) {
-            Ok(()) => return,
-            Err(back) => back,
-        },
-        None => (tcp, host_read, host_write),
-    };
-    let (mut host_read, mut host_write) = (host_read, host_write);
-    let Ok(mut tcp_read) = tcp.try_clone() else { return };
-    let mut tcp_write = tcp;
-    // host -> container
-    let inbound = std::thread::spawn(move || {
-        copy(&mut host_read, &mut tcp_write);
-        let _ = tcp_write.shutdown(std::net::Shutdown::Write);
-    });
-    // container -> host, spliced through the kernel where it can be
-    let (tcp_fd, host_fd) = (tcp_read.as_raw_fd(), host_write.0.as_raw_fd());
-    splice_copy(&tcp_fd, &host_fd, || copy(&mut tcp_read, &mut host_write));
-    // SAFETY: a live descriptor; shutdown of the write half only.
-    unsafe { libc::shutdown(host_fd, libc::SHUT_WR) };
-    let _ = inbound.join();
+    streams::serve(listener.into_fd(), streams::Route::Inbound, stream_env(joiner()))
 }
 
 /// This guest's interfaces and their addresses, as getifaddrs reports them.
@@ -1529,10 +1205,32 @@ fn serve_control(stream: OwnedFd) {
     }
 }
 
+/// init's record of restarted agents, one line of arguments per restart, as
+/// `name=count` in the order each first restarted.
+fn agent_restarts(record: &str) -> String {
+    let mut counts: Vec<(String, u32)> = Vec::new();
+    for line in record.lines() {
+        let Some(name) = line.split_whitespace().next().map(|w| w.trim_start_matches('-')) else { continue };
+        let name = if name == "port" { if line.contains("--control") { "control" } else { "docker" } } else { name };
+        match counts.iter_mut().find(|(n, _)| n == name) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((name.to_owned(), 1)),
+        }
+    }
+    if counts.is_empty() {
+        return "none".into();
+    }
+    counts.iter().map(|(n, c)| format!("{n}={c}")).collect::<Vec<_>>().join(" ")
+}
+
 fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
         (Some("ping"), _) => "pong\n".into(),
+        // Which agents init has had to restart, and how often: one line,
+        // `restarts tcp-proxy=2 dns=1`, or `restarts none`.
+        (Some("restarts"), _) => format!("restarts {}\n", agent_restarts(
+            &std::fs::read_to_string("/run/lighter/agent-restarts").unwrap_or_default())),
         // How hard the warm loop may push: the host's need, which the
         // guest's own stall then limits (`warm.rs`).
         (Some("gain"), Some(gain)) => match gain.parse::<u32>() {
@@ -1786,60 +1484,6 @@ fn sync_clock_from_host() -> Result<i128, std::io::Error> {
     Ok(trip)
 }
 
-/// Copies between the vsock connection and a unix socket until either ends.
-fn bridge(guest_side: OwnedFd, path: &str) {
-    let upstream = match UnixStream::connect(path) {
-        Ok(stream) => stream,
-        Err(e) => {
-            // The errno is the whole diagnosis here: "no such file" means the
-            // daemon has not created its socket yet, "connection refused"
-            // means it died after creating one, and "permission denied" means
-            // something quite different again. Reporting only the path sends
-            // you looking in the wrong place.
-            eprintln!("lighter-agent: cannot reach {path}: {e}");
-            return;
-        }
-    };
-    let Ok(mut upstream_read) = upstream.try_clone() else {
-        return;
-    };
-    let mut upstream_write = upstream;
-
-    // Two threads rather than poll(): the whole point of this process is to be
-    // simple enough to trust, and a stream copy in each direction is the
-    // simplest thing that cannot deadlock on a half-full pipe.
-    //
-    // The two directions are named rather than inferred. They were once both
-    // written as "guest to upstream" — which connects, forwards the request,
-    // and then hangs forever waiting for a reply nobody is carrying back.
-    let mut guest_read = Fd(guest_side);
-    let mut guest_write = match guest_read.try_clone() {
-        Ok(fd) => fd,
-        Err(_) => return,
-    };
-
-    // guest -> dockerd
-    let request = std::thread::spawn(move || {
-        copy(&mut guest_read, &mut upstream_write);
-        // Let dockerd see the end of the request rather than waiting on a
-        // connection that will send no more.
-        let _ = upstream_write.shutdown(std::net::Shutdown::Write);
-    });
-
-    // dockerd -> guest
-    copy(&mut upstream_read, &mut guest_write);
-    // The daemon has said everything it will say. The host client is owed the
-    // end of the response even though its own stdin may stay open forever —
-    // `docker exec` with a terminal for stdin does exactly that, and without
-    // this half-close it hangs on a reply that finished long ago. SHUT_WR
-    // rather than dropping the fd: the request direction may still be
-    // draining, and it ends on its own terms.
-    // SAFETY: a live descriptor; shutdown of the write half only.
-    unsafe { libc::shutdown(guest_write.0.as_raw_fd(), libc::SHUT_WR) };
-
-    let _ = request.join();
-}
-
 /// Sends back whatever arrives, so the gate can prove the round trip.
 fn echo_back(stream: OwnedFd) {
     let mut fd = Fd(stream);
@@ -1853,157 +1497,6 @@ fn echo_back(stream: OwnedFd) {
                 }
             }
         }
-    }
-}
-
-/// Moves a TCP socket's bytes to another descriptor without passing them
-/// through this process: `splice` from the socket into a pipe and from the
-/// pipe onward, both inside the kernel. The container's side of a stream is
-/// TCP, which supports it; the vsock side takes the pipe's pages through
-/// `sendmsg`. Falls back to [`copy`] on a kernel or socket that refuses,
-/// which is how the other direction still moves — a vsock socket cannot be
-/// spliced *from*.
-fn splice_copy(from: &impl AsRawFd, to: &impl AsRawFd, fallback: impl FnOnce()) {
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: a two-int array for pipe2 to fill.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return fallback();
-    }
-    // SAFETY: fresh descriptors we own.
-    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    // The pipe's capacity bounds each splice; a megabyte keeps the two
-    // calls per chunk from being the cost.
-    // SAFETY: F_SETPIPE_SZ with an int argument.
-    unsafe { libc::fcntl(wr.as_raw_fd(), libc::F_SETPIPE_SZ, 4 << 20) };
-    const CHUNK: usize = 4 << 20;
-    let mut first = true;
-    loop {
-        // SAFETY: descriptors are live; null offsets for sockets and pipes.
-        let n = unsafe {
-            libc::splice(from.as_raw_fd(), std::ptr::null_mut(), wr.as_raw_fd(), std::ptr::null_mut(), CHUNK, libc::SPLICE_F_MOVE)
-        };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if first && e.raw_os_error() == Some(libc::EINVAL) {
-                return fallback();
-            }
-            break;
-        }
-        if n == 0 {
-            break;
-        }
-        first = false;
-        let mut left = n as usize;
-        while left > 0 {
-            // SAFETY: as above.
-            let m = unsafe {
-                libc::splice(rd.as_raw_fd(), std::ptr::null_mut(), to.as_raw_fd(), std::ptr::null_mut(), left, libc::SPLICE_F_MOVE)
-            };
-            if m < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return;
-            }
-            if m == 0 {
-                return;
-            }
-            left -= m as usize;
-        }
-    }
-}
-
-/// How long a write may keep being refused for want of memory before the
-/// stream is given up: the guest reclaiming under a host that is short.
-const COPY_RETRY_WINDOW: Duration = Duration::from_secs(30);
-
-fn copy(from: &mut impl Read, to: &mut impl Write) {
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut said = false;
-    'stream: loop {
-        let n = match from.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        // Not `write_all`: a write refused for want of memory (a 256 KiB
-        // vsock packet is one linear allocation, and a fragmented guest
-        // refuses those before it is out of memory) is retried with a
-        // growing pause rather than taken as the end of the stream. Only
-        // the peer ends a stream.
-        let mut off = 0;
-        let mut pause = Duration::from_millis(1);
-        let mut refused_since: Option<Instant> = None;
-        while off < n {
-            match to.write(&buf[off..n]) {
-                Ok(0) => break 'stream,
-                Ok(m) => {
-                    off += m;
-                    refused_since = None;
-                    pause = Duration::from_millis(1);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::OutOfMemory | io::ErrorKind::WouldBlock
-                    ) || e.raw_os_error() == Some(libc::ENOBUFS) =>
-                {
-                    let since = *refused_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() > COPY_RETRY_WINDOW {
-                        eprintln!("lighter-agent: a write refused for {}s; giving the stream up: {e}", COPY_RETRY_WINDOW.as_secs());
-                        break 'stream;
-                    }
-                    if !said {
-                        eprintln!("lighter-agent: a write was refused ({e}); retrying while the guest reclaims");
-                        said = true;
-                    }
-                    std::thread::sleep(pause);
-                    pause = (pause * 2).min(Duration::from_millis(50));
-                }
-                Err(_) => break 'stream,
-            }
-        }
-    }
-    let _ = to.flush();
-}
-
-/// Copies whatever the kernel already holds for `from` to `to`, and stops
-/// when nothing more is queued right now.
-/// Whether the peer closed within a moment of connecting, before sending a
-/// byte: Docker's proxy hanging up on a v6 publish it could not complete.
-/// A server that answers ends the wait with its first byte; a slow one
-/// costs the join fifty milliseconds and its reply nothing, since the reply
-/// waits in the socket.
-fn hung_up_before_answering(tcp: &std::net::TcpStream) -> bool {
-    let mut pfd = libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLIN | libc::POLLRDHUP, revents: 0 };
-    // SAFETY: one pollfd for a live socket, a bounded wait.
-    if unsafe { libc::poll(&mut pfd, 1, 50) } <= 0 {
-        return false;
-    }
-    let mut byte = 0u8;
-    // SAFETY: a one-byte peek into a live socket.
-    let n = unsafe { libc::recv(tcp.as_raw_fd(), std::ptr::addr_of_mut!(byte).cast(), 1, libc::MSG_PEEK) };
-    n == 0 || (n < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::ConnectionReset)
-}
-
-/// The bytes queued on `from` right now, taken off it.
-fn take_queued(from: std::os::fd::RawFd) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let mut queued: libc::c_int = 0;
-        if unsafe { libc::ioctl(from, libc::FIONREAD, &mut queued) } < 0 || queued <= 0 {
-            return Ok(out);
-        }
-        let mut buf = vec![0u8; queued as usize];
-        let n = unsafe { libc::read(from, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        out.extend_from_slice(&buf[..n as usize]);
     }
 }
 
@@ -2047,6 +1540,12 @@ impl Write for Fd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restarts_are_counted_by_agent() {
+        assert_eq!(super::agent_restarts(""), "none");
+        let record = "--tcp-proxy 15201\n--dns 192.168.127.2\n--tcp-proxy 15201\n--port 2376 --control\n--port 2375 --to /run/docker.sock\n";
+        assert_eq!(super::agent_restarts(record), "tcp-proxy=2 dns=1 control=1 docker=1");
+    }
     use super::psi_avg10;
 
     #[test]
