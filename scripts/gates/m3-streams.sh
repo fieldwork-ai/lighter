@@ -401,8 +401,16 @@ code="$($D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --m
 # Docker socket. Every connection is held open, the three agents' thread
 # counts must not move, and egress must keep working. Out and in run one
 # after the other, since both draw on the Mac's 16,384 ephemeral ports; the
-# outbound connections go to two ports on the Mac for the same reason.
-echo "==> Streams by the thousand"
+# outbound connections go to two ports on the Mac for the same reason. Each
+# stream is a socket in the VMM, so the floods are sized to what this Mac
+# lets one process hold: 20,000 and 10,000 on the M5, about 4,000 on the M1
+# (kern.maxfilesperproc 10,240), where 20,000 took the VMM to its limit and
+# its control and Docker sockets stopped answering until the flood ended.
+per_process="$(sysctl -n kern.maxfilesperproc)"
+room=$(( (per_process - 2000) / 2 ))
+flood_out=$(( room < 20000 ? room : 20000 ))
+flood_in=$(( room < 10000 ? room : 10000 ))
+echo "==> Streams by the thousand ($flood_out out, $flood_in in; this Mac allows $per_process files a process)"
 python3 - <<'PY' &
 import select, socket
 listeners = []
@@ -427,7 +435,7 @@ before="$(agent_threads)"
 $D run -d --name m3s-flood --ulimit nofile=65536:65536 node:24-alpine node -e '
 const net = require("net");
 let open = 0, failed = 0; const held = [];
-for (let i = 0; i < 20000; i++) {
+for (let i = 0; i < '"$flood_out"'; i++) {
   const s = net.connect(i % 2 ? 18095 : 18094, "'"$LAN_IP"'");
   s.on("connect", () => { open++; held.push(s); }); s.on("error", () => { failed++; });
 }
@@ -451,10 +459,10 @@ const net = require("net"); const held = [];
 net.createServer(s => { held.push(s); s.on("error", () => {}); }).listen(18092);' >/dev/null 2>&1
 $D run -d --name m3s-logs alpine:3.21 sh -c 'while true; do echo tick; sleep 1; done' >/dev/null 2>&1
 for _ in $(seq 1 30); do nc -z -w 1 127.0.0.1 18092 2>/dev/null && break; sleep 1; done
-python3 - "$LIGHTER_HOME" <<'PY' >"$LIGHTER_HOME/flood-in.log" 2>&1 &
+python3 - "$LIGHTER_HOME" "$flood_in" <<'PY' >"$LIGHTER_HOME/flood-in.log" 2>&1 &
 import socket, sys, time
 held, failed, errors = [], 0, {}
-for i in range(10000):
+for i in range(int(sys.argv[2])):
     try:
         held.append(socket.create_connection(("127.0.0.1", 18092), timeout=10))
     except OSError as e:
@@ -480,8 +488,8 @@ in="$(cat "$LIGHTER_HOME/flood-in.log")"
 kill "$FLOOD_IN_PID" 2>/dev/null
 $D rm -f m3s-hold m3s-logs >/dev/null 2>&1
 echo "    outbound: $out; inbound: $in; agent threads before [$before], out [$during_out], in [$during_in]"
-[ "$out" = "open 20000 failed 0" ] && pass "20,000 outbound connections open at once" || fail "outbound flood: ${out:-no report}"
-[ "$in" = "in 10000 failed 0 logs 200" ] && pass "10,000 inbound connections and 200 followed logs at once" || fail "inbound flood: ${in:-no report}"
+[ "$out" = "open $flood_out failed 0" ] && pass "$flood_out outbound connections open at once" || fail "outbound flood: ${out:-no report}"
+[ "$in" = "in $flood_in failed 0 logs 200" ] && pass "$flood_in inbound connections and 200 followed logs at once" || fail "inbound flood: ${in:-no report}"
 if [ -n "$before" ] && [ "$before" = "$during_out" ] && [ "$before" = "$during_in" ]; then
 	pass "the stream agents' threads did not move ($before)"
 else

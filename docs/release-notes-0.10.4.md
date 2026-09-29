@@ -25,4 +25,5 @@ If containers suddenly cannot connect out while names still resolve, `lighter re
 
 ## Also
 
-- Linux remains **6.18.52** (kernel 74880743). The root filesystem is 0.10.3's with the new agent and `init` in place, and nothing else changed; the data epoch remains **1**.
+- Linux remains **6.18.52** (kernel 74880743). The root filesystem is 0.10.3's with the new agent and `init` in place and nothing else changed (rootfs b9ce2c4c); the data epoch remains **1**.
+- Network speed is unchanged, measured against 0.10.3 on an M1 in one session: joined streams 49 to 60 Gbit/s either way, a kept-alive request through a published port 135 µs. New connections to a published port are 15% faster and steadier (about 16,700 a second).
