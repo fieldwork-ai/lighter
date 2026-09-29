@@ -429,6 +429,9 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             memory.base_mib + memory.range_mib
         );
     }
+    if let Some(restarts) = &status.agent_restarts {
+        println!("  agents     restarted: {restarts} (see `lighter logs`)");
+    }
     for disk in &status.storage_waiting {
         println!("  storage    Waiting for host disk space; VM running, writes waiting.");
         println!(

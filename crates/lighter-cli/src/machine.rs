@@ -28,6 +28,9 @@ pub struct Status {
     pub storage_waiting: Vec<crate::storage_status::Waiting>,
     /// The guest's plugged memory and ceiling, with cooperative resources.
     pub memory: Option<crate::storage_status::Memory>,
+    /// Agents the guest has had to restart, as the agent reports them
+    /// (`tcp-proxy=2 dns=1`); `None` when none has or the guest cannot say.
+    pub agent_restarts: Option<String>,
 }
 
 /// The daemon that owns this home, verified with its process generation;
@@ -259,6 +262,10 @@ pub fn status() -> anyhow::Result<Status> {
     };
     let docker = docker_version_until(&socket, Instant::now() + timeout).ok();
     let footprint = pid.and_then(footprint_mib);
+    let agent_restarts = pid
+        .and_then(|_| control("restarts").ok())
+        .and_then(|reply| reply.strip_prefix("restarts ").map(str::to_owned))
+        .filter(|r| r != "none");
     Ok(Status {
         running: pid.is_some(),
         pid,
@@ -266,6 +273,7 @@ pub fn status() -> anyhow::Result<Status> {
         footprint_mib: footprint,
         storage_waiting,
         memory: report.memory,
+        agent_restarts,
     })
 }
 

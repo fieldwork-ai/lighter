@@ -16,7 +16,7 @@
 set -u
 # The connection fixture keeps a thousand sockets open. A shell inherited
 # from a GUI app may have a soft limit of only 256.
-ulimit -n 10240 || { echo "the stream gate needs a 10240-file soft limit" >&2; exit 1; }
+ulimit -n 32768 || { echo "the stream gate needs a 32768-file limit: 10,000 inbound connections are held at once" >&2; exit 1; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 LIGHTER="${LIGHTER_BIN:-target/release/lighter}"
@@ -35,12 +35,16 @@ pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
 HTTP_PID=""
 HOLD_PID=""
+FLOOD_HOLD_PID=""
+FLOOD_IN_PID=""
 cleanup() {
 	mkdir -p .logs
 	[ ! -f "$LIGHTER_HOME/machine.log" ] || cp "$LIGHTER_HOME/machine.log" .logs/m3-streams-last-boot.log
 	[ ! -f "$LIGHTER_HOME/http.log" ] || cp "$LIGHTER_HOME/http.log" .logs/m3-streams-last-http.log
 	[ -z "$HTTP_PID" ] || kill "$HTTP_PID" 2>/dev/null
 	[ -z "$HOLD_PID" ] || kill "$HOLD_PID" 2>/dev/null
+	[ -z "$FLOOD_HOLD_PID" ] || kill "$FLOOD_HOLD_PID" 2>/dev/null
+	[ -z "$FLOOD_IN_PID" ] || kill "$FLOOD_IN_PID" 2>/dev/null
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	[ -f "$LIGHTER_HOME/lighter.pid" ] && kill -9 "$(cat "$LIGHTER_HOME/lighter.pid")" 2>/dev/null || true
 	rm -rf "$LIGHTER_HOME"
@@ -170,6 +174,15 @@ else
 	echo "    container: $($D inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' m3s-v4only 2>&1 | head -1)"
 	$D logs m3s-v4only 2>&1 | tail -3 | sed 's/^/    /'
 fi
+# The same server answers and closes at once (HTTP/1.0), which races the
+# join: 0.10.4's first event loop attached the vsock end first, and a
+# container socket already closing then took the stream down with it, an
+# empty reply to one request in twenty.
+empty=0
+for _ in $(seq 1 200); do
+	[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18093/ 2>/dev/null)" = 200 ] || empty=$((empty + 1))
+done
+[ "$empty" -eq 0 ] && pass "200 requests to a server that answers and closes, every one answered" || fail "$empty of 200 requests to a server that answers and closes got no answer"
 $D stop -t 1 m3s-v4only >/dev/null 2>&1
 
 # integrity: a checksummed quarter gigabyte each way. iperf3 checks
@@ -294,6 +307,195 @@ else
 	echo "  ··   IPv6: the Mac has no v6 route; egress checks skipped"
 	[ "${aaaa:-0}" -eq 0 ] && pass "AAAA withheld on a Mac without a v6 route" || fail "IPv6: AAAA answered with no v6 route on the Mac"
 fi
+
+# The outbound proxy under a thread shortage. On 2026-09-29 the guest ran
+# out of threads (threads-max is set at boot from the RAM then, 2 GiB in
+# cooperative mode) and the proxy, a thread per connection, panicked on the
+# spawn and never came back: every container's TCP was refused until a
+# restart. Here the shortage is made on purpose: threads-max is set just
+# above the guest's count while one process opens connections that stay
+# open, then put back, and egress must still work.
+echo "==> The TCP proxy under a thread shortage"
+guest_sh() {
+	python3 - "$1" <<'PY'
+import os, socket, sys
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+    control.settimeout(30)
+    control.connect(os.path.join(os.environ['LIGHTER_HOME'], 'control.sock'))
+    control.sendall(b'sh ' + sys.argv[1].encode() + b'\n')
+    response = b''
+    while not response.endswith(b'--end--\n'):
+        chunk = control.recv(65536)
+        if not chunk:
+            break
+        response += chunk
+lines = response.decode(errors='replace').splitlines()
+print('\n'.join(l for l in lines if l != '--end--' and not l.startswith('exit=')))
+PY
+}
+tcp_proxy_alive() { guest_sh 'for p in $(pidof lighter-agent); do tr "\0" " " </proc/$p/cmdline; echo; done' | grep -q -- '--tcp-proxy'; }
+python3 - <<'PY' &
+import socket
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 18094)); srv.listen(1024)
+held = []
+while True:
+    held.append(srv.accept()[0])
+PY
+FLOOD_HOLD_PID=$!
+sleep 1
+$D run -d --name m3s-flood node:24-alpine node -e '
+const net = require("net");
+setTimeout(() => {
+  let open = 0, refused = 0, reset = 0;
+  for (let i = 0; i < 300; i++) {
+    const s = net.connect(18094, "'"$LAN_IP"'");
+    let connected = false;
+    s.on("connect", () => { connected = true; open++; });
+    s.once("error", () => { if (connected) { open--; reset++; } else { refused++; } });
+  }
+  setTimeout(() => { console.log("open " + open + " reset " + reset + " refused " + refused); process.exit(0); }, 12000);
+}, 4000);' >/dev/null 2>&1
+sleep 1
+threads_max="$(guest_sh 'cat /proc/sys/kernel/threads-max')"
+tasks="$(guest_sh 'ls -d /proc/[0-9]*/task/[0-9]* | wc -l')"
+guest_sh "sysctl -w kernel.threads-max=$((tasks + 40))" >/dev/null
+$D wait m3s-flood >/dev/null 2>&1
+guest_sh "sysctl -w kernel.threads-max=$threads_max" >/dev/null
+flood="$($D logs m3s-flood 2>&1 | tail -1)"
+$D rm -f m3s-flood >/dev/null 2>&1
+kill "$FLOOD_HOLD_PID" 2>/dev/null
+echo "    flood with threads-max at $((tasks + 40)) (from $threads_max): $flood"
+if tcp_proxy_alive; then
+	pass "the TCP proxy is still running after the shortage"
+else
+	fail "the TCP proxy died in the shortage: $(grep -m1 -A1 'panicked' "$LIGHTER_HOME/machine.log" | tr '\n' ' ')"
+fi
+if $D run --rm curlimages/curl:8.11.1 -s -o /dev/null --max-time 10 https://example.com 2>/dev/null; then
+	pass "containers reach the network after the shortage"
+else
+	fail "no container can connect out after the shortage"
+fi
+
+echo "==> An agent that dies comes back"
+limits="$(guest_sh 'cat /proc/sys/kernel/threads-max /proc/sys/kernel/pid_max' | xargs)"
+[ "$limits" = "4194304 4194304" ] && pass "threads-max and pid_max are the kernel's maximums" || fail "limits: threads-max and pid_max read $limits"
+proxy_pid="$(guest_sh 'for p in $(pidof lighter-agent); do tr "\0" " " </proc/$p/cmdline | grep -q -- --tcp-proxy && echo $p; done' | head -1)"
+guest_sh "kill -9 $proxy_pid" >/dev/null
+back=""
+for i in $(seq 1 30); do
+	if tcp_proxy_alive; then back=$i; break; fi
+	sleep 0.1
+done
+if [ -n "$back" ] && [ "$back" -le 30 ]; then
+	pass "the TCP proxy was running again $((back * 100)) ms after a kill -9"
+else
+	fail "the TCP proxy did not come back within 3 s of a kill -9"
+fi
+code="$($D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://example.com 2>/dev/null)"
+[ "$code" = 200 ] && pass "egress works after the restart" || fail "egress after the restart: http_code=${code:-none}"
+"$LIGHTER" status 2>/dev/null | grep -q "restarted: tcp-proxy=1" && pass "lighter status reports the restart" || fail "lighter status: $("$LIGHTER" status 2>&1 | grep -i agents || echo 'no agents line')"
+
+# Streams in their thousands on every route: containers' connections out,
+# the Mac's in through a published port, and `docker logs -f` through the
+# Docker socket. Every connection is held open, the three agents' thread
+# counts must not move, and egress must keep working. Out and in run one
+# after the other, since both draw on the Mac's 16,384 ephemeral ports; the
+# outbound connections go to two ports on the Mac for the same reason. Each
+# stream is a socket in the VMM, so the floods are sized to what this Mac
+# lets one process hold: 20,000 and 10,000 on the M5, about 4,000 on the M1
+# (kern.maxfilesperproc 10,240), where 20,000 took the VMM to its limit and
+# its control and Docker sockets stopped answering until the flood ended.
+per_process="$(sysctl -n kern.maxfilesperproc)"
+room=$(( (per_process - 2000) / 2 ))
+flood_out=$(( room < 20000 ? room : 20000 ))
+flood_in=$(( room < 10000 ? room : 10000 ))
+echo "==> Streams by the thousand ($flood_out out, $flood_in in; this Mac allows $per_process files a process)"
+python3 - <<'PY' &
+import select, socket
+listeners = []
+for port in (18094, 18095):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port)); s.listen(4096); s.setblocking(False); listeners.append(s)
+held = []
+while True:
+    for s in select.select(listeners, [], [])[0]:
+        try:
+            while True:
+                held.append(s.accept()[0])
+        except BlockingIOError:
+            pass
+PY
+FLOOD_HOLD_PID=$!
+agent_threads() {
+	guest_sh 'for p in $(pidof lighter-agent); do a=$(tr "\0" " " </proc/$p/cmdline); case "$a" in *--tcp-proxy*|*--inbound*|*/run/docker.sock*) echo "$(ls /proc/$p/task | wc -l)";; esac; done' | xargs
+}
+egress() { $D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://example.com 2>/dev/null; }
+before="$(agent_threads)"
+$D run -d --name m3s-flood --ulimit nofile=65536:65536 node:24-alpine node -e '
+const net = require("net");
+let open = 0, failed = 0; const held = [];
+for (let i = 0; i < '"$flood_out"'; i++) {
+  const s = net.connect(i % 2 ? 18095 : 18094, "'"$LAN_IP"'");
+  s.on("connect", () => { open++; held.push(s); }); s.on("error", () => { failed++; });
+}
+setTimeout(() => { console.log("open " + open + " failed " + failed); }, 25000);
+setTimeout(() => process.exit(0), 32000);' >/dev/null 2>&1
+sleep 27
+during_out="$(agent_threads)"
+code_out="$(egress)"
+out="$($D logs m3s-flood 2>&1 | tail -1)"
+$D wait m3s-flood >/dev/null 2>&1
+$D rm -f m3s-flood >/dev/null 2>&1
+kill "$FLOOD_HOLD_PID" 2>/dev/null
+# The closed connections hold their ports in TIME_WAIT for about thirty
+# seconds on a Mac; the VMM's own sockets are gone within five.
+sleep 5
+for _ in $(seq 1 90); do [ "$(netstat -an -p tcp | grep -c TIME_WAIT)" -lt 2000 ] && break; sleep 1; done
+echo "    ports between the floods: $(netstat -an -p tcp | grep -c TIME_WAIT) in TIME_WAIT, $(netstat -an -p tcp | grep -c ESTABLISHED) established"
+
+$D run -d --name m3s-hold -p 18092:18092 node:24-alpine node -e '
+const net = require("net"); const held = [];
+net.createServer(s => { held.push(s); s.on("error", () => {}); }).listen(18092);' >/dev/null 2>&1
+$D run -d --name m3s-logs alpine:3.21 sh -c 'while true; do echo tick; sleep 1; done' >/dev/null 2>&1
+for _ in $(seq 1 30); do nc -z -w 1 127.0.0.1 18092 2>/dev/null && break; sleep 1; done
+python3 - "$LIGHTER_HOME" "$flood_in" <<'PY' >"$LIGHTER_HOME/flood-in.log" 2>&1 &
+import socket, sys, time
+held, failed, errors = [], 0, {}
+for i in range(int(sys.argv[2])):
+    try:
+        held.append(socket.create_connection(("127.0.0.1", 18092), timeout=10))
+    except OSError as e:
+        failed += 1
+        errors[e.strerror] = errors.get(e.strerror, 0) + 1
+docker = []
+for i in range(200):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(sys.argv[1] + "/docker.sock")
+        s.sendall(b"GET /containers/m3s-logs/logs?follow=1&stdout=1 HTTP/1.1\r\nHost: docker\r\n\r\n")
+        if b"200 OK" in s.recv(4096):
+            docker.append(s)
+    except OSError:
+        pass
+print("in", len(held), "failed", failed, "logs", len(docker), *(f"({n} {e})" for e, n in errors.items()), flush=True)
+time.sleep(30)
+PY
+FLOOD_IN_PID=$!
+for _ in $(seq 1 60); do [ -s "$LIGHTER_HOME/flood-in.log" ] && break; sleep 1; done
+during_in="$(agent_threads)"
+code_in="$(egress)"
+in="$(cat "$LIGHTER_HOME/flood-in.log")"
+kill "$FLOOD_IN_PID" 2>/dev/null
+$D rm -f m3s-hold m3s-logs >/dev/null 2>&1
+echo "    outbound: $out; inbound: $in; agent threads before [$before], out [$during_out], in [$during_in]"
+[ "$out" = "open $flood_out failed 0" ] && pass "$flood_out outbound connections open at once" || fail "outbound flood: ${out:-no report}"
+[ "$in" = "in $flood_in failed 0 logs 200" ] && pass "$flood_in inbound connections and 200 followed logs at once" || fail "inbound flood: ${in:-no report}"
+if [ -n "$before" ] && [ "$before" = "$during_out" ] && [ "$before" = "$during_in" ]; then
+	pass "the stream agents' threads did not move ($before)"
+else
+	fail "agent threads before [$before], out [$during_out], in [$during_in]"
+fi
+[ "$code_out" = 200 ] && [ "$code_in" = 200 ] && pass "egress works during both floods" || fail "egress during the floods: out ${code_out:-none}, in ${code_in:-none}"
 
 # nothing on eth0 while all that happened, beyond DNS and ICMP
 echo

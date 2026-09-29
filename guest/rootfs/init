@@ -338,6 +338,14 @@ if [ -e /sys/block/zram0/disksize ] && ! grep -qw lighter.zram=0 /proc/cmdline; 
 	sysctl -q -w vm.swappiness=0 2>/dev/null || true
 fi
 
+# --- Limits ---------------------------------------------------------------
+# threads-max is set at boot from the RAM there is then, and a cooperative
+# machine boots with 2 GiB of what grows to tens: its 15,793 threads ran out
+# under a browser test and took the agent's outbound proxy with them (0.10.4).
+# Memory, the cgroups and each container's pids.max decide instead, as on any
+# server.
+sysctl -q -w kernel.threads-max=4194304 kernel.pid_max=4194304 2>/dev/null || true
+
 # --- containerd -----------------------------------------------------------
 # Started here, the moment the data disk is there, rather than by dockerd.
 # dockerd's own managed containerd is started and then polled once a second,
@@ -512,6 +520,34 @@ if [ -n "$devagent" ] && [ -f "$devagent" ]; then
 	fi
 fi
 
+# Every agent is restarted if it exits. Each one is a whole feature (the
+# Docker socket, the Mac's control, containers' TCP, DNS), and the one that
+# died in 0.10.3 took containers' egress with it until the machine restarted.
+# A restart is on the console and in /run/lighter/agent-restarts, which the
+# control channel reports.
+supervise() {
+	(
+		# Not `set -e` in here: an agent's exit is what this loop is for.
+		set +e
+		pause=1
+		while :; do
+			started=$(cut -d. -f1 /proc/uptime)
+			"$AGENT" "$@"
+			status=$?
+			if [ $(( $(cut -d. -f1 /proc/uptime) - started )) -ge 60 ]; then
+				pause=1
+			fi
+			echo "INIT agent exited: $* status=$status; restarting in ${pause}s"
+			mkdir -p /run/lighter && echo "$*" >> /run/lighter/agent-restarts
+			sleep "$pause"
+			pause=$(( pause * 2 ))
+			if [ "$pause" -gt 30 ]; then
+				pause=30
+			fi
+		done
+	) &
+}
+
 # --- Networking -----------------------------------------------------------
 # A socket may ask for a send buffer up to this; the agent asks for 8 MiB
 # on every stream, because a vsock packet's memory stays charged to its
@@ -661,13 +697,13 @@ fi
 # --- The agent ------------------------------------------------------------
 # Started last, on purpose: it is what the host connects to, and advertising it
 # before dockerd answers turns a slow start into a connection refused.
-"$AGENT" --port 2375 --to /run/docker.sock &
+supervise --port 2375 --to /run/docker.sock
 
 # The control channel, on its own port. The host uses it to put the clock right
 # after the Mac has slept: the machine has no real-time clock, so a guest whose
 # host suspended for an hour wakes an hour behind, and everything that checks a
 # certificate starts failing with an error about the certificate.
-"$AGENT" --port 2376 --control &
+supervise --port 2376 --control
 
 # --- Streams --------------------------------------------------------------
 # Every TCP connection that would leave through eth0 — from a container or
@@ -679,10 +715,10 @@ fi
 # or a bridge is left alone without listing subnets that Docker changes at
 # will.
 {
-	"$AGENT" --tcp-proxy 15201 &
-	"$AGENT" --udp-proxy 15202 &
-	"$AGENT" --inbound 2378 &
-	"$AGENT" --udp-inbound &
+	supervise --tcp-proxy 15201
+	supervise --udp-proxy 15202
+	supervise --inbound 2378
+	supervise --udp-inbound
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
 	# container and drops loopback nameservers on the way. The agent listens
@@ -690,7 +726,7 @@ fi
 	# guest's port 53 stays free for a container to publish (Pi-hole); a
 	# query the Mac forwards to that published port carries the inbound mark
 	# and is left for Docker.
-	"$AGENT" --dns 192.168.127.2 &
+	supervise --dns 192.168.127.2
 	printf 'nameserver 192.168.127.2\n' > /etc/resolv.conf
 	# The ruleset goes through a file: busybox's shell does not take a
 	# heredoc on an `if` line the way bash does, and the rule that had
