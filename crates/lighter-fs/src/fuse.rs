@@ -146,6 +146,21 @@ pub mod init2 {
     /// changed. Overall bit 57. Offered only with the notification channel
     /// live, since that is the whole basis for it.
     pub const LIGHTER_TRUST_DENTRIES: u32 = 1 << 25;
+    /// Ours, matched by guest patch 0046: an attribute flagged
+    /// [`attr::LIGHTER_CALLER_UID`] or `_GID` belongs to whoever asks.
+    /// Overall bit 56.
+    pub const LIGHTER_CALLER_OWNS: u32 = 1 << 24;
+}
+
+/// `fuse_attr.flags`.
+pub mod attr {
+    /// Ours, with [`super::init2::LIGHTER_CALLER_OWNS`]: the Mac user owns
+    /// this and no container has recorded an owner, so the guest shows it as
+    /// the caller's, as Docker Desktop does. Mainline has assigned up to
+    /// bit 1.
+    pub const LIGHTER_CALLER_UID: u32 = 1 << 30;
+    /// The same for the group.
+    pub const LIGHTER_CALLER_GID: u32 = 1 << 31;
 }
 
 /// `fuse_open_out.open_flags`.
@@ -238,6 +253,8 @@ pub struct Attr {
     pub gid: u32,
     pub rdev: u32,
     pub blksize: u32,
+    /// [`attr`] bits.
+    pub flags: u32,
 }
 
 impl Attr {
@@ -261,8 +278,7 @@ impl Attr {
         out.extend_from_slice(&self.gid.to_le_bytes());
         out.extend_from_slice(&self.rdev.to_le_bytes());
         out.extend_from_slice(&self.blksize.to_le_bytes());
-        // `flags`, which only means anything with FUSE_SUBMOUNTS.
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
     }
 }
 
