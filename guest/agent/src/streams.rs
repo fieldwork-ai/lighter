@@ -248,9 +248,11 @@ impl Loop {
         let step = conn.drive(&self.route, &self.env, now);
         let after = conn.b.as_ref().map(|b| b.as_raw_fd());
         let armed = conn.at;
-        if step == Step::Wait && after.is_some() && (after != before || conn.b_new) {
+        if step == Step::Wait
+            && let Some(fd) = after
+            && (after != before || conn.b_new)
+        {
             conn.b_new = false;
-            let fd = after.expect("checked");
             if let Err(e) = self.watch(fd, id << 1 | 1) {
                 ran_out("epoll watches", &e);
                 self.close(id);
