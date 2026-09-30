@@ -175,7 +175,7 @@ docker run --rm --device lighter.sh/metal=all -v ./models:/models llama-cpp-rpc 
 ## Home lab: Frigate, Home Assistant, Pi-hole
 
 - **Frigate supports lighter upstream** ([frigate#24453](https://github.com/blakeblackshear/frigate/pull/24453), in Frigate's next release): its `onnx` detector runs on the Neural Engine, and `preset-apple-silicon-h264` / `-h265` decode cameras on the media engine. On an 8 GB M1, one detector keeps up with 14 cameras (YOLOv9-s), against 3 for Frigate's ZMQ detector on the Mac. For today's Frigate, [`examples/frigate-ane`](examples/frigate-ane) adds the detector to Frigate's own image.
-- **Home Assistant** runs as it does anywhere else, with its media, databases and config on shared folders (container `chown` included). Its voice pipeline's speech-to-text runs on the Mac's GPU: [`examples/whisper-metal`](examples/whisper-metal) is a Wyoming whisper service that transcribes an 11 s clip in 1.3 s, against 5.8 s on the CPU.
+- **Home Assistant** runs as it does anywhere else, with its media, databases and config on shared folders. Its voice pipeline's speech-to-text runs on the Mac's GPU: [`examples/whisper-metal`](examples/whisper-metal) is a Wyoming whisper service that transcribes an 11 s clip in 1.3 s, against 5.8 s on the CPU.
 
 - **Zigbee and Z-Wave sticks:** `lighter usb attach <vendor:product>` hands a stick plugged into the Mac to the guest, under the `/dev/serial/by-id` name Linux gives it. See the [0.11.0 release notes](docs/release-notes-0.11.0.md).
 
