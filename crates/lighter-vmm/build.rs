@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 fn main() {
+    usb();
     println!("cargo:rustc-check-cfg=cfg(gpu_libs)");
     println!("cargo:rerun-if-env-changed=LIGHTER_GPU_LIBS");
     let dir = std::env::var_os("LIGHTER_GPU_LIBS")
@@ -126,5 +127,25 @@ fn main() {
             "cargo:warning=ggml archives not found in {}; building without lighter.sh/metal (host/metal/build.sh)",
             ggml.display()
         );
+    }
+}
+
+/// The IOUSBHost shim USB passthrough is built on (`src/usb/iousb.m`).
+/// Always built: IOUSBHost ships with macOS, so there is nothing to find.
+fn usb() {
+    println!("cargo:rerun-if-changed=src/usb/iousb.m");
+    println!("cargo:rerun-if-changed=src/usb/iousb.h");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    cc::Build::new()
+        .file("src/usb/iousb.m")
+        .flag("-fobjc-arc")
+        .flag("-Wall")
+        .flag("-Wextra")
+        .warnings_into_errors(true)
+        .compile("lighter_iousb");
+    for f in ["IOUSBHost", "IOKit", "Foundation", "CoreFoundation"] {
+        println!("cargo:rustc-link-lib=framework={f}");
     }
 }

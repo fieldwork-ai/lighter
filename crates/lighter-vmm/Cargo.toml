@@ -19,6 +19,9 @@ tracing.workspace = true
 vm-fdt = "0.3"
 virtio-media = { version = "0.0.8", default-features = false }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 
