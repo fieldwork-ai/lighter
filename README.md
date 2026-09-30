@@ -172,19 +172,12 @@ docker run --rm --device lighter.sh/metal=all -v ./models:/models llama-cpp-rpc 
   llama-bench -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --rpc "$LIGHTER_METAL" -ngl 99
 ```
 
-## Home lab: Frigate, Home Assistant, Zigbee, Pi-hole
+## Home lab: Frigate, Home Assistant, Pi-hole
 
 - **Frigate supports lighter upstream** ([frigate#24453](https://github.com/blakeblackshear/frigate/pull/24453), in Frigate's next release): its `onnx` detector runs on the Neural Engine, and `preset-apple-silicon-h264` / `-h265` decode cameras on the media engine. On an 8 GB M1, one detector keeps up with 14 cameras (YOLOv9-s), against 3 for Frigate's ZMQ detector on the Mac. For today's Frigate, [`examples/frigate-ane`](examples/frigate-ane) adds the detector to Frigate's own image.
 - **Home Assistant** runs as it does anywhere else, with its media, databases and config on shared folders (container `chown` included). Its voice pipeline's speech-to-text runs on the Mac's GPU: [`examples/whisper-metal`](examples/whisper-metal) is a Wyoming whisper service that transcribes an 11 s clip in 1.3 s, against 5.8 s on the CPU.
 
-- **Zigbee and Z-Wave sticks** plug into the Mac and appear in the guest as they would on a Linux box, under the same stable names, so Zigbee2MQTT, ZHA and Z-Wave JS configurations move over unchanged:
-
-  ```
-  lighter usb attach 303a:831a     # a Home Assistant Connect ZBT-2, from `lighter usb list`
-  docker run --device /dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00 …
-  ```
-
-  An attached stick stays attached across restarts and re-plugs, and goes back to macOS when detached. It answers at native speed: a ZBT-2's firmware probe takes the same 3 s through a container as on the Mac. No root and no helper app. See the [0.11.0 release notes](docs/release-notes-0.11.0.md).
+- **Zigbee and Z-Wave sticks:** `lighter usb attach <vendor:product>` hands a stick plugged into the Mac to the guest, under the `/dev/serial/by-id` name Linux gives it. See the [0.11.0 release notes](docs/release-notes-0.11.0.md).
 
 - **Pi-hole and AdGuard Home** publish DNS on port 53 (`-p 53:53/udp -p 53:53/tcp`); point your router at the Mac and every device on the network is covered. Published ports pass on each caller's own address, so Pi-hole shows your devices one by one (set its listening mode to all origins: `FTLCONF_dns_listeningMode: all`).
 
@@ -205,7 +198,6 @@ docker run --rm --device lighter.sh/metal=all -v ./models:/models llama-cpp-rpc 
 - **Kubernetes with kind:** single- and multi-node clusters with `kind`, `kubectl` and `helm`. See the [Kubernetes guide](docs/kubernetes.md).
 - **Ports and IPv6:** published ports (`-p 8080:80`) bind on the Mac; IPv6 wherever the Mac has it.
 - **Shared folders that behave:** changes on either side seen in milliseconds.
-- **USB devices:** `lighter usb attach` gives the guest a device plugged into the Mac, through Linux's own drivers. Serial devices today: tested with Zigbee coordinators, and Z-Wave and Thread sticks use the same drivers.
 - **Cooperative resources (experimental):** `lighter config --resources cooperative` uses every core and grows memory as containers need it, up to twice the Mac's RAM, giving it back when they stop. See the [0.10.0 release notes](docs/release-notes-0.10.0.md).
 - **Headless:** a background daemon or `launchd` service; no menu bar, no Electron.
 
