@@ -11,6 +11,8 @@
 #              coordinator answers, and a restart resumes the same network
 #   blz      — unattended: the ThirdReality stick forms a network the way
 #              ZHA does (zigpy, zigpy-blz at 2 Mbaud), and resumes it
+#   ha       — unattended: Home Assistant in a container, onboarded, with ZHA
+#              set up on the ThirdReality stick, ready to pair devices to
 #   pair     — a person puts the sensor and the bulb in pairing mode; both
 #              join and are interviewed
 #   devices  — the sensor reports a temperature; the bulb switches on and
@@ -33,6 +35,7 @@ ZBT_NAME=/dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00
 TR=1a86:7523
 TR_NAME=/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
 BLZ=m15p2-blz
+HA=m15p2-ha
 MQTT=m15p2-mqtt
 Z2M=m15p2-z2m
 FAILED=0
@@ -103,7 +106,7 @@ up() {
 		$D run -d --name "$MQTT" --network m15p2 --restart unless-stopped \
 			-v "$HOME2/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2 >/dev/null
 	$D inspect "$Z2M" >/dev/null 2>&1 ||
-		$D run -d --name "$Z2M" --network m15p2 --restart unless-stopped -p 8080:8080 \
+		$D run -d --name "$Z2M" --network m15p2 --restart unless-stopped -p 18080:8080 \
 			--device "$ZBT_NAME:/dev/ttyACM0" -v "$HOME2/z2m:/app/data" koenkk/zigbee2mqtt:latest >/dev/null
 	$D start "$MQTT" "$Z2M" >/dev/null 2>&1
 }
@@ -134,7 +137,7 @@ phase_network() {
 	else
 		fail "Zigbee2MQTT did not start again: $($D logs --tail 15 "$Z2M" 2>&1 | tr '\n' ' ')"
 	fi
-	note "the frontend: http://127.0.0.1:8080"
+	note "the frontend: http://127.0.0.1:18080"
 }
 
 phase_blz() {
@@ -154,6 +157,38 @@ phase_blz() {
 	second="$($D exec "$BLZ" python /t/blz-network.py /dev/tr /data/zigbee.db 2>"$HOME2/blz/second.err" | tail -1)"
 	[ "$second" = "$first" ] && pass "started again onto the same network" || fail "after a restart: '$second' (see $HOME2/blz/second.err)"
 	$D stop "$BLZ" >/dev/null 2>&1
+}
+
+phase_ha() {
+	echo "==> Home Assistant with ZHA on the ThirdReality stick"
+	up
+	wait_for 30 has_name "$TR_NAME" || { fail "the ThirdReality stick is not in the guest"; return; }
+	# One stack per stick: the zigpy container holds the same port.
+	$D stop "$BLZ" >/dev/null 2>&1
+	mkdir -p "$HOME2/ha"
+	$D inspect "$HA" >/dev/null 2>&1 ||
+		$D run -d --name "$HA" --restart unless-stopped -p 18123:8123 -e TZ=Europe/London \
+			--device "$TR_NAME:/dev/ttyUSB0" -v "$HOME2/ha:/config" ghcr.io/home-assistant/home-assistant:stable >/dev/null
+	$D start "$HA" >/dev/null 2>&1
+	if wait_for 300 curl -fs -o /dev/null http://127.0.0.1:18123/api/onboarding; then
+		pass "Home Assistant answers on http://127.0.0.1:18123"
+	else
+		fail "Home Assistant did not come up: $($D logs --tail 10 "$HA" 2>&1 | tr '\n' ' ')"
+		return
+	fi
+	local out rc
+	out="$(python3 scripts/gates/fixtures/ha-zha-setup.py http://127.0.0.1:18123 "$HOME2/ha-credentials.json" /dev/ttyUSB0 blz 2>&1)"
+	rc=$?
+	if [ $rc = 0 ] && echo "$out" | grep -q '"state": "loaded"'; then
+		pass "ZHA is set up on the ThirdReality stick and loaded: $out (sign-in: $HOME2/ha-credentials.json)"
+	elif [ $rc = 3 ]; then
+		# BLZ is not upstream in ZHA (nor in Zigbee2MQTT): it takes Bouffalo
+		# Lab's custom ZHA (bouffalolab/haos_custom_zha_blz), a person's call.
+		pass "Home Assistant is onboarded (sign-in: $HOME2/ha-credentials.json)"
+		note "$out: BLZ needs bouffalolab/haos_custom_zha_blz"
+	else
+		fail "ZHA: $out"
+	fi
 }
 
 phase_pair() {
@@ -239,7 +274,7 @@ phase_down() {
 [ $# -gt 0 ] || set -- network
 for phase in "$@"; do
 	case "$phase" in
-	network | blz | pair | devices | replug | sleep | down) "phase_$phase" ;;
+	network | blz | ha | pair | devices | replug | sleep | down) "phase_$phase" ;;
 	*) echo "unknown phase: $phase" >&2; exit 2 ;;
 	esac
 done
