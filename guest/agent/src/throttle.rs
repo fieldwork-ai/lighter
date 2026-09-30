@@ -8,7 +8,7 @@
 //! reaches it is slowed in reclaim, as the kernel does to any cgroup above
 //! its high, instead of killed. The stall wakes the agent at once (`Stall`,
 //! a trigger on the guest's memory pressure), the throttle's own count in
-//! the containers' `memory.events` says it was the edge and not some other
+//! the containers' `memory.events.local` says it was the edge and not some other
 //! reclaim, the agent's line says `need`, the host plugs more, and the edge
 //! moves up with it on the next tick. Meta's Senpai and TMO steer
 //! memory the same way, from pressure stall information and `memory.high`.
@@ -222,7 +222,9 @@ impl Throttle {
 
     /// The `high` count in `memory.events`: each is a reclaim-and-throttle.
     fn high_events(&self) -> u64 {
-        std::fs::read_to_string(format!("{}/memory.events", self.cgroup))
+        // Local: the hierarchical count also has every container below
+        // breaching a `memory.high` of its own, which is not the edge.
+        std::fs::read_to_string(format!("{}/memory.events.local", self.cgroup))
             .ok()
             .and_then(|e| {
                 e.lines()

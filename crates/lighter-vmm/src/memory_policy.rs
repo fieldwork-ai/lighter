@@ -174,10 +174,11 @@ const HEADROOM_FRACTION: u64 = 4;
 /// How long a floor set by an unplug the guest could not finish holds before
 /// a shrink may try under it again, if the guest has not grown meanwhile.
 const UNPLUG_FLOOR_HOLD: Duration = Duration::from_secs(600);
-/// While the Mac is under pressure a range grows by `GROW_STEP_MIN` at
-/// most this often, whatever asks: under the throttle's give-up of three
-/// seconds, so a burst held at the edge is still met by growth rather than
-/// the OOM killer, and slow enough that the Mac is not swapping for it.
+/// While the Mac is under pressure short of Critical, a range grows by
+/// `GROW_STEP_MIN` at most this often, whatever asks: under the throttle's
+/// give-up of three seconds, so a burst held at the edge is still met by
+/// growth rather than the OOM killer, and slow enough that the Mac is not
+/// swapping for it.
 const PRESSED_GROW_EVERY: Duration = Duration::from_secs(2);
 const HEADROOM_MIN: u64 = 1 << 30;
 
@@ -391,6 +392,9 @@ struct CompressionState {
     overcommitted: bool,
     /// Until when a Warn or Critical is remembered.
     pressure_until: Option<Instant>,
+    /// Until when a Critical is remembered: the guest does not grow at
+    /// all until then.
+    critical_until: Option<Instant>,
     /// The guest's memory stall averages over ten seconds, hundredths of a
     /// percent: some task stalled, every task stalled.
     stall_some: u32,
@@ -413,6 +417,24 @@ impl CompressionState {
         level != Pressure::Normal as u32
             || self.overcommitted
             || self.pressure_until.is_some_and(|until| now < until)
+    }
+
+    /// Whether the host is at Critical, or was within the last minute: a
+    /// Critical that reads Normal a minute later is the level bouncing
+    /// (Critical, Normal, Warn within a minute on 2026-09-30).
+    fn critical(&self, level: u32, now: Instant) -> bool {
+        level == Pressure::Critical as u32 || self.critical_until.is_some_and(|until| now < until)
+    }
+
+    /// The level moved from `previous` to `level`.
+    fn level_changed(&mut self, previous: u32, level: Pressure, now: Instant) {
+        self.quiet_polls = 0;
+        if level != Pressure::Normal {
+            self.pressure_until = Some(now + PRESSURE_MEMORY);
+        }
+        if level == Pressure::Critical || previous == Pressure::Critical as u32 {
+            self.critical_until = Some(now + PRESSURE_MEMORY);
+        }
     }
 }
 
@@ -474,12 +496,37 @@ impl Steering {
             .map_or(self.ram_bytes, |m| m.state().total_bytes())
     }
 
-    /// Whether the Mac is under pressure by any of its signs.
-    fn pressed(&self) -> bool {
-        self.compression
+    /// How fast the Mac lets the guest grow now (`Pace`). Not at all at
+    /// Critical: a guest that needs more then waits at the throttle's
+    /// edge, and past its give-up its own kernel reclaims or kills within
+    /// the containers, where a Mac that is swapping wedges everything on
+    /// it. Paced growth at Critical took a guest from 28 to 47 GiB on a
+    /// 32 GiB Mac in seven minutes (0.10.2, 2026-09-30).
+    fn pace(&self) -> Pace {
+        let now = Instant::now();
+        let level = self.level.load(Ordering::Relaxed);
+        {
+            let state = self
+                .compression
+                .lock()
+                .expect("compression policy poisoned");
+            if !state.pressed(level, now) {
+                return Pace::Free;
+            }
+            if state.critical(level, now) {
+                return Pace::Hold;
+            }
+        }
+        if self
+            .grew_pressed
             .lock()
-            .expect("compression policy poisoned")
-            .pressed(self.level.load(Ordering::Relaxed), Instant::now())
+            .expect("pressed growth poisoned")
+            .is_some_and(|at| at.elapsed() < PRESSED_GROW_EVERY)
+        {
+            Pace::Hold
+        } else {
+            Pace::Step
+        }
     }
 
     /// Whether the Mac could give the guest `bytes` for its cache: under no
@@ -515,18 +562,7 @@ impl Steering {
         *self.last_line.lock().expect("last line poisoned") = line;
         let state = mem.state();
         let plugged = state.plugged_bytes();
-        let pace = if !self.pressed() {
-            Pace::Free
-        } else if self
-            .grew_pressed
-            .lock()
-            .expect("pressed growth poisoned")
-            .is_some_and(|at| at.elapsed() < PRESSED_GROW_EVERY)
-        {
-            Pace::Hold
-        } else {
-            Pace::Step
-        };
+        let pace = self.pace();
         let demand = if need {
             Demand::Need
         } else if release && self.room_for(headroom(state.total_bytes())) {
@@ -1303,14 +1339,11 @@ impl Observer for Levels {
                 cap_mib = (u64::from(cap_pages(level as u32, steering.total_bytes())) * BALLOON_PAGE_SIZE) >> 20,
                 "host memory pressure changed"
             );
-            let mut state = steering
+            steering
                 .compression
                 .lock()
-                .expect("compression policy poisoned");
-            state.quiet_polls = 0;
-            if level != Pressure::Normal {
-                state.pressure_until = Some(Instant::now() + PRESSURE_MEMORY);
-            }
+                .expect("compression policy poisoned")
+                .level_changed(previous, level, Instant::now());
         }
         steering.apply();
     }
@@ -1493,7 +1526,8 @@ enum Pace {
     Free,
     /// Under pressure: `GROW_STEP_MIN`, once per `PRESSED_GROW_EVERY`.
     Step,
-    /// Under pressure, and the guest grew within the interval: not yet.
+    /// At Critical, or under pressure with the guest grown within the
+    /// interval: not now.
     Hold,
 }
 
@@ -1518,7 +1552,7 @@ enum Sizing {
 ///   busy guest's lines come every quarter-second.
 /// - With the Mac under pressure, any growth is `GROW_STEP_MIN` at most
 ///   once per `PRESSED_GROW_EVERY` (`Pace`), and the throttle paces the
-///   work rather than the Mac swapping for it.
+///   work rather than the Mac swapping for it; at Critical there is none.
 /// - `Room` (free memory low but available memory fine: page cache filling
 ///   the guest, with the Mac under no pressure and memory to spare) grows
 ///   by a headroom, so a working set of files stays cached as it would in
@@ -2043,14 +2077,39 @@ mod tests {
 
     /// What `Levels::pressure` does, for a `Steering` held by value.
     fn pressure(steering: &Steering, level: Pressure) {
-        if steering.level.swap(level as u32, Ordering::Relaxed) != level as u32 {
-            let mut state = steering.compression.lock().unwrap();
-            state.quiet_polls = 0;
-            if level != Pressure::Normal {
-                state.pressure_until = Some(Instant::now() + PRESSURE_MEMORY);
-            }
+        let previous = steering.level.swap(level as u32, Ordering::Relaxed);
+        if previous != level as u32 {
+            steering
+                .compression
+                .lock()
+                .unwrap()
+                .level_changed(previous, level, Instant::now());
         }
         steering.apply();
+    }
+
+    /// The Mac's level sets how fast the guest may grow: freely at Normal,
+    /// a paced step at Warn, and not at all at Critical or for a minute
+    /// after it, whatever the level reads meanwhile.
+    #[test]
+    fn critical_holds_every_growth_for_a_minute_after_it() {
+        let (steering, _) = steering_for_tests(8 << 30);
+        assert_eq!(steering.pace(), Pace::Free);
+        pressure(&steering, Pressure::Warn);
+        assert_eq!(steering.pace(), Pace::Step);
+        pressure(&steering, Pressure::Critical);
+        assert_eq!(steering.pace(), Pace::Hold);
+        // Guillaume's Mac: Critical, then Normal and Warn within a minute.
+        pressure(&steering, Pressure::Normal);
+        assert_eq!(steering.pace(), Pace::Hold, "Normal just after Critical");
+        pressure(&steering, Pressure::Warn);
+        assert_eq!(steering.pace(), Pace::Hold, "Warn just after Critical");
+        // The minute runs from when Critical ended.
+        steering.compression.lock().unwrap().critical_until = Some(Instant::now());
+        assert_eq!(steering.pace(), Pace::Step, "Warn a minute after");
+        steering.compression.lock().unwrap().pressure_until = Some(Instant::now());
+        pressure(&steering, Pressure::Normal);
+        assert_eq!(steering.pace(), Pace::Free);
     }
 
     /// A guest that has said it is fine, and long enough ago: the ramp's
