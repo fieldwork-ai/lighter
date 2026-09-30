@@ -38,6 +38,11 @@ Also refused:
 
 Devices that need isochronous transfers (webcams, audio interfaces) are not supported yet.
 
+## Tips for Zigbee and Z-Wave containers
+
+- **Give the container `restart: unless-stopped`.** When the Mac sleeps, a coordinator like the ZBT-2 stays powered and can declare its host gone, and Zigbee2MQTT exits; the restart puts it back on the same network in about a second.
+- **After unplugging a stick, start its container again once the stick is back.** Docker's own restart runs while the device is missing, fails, and gives up, on lighter as on any Linux host.
+
 ## If lighter is killed
 
 A device lighter holds is out of macOS's reach until it is given back. If the machine's process dies holding devices, even with `kill -9`, a small keeper process gives them back to macOS within a second. The next start repairs anything left over, for instance after a power cut.
