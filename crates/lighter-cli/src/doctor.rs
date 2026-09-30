@@ -131,6 +131,23 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("guest filesystem", e.to_string(), "set LIGHTER_GUEST_DIR"),
     });
 
+    match crate::service::configured_executable() {
+        Ok(None) => {}
+        Ok(Some(exe)) if exe.exists() => {
+            findings.push(Finding::good("login agent", exe.display().to_string()))
+        }
+        Ok(Some(exe)) => findings.push(Finding::bad(
+            "login agent",
+            format!("names {}, which no longer exists", exe.display()),
+            "`lighter install` registers the installed release",
+        )),
+        Err(e) => findings.push(Finding::bad(
+            "login agent",
+            e.to_string(),
+            "`lighter install`",
+        )),
+    }
+
     // The accelerator devices: each is on when its host component is in
     // the binary (the GPU, the Neural Engine, ggml) or on the Mac (torch).
     let config = crate::config::Config::load().unwrap_or_default();

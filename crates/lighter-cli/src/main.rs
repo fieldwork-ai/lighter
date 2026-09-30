@@ -211,6 +211,9 @@ fn main() -> std::process::ExitCode {
             | Command::InstallArchive { .. }
     ) {
         updates::notice();
+        if let Err(e) = service::heal() {
+            eprintln!("lighter: could not point the login agent at the installed release: {e}");
+        }
     }
     match dispatch(cli.command) {
         Ok(code) => code,
