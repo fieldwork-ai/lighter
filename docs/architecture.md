@@ -125,6 +125,31 @@ A process that sizes itself from `MemTotal` at start (a JVM's default heap) sees
 
 Under a hypervisor, WFI parks the host thread, and waking it costs the sender a trap and the receiver a scheduler round trip: 19 µs between two vCPUs, where a thread pool hands off constantly. An idle guest CPU therefore spins briefly first, with `TIF_POLLING_NRFLAG` set so a waker writes a flag instead of sending an interrupt (patch 0011): 2.9 µs, and npm on the M5's own disk went from 8.3 s to 5.1. The spin pays only while it catches wakeups (patch 0039): a poll that times out halves the window, a CPU whose spinning costs more than 50 µs per caught wakeup backs off, and the window is shorter where the vCPUs fill the host's cores. A container's stream to an accelerator widens it while a model is talking, which keeps a Metal token loop at full rate. The host's queue pollers back off the same way. An idle machine costs 5 ms of CPU a second on the M5.
 
+## USB
+
+A USB device plugged into the Mac reaches a container as it would on a Linux box, through Linux's own drivers (0.11.0). The Mac serves it over USB/IP, the protocol Linux's `vhci-hcd` speaks, on a vsock stream per device. The agent hands the stream to `vhci` through sysfs, and from then on the kernel owns it: the device enumerates as if plugged into a port, `cdc_acm` or a USB-to-serial driver binds, and a container names the device by the stable path Linux hosts use (`/dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00`), which the agent keeps from the kernel's uevents, since the guest has no udev.
+
+**Taken as the user.** macOS gates taking a device from its driver (`DeviceCapture`) behind the `com.apple.vm.device-access` entitlement or root. Asking the driver to let go (`DeviceSeize`) is not gated, and Apple's drivers, kernel and DriverKit alike, let go. The device is then unconfigured, which detaches macOS's interface drivers, and the guest configures it itself, as a freshly plugged device. Giving it back is configuring it again with macOS's drivers matched. A seized device is not reset when its holder dies, so a crash would leave it out of macOS's reach until it was unplugged. A keeper process, started by the machine in a session of its own, gives back whatever the machine's record lists when the machine exits, however it exits. The next machine to start repairs any leftovers, under the same lock.
+
+**One thread, nothing waited on.** Every attached device's session runs on one thread. A URB starts at once as an asynchronous IOUSBHost request, and completes from the device's own dispatch queue into the session. That includes the operations IOUSBHost offers only synchronously, `SET_CONFIGURATION` and `SET_INTERFACE`, which Linux's own server carries out rather than forwards and which run as blocks on that queue. A serial driver's bulk in, waiting hours for a Zigbee frame, costs a map entry.
+
+- **Unlinks** follow Linux's server exactly: an unlinked URB is answered by the unlink alone. macOS aborts a whole pipe, never one request, so the URBs caught beside it are submitted again when nothing moved, and answered short when something did.
+- **Backpressure:** what a session holds (replies unwritten, and the data its pending URBs carry or await) is bounded, and past the bound it stops taking commands.
+- **The stream** to the guest is the reactor's, like any other.
+
+**Kept in line.** The configuration names the devices wanted (`lighter usb attach`). A manager attaches each whenever it is present, woken by IOKit when a device arrives, and detaches what is no longer wanted. A session that ends soon after it began is retried with a back-off: the guest's agent not listening yet at boot is the usual case.
+
+**What is refused, unless `--force`:**
+- input devices, since a keyboard taken from macOS is a Mac with no keyboard;
+- storage, which macOS may have mounted;
+- hubs;
+- a device whose serial port a Mac program has open, named in the refusal;
+- Bluetooth adapters, which are not supported yet.
+
+Isochronous transfers (audio, video, a Bluetooth adapter's voice channel) are answered with `-EOPNOTSUPP` for now.
+
+**Speed.** Through a container, the ZBT-2's firmware probe took 3.02–3.11 s against 2.98–2.99 s natively, of which about 40 ms is `docker exec`. The ThirdReality dongle's BLZ requests at 2 Mbaud take 4.5 ms either way. Gate m15 checks both.
+
 ## Testing
 
 Unit tests are fast and prove much less than the gates. Each gate is a script that boots a real machine and checks a real claim, and a release passes all of them on the exact build it ships.
@@ -141,5 +166,6 @@ Unit tests are fast and prove much less than the gates. Each gate is a script th
 | m7 | x86-64 containers run under Rosetta |
 | m8 | a day's stack survives a night's sleep |
 | m9 to m14 | the GPU, the Neural Engine, PyTorch, Metal, video decode and video encode |
+| m15 | USB devices on the Mac reach containers, answer at native speed, come and go, and go back to macOS whatever happens (part one unattended, part two with a person pairing radios and unplugging sticks) |
 
 GitHub's macOS runners are virtual machines without nested virtualization, so CI runs the unit tests and nothing that boots a guest; the gates run on real Macs. Benchmarks are `benchmarks/compare.sh`, one runtime at a time on a settled Mac; [`measuring.md`](measuring.md) says which instrument answers which question.

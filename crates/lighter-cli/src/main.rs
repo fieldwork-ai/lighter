@@ -471,6 +471,12 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             memory.base_mib + memory.range_mib
         );
     }
+    if let Some(entries) = usb::status() {
+        for e in entries {
+            let detail = if e.detail.is_empty() { String::new() } else { format!(" ({})", e.detail) };
+            println!("  usb        {} {}{detail}", e.spec, e.status);
+        }
+    }
     if let Some(restarts) = &status.agent_restarts {
         println!("  agents     restarted: {restarts} (see `lighter logs`)");
     }

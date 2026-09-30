@@ -169,6 +169,12 @@ pub fn keeper(parent: u32) -> anyhow::Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// Where each attached device stands, for `lighter status`; `None` when the
+/// machine is not running or has none.
+pub fn status() -> Option<Vec<Entry>> {
+    ask("status").filter(|entries| !entries.is_empty())
+}
+
 /// Asks the running machine, if there is one: `reload` or `status`.
 fn ask(request: &str) -> Option<Vec<Entry>> {
     let home = crate::paths::home().ok()?;
