@@ -471,3 +471,30 @@ int lighter_usb_port_holder(const char *path, int32_t *pid, char *name, size_t n
     free(pids);
     return found;
 }
+
+static void drain(void *refcon, io_iterator_t it) {
+    void **pair = refcon;
+    io_service_t s;
+    int any = 0;
+    while ((s = IOIteratorNext(it))) {
+        IOObjectRelease(s);
+        any = 1;
+    }
+    if (any) ((void (*)(void *))pair[1])(pair[0]);
+}
+
+void lighter_usb_watch(void *ctx, void (*arrived)(void *ctx)) {
+    IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault);
+    IONotificationPortSetDispatchQueue(port, dispatch_queue_create("dev.lighter.usb.watch", DISPATCH_QUEUE_SERIAL));
+    void **pair = calloc(2, sizeof(void *));
+    pair[0] = ctx;
+    pair[1] = (void *)arrived;
+    io_iterator_t it = IO_OBJECT_NULL;
+    if (IOServiceAddMatchingNotification(port, kIOFirstMatchNotification, IOServiceMatching("IOUSBHostDevice"),
+                                         drain, pair, &it) == KERN_SUCCESS) {
+        // Arming the notification means draining what matches now; those
+        // are not arrivals.
+        io_service_t s;
+        while ((s = IOIteratorNext(it))) IOObjectRelease(s);
+    }
+}

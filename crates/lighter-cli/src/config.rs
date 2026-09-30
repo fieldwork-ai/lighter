@@ -55,6 +55,19 @@ pub struct Config {
     /// on the Mac's media engine, for stock ffmpeg's `h264_v4l2m2m`. On by
     /// default; costs nothing until a container opens it.
     pub video: bool,
+    /// USB devices on the Mac the guest has, as if plugged into it (`lighter
+    /// usb attach`), attached whenever they are plugged in and the machine
+    /// runs.
+    pub usb: Vec<UsbDevice>,
+}
+
+/// A USB device the guest has: `vendor:product[:serial]`, in hex, and
+/// whether it was attached against a default refusal (`--force`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbDevice {
+    pub spec: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// How the machine is sized.
@@ -137,6 +150,7 @@ impl Default for Config {
             torch_python: String::new(),
             metal: true,
             video: true,
+            usb: Vec::new(),
         }
     }
 }

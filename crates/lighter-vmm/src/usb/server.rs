@@ -76,6 +76,8 @@ enum Event {
     Done(Done),
     /// The device went away (unplugged, or taken back by macOS).
     Gone,
+    /// Detached on the Mac's side: the guest sees the device unplugged.
+    End,
 }
 
 /// Where a session's device reports, from any thread.
@@ -160,6 +162,12 @@ impl Server {
     pub fn serve(&self, sink: &Sink, socket: UnixStream, device: Box<dyn Device>) {
         self.shared.arrivals.lock().expect("usb arrivals poisoned").push((sink.id, socket, device));
         self.shared.wake();
+    }
+
+    /// Ends a session: the guest sees its device unplugged, and the device
+    /// goes back to macOS.
+    pub fn end(&self, sink: &Sink) {
+        self.shared.post(sink.id, Event::End);
     }
 
     /// Whether a session is still being served.
@@ -310,6 +318,7 @@ impl Loop {
                     tracing::info!(session = id, "usb: the device went away");
                     self.end(id);
                 }
+                Event::End => self.end(id),
             }
         }
     }
@@ -753,6 +762,15 @@ mod tests {
         let mut chunk = [0u8; 16];
         assert_eq!(r.guest.read(&mut chunk).unwrap(), 0, "the guest sees the stream end");
         assert!(!r.server.serving(&r.sink));
+    }
+
+    #[test]
+    fn ending_a_session_unplugs_it_for_the_guest_and_gives_the_device_back() {
+        let mut r = rig();
+        r.server.end(&r.sink);
+        assert_eq!(r.call(), Call::Close);
+        let mut chunk = [0u8; 16];
+        assert_eq!(r.guest.read(&mut chunk).unwrap(), 0);
     }
 
     #[test]

@@ -281,6 +281,12 @@ pub fn machine() -> anyhow::Result<()> {
         machine.proxy_socket(&path, port)?;
     }
     lighter_vmm::streams::start(machine.vsock())?;
+    // USB devices the configuration names, attached whenever they are
+    // plugged in (`lighter usb attach`).
+    let _usb = match lighter_vmm::streams::reactor() {
+        Some(reactor) => Some(crate::usb::Server::start(&home, reactor)?),
+        None => None,
+    };
     // The doctor asks this process, not a shell, to reach a device on the
     // local network, since the permission is this process's; and the
     // process asks macOS for it now, once, rather than at the first

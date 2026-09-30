@@ -51,6 +51,20 @@ unsafe extern "C" {
     fn lighter_usb_abort(d: *mut Raw, endpoint: u8);
     fn lighter_usb_close(d: *mut Raw);
     fn lighter_usb_port_holder(path: *const c_char, pid: *mut i32, name: *mut c_char, name_len: usize) -> i32;
+    fn lighter_usb_watch(ctx: *mut c_void, arrived: extern "C" fn(*mut c_void));
+}
+
+/// Calls `arrived` whenever a USB device appears on the Mac, for the life of
+/// the process.
+pub fn watch(arrived: Box<dyn Fn() + Send + Sync>) {
+    extern "C" fn trampoline(ctx: *mut c_void) {
+        // SAFETY: the Box leaked below, alive for the process.
+        let f = unsafe { &*(ctx as *const Box<dyn Fn() + Send + Sync>) };
+        f();
+    }
+    let ctx = Box::into_raw(Box::new(arrived)) as *mut c_void;
+    // SAFETY: a callback and a context that live as long as the process.
+    unsafe { lighter_usb_watch(ctx, trampoline) };
 }
 
 /// USB speeds as the guest's `vhci-hcd` wants them (`enum usb_device_speed`).

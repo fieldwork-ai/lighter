@@ -62,3 +62,7 @@ void lighter_usb_close(lighter_usb *d);
 
 // Whether a process other than this one holds `path` open, and its pid.
 int lighter_usb_port_holder(const char *path, int32_t *pid, char *name, size_t name_len);
+
+// Calls `arrived(ctx)` whenever a USB device appears on the Mac, from a
+// queue of its own, for as long as the process runs.
+void lighter_usb_watch(void *ctx, void (*arrived)(void *ctx));

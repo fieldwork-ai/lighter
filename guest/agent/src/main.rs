@@ -22,6 +22,7 @@ mod streams;
 mod throttle;
 mod udp;
 mod udp_inbound;
+mod usb;
 mod vsock;
 mod warm;
 
@@ -63,6 +64,7 @@ fn main() -> std::process::ExitCode {
     let mut dns: Option<String> = None;
     let mut udp_proxy: Option<u16> = None;
     let mut udp_inbound = false;
+    let mut usb: Option<u32> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -93,6 +95,9 @@ fn main() -> std::process::ExitCode {
             // The other direction for UDP: the host's flows to published
             // UDP ports arrive on one vsock stream (see udp_inbound.rs).
             "--udp-inbound" => udp_inbound = true,
+            // USB devices from the Mac: each on a vsock stream, attached to
+            // vhci-hcd, with /dev/serial/by-id kept (see usb.rs).
+            "--usb" => usb = args.next().and_then(|v| v.parse().ok()),
             "--bpf-rollback-test" => {
                 return match sockmap::check_failed_join() {
                     Ok(()) => std::process::ExitCode::SUCCESS,
@@ -112,6 +117,9 @@ fn main() -> std::process::ExitCode {
 
     if let Some(port) = tcp_proxy {
         return serve_tcp_proxy(port);
+    }
+    if let Some(port) = usb {
+        return usb::serve(port);
     }
     if let Some(port) = inbound {
         return serve_inbound(port);

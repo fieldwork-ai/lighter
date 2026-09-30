@@ -6,5 +6,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod iousb;
+#[cfg(target_os = "macos")]
+pub mod manager;
 pub mod server;
 pub mod usbip;
