@@ -498,3 +498,33 @@ void lighter_usb_watch(void *ctx, void (*arrived)(void *ctx)) {
         while ((s = IOIteratorNext(it))) IOObjectRelease(s);
     }
 }
+
+int lighter_usb_restore(uint64_t registry_id, char *error, size_t error_len) {
+    @autoreleasepool {
+        io_service_t service =
+            IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(registry_id));
+        if (service == IO_OBJECT_NULL) return 0;
+        NSError *e = nil;
+        IOUSBHostDevice *device = [[IOUSBHostDevice alloc] initWithIOService:service
+                                                                      options:IOUSBHostObjectInitOptionsDeviceSeize
+                                                                        queue:nil
+                                                                        error:&e
+                                                              interestHandler:nil];
+        IOObjectRelease(service);
+        if (!device) {
+            snprintf(error, error_len, "%s (0x%08x)", e.localizedDescription.UTF8String, (unsigned)e.code);
+            return -1;
+        }
+        const IOUSBDeviceDescriptor *dd = device.deviceDescriptor;
+        [device configureWithValue:0 matchInterfaces:YES error:&e];
+        const IOUSBConfigurationDescriptor *cd =
+            dd && dd->bNumConfigurations ? [device configurationDescriptorWithIndex:0 error:&e] : NULL;
+        BOOL ok = cd ? [device configureWithValue:cd->bConfigurationValue matchInterfaces:YES error:&e] : NO;
+        [device destroy];
+        if (!ok) {
+            snprintf(error, error_len, "%s (0x%08x)", e.localizedDescription.UTF8String, (unsigned)e.code);
+            return -1;
+        }
+        return 0;
+    }
+}

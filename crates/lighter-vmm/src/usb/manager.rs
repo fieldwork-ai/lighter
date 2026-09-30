@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -88,6 +89,43 @@ pub enum Status {
     Retrying(String),
 }
 
+/// The record of held devices: registry ids, one per line. Written whole and
+/// renamed into place, so a reader never sees half of it.
+fn write_held(path: &Path, ids: &[u64]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let body: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Gives back to macOS every device the record lists: a lighter that died
+/// holding them left them seized and unconfigured, invisible to macOS until
+/// replugged. Run by the keeper when the machine's process exits, and by
+/// the next machine at start. A lock keeps the two apart, since two seizes
+/// of one device take it from each other.
+pub fn restore_held(path: &Path) {
+    let Ok(lock) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("lock")) else {
+        return;
+    };
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on a descriptor we hold for the whole function.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    let ids: Vec<u64> = std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    for id in &ids {
+        match iousb::restore(*id) {
+            Ok(()) => tracing::info!(registry_id = id, "usb: gave a device back to macOS"),
+            Err(e) => tracing::warn!(registry_id = id, "usb: could not give a device back to macOS: {e}"),
+        }
+    }
+    let _ = write_held(path, &[]);
+    // SAFETY: as above.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+}
+
 /// Why a device is not attached without `force`, or `None`.
 pub fn refusal(info: &Info) -> Option<String> {
     if info.has_interface_class(0xe0) {
@@ -119,9 +157,14 @@ struct State {
     status: HashMap<Spec, Status>,
     next_devid: u32,
     changed: bool,
+    /// The registry ids last written to the held record.
+    recorded: Vec<u64>,
 }
 
 pub struct Manager {
+    /// Where the devices this process holds are recorded, for whoever gives
+    /// them back if it dies holding them (`restore_held`).
+    held: PathBuf,
     server: Server,
     reactor: Arc<crate::reactor::Reactor>,
     state: Mutex<State>,
@@ -129,8 +172,12 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn start(reactor: Arc<crate::reactor::Reactor>) -> std::io::Result<Arc<Manager>> {
+    pub fn start(reactor: Arc<crate::reactor::Reactor>, held: PathBuf) -> std::io::Result<Arc<Manager>> {
+        // Devices a lighter that crashed left seized go back to macOS first;
+        // the wanted ones are seized again below.
+        restore_held(&held);
         let manager = Arc::new(Manager {
+            held,
             server: Server::start()?,
             reactor,
             state: Mutex::new(State {
@@ -140,6 +187,7 @@ impl Manager {
                 status: HashMap::new(),
                 next_devid: 0x0001_0001,
                 changed: false,
+                recorded: Vec::new(),
             }),
             wake: Condvar::new(),
         });
@@ -196,6 +244,18 @@ impl Manager {
     }
 
     fn reconcile(&self, state: &mut State) {
+        self.reconcile_devices(state);
+        let mut held: Vec<u64> = state.sessions.values().map(|s| s.registry_id).collect();
+        held.sort_unstable();
+        if held != state.recorded {
+            match write_held(&self.held, &held) {
+                Ok(()) => state.recorded = held,
+                Err(e) => tracing::warn!("usb: cannot record the devices held: {e}"),
+            }
+        }
+    }
+
+    fn reconcile_devices(&self, state: &mut State) {
         let present = iousb::list();
         let now = Instant::now();
         // Detach what is no longer wanted.

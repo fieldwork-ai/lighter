@@ -76,6 +76,13 @@ enum Command {
     },
     /// Stop the machine.
     Stop,
+    /// Gives attached USB devices back to macOS when the machine's process
+    /// exits; started by the machine.
+    #[command(hide = true, name = "usb-keeper")]
+    UsbKeeper {
+        #[arg(long)]
+        parent: u32,
+    },
     /// USB devices on the Mac, attached to the guest as if plugged into it.
     Usb {
         #[command(subcommand)]
@@ -267,6 +274,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             UsbAction::Detach { spec } => usb::detach(&spec),
             UsbAction::LsSerial => usb::ls_serial(),
         },
+        Command::UsbKeeper { parent } => usb::keeper(parent),
         Command::AneHost { port, cache } => {
             ane_host::serve(port, &cache)?;
             Ok(std::process::ExitCode::SUCCESS)

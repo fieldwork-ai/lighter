@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, UsbDevice};
 
 const SOCKET: &str = "usb.sock";
+/// The devices the machine holds, for the keeper (`keeper`).
+const HELD: &str = "usb-held.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -67,7 +69,8 @@ pub struct Server {
 
 impl Server {
     pub fn start(home: &Path, reactor: Arc<lighter_vmm::reactor::Reactor>) -> anyhow::Result<Server> {
-        let manager = Manager::start(reactor)?;
+        let manager = Manager::start(reactor, home.join(HELD))?;
+        spawn_keeper();
         manager.set(wants(&Config::load()?));
         let path = home.join(SOCKET);
         let _ = std::fs::remove_file(&path);
@@ -100,6 +103,55 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Starts the keeper: a process of its own that outlives this one, and gives
+/// back to macOS whatever this one held when it exits, however it exits. A
+/// seized device is not reset when its holder dies, so a machine killed with
+/// its devices attached would otherwise leave them unconfigured and out of
+/// macOS's reach until they were unplugged.
+fn spawn_keeper() {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["usb-keeper", "--parent", &std::process::id().to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: setsid is async-signal-safe; a session of its own keeps it out
+    // of a signal to the machine's process group.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    if let Err(e) = command.spawn() {
+        tracing::warn!("usb: no keeper, so a crash would leave attached devices unconfigured: {e}");
+    }
+}
+
+/// The keeper's whole life: wait for the machine's process to exit, then
+/// give back what it held.
+pub fn keeper(parent: u32) -> anyhow::Result<std::process::ExitCode> {
+    // SAFETY: kqueue() takes nothing.
+    let kq = unsafe { libc::kqueue() };
+    let change = libc::kevent {
+        ident: parent as usize,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let mut event = change;
+    // SAFETY: one change and room for one event; a parent already gone
+    // fails the registration, which is as good as its exit.
+    let n = unsafe { libc::kevent(kq, &change, 1, &mut event, 1, std::ptr::null()) };
+    let _ = n;
+    lighter_vmm::usb::manager::restore_held(&crate::paths::home()?.join(HELD));
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Asks the running machine, if there is one: `reload` or `status`.

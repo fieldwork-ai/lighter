@@ -66,3 +66,9 @@ int lighter_usb_port_holder(const char *path, int32_t *pid, char *name, size_t n
 // Calls `arrived(ctx)` whenever a USB device appears on the Mac, from a
 // queue of its own, for as long as the process runs.
 void lighter_usb_watch(void *ctx, void (*arrived)(void *ctx));
+
+// Gives a device back to macOS that a lighter which is no longer running
+// left unconfigured (it crashed holding it): seized again, then configured
+// with macOS's drivers matched. Synchronous. 0 on success, or when the
+// device is no longer attached; -1 and a message otherwise.
+int lighter_usb_restore(uint64_t registry_id, char *error, size_t error_len);

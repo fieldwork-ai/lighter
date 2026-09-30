@@ -52,6 +52,19 @@ unsafe extern "C" {
     fn lighter_usb_close(d: *mut Raw);
     fn lighter_usb_port_holder(path: *const c_char, pid: *mut i32, name: *mut c_char, name_len: usize) -> i32;
     fn lighter_usb_watch(ctx: *mut c_void, arrived: extern "C" fn(*mut c_void));
+    fn lighter_usb_restore(registry_id: u64, error: *mut c_char, error_len: usize) -> i32;
+}
+
+/// Gives back to macOS a device a lighter that is no longer running left
+/// seized and unconfigured. Nothing to do for a device no longer attached.
+pub fn restore(registry_id: u64) -> Result<(), String> {
+    let mut error = [0 as c_char; 256];
+    // SAFETY: a message buffer of the length given.
+    if unsafe { lighter_usb_restore(registry_id, error.as_mut_ptr(), error.len()) } == 0 {
+        return Ok(());
+    }
+    // SAFETY: the shim wrote a NUL-terminated message.
+    Err(unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy().into_owned())
 }
 
 /// Calls `arrived` whenever a USB device appears on the Mac, for the life of
