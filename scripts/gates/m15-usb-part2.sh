@@ -9,6 +9,8 @@
 #
 #   network  — unattended: Zigbee2MQTT forms its network on the stick, the
 #              coordinator answers, and a restart resumes the same network
+#   blz      — unattended: the ThirdReality stick forms a network the way
+#              ZHA does (zigpy, zigpy-blz at 2 Mbaud), and resumes it
 #   pair     — a person puts the sensor and the bulb in pairing mode; both
 #              join and are interviewed
 #   devices  — the sensor reports a temperature; the bulb switches on and
@@ -28,6 +30,9 @@ export LIGHTER_HOME="$HOME2/home"
 D="docker -H unix://$LIGHTER_HOME/docker.sock"
 ZBT=303a:831a
 ZBT_NAME=/dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00
+TR=1a86:7523
+TR_NAME=/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+BLZ=m15p2-blz
 MQTT=m15p2-mqtt
 Z2M=m15p2-z2m
 FAILED=0
@@ -44,7 +49,7 @@ ask() { # a step for the person at the Mac; returns when they press return
 	printf '\n  \033[1m>>\033[0m  %s\n      press return when done ' "$*"
 	read -r _ </dev/tty
 }
-has_name() { "$LIGHTER" usb ls-serial 2>/dev/null | grep -q "$ZBT_NAME"; }
+has_name() { "$LIGHTER" usb ls-serial 2>/dev/null | grep -q "${1:-$ZBT_NAME}"; }
 running() { $D info >/dev/null 2>&1; }
 # One message from a topic, retained or the next to arrive, within `wait` s.
 mqtt_get() { # topic wait
@@ -66,7 +71,7 @@ up() {
 	[ -x "$LIGHTER" ] || { echo "no $LIGHTER: cargo build --release, then scripts/sign.sh it" >&2; exit 2; }
 	mkdir -p "$LIGHTER_HOME" "$HOME2/z2m" "$HOME2/mosquitto"
 	if ! running; then
-		printf '{"usb":[{"spec":"%s"}]}\n' "$ZBT" >"$LIGHTER_HOME/config.json"
+		printf '{"usb":[{"spec":"%s"},{"spec":"%s"}]}\n' "$ZBT" "$TR" >"$LIGHTER_HOME/config.json"
 		# Outlives this script: the next phase finds the same machine.
 		nohup "$LIGHTER" start >"$HOME2/start.log" 2>&1 </dev/null &
 		wait_for 90 running || { fail "the machine did not come up (see $HOME2/start.log)"; exit 1; }
@@ -130,6 +135,25 @@ phase_network() {
 		fail "Zigbee2MQTT did not start again: $($D logs --tail 15 "$Z2M" 2>&1 | tr '\n' ' ')"
 	fi
 	note "the frontend: http://127.0.0.1:8080"
+}
+
+phase_blz() {
+	echo "==> The ThirdReality stick forms a network, as ZHA would"
+	up
+	wait_for 30 has_name "$TR_NAME" || { fail "the ThirdReality stick is not in the guest: $("$LIGHTER" usb ls-serial 2>&1 | xargs)"; return; }
+	mkdir -p "$HOME2/blz"
+	if ! $D inspect "$BLZ" >/dev/null 2>&1; then
+		$D run -d --name "$BLZ" --device "$TR_NAME:/dev/tr" -v "$HOME2/blz:/data" \
+			-v "$ROOT/scripts/gates/fixtures:/t:ro" python:3.12-alpine sleep infinity >/dev/null &&
+			$D exec "$BLZ" pip install -q zigpy-blz >/dev/null 2>&1
+	fi
+	$D start "$BLZ" >/dev/null 2>&1
+	local first second
+	first="$($D exec "$BLZ" python /t/blz-network.py /dev/tr /data/zigbee.db 2>"$HOME2/blz/first.err" | tail -1)"
+	echo "$first" | grep -q '"pan_id"' && pass "formed: $first" || { fail "no network: $(tail -5 "$HOME2/blz/first.err" | xargs)"; return; }
+	second="$($D exec "$BLZ" python /t/blz-network.py /dev/tr /data/zigbee.db 2>"$HOME2/blz/second.err" | tail -1)"
+	[ "$second" = "$first" ] && pass "started again onto the same network" || fail "after a restart: '$second' (see $HOME2/blz/second.err)"
+	$D stop "$BLZ" >/dev/null 2>&1
 }
 
 phase_pair() {
@@ -215,7 +239,7 @@ phase_down() {
 [ $# -gt 0 ] || set -- network
 for phase in "$@"; do
 	case "$phase" in
-	network | pair | devices | replug | sleep | down) "phase_$phase" ;;
+	network | blz | pair | devices | replug | sleep | down) "phase_$phase" ;;
 	*) echo "unknown phase: $phase" >&2; exit 2 ;;
 	esac
 done
