@@ -47,10 +47,13 @@ lighter_usb *lighter_usb_open(uint64_t registry_id, void *ctx, lighter_usb_done_
                               lighter_usb_gone_fn gone, lighter_usb_closed_fn closed, char *error,
                               size_t error_len);
 
-void lighter_usb_control(lighter_usb *d, uint32_t tag, const uint8_t setup[8], const uint8_t *out,
-                         uint32_t out_len, uint32_t in_len);
+// `is_in`: a device-to-host request, `in_len` bytes back; otherwise `out`.
+void lighter_usb_control(lighter_usb *d, uint32_t tag, const uint8_t setup[8], int is_in,
+                         const uint8_t *out, uint32_t out_len, uint32_t in_len);
+// `zero_packet`: an out transfer that is a whole number of packets ends with
+// a zero-length one, and completes when that has gone.
 void lighter_usb_transfer(lighter_usb *d, uint32_t tag, uint8_t endpoint, const uint8_t *out,
-                          uint32_t out_len, uint32_t in_len);
+                          uint32_t out_len, uint32_t in_len, int zero_packet);
 void lighter_usb_set_configuration(lighter_usb *d, uint32_t tag, uint8_t value);
 void lighter_usb_set_interface(lighter_usb *d, uint32_t tag, uint8_t interface, uint8_t alternate);
 void lighter_usb_clear_halt(lighter_usb *d, uint32_t tag, uint8_t endpoint);

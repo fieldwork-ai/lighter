@@ -12,12 +12,23 @@
 //! `stub_tx.c`), including its unlink rules: a URB stopped by an unlink is
 //! answered by the unlink's reply alone, with the URB's status, and never by
 //! a submit reply; an unlink that finds its URB already answered is answered
-//! with status 0. macOS can abort only a whole pipe, never one request, so an
-//! abort stops every URB queued on the endpoint. The ones nobody unlinked
-//! are then submitted again when nothing had moved, and answered with what
-//! did move otherwise; a guest sees what it would on Linux.
+//! with status 0.
+//!
+//! macOS can abort only a whole pipe, never one request, so an unlink stops
+//! every URB queued on its endpoint. While that abort is outstanding, new
+//! URBs for the pipe wait; when it is done, the URBs it caught that nobody
+//! unlinked go back first, in order, then the ones that waited, so the bytes
+//! on a pipe keep their order. A caught URB that had moved data is answered
+//! short, as Linux would; a caught control request is never repeated, since
+//! one with no data stage cannot say whether the device acted on it.
+//!
+//! Commands are always read and acted on, so an unlink is never stuck behind
+//! the traffic it would stop. What is bounded is the replies waiting for the
+//! guest to read them: past the mark, new submits wait, in order, and start
+//! when the guest reads again. Only a guest that stops reading altogether,
+//! with more waiting than that, stops being read.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -27,14 +38,18 @@ use std::sync::{Arc, Mutex};
 use super::usbip::{self, Command, Special, Submit, status};
 use crate::reactor::Kq;
 
-/// What a session may hold at once: replies not yet written, plus what its
-/// pending URBs carry (an out transfer's data) or will bring back (an in
-/// transfer's length). Past the high mark the session stops taking commands,
-/// and its socket stops being read, until it is under the low mark: a guest
-/// that submits faster than it reads cannot grow the host without bound.
-const COMMITTED_HIGH: usize = 4 << 20;
-const COMMITTED_LOW: usize = 1 << 20;
+/// Replies waiting for the guest past this defer new submits; under the low
+/// mark they start again.
+const TX_HIGH: usize = 4 << 20;
+const TX_LOW: usize = 1 << 20;
+/// Submits waiting past this stop the socket being read at all: only a
+/// guest that has stopped reading its replies gets here.
+const DEFERRED_MAX: usize = 16 << 20;
 const READ_CHUNK: usize = 64 * 1024;
+
+/// Linux's URB transfer flags that change what a transfer means.
+const URB_SHORT_NOT_OK: u32 = 0x0001;
+const URB_ZERO_PACKET: u32 = 0x0040;
 
 /// What a device is asked to do. Every one completes through the sink,
 /// under the tag it was started with.
@@ -48,11 +63,13 @@ pub enum Op {
         in_len: usize,
     },
     /// A bulk or interrupt transfer on `endpoint` (its address, direction bit
-    /// included).
+    /// included). `zero_packet`: an out transfer whose length is a whole
+    /// number of packets ends with a zero-length one.
     Transfer {
         endpoint: u8,
         out: Vec<u8>,
         in_len: usize,
+        zero_packet: bool,
     },
     SetConfiguration(u8),
     SetInterface {
@@ -69,7 +86,9 @@ pub trait Device: Send {
     /// Stops every transfer queued on `endpoint` (0 for the default pipe).
     /// Each completes with [`status::ECONNRESET`] and whatever moved.
     fn abort(&mut self, endpoint: u8);
-    /// Ends the session's hold on the device, giving it back to macOS.
+    /// Gives the device back to macOS. Its sink's [`Sink::closed`] is called
+    /// when that is done, and not before: until then the session counts as
+    /// served, so nothing seizes the device again while it is being released.
     fn close(&mut self);
 }
 
@@ -89,6 +108,8 @@ enum Event {
     Gone,
     /// Detached on the Mac's side: the guest sees the device unplugged.
     End,
+    /// The device is back with macOS; the session is over.
+    Closed,
 }
 
 /// Where a session's device reports, from any thread.
@@ -106,6 +127,11 @@ impl Sink {
     pub fn gone(&self) {
         self.shared.post(self.id, Event::Gone);
     }
+
+    /// The device has been given back: the last word from a device.
+    pub fn closed(&self) {
+        self.shared.post(self.id, Event::Closed);
+    }
 }
 
 /// A session handed to the loop: its id, its socket and its device.
@@ -116,8 +142,8 @@ struct Shared {
     arrivals: Mutex<Vec<Arrival>>,
     wake_write: RawFd,
     next: AtomicU64,
-    /// The sessions the loop holds now, for callers that ask.
-    live: Mutex<Vec<u64>>,
+    /// Sessions from `serve` until their device is given back.
+    live: Mutex<HashSet<u64>>,
 }
 
 impl Shared {
@@ -134,6 +160,10 @@ impl Shared {
         // SAFETY: a one-byte write to our own non-blocking pipe; a full pipe
         // already means a wake is pending.
         unsafe { libc::write(self.wake_write, std::ptr::addr_of!(b).cast(), 1) };
+    }
+
+    fn is_live(&self, id: u64) -> bool {
+        self.live.lock().expect("usb live poisoned").contains(&id)
     }
 }
 
@@ -158,7 +188,7 @@ impl Server {
             arrivals: Mutex::new(Vec::new()),
             wake_write: fds[1],
             next: AtomicU64::new(1),
-            live: Mutex::new(Vec::new()),
+            live: Mutex::new(HashSet::new()),
         });
         let kq = Kq::new()?;
         kq.read(fds[0], true);
@@ -178,8 +208,14 @@ impl Server {
         }
     }
 
-    /// Serves `device` on `socket` until either ends.
+    /// Serves `device` on `socket` until either ends. Served from now: a
+    /// caller asking straight after sees it so.
     pub fn serve(&self, sink: &Sink, socket: UnixStream, device: Box<dyn Device>) {
+        self.shared
+            .live
+            .lock()
+            .expect("usb live poisoned")
+            .insert(sink.id);
         self.shared
             .arrivals
             .lock()
@@ -194,13 +230,10 @@ impl Server {
         self.shared.post(sink.id, Event::End);
     }
 
-    /// Whether a session is still being served.
+    /// Whether a session is still being served, or its device not yet given
+    /// back.
     pub fn serving(&self, sink: &Sink) -> bool {
-        self.shared
-            .live
-            .lock()
-            .expect("usb live poisoned")
-            .contains(&sink.id)
+        self.shared.is_live(sink.id)
     }
 }
 
@@ -212,6 +245,18 @@ struct Pending {
     unlink: Option<u32>,
 }
 
+/// A pipe while an abort on it is outstanding.
+#[derive(Default)]
+struct Aborting {
+    /// Its URBs the abort has yet to hand back.
+    outstanding: HashSet<u32>,
+    /// URBs it caught that nobody unlinked and that moved nothing: they go
+    /// back on the pipe, by sequence number, when the abort is done.
+    caught: BTreeMap<u32, Submit>,
+    /// Submits for the pipe that came while it was aborting, in order.
+    held: VecDeque<Submit>,
+}
+
 struct Session {
     socket: UnixStream,
     device: Box<dyn Device>,
@@ -221,31 +266,199 @@ struct Session {
     tx_bytes: usize,
     reading: bool,
     writing: bool,
+    /// URBs started on the device, by sequence number.
     pending: HashMap<u32, Pending>,
-    /// Bytes of replies queued plus bytes the pending URBs hold or await.
-    committed: usize,
-    /// Taking commands; off while `committed` is above the low mark again.
-    taking: bool,
-    /// The guest's end has closed: finish writing, then end.
+    /// Pipes with an abort outstanding.
+    aborting: HashMap<u8, Aborting>,
+    /// Submits waiting for the guest to read its replies, in order.
+    deferred: VecDeque<Submit>,
+    deferred_bytes: usize,
+    /// The guest's end has closed.
     closing: bool,
 }
 
 impl Session {
-    fn hold(&mut self, seqnum: u32, pending: Pending) {
-        self.committed += weight(&pending.submit);
-        self.pending.insert(seqnum, pending);
+    fn reply(&mut self, reply: Vec<u8>) {
+        self.tx_bytes += reply.len();
+        self.tx.push_back(reply);
     }
 
-    fn release(&mut self, seqnum: u32) -> Option<Pending> {
-        let p = self.pending.remove(&seqnum)?;
-        self.committed -= weight(&p.submit);
-        Some(p)
+    /// Starts a submit on the device, or holds it behind its pipe's abort.
+    fn start(&mut self, submit: Submit) {
+        let (pipe, op) = operation(&submit);
+        if let Some(a) = self.aborting.get_mut(&pipe) {
+            a.held.push_back(submit);
+            return;
+        }
+        let seqnum = submit.seqnum;
+        self.pending.insert(
+            seqnum,
+            Pending {
+                pipe,
+                submit,
+                unlink: None,
+            },
+        );
+        self.device.start(seqnum, op);
     }
-}
 
-/// What a pending URB counts against its session.
-fn weight(submit: &Submit) -> usize {
-    submit.data.len() + if submit.is_in() { submit.length } else { 0 }
+    fn submit(&mut self, submit: Submit) {
+        if submit.is_iso() {
+            // Isochronous transfers (audio, video, a Bluetooth dongle's
+            // voice channel) are not carried yet; the URB fails and the
+            // driver sees why.
+            self.reply(usbip::ret_submit(submit.seqnum, status::EOPNOTSUPP, 0, &[]));
+            return;
+        }
+        // A control request's setup packet and its header must agree on its
+        // direction, or its reply would carry data the guest does not read.
+        if submit.ep == 0 && (submit.setup[0] & 0x80 != 0) != submit.is_in() {
+            self.reply(usbip::ret_submit(submit.seqnum, status::EINVAL, 0, &[]));
+            return;
+        }
+        if self.tx_bytes >= TX_HIGH || !self.deferred.is_empty() {
+            self.deferred_bytes += submit.data.len();
+            self.deferred.push_back(submit);
+            return;
+        }
+        self.start(submit);
+    }
+
+    fn unlink(&mut self, seqnum: u32, victim: u32) {
+        // Not on the device yet: stopped here, as Linux stops a URB it has
+        // not submitted.
+        if let Some(i) = self.deferred.iter().position(|s| s.seqnum == victim) {
+            let s = self.deferred.remove(i).expect("found");
+            self.deferred_bytes -= s.data.len();
+            self.reply(usbip::ret_unlink(seqnum, status::ECONNRESET));
+            return;
+        }
+        for a in self.aborting.values_mut() {
+            if let Some(i) = a.held.iter().position(|s| s.seqnum == victim) {
+                a.held.remove(i);
+                self.reply(usbip::ret_unlink(seqnum, status::ECONNRESET));
+                return;
+            }
+            if a.caught.remove(&victim).is_some() {
+                self.reply(usbip::ret_unlink(seqnum, status::ECONNRESET));
+                return;
+            }
+        }
+        match self.pending.get_mut(&victim) {
+            Some(p) if p.unlink.is_none() => {
+                p.unlink = Some(seqnum);
+                let pipe = p.pipe;
+                if !self.aborting.contains_key(&pipe) {
+                    let outstanding = self
+                        .pending
+                        .iter()
+                        .filter(|(_, q)| q.pipe == pipe)
+                        .map(|(&s, _)| s)
+                        .collect();
+                    self.aborting.insert(
+                        pipe,
+                        Aborting {
+                            outstanding,
+                            ..Aborting::default()
+                        },
+                    );
+                    self.device.abort(pipe);
+                }
+            }
+            // Answered already, or already being stopped by an earlier
+            // unlink: nothing of this one's to stop.
+            _ => self.reply(usbip::ret_unlink(seqnum, status::OK)),
+        }
+    }
+
+    fn done(&mut self, done: Done) {
+        let Some(p) = self.pending.remove(&done.tag) else {
+            return;
+        };
+        let pipe = p.pipe;
+        let caught_by_abort = self
+            .aborting
+            .get_mut(&pipe)
+            .is_some_and(|a| a.outstanding.remove(&done.tag));
+        let is_in = p.submit.is_in();
+        let actual = if is_in {
+            done.actual.min(done.data.len())
+        } else {
+            done.actual
+        };
+        if let Some(unlink) = p.unlink {
+            self.reply(usbip::ret_unlink(unlink, done.status));
+        } else if done.status == status::ECONNRESET && caught_by_abort && pipe != 0 && actual == 0 {
+            // Caught by the abort another URB's unlink asked for, with
+            // nothing moved: it goes back on the pipe when the abort is done.
+            self.aborting
+                .get_mut(&pipe)
+                .expect("aborting")
+                .caught
+                .insert(done.tag, p.submit);
+        } else {
+            let mut status = done.status;
+            if status == status::ECONNRESET && caught_by_abort && pipe != 0 {
+                // Cut short by another URB's abort: short, not failed.
+                status = status::OK;
+            }
+            if status == status::OK
+                && is_in
+                && p.submit.transfer_flags & URB_SHORT_NOT_OK != 0
+                && actual < p.submit.length
+            {
+                status = status::EREMOTEIO;
+            }
+            let data: &[u8] = if is_in { &done.data[..actual] } else { &[] };
+            self.reply(usbip::ret_submit(done.tag, status, actual, data));
+        }
+        // The abort is done when every URB it caught is back: the caught go
+        // back on the pipe first, in order, then what waited behind them.
+        if self
+            .aborting
+            .get(&pipe)
+            .is_some_and(|a| a.outstanding.is_empty())
+        {
+            let a = self.aborting.remove(&pipe).expect("aborting");
+            for (_, submit) in a.caught {
+                self.start(submit);
+            }
+            for submit in a.held {
+                self.start(submit);
+            }
+        }
+    }
+
+    /// Acts on every whole command received.
+    fn commands(&mut self) -> Result<(), usbip::ParseError> {
+        let mut at = 0;
+        let result = loop {
+            match usbip::parse(&self.rx[at..]) {
+                Ok(Some((command, used))) => {
+                    at += used;
+                    match command {
+                        Command::Submit(submit) => self.submit(submit),
+                        Command::Unlink { seqnum, victim } => self.unlink(seqnum, victim),
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        self.rx.drain(..at);
+        result
+    }
+
+    /// Starts deferred submits once the guest has read its replies down.
+    fn resume(&mut self) {
+        if self.tx_bytes >= TX_LOW {
+            return;
+        }
+        while let Some(submit) = self.deferred.pop_front() {
+            self.deferred_bytes -= submit.data.len();
+            self.start(submit);
+        }
+    }
 }
 
 struct Loop {
@@ -254,6 +467,9 @@ struct Loop {
     wake_read: RawFd,
     sessions: HashMap<u64, Session>,
     by_fd: HashMap<RawFd, u64>,
+    /// Sessions ended or gone before the loop took them up, and sessions
+    /// ended but not yet closed.
+    ended_early: HashSet<u64>,
     buf: Vec<u8>,
 }
 
@@ -265,6 +481,7 @@ impl Loop {
             wake_read,
             sessions: HashMap::new(),
             by_fd: HashMap::new(),
+            ended_early: HashSet::new(),
             buf: vec![0u8; READ_CHUNK],
         }
     }
@@ -297,23 +514,28 @@ impl Loop {
                 tracing::error!("usb: kevent failed: {}", io::Error::last_os_error());
                 return;
             }
+            // Completions first: a reply the device finished before the
+            // guest's next command counts against that command.
+            let mut readable = Vec::new();
             for ev in &events[..n as usize] {
                 let fd = ev.ident as RawFd;
                 if fd == self.wake_read {
                     self.drain_wake();
-                    continue;
-                }
-                let Some(&id) = self.by_fd.get(&fd) else {
-                    continue;
-                };
-                if ev.filter == libc::EVFILT_READ {
-                    self.read(id);
-                } else if ev.filter == libc::EVFILT_WRITE {
-                    self.pace(id);
+                } else if let Some(&id) = self.by_fd.get(&fd) {
+                    readable.push((id, ev.filter == libc::EVFILT_READ));
                 }
             }
             self.take_arrivals();
-            self.take_events();
+            let mut touched: HashSet<u64> = self.take_events().into_iter().collect();
+            for (id, read) in readable {
+                if read {
+                    self.read(id);
+                }
+                touched.insert(id);
+            }
+            for id in touched {
+                self.pace(id);
+            }
         }
     }
 
@@ -326,8 +548,10 @@ impl Loop {
     fn take_arrivals(&mut self) {
         let arrivals =
             std::mem::take(&mut *self.shared.arrivals.lock().expect("usb arrivals poisoned"));
-        for (id, socket, device) in arrivals {
-            if socket.set_nonblocking(true).is_err() {
+        for (id, socket, mut device) in arrivals {
+            if self.ended_early.remove(&id) || socket.set_nonblocking(true).is_err() {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+                device.close();
                 continue;
             }
             let fd = socket.as_raw_fd();
@@ -345,219 +569,121 @@ impl Loop {
                     reading: true,
                     writing: false,
                     pending: HashMap::new(),
-                    committed: 0,
-                    taking: true,
+                    aborting: HashMap::new(),
+                    deferred: VecDeque::new(),
+                    deferred_bytes: 0,
                     closing: false,
                 },
             );
-            self.shared.live.lock().expect("usb live poisoned").push(id);
         }
     }
 
-    fn take_events(&mut self) {
+    /// Hands out the devices' events; returns the sessions they touched.
+    fn take_events(&mut self) -> Vec<u64> {
         let events = std::mem::take(&mut *self.shared.events.lock().expect("usb events poisoned"));
+        let mut touched = Vec::new();
         for (id, event) in events {
             match event {
-                Event::Done(done) => self.done(id, done),
-                Event::Gone => {
-                    tracing::info!(session = id, "usb: the device went away");
-                    self.end(id);
+                Event::Closed => {
+                    self.ended_early.remove(&id);
+                    self.shared
+                        .live
+                        .lock()
+                        .expect("usb live poisoned")
+                        .remove(&id);
                 }
-                Event::End => self.end(id),
+                Event::Done(done) => {
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.done(done);
+                        touched.push(id);
+                    }
+                }
+                Event::Gone | Event::End => {
+                    if matches!(event, Event::Gone) {
+                        tracing::info!(session = id, "usb: the device went away");
+                    }
+                    if self.sessions.contains_key(&id) {
+                        self.end(id);
+                    } else {
+                        // Not yet taken up (a device can go before it is
+                        // served): ended when it is. Forgotten at `Closed`.
+                        self.ended_early.insert(id);
+                    }
+                }
             }
         }
+        touched
     }
 
+    /// Reads and acts on the guest's commands, a chunk at a time, until
+    /// the socket is empty or the guest has stopped reading its replies.
     fn read(&mut self, id: u64) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        loop {
+        while session.deferred_bytes < DEFERRED_MAX {
             match session.socket.read(&mut self.buf) {
                 Ok(0) => {
                     // The guest detached, or the machine is stopping.
                     session.closing = true;
-                    break;
+                    return;
                 }
                 Ok(n) => session.rx.extend_from_slice(&self.buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => {
                     session.closing = true;
-                    break;
+                    return;
                 }
             }
-            if session.committed >= COMMITTED_HIGH {
-                break;
+            if let Err(e) = session.commands() {
+                tracing::warn!(session = id, "usb: {e}; ending the device's session");
+                self.end(id);
+                return;
             }
         }
-        self.process(id);
     }
 
-    /// Takes the commands the session has read, while it may.
-    fn process(&mut self, id: u64) {
-        let mut at = 0;
-        let mut corrupt = false;
-        loop {
-            let Some(session) = self.sessions.get(&id) else {
-                return;
-            };
-            if session.committed >= COMMITTED_HIGH {
-                break;
-            }
-            match usbip::parse(&session.rx[at..]) {
-                Ok(Some((command, used))) => {
-                    at += used;
-                    self.command(id, command);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!(session = id, "usb: {e}; ending the device's session");
-                    corrupt = true;
-                    break;
-                }
-            }
-        }
+    /// Starts what may start, writes what it can, and sets the socket's
+    /// watches: writable while replies wait, readable unless the guest has
+    /// stopped reading.
+    fn pace(&mut self, id: u64) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        session.rx.drain(..at);
-        if corrupt {
+        loop {
+            session.resume();
+            let before = session.tx_bytes;
+            while let Some(front) = session.tx.front() {
+                match session.socket.write(&front[session.tx_at..]) {
+                    Ok(n) => {
+                        session.tx_at += n;
+                        session.tx_bytes -= n;
+                        if session.tx_at == front.len() {
+                            session.tx.pop_front();
+                            session.tx_at = 0;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        self.end(id);
+                        return;
+                    }
+                }
+            }
+            // Writing may have brought the replies under the low mark with
+            // submits still deferred: start them now, not at the next event.
+            if session.deferred.is_empty()
+                || session.tx_bytes >= TX_LOW
+                || session.tx_bytes == before
+            {
+                break;
+            }
+        }
+        if session.closing {
             self.end(id);
             return;
-        }
-        self.pace(id);
-    }
-
-    fn command(&mut self, id: u64, command: Command) {
-        let Some(session) = self.sessions.get_mut(&id) else {
-            return;
-        };
-        match command {
-            Command::Submit(submit) => {
-                if submit.is_iso() {
-                    // Isochronous transfers (audio, video, a Bluetooth
-                    // dongle's voice channel) are not carried yet; the URB
-                    // fails and the driver sees why.
-                    queue(
-                        session,
-                        usbip::ret_submit(submit.seqnum, status::EOPNOTSUPP, 0, &[]),
-                    );
-                    self.pace(id);
-                    return;
-                }
-                let (pipe, op) = operation(&submit);
-                let seqnum = submit.seqnum;
-                session.hold(
-                    seqnum,
-                    Pending {
-                        pipe,
-                        submit,
-                        unlink: None,
-                    },
-                );
-                session.device.start(seqnum, op);
-            }
-            Command::Unlink { seqnum, victim } => {
-                match session.pending.get_mut(&victim) {
-                    Some(p) if p.unlink.is_none() => {
-                        p.unlink = Some(seqnum);
-                        let pipe = p.pipe;
-                        session.device.abort(pipe);
-                    }
-                    // Answered already, or already being stopped by an
-                    // earlier unlink: nothing of this one's to stop.
-                    _ => queue(session, usbip::ret_unlink(seqnum, status::OK)),
-                }
-                self.pace(id);
-            }
-        }
-    }
-
-    fn done(&mut self, id: u64, done: Done) {
-        let Some(session) = self.sessions.get_mut(&id) else {
-            return;
-        };
-        let Some(p) = session.release(done.tag) else {
-            return;
-        };
-        if let Some(unlink) = p.unlink {
-            queue(session, usbip::ret_unlink(unlink, done.status));
-        } else if done.status == status::ECONNRESET && done.actual == 0 {
-            // Caught by an abort another URB's unlink asked for: nothing
-            // moved, so it goes back on its pipe as if nothing happened.
-            let (pipe, op) = operation(&p.submit);
-            session.hold(
-                done.tag,
-                Pending {
-                    pipe,
-                    submit: p.submit,
-                    unlink: None,
-                },
-            );
-            session.device.start(done.tag, op);
-            return;
-        } else {
-            // Answered with what moved, including a transfer another
-            // URB's abort cut short, which is then short, not failed.
-            let status = if done.status == status::ECONNRESET {
-                status::OK
-            } else {
-                done.status
-            };
-            let data: &[u8] = if p.submit.is_in() {
-                &done.data[..done.actual.min(done.data.len())]
-            } else {
-                &[]
-            };
-            queue(
-                session,
-                usbip::ret_submit(done.tag, status, done.actual, data),
-            );
-        }
-        self.pace(id);
-    }
-
-    /// Writes what it can, and sets the socket's watches for what the session
-    /// waits on: writable while replies wait, readable while it takes
-    /// commands. A session back under its low mark takes the commands it had
-    /// already read.
-    fn pace(&mut self, id: u64) {
-        self.flush(id);
-        let resume = self
-            .sessions
-            .get(&id)
-            .is_some_and(|s| !s.taking && s.committed < COMMITTED_LOW);
-        if resume {
-            if let Some(s) = self.sessions.get_mut(&id) {
-                s.taking = true;
-            }
-            self.process(id);
-        }
-    }
-
-    fn flush(&mut self, id: u64) {
-        let Some(session) = self.sessions.get_mut(&id) else {
-            return;
-        };
-        while let Some(front) = session.tx.front() {
-            match session.socket.write(&front[session.tx_at..]) {
-                Ok(n) => {
-                    session.tx_at += n;
-                    session.tx_bytes -= n;
-                    session.committed -= n;
-                    if session.tx_at == front.len() {
-                        session.tx.pop_front();
-                        session.tx_at = 0;
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    self.end(id);
-                    return;
-                }
-            }
         }
         let fd = session.socket.as_raw_fd();
         let want_write = !session.tx.is_empty();
@@ -565,16 +691,10 @@ impl Loop {
             session.writing = want_write;
             self.kq.write(fd, want_write);
         }
-        if session.committed >= COMMITTED_HIGH {
-            session.taking = false;
-        }
-        let want_read = !session.closing && session.taking;
+        let want_read = session.deferred_bytes < DEFERRED_MAX;
         if want_read != session.reading {
             session.reading = want_read;
             self.kq.read(fd, want_read);
-        }
-        if session.closing && session.tx.is_empty() {
-            self.end(id);
         }
     }
 
@@ -585,20 +705,10 @@ impl Loop {
         let fd = session.socket.as_raw_fd();
         self.kq.forget(fd);
         self.by_fd.remove(&fd);
-        self.shared
-            .live
-            .lock()
-            .expect("usb live poisoned")
-            .retain(|&l| l != id);
         let _ = session.socket.shutdown(std::net::Shutdown::Both);
+        // Served until the device says it is back with macOS (`Closed`).
         session.device.close();
     }
-}
-
-fn queue(session: &mut Session, reply: Vec<u8>) {
-    session.tx_bytes += reply.len();
-    session.committed += reply.len();
-    session.tx.push_back(reply);
 }
 
 /// What a submit asks of the device, and the pipe it queues on.
@@ -630,6 +740,7 @@ fn operation(submit: &Submit) -> (u8, Op) {
             endpoint,
             out: submit.data.clone(),
             in_len: if submit.is_in() { submit.length } else { 0 },
+            zero_packet: !submit.is_in() && submit.transfer_flags & URB_ZERO_PACKET != 0,
         },
     )
 }
@@ -731,6 +842,23 @@ mod tests {
             }
         }
 
+        fn until_not_serving(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.server.serving(&self.sink) {
+                assert!(std::time::Instant::now() < deadline, "still served");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn done(&self, tag: u32, status: i32, actual: usize, data: &[u8]) {
+            self.sink.done(Done {
+                tag,
+                status,
+                actual,
+                data: data.to_vec(),
+            });
+        }
+
         fn no_reply(&mut self) {
             self.guest
                 .set_read_timeout(Some(Duration::from_millis(100)))
@@ -789,7 +917,8 @@ mod tests {
                 Op::Transfer {
                     endpoint: 0x02,
                     out: b"abc".to_vec(),
-                    in_len: 0
+                    in_len: 0,
+                    zero_packet: false
                 }
             )
         );
@@ -817,7 +946,8 @@ mod tests {
                 Op::Transfer {
                     endpoint: 0x81,
                     out: Vec::new(),
-                    in_len: 64
+                    in_len: 64,
+                    zero_packet: false
                 }
             )
         );
@@ -1041,7 +1171,8 @@ mod tests {
                 Op::Transfer {
                     endpoint: 0x81,
                     out: Vec::new(),
-                    in_len: 64
+                    in_len: 64,
+                    zero_packet: false
                 }
             )
         );
@@ -1091,7 +1222,12 @@ mod tests {
             0,
             "the guest sees the stream end"
         );
-        assert!(!r.server.serving(&r.sink));
+        // Served until the device is back with macOS, so nothing seizes it
+        // again while it is being released.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(r.server.serving(&r.sink));
+        r.sink.closed();
+        r.until_not_serving();
     }
 
     #[test]
@@ -1119,50 +1255,46 @@ mod tests {
         assert_eq!(r.call(), Call::Close);
     }
 
-    /// A guest that stops reading stops being read: its replies cannot grow
-    /// without bound.
+    /// A guest that stops reading its replies stops having its submits
+    /// started: what the host holds for it is bounded.
     #[test]
-    fn replies_that_back_up_stop_the_commands_being_read() {
-        let r = rig();
+    fn replies_that_back_up_hold_new_submits_until_they_are_read() {
+        let mut r = rig();
         let big = 256 * 1024;
-        let mut started = 0u32;
-        // Each submit is answered at once with a quarter megabyte the guest
-        // never reads; the server must stop taking submits well before a
-        // hundred of them are answered.
-        let writer = r.guest.try_clone().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        let mut writer = writer;
-        for seq in 1..=100u32 {
-            let bytes = encode(&submit(seq, DIR_IN, 1, big, Vec::new()));
-            let _ = writer.write(&bytes);
-        }
-        while let Ok(Call::Start(tag, _)) = r.calls.recv_timeout(Duration::from_millis(300)) {
-            started += 1;
-            r.sink.done(Done {
-                tag,
-                status: 0,
-                actual: big,
-                data: vec![0; big],
-            });
-        }
+        let answer = |r: &Rig, tag| r.done(tag, 0, big, &vec![0; big]);
+        // Each submit is answered with a quarter megabyte the guest does not
+        // read, until one is held.
+        let mut seq = 0u32;
+        let held = loop {
+            seq += 1;
+            assert!(
+                seq <= 100,
+                "every submit was started while no reply was read"
+            );
+            r.send(submit(seq, DIR_IN, 1, big, Vec::new()));
+            match r.calls.recv_timeout(Duration::from_millis(300)) {
+                Ok(Call::Start(tag, _)) => answer(&r, tag),
+                Ok(other) => panic!("{other:?}"),
+                Err(_) => break seq,
+            }
+        };
         assert!(
-            started < 100,
-            "every submit was taken while no reply was read ({started})"
+            (held as usize - 1) * big >= TX_HIGH,
+            "it held a submit early ({held})"
         );
-        assert!(
-            started as usize * big >= COMMITTED_HIGH,
-            "it stopped early ({started})"
-        );
-        // Reading the replies lets it take the rest. (The writer's clone
-        // shares the socket's non-blocking flag; the reader wants blocking.)
-        r.guest.set_nonblocking(false).unwrap();
-        let mut replies = 0;
+        // Commands are still read while it is held.
+        r.send(Command::Unlink {
+            seqnum: 1000,
+            victim: 1,
+        });
+        // Reading the replies starts the held one, and the rest run.
         let reader = std::thread::spawn({
             let mut guest = r.guest.try_clone().unwrap();
             move || {
                 let mut chunk = vec![0u8; 1 << 20];
                 let mut total = 0usize;
-                while total < 100 * (big + usbip::HEADER_LEN) {
+                let want = 100 * (big + usbip::HEADER_LEN) + usbip::HEADER_LEN;
+                while total < want {
                     match guest.read(&mut chunk) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => total += n,
@@ -1171,20 +1303,252 @@ mod tests {
                 total
             }
         });
-        while let Ok(Call::Start(tag, _)) = r.calls.recv_timeout(Duration::from_secs(2)) {
-            replies += 1;
-            r.sink.done(Done {
-                tag,
-                status: 0,
-                actual: big,
-                data: vec![0; big],
-            });
+        assert_eq!(r.call(), Call::Start(held, transfer(0x81, big)));
+        answer(&r, held);
+        for seq in held + 1..=100 {
+            r.send(submit(seq, DIR_IN, 1, big, Vec::new()));
+            assert_eq!(r.call(), Call::Start(seq, transfer(0x81, big)));
+            answer(&r, seq);
         }
         assert_eq!(
-            started + replies,
-            100,
-            "every submit is taken once replies are read"
+            reader.join().unwrap(),
+            100 * (big + usbip::HEADER_LEN) + usbip::HEADER_LEN
         );
-        assert_eq!(reader.join().unwrap(), 100 * (big + usbip::HEADER_LEN));
+    }
+
+    fn with_flags(command: Command, flags: u32) -> Command {
+        let Command::Submit(mut s) = command else {
+            unreachable!()
+        };
+        s.transfer_flags = flags;
+        Command::Submit(s)
+    }
+
+    fn transfer(endpoint: u8, in_len: usize) -> Op {
+        Op::Transfer {
+            endpoint,
+            out: Vec::new(),
+            in_len,
+            zero_packet: false,
+        }
+    }
+
+    /// An unlink is acted on while replies back up: it is what frees them.
+    #[test]
+    fn unlinks_are_acted_on_while_replies_back_up() {
+        let mut r = rig();
+        r.send(submit(1, DIR_IN, 2, 64, Vec::new()));
+        assert_eq!(r.call(), Call::Start(1, transfer(0x82, 64)));
+        let big = 8 << 20;
+        r.send(submit(2, DIR_IN, 1, big, Vec::new()));
+        r.call();
+        r.done(2, 0, big, &vec![7; big]);
+        // Past the mark: a new submit waits, and is not started.
+        r.send(submit(3, DIR_IN, 1, 64, Vec::new()));
+        r.no_call();
+        // Unlinking a URB on the device still aborts its pipe.
+        r.send(Command::Unlink {
+            seqnum: 4,
+            victim: 1,
+        });
+        assert_eq!(r.call(), Call::Abort(0x82));
+        // Unlinking the one that waits stops it here.
+        r.send(Command::Unlink {
+            seqnum: 5,
+            victim: 3,
+        });
+        r.no_call();
+        r.done(1, status::ECONNRESET, 0, &[]);
+        assert!(matches!(r.reply(), Reply::Submit { seqnum: 2, actual, .. } if actual == big));
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 5,
+                status: status::ECONNRESET
+            }
+        );
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 4,
+                status: status::ECONNRESET
+            }
+        );
+        r.no_reply();
+        r.no_call();
+    }
+
+    /// Bytes on a pipe keep their order through another URB's abort: what
+    /// it caught goes back first, then what came while it ran.
+    #[test]
+    fn a_pipe_keeps_its_order_through_an_abort() {
+        let mut r = rig();
+        r.send(submit(1, DIR_OUT, 2, 1, vec![1]));
+        r.call();
+        r.send(submit(2, DIR_OUT, 2, 1, vec![2]));
+        r.call();
+        r.send(Command::Unlink {
+            seqnum: 3,
+            victim: 1,
+        });
+        assert_eq!(r.call(), Call::Abort(0x02));
+        r.send(submit(4, DIR_OUT, 2, 1, vec![4]));
+        // Another pipe is not held.
+        r.send(submit(5, DIR_IN, 1, 64, Vec::new()));
+        assert_eq!(r.call(), Call::Start(5, transfer(0x81, 64)));
+        r.no_call();
+        r.done(1, status::ECONNRESET, 0, &[]);
+        r.no_call();
+        r.done(2, status::ECONNRESET, 0, &[]);
+        let out = |b: u8| Op::Transfer {
+            endpoint: 0x02,
+            out: vec![b],
+            in_len: 0,
+            zero_packet: false,
+        };
+        assert_eq!(r.call(), Call::Start(2, out(2)));
+        assert_eq!(r.call(), Call::Start(4, out(4)));
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 3,
+                status: status::ECONNRESET
+            }
+        );
+    }
+
+    /// A control request is never repeated: one with no data stage cannot
+    /// say whether the device acted on it.
+    #[test]
+    fn control_requests_caught_by_an_abort_are_answered_not_repeated() {
+        let mut r = rig();
+        r.send(control(1, DIR_IN, [0x80, 6, 0, 1, 0, 0, 18, 0], Vec::new()));
+        r.call();
+        r.send(control(
+            2,
+            DIR_OUT,
+            [0x21, 0x22, 3, 0, 0, 0, 0, 0],
+            Vec::new(),
+        ));
+        r.call();
+        r.send(Command::Unlink {
+            seqnum: 3,
+            victim: 1,
+        });
+        assert_eq!(r.call(), Call::Abort(0));
+        r.done(1, status::ECONNRESET, 0, &[]);
+        r.done(2, status::ECONNRESET, 0, &[]);
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 3,
+                status: status::ECONNRESET
+            }
+        );
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 2,
+                status: status::ECONNRESET,
+                actual: 0,
+                data: Vec::new()
+            }
+        );
+        r.no_call();
+    }
+
+    #[test]
+    fn a_device_gone_before_it_is_served_ends_its_session() {
+        let server = Server::start().unwrap();
+        let (mut guest, host) = UnixStream::pair().unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (tx, calls) = mpsc::channel();
+        let sink = server.sink();
+        sink.gone();
+        std::thread::sleep(Duration::from_millis(50));
+        server.serve(&sink, host, Box::new(Mock { log: tx }));
+        assert_eq!(
+            calls.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Call::Close
+        );
+        let mut chunk = [0u8; 16];
+        assert_eq!(guest.read(&mut chunk).unwrap(), 0);
+    }
+
+    #[test]
+    fn transfer_flags_are_honored() {
+        let mut r = rig();
+        r.send(with_flags(
+            submit(1, DIR_OUT, 2, 64, vec![0; 64]),
+            URB_ZERO_PACKET,
+        ));
+        assert_eq!(
+            r.call(),
+            Call::Start(
+                1,
+                Op::Transfer {
+                    endpoint: 0x02,
+                    out: vec![0; 64],
+                    in_len: 0,
+                    zero_packet: true
+                }
+            )
+        );
+        r.send(with_flags(
+            submit(2, DIR_IN, 1, 64, Vec::new()),
+            URB_SHORT_NOT_OK,
+        ));
+        r.call();
+        r.done(2, 0, 5, b"short");
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 2,
+                status: status::EREMOTEIO,
+                actual: 5,
+                data: b"short".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn a_control_request_whose_setup_and_header_disagree_is_refused() {
+        let mut r = rig();
+        // A host-to-device setup packet in a device-to-host URB.
+        r.send(control(
+            1,
+            DIR_IN,
+            [0x21, 0x22, 3, 0, 0, 0, 0, 0],
+            Vec::new(),
+        ));
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 1,
+                status: status::EINVAL,
+                actual: 0,
+                data: Vec::new()
+            }
+        );
+        r.no_call();
+    }
+
+    #[test]
+    fn a_device_reporting_more_than_it_sent_is_clamped() {
+        let mut r = rig();
+        r.send(submit(1, DIR_IN, 1, 64, Vec::new()));
+        r.call();
+        r.done(1, 0, 10, b"abc");
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 1,
+                status: 0,
+                actual: 3,
+                data: b"abc".to_vec()
+            }
+        );
     }
 }

@@ -58,10 +58,12 @@ pub fn free_port(status: &str, speed: u32) -> Option<u32> {
 /// a `by-id` name: runs of whitespace become one `_` with none at either end,
 /// and anything outside udev's allowed set becomes `_`.
 pub fn udev_part(s: &str) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join("_");
+    // udev's whitespace is C's isspace, ASCII alone, and it keeps every
+    // multi-byte UTF-8 character (the kernel's strings are always valid).
+    let collapsed = s.split(|c: char| c.is_ascii_whitespace() || c == '\x0b').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_");
     collapsed
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "#+-.:=@_".contains(c) { c } else { '_' })
+        .map(|c| if c.is_ascii_alphanumeric() || "#+-.:=@_".contains(c) || !c.is_ascii() { c } else { '_' })
         .collect()
 }
 
@@ -140,7 +142,11 @@ impl Names {
     }
 
     fn remove(&mut self, tty: &str) {
-        if let Some(link) = self.0.remove(tty) {
+        // Only while it still names this tty: a second device with the same
+        // name may have taken it over since.
+        if let Some(link) = self.0.remove(tty)
+            && std::fs::read_link(&link).is_ok_and(|to| to == Path::new(&format!("../../{tty}")))
+        {
             let _ = std::fs::remove_file(link);
         }
     }
@@ -359,6 +365,7 @@ ss  0008 004 000 00000000 000000 0-0
             "usb-Silicon_Labs_Sonoff_Zigbee_3.0_USB_Dongle_Plus_ba3b0b0b-if00-port0"
         );
         assert_eq!(udev_part("  a  b/c "), "a_b_c");
+        assert_eq!(udev_part("Société Générale\u{a0}Zigbee"), "Société_Générale\u{a0}Zigbee");
     }
 
     #[test]

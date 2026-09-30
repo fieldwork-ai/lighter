@@ -46,6 +46,7 @@ unsafe extern "C" {
         d: *mut Raw,
         tag: u32,
         setup: *const u8,
+        is_in: i32,
         out: *const u8,
         out_len: u32,
         in_len: u32,
@@ -57,6 +58,7 @@ unsafe extern "C" {
         out: *const u8,
         out_len: u32,
         in_len: u32,
+        zero_packet: i32,
     );
     fn lighter_usb_set_configuration(d: *mut Raw, tag: u32, value: u8);
     fn lighter_usb_set_interface(d: *mut Raw, tag: u32, interface: u8, alternate: u8);
@@ -108,7 +110,6 @@ pub enum Speed {
     Full = 2,
     High = 3,
     Super = 5,
-    SuperPlus = 6,
 }
 
 /// A USB device attached to the Mac.
@@ -182,8 +183,9 @@ pub fn list() -> Vec<Info> {
                 0 => Some(Speed::Low),
                 1 => Some(Speed::Full),
                 2 => Some(Speed::High),
-                3 => Some(Speed::Super),
-                4 => Some(Speed::SuperPlus),
+                // vhci-hcd has no SuperSpeed+ port (it refuses speed 6);
+                // such a device runs as SuperSpeed, as behind a 5 Gbps hub.
+                3 | 4 => Some(Speed::Super),
                 _ => None,
             },
             interface_classes: r.interface_classes,
@@ -250,7 +252,8 @@ extern "C" fn on_gone(ctx: *mut c_void) {
 
 extern "C" fn on_closed(ctx: *mut c_void) {
     // SAFETY: the Box leaked at open, returned once, after the last callback.
-    drop(unsafe { Box::from_raw(ctx as *mut Sink) });
+    let sink = unsafe { Box::from_raw(ctx as *mut Sink) };
+    sink.closed();
 }
 
 impl IoUsbDevice {
@@ -272,7 +275,8 @@ impl IoUsbDevice {
             )
         };
         if raw.is_null() {
-            // SAFETY: the shim did not keep ctx; it is ours to free.
+            // SAFETY: the shim did not keep ctx; it is ours to free. Never
+            // served, so there is no session to say `closed` to.
             drop(unsafe { Box::from_raw(ctx as *mut Sink) });
             // SAFETY: the shim wrote a NUL-terminated message.
             return Err(unsafe { CStr::from_ptr(error.as_ptr()) }
@@ -292,6 +296,7 @@ impl Device for IoUsbDevice {
                     self.raw,
                     tag,
                     setup.as_ptr(),
+                    i32::from(setup[0] & 0x80 != 0),
                     out.as_ptr(),
                     out.len() as u32,
                     in_len as u32,
@@ -300,6 +305,7 @@ impl Device for IoUsbDevice {
                     endpoint,
                     out,
                     in_len,
+                    zero_packet,
                 } => lighter_usb_transfer(
                     self.raw,
                     tag,
@@ -307,6 +313,7 @@ impl Device for IoUsbDevice {
                     out.as_ptr(),
                     out.len() as u32,
                     in_len as u32,
+                    i32::from(zero_packet),
                 ),
                 Op::SetConfiguration(value) => lighter_usb_set_configuration(self.raw, tag, value),
                 Op::SetInterface {

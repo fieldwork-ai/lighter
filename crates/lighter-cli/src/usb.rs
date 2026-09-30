@@ -148,25 +148,52 @@ fn spawn_keeper() {
 }
 
 /// The keeper's whole life: wait for the machine's process to exit, then
-/// give back what it held.
+/// give back what it held, and only that: a newer machine's record is not
+/// its to act on (`restore_held`).
 pub fn keeper(parent: u32) -> anyhow::Result<std::process::ExitCode> {
+    let held = crate::paths::home()?.join(HELD);
+    wait_for_exit(parent);
+    lighter_vmm::usb::manager::restore_held(&held, Some(parent));
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Returns once `pid` has exited.
+fn wait_for_exit(pid: u32) {
     // SAFETY: kqueue() takes nothing.
     let kq = unsafe { libc::kqueue() };
-    let change = libc::kevent {
-        ident: parent as usize,
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    let mut event = change;
-    // SAFETY: one change and room for one event; a parent already gone
-    // fails the registration, which is as good as its exit.
-    let n = unsafe { libc::kevent(kq, &change, 1, &mut event, 1, std::ptr::null()) };
-    let _ = n;
-    lighter_vmm::usb::manager::restore_held(&crate::paths::home()?.join(HELD));
-    Ok(std::process::ExitCode::SUCCESS)
+    if kq >= 0 {
+        let change = libc::kevent {
+            ident: pid as usize,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let mut event = change;
+        loop {
+            // SAFETY: one change and room for one event, on our own kqueue.
+            // Retrying after EINTR re-adds the same one-shot watch.
+            let n = unsafe { libc::kevent(kq, &change, 1, &mut event, 1, std::ptr::null()) };
+            if n > 0 {
+                return;
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // Gone before it could be watched.
+                Some(libc::ESRCH) => return,
+                _ => break,
+            }
+        }
+    }
+    // No kqueue to wait on: ask instead. A restore while the machine still
+    // runs would take its devices from it, so this never gives up.
+    // SAFETY: signal 0 only checks that the process exists.
+    while unsafe { libc::kill(pid as i32, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 /// Where each attached device stands, for `lighter status`; `None` when the
@@ -198,7 +225,7 @@ fn speed(s: Option<iousb::Speed>) -> &'static str {
         Some(iousb::Speed::Low) => "low speed",
         Some(iousb::Speed::Full) => "full speed",
         Some(iousb::Speed::High) => "high speed",
-        Some(iousb::Speed::Super) | Some(iousb::Speed::SuperPlus) => "SuperSpeed",
+        Some(iousb::Speed::Super) => "SuperSpeed",
         None => "",
     }
 }

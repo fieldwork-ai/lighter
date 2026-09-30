@@ -204,8 +204,8 @@ lighter_usb *lighter_usb_open(uint64_t registry_id, void *ctx, lighter_usb_done_
     }
 }
 
-void lighter_usb_control(lighter_usb *d, uint32_t tag, const uint8_t setup[8], const uint8_t *out,
-                         uint32_t out_len, uint32_t in_len) {
+void lighter_usb_control(lighter_usb *d, uint32_t tag, const uint8_t setup[8], int is_in,
+                         const uint8_t *out, uint32_t out_len, uint32_t in_len) {
     // A struct, since a block cannot capture an array.
     struct { uint8_t b[8]; } s;
     memcpy(s.b, setup, 8);
@@ -222,9 +222,8 @@ void lighter_usb_control(lighter_usb *d, uint32_t tag, const uint8_t setup[8], c
                 .wLength = (uint16_t)(s.b[6] | (s.b[7] << 8)),
             };
             NSMutableData *data = nil;
-            if (in_len) data = [NSMutableData dataWithLength:in_len];
+            if (is_in) data = in_len ? [NSMutableData dataWithLength:in_len] : nil;
             else if (payload) data = [payload mutableCopy];
-            BOOL is_in = (s.b[0] & 0x80) != 0;
             NSError *e = nil;
             // No timeout: the guest's driver times a request out itself, by
             // unlinking it, as it would on a Linux host.
@@ -242,7 +241,7 @@ void lighter_usb_control(lighter_usb *d, uint32_t tag, const uint8_t setup[8], c
 }
 
 void lighter_usb_transfer(lighter_usb *d, uint32_t tag, uint8_t endpoint, const uint8_t *out,
-                          uint32_t out_len, uint32_t in_len) {
+                          uint32_t out_len, uint32_t in_len, int zero_packet) {
     NSData *payload = out_len ? [NSData dataWithBytes:out length:out_len] : nil;
     LighterUsbHolder *h = holder_of(d);
     dispatch_async(h.queue, ^{
@@ -256,14 +255,49 @@ void lighter_usb_transfer(lighter_usb *d, uint32_t tag, uint8_t endpoint, const 
             BOOL is_in = (endpoint & 0x80) != 0;
             NSMutableData *data = is_in ? [NSMutableData dataWithLength:in_len]
                                         : (payload ? [payload mutableCopy] : nil);
+            uint16_t max_packet = OSSwapLittleToHostInt16(pipe.descriptors->descriptor.wMaxPacketSize) & 0x7ff;
+            BOOL zlp = !is_in && zero_packet && out_len && max_packet && out_len % max_packet == 0;
             NSError *e = nil;
+            if (!zlp) {
+                BOOL queued = [pipe enqueueIORequestWithData:data
+                                           completionTimeout:0
+                                                       error:&e
+                                           completionHandler:^(IOReturn r, NSUInteger n) {
+                                               finish(h, tag, status_of(r), (uint32_t)n, is_in ? data : nil);
+                                           }];
+                if (!queued) finish(h, tag, status_of_error(e), 0, nil);
+                return;
+            }
+            // Linux's URB_ZERO_PACKET: the data, then a zero-length packet
+            // queued straight behind it, so nothing can come between them.
+            // A pipe completes in order, on this queue: the data's handler
+            // runs first, and the URB is answered when the packet has gone.
+            __block IOReturn sent = kIOReturnSuccess;
+            __block NSUInteger sent_n = 0;
+            // Set if the packet could not be queued: the data's own handler
+            // answers. Neither handler can run before this block returns.
+            __block BOOL alone = NO;
             BOOL queued = [pipe enqueueIORequestWithData:data
                                        completionTimeout:0
                                                    error:&e
                                        completionHandler:^(IOReturn r, NSUInteger n) {
-                                           finish(h, tag, status_of(r), (uint32_t)n, is_in ? data : nil);
+                                           sent = r;
+                                           sent_n = n;
+                                           if (alone) finish(h, tag, status_of(r), (uint32_t)n, nil);
                                        }];
-            if (!queued) finish(h, tag, status_of_error(e), 0, nil);
+            if (!queued) {
+                finish(h, tag, status_of_error(e), 0, nil);
+                return;
+            }
+            queued = [pipe enqueueIORequestWithData:nil
+                                  completionTimeout:0
+                                              error:&e
+                                  completionHandler:^(IOReturn r, NSUInteger n) {
+                                      (void)n;
+                                      IOReturn status = sent != kIOReturnSuccess ? sent : r;
+                                      finish(h, tag, status_of(status), (uint32_t)sent_n, nil);
+                                  }];
+            if (!queued) alone = YES;
         }
     });
 }

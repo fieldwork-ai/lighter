@@ -59,7 +59,7 @@ The Mac serves each device over USB/IP, the protocol Linux's `vhci-hcd` speaks, 
 
 - **The Mac's side** is asynchronous throughout: one thread for every device, each transfer an asynchronous IOUSBHost request.
 - **The protocol** follows Linux's own USB/IP server, including its unlink rules.
-- **What a device may hold at once is bounded.**
+- **The replies waiting for the guest are bounded:** past the bound, new transfers wait, while unlinks are still acted on.
 
 `docs/architecture.md`, "USB", has the details.
 
