@@ -719,6 +719,8 @@ supervise --port 2376 --control
 	supervise --udp-proxy 15202
 	supervise --inbound 2378
 	supervise --udp-inbound
+	# USB devices the Mac attaches: each on its own stream, to vhci-hcd.
+	supervise --usb 2384
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
 	# container and drops loopback nameservers on the way. The agent listens

@@ -26,6 +26,7 @@ mod service;
 mod storage_status;
 mod updates;
 mod upgrade;
+mod usb;
 
 use std::time::Duration;
 
@@ -44,6 +45,28 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum UsbAction {
+    /// The Mac's USB devices, and which the guest has.
+    #[command(alias = "ls")]
+    List,
+    /// Attach a device, by vendor:product (hex, from `lighter usb list`),
+    /// with :serial when two of the same are plugged in. It stays attached
+    /// across restarts and re-plugs until detached.
+    Attach {
+        spec: String,
+        /// Attach an input or storage device, or one whose port a Mac
+        /// program has open, which are refused otherwise.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Give a device back to macOS.
+    Detach { spec: String },
+    /// The guest's /dev/serial/by-id names, for `docker run --device`.
+    #[command(name = "ls-serial")]
+    LsSerial,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Start the machine and point the Docker CLI at it.
     Start {
@@ -53,6 +76,18 @@ enum Command {
     },
     /// Stop the machine.
     Stop,
+    /// Gives attached USB devices back to macOS when the machine's process
+    /// exits; started by the machine.
+    #[command(hide = true, name = "usb-keeper")]
+    UsbKeeper {
+        #[arg(long)]
+        parent: u32,
+    },
+    /// USB devices on the Mac, attached to the guest as if plugged into it.
+    Usb {
+        #[command(subcommand)]
+        action: UsbAction,
+    },
     /// Restart the machine.
     Restart,
     /// Say whether it is running, and what it costs.
@@ -233,6 +268,13 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             start(Duration::from_secs(120))
         }
         Command::Status => status(),
+        Command::Usb { action } => match action {
+            UsbAction::List => usb::list(),
+            UsbAction::Attach { spec, force } => usb::attach(&spec, force),
+            UsbAction::Detach { spec } => usb::detach(&spec),
+            UsbAction::LsSerial => usb::ls_serial(),
+        },
+        Command::UsbKeeper { parent } => usb::keeper(parent),
         Command::AneHost { port, cache } => {
             ane_host::serve(port, &cache)?;
             Ok(std::process::ExitCode::SUCCESS)
@@ -428,6 +470,16 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             memory.base_mib + memory.plugged_mib,
             memory.base_mib + memory.range_mib
         );
+    }
+    if let Some(entries) = usb::status() {
+        for e in entries {
+            let detail = if e.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", e.detail)
+            };
+            println!("  usb        {} {}{detail}", e.spec, e.status);
+        }
     }
     if let Some(restarts) = &status.agent_restarts {
         println!("  agents     restarted: {restarts} (see `lighter logs`)");

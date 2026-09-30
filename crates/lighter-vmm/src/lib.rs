@@ -53,6 +53,7 @@ pub mod smp;
 pub mod sockbuf;
 pub mod streams;
 pub mod sysreg;
+pub mod usb;
 pub mod vcpu;
 pub mod video;
 pub mod virtio;

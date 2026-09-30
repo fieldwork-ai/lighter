@@ -47,6 +47,11 @@ fn on_threads() -> bool {
 /// The reactor, if streams run on it.
 static REACTOR: std::sync::OnceLock<Arc<crate::reactor::Reactor>> = std::sync::OnceLock::new();
 
+/// The reactor carrying every stream, once `start` has run.
+pub fn reactor() -> Option<Arc<crate::reactor::Reactor>> {
+    REACTOR.get().cloned()
+}
+
 /// Starts answering the agent's streams.
 /// The vsock port the agent dials for UDP.
 pub const UDP_PORT: u32 = 2380;

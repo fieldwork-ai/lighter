@@ -45,9 +45,10 @@ enum Phase {
     AwaitHeader,
     /// The Mac's socket is connecting; writable means done.
     Connecting,
-    /// A host-opened stream (published port) waiting for the guest's accept,
-    /// then owed the guest address to dial as its first bytes.
-    AwaitEstablished(SocketAddr, Option<SocketAddr>),
+    /// A host-opened stream waiting for the guest's accept, then owed its
+    /// header as its first bytes: the guest address to dial for a published
+    /// port, the device to attach for USB.
+    AwaitEstablished(Vec<u8>),
     Open,
     /// The guest's UDP, every flow multiplexed on this one stream; the
     /// flows' sockets are in `Loop::udp_flows`.
@@ -70,8 +71,32 @@ struct UdpPublish {
 /// closed; the agent's own sweep of outbound flows uses the same.
 const UDP_FLOW_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A stream's socket on the Mac: TCP for the network's streams, one end of a
+/// unix socketpair for a stream this process serves itself (a USB device's,
+/// `usb/`). Everything here is done on the raw descriptor.
+enum MacSocket {
+    Tcp(TcpStream),
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl MacSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            MacSocket::Tcp(s) => s.as_raw_fd(),
+            MacSocket::Unix(s) => s.as_raw_fd(),
+        }
+    }
+
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        match self {
+            MacSocket::Tcp(s) => s.shutdown(how),
+            MacSocket::Unix(s) => crate::virtio::vsock::Socket::shutdown(s, how),
+        }
+    }
+}
+
 struct Stream {
-    tcp: Option<TcpStream>,
+    tcp: Option<MacSocket>,
     phase: Phase,
     /// Bytes read from the socket the guest has not had credit for yet.
     to_guest: Vec<u8>,
@@ -109,6 +134,9 @@ enum Command {
     /// A connection accepted on a published port, and the address in the
     /// guest the agent is to dial for it.
     Inbound(SocketAddr, TcpStream),
+    /// A stream this process serves itself, to open to a guest port with a
+    /// header of its own (a USB device's, `usb/`).
+    Carry(u32, std::os::unix::net::UnixStream, Vec<u8>),
     Dns(ConnKey),
     /// A DNS reply resolved off-thread, to go out on its stream.
     DnsReply(ConnKey, u16, Vec<u8>),
@@ -186,6 +214,16 @@ impl Reactor {
         self.wake();
     }
 
+    /// A stream this process serves on `socket`, opened to `guest_port` with
+    /// `header` as its first bytes once the guest accepts.
+    pub fn carry(&self, guest_port: u32, socket: std::os::unix::net::UnixStream, header: Vec<u8>) {
+        self.commands
+            .lock()
+            .expect("reactor commands poisoned")
+            .push(Command::Carry(guest_port, socket, header));
+        self.wake();
+    }
+
     /// A DNS stream the guest opened.
     /// The guest's UDP stream: one per boot, every flow on it.
     pub fn accept_udp(&self, key: ConnKey) {
@@ -246,7 +284,7 @@ impl Reactor {
     }
 }
 
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     // SAFETY: fcntl on a live descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -478,10 +516,10 @@ fn connect_result(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-struct Kq(RawFd);
+pub(crate) struct Kq(pub(crate) RawFd);
 
 impl Kq {
-    fn new() -> io::Result<Kq> {
+    pub(crate) fn new() -> io::Result<Kq> {
         // SAFETY: kqueue() takes nothing.
         let fd = unsafe { libc::kqueue() };
         if fd < 0 {
@@ -490,7 +528,7 @@ impl Kq {
         Ok(Kq(fd))
     }
 
-    fn set(&self, fd: RawFd, filter: i16, flags: u16) {
+    pub(crate) fn set(&self, fd: RawFd, filter: i16, flags: u16) {
         let ev = libc::kevent {
             ident: fd as usize,
             filter,
@@ -503,7 +541,7 @@ impl Kq {
         unsafe { libc::kevent(self.0, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
     }
 
-    fn read(&self, fd: RawFd, on: bool) {
+    pub(crate) fn read(&self, fd: RawFd, on: bool) {
         self.set(
             fd,
             libc::EVFILT_READ,
@@ -515,7 +553,7 @@ impl Kq {
         );
     }
 
-    fn write(&self, fd: RawFd, on: bool) {
+    pub(crate) fn write(&self, fd: RawFd, on: bool) {
         self.set(
             fd,
             libc::EVFILT_WRITE,
@@ -527,7 +565,7 @@ impl Kq {
         );
     }
 
-    fn forget(&self, fd: RawFd) {
+    pub(crate) fn forget(&self, fd: RawFd) {
         self.set(fd, libc::EVFILT_READ, libc::EV_DELETE);
         self.set(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
     }
@@ -902,8 +940,36 @@ impl Loop {
                 self.streams.insert(
                     key,
                     Stream {
-                        tcp: Some(mac),
-                        phase: Phase::AwaitEstablished(dst, client),
+                        tcp: Some(MacSocket::Tcp(mac)),
+                        phase: Phase::AwaitEstablished(inbound_header(dst, client)),
+                        to_guest: Vec::new(),
+                        to_guest_at: 0,
+                        from_guest: VecDeque::new(),
+                        from_guest_at: 0,
+                        tcp_eof: false,
+                        guest_eof: false,
+                        reading: false,
+                        writing: false,
+                        partial: Vec::new(),
+                        boost: None,
+                    },
+                );
+            }
+            Command::Carry(guest_port, socket, header) => {
+                crate::sockbuf::widen(&socket);
+                if set_nonblocking(socket.as_raw_fd()).is_err() {
+                    return;
+                }
+                let Ok(clone) = socket.try_clone() else {
+                    return;
+                };
+                let key = self.shared.open(guest_port, clone);
+                self.by_fd.insert(socket.as_raw_fd(), key);
+                self.streams.insert(
+                    key,
+                    Stream {
+                        tcp: Some(MacSocket::Unix(socket)),
+                        phase: Phase::AwaitEstablished(header),
                         to_guest: Vec::new(),
                         to_guest_at: 0,
                         from_guest: VecDeque::new(),
@@ -1310,6 +1376,7 @@ impl Loop {
                     match connect_nonblocking(addr) {
                         Ok(tcp) => {
                             let fd = tcp.as_raw_fd();
+                            let tcp = MacSocket::Tcp(tcp);
                             self.by_fd.insert(fd, key);
                             let stream = self.streams.get_mut(&key).expect("present");
                             stream.tcp = Some(tcp);
@@ -1330,10 +1397,10 @@ impl Loop {
                 Err(Gone) => self.close(key),
             },
             Phase::Connecting => {}
-            Phase::AwaitEstablished(dst, client) => match self.shared.status(key) {
+            Phase::AwaitEstablished(ref header) => match self.shared.status(key) {
                 Status::Established => {
-                    match self.shared.try_send(key, &inbound_header(dst, client)) {
-                        Ok(n) if n == inbound_header(dst, client).len() => {
+                    match self.shared.try_send(key, header) {
+                        Ok(n) if n == header.len() => {
                             let fd = stream.tcp.as_ref().expect("socket").as_raw_fd();
                             stream.phase = Phase::Open;
                             stream.reading = true;
