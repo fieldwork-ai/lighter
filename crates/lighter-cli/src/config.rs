@@ -425,6 +425,10 @@ mod tests {
             torch_python: String::new(),
             metal: false,
             video: false,
+            usb: vec![UsbDevice {
+                spec: "303a:831a".into(),
+                force: false,
+            }],
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         assert!(

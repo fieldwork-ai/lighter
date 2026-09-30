@@ -42,12 +42,23 @@ const READ_CHUNK: usize = 64 * 1024;
 pub enum Op {
     /// A control transfer on the default pipe: `out` for a host-to-device
     /// request, `in_len` bytes back for a device-to-host one.
-    Control { setup: [u8; 8], out: Vec<u8>, in_len: usize },
+    Control {
+        setup: [u8; 8],
+        out: Vec<u8>,
+        in_len: usize,
+    },
     /// A bulk or interrupt transfer on `endpoint` (its address, direction bit
     /// included).
-    Transfer { endpoint: u8, out: Vec<u8>, in_len: usize },
+    Transfer {
+        endpoint: u8,
+        out: Vec<u8>,
+        in_len: usize,
+    },
     SetConfiguration(u8),
-    SetInterface { interface: u8, alternate: u8 },
+    SetInterface {
+        interface: u8,
+        alternate: u8,
+    },
     ClearHalt(u8),
     Reset,
 }
@@ -97,9 +108,12 @@ impl Sink {
     }
 }
 
+/// A session handed to the loop: its id, its socket and its device.
+type Arrival = (u64, UnixStream, Box<dyn Device>);
+
 struct Shared {
     events: Mutex<Vec<(u64, Event)>>,
-    arrivals: Mutex<Vec<(u64, UnixStream, Box<dyn Device>)>>,
+    arrivals: Mutex<Vec<Arrival>>,
     wake_write: RawFd,
     next: AtomicU64,
     /// The sessions the loop holds now, for callers that ask.
@@ -108,7 +122,10 @@ struct Shared {
 
 impl Shared {
     fn post(&self, id: u64, event: Event) {
-        self.events.lock().expect("usb events poisoned").push((id, event));
+        self.events
+            .lock()
+            .expect("usb events poisoned")
+            .push((id, event));
         self.wake();
     }
 
@@ -155,12 +172,19 @@ impl Server {
     /// A sink for a session about to start: the device is opened with it,
     /// then handed to [`Server::serve`].
     pub fn sink(&self) -> Sink {
-        Sink { id: self.shared.next.fetch_add(1, Ordering::Relaxed), shared: self.shared.clone() }
+        Sink {
+            id: self.shared.next.fetch_add(1, Ordering::Relaxed),
+            shared: self.shared.clone(),
+        }
     }
 
     /// Serves `device` on `socket` until either ends.
     pub fn serve(&self, sink: &Sink, socket: UnixStream, device: Box<dyn Device>) {
-        self.shared.arrivals.lock().expect("usb arrivals poisoned").push((sink.id, socket, device));
+        self.shared
+            .arrivals
+            .lock()
+            .expect("usb arrivals poisoned")
+            .push((sink.id, socket, device));
         self.shared.wake();
     }
 
@@ -172,7 +196,11 @@ impl Server {
 
     /// Whether a session is still being served.
     pub fn serving(&self, sink: &Sink) -> bool {
-        self.shared.live.lock().expect("usb live poisoned").contains(&sink.id)
+        self.shared
+            .live
+            .lock()
+            .expect("usb live poisoned")
+            .contains(&sink.id)
     }
 }
 
@@ -231,7 +259,14 @@ struct Loop {
 
 impl Loop {
     fn new(shared: Arc<Shared>, kq: Kq, wake_read: RawFd) -> Loop {
-        Loop { shared, kq, wake_read, sessions: HashMap::new(), by_fd: HashMap::new(), buf: vec![0u8; READ_CHUNK] }
+        Loop {
+            shared,
+            kq,
+            wake_read,
+            sessions: HashMap::new(),
+            by_fd: HashMap::new(),
+            buf: vec![0u8; READ_CHUNK],
+        }
     }
 
     fn run(mut self) {
@@ -246,7 +281,14 @@ impl Loop {
         loop {
             // SAFETY: a live kqueue and a buffer of the length given; no timeout.
             let n = unsafe {
-                libc::kevent(self.kq.0, std::ptr::null(), 0, events.as_mut_ptr(), events.len() as i32, std::ptr::null())
+                libc::kevent(
+                    self.kq.0,
+                    std::ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    std::ptr::null(),
+                )
             };
             if n < 0 {
                 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -261,7 +303,9 @@ impl Loop {
                     self.drain_wake();
                     continue;
                 }
-                let Some(&id) = self.by_fd.get(&fd) else { continue };
+                let Some(&id) = self.by_fd.get(&fd) else {
+                    continue;
+                };
                 if ev.filter == libc::EVFILT_READ {
                     self.read(id);
                 } else if ev.filter == libc::EVFILT_WRITE {
@@ -280,7 +324,8 @@ impl Loop {
     }
 
     fn take_arrivals(&mut self) {
-        let arrivals = std::mem::take(&mut *self.shared.arrivals.lock().expect("usb arrivals poisoned"));
+        let arrivals =
+            std::mem::take(&mut *self.shared.arrivals.lock().expect("usb arrivals poisoned"));
         for (id, socket, device) in arrivals {
             if socket.set_nonblocking(true).is_err() {
                 continue;
@@ -324,7 +369,9 @@ impl Loop {
     }
 
     fn read(&mut self, id: u64) {
-        let Some(session) = self.sessions.get_mut(&id) else { return };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
         loop {
             match session.socket.read(&mut self.buf) {
                 Ok(0) => {
@@ -352,7 +399,9 @@ impl Loop {
         let mut at = 0;
         let mut corrupt = false;
         loop {
-            let Some(session) = self.sessions.get(&id) else { return };
+            let Some(session) = self.sessions.get(&id) else {
+                return;
+            };
             if session.committed >= COMMITTED_HIGH {
                 break;
             }
@@ -369,7 +418,9 @@ impl Loop {
                 }
             }
         }
-        let Some(session) = self.sessions.get_mut(&id) else { return };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
         session.rx.drain(..at);
         if corrupt {
             self.end(id);
@@ -379,20 +430,32 @@ impl Loop {
     }
 
     fn command(&mut self, id: u64, command: Command) {
-        let Some(session) = self.sessions.get_mut(&id) else { return };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
         match command {
             Command::Submit(submit) => {
                 if submit.is_iso() {
                     // Isochronous transfers (audio, video, a Bluetooth
                     // dongle's voice channel) are not carried yet; the URB
                     // fails and the driver sees why.
-                    queue(session, usbip::ret_submit(submit.seqnum, status::EOPNOTSUPP, 0, &[]));
+                    queue(
+                        session,
+                        usbip::ret_submit(submit.seqnum, status::EOPNOTSUPP, 0, &[]),
+                    );
                     self.pace(id);
                     return;
                 }
                 let (pipe, op) = operation(&submit);
                 let seqnum = submit.seqnum;
-                session.hold(seqnum, Pending { pipe, submit, unlink: None });
+                session.hold(
+                    seqnum,
+                    Pending {
+                        pipe,
+                        submit,
+                        unlink: None,
+                    },
+                );
                 session.device.start(seqnum, op);
             }
             Command::Unlink { seqnum, victim } => {
@@ -412,23 +475,45 @@ impl Loop {
     }
 
     fn done(&mut self, id: u64, done: Done) {
-        let Some(session) = self.sessions.get_mut(&id) else { return };
-        let Some(p) = session.release(done.tag) else { return };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let Some(p) = session.release(done.tag) else {
+            return;
+        };
         if let Some(unlink) = p.unlink {
             queue(session, usbip::ret_unlink(unlink, done.status));
         } else if done.status == status::ECONNRESET && done.actual == 0 {
             // Caught by an abort another URB's unlink asked for: nothing
             // moved, so it goes back on its pipe as if nothing happened.
             let (pipe, op) = operation(&p.submit);
-            session.hold(done.tag, Pending { pipe, submit: p.submit, unlink: None });
+            session.hold(
+                done.tag,
+                Pending {
+                    pipe,
+                    submit: p.submit,
+                    unlink: None,
+                },
+            );
             session.device.start(done.tag, op);
             return;
         } else {
             // Answered with what moved, including a transfer another
             // URB's abort cut short, which is then short, not failed.
-            let status = if done.status == status::ECONNRESET { status::OK } else { done.status };
-            let data: &[u8] = if p.submit.is_in() { &done.data[..done.actual.min(done.data.len())] } else { &[] };
-            queue(session, usbip::ret_submit(done.tag, status, done.actual, data));
+            let status = if done.status == status::ECONNRESET {
+                status::OK
+            } else {
+                done.status
+            };
+            let data: &[u8] = if p.submit.is_in() {
+                &done.data[..done.actual.min(done.data.len())]
+            } else {
+                &[]
+            };
+            queue(
+                session,
+                usbip::ret_submit(done.tag, status, done.actual, data),
+            );
         }
         self.pace(id);
     }
@@ -439,7 +524,10 @@ impl Loop {
     /// already read.
     fn pace(&mut self, id: u64) {
         self.flush(id);
-        let resume = self.sessions.get(&id).is_some_and(|s| !s.taking && s.committed < COMMITTED_LOW);
+        let resume = self
+            .sessions
+            .get(&id)
+            .is_some_and(|s| !s.taking && s.committed < COMMITTED_LOW);
         if resume {
             if let Some(s) = self.sessions.get_mut(&id) {
                 s.taking = true;
@@ -449,7 +537,9 @@ impl Loop {
     }
 
     fn flush(&mut self, id: u64) {
-        let Some(session) = self.sessions.get_mut(&id) else { return };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
         while let Some(front) = session.tx.front() {
             match session.socket.write(&front[session.tx_at..]) {
                 Ok(n) => {
@@ -489,11 +579,17 @@ impl Loop {
     }
 
     fn end(&mut self, id: u64) {
-        let Some(mut session) = self.sessions.remove(&id) else { return };
+        let Some(mut session) = self.sessions.remove(&id) else {
+            return;
+        };
         let fd = session.socket.as_raw_fd();
         self.kq.forget(fd);
         self.by_fd.remove(&fd);
-        self.shared.live.lock().expect("usb live poisoned").retain(|&l| l != id);
+        self.shared
+            .live
+            .lock()
+            .expect("usb live poisoned")
+            .retain(|&l| l != id);
         let _ = session.socket.shutdown(std::net::Shutdown::Both);
         session.device.close();
     }
@@ -510,7 +606,13 @@ fn operation(submit: &Submit) -> (u8, Op) {
     if submit.ep == 0 {
         let op = match usbip::special(&submit.setup) {
             Some(Special::SetConfiguration(value)) => Op::SetConfiguration(value),
-            Some(Special::SetInterface { interface, alternate }) => Op::SetInterface { interface, alternate },
+            Some(Special::SetInterface {
+                interface,
+                alternate,
+            }) => Op::SetInterface {
+                interface,
+                alternate,
+            },
             Some(Special::ClearHalt { endpoint }) => Op::ClearHalt(endpoint),
             Some(Special::ResetDevice) => Op::Reset,
             None => Op::Control {
@@ -576,11 +678,20 @@ mod tests {
     fn rig() -> Rig {
         let server = Server::start().unwrap();
         let (guest, host) = UnixStream::pair().unwrap();
-        guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let (tx, calls) = mpsc::channel();
         let sink = server.sink();
         server.serve(&sink, host, Box::new(Mock { log: tx }));
-        Rig { guest, sink, calls, server, buf: Vec::new(), ins: Default::default() }
+        Rig {
+            guest,
+            sink,
+            calls,
+            server,
+            buf: Vec::new(),
+            ins: Default::default(),
+        }
     }
 
     impl Rig {
@@ -594,11 +705,16 @@ mod tests {
         }
 
         fn call(&self) -> Call {
-            self.calls.recv_timeout(Duration::from_secs(5)).expect("a call on the device")
+            self.calls
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a call on the device")
         }
 
         fn no_call(&self) {
-            assert_eq!(self.calls.recv_timeout(Duration::from_millis(100)).ok(), None);
+            assert_eq!(
+                self.calls.recv_timeout(Duration::from_millis(100)).ok(),
+                None
+            );
         }
 
         fn reply(&mut self) -> Reply {
@@ -616,11 +732,18 @@ mod tests {
         }
 
         fn no_reply(&mut self) {
-            self.guest.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            self.guest
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
             let mut chunk = [0u8; 64];
             let got = self.guest.read(&mut chunk);
-            assert!(matches!(got, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock), "unexpected {got:?}");
-            self.guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert!(
+                matches!(got, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+                "unexpected {got:?}"
+            );
+            self.guest
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
         }
     }
 
@@ -642,7 +765,13 @@ mod tests {
     }
 
     fn control(seqnum: u32, direction: u32, setup: [u8; 8], data: Vec<u8>) -> Command {
-        let Command::Submit(mut s) = submit(seqnum, direction, 0, u16::from_le_bytes([setup[6], setup[7]]) as usize, data) else {
+        let Command::Submit(mut s) = submit(
+            seqnum,
+            direction,
+            0,
+            u16::from_le_bytes([setup[6], setup[7]]) as usize,
+            data,
+        ) else {
             unreachable!()
         };
         s.setup = setup;
@@ -653,14 +782,60 @@ mod tests {
     fn transfers_go_to_their_pipe_and_are_answered() {
         let mut r = rig();
         r.send(submit(1, DIR_OUT, 2, 3, b"abc".to_vec()));
-        assert_eq!(r.call(), Call::Start(1, Op::Transfer { endpoint: 0x02, out: b"abc".to_vec(), in_len: 0 }));
-        r.sink.done(Done { tag: 1, status: 0, actual: 3, data: Vec::new() });
-        assert_eq!(r.reply(), Reply::Submit { seqnum: 1, status: 0, actual: 3, data: Vec::new() });
+        assert_eq!(
+            r.call(),
+            Call::Start(
+                1,
+                Op::Transfer {
+                    endpoint: 0x02,
+                    out: b"abc".to_vec(),
+                    in_len: 0
+                }
+            )
+        );
+        r.sink.done(Done {
+            tag: 1,
+            status: 0,
+            actual: 3,
+            data: Vec::new(),
+        });
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 1,
+                status: 0,
+                actual: 3,
+                data: Vec::new()
+            }
+        );
 
         r.send(submit(2, DIR_IN, 1, 64, Vec::new()));
-        assert_eq!(r.call(), Call::Start(2, Op::Transfer { endpoint: 0x81, out: Vec::new(), in_len: 64 }));
-        r.sink.done(Done { tag: 2, status: 0, actual: 5, data: b"hello".to_vec() });
-        assert_eq!(r.reply(), Reply::Submit { seqnum: 2, status: 0, actual: 5, data: b"hello".to_vec() });
+        assert_eq!(
+            r.call(),
+            Call::Start(
+                2,
+                Op::Transfer {
+                    endpoint: 0x81,
+                    out: Vec::new(),
+                    in_len: 64
+                }
+            )
+        );
+        r.sink.done(Done {
+            tag: 2,
+            status: 0,
+            actual: 5,
+            data: b"hello".to_vec(),
+        });
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 2,
+                status: 0,
+                actual: 5,
+                data: b"hello".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -668,19 +843,76 @@ mod tests {
         let mut r = rig();
         r.send(control(1, DIR_OUT, [0x00, 9, 1, 0, 0, 0, 0, 0], Vec::new()));
         assert_eq!(r.call(), Call::Start(1, Op::SetConfiguration(1)));
-        r.send(control(2, DIR_OUT, [0x01, 11, 1, 0, 2, 0, 0, 0], Vec::new()));
-        assert_eq!(r.call(), Call::Start(2, Op::SetInterface { interface: 2, alternate: 1 }));
-        r.send(control(3, DIR_OUT, [0x02, 1, 0, 0, 0x81, 0, 0, 0], Vec::new()));
+        r.send(control(
+            2,
+            DIR_OUT,
+            [0x01, 11, 1, 0, 2, 0, 0, 0],
+            Vec::new(),
+        ));
+        assert_eq!(
+            r.call(),
+            Call::Start(
+                2,
+                Op::SetInterface {
+                    interface: 2,
+                    alternate: 1
+                }
+            )
+        );
+        r.send(control(
+            3,
+            DIR_OUT,
+            [0x02, 1, 0, 0, 0x81, 0, 0, 0],
+            Vec::new(),
+        ));
         assert_eq!(r.call(), Call::Start(3, Op::ClearHalt(0x81)));
         // CDC-ACM's SET_LINE_CODING goes to the device as it is.
         let coding = vec![0x00, 0xc2, 0x01, 0x00, 0, 0, 8];
-        r.send(control(4, DIR_OUT, [0x21, 0x20, 0, 0, 0, 0, 7, 0], coding.clone()));
-        assert_eq!(r.call(), Call::Start(4, Op::Control { setup: [0x21, 0x20, 0, 0, 0, 0, 7, 0], out: coding, in_len: 0 }));
+        r.send(control(
+            4,
+            DIR_OUT,
+            [0x21, 0x20, 0, 0, 0, 0, 7, 0],
+            coding.clone(),
+        ));
+        assert_eq!(
+            r.call(),
+            Call::Start(
+                4,
+                Op::Control {
+                    setup: [0x21, 0x20, 0, 0, 0, 0, 7, 0],
+                    out: coding,
+                    in_len: 0
+                }
+            )
+        );
         // A descriptor read comes back with its bytes.
         r.send(control(5, DIR_IN, [0x80, 6, 0, 1, 0, 0, 18, 0], Vec::new()));
-        assert_eq!(r.call(), Call::Start(5, Op::Control { setup: [0x80, 6, 0, 1, 0, 0, 18, 0], out: Vec::new(), in_len: 18 }));
-        r.sink.done(Done { tag: 5, status: 0, actual: 18, data: vec![18; 18] });
-        assert_eq!(r.reply(), Reply::Submit { seqnum: 5, status: 0, actual: 18, data: vec![18; 18] });
+        assert_eq!(
+            r.call(),
+            Call::Start(
+                5,
+                Op::Control {
+                    setup: [0x80, 6, 0, 1, 0, 0, 18, 0],
+                    out: Vec::new(),
+                    in_len: 18
+                }
+            )
+        );
+        r.sink.done(Done {
+            tag: 5,
+            status: 0,
+            actual: 18,
+            data: vec![18; 18],
+        });
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 5,
+                status: 0,
+                actual: 18,
+                data: vec![18; 18]
+            }
+        );
     }
 
     #[test]
@@ -688,10 +920,24 @@ mod tests {
         let mut r = rig();
         r.send(submit(1, DIR_IN, 1, 64, Vec::new()));
         r.call();
-        r.send(Command::Unlink { seqnum: 2, victim: 1 });
+        r.send(Command::Unlink {
+            seqnum: 2,
+            victim: 1,
+        });
         assert_eq!(r.call(), Call::Abort(0x81));
-        r.sink.done(Done { tag: 1, status: status::ECONNRESET, actual: 0, data: Vec::new() });
-        assert_eq!(r.reply(), Reply::Unlink { seqnum: 2, status: status::ECONNRESET });
+        r.sink.done(Done {
+            tag: 1,
+            status: status::ECONNRESET,
+            actual: 0,
+            data: Vec::new(),
+        });
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 2,
+                status: status::ECONNRESET
+            }
+        );
         r.no_reply();
     }
 
@@ -700,10 +946,24 @@ mod tests {
         let mut r = rig();
         r.send(submit(1, DIR_OUT, 2, 1, vec![1]));
         r.call();
-        r.sink.done(Done { tag: 1, status: 0, actual: 1, data: Vec::new() });
+        r.sink.done(Done {
+            tag: 1,
+            status: 0,
+            actual: 1,
+            data: Vec::new(),
+        });
         assert!(matches!(r.reply(), Reply::Submit { seqnum: 1, .. }));
-        r.send(Command::Unlink { seqnum: 2, victim: 1 });
-        assert_eq!(r.reply(), Reply::Unlink { seqnum: 2, status: 0 });
+        r.send(Command::Unlink {
+            seqnum: 2,
+            victim: 1,
+        });
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 2,
+                status: 0
+            }
+        );
         r.no_call();
     }
 
@@ -712,10 +972,24 @@ mod tests {
         let mut r = rig();
         r.send(submit(1, DIR_IN, 1, 64, Vec::new()));
         r.call();
-        r.send(Command::Unlink { seqnum: 2, victim: 1 });
+        r.send(Command::Unlink {
+            seqnum: 2,
+            victim: 1,
+        });
         r.call();
-        r.sink.done(Done { tag: 1, status: 0, actual: 4, data: b"late".to_vec() });
-        assert_eq!(r.reply(), Reply::Unlink { seqnum: 2, status: 0 });
+        r.sink.done(Done {
+            tag: 1,
+            status: 0,
+            actual: 4,
+            data: b"late".to_vec(),
+        });
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 2,
+                status: 0
+            }
+        );
         r.no_reply();
     }
 
@@ -730,25 +1004,77 @@ mod tests {
         r.call();
         r.send(submit(3, DIR_IN, 1, 64, Vec::new()));
         r.call();
-        r.send(Command::Unlink { seqnum: 4, victim: 1 });
+        r.send(Command::Unlink {
+            seqnum: 4,
+            victim: 1,
+        });
         assert_eq!(r.call(), Call::Abort(0x81));
-        r.sink.done(Done { tag: 1, status: status::ECONNRESET, actual: 0, data: Vec::new() });
-        r.sink.done(Done { tag: 2, status: status::ECONNRESET, actual: 0, data: Vec::new() });
-        r.sink.done(Done { tag: 3, status: status::ECONNRESET, actual: 2, data: b"hi".to_vec() });
-        assert_eq!(r.reply(), Reply::Unlink { seqnum: 4, status: status::ECONNRESET });
-        assert_eq!(r.call(), Call::Start(2, Op::Transfer { endpoint: 0x81, out: Vec::new(), in_len: 64 }));
-        assert_eq!(r.reply(), Reply::Submit { seqnum: 3, status: 0, actual: 2, data: b"hi".to_vec() });
+        r.sink.done(Done {
+            tag: 1,
+            status: status::ECONNRESET,
+            actual: 0,
+            data: Vec::new(),
+        });
+        r.sink.done(Done {
+            tag: 2,
+            status: status::ECONNRESET,
+            actual: 0,
+            data: Vec::new(),
+        });
+        r.sink.done(Done {
+            tag: 3,
+            status: status::ECONNRESET,
+            actual: 2,
+            data: b"hi".to_vec(),
+        });
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 4,
+                status: status::ECONNRESET
+            }
+        );
+        assert_eq!(
+            r.call(),
+            Call::Start(
+                2,
+                Op::Transfer {
+                    endpoint: 0x81,
+                    out: Vec::new(),
+                    in_len: 64
+                }
+            )
+        );
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 3,
+                status: 0,
+                actual: 2,
+                data: b"hi".to_vec()
+            }
+        );
         r.no_reply();
     }
 
     #[test]
     fn isochronous_urbs_fail_rather_than_hang() {
         let mut r = rig();
-        let Command::Submit(mut s) = submit(1, DIR_IN, 3, 192, Vec::new()) else { unreachable!() };
+        let Command::Submit(mut s) = submit(1, DIR_IN, 3, 192, Vec::new()) else {
+            unreachable!()
+        };
         s.number_of_packets = 1;
         s.iso = vec![0; 16];
         r.send(Command::Submit(s));
-        assert_eq!(r.reply(), Reply::Submit { seqnum: 1, status: status::EOPNOTSUPP, actual: 0, data: Vec::new() });
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 1,
+                status: status::EOPNOTSUPP,
+                actual: 0,
+                data: Vec::new()
+            }
+        );
         r.no_call();
     }
 
@@ -760,7 +1086,11 @@ mod tests {
         r.sink.gone();
         assert_eq!(r.call(), Call::Close);
         let mut chunk = [0u8; 16];
-        assert_eq!(r.guest.read(&mut chunk).unwrap(), 0, "the guest sees the stream end");
+        assert_eq!(
+            r.guest.read(&mut chunk).unwrap(),
+            0,
+            "the guest sees the stream end"
+        );
         assert!(!r.server.serving(&r.sink));
     }
 
@@ -808,10 +1138,21 @@ mod tests {
         }
         while let Ok(Call::Start(tag, _)) = r.calls.recv_timeout(Duration::from_millis(300)) {
             started += 1;
-            r.sink.done(Done { tag, status: 0, actual: big, data: vec![0; big] });
+            r.sink.done(Done {
+                tag,
+                status: 0,
+                actual: big,
+                data: vec![0; big],
+            });
         }
-        assert!(started < 100, "every submit was taken while no reply was read ({started})");
-        assert!(started as usize * big >= COMMITTED_HIGH, "it stopped early ({started})");
+        assert!(
+            started < 100,
+            "every submit was taken while no reply was read ({started})"
+        );
+        assert!(
+            started as usize * big >= COMMITTED_HIGH,
+            "it stopped early ({started})"
+        );
         // Reading the replies lets it take the rest. (The writer's clone
         // shares the socket's non-blocking flag; the reader wants blocking.)
         r.guest.set_nonblocking(false).unwrap();
@@ -832,9 +1173,18 @@ mod tests {
         });
         while let Ok(Call::Start(tag, _)) = r.calls.recv_timeout(Duration::from_secs(2)) {
             replies += 1;
-            r.sink.done(Done { tag, status: 0, actual: big, data: vec![0; big] });
+            r.sink.done(Done {
+                tag,
+                status: 0,
+                actual: big,
+                data: vec![0; big],
+            });
         }
-        assert_eq!(started + replies, 100, "every submit is taken once replies are read");
+        assert_eq!(
+            started + replies,
+            100,
+            "every submit is taken once replies are read"
+        );
         assert_eq!(reader.join().unwrap(), 100 * (big + usbip::HEADER_LEN));
     }
 }

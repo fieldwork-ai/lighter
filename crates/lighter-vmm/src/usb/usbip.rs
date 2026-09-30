@@ -81,7 +81,11 @@ impl Submit {
 
     /// The endpoint address, direction bit included, as USB writes it.
     pub fn endpoint_address(&self) -> u8 {
-        if self.is_in() { self.ep | 0x80 } else { self.ep }
+        if self.is_in() {
+            self.ep | 0x80
+        } else {
+            self.ep
+        }
     }
 
     pub fn is_iso(&self) -> bool {
@@ -125,7 +129,13 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Command, usize)>, ParseError> {
     let command = be32(buf, 0);
     let seqnum = be32(buf, 4);
     match command {
-        CMD_UNLINK => Ok(Some((Command::Unlink { seqnum, victim: be32(buf, 20) }, HEADER_LEN))),
+        CMD_UNLINK => Ok(Some((
+            Command::Unlink {
+                seqnum,
+                victim: be32(buf, 20),
+            },
+            HEADER_LEN,
+        ))),
         CMD_SUBMIT => {
             let direction = be32(buf, 12);
             if direction != DIR_IN && direction != DIR_OUT {
@@ -144,7 +154,11 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Command, usize)>, ParseError> {
             if number_of_packets < -1 || number_of_packets as i64 > MAX_ISO_PACKETS as i64 {
                 return Err(ParseError::BadPackets(number_of_packets));
             }
-            let data_len = if direction == DIR_OUT { length as usize } else { 0 };
+            let data_len = if direction == DIR_OUT {
+                length as usize
+            } else {
+                0
+            };
             let iso_len = number_of_packets.max(0) as usize * ISO_DESCRIPTOR_LEN;
             let total = HEADER_LEN + data_len + iso_len;
             if buf.len() < total {
@@ -240,8 +254,16 @@ pub fn encode(command: &Command) -> Vec<u8> {
 /// A reply as the guest reads it, for tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
-    Submit { seqnum: u32, status: i32, actual: usize, data: Vec<u8> },
-    Unlink { seqnum: u32, status: i32 },
+    Submit {
+        seqnum: u32,
+        status: i32,
+        actual: usize,
+        data: Vec<u8>,
+    },
+    Unlink {
+        seqnum: u32,
+        status: i32,
+    },
 }
 
 /// Parses one reply; an in transfer's data is taken as `actual` bytes when
@@ -261,7 +283,12 @@ pub fn parse_reply(buf: &[u8], is_in: impl Fn(u32) -> bool) -> Option<(Reply, us
                 return None;
             }
             Some((
-                Reply::Submit { seqnum, status, actual, data: buf[HEADER_LEN..HEADER_LEN + data_len].to_vec() },
+                Reply::Submit {
+                    seqnum,
+                    status,
+                    actual,
+                    data: buf[HEADER_LEN..HEADER_LEN + data_len].to_vec(),
+                },
                 HEADER_LEN + data_len,
             ))
         }
@@ -275,8 +302,13 @@ pub fn parse_reply(buf: &[u8], is_in: impl Fn(u32) -> bool) -> Option<(Reply, us
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Special {
     SetConfiguration(u8),
-    SetInterface { interface: u8, alternate: u8 },
-    ClearHalt { endpoint: u8 },
+    SetInterface {
+        interface: u8,
+        alternate: u8,
+    },
+    ClearHalt {
+        endpoint: u8,
+    },
     /// A port reset the guest's hub driver asks for: the device is reset.
     ResetDevice,
 }
@@ -293,8 +325,13 @@ pub fn special(setup: &[u8; 8]) -> Option<Special> {
     const PORT_RESET: u16 = 4;
     match (request_type, request) {
         (0x00, SET_CONFIGURATION) => Some(Special::SetConfiguration(value as u8)),
-        (0x01, SET_INTERFACE) => Some(Special::SetInterface { interface: index as u8, alternate: value as u8 }),
-        (0x02, CLEAR_FEATURE) if value == ENDPOINT_HALT => Some(Special::ClearHalt { endpoint: index as u8 }),
+        (0x01, SET_INTERFACE) => Some(Special::SetInterface {
+            interface: index as u8,
+            alternate: value as u8,
+        }),
+        (0x02, CLEAR_FEATURE) if value == ENDPOINT_HALT => Some(Special::ClearHalt {
+            endpoint: index as u8,
+        }),
         (0x23, SET_FEATURE) if value == PORT_RESET => Some(Special::ResetDevice),
         _ => None,
     }
@@ -342,11 +379,20 @@ mod tests {
     #[test]
     fn two_commands_back_to_back_are_taken_one_at_a_time() {
         let mut bytes = encode(&Command::Submit(submit(1, DIR_OUT, 2, 3, vec![1, 2, 3])));
-        bytes.extend(encode(&Command::Unlink { seqnum: 2, victim: 1 }));
+        bytes.extend(encode(&Command::Unlink {
+            seqnum: 2,
+            victim: 1,
+        }));
         let (first, used) = parse(&bytes).unwrap().unwrap();
         assert!(matches!(first, Command::Submit(s) if s.data == [1, 2, 3]));
         let (second, _) = parse(&bytes[used..]).unwrap().unwrap();
-        assert_eq!(second, Command::Unlink { seqnum: 2, victim: 1 });
+        assert_eq!(
+            second,
+            Command::Unlink {
+                seqnum: 2,
+                victim: 1
+            }
+        );
     }
 
     #[test]
@@ -368,18 +414,50 @@ mod tests {
         assert_eq!(reply.len(), HEADER_LEN + 3);
         assert_eq!(
             parse_reply(&reply, |_| true),
-            Some((Reply::Submit { seqnum: 9, status: 0, actual: 3, data: b"abc".to_vec() }, HEADER_LEN + 3))
+            Some((
+                Reply::Submit {
+                    seqnum: 9,
+                    status: 0,
+                    actual: 3,
+                    data: b"abc".to_vec()
+                },
+                HEADER_LEN + 3
+            ))
         );
         let reply = ret_unlink(10, status::ECONNRESET);
-        assert_eq!(parse_reply(&reply, |_| false), Some((Reply::Unlink { seqnum: 10, status: -104 }, HEADER_LEN)));
+        assert_eq!(
+            parse_reply(&reply, |_| false),
+            Some((
+                Reply::Unlink {
+                    seqnum: 10,
+                    status: -104
+                },
+                HEADER_LEN
+            ))
+        );
     }
 
     #[test]
     fn the_requests_the_server_carries_out_itself_are_recognised() {
-        assert_eq!(special(&[0x00, 9, 1, 0, 0, 0, 0, 0]), Some(Special::SetConfiguration(1)));
-        assert_eq!(special(&[0x01, 11, 2, 0, 3, 0, 0, 0]), Some(Special::SetInterface { interface: 3, alternate: 2 }));
-        assert_eq!(special(&[0x02, 1, 0, 0, 0x81, 0, 0, 0]), Some(Special::ClearHalt { endpoint: 0x81 }));
-        assert_eq!(special(&[0x23, 3, 4, 0, 1, 0, 0, 0]), Some(Special::ResetDevice));
+        assert_eq!(
+            special(&[0x00, 9, 1, 0, 0, 0, 0, 0]),
+            Some(Special::SetConfiguration(1))
+        );
+        assert_eq!(
+            special(&[0x01, 11, 2, 0, 3, 0, 0, 0]),
+            Some(Special::SetInterface {
+                interface: 3,
+                alternate: 2
+            })
+        );
+        assert_eq!(
+            special(&[0x02, 1, 0, 0, 0x81, 0, 0, 0]),
+            Some(Special::ClearHalt { endpoint: 0x81 })
+        );
+        assert_eq!(
+            special(&[0x23, 3, 4, 0, 1, 0, 0, 0]),
+            Some(Special::ResetDevice)
+        );
         // A class request to an interface (CDC-ACM's SET_LINE_CODING) is the device's.
         assert_eq!(special(&[0x21, 0x20, 0, 0, 0, 0, 7, 0]), None);
         // CLEAR_FEATURE of anything but ENDPOINT_HALT is the device's.

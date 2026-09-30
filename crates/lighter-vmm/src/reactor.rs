@@ -960,7 +960,9 @@ impl Loop {
                 if set_nonblocking(socket.as_raw_fd()).is_err() {
                     return;
                 }
-                let Ok(clone) = socket.try_clone() else { return };
+                let Ok(clone) = socket.try_clone() else {
+                    return;
+                };
                 let key = self.shared.open(guest_port, clone);
                 self.by_fd.insert(socket.as_raw_fd(), key);
                 self.streams.insert(

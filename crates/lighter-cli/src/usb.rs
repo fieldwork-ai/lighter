@@ -36,7 +36,10 @@ fn wants(config: &Config) -> Vec<Want> {
         .usb
         .iter()
         .filter_map(|d| match d.spec.parse::<Spec>() {
-            Ok(spec) => Some(Want { spec, force: d.force }),
+            Ok(spec) => Some(Want {
+                spec,
+                force: d.force,
+            }),
             Err(e) => {
                 tracing::warn!("usb: ignoring {}: {e}", d.spec);
                 None
@@ -56,7 +59,11 @@ fn entries(manager: &Manager) -> Vec<Entry> {
                 Status::Refused(why) => ("refused", why),
                 Status::Retrying(why) => ("retrying", why),
             };
-            Entry { spec: spec.to_string(), status: status.into(), detail }
+            Entry {
+                spec: spec.to_string(),
+                status: status.into(),
+                detail,
+            }
         })
         .collect()
 }
@@ -68,7 +75,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn start(home: &Path, reactor: Arc<lighter_vmm::reactor::Reactor>) -> anyhow::Result<Server> {
+    pub fn start(
+        home: &Path,
+        reactor: Arc<lighter_vmm::reactor::Reactor>,
+    ) -> anyhow::Result<Server> {
         let manager = Manager::start(reactor, home.join(HELD))?;
         spawn_keeper();
         manager.set(wants(&Config::load()?));
@@ -76,25 +86,28 @@ impl Server {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        std::thread::Builder::new().name("usb-control".into()).spawn(move || {
-            for connection in listener.incoming() {
-                let Ok(mut stream) = connection else { continue };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                let mut line = String::new();
-                if BufReader::new(&stream).read_line(&mut line).is_err() {
-                    continue;
-                }
-                if line.trim() == "reload" {
-                    match Config::load() {
-                        Ok(config) => manager.set(wants(&config)),
-                        Err(e) => tracing::warn!("usb: cannot read the configuration: {e}"),
+        std::thread::Builder::new()
+            .name("usb-control".into())
+            .spawn(move || {
+                for connection in listener.incoming() {
+                    let Ok(mut stream) = connection else { continue };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    let mut line = String::new();
+                    if BufReader::new(&stream).read_line(&mut line).is_err() {
+                        continue;
                     }
+                    if line.trim() == "reload" {
+                        match Config::load() {
+                            Ok(config) => manager.set(wants(&config)),
+                            Err(e) => tracing::warn!("usb: cannot read the configuration: {e}"),
+                        }
+                    }
+                    let reply =
+                        serde_json::to_string(&entries(&manager)).unwrap_or_else(|_| "[]".into());
+                    let _ = writeln!(stream, "{reply}");
                 }
-                let reply = serde_json::to_string(&entries(&manager)).unwrap_or_else(|_| "[]".into());
-                let _ = writeln!(stream, "{reply}");
-            }
-        })?;
+            })?;
         Ok(Server { path })
     }
 }
@@ -112,7 +125,9 @@ impl Drop for Server {
 /// macOS's reach until they were unplugged.
 fn spawn_keeper() {
     use std::os::unix::process::CommandExt;
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let mut command = std::process::Command::new(exe);
     command
         .args(["usb-keeper", "--parent", &std::process::id().to_string()])
@@ -162,7 +177,9 @@ fn ask(request: &str) -> Option<Vec<Entry>> {
     if crate::instance::Identity::peer(&home, &stream).ok()?.pid() != pid {
         return None;
     }
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
     let mut stream = stream;
     writeln!(stream, "{request}").ok()?;
     let mut reply = String::new();
@@ -196,12 +213,21 @@ pub fn list() -> anyhow::Result<std::process::ExitCode> {
     println!("USB devices on this Mac:");
     for info in &devices {
         let spec = format!("{:04x}:{:04x}", info.vendor_id, info.product_id);
-        let wanted = config.usb.iter().find(|d| d.spec.parse::<Spec>().is_ok_and(|s| s.matches(info)));
+        let wanted = config
+            .usb
+            .iter()
+            .find(|d| d.spec.parse::<Spec>().is_ok_and(|s| s.matches(info)));
         let state = match (wanted, &status) {
             (Some(w), Some(entries)) => entries
                 .iter()
                 .find(|e| e.spec == w.spec)
-                .map(|e| if e.detail.is_empty() { e.status.clone() } else { format!("{}: {}", e.status, e.detail) })
+                .map(|e| {
+                    if e.detail.is_empty() {
+                        e.status.clone()
+                    } else {
+                        format!("{}: {}", e.status, e.detail)
+                    }
+                })
                 .unwrap_or_else(|| "attaching".into()),
             (Some(_), None) => "attached when the machine starts".into(),
             (None, _) => match refusal(info) {
@@ -209,15 +235,31 @@ pub fn list() -> anyhow::Result<std::process::ExitCode> {
                 None => "not attached".into(),
             },
         };
-        let serial = if info.serial.is_empty() { String::new() } else { format!(" serial {}", info.serial) };
-        let port = info.callout.as_deref().map(|p| format!(" {p}")).unwrap_or_default();
-        println!("  {spec}  {}{serial}  {}{port}", name(info), speed(info.speed));
+        let serial = if info.serial.is_empty() {
+            String::new()
+        } else {
+            format!(" serial {}", info.serial)
+        };
+        let port = info
+            .callout
+            .as_deref()
+            .map(|p| format!(" {p}"))
+            .unwrap_or_default();
+        println!(
+            "  {spec}  {}{serial}  {}{port}",
+            name(info),
+            speed(info.speed)
+        );
         println!("             {state}");
     }
     let missing: Vec<&UsbDevice> = config
         .usb
         .iter()
-        .filter(|d| !devices.iter().any(|i| d.spec.parse::<Spec>().is_ok_and(|s| s.matches(i))))
+        .filter(|d| {
+            !devices
+                .iter()
+                .any(|i| d.spec.parse::<Spec>().is_ok_and(|s| s.matches(i)))
+        })
         .collect();
     if !missing.is_empty() {
         println!("Attached, not plugged in:");
@@ -240,21 +282,30 @@ pub fn attach(spec: &str, force: bool) -> anyhow::Result<std::process::ExitCode>
     }
     let mut config = Config::load()?;
     let canonical = parsed.to_string();
-    config.usb.retain(|d| d.spec.parse::<Spec>().ok().as_ref() != Some(&parsed));
-    config.usb.push(UsbDevice { spec: canonical.clone(), force });
+    config
+        .usb
+        .retain(|d| d.spec.parse::<Spec>().ok().as_ref() != Some(&parsed));
+    config.usb.push(UsbDevice {
+        spec: canonical.clone(),
+        force,
+    });
     config.save()?;
     let Some(info) = present else {
         println!("{canonical} will be attached whenever it is plugged in.");
         return Ok(std::process::ExitCode::SUCCESS);
     };
     if ask("reload").is_none() {
-        println!("{canonical} ({}) will be attached when the machine starts.", name(&info));
+        println!(
+            "{canonical} ({}) will be attached when the machine starts.",
+            name(&info)
+        );
         return Ok(std::process::ExitCode::SUCCESS);
     }
     // The machine attaches it at once; say how that went.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let entry = ask("status").and_then(|entries| entries.into_iter().find(|e| e.spec == canonical));
+        let entry =
+            ask("status").and_then(|entries| entries.into_iter().find(|e| e.spec == canonical));
         match entry {
             // Served, and now in the guest: enumerated, its driver bound,
             // and its names made, which is what a container needs.
@@ -273,12 +324,17 @@ pub fn attach(spec: &str, force: bool) -> anyhow::Result<std::process::ExitCode>
             Some(e) if e.status == "refused" => {
                 eprintln!("lighter: {canonical} is not attached yet: {}.", e.detail);
                 if e.detail.contains("is open in") {
-                    eprintln!("It stays attached in the configuration, and the guest gets it as soon as the port is free.");
+                    eprintln!(
+                        "It stays attached in the configuration, and the guest gets it as soon as the port is free."
+                    );
                 }
                 return Ok(std::process::ExitCode::FAILURE);
             }
             Some(e) if Instant::now() >= deadline => {
-                eprintln!("lighter: {canonical} is not attached yet ({}: {})", e.status, e.detail);
+                eprintln!(
+                    "lighter: {canonical} is not attached yet ({}: {})",
+                    e.status, e.detail
+                );
                 return Ok(std::process::ExitCode::FAILURE);
             }
             _ => std::thread::sleep(Duration::from_millis(200)),
@@ -290,7 +346,9 @@ pub fn detach(spec: &str) -> anyhow::Result<std::process::ExitCode> {
     let parsed: Spec = spec.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let mut config = Config::load()?;
     let before = config.usb.len();
-    config.usb.retain(|d| d.spec.parse::<Spec>().ok().as_ref() != Some(&parsed));
+    config
+        .usb
+        .retain(|d| d.spec.parse::<Spec>().ok().as_ref() != Some(&parsed));
     if config.usb.len() == before {
         eprintln!("lighter: {spec} is not attached.");
         return Ok(std::process::ExitCode::FAILURE);
@@ -337,7 +395,10 @@ fn serial_settled(vendor: u16, product: u16) -> bool {
         "for d in /sys/bus/usb/devices/*; do [ \"$(cat $d/idVendor 2>/dev/null):$(cat $d/idProduct 2>/dev/null)\" = {vendor:04x}:{product:04x} ] && ls -d $d/*/tty* $d/*/ttyUSB* 2>/dev/null; done"
     ))
     .is_ok_and(|out| !out.trim().is_empty());
-    !has_tty || serial_names().iter().any(|n| n.vendor == vendor && n.product == product)
+    !has_tty
+        || serial_names()
+            .iter()
+            .any(|n| n.vendor == vendor && n.product == product)
 }
 
 struct SerialName {
@@ -353,7 +414,9 @@ fn serial_names() -> Vec<SerialName> {
     let script = "for l in /dev/serial/by-id/*; do [ -e \"$l\" ] || continue; t=$(readlink -f $l); n=${t##*/}; \
                   d=$(readlink -f /sys/class/tty/$n/device); while [ \"$d\" != / ] && [ ! -f $d/idVendor ]; do d=${d%/*}; done; \
                   echo \"$l $n $(cat $d/idVendor 2>/dev/null) $(cat $d/idProduct 2>/dev/null)\"; done";
-    let Ok(out) = guest_sh(script) else { return Vec::new() };
+    let Ok(out) = guest_sh(script) else {
+        return Vec::new();
+    };
     out.lines()
         .filter_map(|line| {
             let mut f = line.split_whitespace();
@@ -376,7 +439,10 @@ pub fn ls_serial() -> anyhow::Result<std::process::ExitCode> {
         println!("No USB serial devices in the guest (`lighter usb list` shows what is attached).");
     }
     for n in names {
-        println!("{}  ({}, {:04x}:{:04x})", n.path, n.tty, n.vendor, n.product);
+        println!(
+            "{}  ({}, {:04x}:{:04x})",
+            n.path, n.tty, n.vendor, n.product
+        );
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

@@ -19,7 +19,14 @@ struct Guest {
 }
 
 impl Guest {
-    fn submit(&mut self, direction: u32, ep: u8, setup: [u8; 8], length: usize, data: Vec<u8>) -> Reply {
+    fn submit(
+        &mut self,
+        direction: u32,
+        ep: u8,
+        setup: [u8; 8],
+        length: usize,
+        data: Vec<u8>,
+    ) -> Reply {
         self.seq += 1;
         if direction == DIR_IN {
             self.ins.insert(self.seq);
@@ -63,7 +70,10 @@ impl Guest {
 fn main() {
     let spec = std::env::args().nth(1).expect("vid:pid");
     let (vid, pid) = spec.split_once(':').expect("vid:pid");
-    let (vid, pid) = (u16::from_str_radix(vid, 16).unwrap(), u16::from_str_radix(pid, 16).unwrap());
+    let (vid, pid) = (
+        u16::from_str_radix(vid, 16).unwrap(),
+        u16::from_str_radix(pid, 16).unwrap(),
+    );
     let info = iousb::list()
         .into_iter()
         .find(|d| d.vendor_id == vid && d.product_id == pid)
@@ -76,11 +86,21 @@ fn main() {
     let sink = server.sink();
     let device = IoUsbDevice::open(info.registry_id, sink.clone()).expect("seize");
     let (guest, host) = UnixStream::pair().unwrap();
-    guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    guest
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     server.serve(&sink, host, Box::new(device));
-    let port_gone = info.callout.as_deref().is_some_and(|p| !std::path::Path::new(p).exists());
+    let port_gone = info
+        .callout
+        .as_deref()
+        .is_some_and(|p| !std::path::Path::new(p).exists());
     println!("seized; macOS's port removed: {port_gone}");
-    let mut g = Guest { s: guest, buf: Vec::new(), ins: Default::default(), seq: 0 };
+    let mut g = Guest {
+        s: guest,
+        buf: Vec::new(),
+        ins: Default::default(),
+        seq: 0,
+    };
     println!("device descriptor:");
     g.submit(DIR_IN, 0, [0x80, 6, 0, 1, 0, 0, 18, 0], 18, vec![]);
     println!("configuration descriptor:");
@@ -93,7 +113,12 @@ fn main() {
     // The session ends with the guest; the device goes back to macOS.
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(5) {
-        if info.callout.as_deref().is_none_or(|p| std::path::Path::new(p).exists()) && !server.serving(&sink) {
+        if info
+            .callout
+            .as_deref()
+            .is_none_or(|p| std::path::Path::new(p).exists())
+            && !server.serving(&sink)
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -101,6 +126,8 @@ fn main() {
     println!(
         "released after {:?}; macOS's port back: {}",
         t0.elapsed(),
-        info.callout.as_deref().is_none_or(|p| std::path::Path::new(p).exists())
+        info.callout
+            .as_deref()
+            .is_none_or(|p| std::path::Path::new(p).exists())
     );
 }

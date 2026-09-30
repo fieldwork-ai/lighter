@@ -42,15 +42,34 @@ unsafe extern "C" {
         error: *mut c_char,
         error_len: usize,
     ) -> *mut Raw;
-    fn lighter_usb_control(d: *mut Raw, tag: u32, setup: *const u8, out: *const u8, out_len: u32, in_len: u32);
-    fn lighter_usb_transfer(d: *mut Raw, tag: u32, endpoint: u8, out: *const u8, out_len: u32, in_len: u32);
+    fn lighter_usb_control(
+        d: *mut Raw,
+        tag: u32,
+        setup: *const u8,
+        out: *const u8,
+        out_len: u32,
+        in_len: u32,
+    );
+    fn lighter_usb_transfer(
+        d: *mut Raw,
+        tag: u32,
+        endpoint: u8,
+        out: *const u8,
+        out_len: u32,
+        in_len: u32,
+    );
     fn lighter_usb_set_configuration(d: *mut Raw, tag: u32, value: u8);
     fn lighter_usb_set_interface(d: *mut Raw, tag: u32, interface: u8, alternate: u8);
     fn lighter_usb_clear_halt(d: *mut Raw, tag: u32, endpoint: u8);
     fn lighter_usb_reset(d: *mut Raw, tag: u32);
     fn lighter_usb_abort(d: *mut Raw, endpoint: u8);
     fn lighter_usb_close(d: *mut Raw);
-    fn lighter_usb_port_holder(path: *const c_char, pid: *mut i32, name: *mut c_char, name_len: usize) -> i32;
+    fn lighter_usb_port_holder(
+        path: *const c_char,
+        pid: *mut i32,
+        name: *mut c_char,
+        name_len: usize,
+    ) -> i32;
     fn lighter_usb_watch(ctx: *mut c_void, arrived: extern "C" fn(*mut c_void));
     fn lighter_usb_restore(registry_id: u64, error: *mut c_char, error_len: usize) -> i32;
 }
@@ -64,7 +83,9 @@ pub fn restore(registry_id: u64) -> Result<(), String> {
         return Ok(());
     }
     // SAFETY: the shim wrote a NUL-terminated message.
-    Err(unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy().into_owned())
+    Err(unsafe { CStr::from_ptr(error.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// Calls `arrived` whenever a USB device appears on the Mac, for the life of
@@ -129,7 +150,10 @@ impl Info {
 
 fn text(raw: &[c_char; 128]) -> String {
     // SAFETY: the shim writes NUL-terminated strings within the array.
-    unsafe { CStr::from_ptr(raw.as_ptr()) }.to_string_lossy().trim().to_owned()
+    unsafe { CStr::from_ptr(raw.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_owned()
 }
 
 /// Every USB device on the Mac.
@@ -179,12 +203,15 @@ pub fn port_holder(path: &str) -> Option<(i32, String)> {
     let mut pid = 0i32;
     let mut name = [0 as c_char; 256];
     // SAFETY: a C string, and out-parameters of the sizes given.
-    let found = unsafe { lighter_usb_port_holder(path.as_ptr(), &mut pid, name.as_mut_ptr(), name.len()) };
+    let found =
+        unsafe { lighter_usb_port_holder(path.as_ptr(), &mut pid, name.as_mut_ptr(), name.len()) };
     if found == 0 {
         return None;
     }
     // SAFETY: proc_name wrote a NUL-terminated name within the buffer.
-    let name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
     Some((pid, name))
 }
 
@@ -207,7 +234,12 @@ extern "C" fn on_done(ctx: *mut c_void, tag: u32, status: i32, actual: u32, data
         // SAFETY: the shim passes `actual` readable bytes for an in transfer.
         unsafe { std::slice::from_raw_parts(data, actual as usize) }.to_vec()
     };
-    sink.done(Done { tag, status, actual: actual as usize, data });
+    sink.done(Done {
+        tag,
+        status,
+        actual: actual as usize,
+        data,
+    });
 }
 
 extern "C" fn on_gone(ctx: *mut c_void) {
@@ -229,13 +261,23 @@ impl IoUsbDevice {
         // SAFETY: callbacks that honor the shim's contract, and a message buffer
         // of the length given.
         let raw = unsafe {
-            lighter_usb_open(registry_id, ctx, on_done, on_gone, on_closed, error.as_mut_ptr(), error.len())
+            lighter_usb_open(
+                registry_id,
+                ctx,
+                on_done,
+                on_gone,
+                on_closed,
+                error.as_mut_ptr(),
+                error.len(),
+            )
         };
         if raw.is_null() {
             // SAFETY: the shim did not keep ctx; it is ours to free.
             drop(unsafe { Box::from_raw(ctx as *mut Sink) });
             // SAFETY: the shim wrote a NUL-terminated message.
-            return Err(unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy().into_owned());
+            return Err(unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
         }
         Ok(IoUsbDevice { raw })
     }
@@ -254,13 +296,23 @@ impl Device for IoUsbDevice {
                     out.len() as u32,
                     in_len as u32,
                 ),
-                Op::Transfer { endpoint, out, in_len } => {
-                    lighter_usb_transfer(self.raw, tag, endpoint, out.as_ptr(), out.len() as u32, in_len as u32)
-                }
+                Op::Transfer {
+                    endpoint,
+                    out,
+                    in_len,
+                } => lighter_usb_transfer(
+                    self.raw,
+                    tag,
+                    endpoint,
+                    out.as_ptr(),
+                    out.len() as u32,
+                    in_len as u32,
+                ),
                 Op::SetConfiguration(value) => lighter_usb_set_configuration(self.raw, tag, value),
-                Op::SetInterface { interface, alternate } => {
-                    lighter_usb_set_interface(self.raw, tag, interface, alternate)
-                }
+                Op::SetInterface {
+                    interface,
+                    alternate,
+                } => lighter_usb_set_interface(self.raw, tag, interface, alternate),
                 Op::ClearHalt(endpoint) => lighter_usb_clear_halt(self.raw, tag, endpoint),
                 Op::Reset => lighter_usb_reset(self.raw, tag),
             }

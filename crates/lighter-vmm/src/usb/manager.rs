@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::iousb::{self, IoUsbDevice, Info};
+use super::iousb::{self, Info, IoUsbDevice};
 use super::server::{Server, Sink};
 
 /// The vsock port the agent attaches devices on (`guest/agent/src/usb.rs`).
@@ -41,12 +41,18 @@ impl std::str::FromStr for Spec {
         let hex = |p: Option<&str>| {
             p.filter(|p| !p.is_empty() && p.len() <= 4)
                 .and_then(|p| u16::from_str_radix(p, 16).ok())
-                .ok_or_else(|| format!("'{s}' is not vendor:product[:serial], in hex (like 303a:831a)"))
+                .ok_or_else(|| {
+                    format!("'{s}' is not vendor:product[:serial], in hex (like 303a:831a)")
+                })
         };
         let vendor = hex(parts.next())?;
         let product = hex(parts.next())?;
         let serial = parts.next().filter(|s| !s.is_empty()).map(str::to_owned);
-        Ok(Spec { vendor, product, serial })
+        Ok(Spec {
+            vendor,
+            product,
+            serial,
+        })
     }
 }
 
@@ -104,7 +110,12 @@ fn write_held(path: &Path, ids: &[u64]) -> std::io::Result<()> {
 /// the next machine at start. A lock keeps the two apart, since two seizes
 /// of one device take it from each other.
 pub fn restore_held(path: &Path) {
-    let Ok(lock) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("lock")) else {
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))
+    else {
         return;
     };
     use std::os::fd::AsRawFd;
@@ -118,7 +129,10 @@ pub fn restore_held(path: &Path) {
     for id in &ids {
         match iousb::restore(*id) {
             Ok(()) => tracing::info!(registry_id = id, "usb: gave a device back to macOS"),
-            Err(e) => tracing::warn!(registry_id = id, "usb: could not give a device back to macOS: {e}"),
+            Err(e) => tracing::warn!(
+                registry_id = id,
+                "usb: could not give a device back to macOS: {e}"
+            ),
         }
     }
     let _ = write_held(path, &[]);
@@ -135,10 +149,14 @@ pub fn refusal(info: &Info) -> Option<String> {
         return Some("a USB hub: attach the devices behind it instead".into());
     }
     if info.has_interface_class(iousb::CLASS_HID) {
-        return Some("an input device (keyboard, mouse or similar); --force to attach it anyway".into());
+        return Some(
+            "an input device (keyboard, mouse or similar); --force to attach it anyway".into(),
+        );
     }
     if info.has_interface_class(iousb::CLASS_MASS_STORAGE) {
-        return Some("a storage device, which macOS may have mounted; --force to attach it anyway".into());
+        return Some(
+            "a storage device, which macOS may have mounted; --force to attach it anyway".into(),
+        );
     }
     None
 }
@@ -172,7 +190,10 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn start(reactor: Arc<crate::reactor::Reactor>, held: PathBuf) -> std::io::Result<Arc<Manager>> {
+    pub fn start(
+        reactor: Arc<crate::reactor::Reactor>,
+        held: PathBuf,
+    ) -> std::io::Result<Arc<Manager>> {
         // Devices a lighter that crashed left seized go back to macOS first;
         // the wanted ones are seized again below.
         restore_held(&held);
@@ -221,7 +242,16 @@ impl Manager {
         state
             .wanted
             .iter()
-            .map(|w| (w.spec.clone(), state.status.get(&w.spec).cloned().unwrap_or(Status::Waiting)))
+            .map(|w| {
+                (
+                    w.spec.clone(),
+                    state
+                        .status
+                        .get(&w.spec)
+                        .cloned()
+                        .unwrap_or(Status::Waiting),
+                )
+            })
             .collect()
     }
 
@@ -260,7 +290,12 @@ impl Manager {
         let now = Instant::now();
         // Detach what is no longer wanted.
         let wanted: Vec<Spec> = state.wanted.iter().map(|w| w.spec.clone()).collect();
-        let unwanted: Vec<Spec> = state.sessions.keys().filter(|s| !wanted.contains(s)).cloned().collect();
+        let unwanted: Vec<Spec> = state
+            .sessions
+            .keys()
+            .filter(|s| !wanted.contains(s))
+            .cloned()
+            .collect();
         for spec in unwanted {
             if let Some(session) = state.sessions.remove(&spec) {
                 self.server.end(&session.sink);
@@ -283,7 +318,10 @@ impl Manager {
                     Some(&(_, p)) if short => (p * 2).min(LONGEST_RETRY),
                     _ => FIRST_RETRY,
                 };
-                state.retry.insert(spec.clone(), (now + if short { pause } else { Duration::ZERO }, pause));
+                state.retry.insert(
+                    spec.clone(),
+                    (now + if short { pause } else { Duration::ZERO }, pause),
+                );
             }
             let Some(info) = present.iter().find(|i| spec.matches(i)) else {
                 state.status.insert(spec, Status::Waiting);
@@ -308,7 +346,9 @@ impl Manager {
                 {
                     state.status.insert(
                         spec,
-                        Status::Refused(format!("{port} is open in {name} (pid {pid}); quit it, or --force")),
+                        Status::Refused(format!(
+                            "{port} is open in {name} (pid {pid}); quit it, or --force"
+                        )),
                     );
                     continue;
                 }
@@ -317,7 +357,9 @@ impl Manager {
                 && now < at
             {
                 if !matches!(state.status.get(&spec), Some(Status::Retrying(_))) {
-                    state.status.insert(spec, Status::Retrying("waiting for the guest".into()));
+                    state
+                        .status
+                        .insert(spec, Status::Retrying("waiting for the guest".into()));
                 }
                 continue;
             }
@@ -328,7 +370,10 @@ impl Manager {
                     state.status.insert(spec, Status::Attached);
                 }
                 Err(why) => {
-                    let pause = state.retry.get(&spec).map_or(FIRST_RETRY, |&(_, p)| (p * 2).min(LONGEST_RETRY));
+                    let pause = state
+                        .retry
+                        .get(&spec)
+                        .map_or(FIRST_RETRY, |&(_, p)| (p * 2).min(LONGEST_RETRY));
                     state.retry.insert(spec.clone(), (now + pause, pause));
                     tracing::warn!(%spec, "usb: {why}");
                     state.status.insert(spec, Status::Retrying(why));
@@ -351,7 +396,11 @@ impl Manager {
         header.extend_from_slice(&info.product_id.to_be_bytes());
         self.server.serve(&sink, server_end, Box::new(device));
         self.reactor.carry(USB_PORT, guest_end, header);
-        Ok(Session { sink, registry_id: info.registry_id, started: Instant::now() })
+        Ok(Session {
+            sink,
+            registry_id: info.registry_id,
+            started: Instant::now(),
+        })
     }
 }
 
