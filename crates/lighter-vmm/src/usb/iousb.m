@@ -73,8 +73,13 @@ struct lighter_usb {
 @property(strong) IOUSBHostDevice *device;
 // Interface number to the open interface of the current configuration.
 @property(strong) NSMutableDictionary<NSNumber *, IOUSBHostInterface *> *interfaces;
-// Endpoint address to its pipe, looked up on first use.
+// Endpoint address to its pipe, looked up on first use, and to the number
+// of the interface it belongs to: an alternate setting replaces only its own
+// interface's pipes, and a pipe with transfers queued must stay the object
+// they were queued on, or an abort would miss them.
 @property(strong) NSMutableDictionary<NSNumber *, IOUSBHostPipe *> *pipes;
+@property(strong) NSMutableDictionary<NSNumber *, NSNumber *> *pipeInterfaces;
+@property(assign) lighter_usb_abort_failed_fn abortFailed;
 @property(assign) BOOL closed;
 @property(assign) BOOL goneReported;
 @end
@@ -101,6 +106,7 @@ static void drop_interfaces(LighterUsbHolder *h) {
     for (IOUSBHostInterface *i in h.interfaces.allValues) [i destroy];
     [h.interfaces removeAllObjects];
     [h.pipes removeAllObjects];
+    [h.pipeInterfaces removeAllObjects];
 }
 
 // Opens every interface of the device's current configuration, on the
@@ -132,6 +138,7 @@ static IOUSBHostPipe *pipe_for(LighterUsbHolder *h, uint8_t endpoint) {
         p = [i copyPipeWithAddress:endpoint error:&e];
         if (p) {
             h.pipes[@(endpoint)] = p;
+            h.pipeInterfaces[@(endpoint)] = @(i.interfaceDescriptor->bInterfaceNumber);
             return p;
         }
     }
@@ -156,8 +163,8 @@ static IOUSBHostObject *control_target(LighterUsbHolder *h, const uint8_t setup[
 }
 
 lighter_usb *lighter_usb_open(uint64_t registry_id, void *ctx, lighter_usb_done_fn done,
-                              lighter_usb_gone_fn gone, lighter_usb_closed_fn closed, char *error,
-                              size_t error_len) {
+                              lighter_usb_gone_fn gone, lighter_usb_abort_failed_fn abort_failed,
+                              lighter_usb_closed_fn closed, char *error, size_t error_len) {
     @autoreleasepool {
         io_service_t service =
             IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(registry_id));
@@ -173,6 +180,8 @@ lighter_usb *lighter_usb_open(uint64_t registry_id, void *ctx, lighter_usb_done_
         h.queue = dispatch_queue_create("dev.lighter.usb", DISPATCH_QUEUE_SERIAL);
         h.interfaces = [NSMutableDictionary dictionary];
         h.pipes = [NSMutableDictionary dictionary];
+        h.pipeInterfaces = [NSMutableDictionary dictionary];
+        h.abortFailed = abort_failed;
         __weak LighterUsbHolder *weak = h;
         NSError *e = nil;
         h.device = [[IOUSBHostDevice alloc]
@@ -334,8 +343,12 @@ void lighter_usb_set_interface(lighter_usb *d, uint32_t tag, uint8_t interface, 
                 finish(h, tag, status_of_error(e), 0, nil);
                 return;
             }
-            // The interface's endpoints change with its setting.
-            [h.pipes removeAllObjects];
+            // The interface's endpoints change with its setting; the other
+            // interfaces' pipes, and what is queued on them, stay.
+            for (NSNumber *ep in [h.pipeInterfaces allKeysForObject:@(interface)]) {
+                [h.pipes removeObjectForKey:ep];
+                [h.pipeInterfaces removeObjectForKey:ep];
+            }
             finish(h, tag, 0, 0, nil);
         }
     });
@@ -355,6 +368,10 @@ void lighter_usb_clear_halt(lighter_usb *d, uint32_t tag, uint8_t endpoint) {
     });
 }
 
+// IOUSBHost's reset terminates the device and enumerates it afresh as a new
+// one, which macOS's drivers take: the guest sees it unplugged, and the
+// manager seizes the new one, as for a device plugged in again. Linux's own
+// vhci resets ports locally, so this comes only from a driver that asks.
 void lighter_usb_reset(lighter_usb *d, uint32_t tag) {
     LighterUsbHolder *h = holder_of(d);
     dispatch_async(h.queue, ^{
@@ -374,13 +391,18 @@ void lighter_usb_abort(lighter_usb *d, uint8_t endpoint) {
         @autoreleasepool {
             if (h.closed) return;
             NSError *e = nil;
+            BOOL ok = YES;
             if (endpoint == 0) {
-                [h.device abortDeviceRequestsWithOption:IOUSBHostAbortOptionAsynchronous error:&e];
+                ok = [h.device abortDeviceRequestsWithOption:IOUSBHostAbortOptionAsynchronous error:&e];
                 for (IOUSBHostInterface *i in h.interfaces.allValues)
-                    [i abortDeviceRequestsWithOption:IOUSBHostAbortOptionAsynchronous error:&e];
+                    ok = [i abortDeviceRequestsWithOption:IOUSBHostAbortOptionAsynchronous error:&e] && ok;
             } else {
-                [pipe_for(h, endpoint) abortWithOption:IOUSBHostAbortOptionAsynchronous error:&e];
+                // Only a pipe already looked up can have transfers queued.
+                IOUSBHostPipe *pipe = h.pipes[@(endpoint)];
+                ok = pipe && [pipe abortWithOption:IOUSBHostAbortOptionAsynchronous error:&e];
             }
+            // Whatever the abort did not reach may never complete.
+            if (!ok) h.abortFailed(h.ctx, endpoint);
         }
     });
 }

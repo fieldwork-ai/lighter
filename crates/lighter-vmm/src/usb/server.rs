@@ -110,6 +110,8 @@ enum Event {
     End,
     /// The device is back with macOS; the session is over.
     Closed,
+    /// An abort of this pipe could not be started.
+    AbortFailed(u8),
 }
 
 /// Where a session's device reports, from any thread.
@@ -128,6 +130,11 @@ impl Sink {
         self.shared.post(self.id, Event::Gone);
     }
 
+    /// An abort asked for could not be carried out.
+    pub fn abort_failed(&self, endpoint: u8) {
+        self.shared.post(self.id, Event::AbortFailed(endpoint));
+    }
+
     /// The device has been given back: the last word from a device.
     pub fn closed(&self) {
         self.shared.post(self.id, Event::Closed);
@@ -144,6 +151,8 @@ struct Shared {
     next: AtomicU64,
     /// Sessions from `serve` until their device is given back.
     live: Mutex<HashSet<u64>>,
+    /// Called whenever a device has been given back.
+    on_closed: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Shared {
@@ -189,6 +198,7 @@ impl Server {
             wake_write: fds[1],
             next: AtomicU64::new(1),
             live: Mutex::new(HashSet::new()),
+            on_closed: Mutex::new(None),
         });
         let kq = Kq::new()?;
         kq.read(fds[0], true);
@@ -197,6 +207,12 @@ impl Server {
             .name("usb".into())
             .spawn(move || Loop::new(looped, kq, fds[0]).run())?;
         Ok(Server { shared })
+    }
+
+    /// Calls `f`, from the server's thread, whenever a device has been given
+    /// back to macOS: what waits on one need not wait for its next tick.
+    pub fn on_closed(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.shared.on_closed.lock().expect("usb poisoned") = Some(f);
     }
 
     /// A sink for a session about to start: the device is opened with it,
@@ -317,7 +333,7 @@ impl Session {
             return;
         }
         if self.tx_bytes >= TX_HIGH || !self.deferred.is_empty() {
-            self.deferred_bytes += submit.data.len();
+            self.deferred_bytes += deferred_weight(&submit);
             self.deferred.push_back(submit);
             return;
         }
@@ -329,7 +345,7 @@ impl Session {
         // not submitted.
         if let Some(i) = self.deferred.iter().position(|s| s.seqnum == victim) {
             let s = self.deferred.remove(i).expect("found");
-            self.deferred_bytes -= s.data.len();
+            self.deferred_bytes -= deferred_weight(&s);
             self.reply(usbip::ret_unlink(seqnum, status::ECONNRESET));
             return;
         }
@@ -386,9 +402,11 @@ impl Session {
         } else {
             done.actual
         };
+        let collateral =
+            p.unlink.is_none() && caught_by_abort && pipe != 0 && done.status == status::ECONNRESET;
         if let Some(unlink) = p.unlink {
             self.reply(usbip::ret_unlink(unlink, done.status));
-        } else if done.status == status::ECONNRESET && caught_by_abort && pipe != 0 && actual == 0 {
+        } else if collateral && actual == 0 && p.submit.length > 0 {
             // Caught by the abort another URB's unlink asked for, with
             // nothing moved: it goes back on the pipe when the abort is done.
             self.aborting
@@ -398,8 +416,14 @@ impl Session {
                 .insert(done.tag, p.submit);
         } else {
             let mut status = done.status;
-            if status == status::ECONNRESET && caught_by_abort && pipe != 0 {
-                // Cut short by another URB's abort: short, not failed.
+            // Caught by another URB's abort after moving data: short, not
+            // failed. Unless it cannot say whether it finished: a
+            // zero-length out transfer, or one whose closing zero-length
+            // packet may not have gone, which is answered with the abort.
+            let complete = actual == p.submit.length;
+            let unsure = p.submit.length == 0
+                || (complete && p.submit.transfer_flags & URB_ZERO_PACKET != 0);
+            if collateral && !unsure {
                 status = status::OK;
             }
             if status == status::OK
@@ -412,21 +436,43 @@ impl Session {
             let data: &[u8] = if is_in { &done.data[..actual] } else { &[] };
             self.reply(usbip::ret_submit(done.tag, status, actual, data));
         }
-        // The abort is done when every URB it caught is back: the caught go
-        // back on the pipe first, in order, then what waited behind them.
         if self
             .aborting
             .get(&pipe)
             .is_some_and(|a| a.outstanding.is_empty())
         {
-            let a = self.aborting.remove(&pipe).expect("aborting");
-            for (_, submit) in a.caught {
-                self.start(submit);
-            }
-            for submit in a.held {
-                self.start(submit);
+            self.abort_done(pipe);
+        }
+    }
+
+    /// The abort is done when every URB it caught is back: the caught go
+    /// back on the pipe first, in order, then what waited behind them.
+    fn abort_done(&mut self, pipe: u8) {
+        let a = self.aborting.remove(&pipe).expect("aborting");
+        for (_, submit) in a.caught {
+            self.start(submit);
+        }
+        for submit in a.held {
+            self.start(submit);
+        }
+    }
+
+    /// macOS could not abort the pipe, so its URBs may never come back. The
+    /// ones unlinked are answered now, as gone (a completion that comes
+    /// later finds nothing to answer); the rest carry on, and so does the
+    /// pipe.
+    fn abort_failed(&mut self, pipe: u8) {
+        let Some(a) = self.aborting.get_mut(&pipe) else {
+            return;
+        };
+        let outstanding: Vec<u32> = a.outstanding.drain().collect();
+        for tag in outstanding {
+            if let Some(unlink) = self.pending.get(&tag).and_then(|p| p.unlink) {
+                self.pending.remove(&tag);
+                self.reply(usbip::ret_unlink(unlink, status::ECONNRESET));
             }
         }
+        self.abort_done(pipe);
     }
 
     /// Acts on every whole command received.
@@ -455,7 +501,7 @@ impl Session {
             return;
         }
         while let Some(submit) = self.deferred.pop_front() {
-            self.deferred_bytes -= submit.data.len();
+            self.deferred_bytes -= deferred_weight(&submit);
             self.start(submit);
         }
     }
@@ -591,6 +637,16 @@ impl Loop {
                         .lock()
                         .expect("usb live poisoned")
                         .remove(&id);
+                    if let Some(f) = &*self.shared.on_closed.lock().expect("usb poisoned") {
+                        f();
+                    }
+                }
+                Event::AbortFailed(pipe) => {
+                    tracing::warn!(session = id, pipe, "usb: macOS could not abort a pipe");
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.abort_failed(pipe);
+                        touched.push(id);
+                    }
                 }
                 Event::Done(done) => {
                     if let Some(session) = self.sessions.get_mut(&id) {
@@ -604,9 +660,12 @@ impl Loop {
                     }
                     if self.sessions.contains_key(&id) {
                         self.end(id);
-                    } else {
+                    } else if matches!(event, Event::Gone) || self.shared.is_live(id) {
                         // Not yet taken up (a device can go before it is
-                        // served): ended when it is. Forgotten at `Closed`.
+                        // served): ended when it is. Forgotten at `Closed`,
+                        // which a device reports after `Gone` and a served
+                        // session after `End`; an `End` for a session
+                        // already closed is dropped.
                         self.ended_early.insert(id);
                     }
                 }
@@ -709,6 +768,12 @@ impl Loop {
         // Served until the device says it is back with macOS (`Closed`).
         session.device.close();
     }
+}
+
+/// What a waiting submit costs: its data, and its header, so in transfers,
+/// which carry none, count too.
+fn deferred_weight(submit: &Submit) -> usize {
+    submit.data.len() + usbip::HEADER_LEN
 }
 
 /// What a submit asks of the device, and the pipe it queues on.
@@ -1550,5 +1615,103 @@ mod tests {
                 data: b"abc".to_vec()
             }
         );
+    }
+
+    /// An abort macOS could not start answers the unlink at once, and the
+    /// pipe carries on; a completion that comes later is not answered twice.
+    #[test]
+    fn an_abort_that_fails_answers_the_unlink_and_frees_the_pipe() {
+        let mut r = rig();
+        r.send(submit(1, DIR_IN, 1, 64, Vec::new()));
+        r.call();
+        r.send(submit(2, DIR_IN, 1, 64, Vec::new()));
+        r.call();
+        r.send(Command::Unlink {
+            seqnum: 3,
+            victim: 1,
+        });
+        assert_eq!(r.call(), Call::Abort(0x81));
+        r.send(submit(4, DIR_IN, 1, 64, Vec::new()));
+        r.no_call();
+        r.sink.abort_failed(0x81);
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 3,
+                status: status::ECONNRESET
+            }
+        );
+        assert_eq!(r.call(), Call::Start(4, transfer(0x81, 64)));
+        r.done(1, 0, 3, b"old");
+        r.done(2, 0, 2, b"ok");
+        assert_eq!(
+            r.reply(),
+            Reply::Submit {
+                seqnum: 2,
+                status: 0,
+                actual: 2,
+                data: b"ok".to_vec()
+            }
+        );
+        r.no_reply();
+    }
+
+    /// A transfer caught by another's abort that cannot say whether it
+    /// finished is answered with the abort, never sent again nor called
+    /// complete.
+    #[test]
+    fn transfers_that_cannot_say_whether_they_finished_are_not_repeated() {
+        let mut r = rig();
+        r.send(submit(1, DIR_OUT, 2, 1, vec![1]));
+        r.call();
+        // A zero-length packet: nothing moved either way.
+        r.send(submit(2, DIR_OUT, 2, 0, Vec::new()));
+        r.call();
+        // Its data sent, its closing zero-length packet perhaps not.
+        r.send(with_flags(
+            submit(3, DIR_OUT, 2, 64, vec![0; 64]),
+            URB_ZERO_PACKET,
+        ));
+        r.call();
+        r.send(Command::Unlink {
+            seqnum: 4,
+            victim: 1,
+        });
+        assert_eq!(r.call(), Call::Abort(0x02));
+        r.done(1, status::ECONNRESET, 0, &[]);
+        r.done(2, status::ECONNRESET, 0, &[]);
+        r.done(3, status::ECONNRESET, 64, &[]);
+        assert_eq!(
+            r.reply(),
+            Reply::Unlink {
+                seqnum: 4,
+                status: status::ECONNRESET
+            }
+        );
+        for seqnum in [2, 3] {
+            assert_eq!(
+                r.reply(),
+                Reply::Submit {
+                    seqnum,
+                    status: status::ECONNRESET,
+                    actual: if seqnum == 3 { 64 } else { 0 },
+                    data: Vec::new()
+                }
+            );
+        }
+        r.no_call();
+    }
+
+    /// Ending a session already closed leaves nothing behind to be served.
+    #[test]
+    fn ending_a_closed_session_is_a_no_op() {
+        let r = rig();
+        r.sink.gone();
+        assert_eq!(r.call(), Call::Close);
+        r.sink.closed();
+        r.until_not_serving();
+        r.server.end(&r.sink);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!r.server.serving(&r.sink));
     }
 }

@@ -175,14 +175,21 @@ fn wait_for_exit(pid: u32) {
             // SAFETY: one change and room for one event, on our own kqueue.
             // Retrying after EINTR re-adds the same one-shot watch.
             let n = unsafe { libc::kevent(kq, &change, 1, &mut event, 1, std::ptr::null()) };
-            if n > 0 {
-                return;
-            }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
+            // A registration that fails comes back as an event with
+            // EV_ERROR and the errno in `data`, since there is room for one.
+            let error = if n > 0 && event.flags & libc::EV_ERROR != 0 {
+                Some(event.data as i32)
+            } else if n < 0 {
+                std::io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            match error {
+                None if n > 0 => return,
+                Some(libc::EINTR) | None => continue,
                 // Gone before it could be watched.
                 Some(libc::ESRCH) => return,
-                _ => break,
+                Some(_) => break,
             }
         }
     }

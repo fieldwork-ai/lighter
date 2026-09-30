@@ -239,8 +239,11 @@ struct State {
 impl State {
     /// Ends a session; its device is held until the server says it is back.
     fn release(&mut self, server: &Server, session: Session) {
-        server.end(&session.sink);
-        self.releasing.push(session);
+        // A session that has closed on its own is over already.
+        if server.serving(&session.sink) {
+            server.end(&session.sink);
+            self.releasing.push(session);
+        }
     }
 }
 
@@ -252,6 +255,7 @@ pub struct Manager {
     reactor: Arc<crate::reactor::Reactor>,
     state: Mutex<State>,
     wake: Condvar,
+    nudged: std::sync::atomic::AtomicBool,
 }
 
 impl Manager {
@@ -277,7 +281,16 @@ impl Manager {
                 releasing: Vec::new(),
             }),
             wake: Condvar::new(),
+            nudged: std::sync::atomic::AtomicBool::new(false),
         });
+        // A device given back is a record to rewrite and perhaps a device to
+        // seize again: at once, not at the next tick.
+        let closed = Arc::downgrade(&manager);
+        manager.server.on_closed(Box::new(move || {
+            if let Some(m) = closed.upgrade() {
+                m.nudge();
+            }
+        }));
         let woken = Arc::downgrade(&manager);
         iousb::watch(Box::new(move || {
             if let Some(m) = woken.upgrade() {
@@ -326,14 +339,27 @@ impl Manager {
         self.wake.notify_one();
     }
 
+    /// `poke` from the USB server's thread, which must not wait on the
+    /// state lock while a reconcile opens a device. A nudge that lands
+    /// between the loop's check and its wait is seen at the next tick.
+    fn nudge(&self) {
+        self.nudged
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake.notify_one();
+    }
+
     fn run(self: Arc<Self>) {
+        use std::sync::atomic::Ordering;
         let mut state = self.state.lock().expect("usb state poisoned");
         loop {
             state.changed = false;
+            self.nudged.store(false, Ordering::Release);
             self.reconcile(&mut state);
             let (s, _) = self
                 .wake
-                .wait_timeout_while(state, TICK, |s| !s.changed)
+                .wait_timeout_while(state, TICK, |s| {
+                    !s.changed && !self.nudged.load(Ordering::Acquire)
+                })
                 .expect("usb state poisoned");
             state = s;
         }

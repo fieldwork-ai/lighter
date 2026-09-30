@@ -13,6 +13,9 @@ typedef void (*lighter_usb_done_fn)(void *ctx, uint32_t tag, int32_t status, uin
                                     const uint8_t *data);
 // The device went away: unplugged, or terminated by macOS.
 typedef void (*lighter_usb_gone_fn)(void *ctx);
+// An abort of `endpoint` could not be carried out: what it was to stop may
+// never complete.
+typedef void (*lighter_usb_abort_failed_fn)(void *ctx, uint8_t endpoint);
 // The device's last callback: after it, nothing refers to `ctx`.
 typedef void (*lighter_usb_closed_fn)(void *ctx);
 
@@ -44,8 +47,8 @@ int lighter_usb_list(lighter_usb_info *out, int max);
 // root) and unconfigures it, so the guest meets it as a device just plugged
 // in. NULL and a message in `error` if it cannot be had.
 lighter_usb *lighter_usb_open(uint64_t registry_id, void *ctx, lighter_usb_done_fn done,
-                              lighter_usb_gone_fn gone, lighter_usb_closed_fn closed, char *error,
-                              size_t error_len);
+                              lighter_usb_gone_fn gone, lighter_usb_abort_failed_fn abort_failed,
+                              lighter_usb_closed_fn closed, char *error, size_t error_len);
 
 // `is_in`: a device-to-host request, `in_len` bytes back; otherwise `out`.
 void lighter_usb_control(lighter_usb *d, uint32_t tag, const uint8_t setup[8], int is_in,

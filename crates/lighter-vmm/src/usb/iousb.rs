@@ -29,6 +29,7 @@ struct RawInfo {
 
 type DoneFn = extern "C" fn(*mut c_void, u32, i32, u32, *const u8);
 type GoneFn = extern "C" fn(*mut c_void);
+type AbortFailedFn = extern "C" fn(*mut c_void, u8);
 type ClosedFn = extern "C" fn(*mut c_void);
 
 unsafe extern "C" {
@@ -38,6 +39,7 @@ unsafe extern "C" {
         ctx: *mut c_void,
         done: DoneFn,
         gone: GoneFn,
+        abort_failed: AbortFailedFn,
         closed: ClosedFn,
         error: *mut c_char,
         error_len: usize,
@@ -250,6 +252,12 @@ extern "C" fn on_gone(ctx: *mut c_void) {
     sink.gone();
 }
 
+extern "C" fn on_abort_failed(ctx: *mut c_void, endpoint: u8) {
+    // SAFETY: as in on_done.
+    let sink = unsafe { &*(ctx as *const Sink) };
+    sink.abort_failed(endpoint);
+}
+
 extern "C" fn on_closed(ctx: *mut c_void) {
     // SAFETY: the Box leaked at open, returned once, after the last callback.
     let sink = unsafe { Box::from_raw(ctx as *mut Sink) };
@@ -269,6 +277,7 @@ impl IoUsbDevice {
                 ctx,
                 on_done,
                 on_gone,
+                on_abort_failed,
                 on_closed,
                 error.as_mut_ptr(),
                 error.len(),
