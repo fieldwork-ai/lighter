@@ -170,7 +170,7 @@ phase_ha() {
 		$D run -d --name "$HA" --restart unless-stopped -p 18123:8123 -e TZ=Europe/London \
 			--device "$TR_NAME:/dev/ttyUSB0" -v "$HOME2/ha:/config" ghcr.io/home-assistant/home-assistant:stable >/dev/null
 	$D start "$HA" >/dev/null 2>&1
-	if wait_for 300 curl -fs -o /dev/null http://127.0.0.1:18123/api/onboarding; then
+	if wait_for 300 curl -fs -o /dev/null http://127.0.0.1:18123/manifest.json; then
 		pass "Home Assistant answers on http://127.0.0.1:18123"
 	else
 		fail "Home Assistant did not come up: $($D logs --tail 10 "$HA" 2>&1 | tr '\n' ' ')"

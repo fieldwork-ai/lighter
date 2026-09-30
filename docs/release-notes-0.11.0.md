@@ -40,6 +40,8 @@ Devices that need isochronous transfers (webcams, audio interfaces) are not supp
 
 ## Tips for Zigbee and Z-Wave containers
 
+- **Choose an EmberZNet stick for Home Assistant or Zigbee2MQTT,** such as the Home Assistant Connect ZBT-2: both support it out of the box. Sticks that speak BLZ, such as ThirdReality's, pass through to containers and work with zigpy-blz, but neither Home Assistant's ZHA nor Zigbee2MQTT supports BLZ yet. Bouffalo Lab's own replacement ZHA did not load on Home Assistant 2026.9.4 when we tried it: it installs an older zha-quirks that Home Assistant's zigpy cannot import.
+
 - **Give the container `restart: unless-stopped`.** When the Mac sleeps, a coordinator like the ZBT-2 stays powered and can declare its host gone, and Zigbee2MQTT exits; the restart puts it back on the same network in about a second.
 - **After unplugging a stick, start its container again once the stick is back.** Docker's own restart runs while the device is missing, fails, and gives up, on lighter as on any Linux host.
 

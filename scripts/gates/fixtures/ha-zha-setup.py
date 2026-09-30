@@ -50,7 +50,15 @@ def sign_in(username, password):
 
 
 def onboard():
-    steps = {s["step"]: s["done"] for s in call("GET", "/api/onboarding")}
+    # Once onboarding is done, a restarted Home Assistant no longer serves
+    # its onboarding view at all.
+    try:
+        with urllib.request.urlopen(BASE + "/api/onboarding", timeout=30) as r:
+            steps = {s["step"]: s["done"] for s in json.loads(r.read())}
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        steps = {"user": True, "core_config": True, "analytics": True, "integration": True}
     creds = pathlib.Path(CREDENTIALS)
     if not steps.get("user"):
         password = secrets.token_urlsafe(18)
