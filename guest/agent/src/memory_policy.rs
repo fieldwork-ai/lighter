@@ -68,10 +68,80 @@ impl IdleTrim {
     }
 }
 
+/// Whether the guest as a whole ran short since the last look, from
+/// `/proc/vmstat`: the page allocator entering direct reclaim
+/// (`allocstall_*`), which the kernel counts only for reclaim that is not a
+/// cgroup's (`do_try_to_free_pages`, `!cgroup_reclaim`). Pressure stall
+/// information cannot tell the two apart: a container at its own
+/// `memory.max` reclaims under `psi_memstall_enter` like a guest out of
+/// memory, and a pressure-only need grew a guest from 28 to 47 GiB on a Mac
+/// at Critical for a builder at its 12 GiB limit (0.10.2, 2026-09-30), and
+/// on the M1 took a guest from 384 MiB to its whole range in a second for a
+/// container thrashing at 1 GiB, with these counters at zero.
+///
+/// Not while the balloon inflated: its allocations enter direct reclaim as
+/// well (`__GFP_NORETRY` allows one pass), and a need on that would hand the
+/// balloon straight back.
+#[derive(Default)]
+pub struct GlobalReclaim {
+    last: Option<(u64, u64)>,
+}
+
+impl GlobalReclaim {
+    pub fn tick(&mut self, vmstat: &str) -> bool {
+        let (mut stalls, mut inflated) = (0u64, 0u64);
+        for line in vmstat.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(name), Some(value)) = (fields.next(), fields.next()) else { continue };
+            let Ok(value) = value.parse::<u64>() else { continue };
+            if name.starts_with("allocstall_") {
+                stalls += value;
+            } else if name == "balloon_inflate" {
+                inflated = value;
+            }
+        }
+        let Some((last_stalls, last_inflated)) = self.last.replace((stalls, inflated)) else {
+            return false;
+        };
+        stalls > last_stalls && inflated == last_inflated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn vmstat(normal: u64, movable: u64, inflate: u64) -> String {
+        format!(
+            "nr_free_pages 1000\nallocstall_dma 0\nallocstall_normal {normal}\nallocstall_movable {movable}\npgscan_direct 5\nballoon_inflate {inflate}\nballoon_deflate 3\n"
+        )
+    }
+
+    #[test]
+    fn direct_reclaim_in_any_zone_is_the_guest_short() {
+        let mut reclaim = GlobalReclaim::default();
+        assert!(!reclaim.tick(&vmstat(4, 9, 7)), "the first look is a baseline");
+        assert!(!reclaim.tick(&vmstat(4, 9, 7)), "no stall since");
+        assert!(reclaim.tick(&vmstat(4, 10, 7)), "the movable zone stalled");
+        assert!(reclaim.tick(&vmstat(5, 10, 7)), "the kernel's zone stalled");
+        assert!(!reclaim.tick(&vmstat(5, 10, 7)), "and stopped");
+    }
+
+    #[test]
+    fn a_stall_while_the_balloon_inflates_is_the_balloons() {
+        let mut reclaim = GlobalReclaim::default();
+        reclaim.tick(&vmstat(0, 0, 100));
+        assert!(!reclaim.tick(&vmstat(0, 3, 140)));
+        assert!(reclaim.tick(&vmstat(0, 4, 140)), "the next stall with the balloon still is");
+    }
+
+    #[test]
+    fn no_vmstat_is_never_short() {
+        let mut reclaim = GlobalReclaim::default();
+        assert!(!reclaim.tick(""));
+        assert!(!reclaim.tick(""));
+    }
 
     struct Group(std::path::PathBuf);
 

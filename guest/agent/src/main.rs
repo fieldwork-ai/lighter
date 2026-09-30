@@ -345,6 +345,7 @@ fn bound_container_cache() {
     let mut last = container_cpu_usec(containers);
     let mut memory_stream: Option<OwnedFd> = None;
     let mut last_offer: Option<[u8; 32]> = None;
+    let mut global_reclaim = memory_policy::GlobalReclaim::default();
     let mut cpu_last = guest_cpu_usec();
     let mut quiet_for = 0u32;
     // Whether a trim has left reporting hurried, so the restore below is a
@@ -528,6 +529,7 @@ fn bound_container_cache() {
                 // The containers met the throttle's edge: a need whatever
                 // the CPU says, since what is throttled sleeps.
                 at_edge,
+                &mut global_reclaim,
             );
         }
         // Image extraction charges shared file pages to the engine. A running
@@ -620,6 +622,7 @@ fn offer_memory(
     nothing_runs: bool,
     busy: bool,
     stalled: bool,
+    global_reclaim: &mut memory_policy::GlobalReclaim,
 ) {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -680,8 +683,12 @@ fn offer_memory(
     // a zone its kernel could not use). `full`, not `some`: `some` counts
     // one task's reclaim, which is the host's own reclaim request and the
     // compaction after it, and a need on it handed the balloon back the
-    // moment the host had asked for it (m6b, the M1, 2026-09-21).
-    let need = stalled || (busy && (avail < (total >> 20) / 8 || psi_full >= 1000));
+    // moment the host had asked for it (m6b, the M1, 2026-09-21). Only
+    // while the guest itself is reclaiming (`GlobalReclaim`): a container
+    // at its own limit stalls the same, and growing the guest is no answer
+    // to it.
+    let short = global_reclaim.tick(&std::fs::read_to_string("/proc/vmstat").unwrap_or_default());
+    let need = stalled || (busy && (avail < (total >> 20) / 8 || (psi_full >= 1000 && short)));
     let spare = if offers && !release && quiet && free > reserve + reserve / 4 {
         free - reserve
     } else {

@@ -138,10 +138,47 @@ BOOT_FOOTPRINT="$(footprint)"
 	&& pass "booted in ${waited}s on its base: ${BOOT_PLUGGED} MiB of ${CEILING_MIB} plugged, footprint ${BOOT_FOOTPRINT} MiB" \
 	|| fail "booted with ${BOOT_PLUGGED:-?} MiB of the range plugged"
 
+# --------------------------------------------------------------- at a limit --
+# A container thrashing at its own memory limit stalls the guest's pressure
+# as a guest out of memory does, and growing the guest does nothing for it.
+# 0.11.1 grew a guest from 384 MiB to its whole range in a second for this
+# (the M1, 2026-09-30), and a Mac at Critical to 47 GiB for a builder at its
+# 12 GiB limit. What it may take is a top-up for the gigabyte the container
+# holds, and the headroom beside it.
+echo
+echo "==> A container thrashing at its own 1 GiB limit for 60s"
+limit_start="$(field plugged_mib)"
+stalls_before="$(guest 'grep ^allocstall_ /proc/vmstat | awk "{s += \$2} END {print s}"')"
+# Four readers of a file five times the room left beside 800 MiB held: one
+# reader stalled the M1's guest 6%, under the agent's line.
+docker run -d --name m6c-atlimit --memory 1g --memory-swap 1g --tmpfs /w:size=900m alpine:3.21 sh -c \
+	'dd if=/dev/zero of=/w/hold bs=1M count=800 2>/dev/null; dd if=/dev/urandom of=/big bs=1M count=1200 2>/dev/null; sync
+	for i in 1 2 3 4; do (while :; do cat /big >/dev/null; done) & done; wait' \
+	>/dev/null 2>&1 || fail "could not start the container at its limit"
+LIMIT_PEAK="${limit_start:-0}"; LIMIT_PSI=0
+for _ in $(seq 1 30); do
+	sleep 2
+	now="$(field plugged_mib)"
+	[ "${now:-0}" -gt "$LIMIT_PEAK" ] && LIMIT_PEAK="$now"
+	psi="$(guest 'sed -n "s/^full avg10=\([0-9]*\).*/\1/p" /proc/pressure/memory')"
+	[ "${psi:-0}" -gt "$LIMIT_PSI" ] && LIMIT_PSI="$psi"
+done
+stalls_after="$(guest 'grep ^allocstall_ /proc/vmstat | awk "{s += \$2} END {print s}"')"
+docker rm -f m6c-atlimit >/dev/null 2>&1 || true
+note "the guest stalled up to ${LIMIT_PSI}% on it; direct reclaim ${stalls_before:-?} → ${stalls_after:-?}"
+[ "${LIMIT_PSI:-0}" -ge 10 ] || note "under the agent's 10% line: this run did not provoke what it tests"
+[ "$LIMIT_PEAK" -le $(( ${limit_start:-0} + 2048 )) ] \
+	&& pass "the range stayed within a top-up: ${limit_start} → at most ${LIMIT_PEAK} MiB" \
+	|| fail "the range grew ${limit_start} → ${LIMIT_PEAK} MiB for a container at its own limit"
+sleep 10
+
 # ------------------------------------------------------------------- burst --
 echo
 echo "==> A ${BURST_MIB} MiB tmpfs burst from the base"
 events_before="$(guest 'grep "^high " /sys/fs/cgroup/docker/memory.events | cut -d" " -f2' || echo 0)"
+# The container at its limit above may have been killed within it.
+dmesg_ooms_before="$(guest 'dmesg | grep -ciE "out of memory|oom-kill"')"
+oom_kills_before="$(guest 'awk "/^oom_kill / {print \$2}" /sys/fs/cgroup/docker/memory.events')"
 start=$(date +%s)
 if docker run --rm --tmpfs /w:size=$((BURST_MIB * 2))m alpine:3.21 \
 	sh -c "dd if=/dev/zero of=/w/x bs=1M count=$BURST_MIB 2>/dev/null" >/dev/null 2>&1; then
@@ -158,8 +195,8 @@ for _ in 1 2 3 4 5 6; do
 	sleep 1
 done
 state="$(guest 'cat /sys/fs/cgroup/docker/memory.events; dmesg | grep -ciE "out of memory|oom-kill"')"
-oom_kills="$(awk '/^oom_kill /{print $2}' <<<"$state")"
-dmesg_ooms="$(tail -1 <<<"$state")"
+oom_kills="$(( $(awk '/^oom_kill /{print $2}' <<<"$state") - ${oom_kills_before:-0} ))"
+dmesg_ooms="$(( $(tail -1 <<<"$state") - ${dmesg_ooms_before:-0} ))"
 high_events="$(awk '/^high /{print $2}' <<<"$state")"
 [ "${oom_kills:-1}" -eq 0 ] && [ "${dmesg_ooms:-1}" -eq 0 ] \
 	&& pass "nothing OOM-killed; the throttle slowed it $(( ${high_events:-0} - ${events_before:-0} )) times" \
@@ -199,6 +236,25 @@ after_fp="$(footprint)"
 [ "${held:-0}" -gt 0 ] && [ "${after_fp:-99999}" -le $((before_fp + 64)) ] \
 	&& pass "at Warn the balloon holds ${held} MiB and the footprint went ${before_fp} → ${after_fp} MiB" \
 	|| fail "at Warn the balloon holds ${held:-0} MiB and the footprint went ${before_fp} → ${after_fp} MiB"
+# At Critical the guest does not grow at all: a burst past what it has waits
+# at the throttle, then its own kernel reclaims or kills, and the Mac is not
+# asked for more (0.10.2 grew 28 → 47 GiB on a 32 GiB Mac at Critical).
+echo critical > "$PRESSURE_FILE"
+sleep 3
+crit_start="$(field plugged_mib)"
+avail="$(guest 'awk "/^MemAvailable:/ {print int(\$2 / 1024)}" /proc/meminfo')"
+docker run --rm --tmpfs "/w:size=$(( ${avail:-1024} + 2048 ))m" alpine:3.21 \
+	sh -c "dd if=/dev/zero of=/w/x bs=1M count=$(( ${avail:-1024} + 1024 )) 2>/dev/null" >/dev/null 2>&1 || true
+CRIT_PEAK="${crit_start:-0}"
+for _ in 1 2 3 4 5 6; do
+	now="$(field plugged_mib)"
+	[ "${now:-0}" -gt "$CRIT_PEAK" ] && CRIT_PEAK="$now"
+	sleep 1
+done
+[ "$CRIT_PEAK" -le "${crit_start:-0}" ] \
+	&& pass "at Critical a burst past the guest's ${avail} MiB available left the range at ${crit_start} MiB" \
+	|| fail "at Critical the range grew ${crit_start} → ${CRIT_PEAK} MiB"
+docker info >/dev/null 2>&1 && pass "the engine answers after it" || fail "the engine does not answer after the burst at Critical"
 echo normal > "$PRESSURE_FILE"
 docker rm -f m6c-keeper >/dev/null 2>&1 || true
 
