@@ -271,7 +271,10 @@ pub fn attach(spec: &str, force: bool) -> anyhow::Result<std::process::ExitCode>
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             Some(e) if e.status == "refused" => {
-                eprintln!("lighter: {canonical} was not attached: {}", e.detail);
+                eprintln!("lighter: {canonical} is not attached yet: {}.", e.detail);
+                if e.detail.contains("is open in") {
+                    eprintln!("It stays attached in the configuration, and the guest gets it as soon as the port is free.");
+                }
                 return Ok(std::process::ExitCode::FAILURE);
             }
             Some(e) if Instant::now() >= deadline => {
