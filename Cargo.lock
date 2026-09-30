@@ -101,7 +101,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "block-buffer"
-version = "0.10.4"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-cli"
-version = "0.10.4"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-docker"
-version = "0.10.4"
+version = "0.11.0"
 dependencies = [
  "libc",
  "serde",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-fs"
-version = "0.10.4"
+version = "0.11.0"
 dependencies = [
  "libc",
  "tracing",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-hv"
-version = "0.10.4"
+version = "0.11.0"
 dependencies = [
  "libc",
  "thiserror 2.0.20",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "lighter-vmm"
-version = "0.10.4"
+version = "0.11.0"
 dependencies = [
  "cc",
  "libc",
