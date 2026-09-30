@@ -4,6 +4,8 @@ USB devices plugged into your Mac can now be used by containers, as if they were
 
 ## Using it
 
+The [USB guide](usb.md) walks through a complete setup: attaching a stick, running Zigbee2MQTT and Home Assistant, pairing devices, and moving an existing network from a Home Assistant VM or a Raspberry Pi.
+
 ```
 lighter usb list                 # the Mac's USB devices, and which the guest has
 lighter usb attach 303a:831a     # vendor:product, from the list
