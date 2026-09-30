@@ -115,6 +115,17 @@ else
 fi
 out="$("$LIGHTER" usb attach "$ZBT" 2>&1)"
 echo "$out" | grep -q "is attached" && echo "$out" | grep -q "$ZBT_NAME" && pass "attached again, and attach names the device's path" || fail "attach: $out"
+$D rm -f m15-zbt >/dev/null 2>&1
+# Straight back, with no pause: the device is still being given back when
+# the attach arrives, and must not be seized mid-release.
+for i in 1 2 3; do
+	"$LIGHTER" usb detach "$ZBT" >/dev/null
+	out="$("$LIGHTER" usb attach "$ZBT" 2>&1)"
+	echo "$out" | grep -q "is attached" || break
+done
+$D run -d --name m15-zbt --device "$ZBT_NAME:/dev/zbt" python:3.12-alpine sleep infinity >/dev/null 2>&1 &&
+	$D exec m15-zbt pip install -q universal-silabs-flasher >/dev/null 2>&1
+echo "$out" | grep -q "is attached" && [ -n "$(zbt_version)" ] && pass "detached and attached back to back three times, and the radio answers" || fail "back-to-back detach and attach: $out"
 
 echo "==> Unplugged on the guest's side, it comes back on its own"
 python3 - "$LIGHTER_HOME" <<'PY'
