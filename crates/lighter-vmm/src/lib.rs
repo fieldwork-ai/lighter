@@ -52,6 +52,7 @@ pub mod rosetta;
 pub mod smp;
 pub mod sockbuf;
 pub mod streams;
+pub mod usb;
 pub mod sysreg;
 pub mod vcpu;
 pub mod video;
