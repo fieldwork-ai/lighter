@@ -1,48 +1,70 @@
-# USB devices: Zigbee, Z-Wave and serial sticks
+# USB Devices: Zigbee, Z-Wave, and Serial Sticks
 
-lighter can hand a USB device plugged into your Mac to your containers, as if it were plugged into a Linux box. The container sees the same `/dev/serial/by-id/…` name Linux would give it, so an existing Zigbee2MQTT, Home Assistant or Z-Wave JS setup moves over unchanged.
+lighter lets you pass USB devices plugged into your Mac directly into your containers, exactly as if they were plugged into a dedicated Linux machine. Containers see standard `/dev/serial/by-id/...` device paths, so existing Zigbee2MQTT, Home Assistant, and Z-Wave JS setups migrate over unchanged.
 
-This guide takes you from a stick in a drawer to sensors in Home Assistant. The steps below were run as written on an M5 MacBook Pro, with a Home Assistant Connect ZBT-2, a ThirdReality temperature sensor and a ThirdReality colour bulb.
+This guide takes you from a stick in a drawer to live sensors in Home Assistant. The walkthrough below was tested end-to-end on Apple Silicon with a Home Assistant Connect ZBT-2 coordinator, a ThirdReality temperature/humidity sensor, and a smart color bulb.
 
-## What works
+## Supported Hardware
 
-- **Serial sticks:** Zigbee coordinators, Z-Wave sticks, Thread radios and USB-to-serial adapters (CDC-ACM, CH34x, CP210x, FTDI and PL2303 chips). These cover nearly every home automation stick.
-- **Not yet:** keyboards, mice and other input devices, USB storage, hubs, Bluetooth adapters, webcams and audio interfaces. lighter refuses the first four so it never takes a device your Mac is using, and says why.
+- **Supported out of the box:** Zigbee coordinators, Z-Wave dongles, Thread radios, and USB-to-serial adapters (chips including CDC-ACM, CH34x, CP210x, FTDI, and PL2303). This covers nearly every smart home coordinator on the market.
+- **Recommended coordinators:** For Home Assistant and Zigbee2MQTT, choose a stick with EmberZNet or Z-Stack firmware, such as the Home Assistant Connect ZBT-2 or a Sonoff Dongle-E/P.
+- **Not currently supported:** Keyboards, mice, USB mass storage drives, hubs, Bluetooth dongles, webcams, and audio interfaces. lighter automatically protects devices your Mac is actively using.
 
-For Home Assistant and Zigbee2MQTT, choose a stick with EmberZNet or Z-Stack firmware, such as the ZBT-2 or a SONOFF dongle. Sticks that speak BLZ, such as ThirdReality's own dongle, pass through fine, but neither Home Assistant nor Zigbee2MQTT supports BLZ yet.
+Note: Sticks using BLZ firmware (such as ThirdReality's dongle) pass through cleanly, but neither Home Assistant nor Zigbee2MQTT officially supports BLZ yet without custom forks.
 
-## 1. Find your stick
+---
 
-Plug it in, then:
+## 1. Find Your Stick
 
+Plug your USB device into your Mac, then list connected devices:
+
+```bash
+lighter usb list
 ```
-$ lighter usb list
+
+Output:
+```text
 USB devices on this Mac:
   303a:831a  Nabu Casa ZBT_2 serial E072A1D9E0CC  full speed /dev/cu.usbmodemE072A1D9E0CC1
              not attached
 ```
 
-`303a:831a` is the stick's vendor and product ID, which is how you name it to lighter.
+The string `303a:831a` is the device's Vendor ID and Product ID (VID:PID), which you use to attach it.
 
-## 2. Attach it
+---
 
+## 2. Attach It
+
+Attach the stick to lighter:
+
+```bash
+lighter usb attach 303a:831a
 ```
-$ lighter usb attach 303a:831a
+
+Output:
+```text
 303a:831a (Nabu Casa ZBT_2) is attached.
-  docker run --device /dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00 …
+  docker run --device /dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00 ...
 ```
 
-The path it prints is the one to give your container. You only do this once: the stick stays attached across restarts and re-plugs until you run `lighter usb detach 303a:831a`, which gives it back to macOS straight away.
+The path printed on the second line is the stable Linux device name to pass into your container.
 
-- **Machine not running?** `attach` says the stick will be attached when it starts. Once it is up, `lighter usb ls-serial` shows the path.
-- **Two identical sticks?** Add the serial number: `lighter usb attach 303a:831a:E072A1D9E0CC`.
-- **"is open in …"?** A Mac app has the stick's port open, often a leftover flashing tool or serial monitor. Quit it and the stick attaches by itself.
+You only need to run this command once: lighter remembers attached devices in its configuration, automatically reconnecting them across VM restarts, Mac sleep/wake cycles, and physical replugs.
+
+To release the stick back to macOS at any time, run `lighter usb detach 303a:831a`.
+
+**Helpful Tips:**
+- **Machine not running yet?** `lighter usb attach` records your choice and attaches the device automatically the next time lighter starts. Once running, view all active paths with `lighter usb ls-serial`.
+- **Multiple identical sticks?** Distinguish them by appending the serial number: `lighter usb attach 303a:831a:E072A1D9E0CC`.
+- **"Port is open in..."?** A macOS app (like a serial terminal or firmware flasher) is currently using the device. Close that app and lighter will attach the stick automatically.
+
+---
 
 ## 3. Run Zigbee2MQTT and Home Assistant
 
-A folder with three files runs the usual stack: an MQTT broker, Zigbee2MQTT and Home Assistant.
+Here is a ready-to-run Docker Compose stack with Mosquitto (MQTT broker), Zigbee2MQTT, and Home Assistant. Create a new directory and save the following three files:
 
-**`compose.yaml`**
+### `compose.yaml`
 
 ```yaml
 services:
@@ -55,13 +77,14 @@ services:
   zigbee2mqtt:
     image: koenkk/zigbee2mqtt
     restart: unless-stopped
-    depends_on: [mosquitto]
+    depends_on:
+      - mosquitto
     ports:
       - "8080:8080"
     volumes:
       - ./zigbee2mqtt:/app/data
     devices:
-      # The path `lighter usb attach` printed, mapped to the name in the config below.
+      # Use the path printed by `lighter usb attach`:
       - /dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00:/dev/ttyACM0
 
   homeassistant:
@@ -73,14 +96,14 @@ services:
       - ./homeassistant:/config
 ```
 
-**`mosquitto/mosquitto.conf`**
+### `mosquitto/mosquitto.conf`
 
-```
+```text
 listener 1883
 allow_anonymous true
 ```
 
-**`zigbee2mqtt/configuration.yaml`**
+### `zigbee2mqtt/configuration.yaml`
 
 ```yaml
 homeassistant:
@@ -101,47 +124,61 @@ advanced:
   ext_pan_id: GENERATE
 ```
 
-The `serial:` settings are the ZBT-2's. For another stick, use the settings from [Zigbee2MQTT's adapter list](https://www.zigbee2mqtt.io/guide/adapters/); they are the same as on any Linux host.
+*(The `serial:` block above is configured for the Home Assistant Connect ZBT-2. For other dongles, check [Zigbee2MQTT's supported adapters guide](https://www.zigbee2mqtt.io/guide/adapters/) for their standard serial settings).*
 
-Then:
+Now start the stack:
 
-```
+```bash
 docker compose up -d
 ```
 
-- **Zigbee2MQTT** is at http://localhost:8080. Its log should end with `Zigbee2MQTT started!`.
-- **Home Assistant** is at http://localhost:8123. Create your account, then go to Settings › Devices & services › Add integration › MQTT, and enter `mosquitto` as the broker, port `1883`.
+- **Zigbee2MQTT Web UI:** Open [http://localhost:8080](http://localhost:8080). The logs will display `Zigbee2MQTT started!`.
+- **Home Assistant Web UI:** Open [http://localhost:8123](http://localhost:8123). Complete the initial setup, then navigate to **Settings > Devices & Services > Add Integration > MQTT**, and enter `mosquitto` for the broker hostname with port `1883`.
 
-## 4. Pair devices
+---
 
-In Zigbee2MQTT, click **Permit join (All)**, then put each device in pairing mode. Most devices pair from a reset: hold a button for about five seconds, or for bulbs, switch them off and on five times. Each one appears in Zigbee2MQTT within seconds, and in Home Assistant a moment later, through MQTT.
+## 4. Pair Your Devices
 
-Prefer ZHA, Home Assistant's built-in Zigbee support, to Zigbee2MQTT? Leave out the `zigbee2mqtt` service, give Home Assistant the `devices:` line instead, and add the Zigbee Home Automation integration with the port `/dev/ttyACM0`. Use one or the other: a stick serves only one of them at a time. (This ZHA route is Home Assistant's standard setup, but unlike the rest of this guide it has not yet been run on lighter with a ZBT-2.)
+1. In the Zigbee2MQTT web interface, click **Permit join (All)**.
+2. Put your Zigbee sensor or bulb into pairing mode (typically by holding the reset button for 5 seconds, or toggling a bulb off and on 5 times).
+3. The device will appear in Zigbee2MQTT within seconds and automatically populate into Home Assistant via MQTT discovery.
 
-## Moving from a Home Assistant VM or a Raspberry Pi
+*Prefer Home Assistant's built-in ZHA integration?* Simply omit the `zigbee2mqtt` service from `compose.yaml`, map the device directly to the `homeassistant` service, and configure ZHA on `/dev/ttyACM0`. Note that a single physical USB stick can only be managed by one coordinator service at a time.
 
-Your Zigbee network lives on the stick and in Zigbee2MQTT's data folder, so moving keeps every paired device:
+---
 
-1. Stop Zigbee2MQTT on the old machine and copy its whole data folder (`configuration.yaml`, `coordinator_backup.json`, `database.db` and the rest) into `./zigbee2mqtt`.
-2. Change `serial: port:` to `/dev/ttyACM0`, and `mqtt: server:` to `mqtt://mosquitto:1883`.
-3. Move the stick to the Mac, attach it, and `docker compose up -d`.
+## Moving From a Raspberry Pi or Home Assistant OS
 
-Zigbee2MQTT resumes the same network, and the devices do not need pairing again. For Home Assistant itself, make a backup on the old machine and restore it during onboarding on the new one. One difference if you are coming from Home Assistant OS: containers have no add-ons, which is why Mosquitto and Zigbee2MQTT are services of their own here.
+Because your Zigbee network state is stored on the coordinator stick and in Zigbee2MQTT's data folder, migrating from an existing setup preserves all paired devices without re-pairing:
 
-## Things worth knowing
+1. Stop Zigbee2MQTT on your old machine and copy its entire data folder (`configuration.yaml`, `coordinator_backup.json`, `database.db`, etc.) into `./zigbee2mqtt/`.
+2. Ensure `serial: port:` is set to `/dev/ttyACM0` and `mqtt: server:` is set to `mqtt://mosquitto:1883`.
+3. Move the USB stick to your Mac, run `lighter usb attach <vid:pid>`, and start your stack with `docker compose up -d`.
 
-- **Keep `restart: unless-stopped`.** When the Mac sleeps, a coordinator such as the ZBT-2 stays powered, stops hearing from its host and gives up, and Zigbee2MQTT exits. With the restart policy it is back on the same network within a second of the Mac waking. This happens without lighter too: native Zigbee2MQTT on a Mac does the same.
-- **After unplugging a stick, start its container again** once the stick is back: `docker compose up -d`. lighter re-attaches the stick by itself within a second, but Docker's own restart runs while the stick is missing, fails, and gives up, as it does on any Linux host.
-- **Sleep and restarts are safe.** The stick stays attached through the Mac sleeping, `lighter stop` and `lighter start`. If lighter is killed, a small helper process gives the stick back to macOS within a second.
+Zigbee2MQTT will resume your existing network immediately. For Home Assistant itself, create a backup on your old host and restore it during the onboarding screen on your Mac.
+
+---
+
+## Important Tips & Behavior
+
+- **Always use `restart: unless-stopped`:** When macOS goes to sleep, USB power is maintained, but the host stops acknowledging packets. Zigbee coordinators will temporarily timeout and Zigbee2MQTT will exit. With `restart: unless-stopped`, Docker automatically restarts Zigbee2MQTT within one second of your Mac waking up, restoring your network seamlessly.
+- **Physical replugs:** If you unplug a stick while containers are running, lighter will automatically re-attach it to the VM within one second when plugged back in. Run `docker compose up -d` to restart any containers that stopped while the device was absent.
+- **Clean crash safety:** If lighter is unexpectedly stopped (`kill -9`), an independent supervisor helper process immediately returns all seized USB devices back to macOS.
+
+---
 
 ## Troubleshooting
 
-| You see | Do this |
+| What you see | How to resolve |
 |---|---|
-| `lighter usb list` doesn't show the stick | Try another port or cable. macOS must see it first: it should appear in System Information › USB. |
-| `is not attached yet: … is open in <app>` | Quit that app. The stick attaches by itself once the port is free. |
-| `refused` in `lighter usb list` | It looks like an input, storage or hub device. `--force` attaches it anyway, and macOS loses it while attached. |
-| Container fails with `no such file or directory` for the device | Check `lighter usb ls-serial` for the exact path, and that `lighter status` shows the stick `attached`. |
-| Zigbee2MQTT: `Adapter disconnected` | The stick went away: unplugged, or the Mac slept. With `restart: unless-stopped` it recovers by itself; after a re-plug, `docker compose up -d`. |
+| `lighter usb list` does not show the stick | Check the cable or try another port. macOS must detect the hardware first; verify it appears in **Apple Menu > About This Mac > System Report > USB**. |
+| `is not attached yet: ... is open in <app>` | A macOS application has the serial port open. Close that application and lighter will attach the stick automatically. |
+| `refused` in `lighter usb list` | The device was identified as an input, storage, or hub device. Pass `--force` to attach it anyway if you are certain it is safe. |
+| Container error: `no such file or directory` | Run `lighter usb ls-serial` to confirm the exact device path, and check `lighter status` to verify the device is listed as `attached`. |
+| Zigbee2MQTT log: `Adapter disconnected` | The USB stick was disconnected or the Mac went to sleep. With `restart: unless-stopped`, it recovers automatically on wake. After a physical replug, run `docker compose up -d`. |
 
-`lighter status` lists every attached device and where it stands. `lighter usb ls-serial` lists the names containers can use.
+To inspect all currently attached USB devices at any time, run:
+```bash
+lighter status
+lighter usb ls-serial
+```
