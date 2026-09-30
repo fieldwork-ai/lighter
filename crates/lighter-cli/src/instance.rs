@@ -108,7 +108,14 @@ impl Identity {
             proc_pidpath_audittoken(&self.token, path.as_mut_ptr().cast(), path.len() as u32)
         };
         if n <= 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the running machine's executable has been removed (its release was upgraded); `lighter restart` moves it to the installed one",
+                ));
+            }
+            return Err(error);
         }
         path.truncate(n as usize);
         if let Some(end) = path.iter().position(|b| *b == 0) {
@@ -149,7 +156,12 @@ impl Identity {
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::ESRCH | libc::ENOENT) => Ok(false),
+            Some(libc::ESRCH) => Ok(false),
+            // The token matched a process whose executable has no path any
+            // more: a package manager replaced the release it runs from
+            // (`brew upgrade` deletes the old keg). It is still running, and
+            // still ours to stop, unless all that is left is a zombie.
+            Some(libc::ENOENT) => Ok(!zombie(self.pid())),
             _ => Err(error),
         }
     }
@@ -177,6 +189,25 @@ impl Identity {
         }
         Ok(Some(identity))
     }
+}
+
+/// Whether `pid` has exited and waits only to be reaped (or is gone).
+fn zombie(pid: u32) -> bool {
+    const SZOMB: u32 = 5; // sys/proc.h
+    // SAFETY: zeroed plain-old-data, filled by the kernel up to its size.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as libc::c_int;
+    // SAFETY: a buffer of exactly the size given.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    n != size || info.pbi_status == SZOMB
 }
 
 pub(crate) fn try_lock(file: &File) -> io::Result<bool> {
@@ -345,6 +376,40 @@ mod tests {
         let mut owner = Instance::acquire(Path::new(&home)).unwrap().unwrap();
         owner.publish().unwrap();
         std::thread::sleep(Duration::from_secs(15));
+    }
+
+    /// `brew upgrade` deletes the keg a running machine was started from.
+    /// It is still running, and must still be found and stopped.
+    #[test]
+    fn an_owner_whose_executable_was_deleted_is_still_running() {
+        let home = Home::new();
+        let bin = tempfile::tempdir().unwrap();
+        let exe = bin.path().join("lighter-test-owner");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .args(["--exact", "instance::tests::daemon_child"])
+            .env("LIGHTER_TEST_INSTANCE_CHILD", &home.0)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Identity::read(&home.0).unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("child did not publish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::remove_file(&exe).unwrap();
+        let identity = Identity::read(&home.0)
+            .unwrap()
+            .expect("an owner whose executable was deleted is still running");
+        assert_eq!(identity.pid(), child.id());
+        assert!(identity.alive().unwrap());
+        assert!(identity.signal(libc::SIGTERM).unwrap());
+        child.wait().unwrap();
+        assert!(!identity.alive().unwrap());
+        assert!(Identity::read(&home.0).unwrap().is_none());
     }
 
     #[test]
