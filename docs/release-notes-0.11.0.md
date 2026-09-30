@@ -69,6 +69,7 @@ Gate m15-usb, part one, runs unattended with a ZBT-2 and a ThirdReality dongle p
 - both attach from the configuration at start, under udev's names, and macOS's own ports go away;
 - each radio answers its firmware query through a container;
 - detach gives the device back to macOS, and attach names its path;
+- detach and attach back to back, three times over, leave the radio answering;
 - a device the guest drops is attached again on its own;
 - the guest's agent can restart under attached devices;
 - a port a Mac program holds is refused, naming the program, then attached once it is let go;
