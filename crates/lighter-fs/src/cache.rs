@@ -293,11 +293,67 @@ impl Invalidator {
         }
     }
 
-    /// The host identity of a path, if it still has one.
-    fn identity(path: &Path) -> Option<(i64, u64)> {
+    /// What a watcher in the guest should be told about `name` in `parent`,
+    /// from what the path holds now and FSEvents' flags for it. A file the
+    /// guest already holds under this name has no news here: its writes
+    /// reach watchers through its inode notification. One it holds under
+    /// another name was renamed in. Otherwise the flags say what happened,
+    /// and since FSEvents folds a burst of changes into one event, a file
+    /// created and written in it is both — as a local create and write is
+    /// to Linux.
+    fn event(
+        &self,
+        parent: u64,
+        name: &[u8],
+        now: Option<(i64, u64, bool)>,
+        flags: u32,
+    ) -> Option<crate::notify::Event> {
+        use crate::fsevents::flag;
+        use crate::notify::{Event, raise};
+        let Some((dev, ino, is_dir)) = now else {
+            return (flags & (flag::ITEM_REMOVED | flag::ITEM_RENAMED) != 0).then_some(Event {
+                raise: raise::DELETE,
+                nodeid: 0,
+                is_dir: flags & flag::ITEM_IS_DIR != 0,
+            });
+        };
+        let nodeid = self.registry.nodeid_for(dev, ino).unwrap_or(0);
+        let held_here = self
+            .registry
+            .get(nodeid)
+            .and_then(|inode| inode.place())
+            .is_some_and(|(at, called)| at.id() == parent && called.as_bytes() == name);
+        if held_here {
+            return None;
+        }
+        let mut events = 0;
+        if nodeid != 0 || flags & (flag::ITEM_CREATED | flag::ITEM_RENAMED) != 0 {
+            events |= raise::CREATE;
+        }
+        if flags & flag::ITEM_MODIFIED != 0 {
+            events |= raise::MODIFY;
+        }
+        let meta = flag::ITEM_INODE_META_MOD | flag::ITEM_CHANGE_OWNER | flag::ITEM_XATTR_MOD;
+        if events == 0 {
+            events = if flags & meta != 0 {
+                raise::ATTRIB
+            } else {
+                raise::MODIFY
+            };
+        }
+        Some(Event {
+            raise: events,
+            nodeid,
+            is_dir,
+        })
+    }
+
+    /// The host identity of a path, if it still has one, and whether it is
+    /// a directory.
+    fn identity(path: &Path) -> Option<(i64, u64, bool)> {
         use std::os::unix::fs::MetadataExt;
         let st = std::fs::symlink_metadata(path).ok()?;
-        Some((st.dev() as i64, st.ino()))
+        Some((st.dev() as i64, st.ino(), st.is_dir()))
     }
 }
 
@@ -309,11 +365,12 @@ impl crate::fsevents::Observer for Invalidator {
         self.sink.push(crate::notify::Notification::Reset);
     }
 
-    fn changed(&self, path: &Path) {
+    fn changed(&self, path: &Path, flags: u32) {
         // The object itself may already be gone — a delete is exactly what the
         // guest most needs to stop caching — so the parent is handled whether
         // or not the object still exists.
-        if let Some((dev, ino)) = Invalidator::identity(path) {
+        let now = Invalidator::identity(path);
+        if let Some((dev, ino, _)) = now {
             self.policy.touched(dev, ino);
             if let Some(nodeid) = self.registry.nodeid_for(dev, ino) {
                 // An ownership record set or cleared on the Mac is a change
@@ -330,7 +387,7 @@ impl crate::fsevents::Observer for Invalidator {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return;
         };
-        let Some((dev, ino)) = Invalidator::identity(parent) else {
+        let Some((dev, ino, _)) = Invalidator::identity(parent) else {
             return;
         };
         self.policy.touched(dev, ino);
@@ -341,6 +398,7 @@ impl crate::fsevents::Observer for Invalidator {
             self.sink.push(crate::notify::Notification::Entry {
                 parent: nodeid,
                 name: name.as_bytes().to_vec(),
+                event: self.event(nodeid, name.as_bytes(), now, flags),
             });
         }
     }

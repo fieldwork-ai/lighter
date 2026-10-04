@@ -53,7 +53,7 @@ mod tests {
     }
 
     impl Observer for Collector {
-        fn changed(&self, path: &Path) {
+        fn changed(&self, path: &Path, _flags: u32) {
             self.0.lock().unwrap().push(Observed {
                 path: path.to_path_buf(),
                 received: std::time::Instant::now(),
