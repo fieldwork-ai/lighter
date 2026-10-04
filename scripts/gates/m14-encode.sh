@@ -33,8 +33,6 @@ TRIXIE="${LIGHTER_GATE_TRIXIE_IMAGE:-debian:trixie-slim}"
 # stride, a dropped or repeated frame, or chroma in the wrong place reads
 # in the single digits or teens.
 MIN_PSNR="${LIGHTER_GATE_MIN_PSNR:-36}"
-# Rate control over four seconds, container overhead included.
-BITRATE_TOLERANCE="${LIGHTER_GATE_BITRATE_TOLERANCE:-0.15}"
 
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
@@ -102,7 +100,8 @@ psnr() { ffmpeg -hide_banner -i "$1" -f lavfi -i "testsrc2=size=$2:rate=30" -fra
 src() { ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=$1:rate=30" -frames:v "$2" -pix_fmt "$3" "${@:4}"; }
 '
 at_least() { awk -v p="${1:-0}" -v m="$2" 'BEGIN{exit !(p >= m)}'; }
-within() { awk -v got="${1:-0}" -v want="$2" -v tol="$BITRATE_TOLERANCE" 'BEGIN{d = got / want - 1; if (d < 0) d = -d; exit !(d <= tol)}'; }
+near() { awk -v got="${1:-0}" -v want="$2" 'BEGIN{exit !(got >= want / 2 && got <= want * 2)}'; }
+mbps() { awk -v b="${1:-0}" 'BEGIN{printf "%.2f", b * 8 / 4 / 1e6}'; }
 
 echo
 echo "==> ffmpeg 5.1 (${BOOKWORM}, --device lighter.sh/video=all)"
@@ -119,7 +118,8 @@ echo "CAP $(v4l2-ctl -d /dev/video1 --list-formats | grep -oE "'"'"'[A-Z0-9]{4}'
 echo "CTRL $(v4l2-ctl -d /dev/video1 -C number_of_b_frames,sequence_header_mode,min_number_of_output_buffers 2>&1 | tr "\n" " ")"
 for c in h264 hevc; do
 	src 1920x1080 120 nv12 -c:v ${c}_v4l2m2m -b:v 8M -g 30 -y /tmp/$c.mp4
-	echo "ENC $c $(frames /tmp/$c.mp4) $(keyframes /tmp/$c.mp4) $(bytes /tmp/$c.mp4) $(psnr /tmp/$c.mp4 1920x1080 120) $(ffprobe -v error -show_entries stream=profile -of csv=p=0 /tmp/$c.mp4)"
+	src 1920x1080 120 nv12 -c:v ${c}_v4l2m2m -b:v 2M -g 30 -y /tmp/$c-2m.mp4
+	echo "ENC $c $(frames /tmp/$c.mp4) $(keyframes /tmp/$c.mp4) $(bytes /tmp/$c.mp4) $(psnr /tmp/$c.mp4 1920x1080 120) $(bytes /tmp/$c-2m.mp4) $(ffprobe -v error -show_entries stream=profile -of csv=p=0 /tmp/$c.mp4)"
 done
 src 1000x562 60 yuv420p -c:v h264_v4l2m2m -b:v 3M -y /tmp/odd.mp4
 echo "ODD $(frames /tmp/odd.mp4) $(psnr /tmp/odd.mp4 1000x562 60)"
@@ -140,13 +140,21 @@ echo "TRANSCODE $(frames /tmp/tx.mp4) $(ffprobe -v error -show_entries stream=co
 	else
 		fail "controls: $ctrl"
 	fi
+	# The bitrate asked for is VideoToolbox's to follow, and how closely is
+	# the media engine's: on an M5 Ultra it spends 6.3 Mbps of 8 on this clip
+	# at 40 dB, and HEVC 2.8 of 2, where an M5 Pro landed within 15% of 8.
+	# What lighter can break is the control reaching it at all, or in the
+	# wrong unit. So each encode lands within a factor of two of its budget,
+	# and quadrupling the budget at least doubles the bytes.
 	for c in h264 hevc; do
-		read -r _ _ n k b p prof <<<"$(grep "^ENC $c " <<<"$out")"
+		read -r _ _ n k b p b2 prof <<<"$(grep "^ENC $c " <<<"$out")"
 		want=$((8000000 * 4 / 8))
-		if [ "${n:-0}" = 120 ] && [ "${k:-0}" = 4 ] && within "$b" "$want" && at_least "$p" "$MIN_PSNR"; then
-			pass "$c: 120 frames, a keyframe every 30, $(awk -v b="$b" 'BEGIN{printf "%.2f", b * 8 / 4 / 1e6}') Mbps for 8 asked, ${p} dB, $prof"
+		want2=$((2000000 * 4 / 8))
+		if [ "${n:-0}" = 120 ] && [ "${k:-0}" = 4 ] && near "$b" "$want" && near "$b2" "$want2" \
+			&& [ "${b:-0}" -ge $((2 * ${b2:-1})) ] && at_least "$p" "$MIN_PSNR"; then
+			pass "$c: 120 frames, a keyframe every 30, $(mbps "$b") Mbps for 8 asked and $(mbps "$b2") for 2, ${p} dB, $prof"
 		else
-			fail "$c: frames=${n:-?} keyframes=${k:-?} bytes=${b:-?} (want ~$want) psnr=${p:-?}"
+			fail "$c: frames=${n:-?} keyframes=${k:-?} bytes=${b:-?} for 8 Mbps (want ~$want) and ${b2:-?} for 2 (want ~$want2) psnr=${p:-?}"
 		fi
 	done
 	read -r _ n p <<<"$(grep ^ODD <<<"$out")"
