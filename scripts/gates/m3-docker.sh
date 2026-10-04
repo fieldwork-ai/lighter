@@ -140,6 +140,17 @@ else
 	fail "seccomp profile: ${out##*$'\n'}"
 fi
 
+# A rootless engine in a container (docker:dind-rootless) opens tun and fuse as
+# a non-root user.
+if docker run --rm --privileged --user 1000:1000 alpine:3.21 sh -c '
+	for dev in /dev/net/tun /dev/fuse; do
+		test -r "$dev" && test -w "$dev" || { ls -l "$dev"; exit 1; }
+	done'; then
+	pass "a non-root user can open /dev/net/tun and /dev/fuse"
+else
+	fail "tun or fuse not open to a non-root user"
+fi
+
 echo
 echo "==> Checking build worker OOM isolation"
 mkdir -p "$RUN_DIR/oom-build"
