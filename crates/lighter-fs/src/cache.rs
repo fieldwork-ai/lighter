@@ -184,7 +184,7 @@ impl Policy {
         let next = u8::from(pushing);
         let previous = self
             .pushing
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state != 2).then_some(next)
             });
         if previous.is_ok_and(|was| was != next) {
