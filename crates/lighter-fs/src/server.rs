@@ -34,7 +34,7 @@ use crate::cache::{Answer, Invalidator, Policy, Timings};
 use crate::errno::linux;
 use crate::fsevents::Watcher;
 use crate::fuse::{self, Attr, EntryOut, InHeader, get_name, get_u32, get_u64, op};
-use crate::inode::{Handle, Inode, Located, OpenDir, OpenFile, Reference, Registry};
+use crate::inode::{Inode, Located, OpenDir, OpenFile, Reference, Registry};
 use crate::opencache::OpenCache;
 use crate::stats::Stats;
 use crate::sys::{self, TimeSpec};
@@ -287,6 +287,9 @@ fn create_job(
         // or a copy of this file will make of it — pnpm imports every store
         // file it has just written, and a write-only descriptor cannot be
         // read from or cloned from.
+        // Not append-mode either: the guest kernel supplies an append's
+        // offset, and the cached descriptor serves every writer of the file.
+        let flags = flags & !0o2000;
         let host_flags = if flags & 0o3 == 1 {
             (flags & !0o3) | 2
         } else {
@@ -354,7 +357,6 @@ fn create_job(
                     std::sync::Arc::new(OpenFile {
                         fd,
                         readable: true,
-                        append: false,
                         writable: flags & 0o3 != 0,
                     }),
                 );
@@ -987,12 +989,8 @@ impl Server {
             op::LIGHTER_CLONE => self.clone_over(header.nodeid, body),
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
-            op::RELEASE | op::RELEASEDIR => {
-                if let Some(fh) = get_u64(body, 0) {
-                    self.registry.release_handle(fh);
-                }
-                Ok(Vec::new())
-            }
+            // Never sent once OPEN has answered ENOSYS; nothing holds an `fh`.
+            op::RELEASE | op::RELEASEDIR => Ok(Vec::new()),
             op::FSYNC | op::FSYNCDIR => self.fsync(nodeid, body),
             op::READDIR => self.readdir(nodeid, body, capacity, false),
             op::READDIRPLUS => self.readdir(nodeid, body, capacity, true),
@@ -2114,14 +2112,7 @@ impl Server {
             .as_ref()
             .map(|inode| inode.overlay())
             .unwrap_or_default();
-        let flags = get_u32(body, 0).unwrap_or(0);
-        let st = if flags & fuse::GETATTR_FH != 0
-            && let Some(fh) = get_u64(body, 8)
-            && let Some(handle) = self.registry.handle(fh)
-            && let Some(fd) = handle.raw_fd()
-        {
-            sys::stat_fd(fd)?
-        } else {
+        let st = {
             let inode = self.inode(nodeid)?;
             self.stat_inode(nodeid, &inode)?
         };
@@ -2487,17 +2478,8 @@ impl Server {
                 return Err(linux::EISDIR);
             }
             let size = get_u64(body, 16).ok_or(linux::EINVAL)?;
-            // Truncating needs a writable descriptor, and the handle the guest
-            // supplied may be read-only or absent entirely.
-            // The guest may have named a handle, but with opens no longer
-            // reported most truncations arrive without one — so the descriptor
-            // is resolved the same way a write's is.
-            let fh = if valid & fuse::fattr::FH != 0 {
-                get_u64(body, 8).unwrap_or(0)
-            } else {
-                0
-            };
-            let file = self.file_for(nodeid, fh, true)?;
+            // Truncating needs a writable descriptor, resolved as a write's is.
+            let file = self.file_for(nodeid, true)?;
             sys::truncate_fd(file.fd.as_raw_fd(), size)?;
         }
 
@@ -3362,16 +3344,10 @@ impl Server {
 
     /// The descriptor an operation should act on.
     ///
-    /// A non-zero `fh` names a handle the guest was given by CREATE, and is
-    /// authoritative. A zero one means the guest has stopped reporting opens,
-    /// so the inode is the only thing identifying the file and the descriptor
-    /// is ours to find or make.
-    fn file_for(&self, nodeid: u64, fh: u64, need_write: bool) -> Result<Arc<OpenFile>, i32> {
-        if fh != 0
-            && let Some(handle) = self.registry.handle(fh)
-        {
-            return handle.file().ok_or(linux::EISDIR);
-        }
+    /// The guest stopped reporting opens, so every `fh` it sends is zero and
+    /// the inode is the only thing identifying the file: the descriptor is
+    /// ours to find or make.
+    fn file_for(&self, nodeid: u64, need_write: bool) -> Result<Arc<OpenFile>, i32> {
         if let Some(cached) = self.open_cache.file(nodeid, need_write) {
             return Ok(cached);
         }
@@ -3387,7 +3363,6 @@ impl Server {
         let file = Arc::new(OpenFile {
             fd,
             readable: true,
-            append: false,
             writable: need_write,
         });
         self.open_cache.put_file(nodeid, file.clone());
@@ -3848,11 +3823,6 @@ impl Server {
         mode: u32,
     ) -> Result<Option<Vec<u8>>, i32> {
         const LINUX_O_EXCL: u32 = 0o200;
-        const LINUX_O_APPEND: u32 = 0o2000;
-        if flags & LINUX_O_APPEND != 0 {
-            // Append keeps the size overlay honest by never being async.
-            return Ok(None);
-        }
         if parent.pending_child(name.to_bytes()).is_some() {
             // Promised already: to the guest this file exists.
             if flags & LINUX_O_EXCL != 0 {
@@ -4137,6 +4107,7 @@ impl Server {
         const LINUX_O_CREAT: u32 = 0o100;
         const LINUX_O_EXCL: u32 = 0o200;
         const LINUX_O_NOFOLLOW: u32 = 0o400000;
+        const LINUX_O_APPEND: u32 = 0o2000;
         let creator = Self::recording_creator(caller);
         if creator.is_none()
             && self.apply.accepting()
@@ -4158,6 +4129,17 @@ impl Server {
             parent.name_pending_gone(name.to_bytes())
                 || parent.pending_child(name.to_bytes()).is_some()
         });
+        // The descriptor is kept in the open cache, where every later read
+        // and write of the inode looks, so it is opened as one of those: not
+        // append-mode, since the guest kernel supplies an append's offset as
+        // it does under any other open, and read-write when this call makes
+        // the file, as `create_job` opens it and for its reason.
+        let flags = flags & !LINUX_O_APPEND;
+        let creating = if flags & 0o3 == 1 {
+            (flags & !0o3) | 2
+        } else {
+            flags
+        };
         let (fd, created) = parent.under(|dir, prefix| {
             let dir = dir.raw_fd();
             let at = &crate::inode::join(prefix, &name);
@@ -4167,7 +4149,7 @@ impl Server {
                 match sys::openat_path(
                     dir,
                     at,
-                    flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
+                    creating | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
                     mode & 0o7777 & !umask,
                 ) {
                     Ok(fd) => break fd,
@@ -4204,23 +4186,30 @@ impl Server {
         if created && let Some(owner) = creator {
             self.record_creator(&parent, &name, &mut entry, owner)?;
         }
-        let fh = self.registry.add_handle(Handle::File(Arc::new(OpenFile {
-            fd,
-            readable: true,
-            append: flags & 0o2000 != 0,
-            writable: flags & 0o3 != 0,
-        })));
+        // No handle: the guest never sends RELEASE for a file it CREATEd once
+        // OPEN has answered ENOSYS (6.18 `fuse_file_put` ends the release
+        // locally under `no_open`), so a descriptor named by `fh` would be
+        // held until the share closed — one per create, until the process
+        // ran out (issue #46).
+        let access = if created { creating } else { flags } & 0o3;
+        self.open_cache.put_file(
+            entry.nodeid,
+            Arc::new(OpenFile {
+                fd,
+                readable: access != 1,
+                writable: access != 0,
+            }),
+        );
         let mut out = self.entry_reply(&entry);
         let mut open_flags = self.created_file_flags();
         if created {
             open_flags |= fuse::fopen::LIGHTER_CREATED;
         }
-        out.extend_from_slice(&open_reply(fh, open_flags));
+        out.extend_from_slice(&open_reply(0, open_flags));
         Ok(out)
     }
 
     fn read(&self, nodeid: u64, body: &[u8], capacity: usize) -> Result<Reply, i32> {
-        let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
         // Reads never lie: bytes this file was promised must be in it first —
@@ -4230,14 +4219,13 @@ impl Server {
         if let Some(errno) = inode.take_write_error() {
             return Err(errno);
         }
-        let file = self.file_for(nodeid, fh, false)?;
+        let file = self.file_for(nodeid, false)?;
         // The guest sized the reply chain; never promise more than it can hold.
         let len = size.min(capacity.saturating_sub(fuse::OUT_HEADER_LEN));
         Ok(Reply::File { file, offset, len })
     }
 
     fn write(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
-        let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let size = get_u32(body, 16).ok_or(linux::EINVAL)? as usize;
         let data = body.get(40..40 + size).ok_or(linux::EINVAL)?;
@@ -4299,7 +4287,6 @@ impl Server {
                             fd = std::sync::Arc::new(OpenFile {
                                 fd: open_inode(&inode, 2)?,
                                 readable: true,
-                                append: false,
                                 writable: true,
                             });
                             fd.fd.as_raw_fd()
@@ -4334,12 +4321,8 @@ impl Server {
         // The queue is refusing work (full disk, retired); the file must
         // exist before a synchronous write can reach it.
         self.settle_while(&inode, |inode| inode.is_pending());
-        let file = self.file_for(nodeid, fh, true)?;
-        // Append is served synchronously: its end position is unknowable
-        // before the syscall, and the size overlay must never have to guess.
-        let written = if file.append {
-            sys::write_append(file.fd.as_raw_fd(), data)?
-        } else if self.apply.accepting() {
+        let file = self.file_for(nodeid, true)?;
+        let written = if self.apply.accepting() {
             // Acknowledged now, applied in order on the queue. The guest's
             // own kernel keeps the pages it just wrote, reads on this inode
             // drain first, and lookup answers with the overlay size — so
@@ -4388,7 +4371,6 @@ impl Server {
     }
 
     fn fsync(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
-        let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let datasync = get_u32(body, 8).unwrap_or(0) & 1 != 0;
         // A directory's own sync is a settling point for the names inside
         // it: entries reach the host when their queued operations apply, so
@@ -4407,7 +4389,7 @@ impl Server {
         if let Some(errno) = inode.take_write_error() {
             return Err(errno);
         }
-        let file = self.file_for(nodeid, fh, false)?;
+        let file = self.file_for(nodeid, false)?;
         sys::fsync(file.fd.as_raw_fd(), datasync)?;
         Ok(Vec::new())
     }
@@ -4641,20 +4623,18 @@ impl Server {
     }
 
     fn lseek(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
-        let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let whence = get_u32(body, 16).ok_or(linux::EINVAL)?;
-        let file = self.file_for(nodeid, fh, false)?;
+        let file = self.file_for(nodeid, false)?;
         let at = sys::seek(file.fd.as_raw_fd(), offset, whence)?;
         Ok(at.to_le_bytes().to_vec())
     }
 
     fn fallocate(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
-        let fh = get_u64(body, 0).ok_or(linux::EINVAL)?;
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let length = get_u64(body, 16).ok_or(linux::EINVAL)?;
         let mode = get_u32(body, 24).ok_or(linux::EINVAL)?;
-        let file = self.file_for(nodeid, fh, true)?;
+        let file = self.file_for(nodeid, true)?;
         sys::fallocate(file.fd.as_raw_fd(), mode, offset, length)?;
         Ok(Vec::new())
     }

@@ -150,7 +150,6 @@ mod tests {
         Arc::new(OpenFile {
             fd: spare_fd(),
             readable: true,
-            append: false,
             writable,
         })
     }

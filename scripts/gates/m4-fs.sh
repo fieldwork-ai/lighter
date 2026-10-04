@@ -401,6 +401,33 @@ else
 		else
 			pass "a recorded owner is still the only one who can write its 644 file"
 		fi
+
+		# A non-root caller's creates are answered synchronously, and the
+		# guest never releases what such a reply names: 0.11.2 kept a
+		# descriptor per file, and a `pnpm install` as 1000 took the VMM to
+		# kern.maxfilesperproc (issue #46). Once the guest has forgotten the
+		# files, the open cache (2048) is all the VMM may still hold.
+		mkdir -p "$SHARE/many"
+		chmod 777 "$SHARE/many"
+		before="$(lsof -p "$VMM_PID" 2>/dev/null | wc -l)"
+		if docker run --rm --user 1000:1000 -v "$MOUNT/many:/w" alpine:3.21 sh -c \
+			'cd /w && i=0 && while [ $i -lt 20000 ]; do : > f$i; i=$((i+1)); done' 2>>"$RUN_DIR/docker.err" \
+			&& docker run --rm --privileged alpine:3.21 sh -c 'sync; echo 2 > /proc/sys/vm/drop_caches'; then
+			after=""
+			for _ in $(seq 1 20); do
+				sleep 1
+				after="$(lsof -p "$VMM_PID" 2>/dev/null | wc -l)"
+				[ $((after - before)) -le 2560 ] && break
+			done
+			if [ $((after - before)) -le 2560 ]; then
+				pass "20000 files created by a non-root container leave the VMM no descriptors once forgotten ($before -> $after)"
+			else
+				fail "the VMM went from $before to $after descriptors over 20000 forgotten non-root creates"
+			fi
+		else
+			fail "a non-root container could not create 20000 files"
+			sed 's/^/    /' "$RUN_DIR/docker.err"
+		fi
 		unset DOCKER_HOST
 	else
 		fail "the Docker guest did not come up"

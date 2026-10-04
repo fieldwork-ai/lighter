@@ -637,15 +637,6 @@ pub fn write_at(fd: RawFd, buf: &[u8], offset: u64) -> Result<usize> {
     })
 }
 
-/// Appends to a descriptor opened `O_APPEND`.
-///
-/// `pwrite` on macOS honours the offset even for an append-mode descriptor,
-/// which would overwrite rather than append — so append has to use `write`.
-pub fn write_append(fd: RawFd, buf: &[u8]) -> Result<usize> {
-    // SAFETY: a buffer we own of the length we pass, and a live descriptor.
-    check_size(unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) })
-}
-
 /// Flushes a file's data to stable storage.
 ///
 /// `fsync` on macOS returns once the write has reached the drive's cache, not
