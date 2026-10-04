@@ -105,7 +105,16 @@ impl VsockProxy {
                     if accept_stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let Ok(stream) = stream else { continue };
+                    let stream = match stream {
+                        Ok(stream) => stream,
+                        // At the descriptor limit the connection stays queued
+                        // and accept fails again at once: without a pause this
+                        // thread spins a core until a descriptor frees (#46).
+                        Err(_) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                    };
                     let shared = accept_shared.clone();
                     let inspect = inspect.clone();
                     crate::workers::run("vsock-conn", crate::qos::CONNECTION_STACK, move || {

@@ -95,9 +95,25 @@ unsafe extern "C" {
 
 /// What a watcher does with each changed path.
 pub trait Observer: Send + Sync {
-    fn changed(&self, path: &Path);
+    /// `flags` are the event's `kFSEventStreamEventFlag*` word, which
+    /// [`flag`] names the parts of.
+    fn changed(&self, path: &Path, flags: u32);
     /// Individual paths are no longer a complete account of the changes.
     fn rescan(&self, path: &Path, root_changed: bool);
+}
+
+/// The per-item `kFSEventStreamEventFlag*` bits, from FSEvents.h. Several
+/// changes to one path inside the stream's latency arrive as one event with
+/// every bit set, so they say what may have happened, not in what order.
+pub mod flag {
+    pub const ITEM_CREATED: u32 = 0x100;
+    pub const ITEM_REMOVED: u32 = 0x200;
+    pub const ITEM_INODE_META_MOD: u32 = 0x400;
+    pub const ITEM_RENAMED: u32 = 0x800;
+    pub const ITEM_MODIFIED: u32 = 0x1000;
+    pub const ITEM_CHANGE_OWNER: u32 = 0x4000;
+    pub const ITEM_XATTR_MOD: u32 = 0x8000;
+    pub const ITEM_IS_DIR: u32 = 0x20000;
 }
 
 /// A running FSEvents stream.
@@ -164,7 +180,7 @@ extern "C" fn on_events(
             observer.rescan(path, root_changed);
             rescanned = true;
         }
-        observer.changed(path);
+        observer.changed(path, flags);
     }
 }
 
@@ -322,7 +338,7 @@ mod tests {
     fn lost_event_detail_requests_one_rescan_per_callback() {
         struct Events(Arc<Mutex<Vec<&'static str>>>);
         impl Observer for Events {
-            fn changed(&self, _: &Path) {
+            fn changed(&self, _: &Path, _: u32) {
                 self.0.lock().unwrap().push("changed");
             }
             fn rescan(&self, _: &Path, root_changed: bool) {

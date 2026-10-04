@@ -54,7 +54,15 @@ impl Server {
                     Arc::new(OnceLock::new());
                 let cache: Arc<Option<PathBuf>> = Arc::new(cache);
                 for stream in listener.incoming() {
-                    let Ok(stream) = stream else { continue };
+                    let stream = match stream {
+                        Ok(stream) => stream,
+                        // A failed accept at the descriptor limit fails again
+                        // at once.
+                        Err(_) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                    };
                     let runtime = runtime.clone();
                     let cache = cache.clone();
                     let _ = std::thread::Builder::new()

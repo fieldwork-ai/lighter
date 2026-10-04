@@ -310,7 +310,15 @@ impl PortMapper {
                     if stop.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
-                    let Ok(mac) = accepted else { continue };
+                    let mac = match accepted {
+                        Ok(mac) => mac,
+                        // As for the Docker socket: a failed accept at the
+                        // descriptor limit fails again at once.
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    };
                     if !on_threads()
                         && let Some(reactor) = REACTOR.get()
                     {

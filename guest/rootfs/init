@@ -40,6 +40,12 @@ ulimit -n 65536 || echo "INIT nofile=65536 failed"
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+# The modes udev gives these on any distribution; there is no udev here, and
+# devtmpfs leaves both 0600, so a rootless engine inside a container cannot set
+# up its network (tun) or fuse-overlayfs (fuse). Docker copies the mode into
+# every container that gets the device. Opening either grants nothing alone:
+# an interface still takes CAP_NET_ADMIN and a mount still takes a mount.
+chmod 0666 /dev/net/tun /dev/fuse 2>/dev/null || true
 mount -t tmpfs    tmpfs    /run
 mkdir -p /dev/pts /dev/shm
 mount -t devpts devpts /dev/pts 2>/dev/null || true
@@ -644,6 +650,10 @@ fi
 # timestamps are how a container start is taken apart.
 dockerd_debug=""
 grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
+# --host-gateway-ip is what `--add-host name:host-gateway` writes. Left unset it
+# is docker0's address in this guest, where nothing of the Mac's listens; it
+# must be HOST_ALIAS (crates/lighter-vmm/src/dns.rs), what host.docker.internal
+# answers and the streams carry to the Mac's loopback.
 sh -c '
 	echo $$ > /sys/fs/cgroup/engine/cgroup.procs 2>/dev/null
 	echo -900 > /proc/self/oom_score_adj 2>/dev/null
@@ -657,6 +667,7 @@ sh -c '
 		--storage-driver=overlay2 \
 		--mtu="$1" \
 		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
+		--host-gateway-ip=192.168.127.254 \
 		--seccomp-profile=/etc/docker/seccomp.json \
 		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
 DOCKERD_PID=$!

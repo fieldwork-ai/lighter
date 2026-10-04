@@ -1136,6 +1136,99 @@ fn create_excl_on_an_existing_file_is_eexist() {
     assert_eq!(err, 17, "EEXIST");
 }
 
+/// Descriptors this process holds on files under `root`. Other tests' servers
+/// run in the same process, so a count of every descriptor measures nothing.
+fn descriptors_under(root: &Path) -> usize {
+    let root = std::fs::canonicalize(root).unwrap();
+    std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<RawFd>().ok())
+        .filter(|&fd| {
+            let mut path = [0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into the buffer.
+            let named = unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } == 0;
+            named
+                && std::ffi::CStr::from_bytes_until_nul(&path)
+                    .ok()
+                    .and_then(|path| path.to_str().ok())
+                    .is_some_and(|path| Path::new(path).starts_with(&root))
+        })
+        .count()
+}
+
+/// A CREATE from a non-root caller takes the synchronous path, and the guest
+/// never sends RELEASE for it (`no_open`), so any descriptor its reply names
+/// is held until the share closes. 0.11.2 named one per create, and a
+/// `pnpm install` as uid 1000 took `lighter run` to kern.maxfilesperproc
+/// (issue #46). Once the guest has forgotten the files, the open cache is all
+/// that may remain.
+#[test]
+fn a_non_root_create_leaves_no_descriptor_behind() {
+    let mut guest = Guest::new("create-release");
+    guest.caller = (1000, 1000);
+    const FILES: usize = 4096; // twice the open cache
+    for i in 0..FILES {
+        let (nodeid, fh) = guest
+            .create(
+                1,
+                &format!("f{i}"),
+                0o100 | 0o1, /* O_CREAT | O_WRONLY */
+            )
+            .unwrap();
+        assert_eq!(fh, 0, "nothing would ever release a handle");
+        guest.write(nodeid, fh, 0, b"x").unwrap();
+        guest.call(op::FORGET, nodeid, &1u64.to_le_bytes()).ok();
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let held = descriptors_under(&guest.root);
+    assert!(
+        held <= 2048 + 64,
+        "{held} descriptors held under the share after {FILES} creates the guest has forgotten"
+    );
+}
+
+/// A write-only create leaves a read-write descriptor in the open cache, as
+/// the asynchronous path does: what was just written can be read back (a
+/// clone or copy of the file reads it) without a write-only descriptor
+/// answering EBADF.
+#[test]
+fn a_write_only_create_can_be_read_back() {
+    let mut guest = Guest::new("create-wronly-read");
+    guest.caller = (1000, 1000);
+    let (nodeid, fh) = guest
+        .create(1, "fresh", 0o100 | 0o1 /* O_CREAT | O_WRONLY */)
+        .unwrap();
+    guest.write(nodeid, fh, 0, b"written").unwrap();
+    assert_eq!(guest.read(nodeid, 0, 0, 4096).unwrap(), b"written");
+}
+
+/// An append under a CREATE writes where the guest kernel says, as under any
+/// other open: the guest computes an append's offset itself, and the cached
+/// descriptor serves every writer of the file, so it must not be append-mode.
+#[test]
+fn an_appending_create_writes_at_the_offsets_given() {
+    let mut guest = Guest::new("create-append");
+    guest.caller = (1000, 1000);
+    const LINUX_O_APPEND: u32 = 0o2000;
+    std::fs::write(guest.host("log"), b"first\n").unwrap();
+    let (log, fh) = guest
+        .create(1, "log", 0o100 | 0o1 | LINUX_O_APPEND)
+        .unwrap();
+    guest.write(log, fh, 6, b"second\n").unwrap();
+    let (fresh, fh) = guest
+        .create(1, "fresh", 0o100 | 0o1 | LINUX_O_APPEND)
+        .unwrap();
+    guest.write(fresh, fh, 0, b"one ").unwrap();
+    guest.write(fresh, 0, 4, b"two").unwrap();
+    guest.write(fresh, 0, 0, b"ONE").unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert_eq!(
+        std::fs::read(guest.host("log")).unwrap(),
+        b"first\nsecond\n"
+    );
+    assert_eq!(std::fs::read(guest.host("fresh")).unwrap(), b"ONE two");
+}
+
 /// The asynchronous write path, held to its three promises: reads never lie,
 /// durability is never claimed early, and the size the guest is told never
 /// runs behind what it was promised. Each is checked under a storm of small

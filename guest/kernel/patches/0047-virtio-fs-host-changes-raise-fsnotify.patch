@@ -1,0 +1,198 @@
+virtio-fs: a change the host makes raises the events a watcher expects
+
+A file changed on the Mac reaches the guest as a reverse invalidation over
+the notification queue (patch 0001), and the new content is visible at
+once, but inotify sees nothing: no process in the guest created, wrote or
+removed anything, and FUSE's reverse invalidations raise no fsnotify
+events. Node's fs.watch, chokidar and so Vite's dev server in a container
+never heard of an edit saved on the Mac (lighter issue #43).
+
+An inode invalidation of a regular file now raises FS_MODIFY and then
+FS_CLOSE_WRITE on the file and to a watching parent: by the time FSEvents
+reports a write it is complete, and tools that wait for close-after-write
+work too.
+
+An entry invalidation raises, by name to the directory, the events the host
+decided and carries after the NUL that ends the name: any of created,
+written (and closed), attributes changed and deleted, in that order, and
+whether a directory. The host decides because it saw the
+change. The guest cannot: in a directory being edited the host hands out
+entries already expired, fuse_dentry_delete drops such a dentry the moment
+it is unused, and every invalidation d_invalidates the name, so the dcache
+rarely knows what was there before. A file the guest holds under the name
+already gets no entry event; its writes come through its inode. A write or
+attribute change to a file the guest does not hold is reported to the
+directory with its name only on the way from a child to its parent, so
+that one costs a LOOKUP, in a directory someone watches.
+
+A kernel without this patch never reads past the NUL, and a host that sends
+no trailer leaves nothing to raise. The host's watch ignores the changes
+this guest makes itself, so nothing is reported twice. A rename is a delete
+and a create, as FSEvents does not pair them.
+
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include <linux/fs.h>
++#include <linux/fsnotify.h>
++#include <linux/namei.h>
+ #include <linux/dax.h>
+ #include <linux/pci.h>
+ #include <linux/interrupt.h>
+@@ -970,7 +972,122 @@
+  *
+  * Everything is bounds-checked against the length the device actually wrote,
+  * because that length is the only thing here the guest did not choose.
++ */
++/*
++ * lighter: the event a watcher in the guest should see at a name, carried
++ * after the NUL that ends an INVAL_ENTRY's name. A kernel without this
++ * patch never reads past the NUL; a host that sends no trailer leaves
++ * nothing to raise.
++ */
++struct lighter_entry_event {
++	u64		nodeid;	/* this guest's inode for the name now, or 0 */
++	u32		flags;
++	u32		padding;
++};
++#define LIGHTER_ENTRY_KNOWN	(1 << 0)
++#define LIGHTER_ENTRY_CREATE	(1 << 1)
++#define LIGHTER_ENTRY_DELETE	(1 << 2)
++#define LIGHTER_ENTRY_MODIFY	(1 << 3)	/* and the close that ends it */
++#define LIGHTER_ENTRY_DIR	(1 << 4)
++#define LIGHTER_ENTRY_ATTRIB	(1 << 5)
++#define LIGHTER_ENTRY_EVENTS	(LIGHTER_ENTRY_CREATE | LIGHTER_ENTRY_DELETE | \
++				 LIGHTER_ENTRY_MODIFY | LIGHTER_ENTRY_ATTRIB)
++
++/*
++ * A change the host made is invisible to inotify: nothing in the guest
++ * created, wrote or removed anything, and FUSE's reverse invalidations raise
++ * no events of their own. So the event a watcher would have seen is raised
++ * here, by name, to the directory. The host decides which: it saw the change,
++ * where this guest's dcache forgets an unused name at once in a directory
++ * being edited (its entries there are handed out already expired) and cannot
++ * say what was there before. The host's own watch ignores what this guest
++ * does, so nothing is reported twice.
++ */
++static void virtio_fs_inval_entry(struct fuse_conn *fc, u64 parent,
++				  struct qstr *name, u32 flags,
++				  const struct lighter_entry_event *event)
++{
++	struct qstr q = QSTR_INIT(name->name, name->len);
++	struct inode *dir, *child = NULL, *data;
++	struct dentry *alias, *found;
++	u32 isdir;
++
++	fuse_reverse_inval_entry(fc, parent, 0, name, flags);
++
++	if (!event || !(event->flags & LIGHTER_ENTRY_EVENTS))
++		return;
++	dir = fuse_ilookup(fc, parent, NULL);
++	if (!dir)
++		return;
++	if (!fsnotify_sb_has_watchers(dir->i_sb))
++		goto out;
++	if (event->nodeid)
++		child = fuse_ilookup(fc, event->nodeid, NULL);
++	data = child ?: dir;
++	isdir = event->flags & LIGHTER_ENTRY_DIR ? FS_ISDIR : 0;
++	if (event->flags & LIGHTER_ENTRY_CREATE)
++		fsnotify_name(FS_CREATE | isdir, data, FSNOTIFY_EVENT_INODE,
++			      dir, &q, 0);
++	/*
++	 * A write or an attribute change carries its name only on the way from
++	 * a child to its watching parent, so these need the child: one LOOKUP,
++	 * of a file the host says is there, in a directory someone watches.
++	 */
++	if (event->flags & (LIGHTER_ENTRY_MODIFY | LIGHTER_ENTRY_ATTRIB)) {
++		alias = d_find_alias(dir);
++		found = alias ? lookup_noperm_positive_unlocked(&q, alias) :
++				ERR_PTR(-ENOENT);
++		dput(alias);
++		if (!IS_ERR(found)) {
++			if (event->flags & LIGHTER_ENTRY_MODIFY &&
++			    d_is_reg(found)) {
++				fsnotify_dentry(found, FS_MODIFY);
++				fsnotify_dentry(found, FS_CLOSE_WRITE);
++			}
++			if (event->flags & LIGHTER_ENTRY_ATTRIB)
++				fsnotify_dentry(found, FS_ATTRIB);
++			dput(found);
++		}
++	}
++	if (event->flags & LIGHTER_ENTRY_DELETE)
++		fsnotify_name(FS_DELETE | isdir, dir, FSNOTIFY_EVENT_INODE,
++			      dir, &q, 0);
++	iput(child);
++out:
++	iput(dir);
++}
++
++/*
++ * The host wrote a file: what a watcher would have seen from a local writer
++ * is a modification and then the close that ends it, by which time the
++ * host's write is complete. Raised on the file and to a watching parent.
++ * Directories are left to the entry events above.
+  */
++static void virtio_fs_inval_inode(struct fuse_conn *fc, u64 nodeid,
++				  loff_t off, loff_t len)
++{
++	struct inode *inode;
++	struct dentry *alias;
++
++	fuse_reverse_inval_inode(fc, nodeid, off, len);
++
++	inode = fuse_ilookup(fc, nodeid, NULL);
++	if (!inode)
++		return;
++	if (S_ISREG(inode->i_mode) && fsnotify_sb_has_watchers(inode->i_sb)) {
++		alias = d_find_alias(inode);
++		if (alias) {
++			fsnotify_dentry(alias, FS_MODIFY);
++			fsnotify_dentry(alias, FS_CLOSE_WRITE);
++			dput(alias);
++		} else {
++			fsnotify_inode(inode, FS_MODIFY);
++			fsnotify_inode(inode, FS_CLOSE_WRITE);
++		}
++	}
++	iput(inode);
++}
++
+ static void virtio_fs_notify_one(struct fuse_conn *fc, void *buf,
+ 				 unsigned int len)
+ {
+@@ -997,12 +1114,15 @@
+ 		if (plen < sizeof(out))
+ 			return;
+ 		memcpy(&out, payload, sizeof(out));
+-		fuse_reverse_inval_inode(fc, out.ino, out.off, out.len);
++		virtio_fs_inval_inode(fc, out.ino, out.off, out.len);
+ 		break;
+ 	}
+ 	case FUSE_NOTIFY_INVAL_ENTRY: {
+ 		struct fuse_notify_inval_entry_out out;
++		struct lighter_entry_event event;
++		bool known = false;
+ 		struct qstr name;
++		size_t at;
+ 
+ 		if (plen < sizeof(out))
+ 			return;
+@@ -1016,7 +1136,13 @@
+ 		name.len = out.namelen;
+ 		if (name.name[name.len] != '\0')
+ 			return;
+-		fuse_reverse_inval_entry(fc, out.parent, 0, &name, out.flags);
++		at = sizeof(out) + (size_t)out.namelen + 1;
++		if (at + sizeof(event) <= plen) {
++			memcpy(&event, (char *)payload + at, sizeof(event));
++			known = event.flags & LIGHTER_ENTRY_KNOWN;
++		}
++		virtio_fs_inval_entry(fc, out.parent, &name, out.flags,
++				      known ? &event : NULL);
+ 		break;
+ 	}
+ 	default:

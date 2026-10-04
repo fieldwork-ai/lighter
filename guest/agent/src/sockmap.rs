@@ -46,9 +46,10 @@ const BPF_MAP_CREATE: libc::c_int = 0;
 const BPF_MAP_LOOKUP_ELEM: libc::c_int = 1;
 const BPF_MAP_UPDATE_ELEM: libc::c_int = 2;
 const BPF_MAP_DELETE_ELEM: libc::c_int = 3;
+const BPF_MAP_GET_NEXT_KEY: libc::c_int = 4;
 const BPF_PROG_LOAD: libc::c_int = 5;
 const BPF_PROG_ATTACH: libc::c_int = 8;
-const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
+const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_SOCKMAP: u32 = 15;
 const BPF_PROG_TYPE_SK_SKB: u32 = 14;
 /// `BPF_SK_SKB_VERDICT`: a verdict on each received skb, no stream parser.
@@ -321,7 +322,7 @@ pub fn probe() {
     println!("trivial sk_skb, expected verdict: {}", try_load(BPF_PROG_TYPE_SK_SKB, &trivial, 1, BPF_SK_SKB_VERDICT));
     println!("trivial sk_msg: {}", try_load(16, &trivial, 1, 0));
     println!("trivial socket_filter: {}", try_load(1, &trivial, 1, 0));
-    match (map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, 16), map_create(BPF_MAP_TYPE_LRU_HASH, 8, 4, 16)) {
+    match (map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, 16), map_create(BPF_MAP_TYPE_HASH, 8, 4, 16)) {
         (Ok(sockets), Ok(peers)) => {
             let full = program(peers.as_raw_fd(), sockets.as_raw_fd());
             println!("full sk_skb: {}", try_load(BPF_PROG_TYPE_SK_SKB, &full, 1, 0));
@@ -343,20 +344,32 @@ pub struct Joiner {
     free: Mutex<Vec<u32>>,
 }
 
+/// A joined pair's slots and the socket cookies its peer entries are keyed
+/// by, for [`Joiner::release`].
+pub struct Joined {
+    slots: (u32, u32),
+    /// Zero for an entry already removed.
+    cookies: [u64; 2],
+}
+
 pub struct JoinError {
     pub error: io::Error,
     /// False if a verdict might already have moved bytes, or cleanup failed.
     pub can_fallback: bool,
-    pub slots: Option<(u32, u32)>,
+    pub joined: Option<Joined>,
 }
 
 impl Joiner {
     pub fn new() -> io::Result<Joiner> {
         let targets = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
         let attach = map_create(BPF_MAP_TYPE_SOCKMAP, 4, 4, SLOTS)?;
-        // Keyed by socket cookie, never reused, so an entry a closed socket
-        // leaves behind matches nothing and the LRU retires it unasked.
-        let peers = map_create(BPF_MAP_TYPE_LRU_HASH, 8, 4, SLOTS)?;
+        // Keyed by socket cookie, and emptied by `release`. Not an LRU that
+        // retires entries unasked: once full it evicted joined streams' own
+        // entries, a verdict that found no peer passed the bytes to a socket
+        // nobody reads, and the stream hung in both directions — about one
+        // published-port request in 130 on a machine up for days. A joined
+        // stream holds two slots and two entries, so this never fills.
+        let peers = map_create(BPF_MAP_TYPE_HASH, 8, 4, SLOTS)?;
         let insns = program(peers.as_raw_fd(), targets.as_raw_fd());
         let mut log = vec![0u8; 64 * 1024];
         let mut attr = Attr { zero: [0; 128] };
@@ -400,13 +413,13 @@ impl Joiner {
     }
 
     /// Joins two sockets: bytes on either go to the other, in the kernel.
-    /// Returns the pair's slots, for [`Joiner::part`].
-    pub fn join(&self, a: RawFd, b: RawFd) -> Result<(u32, u32), JoinError> {
+    /// Returns what [`Joiner::release`] takes back once both are closed.
+    pub fn join(&self, a: RawFd, b: RawFd) -> Result<Joined, JoinError> {
         let (slot_a, slot_b) = {
             let mut free = self.free.lock().expect("sockmap slots poisoned");
             if free.len() < 2 {
                 return Err(JoinError { error: io::Error::other("no free sockmap slots"),
-                    can_fallback: true, slots: None });
+                    can_fallback: true, joined: None });
             }
             (free.pop().unwrap(), free.pop().unwrap())
         };
@@ -444,22 +457,52 @@ impl Joiner {
             // Close both sockets instead of risking a truncated fallback.
             // The caller returns the slots only after closing on that path.
             return Err(JoinError { error, can_fallback: clean && !active,
-                slots: Some((slot_a, slot_b)) });
+                joined: Some(Joined { slots: (slot_a, slot_b), cookies: [0; 2] }) });
         }
         kick(a);
         kick(b);
-        Ok((slot_a, slot_b))
+        let cookies = [cookies[0], cookies[1]];
+        Ok(Joined { slots: (slot_a, slot_b), cookies })
     }
 
-    /// Returns a pair's slots once both sockets are closed. A closed socket
-    /// leaves every map on its own, and its peer entry matches nothing
-    /// again, so this is bookkeeping and no syscall — which is why the
-    /// sockets must be closed first: a slot handed out while its last
-    /// socket is still in the map would replace it.
-    pub fn release(&self, slots: (u32, u32)) {
+    /// Takes a pair back once both its sockets are closed: their peer
+    /// entries go, and their slots return to the free list. The sockets must
+    /// be closed first: a closed socket has left the sockmaps on its own,
+    /// and a slot handed out while its last socket is still in one would
+    /// replace it.
+    pub fn release(&self, joined: Joined) {
+        for cookie in joined.cookies.into_iter().filter(|&cookie| cookie != 0) {
+            if let Err(e) = map_delete(self.peers.as_raw_fd(), &cookie.to_ne_bytes()) {
+                eprintln!("lighter-agent: sockmap peer {cookie:#x} not removed: {e}");
+            }
+        }
         let mut free = self.free.lock().expect("sockmap slots poisoned");
-        free.push(slots.0);
-        free.push(slots.1);
+        free.push(joined.slots.0);
+        free.push(joined.slots.1);
+    }
+
+    /// How many streams' peer entries are held: twice the streams joined now.
+    pub fn peer_count(&self) -> usize {
+        let mut key = [0u8; 8];
+        let mut next = [0u8; 8];
+        let mut count = 0;
+        let mut first = true;
+        loop {
+            let mut attr = Attr { zero: [0; 128] };
+            attr.elem = MapElem {
+                map_fd: self.peers.as_raw_fd() as u32,
+                _pad: 0,
+                key: if first { 0 } else { key.as_ptr() as u64 },
+                value: next.as_mut_ptr() as u64,
+                flags: 0,
+            };
+            if bpf(BPF_MAP_GET_NEXT_KEY, &mut attr).is_err() {
+                return count;
+            }
+            first = false;
+            key = next;
+            count += 1;
+        }
     }
 
     /// Whether a socket is still in the map (it leaves when it closes).
@@ -488,13 +531,13 @@ pub fn check_failed_join() -> io::Result<()> {
             Err(failure) => failure,
         };
         if !failure.can_fallback { return Err(io::Error::other("failed preparation did not permit clean fallback")); }
-        if let Some(slots) = failure.slots {
-            for slot in [slots.0, slots.1] {
+        if let Some(joined) = failure.joined {
+            for slot in [joined.slots.0, joined.slots.1] {
                 if joiner.holds(slot) || map_lookup_present(joiner.attach.as_raw_fd(), &slot.to_ne_bytes(), 8) {
                     return Err(io::Error::other("failed join left a socket attached"));
                 }
             }
-            joiner.release(slots);
+            joiner.release(joined);
         }
         if joiner.free.lock().unwrap().len() != before {
             return Err(io::Error::other("failed join leaked slots"));
@@ -517,8 +560,23 @@ pub fn check_failed_join() -> io::Result<()> {
     drop(client);
     drop(peer);
     drop(unconnected);
-    if let Some(slots) = failure.slots { joiner.release(slots); }
+    if let Some(joined) = failure.joined { joiner.release(joined); }
     if joiner.free.lock().unwrap().len() != before { return Err(io::Error::other("abort leaked slots")); }
-    println!("PASS: 100 failed preparations detach maps, return slots and preserve I/O; partial activation aborts");
+    // A joined stream's peer entries go when it is released, so a joiner
+    // that has carried any number of streams holds entries only for those
+    // still joined (the LRU that kept them evicted live streams instead).
+    for _ in 0..100 {
+        let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (peer, _) = listener.accept()?;
+        let joined = joiner.join(client.as_raw_fd(), peer.as_raw_fd())
+            .map_err(|failure| io::Error::other(format!("join failed: {}", failure.error)))?;
+        if joiner.peer_count() != 2 { return Err(io::Error::other("a joined pair is not two peer entries")); }
+        client.write_all(b"x")?;
+        drop(client);
+        drop(peer);
+        joiner.release(joined);
+    }
+    if joiner.peer_count() != 0 { return Err(io::Error::other("released streams left peer entries")); }
+    println!("PASS: 100 failed preparations detach maps, return slots and preserve I/O; partial activation aborts; 100 released streams leave no peer entries");
     Ok(())
 }

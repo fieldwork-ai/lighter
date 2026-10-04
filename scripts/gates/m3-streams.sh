@@ -139,6 +139,12 @@ done
 if grep -q 'HTTP fixture ready' "$LIGHTER_HOME/http.log"; then
 	code="$($D run --rm curlimages/curl:8.11.1 -sS -o /dev/null -w '%{http_code}' --max-time 10 http://host.docker.internal:18099/ 2>"$LIGHTER_HOME/http-client.log")"
 	[ "$code" = 200 ] && pass "host.docker.internal reaches a server on the Mac" || { fail "host.docker.internal: http_code=${code:-none}"; cat "$LIGHTER_HOME/http-client.log"; }
+	# Compose's extra_hosts: ["name:host-gateway"] must mean the same Mac, and
+	# only it: a second record for the guest's bridge is one a client may try first.
+	out="$($D run --rm --add-host probe.test:host-gateway alpine:3.21 sh -c '
+		getent hosts probe.test | awk "{print \$1}" | tr "\n" " "
+		wget -q -T 10 -O - http://probe.test:18099/' 2>"$LIGHTER_HOME/host-gateway.log")"
+	[ "$out" = "192.168.127.254 ok" ] && pass "host-gateway reaches a server on the Mac" || { fail "host-gateway: '${out}'"; cat "$LIGHTER_HOME/host-gateway.log"; }
 else
 	fail "the host HTTP fixture did not start"
 	cat "$LIGHTER_HOME/http.log"
@@ -432,6 +438,7 @@ agent_threads() {
 }
 egress() { $D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://example.com 2>/dev/null; }
 before="$(agent_threads)"
+tcp_before="$(sysctl -n net.inet.tcp.pcbcount)"
 $D run -d --name m3s-flood --ulimit nofile=65536:65536 node:24-alpine node -e '
 const net = require("net");
 let open = 0, failed = 0; const held = [];
@@ -449,10 +456,11 @@ $D wait m3s-flood >/dev/null 2>&1
 $D rm -f m3s-flood >/dev/null 2>&1
 kill "$FLOOD_HOLD_PID" 2>/dev/null
 # The closed connections hold their ports in TIME_WAIT for about thirty
-# seconds on a Mac; the VMM's own sockets are gone within five.
-sleep 5
-for _ in $(seq 1 90); do [ "$(netstat -an -p tcp | grep -c TIME_WAIT)" -lt 2000 ] && break; sleep 1; done
-echo "    ports between the floods: $(netstat -an -p tcp | grep -c TIME_WAIT) in TIME_WAIT, $(netstat -an -p tcp | grep -c ESTABLISHED) established"
+# seconds on a Mac. Counted by the kernel's TCP control blocks, which include
+# TIME_WAIT: macOS 27's netstat lists no TCP sockets at all, so a count read
+# from it was always zero and the inbound flood started on spent ports.
+for _ in $(seq 1 90); do [ "$(sysctl -n net.inet.tcp.pcbcount)" -lt $(( tcp_before + 2000 )) ] && break; sleep 1; done
+echo "    TCP control blocks between the floods: $(sysctl -n net.inet.tcp.pcbcount) (before the floods: $tcp_before)"
 
 $D run -d --name m3s-hold -p 18092:18092 node:24-alpine node -e '
 const net = require("net"); const held = [];

@@ -53,10 +53,43 @@ pub enum Notification {
     /// FUSE_NOTIFY_INC_EPOCH separately from individual notifications.
     Reset,
     /// A name in a directory: it may have appeared, vanished, or come to mean
-    /// a different file.
-    Entry { parent: u64, name: Vec<u8> },
+    /// a different file. `event` is what a watcher in the guest should be
+    /// told, if anything.
+    Entry {
+        parent: u64,
+        name: Vec<u8>,
+        event: Option<Event>,
+    },
     /// A file's contents or attributes.
     Inode { nodeid: u64 },
+}
+
+/// What a watcher in the guest should be told happened at a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Event {
+    /// The [`raise`] events, in the order the guest raises them.
+    pub raise: u32,
+    /// The guest's nodeid for what the name holds now, or 0.
+    pub nodeid: u64,
+    pub is_dir: bool,
+}
+
+/// The events an entry notification asks the guest to raise; they are bits
+/// of the trailer it carries after its name.
+pub mod raise {
+    pub const CREATE: u32 = 1 << 1;
+    pub const DELETE: u32 = 1 << 2;
+    /// A write, and the close that ends it.
+    pub const MODIFY: u32 = 1 << 3;
+    pub const ATTRIB: u32 = 1 << 5;
+}
+
+/// The trailer's other flags.
+mod trailer {
+    /// The trailer is present; a guest that finds fewer bytes, from an older
+    /// host, has nothing to raise.
+    pub const KNOWN: u32 = 1 << 0;
+    pub const DIR: u32 = 1 << 4;
 }
 
 impl Notification {
@@ -70,7 +103,11 @@ impl Notification {
         let mut body = Vec::with_capacity(64);
         let code = match self {
             Notification::Reset => code::INC_EPOCH,
-            Notification::Entry { parent, name } => {
+            Notification::Entry {
+                parent,
+                name,
+                event,
+            } => {
                 body.extend_from_slice(&parent.to_le_bytes());
                 body.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 body.extend_from_slice(&0u32.to_le_bytes()); // flags
@@ -78,6 +115,21 @@ impl Notification {
                 // The guest requires the terminator and checks for it; without
                 // one it drops the message rather than reading past the name.
                 body.push(0);
+                // Past the terminator, where only a guest with patch 0047
+                // looks: the event its inotify watchers should see (issue #43).
+                // Decided here, because the guest's dcache forgets a name the
+                // moment it is unused in a directory being edited and cannot
+                // say what was there before.
+                let (nodeid, flags) = match event {
+                    Some(event) => (
+                        event.nodeid,
+                        trailer::KNOWN | event.raise | if event.is_dir { trailer::DIR } else { 0 },
+                    ),
+                    None => (0, trailer::KNOWN),
+                };
+                body.extend_from_slice(&nodeid.to_le_bytes());
+                body.extend_from_slice(&flags.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
                 code::INVAL_ENTRY
             }
             Notification::Inode { nodeid } => {
@@ -201,6 +253,7 @@ mod tests {
         let bytes = Notification::Entry {
             parent: 7,
             name: b"README.md".to_vec(),
+            event: None,
         }
         .encode();
 
@@ -219,6 +272,42 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 9);
         assert_eq!(&bytes[32..41], b"README.md");
         assert_eq!(bytes[41], 0, "the name must be NUL-terminated");
+    }
+
+    /// What follows the terminator is the event for the guest's watchers.
+    #[test]
+    fn an_entry_notification_carries_its_event() {
+        let trailer = |event| {
+            let bytes = Notification::Entry {
+                parent: 7,
+                name: b"a".to_vec(),
+                event,
+            }
+            .encode();
+            assert_eq!(bytes.len(), 16 + 16 + 2 + 16);
+            let at = &bytes[34..];
+            (
+                u64::from_le_bytes(at[0..8].try_into().unwrap()),
+                u32::from_le_bytes(at[8..12].try_into().unwrap()),
+            )
+        };
+        assert_eq!(trailer(None), (0, trailer::KNOWN));
+        assert_eq!(
+            trailer(Some(Event {
+                raise: raise::CREATE | raise::MODIFY,
+                nodeid: 9,
+                is_dir: false
+            })),
+            (9, trailer::KNOWN | raise::CREATE | raise::MODIFY)
+        );
+        assert_eq!(
+            trailer(Some(Event {
+                raise: raise::DELETE,
+                nodeid: 0,
+                is_dir: true
+            })),
+            (0, trailer::KNOWN | raise::DELETE | trailer::DIR)
+        );
     }
 
     #[test]

@@ -1317,11 +1317,6 @@ impl Inode {
     }
 }
 
-/// An open file or directory, named by an `fh`.
-pub enum Handle {
-    File(Arc<OpenFile>),
-}
-
 /// A directory's contents, as one immutable list.
 ///
 /// Not a stream. A FUSE readdir offset has to mean the same thing to whoever
@@ -1364,28 +1359,6 @@ pub struct OpenFile {
     /// start read-only and are upgraded on the first write, because most files
     /// are only ever read and a read-write open of a read-only file fails.
     pub writable: bool,
-    /// Opened `O_APPEND` on the host.
-    ///
-    /// Worth a field of its own because it changes which syscall writes it:
-    /// POSIX has `pwrite` ignore its offset on an append-mode descriptor, so
-    /// the offset FUSE supplies would be silently discarded and two writers
-    /// would still be safe — but a *non*-append handle must use `pwrite`, and
-    /// telling them apart needs this.
-    pub append: bool,
-}
-
-impl Handle {
-    pub fn file(&self) -> Option<Arc<OpenFile>> {
-        match self {
-            Handle::File(file) => Some(file.clone()),
-        }
-    }
-
-    pub fn raw_fd(&self) -> Option<RawFd> {
-        match self {
-            Handle::File(file) => Some(file.fd.as_raw_fd()),
-        }
-    }
 }
 
 /// How many independent locks the tables are split across.
@@ -1430,10 +1403,7 @@ pub struct Registry {
     /// install, a create costs 26 microseconds on one thread and 39 under
     /// sixteen, and the difference is this.
     by_identity: [RwLock<HashMap<(i64, u64), u64>>; SHARDS],
-    /// Sharded by `fh`.
-    handles: [Mutex<HashMap<u64, Arc<Handle>>>; SHARDS],
     next_id: AtomicU64,
-    next_handle: AtomicU64,
     /// How many metadata descriptors the inode table is holding open.
     ///
     /// Shared with every inode, which is the only arrangement that stays
@@ -1523,9 +1493,7 @@ impl Registry {
         Registry {
             by_id,
             by_identity,
-            handles: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(ROOT_ID + 1),
-            next_handle: AtomicU64::new(1),
             census,
             budget: descriptor_budget(),
             sweep: AtomicUsize::new(0),
@@ -2213,37 +2181,6 @@ impl Registry {
             .map(|shard| shard.lock().expect("inode table poisoned").len())
             .sum()
     }
-
-    pub fn add_handle(&self, handle: Handle) -> u64 {
-        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.handles[shard(id)]
-            .lock()
-            .expect("handle table poisoned")
-            .insert(id, Arc::new(handle));
-        id
-    }
-
-    pub fn handle(&self, id: u64) -> Option<Arc<Handle>> {
-        self.handles[shard(id)]
-            .lock()
-            .expect("handle table poisoned")
-            .get(&id)
-            .cloned()
-    }
-
-    pub fn release_handle(&self, id: u64) {
-        self.handles[shard(id)]
-            .lock()
-            .expect("handle table poisoned")
-            .remove(&id);
-    }
-
-    pub fn handle_count(&self) -> usize {
-        self.handles
-            .iter()
-            .map(|shard| shard.lock().expect("handle table poisoned").len())
-            .sum()
-    }
 }
 
 /// How many entries one sweep of a shard reads, and how many of them it may
@@ -2404,11 +2341,6 @@ mod tests {
         }
     }
 
-    /// A descriptor for the handle tests, which do not care what it points at.
-    fn spare_fd() -> OwnedFd {
-        crate::sys::open_root(&std::env::temp_dir()).unwrap()
-    }
-
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -2522,23 +2454,6 @@ mod tests {
             first, second,
             "two different files were given the same nodeid"
         );
-    }
-
-    #[test]
-    fn handles_are_issued_and_released() {
-        let scratch = Scratch::new("handles");
-        let reg = scratch.registry();
-        let fh = reg.add_handle(Handle::File(Arc::new(OpenFile {
-            fd: spare_fd(),
-            readable: true,
-            append: false,
-            writable: true,
-        })));
-        assert!(reg.handle(fh).is_some());
-        assert_eq!(reg.handle_count(), 1);
-        reg.release_handle(fh);
-        assert!(reg.handle(fh).is_none());
-        assert_eq!(reg.handle_count(), 0);
     }
 
     /// Parking is a descriptor decision, not an identity one: the inode keeps
@@ -2807,27 +2722,5 @@ mod tests {
             budget < ceiling,
             "budget {budget} must be under the ceiling {ceiling}"
         );
-    }
-
-    /// Handle numbers are never reused. A stale `fh` from a released file must
-    /// fail rather than land on whatever was opened next.
-    #[test]
-    fn handle_numbers_are_not_recycled() {
-        let scratch = Scratch::new("recycle");
-        let reg = scratch.registry();
-        let first = reg.add_handle(Handle::File(Arc::new(OpenFile {
-            fd: spare_fd(),
-            readable: true,
-            append: false,
-            writable: true,
-        })));
-        reg.release_handle(first);
-        let second = reg.add_handle(Handle::File(Arc::new(OpenFile {
-            fd: spare_fd(),
-            readable: true,
-            append: false,
-            writable: true,
-        })));
-        assert_ne!(first, second);
     }
 }

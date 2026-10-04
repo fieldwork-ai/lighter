@@ -362,7 +362,7 @@ struct Conn {
     at: Option<Instant>,
     /// Keeps the vCPUs polling while an accelerator stream is open.
     wide: Option<crate::accelerator::Wide>,
-    slots: Option<(u32, u32)>,
+    joined: Option<crate::sockmap::Joined>,
     pumps: Option<Box<[Pump; 2]>>,
 }
 
@@ -390,7 +390,7 @@ impl Conn {
             attempts: 0,
             at: None,
             wide: None,
-            slots: None,
+            joined: None,
             pumps: None,
         }
     }
@@ -782,8 +782,8 @@ impl Conn {
         // requests to a published HTTP/1.0 server, until this order).
         let (tcp, other) = if self.a_tcp { (a, b) } else { (b, a) };
         match joiner.join(tcp, other) {
-            Ok(slots) => {
-                self.slots = Some(slots);
+            Ok(joined) => {
+                self.joined = Some(joined);
                 self.state = State::Joined;
             }
             Err(failure) => {
@@ -797,13 +797,13 @@ impl Conn {
                         failure.can_fallback, failure.error);
                 }
                 if failure.can_fallback {
-                    if let Some(slots) = failure.slots {
-                        joiner.release(slots);
+                    if let Some(joined) = failure.joined {
+                        joiner.release(joined);
                     }
                     self.state = State::Copying;
                 } else {
                     // Closed before the slots go back (`close`).
-                    self.slots = failure.slots;
+                    self.joined = failure.joined;
                     return Some(Step::Close);
                 }
             }
@@ -845,7 +845,7 @@ impl Conn {
     }
 
     fn close(self, env: &Env) {
-        let slots = self.slots;
+        let joined = self.joined;
         // Closed before the slots go back: a closed socket has left the maps,
         // and a slot handed out while its last socket is still in one would
         // replace it.
@@ -853,8 +853,8 @@ impl Conn {
         drop(self.b);
         drop(self.a);
         drop(self.wide);
-        if let (Some(slots), Some(joiner)) = (slots, env.joiner) {
-            joiner.release(slots);
+        if let (Some(joined), Some(joiner)) = (joined, env.joiner) {
+            joiner.release(joined);
         }
     }
 }

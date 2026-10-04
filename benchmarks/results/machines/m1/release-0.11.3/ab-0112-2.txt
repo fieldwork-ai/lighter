@@ -1,0 +1,5 @@
+==> lighter: yarn-install 9788 9663 9569
+==> lighter: copy-tree 10274 15706 5400
+==> lighter: find-walk 321 127 164
+==> lighter: ripgrep 310 147 125
+==> lighter: disk-seq-write 1868 750 529

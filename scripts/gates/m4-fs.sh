@@ -401,6 +401,85 @@ else
 		else
 			pass "a recorded owner is still the only one who can write its 644 file"
 		fi
+
+		# A non-root caller's creates are answered synchronously, and the
+		# guest never releases what such a reply names: 0.11.2 kept a
+		# descriptor per file, and a `pnpm install` as 1000 took the VMM to
+		# kern.maxfilesperproc (issue #46). Once the guest has forgotten the
+		# files, the open cache (2048) is all the VMM may still hold.
+		mkdir -p "$SHARE/many"
+		chmod 777 "$SHARE/many"
+		before="$(lsof -p "$VMM_PID" 2>/dev/null | wc -l)"
+		if docker run --rm --user 1000:1000 -v "$MOUNT/many:/w" alpine:3.21 sh -c \
+			'cd /w && i=0 && while [ $i -lt 20000 ]; do : > f$i; i=$((i+1)); done' 2>>"$RUN_DIR/docker.err" \
+			&& docker run --rm --privileged alpine:3.21 sh -c 'sync; echo 2 > /proc/sys/vm/drop_caches'; then
+			after=""
+			for _ in $(seq 1 20); do
+				sleep 1
+				after="$(lsof -p "$VMM_PID" 2>/dev/null | wc -l)"
+				[ $((after - before)) -le 2560 ] && break
+			done
+			if [ $((after - before)) -le 2560 ]; then
+				pass "20000 files created by a non-root container leave the VMM no descriptors once forgotten ($before -> $after)"
+			else
+				fail "the VMM went from $before to $after descriptors over 20000 forgotten non-root creates"
+			fi
+		else
+			fail "a non-root container could not create 20000 files"
+			sed 's/^/    /' "$RUN_DIR/docker.err"
+		fi
+
+		# What macOS changes in a bind mount raises the inotify events a
+		# local writer would (issue #43: Vite never reloaded), and what the
+		# container changes raises its own once, not again on the way back.
+		mkdir -p "$SHARE/watched"
+		printf 'x\n' > "$SHARE/watched/existing"
+		docker rm -f m4-watch >/dev/null 2>&1 || true
+		docker run -d --name m4-watch -v "$MOUNT/watched:/w" alpine:3.21 sh -c '
+			apk add -q inotify-tools >/dev/null 2>&1 || exit 1
+			cat /w/existing >/dev/null
+			exec inotifywait -m -q --format "%e %f" -e create,delete,modify,close_write /w > /tmp/events 2>&1' >/dev/null
+		watching=0
+		for _ in $(seq 1 60); do
+			docker exec m4-watch pgrep inotifywait >/dev/null 2>&1 && { watching=1; break; }
+			sleep 0.5
+		done
+		sleep 1
+		events() { docker exec m4-watch cat /tmp/events 2>/dev/null; }
+		expect() { # pattern: waits up to five seconds for an event line
+			for _ in $(seq 1 50); do
+				events | grep -qx "$1" && return 0
+				sleep 0.1
+			done
+			return 1
+		}
+		missing=""
+		if [ "$watching" -eq 1 ]; then
+			printf 'new\n' > "$SHARE/watched/new.txt"
+			expect "CREATE new.txt" || missing="$missing [create]"
+			docker exec m4-watch ls -l /w >/dev/null
+			printf 'more\n' >> "$SHARE/watched/existing"
+			expect "MODIFY existing" || missing="$missing [modify]"
+			expect "CLOSE_WRITE,CLOSE existing" || missing="$missing [close_write]"
+			rm "$SHARE/watched/existing"
+			expect "DELETE existing" || missing="$missing [delete]"
+			mv "$SHARE/watched/new.txt" "$SHARE/watched/renamed.txt"
+			expect "DELETE new.txt" || missing="$missing [rename-from]"
+			expect "CREATE renamed.txt" || missing="$missing [rename-to]"
+			docker exec m4-watch sh -c 'echo in > /w/inside'
+			expect "CREATE inside" || missing="$missing [container-create]"
+			sleep 2
+			[ "$(events | grep -cx 'CREATE inside')" = 1 ] || missing="$missing [container-create-once]"
+			if [ -z "$missing" ]; then
+				pass "macOS's creates, writes, deletes and renames in a bind mount reach a container's inotify; its own, once"
+			else
+				fail "inotify in the container missed:$missing"
+				events | sed 's/^/    /'
+			fi
+		else
+			fail "inotifywait did not start in the container"
+		fi
+		docker rm -f m4-watch >/dev/null 2>&1 || true
 		unset DOCKER_HOST
 	else
 		fail "the Docker guest did not come up"
