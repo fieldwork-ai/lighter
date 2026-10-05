@@ -722,6 +722,7 @@ impl Server {
                 // channel rather than by FSEvents' own coalescing window.
                 std::time::Duration::from_millis(10),
                 Box::new(Invalidator::new(
+                    root,
                     policy.clone(),
                     registry.clone(),
                     sink.clone(),

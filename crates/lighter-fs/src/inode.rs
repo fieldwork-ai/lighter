@@ -1586,6 +1586,12 @@ impl Registry {
         let _ = self.forgotten.set(forgotten);
     }
 
+    /// Whether the guest holds no inode but the root: nothing below the
+    /// root's own entries can be cached in it.
+    pub fn knows_only_the_root(&self) -> bool {
+        self.census.inodes() <= 1
+    }
+
     pub fn get(&self, id: u64) -> Option<Arc<Inode>> {
         self.by_id[shard(id)]
             .lock()
