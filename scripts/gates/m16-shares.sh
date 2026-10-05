@@ -32,6 +32,7 @@ cd "$ROOT"
 PROFILE="${PROFILE:-release}"
 LIGHTER="target/$PROFILE/lighter"
 IMAGE="alpine:3.21"
+PYTHON="python:3.12-slim"
 # How much more CPU the default shares may cost than the home folder alone,
 # in seconds over the idle window. A tenth of a second in 30 is 0.3% of a
 # core, well under anything a person would see in Activity Monitor.
@@ -63,9 +64,15 @@ detach() {
 		|| true
 }
 
+SMB_D="$HOME/.lighter-gate-smb-d-$$"
+SMB_T="$HOME/.lighter-gate-smb-t-$$"
+
 cleanup() {
 	[ "$FAILED" = 0 ] || cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m16-machine.log" 2>/dev/null || true
-	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp >/dev/null 2>&1 || true
+	umount "$SMB_D" 2>/dev/null || true
+	umount "$SMB_T" 2>/dev/null || true
+	rmdir "$SMB_D" "$SMB_T" 2>/dev/null || true
+	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	detach "$APFS"
 	detach "$EXFAT"
@@ -162,6 +169,75 @@ docker run --rm -v "/Volumes/$EXFAT:/d" "$IMAGE" sh -c 'echo "from a container" 
 seen="$(cat "/Volumes/$EXFAT/out.txt" 2>/dev/null || true)"
 [ "$seen" = "from a container" ] && pass "a container writes to it, and the Mac reads what it wrote" \
 	|| fail "the Mac reads the container's file as: ${seen:-nothing}"
+
+# What a metadata-preserving move does, as Sonarr's import does it: extended
+# attributes set, read and listed, then the file moved to another volume
+# keeping them. Each line is "<check> ok|FAIL <detail>".
+metadata() {
+	docker run --rm -v "$1:/from" -v "$2:/to" "$PYTHON" python3 -c '
+import os, shutil
+p = "/from/meta.txt"
+open(p, "w").write("x")
+checks = [
+    ("set an extended attribute", lambda: os.setxattr(p, "user.gate", b"1")),
+    ("read it", lambda: os.getxattr(p, "user.gate") == b"1" or 1 / 0),
+    ("list it", lambda: "user.gate" in os.listxattr(p) or 1 / 0),
+    ("move it to another volume", lambda: shutil.move(p, "/to/meta.txt")),
+    ("the moved file keeps it", lambda: os.getxattr("/to/meta.txt", "user.gate") == b"1" or 1 / 0),
+]
+for name, check in checks:
+    try:
+        check()
+        print(name, "ok")
+    except Exception as e:
+        print(name, "FAIL", e)
+os.remove("/to/meta.txt")
+' 2>&1
+}
+
+# Turns metadata()'s lines into gate lines, prefixed with what was tested.
+judge() {
+	local what="$1" line
+	while IFS= read -r line; do
+		case "$line" in
+		*" ok") pass "$what: ${line% ok}" ;;
+		*" FAIL "*) fail "$what: ${line%% FAIL *} — ${line#* FAIL }" ;;
+		esac
+	done
+}
+
+echo
+echo "==> Metadata on a drive with no identity paths (#53)"
+# exFAT, FAT and SMB have no /.vol: a file there was named by an identity
+# path that did not exist, and every extended attribute call failed with
+# ENOENT on a file that was plainly there.
+docker pull -q "$PYTHON" >/dev/null
+metadata "/Volumes/$EXFAT" "/Volumes/$APFS" | judge "exFAT"
+
+echo
+echo "==> Metadata between two SMB shares (#53)"
+# The report's own setup: two shares mounted with mount_smbfs, bind-mounted
+# into one container. The server is Samba in a container on this machine,
+# published on 445, so the gate needs no NAS.
+if lsof -nP -iTCP:445 -sTCP:LISTEN >/dev/null 2>&1; then
+	fail "port 445 is taken on this Mac (File Sharing?); the SMB checks need it"
+else
+	docker build -q -t lighter-gate-smb scripts/gates/fixtures/smb >/dev/null
+	docker run -d --name lighter-gate-smb -p 445:445 lighter-gate-smb >/dev/null
+	for _ in $(seq 1 40); do nc -z 127.0.0.1 445 2>/dev/null && break; sleep 0.25; done
+	mkdir -p "$SMB_D" "$SMB_T"
+	# By name rather than address: the Mac's SMB client keeps a session to
+	# a server it has just used, and refuses a second mount of the same
+	# share by the same spelling until it lets go ("File exists").
+	if mount_smbfs "//lt:lt@localhost/d" "$SMB_D" 2>"$SCRATCH/smb.err" \
+		&& mount_smbfs "//lt:lt@localhost/t" "$SMB_T" 2>>"$SCRATCH/smb.err"; then
+		metadata "$SMB_D" "$SMB_T" | judge "SMB"
+		umount "$SMB_D"; umount "$SMB_T"
+	else
+		fail "could not mount the shares: $(cat "$SCRATCH/smb.err")"
+	fi
+	docker rm -f lighter-gate-smb >/dev/null
+fi
 
 echo
 echo "==> A change on the Mac, seen by a container that has the drive open"
