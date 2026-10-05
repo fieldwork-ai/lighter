@@ -18,6 +18,7 @@ mod installation;
 mod instance;
 mod localnet;
 mod machine;
+mod mounts;
 mod mps;
 mod paths;
 mod release;
@@ -505,6 +506,14 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             port.port,
             port.addrs.join(", "),
             port.reason
+        );
+    }
+    for mount in &status.unshared {
+        println!(
+            "  mounts     {} binds {}, which is not shared: {}",
+            mount.container,
+            mount.source,
+            mount.remedy()
         );
     }
     for disk in &status.storage_waiting {

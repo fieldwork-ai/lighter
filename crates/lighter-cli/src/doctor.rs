@@ -269,6 +269,31 @@ pub fn run() -> Vec<Finding> {
         && let Ok(home) = paths::home()
         && let Ok(report) = crate::storage_status::query(&home, pid)
     {
+        if let Some(shares) = &report.shares {
+            let unshared = crate::mounts::running(shares);
+            findings.push(if unshared.is_empty() {
+                Finding::good("bind mounts", "every one from the Mac is shared")
+            } else {
+                Finding::warn(
+                    "bind mounts",
+                    format!(
+                        "from folders the machine does not share, so the containers see empty folders: {}",
+                        unshared
+                            .iter()
+                            .map(|m| format!("{} ({})", m.source, m.container))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    &unshared
+                        .iter()
+                        .map(|m| m.remedy())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            });
+        }
         findings.push(if report.unforwarded.is_empty() {
             Finding::good("published ports", "all forwarded")
         } else {

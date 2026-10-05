@@ -205,6 +205,10 @@ pub fn machine() -> anyhow::Result<()> {
     } else {
         None
     };
+    let shared: Vec<String> = shares
+        .iter()
+        .map(|share| share.path.display().to_string())
+        .collect();
     for share in &shares {
         cmdline.push_str(&format!(
             " lighter.share={}:{}",
@@ -288,6 +292,7 @@ pub fn machine() -> anyhow::Result<()> {
             .collect(),
         machine.mem().cloned(),
         Some(port_health.clone()),
+        shared,
     )?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;

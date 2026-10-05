@@ -348,7 +348,7 @@ fn home_directory() -> String {
 /// from a second server whose cache the first's writes never reach.
 pub const DEFAULT_SHARES: [&str; 3] = ["/Users", "/Volumes", "/var/folders"];
 
-fn default_shares() -> Vec<String> {
+pub fn default_shares() -> Vec<String> {
     DEFAULT_SHARES.iter().map(|s| s.to_string()).collect()
 }
 

@@ -50,6 +50,9 @@ pub struct Report {
     pub waiting: Vec<Waiting>,
     pub memory: Option<Memory>,
     pub unforwarded: Vec<Unforwarded>,
+    /// The folders the machine shares: those configured that were there
+    /// when it started. `None` from a machine before 0.11.6.
+    pub shares: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,6 +63,8 @@ struct Reply {
     memory: Option<Memory>,
     #[serde(default)]
     unforwarded: Vec<Unforwarded>,
+    #[serde(default)]
+    shares: Option<Vec<String>>,
 }
 
 pub struct Server {
@@ -75,6 +80,7 @@ impl Server {
         disks: Vec<(PathBuf, Arc<Disk>)>,
         mem: Option<lighter_vmm::virtio::mem::MemControl>,
         ports: Option<lighter_docker::PortHealth>,
+        shares: Vec<String>,
     ) -> io::Result<Self> {
         let path = home.join(SOCKET);
         match std::fs::remove_file(&path) {
@@ -144,6 +150,7 @@ impl Server {
                         waiting,
                         memory,
                         unforwarded,
+                        shares: Some(shares.clone()),
                     };
                     if let Ok(bytes) = serde_json::to_vec(&reply) {
                         let _ = stream.write_all(&bytes);
@@ -191,6 +198,7 @@ pub fn query(home: &Path, pid: u32) -> io::Result<Report> {
         waiting: reply.waiting,
         memory: reply.memory,
         unforwarded: reply.unforwarded,
+        shares: reply.shares,
     })
 }
 
@@ -203,10 +211,11 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("lighter-storage-status-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        let server = Server::start(&home, Vec::new(), None, None).unwrap();
+        let server = Server::start(&home, Vec::new(), None, None, vec!["/Users".into()]).unwrap();
         let report = query(&home, std::process::id()).unwrap();
         assert!(report.waiting.is_empty());
         assert!(report.memory.is_none(), "no range, no memory report");
+        assert_eq!(report.shares, Some(vec!["/Users".to_string()]));
         assert!(query(&home, std::process::id() + 1).is_err());
         assert_eq!(
             std::fs::metadata(home.join(SOCKET))
