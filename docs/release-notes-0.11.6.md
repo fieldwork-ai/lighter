@@ -1,6 +1,6 @@
 # lighter 0.11.6
 
-Containers can bind from external drives, and from the Mac's temporary folders, at the same paths as on the Mac (#52). A bind from a folder lighter does not share is no longer silently empty.
+Containers can bind from external drives, and from the Mac's temporary folders, at the same paths as on the Mac (#52). Extended attributes work on files on SMB shares and on drives formatted exFAT or FAT (#53). A bind from a folder lighter does not share is no longer silently empty.
 
 ## What went wrong
 
@@ -11,6 +11,7 @@ lighter shared your home folder and nothing else. A bind from anywhere outside i
 - **`/Users`, `/Volumes` and `/var/folders` are shared**, at the same paths as on the Mac. These are Docker Desktop's defaults, without `/tmp`. An existing configuration that shares the home folder now reads as these, keeping any other folder it lists.
 - **A drive is there whenever it is connected**, including one plugged in while the machine runs, APFS or exFAT.
 - **A drive ejects while the machine runs**, from Finder, `diskutil eject` or `hdiutil detach`. lighter keeps files open on the Mac on the guest's behalf, and macOS refuses to eject a volume while anything has a file on it open; lighter now closes what it holds on a volume when macOS asks to eject it. A container still using the drive finds it gone, as it would on a Linux machine whose disk was unplugged.
+- **Extended attributes work on SMB shares and exFAT or FAT drives (#53).** lighter names a file on the Mac by its identity (`/.vol/<device>/<inode>`) where the volume supports that, and decided whether it did once, for the shared folder's own disk. A volume mounted inside a shared folder that has no identity paths, as SMB, exFAT and FAT do not, was given paths that did not exist, so every `getfattr`, `setfattr` and listing failed with "No such file or directory" on a file that was plainly there. Moving a file between two SMB shares keeping its metadata, as Sonarr does when it imports a download, failed the same way. Each volume now answers for itself.
 - **A file a short-lived container wrote is no longer left open on the Mac.** If the guest forgot the file before lighter had finished creating it, which is ordinary when the container exits straight away, lighter held it open until 2,048 others had taken its place.
 - **`lighter config --share <path>` and `--unshare <path>`** change what is shared, then `lighter restart`.
 - **A shared folder that is not there**, such as a drive that is unplugged, is left out when the machine starts instead of stopping it, and `lighter doctor` names it.
