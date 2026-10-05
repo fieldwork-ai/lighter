@@ -250,7 +250,7 @@ pub fn list() -> anyhow::Result<std::process::ExitCode> {
     let config = Config::load()?;
     let status = ask("status");
     let devices = iousb::list();
-    println!("USB devices on this Mac:");
+    outln!("USB devices on this Mac:");
     for info in &devices {
         let spec = format!("{:04x}:{:04x}", info.vendor_id, info.product_id);
         let wanted = config
@@ -285,12 +285,12 @@ pub fn list() -> anyhow::Result<std::process::ExitCode> {
             .as_deref()
             .map(|p| format!(" {p}"))
             .unwrap_or_default();
-        println!(
+        outln!(
             "  {spec}  {}{serial}  {}{port}",
             name(info),
             speed(info.speed)
         );
-        println!("             {state}");
+        outln!("             {state}");
     }
     let missing: Vec<&UsbDevice> = config
         .usb
@@ -302,9 +302,9 @@ pub fn list() -> anyhow::Result<std::process::ExitCode> {
         })
         .collect();
     if !missing.is_empty() {
-        println!("Attached, not plugged in:");
+        outln!("Attached, not plugged in:");
         for d in missing {
-            println!("  {}", d.spec);
+            outln!("  {}", d.spec);
         }
     }
     Ok(std::process::ExitCode::SUCCESS)
@@ -331,11 +331,11 @@ pub fn attach(spec: &str, force: bool) -> anyhow::Result<std::process::ExitCode>
     });
     config.save()?;
     let Some(info) = present else {
-        println!("{canonical} will be attached whenever it is plugged in.");
+        outln!("{canonical} will be attached whenever it is plugged in.");
         return Ok(std::process::ExitCode::SUCCESS);
     };
     if ask("reload").is_none() {
-        println!(
+        outln!(
             "{canonical} ({}) will be attached when the machine starts.",
             name(&info)
         );
@@ -350,14 +350,14 @@ pub fn attach(spec: &str, force: bool) -> anyhow::Result<std::process::ExitCode>
             // Served, and now in the guest: enumerated, its driver bound,
             // and its names made, which is what a container needs.
             Some(e) if e.status == "attached" && in_guest(info.vendor_id, info.product_id) => {
-                println!("{canonical} ({}) is attached.", name(&info));
+                outln!("{canonical} ({}) is attached.", name(&info));
                 let names: Vec<String> = serial_names()
                     .into_iter()
                     .filter(|n| n.vendor == info.vendor_id && n.product == info.product_id)
                     .map(|n| n.path)
                     .collect();
                 for path in &names {
-                    println!("  docker run --device {path} …");
+                    outln!("  docker run --device {path} …");
                 }
                 return Ok(std::process::ExitCode::SUCCESS);
             }
@@ -395,7 +395,7 @@ pub fn detach(spec: &str) -> anyhow::Result<std::process::ExitCode> {
     }
     config.save()?;
     let _ = ask("reload");
-    println!("{parsed} is detached; macOS has it back.");
+    outln!("{parsed} is detached; macOS has it back.");
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -476,12 +476,15 @@ pub fn ls_serial() -> anyhow::Result<std::process::ExitCode> {
     guest_sh("true")?;
     let names = serial_names();
     if names.is_empty() {
-        println!("No USB serial devices in the guest (`lighter usb list` shows what is attached).");
+        outln!("No USB serial devices in the guest (`lighter usb list` shows what is attached).");
     }
     for n in names {
-        println!(
+        outln!(
             "{}  ({}, {:04x}:{:04x})",
-            n.path, n.tty, n.vendor, n.product
+            n.path,
+            n.tty,
+            n.vendor,
+            n.product
         );
     }
     Ok(std::process::ExitCode::SUCCESS)

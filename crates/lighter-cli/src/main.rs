@@ -9,6 +9,9 @@
 //! `lighter status` answerable by anyone rather than only by whoever is
 //! holding the console.
 
+#[macro_use]
+mod output;
+
 mod ane_host;
 mod bundle;
 mod config;
@@ -292,7 +295,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
         }
         Command::Doctor => {
             let findings = doctor::run();
-            print!("{}", doctor::report(&findings));
+            out!("{}", doctor::report(&findings));
             Ok(if findings.iter().all(|f| f.ok) {
                 std::process::ExitCode::SUCCESS
             } else {
@@ -303,7 +306,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             use lighter_vmm::rosetta;
             if install {
                 if rosetta::installed() {
-                    println!("Rosetta is already installed.");
+                    outln!("Rosetta is already installed.");
                 } else {
                     // Apple's own installer; the flag is its, and stands in for
                     // the agreement its interactive form shows.
@@ -314,18 +317,16 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
                     if !status.success() || !rosetta::installed() {
                         anyhow::bail!("Rosetta did not install ({status})");
                     }
-                    println!(
-                        "Rosetta installed. Restart lighter to run amd64 containers under it."
-                    );
+                    outln!("Rosetta installed. Restart lighter to run amd64 containers under it.");
                 }
             } else if rosetta::installed() {
                 match rosetta::key() {
-                    Ok(_) => println!("installed: amd64 containers run under Rosetta"),
-                    Err(e) => println!("installed but not usable by lighter: {e}"),
+                    Ok(_) => outln!("installed: amd64 containers run under Rosetta"),
+                    Err(e) => outln!("installed but not usable by lighter: {e}"),
                 }
             } else {
-                println!("not installed: amd64 containers run under emulation");
-                println!("run `lighter rosetta --install` to install it");
+                outln!("not installed: amd64 containers run under emulation");
+                outln!("run `lighter rosetta --install` to install it");
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
@@ -365,7 +366,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
                 .as_secs();
             match machine::control(&format!("time {now}"))? {
                 reply if reply == "ok" => {
-                    println!("Guest clock set.");
+                    outln!("Guest clock set.");
                     Ok(std::process::ExitCode::SUCCESS)
                 }
                 reply => anyhow::bail!("the guest refused: {reply}"),
@@ -373,12 +374,12 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
         }
         Command::Install => {
             service::install()?;
-            println!("lighter will start when you log in.");
+            outln!("lighter will start when you log in.");
             Ok(std::process::ExitCode::SUCCESS)
         }
         Command::Uninstall => {
             service::uninstall()?;
-            println!("lighter will no longer start when you log in.");
+            outln!("lighter will no longer start when you log in.");
             Ok(std::process::ExitCode::SUCCESS)
         }
     }
@@ -417,7 +418,7 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
         anyhow::bail!("cannot start; see `lighter doctor`");
     }
 
-    println!(
+    outln!(
         "Starting lighter ({} cores, {} MiB{})…",
         config.vcpus(),
         config.memory_mib(),
@@ -429,12 +430,12 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     let pid = machine::start(&config, timeout)?;
     let socket = paths::docker_socket()?;
     let version = machine::docker_version(&socket)?;
-    println!("Docker {version}");
+    outln!("Docker {version}");
     if paths::is_default_home() && docker_available {
         context::install(&socket, &paths::previous_context()?)?;
-        println!("Running as pid {pid}; the docker CLI now points at it.");
+        outln!("Running as pid {pid}; the docker CLI now points at it.");
     } else {
-        println!(
+        outln!(
             "Running as pid {pid}; use DOCKER_HOST=unix://{}",
             socket.display()
         );
@@ -454,33 +455,33 @@ fn stop() -> anyhow::Result<std::process::ExitCode> {
 
 fn stop_machine() -> anyhow::Result<std::process::ExitCode> {
     if machine::stop(Duration::from_secs(30))? {
-        println!("Stopped.");
+        outln!("Stopped.");
     } else {
-        println!("Not running.");
+        outln!("Not running.");
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
 fn status() -> anyhow::Result<std::process::ExitCode> {
     let status = machine::status()?;
-    print!("{}", installation::version_report());
+    out!("{}", installation::version_report());
     if !status.running {
-        println!("lighter is not running.");
+        outln!("lighter is not running.");
         return Ok(std::process::ExitCode::from(1));
     }
-    println!("lighter is running.");
+    outln!("lighter is running.");
     if let Some(pid) = status.pid {
-        println!("  pid        {pid}");
+        outln!("  pid        {pid}");
     }
     match &status.docker {
-        Some(version) => println!("  docker     {version}"),
-        None => println!("  docker     not answering yet"),
+        Some(version) => outln!("  docker     {version}"),
+        None => outln!("  docker     not answering yet"),
     }
     if let Some(mib) = status.footprint_mib {
-        println!("  memory     {mib} MiB");
+        outln!("  memory     {mib} MiB");
     }
     if let Some(memory) = status.memory {
-        println!(
+        outln!(
             "  guest      {} of {} MiB plugged in (cooperative resources)",
             memory.base_mib + memory.plugged_mib,
             memory.base_mib + memory.range_mib
@@ -493,14 +494,14 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             } else {
                 format!(" ({})", e.detail)
             };
-            println!("  usb        {} {}{detail}", e.spec, e.status);
+            outln!("  usb        {} {}{detail}", e.spec, e.status);
         }
     }
     if let Some(restarts) = &status.agent_restarts {
-        println!("  agents     restarted: {restarts} (see `lighter logs`)");
+        outln!("  agents     restarted: {restarts} (see `lighter logs`)");
     }
     for port in &status.unforwarded {
-        println!(
+        outln!(
             "  ports      {} {} not forwarded on {}, retrying: {}",
             port.proto,
             port.port,
@@ -509,7 +510,7 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
         );
     }
     for mount in &status.unshared {
-        println!(
+        outln!(
             "  mounts     {} binds {}, which is not shared: {}",
             mount.container,
             mount.source,
@@ -517,8 +518,8 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
         );
     }
     for disk in &status.storage_waiting {
-        println!("  storage    Waiting for host disk space; VM running, writes waiting.");
-        println!(
+        outln!("  storage    Waiting for host disk space; VM running, writes waiting.");
+        outln!(
             "             {}: {}, {}s, {} retries",
             disk.disk.display(),
             disk.operation,
@@ -526,7 +527,7 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             disk.retries
         );
     }
-    println!("  socket     {}", paths::docker_socket()?.display());
+    outln!("  socket     {}", paths::docker_socket()?.display());
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -670,16 +671,14 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
             .map(|m| m.len() >> 30)
             .unwrap_or(0);
         if image > disk {
-            println!(
-                "The disk is already {image} GiB and disks never shrink; it stays {image} GiB."
-            );
+            outln!("The disk is already {image} GiB and disks never shrink; it stays {image} GiB.");
         }
     }
     if changed {
         config.save()?;
-        println!("Saved. Restart for it to take effect: `lighter restart`");
+        outln!("Saved. Restart for it to take effect: `lighter restart`");
     }
-    println!(
+    outln!(
         "  resources  {}",
         match config.resources {
             config::Resources::Fixed => "fixed (a slice of the Mac)",
@@ -691,29 +690,29 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         (config::Resources::Cooperative, false) => unset,
         _ => "",
     };
-    println!(
+    outln!(
         "  cpus       {}{}",
         config.vcpus(),
         limit(config.cpus.is_some(), " (the Mac's)")
     );
-    println!(
+    outln!(
         "  memory     {} MiB{}",
         config.memory_mib(),
         limit(config.memory_mib.is_some(), " (twice the Mac's)")
     );
-    println!("  disk       {} GiB", config.disk_gib);
-    println!(
+    outln!("  disk       {} GiB", config.disk_gib);
+    outln!(
         "  publish    {}",
         match config.publish {
             config::Publish::Lan => "lan (every interface, as Docker does)",
             config::Publish::Localhost => "localhost (wildcard publishes on loopback)",
         }
     );
-    println!("  gpu        {}", if config.gpu { "on" } else { "off" });
-    println!("  ane        {}", if config.ane { "on" } else { "off" });
-    println!("  metal      {}", if config.metal { "on" } else { "off" });
-    println!("  video      {}", if config.video { "on" } else { "off" });
-    println!(
+    outln!("  gpu        {}", if config.gpu { "on" } else { "off" });
+    outln!("  ane        {}", if config.ane { "on" } else { "off" });
+    outln!("  metal      {}", if config.metal { "on" } else { "off" });
+    outln!("  video      {}", if config.video { "on" } else { "off" });
+    outln!(
         "  mps        {}{}",
         if config.mps { "on" } else { "off" },
         if config.torch_python.is_empty() {
@@ -723,7 +722,7 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         }
     );
     for share in &config.shares {
-        println!("  share      {share}");
+        outln!("  share      {share}");
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

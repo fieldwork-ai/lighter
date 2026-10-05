@@ -450,7 +450,7 @@ fn install_selected(
     installation::write(&root, &prefix, Method::Script)?;
     let previous = legacy(&prefix)?;
     if previous.as_ref() == Some(&root) {
-        println!("Already installed: {}", manifest.version);
+        outln!("Already installed: {}", manifest.version);
         return Ok(());
     }
     let journal = Journal {
@@ -506,9 +506,10 @@ fn install_selected(
         return Err(error.context("activation failed; rerun the installer to recover"));
     }
     fs::remove_file(prefix.join("upgrade.json"))?;
-    println!(
+    outln!(
         "Installed lighter {} (Linux {}).",
-        manifest.version, manifest.kernel_version
+        manifest.version,
+        manifest.kernel_version
     );
     if let Err(e) = prune_generations(&prefix) {
         eprintln!("warning: could not remove old releases: {e:#}");
