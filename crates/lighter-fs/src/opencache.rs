@@ -26,6 +26,7 @@
 //! descriptor to re-open.
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use crate::inode::{OpenDir, OpenFile};
@@ -110,6 +111,19 @@ impl OpenCache {
             .lock()
             .expect("open cache poisoned")
             .remove(&nodeid);
+    }
+
+    /// Drops every descriptor on `dev`, returning how many. Read from the
+    /// descriptors themselves rather than through the inodes they belong to:
+    /// a volume being ejected must lose every one, including any whose inode
+    /// the registry has already forgotten.
+    pub fn evict_device(&self, dev: i64) -> usize {
+        let mut files = self.files.lock().expect("open cache poisoned");
+        let before = files.len();
+        files.retain(|_, file| {
+            crate::sys::stat_fd(file.fd.as_raw_fd()).map_or(true, |st| st.st_dev as i64 != dev)
+        });
+        before - files.len()
     }
 
     pub fn len(&self) -> usize {

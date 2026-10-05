@@ -497,6 +497,26 @@ struct Rosetta {
 }
 
 /// A shared directory.
+/// A share's descriptors, as the pool sees them: the inodes it remembers
+/// and the files it holds open for the guest.
+struct Hold {
+    registry: Arc<Registry>,
+    open_cache: Arc<OpenCache>,
+}
+
+impl crate::inode::Release for Hold {
+    fn release_device(&self, dev: i64) -> usize {
+        let inodes = self
+            .registry
+            .release_device(dev, |id| self.open_cache.evict(id));
+        let open_files = self.open_cache.evict_device(dev);
+        if inodes + open_files > 0 {
+            tracing::info!(dev, inodes, open_files, "let go of a volume being ejected");
+        }
+        inodes + open_files
+    }
+}
+
 pub struct Server {
     root: PathBuf,
     root_dev: i64,
@@ -518,6 +538,9 @@ pub struct Server {
     /// opens. See [`crate::opencache`]. Shared with apply-queue jobs, which
     /// register a pending create's descriptor here once it exists.
     open_cache: Arc<OpenCache>,
+    /// What the pool asks to let go of a volume being ejected; enrolled
+    /// there weakly, so it lives exactly as long as the share.
+    _hold: Arc<Hold>,
     /// Opcode counters, off unless asked for.
     stats: Stats,
     /// Set on the share that carries Rosetta. See [`Server::serve_rosetta`].
@@ -730,6 +753,15 @@ impl Server {
             "share opened"
         );
         let open_cache = Arc::new(OpenCache::new());
+        registry.on_forget(Box::new({
+            let open_cache = open_cache.clone();
+            move |id| open_cache.evict(id)
+        }));
+        let hold = Arc::new(Hold {
+            registry: registry.clone(),
+            open_cache: open_cache.clone(),
+        });
+        pool.enroll(Arc::downgrade(&hold) as std::sync::Weak<dyn crate::inode::Release>);
         let apply = std::sync::Arc::new(crate::apply::Apply::start(root.to_path_buf()));
         let deferred = std::sync::Arc::new(Holding::default());
         let park_creates = std::env::var("LIGHTER_FS_PARK_CREATES").as_deref() != Ok("0");
@@ -781,6 +813,7 @@ impl Server {
             policy,
             notifications: sink,
             open_cache,
+            _hold: hold,
             stats: Stats::new(),
             rosetta: None,
             apply,
@@ -1359,9 +1392,6 @@ impl Server {
     /// nothing can ever reach again.
     fn forget(&self, nodeid: u64, count: u64) {
         self.registry.forget(nodeid, count);
-        if self.registry.get(nodeid).is_none() {
-            self.open_cache.evict(nodeid);
-        }
     }
 
     // --- name resolution ---------------------------------------------------

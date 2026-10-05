@@ -2668,3 +2668,81 @@ fn macos_attributes_are_not_listed_but_can_be_read() {
     get.extend_from_slice(&name_body("com.apple.lighter-test"));
     assert_eq!(guest.call(op::GETXATTR, nodeid, &get).unwrap(), b"mac");
 }
+
+/// The paths of this process's descriptors inside `dir`, excluding `dir`.
+fn descriptors_inside(dir: &Path) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = dir.canonicalize().unwrap();
+    let mut found = Vec::new();
+    // SAFETY: getdtablesize takes nothing; fcntl(F_GETPATH) writes at most
+    // MAXPATHLEN bytes into a buffer of that size, and fails harmlessly on a
+    // number that is not an open descriptor.
+    let ceiling = unsafe { libc::getdtablesize() };
+    for fd in 0..ceiling {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+            continue;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end]));
+        if path != dir && path.starts_with(&dir) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// A volume cannot be ejected while anything holds a file on it open, and
+/// the guest's lookups, reads and writes leave descriptors behind on purpose.
+/// Asked to let go of a device, the shares close every one of them, open
+/// files included, and the files work as before when next used.
+#[test]
+fn a_share_lets_go_of_a_volume_being_ejected() {
+    let pool = lighter_fs::inode::Pool::default();
+    let mut guest = Guest::new_in("eject", &pool);
+    std::fs::create_dir(guest.host("drive")).unwrap();
+    std::fs::write(guest.host("drive/old"), b"old").unwrap();
+    let drive = guest.lookup(1, "drive").unwrap();
+    let (written, fh) = guest.create(drive, "new", 0o2).unwrap();
+    guest.write(written, fh, 0, b"new").unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let old = guest.lookup(drive, "old").unwrap();
+    let rfh = guest.open(old, 0).unwrap();
+    assert_eq!(guest.read(old, rfh, 0, 16).unwrap(), b"old");
+    let held = descriptors_inside(&guest.root);
+    assert!(!held.is_empty(), "the share should be holding files open");
+
+    let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(&guest.root).unwrap()) as i64;
+    assert!(pool.release_device(dev) > 0);
+    assert_eq!(
+        descriptors_inside(&guest.root),
+        Vec::<PathBuf>::new(),
+        "still open after the release"
+    );
+    assert_eq!(guest.read(old, rfh, 0, 16).unwrap(), b"old");
+    assert_eq!(guest.read(written, fh, 0, 16).unwrap(), b"new");
+}
+
+/// A file a short-lived container creates and writes is forgotten by the
+/// guest as the container exits, often before its held-back create has been
+/// applied. Whatever the order, nothing of it stays open afterwards.
+#[test]
+fn a_file_forgotten_before_its_create_lands_is_not_held_open() {
+    let mut guest = Guest::new("forgotten-create");
+    for n in 0..20 {
+        let (nodeid, fh) = guest.create(1, &format!("f{n}"), 0o2).unwrap();
+        guest.write(nodeid, fh, 0, b"from a container").unwrap();
+        guest.call(op::FORGET, nodeid, &1u64.to_le_bytes()).ok();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert_eq!(
+        std::fs::read(guest.host("f19")).unwrap(),
+        b"from a container"
+    );
+    assert_eq!(
+        descriptors_inside(&guest.root),
+        Vec::<PathBuf>::new(),
+        "held open after the guest forgot them"
+    );
+}
