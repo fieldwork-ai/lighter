@@ -657,6 +657,26 @@ impl Server {
     /// promised when the guest cannot be corrected, and what may be promised
     /// when it can.
     pub fn with_timings(root: &Path, polled: Timings, pushed: Timings) -> std::io::Result<Server> {
+        Server::in_pool(root, polled, pushed, &crate::inode::Pool::default())
+    }
+
+    /// Opens `root` to count its descriptors into `pool`, against one budget
+    /// with the process's other shares.
+    pub fn new_in_pool(root: &Path, pool: &crate::inode::Pool) -> std::io::Result<Server> {
+        Server::in_pool(
+            root,
+            Timings::from_env_over(Timings::POLLED),
+            Timings::from_env_over(Timings::PUSHED),
+            pool,
+        )
+    }
+
+    fn in_pool(
+        root: &Path,
+        polled: Timings,
+        pushed: Timings,
+        pool: &crate::inode::Pool,
+    ) -> std::io::Result<Server> {
         // A share holds a descriptor per remembered inode and per open file,
         // and macOS starts every process at 256 of them.
         let descriptors = sys::raise_file_limit();
@@ -669,7 +689,7 @@ impl Server {
         // Caching is only defensible because the watcher can withdraw it. If
         // the stream will not start, the timeouts go to zero rather than
         // becoming promises that nothing is able to take back.
-        let registry = Arc::new(Registry::new(fd, dev, ino));
+        let registry = Arc::new(Registry::in_pool(fd, dev, ino, pool));
         let sink = Arc::new(crate::notify::Sink::new());
         let policy = Arc::new(Policy::new(polled, pushed));
         let watcher = if polled.caching() || pushed.caching() {

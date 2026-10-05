@@ -102,6 +102,12 @@ struct Guest {
 
 impl Guest {
     fn new(name: &str) -> Guest {
+        Guest::new_in(name, &lighter_fs::inode::Pool::default())
+    }
+
+    /// A guest whose share counts its descriptors into `pool`, as a
+    /// machine's shares do.
+    fn new_in(name: &str, pool: &lighter_fs::inode::Pool) -> Guest {
         let root = std::env::temp_dir().join(format!(
             "lighter-fs-{name}-{}-{}",
             std::process::id(),
@@ -111,7 +117,7 @@ impl Guest {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        Guest::serve(root, true)
+        Guest::serve_in(root, true, pool)
     }
 
     /// A second server on this guest's share, as a restarted VM would have.
@@ -120,7 +126,11 @@ impl Guest {
     }
 
     fn serve(root: PathBuf, owns_root: bool) -> Guest {
-        let server = Server::new(&root).unwrap();
+        Guest::serve_in(root, owns_root, &lighter_fs::inode::Pool::default())
+    }
+
+    fn serve_in(root: PathBuf, owns_root: bool, pool: &lighter_fs::inode::Pool) -> Guest {
+        let server = Server::new_in_pool(&root, pool).unwrap();
         let mut guest = Guest {
             server,
             unique: 1,
@@ -947,6 +957,37 @@ fn a_parked_inode_still_reads_back_what_was_written() {
             "{name} came back wrong after its descriptor was parked"
         );
     }
+    unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+}
+
+/// A machine's shares hold their descriptors against one budget. Each used
+/// to measure itself against the whole of it, so two shares in use at once,
+/// a home folder and a drive, could together reach the process's ceiling,
+/// and the guest saw EMFILE on a file that was plainly there.
+#[test]
+fn shares_of_one_machine_keep_one_budget() {
+    let _alone = with_budget("64");
+    let pool = lighter_fs::inode::Pool::default();
+    let mut home = Guest::new_in("pool-home", &pool);
+    let drive = Guest::new_in("pool-drive", &pool);
+    for n in 0..300 {
+        let (nodeid, fh) = home.create(1, &format!("f{n}"), 0o2).unwrap();
+        home.write(nodeid, fh, 0, b"x").unwrap();
+    }
+    home.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let (by_home, budget) = home.server.descriptor_usage();
+    let (by_drive, _) = drive.server.descriptor_usage();
+    // The idle share sees what the busy one holds: that is what lets either
+    // reclaim when the two together reach the budget.
+    assert_eq!(
+        by_drive, by_home,
+        "the drive's share must count the home share's descriptors"
+    );
+    assert!(by_home > 1, "the busy share must have held something");
+    assert!(
+        by_home <= budget * 2,
+        "{by_home} descriptors held against one budget of {budget}"
+    );
     unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
 }
 

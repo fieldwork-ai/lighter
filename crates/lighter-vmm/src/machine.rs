@@ -403,8 +403,9 @@ impl Machine {
         // is: each needs a waker, and the transports do not exist yet.
         let mut share_wakers = Vec::with_capacity(config.shares.len());
         let mut pollers = Vec::new();
+        let descriptors = lighter_fs::inode::Pool::default();
         for share in &config.shares {
-            let fs = Fs::new(share)?;
+            let fs = Fs::in_pool(share, &descriptors)?;
             share_wakers.push((virtio.len(), fs.waker(), fs.notifications()));
             virtio.push(Box::new(fs));
         }

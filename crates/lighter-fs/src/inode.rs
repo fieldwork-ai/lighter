@@ -257,13 +257,26 @@ pub struct AttrOverride {
     pub landed: bool,
 }
 
+/// The descriptors every share of one process holds, against one budget.
+///
+/// Each share used to count only its own against three quarters of the
+/// process's ceiling, so two shares in use at once could together reach it,
+/// and the guest saw EMFILE (the failure of issue #46, by another road). A
+/// machine's shares now count into one pool; each still parks only its own.
+#[derive(Debug, Clone, Default)]
+pub struct Pool {
+    descriptors: Arc<AtomicUsize>,
+    resident_dirs: Arc<AtomicUsize>,
+}
+
 /// What a share is holding, counted where it changes.
 #[derive(Debug, Default)]
 pub struct Census {
-    /// Open metadata descriptors. The number the budget is about.
-    descriptors: AtomicUsize,
+    /// Open metadata descriptors, across the share's [`Pool`]. The number
+    /// the budget is about.
+    descriptors: Arc<AtomicUsize>,
     /// Of those, directories. See [`Inode::parkable`].
-    resident_dirs: AtomicUsize,
+    resident_dirs: Arc<AtomicUsize>,
     /// Live `Inode` values, as against how many the table lists. The two
     /// disagreeing means something is holding `Arc`s the table has already
     /// forgotten, which from the outside looks exactly like a descriptor leak
@@ -1461,12 +1474,22 @@ impl Registry {
         self.census.descriptors()
     }
 
-    /// Builds a registry whose root is `root_fd`.
+    /// Builds a registry whose root is `root_fd`, with a budget of its own.
     pub fn new(root_fd: OwnedFd, dev: i64, ino: u64) -> Registry {
+        Registry::in_pool(root_fd, dev, ino, &Pool::default())
+    }
+
+    /// Builds a registry whose root is `root_fd`, counting its descriptors
+    /// into `pool` with the process's other shares.
+    pub fn in_pool(root_fd: OwnedFd, dev: i64, ino: u64, pool: &Pool) -> Registry {
         // The root is never forgotten: the kernel does not FORGET nodeid 1, and
         // a count that could reach zero would let a buggy guest drop it and
         // take the whole mount with it.
-        let census = Arc::new(Census::default());
+        let census = Arc::new(Census {
+            descriptors: pool.descriptors.clone(),
+            resident_dirs: pool.resident_dirs.clone(),
+            ..Census::default()
+        });
         census.budget.store(descriptor_budget(), Ordering::Relaxed);
         let root = Arc::new(Inode::new(
             root_fd,

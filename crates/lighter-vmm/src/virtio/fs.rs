@@ -492,6 +492,12 @@ pub struct Fs {
 
 impl Fs {
     pub fn new(share: &Share) -> std::io::Result<Fs> {
+        Fs::in_pool(share, &lighter_fs::inode::Pool::default())
+    }
+
+    /// A share counting its descriptors into `pool`, against one budget with
+    /// the machine's other shares.
+    pub fn in_pool(share: &Share, pool: &lighter_fs::inode::Pool) -> std::io::Result<Fs> {
         if share.tag.len() > TAG_LEN {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -501,7 +507,7 @@ impl Fs {
                 ),
             ));
         }
-        let mut server = Server::new(&share.path)?;
+        let mut server = Server::new_in_pool(&share.path, pool)?;
         if share.tag == crate::rosetta::TAG {
             server.serve_rosetta(crate::rosetta::key()?)?;
         }
