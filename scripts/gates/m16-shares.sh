@@ -94,16 +94,25 @@ cpu_seconds() {
 		printf "%.2f\n", hr*3600 + min*60 + sec + frac/100 }'
 }
 
-# What the machine spends doing nothing for IDLE_WINDOW seconds, once it has
-# settled.
+# What the machine spends doing nothing in IDLE_WINDOW seconds, once it has
+# settled: the least of three windows a third as long, scaled up. Whatever
+# else the Mac does only ever adds to a window, so the least is the closest
+# to the machine's own cost; one window of the same length varied by more
+# than the margin between two runs of the same configuration.
 idle_cost() {
 	docker run --rm "$IMAGE" true >/dev/null
 	sleep 10
-	local before after
-	before="$(cpu_seconds)"
-	sleep "$IDLE_WINDOW"
-	after="$(cpu_seconds)"
-	echo "$after - $before" | bc
+	local least="" before after spent window=$(( IDLE_WINDOW / 3 ))
+	for _ in 1 2 3; do
+		before="$(cpu_seconds)"
+		sleep "$window"
+		after="$(cpu_seconds)"
+		spent="$(echo "$after - $before" | bc)"
+		if [ -z "$least" ] || [ "$(echo "$spent < $least" | bc)" = 1 ]; then
+			least="$spent"
+		fi
+	done
+	echo "$least * 3" | bc
 }
 
 echo
