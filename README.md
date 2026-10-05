@@ -78,6 +78,22 @@ Direct installs can download updates in the background (`lighter update auto-dow
 
 ---
 
+## Sharing folders and drives
+
+Containers can bind from `/Users`, `/Volumes` and `/var/folders` at the same paths as on the Mac, so `-v ~/project:/app`, `-v /Volumes/T9/media:/media` and `-v "$TMPDIR/build":/out` all work as they are. An external drive is visible whenever it is connected, including one plugged in while the machine is running. These are Docker Desktop's defaults, without `/tmp`.
+
+To share another folder, or stop sharing one:
+
+```bash
+lighter config --share /opt/data
+lighter config --unshare /Volumes
+lighter restart
+```
+
+`/tmp` is the machine's own, not the Mac's: bind from your home folder or `$TMPDIR` instead. A bind from a folder on the Mac that isn't shared gives the container an empty folder, as on any Docker host; `lighter status` and `lighter doctor` name such mounts.
+
+---
+
 ## Benchmarks
 
 Seven ways to run a container on a MacBook Pro (M5 Pro, 18 cores, 48 GB, macOS 26), every runtime at 8 vCPUs and 16 GiB, medians of three, recorded with `benchmarks/compare.sh` on lighter 0.10.0. The method, the raw results and every caveat are in [the record](benchmarks/results/machines/m5/compare-2026-09-27/README.md).
