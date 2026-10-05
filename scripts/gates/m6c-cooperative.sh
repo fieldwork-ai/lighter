@@ -137,6 +137,12 @@ BOOT_FOOTPRINT="$(footprint)"
 [ "${BOOT_PLUGGED:-99999}" -le 1024 ] \
 	&& pass "booted in ${waited}s on its base: ${BOOT_PLUGGED} MiB of ${CEILING_MIB} plugged, footprint ${BOOT_FOOTPRINT} MiB" \
 	|| fail "booted with ${BOOT_PLUGGED:-?} MiB of the range plugged"
+# The kernel sizes inotify's limits from the RAM it boots with, which here is
+# the base: 15,783 watches, used up by two dev servers on a monorepo (#49).
+inotify="$(docker run --rm alpine:3.21 sh -c 'cat /proc/sys/fs/inotify/max_user_watches /proc/sys/fs/inotify/max_user_instances' 2>/dev/null | xargs)"
+[ "$inotify" = "524288 1024" ] \
+	&& pass "inotify allows 524288 watches and 1024 instances on the base, whatever the boot RAM" \
+	|| fail "inotify limits on the base: ${inotify:-unreadable}"
 
 # --------------------------------------------------------------- at a limit --
 # A container thrashing at its own memory limit stalls the guest's pressure
