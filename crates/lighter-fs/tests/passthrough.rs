@@ -196,9 +196,20 @@ impl Guest {
 
     /// CREATE, returning `(nodeid, fh)`.
     fn create(&mut self, parent: u64, name: &str, flags: u32) -> Result<(u64, u64), i32> {
+        self.create_mode(parent, name, flags, 0o644)
+    }
+
+    /// CREATE with a mode of the test's choosing.
+    fn create_mode(
+        &mut self,
+        parent: u64,
+        name: &str,
+        flags: u32,
+        mode: u32,
+    ) -> Result<(u64, u64), i32> {
         let mut body = Vec::new();
         body.extend_from_slice(&flags.to_le_bytes());
-        body.extend_from_slice(&0o644u32.to_le_bytes());
+        body.extend_from_slice(&mode.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes()); // umask
         body.extend_from_slice(&0u32.to_le_bytes()); // open_flags
         body.extend_from_slice(name.as_bytes());
@@ -2334,6 +2345,81 @@ fn what_a_non_root_caller_creates_is_its_own() {
     assert_eq!(owner_of(&mut guest, file), (1000, 1000));
     assert!(record_on_host(&guest.host("recordings")).is_some());
     assert!(record_on_host(&guest.host("recordings").join("segment.mp4")).is_some());
+}
+
+/// A file or directory created without its owner-write bit is still a
+/// non-root caller's own (issue #48): macOS refuses an extended attribute on
+/// such an entry, which made git's 0444 objects and `mkdir -m 555` fail as
+/// EACCES after the entry was already on the Mac. Each is created, written
+/// where it is a file, keeps the mode asked for and carries its owner.
+#[test]
+fn a_non_root_caller_creates_read_only_files_and_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut guest = Guest::new("readonly-create");
+    guest.caller = (1000, 1000);
+    const O_CREAT_WRONLY_EXCL: u32 = 0o100 | 0o1 | 0o200;
+    for (name, mode) in [("obj", 0o444), ("tool", 0o555), ("key", 0o400)] {
+        let (file, fh) = guest
+            .create_mode(1, name, O_CREAT_WRONLY_EXCL, mode)
+            .unwrap_or_else(|e| panic!("creating {name} at {mode:o}: errno {e}"));
+        guest.write(file, fh, 0, b"x").unwrap();
+        assert_eq!(owner_of(&mut guest, file), (1000, 1000), "{name}");
+    }
+    let mut body = 0o555u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("sealed"));
+    let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir -m 555");
+    let dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    assert_eq!(owner_of(&mut guest, dir), (1000, 1000));
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    for (name, mode) in [
+        ("obj", 0o444),
+        ("tool", 0o555),
+        ("key", 0o400),
+        ("sealed", 0o555),
+    ] {
+        let path = guest.host(name);
+        let host_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            host_mode, mode,
+            "{name} must keep the mode it was created with"
+        );
+        assert!(
+            record_on_host(&path).is_some(),
+            "{name} must carry its owner"
+        );
+    }
+    // Restore owner-write so the share can be cleaned up.
+    for name in ["obj", "tool", "key", "sealed"] {
+        let path = guest.host(name);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o200)).unwrap();
+    }
+    assert_eq!(std::fs::read(guest.host("obj")).unwrap(), b"x");
+}
+
+/// A chown of a read-only file records its owner, and a chown back to root
+/// clears it, as for any other file (issue #48): the record is an extended
+/// attribute macOS refuses without the owner-write bit.
+#[test]
+fn root_chowns_a_read_only_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut guest = Guest::new("readonly-chown");
+    let path = guest.host("f444");
+    std::fs::write(&path, b"b").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let nodeid = guest.lookup(1, "f444").unwrap();
+    chown(&mut guest, nodeid, 1000, 1000).expect("chown 1000:1000 of a 0444 file");
+    assert_eq!(owner_of(&mut guest, nodeid), (1000, 1000));
+    assert!(record_on_host(&path).is_some());
+    chown(&mut guest, nodeid, 0, 0).expect("chown back to root of a 0444 file");
+    assert_eq!(record_on_host(&path), None);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+        0o444,
+        "the mode must be put back"
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
 /// Root's creations need no record, and a share that never has one never

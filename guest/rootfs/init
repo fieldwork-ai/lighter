@@ -351,6 +351,11 @@ fi
 # Memory, the cgroups and each container's pids.max decide instead, as on any
 # server.
 sysctl -q -w kernel.threads-max=4194304 kernel.pid_max=4194304 2>/dev/null || true
+# The inotify limits are sized the same way, from the boot RAM: 15,783 watches
+# on a cooperative machine, which two Next.js dev servers on a monorepo use up
+# (issue #49), and a container cannot raise them for itself. A watch costs
+# kernel memory only once something makes it.
+sysctl -q -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=1024 2>/dev/null || true
 
 # --- containerd -----------------------------------------------------------
 # Started here, the moment the data disk is there, rather than by dockerd.
