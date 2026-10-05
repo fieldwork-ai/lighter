@@ -26,6 +26,7 @@
 
 pub mod apply;
 pub mod cache;
+pub mod eject;
 pub mod errno;
 pub mod fsevents;
 pub mod fuse;
