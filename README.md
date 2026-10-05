@@ -80,7 +80,7 @@ Direct installs can download updates in the background (`lighter update auto-dow
 
 ## Sharing folders and drives
 
-Containers can bind from `/Users`, `/Volumes` and `/var/folders` at the same paths as on the Mac, so `-v ~/project:/app`, `-v /Volumes/T9/media:/media` and `-v "$TMPDIR/build":/out` all work as they are. An external drive is visible whenever it is connected, including one plugged in while the machine is running. These are Docker Desktop's defaults, without `/tmp`.
+Containers can bind from `/Users`, `/Volumes` and `/var/folders` at the same paths as on the Mac, so `-v ~/project:/app`, `-v /Volumes/T9/media:/media` and `-v "$TMPDIR/build":/out` all work as they are. An external drive is visible whenever it is connected, including one plugged in while the machine is running, and ejects as usual while it runs. These are Docker Desktop's defaults, without `/tmp`.
 
 To share another folder, or stop sharing one:
 

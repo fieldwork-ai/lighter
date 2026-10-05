@@ -9,7 +9,9 @@ lighter shared your home folder and nothing else. A bind from anywhere outside i
 ## What changed
 
 - **`/Users`, `/Volumes` and `/var/folders` are shared**, at the same paths as on the Mac. These are Docker Desktop's defaults, without `/tmp`. An existing configuration that shares the home folder now reads as these, keeping any other folder it lists.
-- **A drive is there whenever it is connected**, including one plugged in while the machine runs, APFS or exFAT, and it ejects normally while the machine runs.
+- **A drive is there whenever it is connected**, including one plugged in while the machine runs, APFS or exFAT.
+- **A drive ejects while the machine runs**, from Finder, `diskutil eject` or `hdiutil detach`, once no running container is using it. lighter keeps files open on the Mac on the guest's behalf, and macOS refuses to eject a volume while anything has a file on it open; lighter now closes what it holds on a volume when macOS asks to eject it.
+- **A file a short-lived container wrote is no longer left open on the Mac.** If the guest forgot the file before lighter had finished creating it, which is ordinary when the container exits straight away, lighter held it open until 2,048 others had taken its place.
 - **`lighter config --share <path>` and `--unshare <path>`** change what is shared, then `lighter restart`.
 - **A shared folder that is not there**, such as a drive that is unplugged, is left out when the machine starts instead of stopping it, and `lighter doctor` names it.
 - **`lighter status` and `lighter doctor` name every bind mount from a folder on the Mac that isn't shared**, with the container and the fix. `/tmp` is the machine's own rather than the Mac's, so for a bind from it they suggest your home folder or `$TMPDIR`.
