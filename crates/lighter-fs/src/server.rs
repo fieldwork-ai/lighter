@@ -502,10 +502,68 @@ struct Rosetta {
 struct Hold {
     registry: Arc<Registry>,
     open_cache: Arc<OpenCache>,
+    volfs: Arc<Volfs>,
+}
+
+/// Which volumes serve `/.vol/<dev>/<ino>`, by device.
+///
+/// A share spans every volume mounted inside it, and only some serve
+/// identity paths: APFS and HFS+ do, while exFAT, FAT and SMB do not. Probed
+/// once for the share's root, a drive or a NAS mounted under `/Volumes` was
+/// handed identity paths that did not exist, and every extended attribute on
+/// it failed with ENOENT (#53).
+#[derive(Default)]
+struct Volfs(std::sync::RwLock<std::collections::HashMap<i64, bool>>);
+
+impl Volfs {
+    /// A path that names what `fd` is open on: by identity where its volume
+    /// allows, since F_GETPATH answers from the vnode name cache, which for a
+    /// file created under a temporary name and renamed into place can still
+    /// be the temporary name (pnpm does that to every store file, and the
+    /// resulting ENOENT killed one install in three).
+    fn path_of(&self, fd: RawFd) -> Result<PathBuf, i32> {
+        let st = sys::stat_fd(fd)?;
+        let dev = st.st_dev as i64;
+        let identity = PathBuf::from(format!("/.vol/{}/{}", st.st_dev, st.st_ino));
+        let known = self.0.read().expect("volfs poisoned").get(&dev).copied();
+        let serves = known.unwrap_or_else(|| {
+            let serves = Volfs::probe(fd);
+            self.0.write().expect("volfs poisoned").insert(dev, serves);
+            serves
+        });
+        if serves {
+            Ok(identity)
+        } else {
+            sys::path_of(fd)
+        }
+    }
+
+    /// Asked of the volume's root, which is always there: the file at hand
+    /// may already be unlinked, and would answer no for a volume that serves.
+    fn probe(fd: RawFd) -> bool {
+        // SAFETY: fstatfs fills the zeroed struct for an open descriptor.
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut fs) } != 0 {
+            return false;
+        }
+        // SAFETY: f_mntonname is NUL-terminated by the kernel.
+        let root = unsafe { std::ffi::CStr::from_ptr(fs.f_mntonname.as_ptr()) };
+        let root = Path::new(std::ffi::OsStr::from_bytes(root.to_bytes()));
+        std::fs::symlink_metadata(root).is_ok_and(|st| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(format!("/.vol/{}/{}", st.dev(), st.ino())).is_ok()
+        })
+    }
+
+    /// Forgets a volume: macOS gives the next one mounted the same number.
+    fn forget(&self, dev: i64) {
+        self.0.write().expect("volfs poisoned").remove(&dev);
+    }
 }
 
 impl crate::inode::Release for Hold {
     fn release_device(&self, dev: i64) -> usize {
+        self.volfs.forget(dev);
         let inodes = self
             .registry
             .release_device(dev, |id| self.open_cache.evict(id));
@@ -526,8 +584,8 @@ pub struct Server {
     host_gid: u32,
     /// Negotiated at INIT, and read by READ to bound a reply.
     max_write: AtomicU32,
-    /// Whether the share's volume serves `/.vol` identity paths. Probed once.
-    volfs: std::sync::OnceLock<bool>,
+    /// Which of the share's volumes serve `/.vol` identity paths.
+    volfs: Arc<Volfs>,
     /// How many more requests to log in order. See [`Server::trace`].
     trace_left: AtomicUsize,
     /// How long the guest may believe what we tell it.
@@ -758,9 +816,11 @@ impl Server {
             let open_cache = open_cache.clone();
             move |id| open_cache.evict(id)
         }));
+        let volfs = Arc::new(Volfs::default());
         let hold = Arc::new(Hold {
             registry: registry.clone(),
             open_cache: open_cache.clone(),
+            volfs: volfs.clone(),
         });
         pool.enroll(Arc::downgrade(&hold) as std::sync::Weak<dyn crate::inode::Release>);
         let apply = std::sync::Arc::new(crate::apply::Apply::start(root.to_path_buf()));
@@ -804,7 +864,7 @@ impl Server {
             host_uid,
             host_gid,
             max_write: AtomicU32::new(MAX_WRITE),
-            volfs: std::sync::OnceLock::new(),
+            volfs,
             trace_left: AtomicUsize::new(
                 std::env::var("LIGHTER_FS_TRACE")
                     .ok()
@@ -1564,8 +1624,7 @@ impl Server {
             && st.st_ino == inode.ino()
             && st.st_dev as i64 == inode.dev()
         {
-            let base =
-                sys::identity_path(parent.raw_fd()).or_else(|_| sys::path_of(parent.raw_fd()))?;
+            let base = self.volfs.path_of(parent.raw_fd())?;
             return sys::c_path(&base.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
         }
         let fd = match inode.reference() {
@@ -1586,22 +1645,7 @@ impl Server {
                 return Err(errno);
             }
         };
-        // By identity when the volume allows it. F_GETPATH answers from the
-        // vnode name cache, which for a file created under a temporary name
-        // and renamed into place can still be the temporary name — pnpm does
-        // exactly that to every store file, and the resulting ENOENT killed
-        // one install in three. Probed once against the share root; a share
-        // on something exotic keeps the old behavior.
-        if *self.volfs.get_or_init(|| {
-            self.registry
-                .get(1)
-                .and_then(|root| root.reference().ok())
-                .and_then(|r| sys::identity_path(r.raw_fd()).ok())
-                .is_some_and(|p| std::fs::metadata(&p).is_ok())
-        }) {
-            return sys::c_path(&sys::identity_path(fd.raw_fd())?);
-        }
-        sys::c_path(&sys::path_of(fd.raw_fd())?)
+        sys::c_path(&self.volfs.path_of(fd.raw_fd())?)
     }
 
     /// Looks a name up under `parent` and registers it, producing the reply
@@ -4900,5 +4944,26 @@ impl Drop for Server {
         }
         // Every promise is kept before the queue behind it is drained.
         self.materialize_all();
+    }
+}
+
+#[cfg(test)]
+mod volfs_tests {
+    use super::*;
+
+    /// Each volume answers for itself: the Mac's own disk names a file by
+    /// identity, and one without `/.vol` (devfs here; exFAT, FAT and SMB in
+    /// life) by its path, which is the only name that exists for it (#53).
+    #[test]
+    fn a_volume_without_identity_paths_is_named_by_path() {
+        let volfs = Volfs::default();
+        let disk = std::fs::File::open(std::env::temp_dir()).unwrap();
+        let named = volfs.path_of(disk.as_raw_fd()).unwrap();
+        assert!(named.starts_with("/.vol/"), "{}", named.display());
+        let dev = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(
+            volfs.path_of(dev.as_raw_fd()).unwrap(),
+            Path::new("/dev/null")
+        );
     }
 }
