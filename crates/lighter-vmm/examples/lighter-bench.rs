@@ -258,7 +258,9 @@ fn main() -> ExitCode {
             machine.vsock(),
             lighter_vmm::streams::Scope::Lan,
         );
-        if let Err(e) = lighter_docker::PortWatcher::start(socket, mapper) {
+        if let Err(e) =
+            lighter_docker::PortWatcher::start(socket, mapper, lighter_docker::PortHealth::new())
+        {
             eprintln!("lighter: cannot watch docker ports: {e}");
             return ExitCode::FAILURE;
         }

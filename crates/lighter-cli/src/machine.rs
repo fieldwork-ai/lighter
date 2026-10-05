@@ -31,6 +31,8 @@ pub struct Status {
     /// Agents the guest has had to restart, as the agent reports them
     /// (`tcp-proxy=2 dns=1`); `None` when none has or the guest cannot say.
     pub agent_restarts: Option<String>,
+    /// Published ports the machine could not forward, and is retrying.
+    pub unforwarded: Vec<crate::storage_status::Unforwarded>,
 }
 
 /// The daemon that owns this home, verified with its process generation;
@@ -255,6 +257,7 @@ pub fn status() -> anyhow::Result<Status> {
         .and_then(|pid| crate::storage_status::query(&paths::home().ok()?, pid).ok())
         .unwrap_or_default();
     let storage_waiting = report.waiting;
+    let unforwarded = report.unforwarded;
     let timeout = if storage_waiting.is_empty() {
         Duration::from_secs(5)
     } else {
@@ -274,6 +277,7 @@ pub fn status() -> anyhow::Result<Status> {
         storage_waiting,
         memory: report.memory,
         agent_restarts,
+        unforwarded,
     })
 }
 

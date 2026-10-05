@@ -104,6 +104,33 @@ code="$(wait_http http://127.0.0.1:18098/)"
 [ "$code" = 200 ] && pass "the same port publishes again at once" || fail "republish: http_code=$code"
 $D rm -f m3p-again >/dev/null 2>&1
 
+# refused: a port the Mac will not give lighter on one family is open on
+# neither, says so in `lighter status`, and opens by itself once the holder
+# lets go, with no container event to prompt it. Tailscale Serve holding the
+# port on a tailnet address did this to MinIO: `[::]:9000` answered and
+# `0.0.0.0:9000` did not, until some other container happened to start.
+python3 -c 'import socket, time
+s = socket.socket(); s.bind(("0.0.0.0", 18096)); s.listen(); time.sleep(20)' &
+HOLDER=$!
+sleep 1
+serve_http m3p-held 18096:80
+listed="$("$LIGHTER" status 2>/dev/null | grep -c 'tcp 18096 not forwarded')"
+[ "$listed" = 1 ] && [ "$(http 'http://[::1]:18096/')" = 000 ] \
+	&& pass "a port refused on v4 is closed on v6 too, and lighter status names it" \
+	|| fail "refused port: [::1] http_code=$(http 'http://[::1]:18096/'), status listed it $listed times"
+wait "$HOLDER" 2>/dev/null
+# The retry backs off to thirty seconds; a minute covers it.
+for _ in $(seq 1 60); do
+	code="$(http http://127.0.0.1:18096/)"
+	[ "$code" = 200 ] && break
+	sleep 1
+done
+[ "$code" = 200 ] && [ "$(http 'http://[::1]:18096/')" = 200 ] \
+	&& [ "$("$LIGHTER" status 2>/dev/null | grep -c 'not forwarded')" = 0 ] \
+	&& pass "it opened on both families by itself once the holder let go" \
+	|| fail "after the holder let go: 127.0.0.1 http_code=$code, [::1] $(http 'http://[::1]:18096/')"
+$D rm -f m3p-held >/dev/null 2>&1
+
 # udp: an echo on a published UDP port
 $D run -d --rm --name m3p-udp -p 18094:9/udp alpine/socat:1.8.0.0 UDP6-RECVFROM:9,ipv6only=0,fork EXEC:cat >/dev/null 2>&1
 sleep 2

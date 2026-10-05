@@ -25,10 +25,11 @@
 
 pub mod http;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Somewhere to put a forward. Implemented by the VMM over its network stack.
 ///
@@ -124,59 +125,97 @@ pub fn published_ports(containers: &serde_json::Value) -> HashSet<Published> {
     ports
 }
 
-/// Watches Docker and keeps the host's forwards matching it.
-pub struct PortWatcher {
-    socket: PathBuf,
-    mapper: Arc<dyn PortMapper>,
-    /// What we have opened. The host port is the identity of a forward.
-    forwarded: HashSet<Published>,
+/// A published port that could not be forwarded, and why. Every address it
+/// was published on is left closed (see [`apply`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unforwarded {
+    pub proto: Proto,
+    pub port: u16,
+    pub addrs: Vec<IpAddr>,
+    pub reason: String,
 }
 
+/// What is forwarded, and what could not be.
+#[derive(Default)]
+struct Forwards {
+    /// What we have opened. The host port is the identity of a forward.
+    forwarded: HashSet<Published>,
+    failed: BTreeMap<(Proto, u16), Unforwarded>,
+}
+
+/// The ports the watcher could not forward, for whoever reports on the
+/// machine (`lighter status`, `lighter doctor`): a failure that only reached
+/// `machine.log` left a container reported as published and healthy with
+/// nothing listening on the Mac.
+#[derive(Clone, Default)]
+pub struct PortHealth(Arc<Mutex<Forwards>>);
+
+impl PortHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn unforwarded(&self) -> Vec<Unforwarded> {
+        let forwards = self.0.lock().expect("port health poisoned");
+        forwards.failed.values().cloned().collect()
+    }
+}
+
+/// How long the watcher waits before trying a failed forward again, at first
+/// and at most. A port is most often refused because something else on the
+/// Mac holds it, and that clears on its own schedule, not on a container's.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MOST: Duration = Duration::from_secs(30);
+
+/// Watches Docker and keeps the host's forwards matching it.
+pub struct PortWatcher;
+
 impl PortWatcher {
-    /// Starts a thread that reconciles now and on every container event.
+    /// Starts a thread that reconciles now and on every container event, and
+    /// one that tries a failed forward again until it opens.
     ///
     /// The handle ends the watching: the event stream is dropped and not
     /// reopened, which is what lets dockerd exit at once when the machine
     /// is being stopped.
-    pub fn start(socket: &Path, mapper: Arc<dyn PortMapper>) -> std::io::Result<Arc<http::Stop>> {
-        let mut watcher = PortWatcher {
-            socket: socket.to_path_buf(),
-            mapper,
-            forwarded: HashSet::new(),
-        };
+    pub fn start(
+        socket: &Path,
+        mapper: Arc<dyn PortMapper>,
+        health: PortHealth,
+    ) -> std::io::Result<Arc<http::Stop>> {
         let stop = http::Stop::new();
-        let handle = Arc::clone(&stop);
+        let (events, retries) = (Arc::clone(&stop), Arc::clone(&stop));
+        let (socket, again) = (socket.to_path_buf(), socket.to_path_buf());
+        let (mapper_again, health_again) = (Arc::clone(&mapper), health.clone());
         std::thread::Builder::new()
             .name("docker-ports".into())
-            .spawn(move || watcher.run(&handle))?;
+            .spawn(move || Self::watch(&socket, &mapper, &health, &events))?;
+        std::thread::Builder::new()
+            .name("docker-ports-retry".into())
+            .spawn(move || Self::retry(&again, &mapper_again, &health_again, &retries))?;
         Ok(stop)
     }
 
-    fn run(&mut self, stop: &http::Stop) {
+    fn watch(socket: &Path, mapper: &Arc<dyn PortMapper>, health: &PortHealth, stop: &http::Stop) {
         // Filters to container events only. URL-encoded because it is a JSON
         // document in a query parameter.
         const EVENTS: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
 
         loop {
-            let socket = self.socket.clone();
-            let mapper = Arc::clone(&self.mapper);
-            let forwarded = &mut self.forwarded;
-
             // Reconcile before watching, not after: containers may already be
             // running from a previous session, and a watcher that only reacted
             // to events would never open their doors.
-            Self::reconcile(&socket, &mapper, forwarded);
+            reconcile(socket, mapper, health);
 
             // Reconciling INSIDE the callback is the whole point. Setting a
             // flag and acting on it after the call returns looks equivalent and
             // is not: a healthy event stream never returns, so the forwards
             // would only ever be fixed up when Docker went away.
-            let result = http::stream_json(&socket, EVENTS, Some(stop), |event| {
+            let result = http::stream_json(socket, EVENTS, Some(stop), |event| {
                 let status = event.get("status").and_then(|s| s.as_str()).unwrap_or("");
                 // Only lifecycle transitions can change what is published.
                 // Reconciling on every exec_start would be correct and noisy.
                 if matches!(status, "start" | "die" | "destroy" | "pause" | "unpause") {
-                    Self::reconcile(&socket, &mapper, forwarded);
+                    reconcile(socket, mapper, health);
                 }
             });
 
@@ -194,34 +233,132 @@ impl PortWatcher {
         }
     }
 
-    /// Makes the host's forwards match what Docker currently publishes.
-    fn reconcile(socket: &Path, mapper: &Arc<dyn PortMapper>, forwarded: &mut HashSet<Published>) {
-        let containers = match http::get_json(socket, "/containers/json") {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::debug!(%e, "could not list containers");
-                return;
-            }
-        };
-        let desired = published_ports(&containers);
-
-        for gone in forwarded.difference(&desired).copied().collect::<Vec<_>>() {
-            match mapper.unexpose(gone) {
-                Ok(()) => {
-                    tracing::info!(published = %gone, "port forward withdrawn");
-                    forwarded.remove(&gone);
+    /// Tries failed forwards again on a backoff. Without it a port refused
+    /// once, because Tailscale Serve or another user's process held it on one
+    /// of the Mac's addresses, stayed closed after the conflict cleared until
+    /// some unrelated container happened to start or stop.
+    fn retry(socket: &Path, mapper: &Arc<dyn PortMapper>, health: &PortHealth, stop: &http::Stop) {
+        let mut pause = RETRY_FIRST;
+        loop {
+            let until = std::time::Instant::now() + pause;
+            while std::time::Instant::now() < until {
+                if stop.asked() {
+                    return;
                 }
-                Err(e) => tracing::warn!(published = %gone, %e, "could not withdraw a forward"),
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if health.unforwarded().is_empty() {
+                pause = RETRY_FIRST;
+                continue;
+            }
+            reconcile(socket, mapper, health);
+            pause = if health.unforwarded().is_empty() {
+                RETRY_FIRST
+            } else {
+                (pause * 2).min(RETRY_MOST)
+            };
+        }
+    }
+}
+
+/// Makes the host's forwards match what Docker currently publishes.
+fn reconcile(socket: &Path, mapper: &Arc<dyn PortMapper>, health: &PortHealth) {
+    let containers = match http::get_json(socket, "/containers/json") {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::debug!(%e, "could not list containers");
+            return;
+        }
+    };
+    let desired = published_ports(&containers);
+    let mut forwards = health.0.lock().expect("port health poisoned");
+    apply(&desired, mapper.as_ref(), &mut forwards);
+}
+
+/// Brings `forwards` to `desired`, a port at a time: every address a port is
+/// published on is forwarded, or none is. `0.0.0.0` and `[::]` bind
+/// separately on the Mac, and one can be refused while the other opens; a
+/// port answering on `::1` but not on `127.0.0.1`, nor to the containers'
+/// `host.docker.internal`, is much harder to diagnose than one that is down.
+fn apply(desired: &HashSet<Published>, mapper: &dyn PortMapper, forwards: &mut Forwards) {
+    for gone in forwards
+        .forwarded
+        .difference(desired)
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        match mapper.unexpose(gone) {
+            Ok(()) => {
+                tracing::info!(published = %gone, "port forward withdrawn");
+                forwards.forwarded.remove(&gone);
+            }
+            Err(e) => tracing::warn!(published = %gone, %e, "could not withdraw a forward"),
+        }
+    }
+
+    let mut ports: BTreeMap<(Proto, u16), Vec<Published>> = BTreeMap::new();
+    for published in desired {
+        ports
+            .entry((published.proto, published.port))
+            .or_default()
+            .push(*published);
+    }
+    forwards.failed.retain(|key, _| ports.contains_key(key));
+
+    for (key, mut members) in ports {
+        members.sort();
+        let missing: Vec<Published> = members
+            .iter()
+            .filter(|m| !forwards.forwarded.contains(m))
+            .copied()
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut opened = Vec::new();
+        let mut refused = None;
+        for published in missing {
+            match mapper.expose(published) {
+                Ok(()) => opened.push(published),
+                Err(e) => {
+                    refused = Some(format!("{published}: {e}"));
+                    break;
+                }
             }
         }
-
-        for new in desired.difference(forwarded).copied().collect::<Vec<_>>() {
-            match mapper.expose(new) {
-                Ok(()) => {
-                    tracing::info!(published = %new, "port forwarded");
-                    forwarded.insert(new);
+        match refused {
+            None => {
+                for published in opened {
+                    tracing::info!(published = %published, "port forwarded");
+                    forwards.forwarded.insert(published);
                 }
-                Err(e) => tracing::warn!(published = %new, %e, "could not forward a port"),
+                if let Some(was) = forwards.failed.remove(&key) {
+                    tracing::info!(port = was.port, "a port that could not be forwarded now is");
+                }
+            }
+            Some(reason) => {
+                let open: Vec<Published> = members
+                    .iter()
+                    .filter(|m| forwards.forwarded.contains(m))
+                    .copied()
+                    .chain(opened)
+                    .collect();
+                for published in open {
+                    let _ = mapper.unexpose(published);
+                    forwards.forwarded.remove(&published);
+                }
+                let failure = Unforwarded {
+                    proto: key.0,
+                    port: key.1,
+                    addrs: members.iter().map(|m| m.addr).collect(),
+                    reason,
+                };
+                // Once per failure, not once per retry: the same refusal
+                // every thirty seconds says nothing new.
+                if forwards.failed.get(&key) != Some(&failure) {
+                    tracing::warn!(port = key.1, reason = %failure.reason, "could not forward a port; retrying");
+                }
+                forwards.failed.insert(key, failure);
             }
         }
     }
@@ -230,6 +367,95 @@ impl PortWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mapper that refuses the bindings it is told to, and remembers what
+    /// is open.
+    #[derive(Default)]
+    struct Mapper {
+        refuse: Mutex<HashSet<Published>>,
+        open: Mutex<HashSet<Published>>,
+    }
+
+    impl PortMapper for Mapper {
+        fn expose(&self, published: Published) -> Result<(), String> {
+            if self.refuse.lock().unwrap().contains(&published) {
+                return Err("Address already in use (os error 48)".into());
+            }
+            self.open.lock().unwrap().insert(published);
+            Ok(())
+        }
+        fn unexpose(&self, published: Published) -> Result<(), String> {
+            self.open.lock().unwrap().remove(&published);
+            Ok(())
+        }
+    }
+
+    /// A port refused on one family is open on neither, recorded with its
+    /// reason, and opens on both once the conflict clears; other ports are
+    /// not held back by it. Docker Desktop fails such a container's start;
+    /// lighter left `[::]:9000` answering and `0.0.0.0:9000` closed.
+    #[test]
+    fn a_port_is_forwarded_on_every_address_or_on_none() {
+        let mapper = Mapper::default();
+        let mut forwards = Forwards::default();
+        let desired = HashSet::from([
+            tcp("0.0.0.0", 9000),
+            tcp("::", 9000),
+            tcp("0.0.0.0", 9001),
+            tcp("::", 9001),
+        ]);
+        mapper.refuse.lock().unwrap().insert(tcp("0.0.0.0", 9000));
+
+        apply(&desired, &mapper, &mut forwards);
+        assert_eq!(
+            *mapper.open.lock().unwrap(),
+            HashSet::from([tcp("0.0.0.0", 9001), tcp("::", 9001)]),
+            "9000 must not be left half open"
+        );
+        let failed: Vec<_> = forwards.failed.values().cloned().collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].port, 9000);
+        assert_eq!(failed[0].addrs.len(), 2);
+        assert!(failed[0].reason.contains("Address already in use"));
+
+        mapper.refuse.lock().unwrap().clear();
+        apply(&desired, &mapper, &mut forwards);
+        assert_eq!(*mapper.open.lock().unwrap(), desired);
+        assert!(
+            forwards.failed.is_empty(),
+            "a port that opened is no longer failing"
+        );
+    }
+
+    /// The v6 binding opens first in no order the code relies on: a refusal
+    /// of `[::]` after `0.0.0.0` opened closes `0.0.0.0` again.
+    #[test]
+    fn a_refused_second_family_closes_the_first() {
+        let mapper = Mapper::default();
+        let mut forwards = Forwards::default();
+        let desired = HashSet::from([tcp("0.0.0.0", 9000), tcp("::", 9000)]);
+        mapper.refuse.lock().unwrap().insert(tcp("::", 9000));
+        apply(&desired, &mapper, &mut forwards);
+        assert!(mapper.open.lock().unwrap().is_empty());
+        assert!(forwards.forwarded.is_empty());
+    }
+
+    /// A failure is about a port Docker publishes; once its container is
+    /// gone there is nothing to report or to retry.
+    #[test]
+    fn a_failure_ends_with_its_container() {
+        let mapper = Mapper::default();
+        let mut forwards = Forwards::default();
+        mapper.refuse.lock().unwrap().insert(tcp("0.0.0.0", 9000));
+        apply(
+            &HashSet::from([tcp("0.0.0.0", 9000)]),
+            &mapper,
+            &mut forwards,
+        );
+        assert_eq!(forwards.failed.len(), 1);
+        apply(&HashSet::new(), &mapper, &mut forwards);
+        assert!(forwards.failed.is_empty());
+    }
 
     fn containers(json: &str) -> serde_json::Value {
         serde_json::from_str(json).unwrap()
