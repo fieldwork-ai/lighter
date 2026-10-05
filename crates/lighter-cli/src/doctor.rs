@@ -242,6 +242,26 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("machine", e.to_string(), "check ~/.lighter"),
     });
 
+    if let Ok(config) = crate::config::Config::load() {
+        let missing: Vec<&String> = config
+            .shares
+            .iter()
+            .filter(|path| !std::path::Path::new(path).is_dir())
+            .collect();
+        findings.push(if missing.is_empty() {
+            Finding::good("shared folders", config.shares.join(", "))
+        } else {
+            Finding::warn(
+                "shared folders",
+                format!(
+                    "not there, so not shared: {}",
+                    missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                "connect the drive and run `lighter restart`, or remove it with `lighter config --unshare`",
+            )
+        });
+    }
+
     // A published port the Mac refused is still listed by `docker ps`, with
     // nothing listening, so only the machine can say. A warning: the machine
     // retries it, and what holds the port is the Mac's to let go.
