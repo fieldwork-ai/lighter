@@ -267,6 +267,7 @@ pub fn machine() -> anyhow::Result<()> {
     };
 
     let mut machine = Machine::start(&machine_config)?;
+    let port_health = lighter_docker::PortHealth::new();
     let _storage_status = crate::storage_status::Server::start(
         &home,
         machine_config
@@ -276,6 +277,7 @@ pub fn machine() -> anyhow::Result<()> {
             .zip(machine.disks().iter().cloned())
             .collect(),
         machine.mem().cloned(),
+        Some(port_health.clone()),
     )?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;
@@ -301,7 +303,7 @@ pub fn machine() -> anyhow::Result<()> {
         crate::config::Publish::Localhost => lighter_vmm::streams::Scope::Localhost,
     };
     let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock(), scope);
-    let ports = lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper)?;
+    let ports = lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper, port_health)?;
 
     // A Mac that slept wakes with a guest whose clock did not.
     let _power = lighter_vmm::wake::Watcher::start(Box::new(Resync {

@@ -487,6 +487,15 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
     if let Some(restarts) = &status.agent_restarts {
         println!("  agents     restarted: {restarts} (see `lighter logs`)");
     }
+    for port in &status.unforwarded {
+        println!(
+            "  ports      {} {} not forwarded on {}, retrying: {}",
+            port.proto,
+            port.port,
+            port.addrs.join(", "),
+            port.reason
+        );
+    }
     for disk in &status.storage_waiting {
         println!("  storage    Waiting for host disk space; VM running, writes waiting.");
         println!(

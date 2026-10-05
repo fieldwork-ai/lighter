@@ -242,6 +242,31 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("machine", e.to_string(), "check ~/.lighter"),
     });
 
+    // A published port the Mac refused is still listed by `docker ps`, with
+    // nothing listening, so only the machine can say. A warning: the machine
+    // retries it, and what holds the port is the Mac's to let go.
+    if let Ok(Some(pid)) = crate::machine::running_pid()
+        && let Ok(home) = paths::home()
+        && let Ok(report) = crate::storage_status::query(&home, pid)
+    {
+        findings.push(if report.unforwarded.is_empty() {
+            Finding::good("published ports", "all forwarded")
+        } else {
+            let ports: Vec<String> = report
+                .unforwarded
+                .iter()
+                .map(|p| format!("{} {} ({})", p.proto, p.port, p.reason))
+                .collect();
+            Finding::warn(
+                "published ports",
+                format!("not forwarded, retrying: {}", ports.join("; ")),
+                "something else on the Mac holds these ports, such as Tailscale Serve or another \
+                 user's process: macOS refuses lighter the port on every address while it holds \
+                 one. lighter opens them as soon as it lets go",
+            )
+        });
+    }
+
     // Only a connect made by the machine's own process tests the machine's
     // own Local Network permission: the gateway is exempt and a shell is
     // not subject, so a check from here against the router would pass while

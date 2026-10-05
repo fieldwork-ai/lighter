@@ -33,11 +33,23 @@ pub struct Memory {
     pub range_mib: u64,
 }
 
+/// A published port the machine could not forward on the Mac, and why: it
+/// is retried until it opens, and until then `docker ps` lists it with
+/// nothing listening.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Unforwarded {
+    pub proto: String,
+    pub port: u16,
+    pub addrs: Vec<String>,
+    pub reason: String,
+}
+
 /// What the machine reports on demand.
 #[derive(Debug, Default)]
 pub struct Report {
     pub waiting: Vec<Waiting>,
     pub memory: Option<Memory>,
+    pub unforwarded: Vec<Unforwarded>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,6 +58,8 @@ struct Reply {
     waiting: Vec<Waiting>,
     #[serde(default)]
     memory: Option<Memory>,
+    #[serde(default)]
+    unforwarded: Vec<Unforwarded>,
 }
 
 pub struct Server {
@@ -60,6 +74,7 @@ impl Server {
         home: &Path,
         disks: Vec<(PathBuf, Arc<Disk>)>,
         mem: Option<lighter_vmm::virtio::mem::MemControl>,
+        ports: Option<lighter_docker::PortHealth>,
     ) -> io::Result<Self> {
         let path = home.join(SOCKET);
         match std::fs::remove_file(&path) {
@@ -106,10 +121,29 @@ impl Server {
                             range_mib: state.region_bytes() >> 20,
                         }
                     });
+                    let unforwarded = ports
+                        .as_ref()
+                        .map(|ports| {
+                            ports
+                                .unforwarded()
+                                .into_iter()
+                                .map(|u| Unforwarded {
+                                    proto: match u.proto {
+                                        lighter_docker::Proto::Tcp => "tcp".into(),
+                                        lighter_docker::Proto::Udp => "udp".into(),
+                                    },
+                                    port: u.port,
+                                    addrs: u.addrs.iter().map(|a| a.to_string()).collect(),
+                                    reason: u.reason,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let reply = Reply {
                         version: 1,
                         waiting,
                         memory,
+                        unforwarded,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&reply) {
                         let _ = stream.write_all(&bytes);
@@ -156,6 +190,7 @@ pub fn query(home: &Path, pid: u32) -> io::Result<Report> {
     Ok(Report {
         waiting: reply.waiting,
         memory: reply.memory,
+        unforwarded: reply.unforwarded,
     })
 }
 
@@ -168,7 +203,7 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("lighter-storage-status-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        let server = Server::start(&home, Vec::new(), None).unwrap();
+        let server = Server::start(&home, Vec::new(), None, None).unwrap();
         let report = query(&home, std::process::id()).unwrap();
         assert!(report.waiting.is_empty());
         assert!(report.memory.is_none(), "no range, no memory report");
