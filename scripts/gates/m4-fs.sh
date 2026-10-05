@@ -480,6 +480,24 @@ else
 			fail "inotifywait did not start in the container"
 		fi
 		docker rm -f m4-watch >/dev/null 2>&1 || true
+
+		# Read-only creates as a non-root user (issue #48): git writes every
+		# object as 0444, and macOS refused the owner record on it after the
+		# file was made, so `git add` failed and left tmp_obj files behind.
+		mkdir -p "$SHARE/repo"
+		chmod 777 "$SHARE/repo"
+		if out="$(docker run --rm --user 1000:1000 -e HOME=/tmp -v "$MOUNT/repo:/r" --entrypoint sh alpine/git:2.47.2 -c '
+			cd /r && git init -q && echo one > a && git add a &&
+			git -c user.email=gate@lighter -c user.name=gate commit -qm one &&
+			mkdir -m 555 sealed && cp "$(ls /r/.git/objects/??/* | head -1)" copied &&
+			echo "commits=$(git rev-list --count HEAD) $(git count-objects -v | grep "^garbage:")"' 2>>"$RUN_DIR/docker.err")" \
+			&& [ "$out" = "commits=1 garbage: 0" ]; then
+			pass "a non-root container commits to a git repository on the share, and makes read-only files and directories"
+		else
+			fail "read-only creates as uid 1000: ${out:-failed}"
+			sed 's/^/    /' "$RUN_DIR/docker.err" | tail -5
+		fi
+		chmod -R u+w "$SHARE/repo" 2>/dev/null || true
 		unset DOCKER_HOST
 	else
 		fail "the Docker guest did not come up"

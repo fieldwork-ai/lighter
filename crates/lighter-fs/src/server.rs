@@ -594,6 +594,27 @@ fn via(inode: &Inode) -> Result<Via, i32> {
 /// through the descriptor's own directory for a listing; the reopen by
 /// identity path — a walk of `/.vol/dev/ino` — is what every other case
 /// used to cost, resident or not.
+/// Runs an extended-attribute write or removal on `path`, which macOS refuses
+/// with EACCES on an entry without its owner-write bit, even to its owner and
+/// through a descriptor open for writing. git's 0444 objects, `mkdir -m 555`
+/// and a chown of a read-only file all need one (issue #48), so on that
+/// refusal the bit is added for one retry and the mode put back. Only the
+/// refusal pays: every other call is the one syscall it was.
+fn with_owner_write<T>(path: &CStr, op: impl Fn() -> Result<T, i32>) -> Result<T, i32> {
+    match op() {
+        Err(errno) if errno == linux::EACCES => {}
+        done => return done,
+    }
+    let mode = sys::stat_at(libc::AT_FDCWD, path)?.st_mode as u32 & 0o7777;
+    if mode & 0o200 != 0 {
+        return Err(linux::EACCES);
+    }
+    sys::chmod_at(libc::AT_FDCWD, path, mode | 0o200)?;
+    let done = op();
+    sys::chmod_at(libc::AT_FDCWD, path, mode)?;
+    done
+}
+
 fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i32> {
     match inode.locate()? {
         Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
@@ -1832,7 +1853,7 @@ impl Server {
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode};
         if (uid, gid) == (0, 0) {
-            match sys::remove_xattr(path, RECORD) {
+            match with_owner_write(path, || sys::remove_xattr(path, RECORD)) {
                 Err(errno) if errno != linux::ENODATA => return Err(errno),
                 _ => {}
             }
@@ -1851,10 +1872,15 @@ impl Server {
         {
             // Before the record: a record in an unmarked directory would be
             // one nothing reads after a restart.
-            sys::set_xattr(&self.path(parent)?, MARKER, b"1", 0)?;
+            let parent_path = self.path(parent)?;
+            with_owner_write(&parent_path, || {
+                sys::set_xattr(&parent_path, MARKER, b"1", 0)
+            })?;
             parent.set_mark(Mark::Marked);
         }
-        sys::set_xattr(path, RECORD, &encode(uid, gid, mode), 0)?;
+        with_owner_write(path, || {
+            sys::set_xattr(path, RECORD, &encode(uid, gid, mode), 0)
+        })?;
         inode.set_owner(Owner::Set(uid, gid));
         Ok(())
     }
@@ -1889,7 +1915,9 @@ impl Server {
     }
 
     /// Records a non-root caller as the owner of what it has just created,
-    /// and says so in the reply.
+    /// and says so in the reply. A record that cannot be written takes the
+    /// new entry with it: the guest is answered with the error, and a file
+    /// left on the Mac would answer its retry with EEXIST.
     fn record_creator(
         &self,
         parent: &Inode,
@@ -1902,7 +1930,14 @@ impl Server {
         path.extend_from_slice(name.to_bytes());
         let path = std::ffi::CString::new(path).map_err(|_| linux::EINVAL)?;
         let inode = self.registry.get(entry.nodeid).ok_or(linux::ESTALE)?;
-        self.record_owner(&inode, Some(parent), &path, owner, entry.attr.mode)?;
+        if let Err(errno) = self.record_owner(&inode, Some(parent), &path, owner, entry.attr.mode) {
+            let dir = entry.attr.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
+            if let Err(undo) = sys::unlink_at(libc::AT_FDCWD, &path, dir) {
+                tracing::warn!(errno, undo, path = %path.to_string_lossy(), "a create whose owner could not be recorded was left behind");
+            }
+            self.forget(entry.nodeid, 1);
+            return Err(errno);
+        }
         (entry.attr.uid, entry.attr.gid) = owner;
         entry.attr.flags = 0;
         Ok(())
