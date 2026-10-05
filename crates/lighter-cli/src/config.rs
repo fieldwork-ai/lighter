@@ -28,6 +28,11 @@ pub struct Config {
     /// Directories from the Mac the guest can see, at the same paths
     /// ([`DEFAULT_SHARES`] unless changed with `lighter config --share`).
     pub shares: Vec<String>,
+    /// What the file was written to mean. Missing, it is from before 0.11.6,
+    /// whose only share was the home folder: that reads as the defaults,
+    /// once, and a home folder chosen since is taken as chosen.
+    #[serde(default)]
+    pub format: u32,
     /// Where a port a container publishes on every interface is bound on
     /// the Mac: the network (`lan`, as Docker does) or loopback only.
     pub publish: Publish,
@@ -144,6 +149,7 @@ impl Default for Config {
             // and a low ceiling is the only way to make btrfs slow.
             disk_gib: free_disk_gib().max(64),
             shares: default_shares(),
+            format: FORMAT,
             publish: Publish::Lan,
             gpu: true,
             ane: true,
@@ -212,12 +218,19 @@ impl Config {
     /// Reads the configuration, or the defaults if there is none.
     pub fn load() -> anyhow::Result<Config> {
         let path = crate::paths::config_file()?;
-        let mut config: Config = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-            Err(e) => return Err(e.into()),
-        };
-        config.shares = upgraded_shares(std::mem::take(&mut config.shares), &home_directory());
+        match std::fs::read(&path) {
+            Ok(bytes) => Config::read(&bytes, &home_directory()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn read(bytes: &[u8], home: &str) -> anyhow::Result<Config> {
+        let mut config: Config = serde_json::from_slice(bytes)?;
+        if config.format < FORMAT {
+            config.shares = upgraded_shares(std::mem::take(&mut config.shares), home);
+            config.format = FORMAT;
+        }
         Ok(config)
     }
 
@@ -335,6 +348,9 @@ fn free_disk_gib() -> u64 {
     (st.f_bavail as u64).saturating_mul(st.f_bsize as u64) >> 30
 }
 
+/// The current meaning of a config file; see [`Config::format`].
+const FORMAT: u32 = 1;
+
 fn home_directory() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/Users".into())
 }
@@ -431,6 +447,23 @@ mod tests {
                 "/Users/nick"
             ),
             ["/Users", "/Volumes", "/var/folders", "/opt/data"]
+        );
+    }
+
+    /// The upgrade happens to a file from before the defaults, once: the
+    /// home folder alone, chosen since, stays the home folder alone.
+    #[test]
+    fn a_home_folder_chosen_since_is_kept() {
+        let old = Config::read(br#"{"shares": ["/Users/nick"]}"#, "/Users/nick").unwrap();
+        assert_eq!(old.shares, default_shares());
+        let chosen = Config {
+            shares: vec!["/Users/nick".into()],
+            ..Config::default()
+        };
+        let bytes = serde_json::to_vec(&chosen).unwrap();
+        assert_eq!(
+            Config::read(&bytes, "/Users/nick").unwrap().shares,
+            ["/Users/nick"]
         );
     }
 
@@ -593,6 +626,7 @@ mod tests {
             memory_mib: Some(4096),
             disk_gib: 32,
             shares: vec!["/tmp".into()],
+            format: FORMAT,
             publish: Publish::Localhost,
             gpu: false,
             ane: false,
