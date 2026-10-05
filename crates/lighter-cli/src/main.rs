@@ -18,6 +18,7 @@ mod installation;
 mod instance;
 mod localnet;
 mod machine;
+mod mounts;
 mod mps;
 mod paths;
 mod release;
@@ -154,6 +155,13 @@ enum Command {
         /// Whether containers get a hardware video decoder (`on`, the default, or `off`).
         #[arg(long, value_enum)]
         video: Option<config::Toggle>,
+        /// Share a folder from the Mac with containers, at the same path
+        /// (`/Users`, `/Volumes` and `/var/folders` are shared already).
+        #[arg(long, value_name = "PATH")]
+        share: Vec<String>,
+        /// Stop sharing a folder.
+        #[arg(long, value_name = "PATH")]
+        unshare: Vec<String>,
     },
     /// Put the guest's clock right.
     ///
@@ -334,6 +342,8 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             torch_python,
             metal,
             video,
+            share,
+            unshare,
         } => configure(Settings {
             resources,
             cpus,
@@ -346,6 +356,8 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             torch_python,
             metal,
             video,
+            share,
+            unshare,
         }),
         Command::Resync => {
             let now = std::time::SystemTime::now()
@@ -496,6 +508,14 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             port.reason
         );
     }
+    for mount in &status.unshared {
+        println!(
+            "  mounts     {} binds {}, which is not shared: {}",
+            mount.container,
+            mount.source,
+            mount.remedy()
+        );
+    }
     for disk in &status.storage_waiting {
         println!("  storage    Waiting for host disk space; VM running, writes waiting.");
         println!(
@@ -530,6 +550,7 @@ fn logs(follow: bool) -> anyhow::Result<std::process::ExitCode> {
 }
 
 /// What `lighter config` was asked to change; `None` leaves a setting alone.
+#[derive(Default)]
 struct Settings {
     resources: Option<config::Resources>,
     cpus: Option<u32>,
@@ -542,9 +563,13 @@ struct Settings {
     torch_python: Option<String>,
     metal: Option<config::Toggle>,
     video: Option<config::Toggle>,
+    share: Vec<String>,
+    unshare: Vec<String>,
 }
 
-fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
+/// Writes what `lighter config` was given into `config`, saying whether
+/// anything was given. A share that cannot be made changes nothing.
+fn apply(config: &mut config::Config, settings: Settings) -> Result<bool, String> {
     let Settings {
         resources,
         cpus,
@@ -557,8 +582,9 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         torch_python,
         metal,
         video,
+        share,
+        unshare,
     } = settings;
-    let mut config = config::Config::load()?;
     let changed = resources.is_some()
         || cpus.is_some()
         || memory.is_some()
@@ -569,7 +595,18 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         || mps.is_some()
         || torch_python.is_some()
         || metal.is_some()
-        || video.is_some();
+        || video.is_some()
+        || !share.is_empty()
+        || !unshare.is_empty();
+    for path in &unshare {
+        config.unshare(path)?;
+    }
+    for path in &share {
+        if !std::path::Path::new(path).is_dir() {
+            return Err(format!("{path} is not a folder on this Mac"));
+        }
+        config.share(path)?;
+    }
     if let Some(resources) = resources
         && resources != config.resources
     {
@@ -588,15 +625,6 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
     }
     if let Some(disk) = disk {
         config.disk_gib = disk;
-        let image = paths::data_disk()?
-            .metadata()
-            .map(|m| m.len() >> 30)
-            .unwrap_or(0);
-        if image > disk {
-            println!(
-                "The disk is already {image} GiB and disks never shrink; it stays {image} GiB."
-            );
-        }
     }
     if let Some(publish) = publish {
         config.publish = publish;
@@ -610,12 +638,42 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
     if let Some(mps) = mps {
         config.mps = mps.into();
     }
+    if let Some(metal) = metal {
+        config.metal = metal.into();
+    }
+    if let Some(video) = video {
+        config.video = video.into();
+    }
     if let Some(python) = torch_python {
         config.torch_python = if python == "auto" {
             String::new()
         } else {
             python
         };
+    }
+    Ok(changed)
+}
+
+fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
+    let mut config = config::Config::load()?;
+    let disk = settings.disk;
+    let changed = match apply(&mut config, settings) {
+        Ok(changed) => changed,
+        Err(e) => {
+            eprintln!("lighter: {e}");
+            return Ok(std::process::ExitCode::FAILURE);
+        }
+    };
+    if let Some(disk) = disk {
+        let image = paths::data_disk()?
+            .metadata()
+            .map(|m| m.len() >> 30)
+            .unwrap_or(0);
+        if image > disk {
+            println!(
+                "The disk is already {image} GiB and disks never shrink; it stays {image} GiB."
+            );
+        }
     }
     if changed {
         config.save()?;
@@ -668,4 +726,39 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
         println!("  share      {share}");
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_setting_is_applied() {
+        let mut config = config::Config::default();
+        let given = Settings {
+            metal: Some(config::Toggle::Off),
+            video: Some(config::Toggle::Off),
+            gpu: Some(config::Toggle::Off),
+            ..Settings::default()
+        };
+        assert_eq!(apply(&mut config, given), Ok(true));
+        assert!(!config.metal && !config.video && !config.gpu);
+        assert_eq!(apply(&mut config, Settings::default()), Ok(false));
+    }
+
+    #[test]
+    fn a_share_must_be_a_folder() {
+        let mut config = config::Config::default();
+        let before = config.shares.clone();
+        let given = Settings {
+            share: vec!["/nowhere/at/all".into()],
+            ..Settings::default()
+        };
+        assert!(
+            apply(&mut config, given)
+                .unwrap_err()
+                .contains("not a folder")
+        );
+        assert_eq!(config.shares, before);
+    }
 }

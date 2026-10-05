@@ -178,6 +178,8 @@ pub struct Machine {
     network: Option<Arc<Network>>,
     vsock: Arc<VsockShared>,
     filesystem_notifications: Vec<Arc<lighter_fs::notify::Sink>>,
+    /// Lets the shares close what they hold on a volume being ejected.
+    _eject_watch: Option<lighter_fs::eject::Watch>,
     /// Socket proxies, held because dropping one unlinks its socket.
     proxies: Vec<VsockProxy>,
     /// Held for the machine's lifetime: dropping it ends the subscription to
@@ -403,11 +405,22 @@ impl Machine {
         // is: each needs a waker, and the transports do not exist yet.
         let mut share_wakers = Vec::with_capacity(config.shares.len());
         let mut pollers = Vec::new();
+        let descriptors = lighter_fs::inode::Pool::default();
         for share in &config.shares {
-            let fs = Fs::new(share)?;
+            let fs = Fs::in_pool(share, &descriptors)?;
             share_wakers.push((virtio.len(), fs.waker(), fs.notifications()));
             virtio.push(Box::new(fs));
         }
+        // Without it a drive any container had used could not be ejected
+        // while the machine ran. A machine that cannot register still runs:
+        // ejecting is then refused while the guest holds a file, as before.
+        let eject_watch = if config.shares.is_empty() {
+            None
+        } else {
+            lighter_fs::eject::Watch::start(&descriptors)
+                .inspect_err(|e| tracing::warn!(%e, "cannot watch for ejected volumes"))
+                .ok()
+        };
         let filesystem_notifications = share_wakers
             .iter()
             .map(|(_, _, sink)| sink.clone())
@@ -950,6 +963,7 @@ impl Machine {
         };
 
         Ok(Machine {
+            _eject_watch: eject_watch,
             filesystem_notifications,
             _vm: vm,
             ctx,

@@ -242,6 +242,26 @@ pub fn run() -> Vec<Finding> {
         Err(e) => Finding::bad("machine", e.to_string(), "check ~/.lighter"),
     });
 
+    if let Ok(config) = crate::config::Config::load() {
+        let missing: Vec<&String> = config
+            .shares
+            .iter()
+            .filter(|path| !std::path::Path::new(path).is_dir())
+            .collect();
+        findings.push(if missing.is_empty() {
+            Finding::good("shared folders", config.shares.join(", "))
+        } else {
+            Finding::warn(
+                "shared folders",
+                format!(
+                    "not there, so not shared: {}",
+                    missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                "connect the drive and run `lighter restart`, or remove it with `lighter config --unshare`",
+            )
+        });
+    }
+
     // A published port the Mac refused is still listed by `docker ps`, with
     // nothing listening, so only the machine can say. A warning: the machine
     // retries it, and what holds the port is the Mac's to let go.
@@ -249,6 +269,31 @@ pub fn run() -> Vec<Finding> {
         && let Ok(home) = paths::home()
         && let Ok(report) = crate::storage_status::query(&home, pid)
     {
+        if let Some(shares) = &report.shares {
+            let unshared = crate::mounts::running(shares);
+            findings.push(if unshared.is_empty() {
+                Finding::good("bind mounts", "every one from the Mac is shared")
+            } else {
+                Finding::warn(
+                    "bind mounts",
+                    format!(
+                        "from folders the machine does not share, so the containers see empty folders: {}",
+                        unshared
+                            .iter()
+                            .map(|m| format!("{} ({})", m.source, m.container))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    &unshared
+                        .iter()
+                        .map(|m| m.remedy())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            });
+        }
         findings.push(if report.unforwarded.is_empty() {
             Finding::good("published ports", "all forwarded")
         } else {

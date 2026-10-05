@@ -97,9 +97,19 @@ pub fn machine() -> anyhow::Result<()> {
         return Ok(());
     };
 
+    // A share that is not there, a drive not plugged in, is left out rather
+    // than stopping the machine: it is shared again at the next start that
+    // finds it. `lighter doctor` names it meanwhile.
     let shares = config
         .shares
         .iter()
+        .filter(|path| {
+            let present = std::path::Path::new(path).is_dir();
+            if !present {
+                tracing::warn!(share = %path, "a shared folder is not there; starting without it");
+            }
+            present
+        })
         .enumerate()
         .map(|(index, path)| Share {
             // A tag is limited to 36 bytes and a path is not, so the tag is an
@@ -195,6 +205,10 @@ pub fn machine() -> anyhow::Result<()> {
     } else {
         None
     };
+    let shared: Vec<String> = shares
+        .iter()
+        .map(|share| share.path.display().to_string())
+        .collect();
     for share in &shares {
         cmdline.push_str(&format!(
             " lighter.share={}:{}",
@@ -278,6 +292,7 @@ pub fn machine() -> anyhow::Result<()> {
             .collect(),
         machine.mem().cloned(),
         Some(port_health.clone()),
+        shared,
     )?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;

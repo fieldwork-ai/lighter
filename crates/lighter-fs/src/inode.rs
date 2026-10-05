@@ -257,13 +257,71 @@ pub struct AttrOverride {
     pub landed: bool,
 }
 
+/// The descriptors every share of one process holds, against one budget.
+///
+/// Each share used to count only its own against three quarters of the
+/// process's ceiling, so two shares in use at once could together reach it,
+/// and the guest saw EMFILE (the failure of issue #46, by another road). A
+/// machine's shares now count into one pool; each still parks only its own.
+#[derive(Debug, Clone, Default)]
+pub struct Pool {
+    descriptors: Arc<AtomicUsize>,
+    resident_dirs: Arc<AtomicUsize>,
+    holders: Arc<Holders>,
+}
+
+/// A share's hold on the Mac's files, which it can let go of a device at a
+/// time: a volume cannot be ejected while anything has a file on it open.
+pub trait Release: Send + Sync {
+    /// Closes every descriptor held on `dev`, returning how many it closed.
+    fn release_device(&self, dev: i64) -> usize;
+}
+
+#[derive(Default)]
+struct Holders(std::sync::Mutex<Vec<std::sync::Weak<dyn Release>>>);
+
+impl std::fmt::Debug for Holders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Holders")
+    }
+}
+
+impl Pool {
+    /// Adds a share to those [`Pool::release_device`] asks.
+    pub fn enroll(&self, holder: std::sync::Weak<dyn Release>) {
+        let mut holders = self.holders.0.lock().expect("pool holders poisoned");
+        holders.retain(|h| h.strong_count() > 0);
+        holders.push(holder);
+    }
+
+    /// Has every share in the pool close what it holds on `dev`, returning
+    /// how many descriptors that closed.
+    pub fn release_device(&self, dev: i64) -> usize {
+        let holders: Vec<_> = self
+            .holders
+            .0
+            .lock()
+            .expect("pool holders poisoned")
+            .iter()
+            .filter_map(|h| h.upgrade())
+            .collect();
+        holders.iter().map(|h| h.release_device(dev)).sum()
+    }
+
+    /// Descriptors held across the pool.
+    pub fn descriptors(&self) -> usize {
+        self.descriptors.load(Ordering::Relaxed)
+    }
+}
+
 /// What a share is holding, counted where it changes.
 #[derive(Debug, Default)]
 pub struct Census {
-    /// Open metadata descriptors. The number the budget is about.
-    descriptors: AtomicUsize,
+    /// Open metadata descriptors, across the share's [`Pool`]. The number
+    /// the budget is about.
+    descriptors: Arc<AtomicUsize>,
     /// Of those, directories. See [`Inode::parkable`].
-    resident_dirs: AtomicUsize,
+    resident_dirs: Arc<AtomicUsize>,
     /// Live `Inode` values, as against how many the table lists. The two
     /// disagreeing means something is holding `Arc`s the table has already
     /// forgotten, which from the outside looks exactly like a descriptor leak
@@ -1453,6 +1511,8 @@ pub struct Registry {
     /// ten-second install into ten minutes of parking the same inodes. Past
     /// the line, the ceiling is near and EMFILE is worse than any stall.
     red_line: usize,
+    /// See [`Registry::on_forget`].
+    forgotten: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
 }
 
 impl Registry {
@@ -1461,12 +1521,22 @@ impl Registry {
         self.census.descriptors()
     }
 
-    /// Builds a registry whose root is `root_fd`.
+    /// Builds a registry whose root is `root_fd`, with a budget of its own.
     pub fn new(root_fd: OwnedFd, dev: i64, ino: u64) -> Registry {
+        Registry::in_pool(root_fd, dev, ino, &Pool::default())
+    }
+
+    /// Builds a registry whose root is `root_fd`, counting its descriptors
+    /// into `pool` with the process's other shares.
+    pub fn in_pool(root_fd: OwnedFd, dev: i64, ino: u64, pool: &Pool) -> Registry {
         // The root is never forgotten: the kernel does not FORGET nodeid 1, and
         // a count that could reach zero would let a buggy guest drop it and
         // take the whole mount with it.
-        let census = Arc::new(Census::default());
+        let census = Arc::new(Census {
+            descriptors: pool.descriptors.clone(),
+            resident_dirs: pool.resident_dirs.clone(),
+            ..Census::default()
+        });
         census.budget.store(descriptor_budget(), Ordering::Relaxed);
         let root = Arc::new(Inode::new(
             root_fd,
@@ -1504,7 +1574,22 @@ impl Registry {
             born: std::time::Instant::now(),
             last_sweep: AtomicUsize::new(0),
             red_line: descriptor_budget() + descriptor_red_headroom(),
+            forgotten: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Calls `forgotten` with the id of every inode the registry drops,
+    /// whichever path drops it, so that what else is held for it goes too.
+    /// The open cache is the reason: an inode a job bound after the guest
+    /// had forgotten it is dropped by the job, and its open file with it.
+    pub fn on_forget(&self, forgotten: Box<dyn Fn(u64) + Send + Sync>) {
+        let _ = self.forgotten.set(forgotten);
+    }
+
+    /// Whether the guest holds no inode but the root: nothing below the
+    /// root's own entries can be cached in it.
+    pub fn knows_only_the_root(&self) -> bool {
+        self.census.inodes() <= 1
     }
 
     pub fn get(&self, id: u64) -> Option<Arc<Inode>> {
@@ -1513,6 +1598,30 @@ impl Registry {
             .expect("inode table poisoned")
             .get(&id)
             .cloned()
+    }
+
+    /// Parks every inode on `dev` but the root, calling `evicted` with each
+    /// one's id first so that whatever else holds it open can let go too.
+    /// Returns how many descriptors it closed. An unlinked file the guest
+    /// still has open cannot be parked, having no path to come back by.
+    pub fn release_device(&self, dev: i64, mut evicted: impl FnMut(u64)) -> usize {
+        let mut closed = 0;
+        for shard in &self.by_id {
+            let inodes: Vec<Arc<Inode>> = shard
+                .lock()
+                .expect("inode table poisoned")
+                .iter()
+                .filter(|(id, inode)| **id != ROOT_ID && inode.dev() == dev)
+                .map(|(_, inode)| inode.clone())
+                .collect();
+            for inode in inodes {
+                evicted(inode.id());
+                if inode.held.load(Ordering::Relaxed) && inode.park() {
+                    closed += 1;
+                }
+            }
+        }
+        closed
     }
 
     /// Counts a lookup of an inode we already hold, if we hold it.
@@ -1907,6 +2016,9 @@ impl Registry {
         let forwarded = inode.forwarded();
         table.remove(&id);
         drop(table);
+        if let Some(forgotten) = self.forgotten.get() {
+            forgotten(id);
+        }
 
         {
             let mut map = self.by_identity[identity_shard(identity.1)]

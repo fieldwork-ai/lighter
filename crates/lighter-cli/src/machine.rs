@@ -33,6 +33,9 @@ pub struct Status {
     pub agent_restarts: Option<String>,
     /// Published ports the machine could not forward, and is retrying.
     pub unforwarded: Vec<crate::storage_status::Unforwarded>,
+    /// Running containers' bind mounts from folders on the Mac the machine
+    /// does not share.
+    pub unshared: Vec<crate::mounts::Unshared>,
 }
 
 /// The daemon that owns this home, verified with its process generation;
@@ -258,6 +261,10 @@ pub fn status() -> anyhow::Result<Status> {
         .unwrap_or_default();
     let storage_waiting = report.waiting;
     let unforwarded = report.unforwarded;
+    let unshared = report
+        .shares
+        .map(|shares| crate::mounts::running(&shares))
+        .unwrap_or_default();
     let timeout = if storage_waiting.is_empty() {
         Duration::from_secs(5)
     } else {
@@ -278,6 +285,7 @@ pub fn status() -> anyhow::Result<Status> {
         memory: report.memory,
         agent_restarts,
         unforwarded,
+        unshared,
     })
 }
 

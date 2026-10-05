@@ -25,8 +25,14 @@ pub struct Config {
     /// it has not allocated yet, and a small disk makes it flush a large copy
     /// mid-copy, file by file (see `Disk` in the architecture doc).
     pub disk_gib: u64,
-    /// Directories from the Mac the guest can see, at the same paths.
+    /// Directories from the Mac the guest can see, at the same paths
+    /// ([`DEFAULT_SHARES`] unless changed with `lighter config --share`).
     pub shares: Vec<String>,
+    /// What the file was written to mean. Missing, it is from before 0.11.6,
+    /// whose only share was the home folder: that reads as the defaults,
+    /// once, and a home folder chosen since is taken as chosen.
+    #[serde(default)]
+    pub format: u32,
     /// Where a port a container publishes on every interface is bound on
     /// the Mac: the network (`lan`, as Docker does) or loopback only.
     pub publish: Publish,
@@ -142,7 +148,8 @@ impl Default for Config {
             // gives its guest. Never less than 64 GiB: the image is sparse,
             // and a low ceiling is the only way to make btrfs slow.
             disk_gib: free_disk_gib().max(64),
-            shares: vec![home_directory()],
+            shares: default_shares(),
+            format: FORMAT,
             publish: Publish::Lan,
             gpu: true,
             ane: true,
@@ -212,9 +219,49 @@ impl Config {
     pub fn load() -> anyhow::Result<Config> {
         let path = crate::paths::config_file()?;
         match std::fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => Config::read(&bytes, &home_directory()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    fn read(bytes: &[u8], home: &str) -> anyhow::Result<Config> {
+        let mut config: Config = serde_json::from_slice(bytes)?;
+        if config.format < FORMAT {
+            config.shares = upgraded_shares(std::mem::take(&mut config.shares), home);
+            config.format = FORMAT;
+        }
+        Ok(config)
+    }
+
+    /// Shares a folder from the Mac. One inside a share already is shared,
+    /// and says by which.
+    pub fn share(&mut self, path: &str) -> Result<(), String> {
+        let path = path.trim_end_matches('/');
+        if !path.starts_with('/') {
+            return Err(format!("{path}: give the folder's full path, from /"));
+        }
+        if let Some(by) = self.shares.iter().find(|s| within(path, s)) {
+            return Err(format!("{path} is already shared, as part of {by}"));
+        }
+        self.shares.push(path.to_string());
+        self.shares = normalized_shares(std::mem::take(&mut self.shares));
+        Ok(())
+    }
+
+    /// Stops sharing a folder. Only a share as a whole can go: a folder
+    /// inside one is that share's.
+    pub fn unshare(&mut self, path: &str) -> Result<(), String> {
+        let path = path.trim_end_matches('/');
+        if let Some(at) = self.shares.iter().position(|s| s == path) {
+            self.shares.remove(at);
+            return Ok(());
+        }
+        match self.shares.iter().find(|s| within(path, s)) {
+            Some(by) => Err(format!(
+                "{path} is part of {by}, which is shared as a whole; `--unshare {by}` stops sharing all of it"
+            )),
+            None => Err(format!("{path} is not shared")),
         }
     }
 
@@ -301,13 +348,174 @@ fn free_disk_gib() -> u64 {
     (st.f_bavail as u64).saturating_mul(st.f_bsize as u64) >> 30
 }
 
+/// The current meaning of a config file; see [`Config::format`].
+const FORMAT: u32 = 1;
+
 fn home_directory() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/Users".into())
+}
+
+/// What containers can bind-mount from the Mac unless told otherwise:
+/// Docker Desktop's file-sharing defaults (`/Users`, `/Volumes`, `/private`,
+/// `/tmp`, `/var/folders`), less the two lighter cannot mount where Docker
+/// Desktop does. A share is mounted in the guest at its own path, so the
+/// Mac's `/tmp` would hide the machine's own, which dockerd uses; and
+/// `/private` would serve `$TMPDIR` a second time beside `/var/folders`,
+/// from a second server whose cache the first's writes never reach.
+pub const DEFAULT_SHARES: [&str; 3] = ["/Users", "/Volumes", "/var/folders"];
+
+pub fn default_shares() -> Vec<String> {
+    DEFAULT_SHARES.iter().map(|s| s.to_string()).collect()
+}
+
+/// Until 0.11.6 the home folder was the one share, written into the file at
+/// install; a list naming it is read as the defaults, with whatever else it
+/// named beside them (a drive under `/Volumes` is then already covered).
+pub fn upgraded_shares(shares: Vec<String>, home: &str) -> Vec<String> {
+    let home = home.trim_end_matches('/');
+    if !shares.iter().any(|s| s.trim_end_matches('/') == home) {
+        return normalized_shares(shares);
+    }
+    normalized_shares(
+        default_shares()
+            .into_iter()
+            .chain(
+                shares
+                    .into_iter()
+                    .filter(|s| s.trim_end_matches('/') != home),
+            )
+            .collect(),
+    )
+}
+
+/// The shares, without duplicates or a path inside another: a directory is
+/// served by one share, or the guest mounts one over the other.
+pub fn normalized_shares(shares: Vec<String>) -> Vec<String> {
+    let mut paths: Vec<String> = shares
+        .into_iter()
+        .map(|s| {
+            let trimmed = s.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/".into()
+            } else {
+                trimmed.to_string()
+            }
+        })
+        .collect();
+    paths.sort_by_key(|p| p.len());
+    let mut kept: Vec<String> = Vec::new();
+    for path in paths {
+        if !kept.iter().any(|k| within(&path, k)) {
+            kept.push(path);
+        }
+    }
+    let order = |p: &String| {
+        DEFAULT_SHARES
+            .iter()
+            .position(|d| d == p)
+            .unwrap_or(usize::MAX)
+    };
+    kept.sort_by(|a, b| order(a).cmp(&order(b)).then(a.cmp(b)));
+    kept
+}
+
+/// Whether `path` is `base` or inside it, by whole components.
+pub fn within(path: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    base.is_empty() || path == base || path.starts_with(&format!("{base}/"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The home folder alone, as every install before 0.11.6 wrote it, reads
+    /// as the defaults; a drive listed beside it is inside `/Volumes`.
+    #[test]
+    fn a_config_from_before_the_defaults_reads_as_them() {
+        assert_eq!(
+            upgraded_shares(vec!["/Users/nick".into()], "/Users/nick"),
+            default_shares()
+        );
+        assert_eq!(
+            upgraded_shares(
+                vec![
+                    "/Users/nick/".into(),
+                    "/Volumes/Media".into(),
+                    "/opt/data".into()
+                ],
+                "/Users/nick"
+            ),
+            ["/Users", "/Volumes", "/var/folders", "/opt/data"]
+        );
+    }
+
+    /// The upgrade happens to a file from before the defaults, once: the
+    /// home folder alone, chosen since, stays the home folder alone.
+    #[test]
+    fn a_home_folder_chosen_since_is_kept() {
+        let old = Config::read(br#"{"shares": ["/Users/nick"]}"#, "/Users/nick").unwrap();
+        assert_eq!(old.shares, default_shares());
+        let chosen = Config {
+            shares: vec!["/Users/nick".into()],
+            ..Config::default()
+        };
+        let bytes = serde_json::to_vec(&chosen).unwrap();
+        assert_eq!(
+            Config::read(&bytes, "/Users/nick").unwrap().shares,
+            ["/Users/nick"]
+        );
+    }
+
+    /// A list that no longer names the home folder is the user's own.
+    #[test]
+    fn a_list_without_the_home_folder_is_kept() {
+        assert_eq!(
+            upgraded_shares(vec!["/Users".into(), "/var/folders".into()], "/Users/nick"),
+            ["/Users", "/var/folders"]
+        );
+    }
+
+    #[test]
+    fn sharing_and_unsharing() {
+        let mut config = Config {
+            shares: default_shares(),
+            ..Config::default()
+        };
+        assert!(
+            config
+                .share("/Volumes/T9")
+                .unwrap_err()
+                .contains("part of /Volumes")
+        );
+        config.share("/opt/data/").unwrap();
+        assert!(config.shares.contains(&"/opt/data".to_string()));
+        assert!(config.share("relative").is_err());
+        assert!(
+            config
+                .unshare("/Volumes/T9")
+                .unwrap_err()
+                .contains("--unshare /Volumes")
+        );
+        config.unshare("/Volumes").unwrap();
+        assert_eq!(config.shares, ["/Users", "/var/folders", "/opt/data"]);
+        assert!(config.unshare("/nowhere").is_err());
+    }
+
+    #[test]
+    fn a_share_inside_another_is_dropped() {
+        assert_eq!(
+            normalized_shares(vec![
+                "/Volumes/T9".into(),
+                "/Volumes".into(),
+                "/Volumes".into(),
+                "/Users2".into()
+            ]),
+            ["/Volumes", "/Users2"]
+        );
+        assert!(within("/Volumes/T9/x", "/Volumes"));
+        assert!(!within("/Volumes2", "/Volumes"));
+    }
 
     /// A machine that takes every core makes the Mac it runs on unusable while
     /// it works, which is the complaint this whole project is answering.
@@ -418,6 +626,7 @@ mod tests {
             memory_mib: Some(4096),
             disk_gib: 32,
             shares: vec!["/tmp".into()],
+            format: FORMAT,
             publish: Publish::Localhost,
             gpu: false,
             ane: false,

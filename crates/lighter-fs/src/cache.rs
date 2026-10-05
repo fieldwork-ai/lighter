@@ -278,10 +278,14 @@ pub struct Invalidator {
     policy: Arc<Policy>,
     registry: Arc<crate::inode::Registry>,
     sink: Arc<crate::notify::Sink>,
+    /// The share's root, as given and as FSEvents spells it (`/var` is
+    /// `/private/var` to it).
+    roots: [std::path::PathBuf; 2],
 }
 
 impl Invalidator {
     pub fn new(
+        root: &Path,
         policy: Arc<Policy>,
         registry: Arc<crate::inode::Registry>,
         sink: Arc<crate::notify::Sink>,
@@ -290,6 +294,10 @@ impl Invalidator {
             policy,
             registry,
             sink,
+            roots: [
+                root.to_path_buf(),
+                root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            ],
         }
     }
 
@@ -366,6 +374,19 @@ impl crate::fsevents::Observer for Invalidator {
     }
 
     fn changed(&self, path: &Path, flags: u32) {
+        // A guest that has looked up nothing in the share has nothing cached
+        // in it but the root's own entries. `/var/folders` is where every app
+        // on the Mac keeps its temporary files, and `/Volumes` holds whole
+        // drives: an idle machine is told of a stream of changes there that
+        // no container asked about, and two stats each made them its largest
+        // idle cost.
+        if self.registry.knows_only_the_root()
+            && path
+                .parent()
+                .is_some_and(|parent| self.roots.iter().all(|root| parent != root))
+        {
+            return;
+        }
         // The object itself may already be gone — a delete is exactly what the
         // guest most needs to stop caching — so the parent is handled whether
         // or not the object still exists.
@@ -407,6 +428,39 @@ impl crate::fsevents::Observer for Invalidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Below the root's own entries, a change matters only once the guest
+    /// has looked something up: until then it is not even examined, which is
+    /// what keeps `/var/folders` free while idle.
+    #[test]
+    fn a_change_the_guest_cannot_have_cached_is_not_examined() {
+        use crate::fsevents::{Observer, flag};
+        use std::os::fd::AsRawFd;
+        let scratch =
+            std::env::temp_dir().join(format!("lighter-cache-idle-{}", std::process::id()));
+        std::fs::create_dir_all(scratch.join("app/cache")).unwrap();
+        // As FSEvents spells it: /var/folders is /private/var/folders.
+        let root = scratch.canonicalize().unwrap();
+        let fd = crate::sys::open_root(&root).unwrap();
+        let st = crate::sys::stat_fd(fd.as_raw_fd()).unwrap();
+        let registry = Arc::new(crate::inode::Registry::new(fd, st.st_dev as i64, st.st_ino));
+        let sink = Arc::new(crate::notify::Sink::new());
+        let policy = Arc::new(Policy::new(Timings::POLLED, Timings::PUSHED));
+        let invalidator = Invalidator::new(&root, policy, registry.clone(), sink.clone());
+
+        invalidator.changed(&root.join("app/cache/tmp123"), flag::ITEM_CREATED);
+        assert!(sink.is_empty(), "nothing below the root is known");
+        invalidator.changed(&root.join("new"), flag::ITEM_CREATED);
+        assert!(!sink.is_empty(), "the root's own entries are always known");
+        while sink.take().is_some() {}
+
+        let app = crate::sys::open_root(&root.join("app/cache")).unwrap();
+        let at = crate::sys::stat_fd(app.as_raw_fd()).unwrap();
+        registry.insert(app, at.st_dev as i64, at.st_ino, true, false);
+        invalidator.changed(&root.join("app/cache/tmp123"), flag::ITEM_CREATED);
+        assert!(!sink.is_empty(), "a directory the guest knows hears of it");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn a_lost_watch_cannot_be_reenabled_by_late_feature_negotiation() {

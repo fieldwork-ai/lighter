@@ -102,6 +102,12 @@ struct Guest {
 
 impl Guest {
     fn new(name: &str) -> Guest {
+        Guest::new_in(name, &lighter_fs::inode::Pool::default())
+    }
+
+    /// A guest whose share counts its descriptors into `pool`, as a
+    /// machine's shares do.
+    fn new_in(name: &str, pool: &lighter_fs::inode::Pool) -> Guest {
         let root = std::env::temp_dir().join(format!(
             "lighter-fs-{name}-{}-{}",
             std::process::id(),
@@ -111,7 +117,7 @@ impl Guest {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        Guest::serve(root, true)
+        Guest::serve_in(root, true, pool)
     }
 
     /// A second server on this guest's share, as a restarted VM would have.
@@ -120,7 +126,11 @@ impl Guest {
     }
 
     fn serve(root: PathBuf, owns_root: bool) -> Guest {
-        let server = Server::new(&root).unwrap();
+        Guest::serve_in(root, owns_root, &lighter_fs::inode::Pool::default())
+    }
+
+    fn serve_in(root: PathBuf, owns_root: bool, pool: &lighter_fs::inode::Pool) -> Guest {
+        let server = Server::new_in_pool(&root, pool).unwrap();
         let mut guest = Guest {
             server,
             unique: 1,
@@ -947,6 +957,37 @@ fn a_parked_inode_still_reads_back_what_was_written() {
             "{name} came back wrong after its descriptor was parked"
         );
     }
+    unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
+}
+
+/// A machine's shares hold their descriptors against one budget. Each used
+/// to measure itself against the whole of it, so two shares in use at once,
+/// a home folder and a drive, could together reach the process's ceiling,
+/// and the guest saw EMFILE on a file that was plainly there.
+#[test]
+fn shares_of_one_machine_keep_one_budget() {
+    let _alone = with_budget("64");
+    let pool = lighter_fs::inode::Pool::default();
+    let mut home = Guest::new_in("pool-home", &pool);
+    let drive = Guest::new_in("pool-drive", &pool);
+    for n in 0..300 {
+        let (nodeid, fh) = home.create(1, &format!("f{n}"), 0o2).unwrap();
+        home.write(nodeid, fh, 0, b"x").unwrap();
+    }
+    home.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let (by_home, budget) = home.server.descriptor_usage();
+    let (by_drive, _) = drive.server.descriptor_usage();
+    // The idle share sees what the busy one holds: that is what lets either
+    // reclaim when the two together reach the budget.
+    assert_eq!(
+        by_drive, by_home,
+        "the drive's share must count the home share's descriptors"
+    );
+    assert!(by_home > 1, "the busy share must have held something");
+    assert!(
+        by_home <= budget * 2,
+        "{by_home} descriptors held against one budget of {budget}"
+    );
     unsafe { std::env::remove_var("LIGHTER_FS_FD_BUDGET") };
 }
 
@@ -2626,4 +2667,82 @@ fn macos_attributes_are_not_listed_but_can_be_read() {
     get.extend_from_slice(&0u32.to_le_bytes());
     get.extend_from_slice(&name_body("com.apple.lighter-test"));
     assert_eq!(guest.call(op::GETXATTR, nodeid, &get).unwrap(), b"mac");
+}
+
+/// The paths of this process's descriptors inside `dir`, excluding `dir`.
+fn descriptors_inside(dir: &Path) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = dir.canonicalize().unwrap();
+    let mut found = Vec::new();
+    // SAFETY: getdtablesize takes nothing; fcntl(F_GETPATH) writes at most
+    // MAXPATHLEN bytes into a buffer of that size, and fails harmlessly on a
+    // number that is not an open descriptor.
+    let ceiling = unsafe { libc::getdtablesize() };
+    for fd in 0..ceiling {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+            continue;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end]));
+        if path != dir && path.starts_with(&dir) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// A volume cannot be ejected while anything holds a file on it open, and
+/// the guest's lookups, reads and writes leave descriptors behind on purpose.
+/// Asked to let go of a device, the shares close every one of them, open
+/// files included, and the files work as before when next used.
+#[test]
+fn a_share_lets_go_of_a_volume_being_ejected() {
+    let pool = lighter_fs::inode::Pool::default();
+    let mut guest = Guest::new_in("eject", &pool);
+    std::fs::create_dir(guest.host("drive")).unwrap();
+    std::fs::write(guest.host("drive/old"), b"old").unwrap();
+    let drive = guest.lookup(1, "drive").unwrap();
+    let (written, fh) = guest.create(drive, "new", 0o2).unwrap();
+    guest.write(written, fh, 0, b"new").unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    let old = guest.lookup(drive, "old").unwrap();
+    let rfh = guest.open(old, 0).unwrap();
+    assert_eq!(guest.read(old, rfh, 0, 16).unwrap(), b"old");
+    let held = descriptors_inside(&guest.root);
+    assert!(!held.is_empty(), "the share should be holding files open");
+
+    let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(&guest.root).unwrap()) as i64;
+    assert!(pool.release_device(dev) > 0);
+    assert_eq!(
+        descriptors_inside(&guest.root),
+        Vec::<PathBuf>::new(),
+        "still open after the release"
+    );
+    assert_eq!(guest.read(old, rfh, 0, 16).unwrap(), b"old");
+    assert_eq!(guest.read(written, fh, 0, 16).unwrap(), b"new");
+}
+
+/// A file a short-lived container creates and writes is forgotten by the
+/// guest as the container exits, often before its held-back create has been
+/// applied. Whatever the order, nothing of it stays open afterwards.
+#[test]
+fn a_file_forgotten_before_its_create_lands_is_not_held_open() {
+    let mut guest = Guest::new("forgotten-create");
+    for n in 0..20 {
+        let (nodeid, fh) = guest.create(1, &format!("f{n}"), 0o2).unwrap();
+        guest.write(nodeid, fh, 0, b"from a container").unwrap();
+        guest.call(op::FORGET, nodeid, &1u64.to_le_bytes()).ok();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert_eq!(
+        std::fs::read(guest.host("f19")).unwrap(),
+        b"from a container"
+    );
+    assert_eq!(
+        descriptors_inside(&guest.root),
+        Vec::<PathBuf>::new(),
+        "held open after the guest forgot them"
+    );
 }
