@@ -232,6 +232,63 @@ seen="$(nc -w 3 127.0.0.1 18095 </dev/null 2>/dev/null)"
 [ -n "$seen" ] && [ "$seen" != "${LAN_IP:-none}" ] && pass "tcp: loopback is seen as the guest ($seen)" || fail "tcp: loopback was seen as '${seen:-nothing}'"
 $D rm -f m3p-peer-tcp m3p-peer-udp >/dev/null 2>&1
 
+echo "==> A host-network container's ports, forwarded from the Mac (#60)"
+# Nothing publishes a host-network container's port: Docker has no binding
+# to report, so it was reachable from nothing on the Mac. The agent finds
+# what such a container listens on, and the Mac forwards it as it does a
+# published port, a second or so after the server starts listening.
+MAC_LAN="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+$D pull -q python:3.12-slim >/dev/null 2>&1
+$D rm -f m3-hostweb m3-hostlo m3-hostudp >/dev/null 2>&1
+$D run -d --name m3-hostweb --network host python:3.12-slim python3 -m http.server 18123 >/dev/null
+$D run -d --name m3-hostlo --network host python:3.12-slim python3 -m http.server 18126 --bind 127.0.0.1 >/dev/null
+$D run -d --name m3-hostudp --network host python:3.12-slim python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 15999))
+while True:
+    d, a = s.recvfrom(2048); s.sendto(b"echo " + d, a)' >/dev/null
+code=000
+for _ in $(seq 1 40); do
+	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:18123/ || true)"
+	[ "$code" = 200 ] && break
+	sleep 0.5
+done
+[ "$code" = 200 ] && pass "a host-network server is reachable on the Mac's localhost" \
+	|| fail "a host-network server on 18123 is not reachable from the Mac ($code)"
+if [ -n "$MAC_LAN" ]; then
+	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$MAC_LAN:18123/" || true)"
+	[ "$code" = 200 ] && pass "and at the Mac's own address, where the container sees the Mac as its client" \
+		|| fail "a host-network server is not reachable at $MAC_LAN ($code)"
+	sleep 1
+	$D logs m3-hostweb 2>&1 | grep -q "^$MAC_LAN " \
+		|| fail "the host-network server did not see $MAC_LAN as its client: $($D logs m3-hostweb 2>&1 | grep -oE '^[0-9.]+ ' | sort -u | tr '\n' ' ')"
+fi
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:18126/ || true)"
+lan_code="000"
+[ -n "$MAC_LAN" ] && lan_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$MAC_LAN:18126/" || true)"
+[ "$code" = 200 ] && [ "$lan_code" = 000 ] && pass "a host-network listener on 127.0.0.1 is the Mac's loopback only" \
+	|| fail "a loopback listener: localhost $code, the Mac's address $lan_code"
+reply="$(python3 -c '
+import socket
+for _ in range(20):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.5)
+    s.sendto(b"ping", ("127.0.0.1", 15999))
+    try:
+        print(s.recvfrom(2048)[0].decode()); break
+    except OSError:
+        pass')"
+[ "$reply" = "echo ping" ] && pass "a host-network UDP service answers from the Mac" \
+	|| fail "a host-network UDP echo on 15999 answered: ${reply:-nothing}"
+$D rm -f m3-hostweb >/dev/null
+gone=1
+for _ in $(seq 1 20); do
+	curl -s -o /dev/null --max-time 1 http://127.0.0.1:18123/ || { gone=0; break; }
+	sleep 0.5
+done
+[ "$gone" = 0 ] && pass "the forward is withdrawn when the container stops" \
+	|| fail "18123 still answers on the Mac after its container stopped"
+$D rm -f m3-hostlo m3-hostudp >/dev/null 2>&1
+
 echo "==> HTTP immediately after connection bursts"
 if python3 scripts/test-publish-burst.py --docker-host "unix://$LIGHTER_HOME/docker.sock"; then
 	pass "connection bursts preserve HTTP on all-interface and loopback publishes"
