@@ -2368,31 +2368,48 @@ fn a_chown_of_the_group_alone_keeps_the_owner() {
     assert_eq!(owner_of(&mut guest, nodeid), (1000, 44));
 }
 
-/// What a non-root process creates is its own, or it could not write the
-/// directory it has just made.
+/// What a non-root process creates belongs to whoever asks, as a Mac file
+/// does, so a container running as another user can write it too (issue
+/// #55): recording the creator locked every other non-root user out of a
+/// directory one of them had made. Only a chown is recorded.
 #[test]
-fn what_a_non_root_caller_creates_is_its_own() {
+fn what_a_non_root_caller_creates_belongs_to_whoever_asks() {
     let mut guest = Guest::new("creator");
     guest.caller = (1000, 1000);
+    let whoever = fuse::attr::LIGHTER_CALLER_UID | fuse::attr::LIGHTER_CALLER_GID;
 
     let mut body = 0o755u32.to_le_bytes().to_vec();
     body.extend_from_slice(&0u32.to_le_bytes());
-    body.extend_from_slice(&name_body("recordings"));
+    body.extend_from_slice(&name_body("target"));
     let reply = guest.call(op::MKDIR, 1, &body).unwrap();
     let dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
-    let (file, _) = guest.create(dir, "segment.mp4", CREATE_RDWR).unwrap();
+    let (file, _) = guest.create(dir, "inputFiles.lst", CREATE_RDWR).unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
 
+    for nodeid in [dir, file] {
+        assert_eq!(flags_of(&mut guest, nodeid) & whoever, whoever);
+    }
+    assert!(record_on_host(&guest.host("target")).is_none());
+    assert!(record_on_host(&guest.host("target").join("inputFiles.lst")).is_none());
+
+    guest.caller = (501, 20);
+    guest
+        .create(dir, "written-by-another-user", CREATE_RDWR)
+        .unwrap();
+    assert_eq!(flags_of(&mut guest, dir) & whoever, whoever);
+
+    // A chown, unlike a create, is a statement about the owner, and stays.
+    guest.caller = (0, 0);
+    chown(&mut guest, dir, 1000, 1000).unwrap();
     assert_eq!(owner_of(&mut guest, dir), (1000, 1000));
-    assert_eq!(owner_of(&mut guest, file), (1000, 1000));
-    assert!(record_on_host(&guest.host("recordings")).is_some());
-    assert!(record_on_host(&guest.host("recordings").join("segment.mp4")).is_some());
+    assert_eq!(flags_of(&mut guest, dir) & whoever, 0);
+    assert!(record_on_host(&guest.host("target")).is_some());
 }
 
-/// A file or directory created without its owner-write bit is still a
-/// non-root caller's own (issue #48): macOS refuses an extended attribute on
-/// such an entry, which made git's 0444 objects and `mkdir -m 555` fail as
-/// EACCES after the entry was already on the Mac. Each is created, written
-/// where it is a file, keeps the mode asked for and carries its owner.
+/// A non-root caller creates files and directories without their owner-write
+/// bit (issue #48: git's 0444 objects, `mkdir -m 555`): each is created,
+/// written where it is a file, keeps the mode asked for, and belongs to
+/// whoever asks, with no record to write.
 #[test]
 fn a_non_root_caller_creates_read_only_files_and_directories() {
     use std::os::unix::fs::PermissionsExt;
@@ -2404,14 +2421,11 @@ fn a_non_root_caller_creates_read_only_files_and_directories() {
             .create_mode(1, name, O_CREAT_WRONLY_EXCL, mode)
             .unwrap_or_else(|e| panic!("creating {name} at {mode:o}: errno {e}"));
         guest.write(file, fh, 0, b"x").unwrap();
-        assert_eq!(owner_of(&mut guest, file), (1000, 1000), "{name}");
     }
     let mut body = 0o555u32.to_le_bytes().to_vec();
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(&name_body("sealed"));
-    let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir -m 555");
-    let dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
-    assert_eq!(owner_of(&mut guest, dir), (1000, 1000));
+    guest.call(op::MKDIR, 1, &body).expect("mkdir -m 555");
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
     for (name, mode) in [
         ("obj", 0o444),
@@ -2425,10 +2439,7 @@ fn a_non_root_caller_creates_read_only_files_and_directories() {
             host_mode, mode,
             "{name} must keep the mode it was created with"
         );
-        assert!(
-            record_on_host(&path).is_some(),
-            "{name} must carry its owner"
-        );
+        assert!(record_on_host(&path).is_none(), "{name} carries no record");
     }
     // Restore owner-write so the share can be cleaned up.
     for name in ["obj", "tool", "key", "sealed"] {
