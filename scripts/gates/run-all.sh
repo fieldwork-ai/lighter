@@ -6,6 +6,12 @@
 # being run is by getting slower a minute at a time with nobody able to say
 # which minute. So each one reports what it cost, and the total is printed at
 # the end where it cannot be missed.
+#
+# Every gate boots a machine with an empty image store, so a full run pulls
+# dozens of images from Docker Hub, and its anonymous limit is per public
+# address: two Macs on one network ran out of it in an afternoon. With
+# LIGHTER_REGISTRY_MIRROR set (http://192.168.127.254:<port>, a pull-through
+# cache on the Mac's loopback) every machine pulls Docker Hub through it.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

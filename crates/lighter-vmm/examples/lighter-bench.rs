@@ -146,6 +146,16 @@ fn main() -> ExitCode {
         }
     }
 
+    // Docker Hub through a cache, as the CLI does (`lighter.registry_mirror`).
+    if let Ok(mirror) = std::env::var("LIGHTER_REGISTRY_MIRROR")
+        && !mirror.is_empty()
+        && !mirror.contains(char::is_whitespace)
+    {
+        config
+            .cmdline
+            .push_str(&format!(" lighter.registry_mirror={mirror}"));
+    }
+
     // The Neural Engine service, host-side; the port rides the command line.
     let _ane = if ane {
         match lighter_vmm::ane::Server::start(None) {

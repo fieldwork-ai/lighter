@@ -148,6 +148,14 @@ pub fn machine() -> anyhow::Result<()> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     ));
+    // Docker Hub through a cache, for the gates (`lighter.registry_mirror`
+    // in init): not a setting, since a user's dockerd is theirs to configure.
+    if let Ok(mirror) = std::env::var("LIGHTER_REGISTRY_MIRROR")
+        && !mirror.is_empty()
+        && !mirror.contains(char::is_whitespace)
+    {
+        cmdline.push_str(&format!(" lighter.registry_mirror={mirror}"));
+    }
     // The Neural Engine service: a process of its own (ane_host.rs says
     // why), on a loopback port the container reaches through the streams;
     // init publishes it as a CDI device. Held for the machine's life.

@@ -655,6 +655,13 @@ fi
 # timestamps are how a container start is taken apart.
 dockerd_debug=""
 grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
+# `lighter.registry_mirror=<url>`: Docker Hub pulls through a cache. For the
+# gates, which boot a machine with an empty image store each time and spent
+# Docker Hub's anonymous pull limit for the whole network (2026-10-06).
+registry_mirror=""
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in lighter.registry_mirror=*) registry_mirror="--registry-mirror=${arg#lighter.registry_mirror=}" ;; esac
+done
 # --host-gateway-ip is what `--add-host name:host-gateway` writes. Left unset it
 # is docker0's address in this guest, where nothing of the Mac's listens; it
 # must be HOST_ALIAS (crates/lighter-vmm/src/dns.rs), what host.docker.internal
@@ -665,7 +672,7 @@ sh -c '
 	# BuildKit workers have no explicit OCI OOM score. Their runtime resets
 	# inherited protection so a large build cannot evict all normal containers.
 	export DOCKER_BUILDKIT_RUNC_COMMAND=/sbin/lighter-build-runc
-	exec dockerd $2 \
+	exec dockerd $2 $3 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \
 		--data-root=/var/lib/docker \
@@ -674,7 +681,7 @@ sh -c '
 		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
 		--host-gateway-ip=192.168.127.254 \
 		--seccomp-profile=/etc/docker/seccomp.json \
-		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
+		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" "$registry_mirror" &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on
