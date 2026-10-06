@@ -50,6 +50,10 @@ const PIPE: usize = 4 << 20;
 const REFUSED_WINDOW: Duration = Duration::from_secs(30);
 /// How long a v6 dial waits to see whether Docker's proxy hangs up on it.
 const V6_HANGUP_WAIT: Duration = Duration::from_millis(50);
+/// Accepting a continuous backlog must leave time to carry and close the
+/// streams already held. The listener is level-triggered, so the next turn
+/// sees any connections left queued.
+const ACCEPT_BATCH: usize = 256;
 
 pub fn serve(listener: OwnedFd, route: Route, env: Env) -> std::process::ExitCode {
     let mut lp = match Loop::new(listener, route, env) {
@@ -163,7 +167,7 @@ impl Loop {
     }
 
     fn accept_all(&mut self, now: Instant) {
-        loop {
+        for _ in 0..ACCEPT_BATCH {
             // SAFETY: accepting on a live listener with no interest in the
             // peer address.
             let raw = unsafe {
@@ -176,12 +180,13 @@ impl Loop {
                     Some(libc::EAGAIN) => return,
                     Some(libc::EINTR) | Some(libc::ECONNABORTED) | Some(libc::EPROTO) => continue,
                     Some(libc::EMFILE) | Some(libc::ENFILE) => {
-                        ran_out("descriptors", &e);
-                        if !self.shed() {
-                            self.pause_listening(now);
-                            return;
-                        }
-                        continue;
+                        self.shed(&e);
+                        // A successful shed does not make room: the spare
+                        // was reopened. Carry and close existing streams
+                        // before accepting again, even if clients retry
+                        // fast enough to keep the listener readable.
+                        self.pause_listening(now);
+                        return;
                     }
                     _ => {
                         ran_out("memory for a connection", &e);
@@ -207,9 +212,11 @@ impl Loop {
     }
 
     /// Accepts and drops one waiting connection with the spare descriptor.
-    fn shed(&mut self) -> bool {
-        let Some(spare) = self.spare.take() else { return false };
-        drop(spare);
+    fn shed(&mut self, error: &io::Error) {
+        // Diagnostics also open files. Release the spare before reading
+        // /proc, otherwise EMFILE makes every resource count unavailable.
+        drop(self.spare.take());
+        ran_out("descriptors", error);
         // SAFETY: as in accept_all.
         let raw = unsafe {
             libc::accept4(self.listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC)
@@ -219,7 +226,6 @@ impl Loop {
             drop(unsafe { OwnedFd::from_raw_fd(raw) });
         }
         self.spare = open_spare();
-        raw >= 0
     }
 
     /// Stops accepting for a moment rather than spinning on a failure that
@@ -1453,5 +1459,112 @@ mod tests {
         let env = Env { dial_host: dial_fake_host, destination: to_10_1_2_3, joiner: None, host_window: Duration::from_secs(1) };
         let _t = run(Loop::new(l, Route::Unix(path), env).unwrap());
         assert_eq!(round_trip(port, b"ping"), b"reply to ping");
+    }
+
+    /// File limits are per process: isolate the shortage from the other
+    /// tests and put a timeout around a loop that used to shed indefinitely.
+    #[test]
+    fn descriptor_exhaustion_drains_finished_streams_before_shedding_more_clients() {
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "LIGHTER_TEST_EMFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "streams::tests::descriptor_exhaustion_drains_finished_streams_before_shedding_more_clients", "--nocapture"])
+                .env(CHILD, "1").stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().unwrap();
+            let started = Instant::now();
+            while child.try_wait().unwrap().is_none() {
+                if started.elapsed() > Duration::from_secs(10) {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("stream loop did not recover: {}", String::from_utf8_lossy(&output.stderr));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            let log = String::from_utf8_lossy(&output.stderr);
+            assert!(log.contains("out of descriptors"), "the fixture must actually reach EMFILE");
+            assert!(!log.contains("tasks ?"), "diagnostics need room to read /proc");
+            assert!(!log.contains("this process's descriptors 0"), "descriptor count must remain available");
+            return;
+        }
+
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = std::env::temp_dir().join(format!("lighter-emfile-{}.sock", std::process::id()));
+        let server = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).unwrap();
+            socket.write_all(b"reply to ").unwrap();
+            socket.write_all(&request).unwrap();
+        });
+        let (listener, port) = listener();
+        let mut lp = Loop::new(listener, Route::Unix(path.clone()), outbound_env()).unwrap();
+
+        // A finished stream still owns two descriptors until the loop
+        // drives it. Its peers have closed, so both directions can finish.
+        let (a, peer_a) = UnixStream::pair().unwrap();
+        let (b, peer_b) = UnixStream::pair().unwrap();
+        drop(peer_a);
+        drop(peer_b);
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        set_nonblocking(b.as_raw_fd()).unwrap();
+        let mut finished = Conn::new(a.into(), false, State::Copying, Instant::now());
+        finished.b = Some(b.into());
+        (finished.watched_a, finished.watched_b) = finished.interest();
+        lp.watch(libc::EPOLL_CTL_ADD, finished.a.as_raw_fd(), 0, finished.watched_a).unwrap();
+        lp.watch(libc::EPOLL_CTL_ADD, finished.b.as_ref().unwrap().as_raw_fd(), 1, finished.watched_b).unwrap();
+        lp.conns.insert(0, finished);
+        lp.next = 1;
+
+        // Only one queued client must be refused. The next can be served
+        // once the finished stream releases its descriptors.
+        let _refused = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut queued = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        queued.write_all(b"ping").unwrap();
+        queued.shutdown(std::net::Shutdown::Write).unwrap();
+        queued.set_nonblocking(true).unwrap();
+
+        // SAFETY: this test runs alone in its child process. Preserve the
+        // hard limit; the child exits without affecting the parent.
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        limit.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut held = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        lp.turn(Some(Duration::ZERO));
+        assert!(lp.conns.is_empty(), "the finished stream must be closed under EMFILE");
+        // Leave room for the fixture server's accept and copying path.
+        for _ in 0..10 { held.pop(); }
+        let started = Instant::now();
+        let mut response = Vec::new();
+        loop {
+            lp.turn(Some(Duration::from_millis(10)));
+            let mut buf = [0; 64];
+            match queued.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("queued client was needlessly refused: {error}"),
+            }
+            assert!(started.elapsed() < Duration::from_secs(3), "queued client did not recover");
+        }
+        assert_eq!(response, b"reply to ping");
+        server.join().unwrap();
+        drop(lp);
+        std::fs::remove_file(path).unwrap();
     }
 }
