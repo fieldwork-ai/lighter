@@ -377,6 +377,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lighter-bridge"
+version = "0.11.7"
+dependencies = [
+ "cc",
+ "libc",
+ "lighter-vmnet",
+]
+
+[[package]]
 name = "lighter-cli"
 version = "0.11.7"
 dependencies = [
@@ -387,6 +396,7 @@ dependencies = [
  "lighter-docker",
  "lighter-hv",
  "lighter-vmm",
+ "lighter-vmnet",
  "semver",
  "serde",
  "serde_json",
@@ -433,11 +443,20 @@ dependencies = [
  "lighter-docker",
  "lighter-fs",
  "lighter-hv",
+ "lighter-vmnet",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
  "virtio-media",
  "vm-fdt",
+]
+
+[[package]]
+name = "lighter-vmnet"
+version = "0.11.7"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

@@ -137,7 +137,7 @@ impl Outbox {
         self.state.lock().expect("net outbox poisoned").bytes < OUTBOX_BYTES
     }
 
-    fn push(&self, frame: Vec<u8>) {
+    pub(crate) fn push(&self, frame: Vec<u8>) {
         let mut state = self.state.lock().expect("net outbox poisoned");
         state.bytes += frame.len();
         state.frames.push_back(frame);
@@ -185,6 +185,11 @@ pub struct Net {
     mtu: u16,
     /// Frames dropped because the guest had no receive buffers posted.
     dropped: u64,
+    /// Whether the guest may leave checksums to the device. The responder's
+    /// card may: nothing it carries reaches a wire. A card whose frames go
+    /// to a real network may not, since the device passes frames on as
+    /// they are and a partial checksum would arrive as a corrupt one.
+    csum: bool,
 }
 
 impl Net {
@@ -195,6 +200,16 @@ impl Net {
             mac,
             mtu,
             dropped: 0,
+            csum: true,
+        }
+    }
+
+    /// A card whose frames reach a real network: no offloads at all, so
+    /// every frame the guest hands over is complete.
+    pub fn new_wired(outbox: Arc<Outbox>, mac: [u8; 6], inbox: Inbox, mtu: u16) -> Net {
+        Net {
+            csum: false,
+            ..Net::new(outbox, mac, inbox, mtu)
         }
     }
 
@@ -370,7 +385,8 @@ impl VirtioDevice for Net {
         // wants ordinary complete frames, and claiming checksum or segmentation
         // support we do not implement produces corrupt traffic under load
         // rather than an honest failure at negotiation.
-        COMMON_FEATURES | F_MAC | F_MTU | F_STATUS | F_CSUM
+        let csum = if self.csum { F_CSUM } else { 0 };
+        COMMON_FEATURES | F_MAC | F_MTU | F_STATUS | csum
     }
 
     fn queue_count(&self) -> usize {
@@ -525,5 +541,17 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         outbox.close();
         assert!(taker.join().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_wired_card_leaves_no_checksum_to_the_device() {
+        let wired = Net::new_wired(Outbox::new(), [2, 0, 0, 0, 0, 1], Net::new_inbox(), 1500);
+        assert_eq!(wired.features() & F_CSUM, 0);
+        let card = Net::new(Outbox::new(), [2, 0, 0, 0, 0, 1], Net::new_inbox(), 1500);
+        assert_eq!(
+            card.features() & F_CSUM,
+            F_CSUM,
+            "the responder's card is unchanged"
+        );
     }
 }

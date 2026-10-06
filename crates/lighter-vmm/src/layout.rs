@@ -31,7 +31,9 @@ impl Window {
 /// Each is a fixed 512-byte window with its own SPI. Slots are cheap — an
 /// unused one costs the guest one failed magic-number probe at boot — and
 /// running out means changing the memory map, so the number is generous.
-pub const VIRTIO_MMIO_SLOTS: usize = 16;
+/// Thirty-two since 0.12: a machine with every device, the LAN card and a
+/// few shares of the user's own came within one of sixteen.
+pub const VIRTIO_MMIO_SLOTS: usize = 32;
 
 /// Size of one virtio-mmio register window.
 pub const VIRTIO_MMIO_SIZE: u64 = 0x200;

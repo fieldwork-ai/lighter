@@ -1,0 +1,15 @@
+[package]
+name = "lighter-vmnet"
+description = "A vmnet bridged interface relayed to a datagram socket, one frame per datagram"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+cc = "1"

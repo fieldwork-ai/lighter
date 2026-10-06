@@ -252,10 +252,37 @@ pub fn machine() -> anyhow::Result<()> {
         }
     }
 
+    // LAN mode: a second card bridged to one of the Mac's, so the machine
+    // is on the user's network (`lan.rs`). A machine that cannot bridge
+    // starts without it, and `lighter status` and `doctor` say why.
+    let lan = if config.lan {
+        match start_lan(&config, &home) {
+            Ok((lan, kernel_args)) => {
+                cmdline.push_str(&kernel_args);
+                Some(Arc::new(lan))
+            }
+            Err(why) => {
+                tracing::warn!(%why, "LAN mode is on, but the machine starts without its LAN card");
+                let _ = std::fs::write(home.join("lan-error"), &why);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if lan.is_some() {
+        let _ = std::fs::remove_file(home.join("lan-error"));
+    }
+    cmdline.push_str(match config.publish {
+        crate::config::Publish::Lan => " lighter.publish=lan",
+        crate::config::Publish::Localhost => " lighter.publish=localhost",
+    });
+
     // Fixed boots with all of it; native boots on a base and plugs the rest
     // in as the host offers it (`lighter_vmm::virtio::mem`).
     let (ram_bytes, hotplug_bytes) = config.memory_split();
     let machine_config = MachineConfig {
+        lan,
         vcpus: config.vcpus(),
         ram_bytes,
         hotplug_bytes,
@@ -533,4 +560,23 @@ impl lighter_docker::HostListeners for AgentListeners {
         };
         lighter_docker::parse_listeners(&line)
     }
+}
+
+/// Bridges the LAN card, and says what the guest needs to know: how it gets
+/// its address, and the Mac's own on that network, which a Wi-Fi bridge's
+/// router may offer it and it must refuse.
+fn start_lan(
+    config: &crate::config::Config,
+    home: &std::path::Path,
+) -> Result<(lighter_vmm::lan::Lan, String), String> {
+    let interface = crate::lan::interface(&config.lan_interface)?;
+    let address = crate::lan::address_for_guest(&config.lan_address, &interface)?;
+    let mac = crate::lan::mac(home).map_err(|e| format!("cannot keep the LAN card's MAC: {e}"))?;
+    let (lan, how) = crate::lan::connect(&interface, mac)?;
+    tracing::info!(%interface, %address, how, "LAN card bridged");
+    let mut args = format!(" lighter.lan={address}");
+    if let Some((mac_ip, _)) = crate::lan::mac_address(&interface) {
+        args.push_str(&format!(" lighter.lan_avoid={mac_ip}"));
+    }
+    Ok((lan, args))
 }

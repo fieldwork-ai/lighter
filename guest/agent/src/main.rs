@@ -1252,6 +1252,8 @@ fn handle_control(line: &str) -> String {
         // What host-network containers listen on, for the Mac to forward
         // as it does Docker's published ports (`listeners.rs`).
         (Some("listeners"), _) => listeners::report(),
+        // The LAN card's state, for `lighter status` and `doctor`.
+        (Some("lan"), _) => listeners::lan_report(),
         // Which agents init has had to restart, and how often: one line,
         // `restarts tcp-proxy=2 dns=1`, or `restarts none`.
         (Some("restarts"), _) => format!("restarts {}\n", agent_restarts(

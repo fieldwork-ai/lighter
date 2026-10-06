@@ -36,6 +36,31 @@ pub struct Status {
     /// Running containers' bind mounts from folders on the Mac the machine
     /// does not share.
     pub unshared: Vec<crate::mounts::Unshared>,
+    /// LAN mode's card: the agent's word on it (`address 192.168.50.241/24`,
+    /// `waiting`, `declined <the Mac's address>`), or why the machine
+    /// started without it. None when LAN mode is off.
+    pub lan: Option<LanState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanState {
+    Address(String),
+    Waiting,
+    Declined(String),
+    Missing(String),
+}
+
+impl LanState {
+    pub fn parse(reply: &str) -> Option<LanState> {
+        let rest = reply.trim().strip_prefix("lan")?.trim();
+        Some(match rest.split_once(' ').unwrap_or((rest, "")) {
+            ("address", a) => LanState::Address(a.trim().to_string()),
+            ("waiting", _) => LanState::Waiting,
+            ("declined", a) => LanState::Declined(a.trim().to_string()),
+            ("off", _) => return None,
+            (other, _) => LanState::Missing(other.to_string()),
+        })
+    }
 }
 
 /// The daemon that owns this home, verified with its process generation;
@@ -272,6 +297,18 @@ pub fn status() -> anyhow::Result<Status> {
     };
     let docker = docker_version_until(&socket, Instant::now() + timeout).ok();
     let footprint = pid.and_then(footprint_mib);
+    let lan = if pid.is_some() && crate::config::Config::load().is_ok_and(|c| c.lan) {
+        let home = paths::home().ok();
+        match home
+            .as_ref()
+            .and_then(|h| std::fs::read_to_string(h.join("lan-error")).ok())
+        {
+            Some(why) => Some(LanState::Missing(why.trim().to_string())),
+            None => control("lan").ok().and_then(|r| LanState::parse(&r)),
+        }
+    } else {
+        None
+    };
     let agent_restarts = pid
         .and_then(|_| control("restarts").ok())
         .and_then(|reply| reply.strip_prefix("restarts ").map(str::to_owned))
@@ -286,6 +323,7 @@ pub fn status() -> anyhow::Result<Status> {
         agent_restarts,
         unforwarded,
         unshared,
+        lan,
     })
 }
 
@@ -456,5 +494,24 @@ mod legacy_tests {
             std::io::ErrorKind::WouldBlock
         );
         drop((replacement, docker));
+    }
+}
+
+#[cfg(test)]
+mod lan_state_tests {
+    use super::*;
+
+    #[test]
+    fn the_agents_lan_reply_parses() {
+        assert_eq!(
+            LanState::parse("lan address 192.168.50.241/24\n"),
+            Some(LanState::Address("192.168.50.241/24".into()))
+        );
+        assert_eq!(LanState::parse("lan waiting"), Some(LanState::Waiting));
+        assert_eq!(
+            LanState::parse("lan declined 192.168.50.174"),
+            Some(LanState::Declined("192.168.50.174".into()))
+        );
+        assert_eq!(LanState::parse("lan off"), None);
     }
 }

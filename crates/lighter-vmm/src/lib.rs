@@ -38,6 +38,7 @@ pub mod fdt;
 pub mod footprint;
 pub mod irq;
 pub mod kernel;
+pub mod lan;
 pub mod layout;
 pub mod machine;
 pub mod memory;

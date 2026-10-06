@@ -62,9 +62,14 @@ pub struct Listener {
 }
 
 /// The `listeners` reply: `listeners tcp 0.0.0.0 8123 <id>;udp :: 5353 <id>`,
-/// or `listeners none`, or `listeners error <why>`.
+/// or `listeners none`, or `listeners error <why>`. In LAN mode the same
+/// answer is what the LAN card's firewall lets through (`lighter_lan`).
 pub fn report() -> String {
-    match current() {
+    let found = current();
+    if let Ok(found) = &found {
+        lan_firewall(found);
+    }
+    match found {
         Ok(found) if found.is_empty() => "listeners none\n".into(),
         Ok(found) => {
             let entries: Vec<String> = found
@@ -94,6 +99,64 @@ pub fn current() -> io::Result<Vec<Listener>> {
         }
     }
     Ok(listeners(&sockets, &containers, ephemeral_low()))
+}
+
+/// The ports host-network containers listen on, as the LAN card's
+/// firewall admits them. Written only when they change: one `nft` run,
+/// both sets flushed and filled in one transaction.
+fn lan_firewall(found: &[Listener]) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    if !Path::new("/run/lighter-lan.nft").exists() {
+        return;
+    }
+    let (rules, _) = lan_rules(found);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if last.as_deref() == Some(rules.as_str()) {
+        return;
+    }
+    let applied = std::process::Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().expect("piped").write_all(rules.as_bytes())?;
+            child.wait()
+        });
+    match applied {
+        Ok(status) if status.success() => *last = Some(rules),
+        other => eprintln!("lighter-agent: the LAN firewall's ports were not updated: {other:?}"),
+    }
+}
+
+/// The nft input for [`lan_firewall`], and the ports in it.
+fn lan_rules(found: &[Listener]) -> (String, Vec<(Proto, u16)>) {
+    let mut ports: Vec<(Proto, u16)> = found
+        .iter()
+        .filter(|l| !l.addr.is_loopback())
+        .map(|l| (l.proto, l.port))
+        .collect();
+    ports.sort();
+    ports.dedup();
+    let mut rules = String::from("flush set inet lighter_lan tcp_ports\nflush set inet lighter_lan udp_ports\n");
+    for (proto, set) in [(Proto::Tcp, "tcp_ports"), (Proto::Udp, "udp_ports")] {
+        let list: Vec<String> = ports.iter().filter(|(p, _)| *p == proto).map(|(_, port)| port.to_string()).collect();
+        if !list.is_empty() {
+            rules.push_str(&format!("add element inet lighter_lan {set} {{ {} }}\n", list.join(", ")));
+        }
+    }
+    (rules, ports)
+}
+
+/// The `lan` reply: `lan address 192.168.50.241/24`, `lan waiting`,
+/// `lan declined <the Mac's address>`, or `lan off`.
+pub fn lan_report() -> String {
+    match std::fs::read_to_string("/run/lighter/lan-state") {
+        Ok(state) => format!("lan {}\n", state.trim()),
+        Err(_) => "lan off\n".into(),
+    }
 }
 
 /// The rules, apart from the kernel: a container's sockets only; UDP
@@ -332,6 +395,22 @@ mod tests {
             32768,
         );
         assert_eq!(found.iter().map(|l| l.port).collect::<Vec<_>>(), [5353]);
+    }
+
+    #[test]
+    fn the_lan_firewall_admits_what_is_reachable() {
+        let l = |proto, addr: &str, port| Listener { proto, addr: addr.parse().unwrap(), port, container: "a".into() };
+        let (rules, ports) = lan_rules(&[
+            l(Proto::Tcp, "0.0.0.0", 8123),
+            l(Proto::Tcp, "::", 8123),
+            l(Proto::Udp, "0.0.0.0", 5353),
+            l(Proto::Tcp, "127.0.0.1", 9000),
+        ]);
+        assert_eq!(ports, [(Proto::Tcp, 8123), (Proto::Udp, 5353)], "loopback is not the LAN's");
+        assert!(rules.contains("add element inet lighter_lan tcp_ports { 8123 }"));
+        assert!(rules.contains("add element inet lighter_lan udp_ports { 5353 }"));
+        let (rules, _) = lan_rules(&[]);
+        assert!(!rules.contains("add element"), "an empty set is flushed, not filled");
     }
 
     #[test]

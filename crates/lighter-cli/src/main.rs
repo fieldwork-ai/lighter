@@ -19,6 +19,7 @@ mod context;
 mod doctor;
 mod installation;
 mod instance;
+mod lan;
 mod localnet;
 mod machine;
 mod mounts;
@@ -71,6 +72,17 @@ enum UsbAction {
 }
 
 #[derive(Subcommand)]
+enum LanAction {
+    /// Install lighter's network helper (run with sudo): what puts the
+    /// machine on the Mac's network until lighter has Apple's entitlement.
+    Enable,
+    /// Remove the helper (run with sudo).
+    Disable,
+    /// Whether the helper is installed, and which network cards it can use.
+    Status,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Start the machine and point the Docker CLI at it.
     Start {
@@ -91,6 +103,11 @@ enum Command {
     Usb {
         #[command(subcommand)]
         action: UsbAction,
+    },
+    /// The machine on the Mac's network (LAN mode): its helper.
+    Lan {
+        #[command(subcommand)]
+        action: LanAction,
     },
     /// Restart the machine.
     Restart,
@@ -165,6 +182,19 @@ enum Command {
         /// Stop sharing a folder.
         #[arg(long, value_name = "PATH")]
         unshare: Vec<String>,
+        /// Put the machine on the Mac's network with a card of its own, so a
+        /// host-network container can discover and be discovered (`on` or
+        /// `off`, the default). Needs `sudo lighter lan enable` once.
+        #[arg(long, value_enum)]
+        lan: Option<config::Toggle>,
+        /// Which of the Mac's network cards LAN mode bridges (`auto`, the
+        /// primary, or a name such as `en0`).
+        #[arg(long, value_name = "NAME")]
+        lan_interface: Option<String>,
+        /// The machine's address on the LAN, where the router cannot lease
+        /// one (Wi-Fi, mostly): `192.168.50.240`, or `auto` for DHCP.
+        #[arg(long, value_name = "ADDRESS")]
+        lan_address: Option<String>,
     },
     /// Put the guest's clock right.
     ///
@@ -289,6 +319,11 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             UsbAction::LsSerial => usb::ls_serial(),
         },
         Command::UsbKeeper { parent } => usb::keeper(parent),
+        Command::Lan { action } => match action {
+            LanAction::Enable => lan::enable(),
+            LanAction::Disable => lan::disable(),
+            LanAction::Status => lan::status(),
+        },
         Command::AneHost { port, cache } => {
             ane_host::serve(port, &cache)?;
             Ok(std::process::ExitCode::SUCCESS)
@@ -345,6 +380,9 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             video,
             share,
             unshare,
+            lan,
+            lan_interface,
+            lan_address,
         } => configure(Settings {
             resources,
             cpus,
@@ -359,6 +397,9 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             video,
             share,
             unshare,
+            lan,
+            lan_interface,
+            lan_address,
         }),
         Command::Resync => {
             let now = std::time::SystemTime::now()
@@ -509,6 +550,21 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             port.reason
         );
     }
+    if let Some(lan) = &status.lan {
+        let card = crate::config::Config::load()
+            .ok()
+            .and_then(|c| lan::interface(&c.lan_interface).ok())
+            .map(|i| format!(" on {}{i}", if lan::is_wifi(&i) { "Wi-Fi " } else { "" }))
+            .unwrap_or_default();
+        match lan {
+            machine::LanState::Address(a) => outln!("  lan        {a}{card}"),
+            machine::LanState::Waiting => outln!("  lan        waiting for an address{card}"),
+            machine::LanState::Declined(mac) => outln!(
+                "  lan        no address{card}: the router offered the Mac's own ({mac}); set one with `lighter config --lan-address`"
+            ),
+            machine::LanState::Missing(why) => outln!("  lan        not on the network: {why}"),
+        }
+    }
     for mount in &status.unshared {
         outln!(
             "  mounts     {} binds {}, which is not shared: {}",
@@ -566,6 +622,9 @@ struct Settings {
     video: Option<config::Toggle>,
     share: Vec<String>,
     unshare: Vec<String>,
+    lan: Option<config::Toggle>,
+    lan_interface: Option<String>,
+    lan_address: Option<String>,
 }
 
 /// Writes what `lighter config` was given into `config`, saying whether
@@ -585,6 +644,9 @@ fn apply(config: &mut config::Config, settings: Settings) -> Result<bool, String
         video,
         share,
         unshare,
+        lan,
+        lan_interface,
+        lan_address,
     } = settings;
     let changed = resources.is_some()
         || cpus.is_some()
@@ -598,7 +660,10 @@ fn apply(config: &mut config::Config, settings: Settings) -> Result<bool, String
         || metal.is_some()
         || video.is_some()
         || !share.is_empty()
-        || !unshare.is_empty();
+        || !unshare.is_empty()
+        || lan.is_some()
+        || lan_interface.is_some()
+        || lan_address.is_some();
     for path in &unshare {
         config.unshare(path)?;
     }
@@ -644,6 +709,28 @@ fn apply(config: &mut config::Config, settings: Settings) -> Result<bool, String
     }
     if let Some(video) = video {
         config.video = video.into();
+    }
+    if let Some(lan) = lan {
+        config.lan = lan.into();
+    }
+    if let Some(interface) = lan_interface {
+        if interface != "auto" && !interface.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(format!(
+                "{interface} is not a network card's name (en0, en1)"
+            ));
+        }
+        config.lan_interface = interface;
+    }
+    if let Some(address) = lan_address {
+        let address = if address == "auto" {
+            String::new()
+        } else {
+            address
+        };
+        // Checked now, so a typo is an error here and not a machine that
+        // starts off the network.
+        lan::address_for_guest(&address, "lo0")?;
+        config.lan_address = address;
     }
     if let Some(python) = torch_python {
         config.torch_python = if python == "auto" {
@@ -724,6 +811,23 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
     for share in &config.shares {
         outln!("  share      {share}");
     }
+    if config.lan {
+        outln!(
+            "  lan        on, bridging {}, address {}",
+            if config.lan_interface.is_empty() || config.lan_interface == "auto" {
+                "the primary card"
+            } else {
+                config.lan_interface.as_str()
+            },
+            if config.lan_address.is_empty() {
+                "by DHCP"
+            } else {
+                config.lan_address.as_str()
+            }
+        );
+    } else {
+        outln!("  lan        off");
+    }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -743,6 +847,39 @@ mod tests {
         assert_eq!(apply(&mut config, given), Ok(true));
         assert!(!config.metal && !config.video && !config.gpu);
         assert_eq!(apply(&mut config, Settings::default()), Ok(false));
+    }
+
+    #[test]
+    fn lan_settings_are_applied_and_checked() {
+        let mut config = config::Config::default();
+        let given = Settings {
+            lan: Some(config::Toggle::On),
+            lan_interface: Some("en1".into()),
+            lan_address: Some("192.168.50.240/24".into()),
+            ..Settings::default()
+        };
+        assert_eq!(apply(&mut config, given), Ok(true));
+        assert!(config.lan);
+        assert_eq!(
+            (config.lan_interface.as_str(), config.lan_address.as_str()),
+            ("en1", "192.168.50.240/24")
+        );
+        let auto = Settings {
+            lan_address: Some("auto".into()),
+            ..Settings::default()
+        };
+        apply(&mut config, auto).unwrap();
+        assert_eq!(config.lan_address, "", "auto is DHCP");
+        let bad = Settings {
+            lan_address: Some("192.168.50".into()),
+            ..Settings::default()
+        };
+        assert!(apply(&mut config, bad).is_err());
+        let bad = Settings {
+            lan_interface: Some("en0; rm".into()),
+            ..Settings::default()
+        };
+        assert!(apply(&mut config, bad).is_err());
     }
 
     #[test]

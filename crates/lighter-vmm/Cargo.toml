@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+lighter-vmnet.workspace = true
 lighter-hv.workspace = true
 lighter-docker.workspace = true
 lighter-fs.workspace = true

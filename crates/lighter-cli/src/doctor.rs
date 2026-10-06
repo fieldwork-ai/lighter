@@ -294,6 +294,39 @@ pub fn run() -> Vec<Finding> {
                 )
             });
         }
+        // LAN mode: whether the machine is on the network, and if not, why
+        // and what to do.
+        if crate::config::Config::load().is_ok_and(|c| c.lan) {
+            let state = match std::fs::read_to_string(home.join("lan-error")) {
+                Ok(why) => Some(crate::machine::LanState::Missing(why.trim().to_string())),
+                Err(_) => crate::machine::control("lan")
+                    .ok()
+                    .and_then(|r| crate::machine::LanState::parse(&r)),
+            };
+            findings.push(match state {
+                Some(crate::machine::LanState::Address(a)) => Finding::good("LAN", format!("on the network as {a}")),
+                Some(crate::machine::LanState::Waiting) => Finding::warn(
+                    "LAN",
+                    "the card is up, waiting for the router to lease it an address",
+                    "on Wi-Fi a router may never lease one (the Mac's Wi-Fi carries one MAC); set one outside its DHCP range with `lighter config --lan-address 192.168.x.y` and `lighter restart`",
+                ),
+                Some(crate::machine::LanState::Declined(mac)) => Finding::warn(
+                    "LAN",
+                    format!("no address: the router offered the Mac's own ({mac}), as routers do for a machine bridged over Wi-Fi"),
+                    "set one outside the router's DHCP range with `lighter config --lan-address 192.168.x.y` and `lighter restart`",
+                ),
+                Some(crate::machine::LanState::Missing(why)) => Finding::warn(
+                    "LAN",
+                    format!("not on the network: {why}"),
+                    if crate::lan::installed() {
+                        "check `lighter lan status`, then `lighter restart`"
+                    } else {
+                        "install lighter's network helper with `sudo lighter lan enable`, then `lighter restart`"
+                    },
+                ),
+                None => Finding::warn("LAN", "the machine does not say", "`lighter restart`"),
+            });
+        }
         findings.push(if report.unforwarded.is_empty() {
             Finding::good("published ports", "all forwarded")
         } else {

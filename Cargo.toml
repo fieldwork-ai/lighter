@@ -15,6 +15,7 @@ lighter-hv = { path = "crates/lighter-hv", version = "0.11.7" }
 lighter-vmm = { path = "crates/lighter-vmm", version = "0.11.7" }
 lighter-docker = { path = "crates/lighter-docker", version = "0.11.7" }
 lighter-fs = { path = "crates/lighter-fs", version = "0.11.7" }
+lighter-vmnet = { path = "crates/lighter-vmnet", version = "0.11.7" }
 
 anyhow = "1"
 thiserror = "2"
