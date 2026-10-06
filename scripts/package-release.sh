@@ -108,7 +108,7 @@ echo "==> Signing identity: $IDENTITY"
 
 # --- build -------------------------------------------------------------------
 echo "==> Building lighter-cli release binary"
-cargo build --release -p lighter-cli
+cargo build --release -p lighter-cli -p lighter-bridge
 built_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "lighter-cli"))')"
 [ "$built_version" = "$VERSION" ] || { echo "error: requested version differs from workspace version"; exit 1; }
 # The checkout can be the user's daily-driver wrapper target. Building
@@ -141,6 +141,11 @@ cp entitlements.plist "$STAGE/share/lighter/"
 APP="$STAGE/share/lighter/lighter.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/lighter "$APP/Contents/MacOS/lighter"
+# LAN mode's root helper rides inside the app, so that the app's signature
+# and notarization cover it and the release manifest, which earlier
+# lighters verify by its exact list, does not change (`sudo lighter lan
+# enable` installs it).
+cp target/release/lighter-bridge "$APP/Contents/MacOS/lighter-bridge"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 cp assets/lighter.icns "$APP/Contents/Resources/lighter.icns"
 
@@ -164,6 +169,13 @@ for name in ('bin/lighter', 'share/lighter/Image', 'share/lighter/rootfs.ext4', 
 manifest = dict(schema=1, version=sys.argv[2], kernel_version=(root/'share/lighter/kernel.version').read_text().strip(), data_epoch=1, files=files)
 (root/'share/lighter/lighter.app/Contents/Resources/release.json').write_text(json.dumps(manifest, indent=2)+'\n')
 PYMANIFEST
+# Nested code is signed before the bundle that seals it.
+codesign --sign "$IDENTITY" \
+	--identifier dev.lighter.bridge \
+	--force \
+	--options runtime \
+	--timestamp \
+	"$APP/Contents/MacOS/lighter-bridge"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist"
 
@@ -177,6 +189,7 @@ codesign --sign "$IDENTITY" \
 echo "==> Verifying signatures"
 codesign --verify --verbose=2 "$STAGE/bin/lighter"
 codesign --verify --verbose=2 --deep "$APP"
+codesign --verify --verbose=2 -R='anchor apple generic and identifier "dev.lighter.bridge" and certificate leaf[subject.OU] = "N7N6BNF95K"' "$APP/Contents/MacOS/lighter-bridge"
 
 # --- notarize ----------------------------------------------------------------
 if [ -z "$SKIP_NOTARIZE" ]; then

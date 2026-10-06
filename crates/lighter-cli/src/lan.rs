@@ -313,14 +313,15 @@ pub fn status() -> anyhow::Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// The helper shipped with this lighter: beside the binary in a checkout,
-/// in `share/lighter` in an installation.
+/// The helper shipped with this lighter: inside `lighter.app`, whose
+/// signature covers it, beside the app's own binary or reached from the
+/// installation's `bin`; beside the binary in a checkout.
 fn bundled_helper() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let dir = exe.parent()?;
     [
         dir.join("lighter-bridge"),
-        dir.join("../share/lighter/lighter-bridge"),
+        dir.join("../share/lighter/lighter.app/Contents/MacOS/lighter-bridge"),
     ]
     .into_iter()
     .find(|p| p.exists())
