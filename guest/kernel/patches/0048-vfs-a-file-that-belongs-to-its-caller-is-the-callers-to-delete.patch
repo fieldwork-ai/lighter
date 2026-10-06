@@ -1,0 +1,103 @@
+vfs: a file that belongs to its caller is the caller's in the VFS's own owner checks
+
+Patch 0046 makes a fuse file the Mac user owns, with no owner a container
+recorded, belong to whoever asks: stat, the permission check and setattr
+treat the caller as its owner. The VFS makes owner checks of its own,
+against i_uid, which for such a file is root, so a container running as
+1000 could not delete its own file from a sticky directory (`mkdir -m 1777
+tmp && touch tmp/f && rm tmp/f` failed with EPERM), nor follow or open one
+there under fs.protected_symlinks and fs.protected_regular, nor use
+O_NOATIME, leases or chattr on it. Docker Desktop and OrbStack allow all of
+them.
+
+The fuse inode now carries S_CALLER_OWNS beside 0046's per-inode state, and
+inode_owner_or_capable(), __check_sticky(), may_follow_link() and
+may_create_in_sticky() count the caller as the owner of an inode that has
+it. A flag in i_flags rather than a fuse callback, because these checks run
+in the VFS with no reference to the filesystem's own state. Set only by a
+server that has negotiated FUSE_LIGHTER_CALLER_OWNS, so a stock server sees
+no change.
+
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2525,6 +2525,7 @@
+ #define S_CASEFOLD	(1 << 15) /* Casefolded file */
+ #define S_VERITY	(1 << 16) /* Verity file (using fs/verity/) */
+ #define S_KERNEL_FILE	(1 << 17) /* File is in use by the kernel (eg. fs/cachefiles) */
++#define S_CALLER_OWNS	(1 << 18) /* lighter: belongs to whoever asks (fuse) */
+ #define S_ANON_INODE	(1 << 19) /* Inode is an anonymous inode */
+ 
+ /*
+@@ -3983,6 +3984,17 @@
+ static inline bool is_sxid(umode_t mode)
+ {
+ 	return mode & (S_ISUID | S_ISGID);
++}
++
++/*
++ * lighter: an inode that belongs to whoever asks, as a fuse server marks a
++ * Mac file no container has chowned. i_uid stays what the server sent
++ * (root); for the owner checks the VFS makes itself, the caller is the
++ * owner, as stat and the permission check already have it.
++ */
++static inline bool inode_belongs_to_caller(const struct inode *inode)
++{
++	return inode->i_flags & S_CALLER_OWNS;
+ }
+ 
+ static inline int check_sticky(struct mnt_idmap *idmap,
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -2626,6 +2626,9 @@
+ 	vfsuid_t vfsuid;
+ 	struct user_namespace *ns;
+ 
++	if (inode_belongs_to_caller(inode))
++		return true;
++
+ 	vfsuid = i_uid_into_vfsuid(idmap, inode);
+ 	if (vfsuid_eq_kuid(vfsuid, current_fsuid()))
+ 		return true;
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1176,7 +1176,8 @@
+ 	idmap = mnt_idmap(nd->path.mnt);
+ 	vfsuid = i_uid_into_vfsuid(idmap, inode);
+ 	/* Allowed if owner and follower match. */
+-	if (vfsuid_eq_kuid(vfsuid, current_fsuid()))
++	if (inode_belongs_to_caller(inode) ||
++	    vfsuid_eq_kuid(vfsuid, current_fsuid()))
+ 		return 0;
+ 
+ 	/* Allowed if parent directory not sticky and world-writable. */
+@@ -1314,6 +1315,9 @@
+ 		return 0;
+ 
+ 	if (S_ISFIFO(inode->i_mode) && !sysctl_protected_fifos)
++		return 0;
++
++	if (inode_belongs_to_caller(inode))
+ 		return 0;
+ 
+ 	i_vfsuid = i_uid_into_vfsuid(idmap, inode);
+@@ -3224,6 +3228,8 @@
+ {
+ 	kuid_t fsuid = current_fsuid();
+ 
++	if (inode_belongs_to_caller(inode) || inode_belongs_to_caller(dir))
++		return 0;
+ 	if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), fsuid))
+ 		return 0;
+ 	if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, dir), fsuid))
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -265,6 +265,9 @@
+ 	if (fc->lighter_caller_owns) {
+ 		assign_bit(FUSE_I_LIGHTER_CALLER_UID, &fi->state,
+ 			   attr->flags & FUSE_ATTR_LIGHTER_CALLER_UID);
++		inode_set_flags(inode,
++				attr->flags & FUSE_ATTR_LIGHTER_CALLER_UID ?
++				S_CALLER_OWNS : 0, S_CALLER_OWNS);
+ 		assign_bit(FUSE_I_LIGHTER_CALLER_GID, &fi->state,
+ 			   attr->flags & FUSE_ATTR_LIGHTER_CALLER_GID);
+ 	}

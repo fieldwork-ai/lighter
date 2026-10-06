@@ -210,11 +210,11 @@ pub fn fetch(i: &SelfInstallation, download: bool) -> anyhow::Result<Option<Path
             .map(|m| m.version)
             .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
         if release::stable_version(&version)? <= release::stable_version(&installed)? {
-            println!("Already up to date ({installed}).");
+            outln!("Already up to date ({installed}).");
             return Ok(None);
         }
         if !download {
-            println!("Lighter {version} is available (installed {installed}).");
+            outln!("Lighter {version} is available (installed {installed}).");
             return Ok(None);
         }
         direct(i)?;
@@ -255,7 +255,7 @@ pub fn fetch(i: &SelfInstallation, download: bool) -> anyhow::Result<Option<Path
             fs::rename(root, &final_dir)?;
         }
         s.downloaded = Some(version.clone());
-        println!("Lighter {version} is downloaded and verified. Activate with `lighter upgrade`.");
+        outln!("Lighter {version} is downloaded and verified. Activate with `lighter upgrade`.");
         Ok(Some(final_dir))
     })();
     if let Err(e) = &result {
@@ -357,7 +357,7 @@ pub fn run(action: Action) -> anyhow::Result<()> {
                 save(&i, &s)?;
                 return Err(error);
             }
-            println!(
+            outln!(
                 "Automatic downloads {}. Activation always requires `lighter upgrade`.",
                 if enabled { "enabled" } else { "disabled" }
             );

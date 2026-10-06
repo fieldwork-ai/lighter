@@ -1106,9 +1106,9 @@ impl Server {
             op::GETATTR => self.getattr(nodeid, body),
             op::SETATTR => self.setattr(nodeid, body),
             op::READLINK => self.readlink(nodeid),
-            op::SYMLINK => self.symlink(nodeid, body, (header.uid, header.gid)),
-            op::MKNOD => self.mknod(nodeid, body, (header.uid, header.gid)),
-            op::MKDIR => self.mkdir(nodeid, body, (header.uid, header.gid)),
+            op::SYMLINK => self.symlink(nodeid, body),
+            op::MKNOD => self.mknod(nodeid, body),
+            op::MKDIR => self.mkdir(nodeid, body),
             op::UNLINK => self.unlink(nodeid, body, false),
             op::RMDIR => self.unlink(nodeid, body, true),
             op::RENAME => self.rename(nodeid, body, false),
@@ -1120,7 +1120,7 @@ impl Server {
             // buys and what it costs.
             op::OPEN | op::OPENDIR => Err(linux::ENOSYS),
 
-            op::CREATE => self.create(nodeid, body, (header.uid, header.gid)),
+            op::CREATE => self.create(nodeid, body),
             op::LIGHTER_CLONE => self.clone_over(header.nodeid, body),
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
@@ -1862,9 +1862,8 @@ impl Server {
             return None;
         }
         let owner = match inode.owner() {
-            // A pending inode has no host file to read yet. Only a root
-            // caller's create is ever acknowledged ahead of the host (see
-            // `recording_creator`), so it has no record to read either.
+            // A pending inode has no host file to read yet, and no record:
+            // a create records no owner, only a chown does.
             Owner::Unknown if inode.is_pending() => return None,
             Owner::Unknown => {
                 let unmarked = match parent {
@@ -2001,41 +2000,6 @@ impl Server {
                 "could not mark the share as recording owners; they will be read again only after the next chown"
             ),
         }
-    }
-
-    /// The owner to record for a file a container creates: its caller,
-    /// unless that is root, which the Mac user already appears as.
-    fn recording_creator(caller: (u32, u32)) -> Option<(u32, u32)> {
-        (caller != (0, 0)).then_some(caller)
-    }
-
-    /// Records a non-root caller as the owner of what it has just created,
-    /// and says so in the reply. A record that cannot be written takes the
-    /// new entry with it: the guest is answered with the error, and a file
-    /// left on the Mac would answer its retry with EEXIST.
-    fn record_creator(
-        &self,
-        parent: &Inode,
-        name: &CStr,
-        entry: &mut EntryOut,
-        owner: (u32, u32),
-    ) -> Result<(), i32> {
-        let mut path = self.path(parent)?.into_bytes();
-        path.push(b'/');
-        path.extend_from_slice(name.to_bytes());
-        let path = std::ffi::CString::new(path).map_err(|_| linux::EINVAL)?;
-        let inode = self.registry.get(entry.nodeid).ok_or(linux::ESTALE)?;
-        if let Err(errno) = self.record_owner(&inode, Some(parent), &path, owner, entry.attr.mode) {
-            let dir = entry.attr.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
-            if let Err(undo) = sys::unlink_at(libc::AT_FDCWD, &path, dir) {
-                tracing::warn!(errno, undo, path = %path.to_string_lossy(), "a create whose owner could not be recorded was left behind");
-            }
-            self.forget(entry.nodeid, 1);
-            return Err(errno);
-        }
-        (entry.attr.uid, entry.attr.gid) = owner;
-        entry.attr.flags = 0;
-        Ok(())
     }
 
     /// The owner a SETATTR asks for, in the guest's numbering: each half the
@@ -2636,34 +2600,28 @@ impl Server {
         sys::readlink_at(libc::AT_FDCWD, &path)
     }
 
-    fn symlink(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
+    fn symlink(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let (name, rest) = get_name(body).ok_or(linux::EINVAL)?;
         let (target, _) = get_name(rest).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let target = CString::new(target).map_err(|_| linux::EINVAL)?;
-        let creator = Self::recording_creator(caller);
-        if creator.is_none()
-            && let Some(reply) = self.name_pending(
-                &parent,
-                &name,
-                crate::inode::PendingKind::Symlink,
-                libc::S_IFLNK as u32 | 0o777,
-                Some(target.clone()),
-            )?
-        {
+        if let Some(reply) = self.name_pending(
+            &parent,
+            &name,
+            crate::inode::PendingKind::Symlink,
+            libc::S_IFLNK as u32 | 0o777,
+            Some(target.clone()),
+        )? {
             return Ok(reply);
         }
         self.settle_while(&parent, |parent| parent.is_pending());
         sys::symlink_at(&target, parent.reference()?.raw_fd(), &name)?;
-        let mut entry = self.entry(&parent, &name)?;
-        if let Some(owner) = creator {
-            self.record_creator(&parent, &name, &mut entry, owner)?;
-        }
+        let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
 
-    fn mknod(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
+    fn mknod(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         self.settle_while(&parent, |parent| parent.is_pending());
         let mode = get_u32(body, 0).ok_or(linux::EINVAL)?;
@@ -2672,40 +2630,29 @@ impl Server {
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         parent.under_name(&name, |dir, at| sys::mknod_at(dir, at, mode & !umask, rdev))?;
-        let mut entry = self.entry(&parent, &name)?;
-        if let Some(owner) = Self::recording_creator(caller) {
-            self.record_creator(&parent, &name, &mut entry, owner)?;
-        }
+        let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
 
-    fn mkdir(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
+    fn mkdir(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let mode = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let umask = get_u32(body, 4).unwrap_or(0);
         let (name, _) = get_name(body.get(8..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         let mode = mode & 0o7777 & !umask;
-        // A non-root caller's create is made on the host before the reply,
-        // so that its owner is on the file before anything can ask.
-        let creator = Self::recording_creator(caller);
-        if creator.is_none()
-            && let Some(reply) = self.name_pending(
-                &parent,
-                &name,
-                crate::inode::PendingKind::Directory,
-                libc::S_IFDIR as u32 | mode,
-                None,
-            )?
-        {
+        if let Some(reply) = self.name_pending(
+            &parent,
+            &name,
+            crate::inode::PendingKind::Directory,
+            libc::S_IFDIR as u32 | mode,
+            None,
+        )? {
             return Ok(reply);
         }
         self.settle_while(&parent, |parent| parent.is_pending());
         parent.under_name(&name, |dir, at| sys::mkdir_at(dir, at, mode))?;
-        let mut entry = self.entry(&parent, &name)?;
-        if let Some(owner) = creator {
-            self.record_creator(&parent, &name, &mut entry, owner)?;
-        }
+        let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
     }
 
@@ -4216,7 +4163,7 @@ impl Server {
         }
     }
 
-    fn create(&self, parent: u64, body: &[u8], caller: (u32, u32)) -> Result<Vec<u8>, i32> {
+    fn create(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let flags = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let mode = get_u32(body, 4).ok_or(linux::EINVAL)?;
@@ -4238,9 +4185,7 @@ impl Server {
         const LINUX_O_EXCL: u32 = 0o200;
         const LINUX_O_NOFOLLOW: u32 = 0o400000;
         const LINUX_O_APPEND: u32 = 0o2000;
-        let creator = Self::recording_creator(caller);
-        if creator.is_none()
-            && self.apply.accepting()
+        if self.apply.accepting()
             && let Some(reply) =
                 self.create_pending(&parent, &name, flags, mode & 0o7777 & !umask)?
         {
@@ -4311,11 +4256,8 @@ impl Server {
         if st.st_mode & 0o170000 == 0o040000 {
             return Err(linux::EISDIR);
         }
-        let mut entry =
+        let entry =
             self.entry_with_reference(&parent, st, self.apply.applied(), || sys::dup(&fd))?;
-        if created && let Some(owner) = creator {
-            self.record_creator(&parent, &name, &mut entry, owner)?;
-        }
         // No handle: the guest never sends RELEASE for a file it CREATEd once
         // OPEN has answered ENOSYS (6.18 `fuse_file_put` ends the release
         // locally under `no_open`), so a descriptor named by `fh` would be

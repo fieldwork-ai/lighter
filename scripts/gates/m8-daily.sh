@@ -60,7 +60,9 @@ with open(sys.argv[1], 'a') as f:
 PYOWNER
 fi
 
+NEVER_CLOSES=""
 cleanup() {
+	[ -n "$NEVER_CLOSES" ] && kill "$NEVER_CLOSES" 2>/dev/null
 	docker compose -f "$COMPOSE" down -v --timeout 10 >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	rm -rf "$SHARE" "$LIGHTER_HOME"
@@ -175,6 +177,93 @@ case "$served" in
 *edited*) pass "the change reached the container" ;;
 *) fail "the container still serves: ${served:-nothing}" ;;
 esac
+
+echo
+echo "==> Connections a container closed, to a server that never closes its end"
+# Home Assistant lost every outbound connection after a night (#57): each
+# poll of a device that keeps idle connections open left the outbound proxy
+# holding four descriptors for good once the container closed its end,
+# until it had none. The proxy probes a container's side once it is quiet,
+# and lets a stream go when that side is gone.
+PORT_FILE="$(mktemp -t lighter-m8-port)"
+python3 - "$PORT_FILE" <<'PY' &
+import socket, sys
+s = socket.socket()
+s.bind(("0.0.0.0", 0))
+s.listen(512)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+held = []
+while True:
+    held.append(s.accept()[0])
+PY
+NEVER_CLOSES=$!
+for _ in $(seq 1 50); do [ -s "$PORT_FILE" ] && break; sleep 0.1; done
+NC_PORT="$(cat "$PORT_FILE")"
+rm -f "$PORT_FILE"
+proxy_fds() {
+	docker run --rm --pid=host --privileged alpine:3.21 sh -c \
+		'for p in $(pidof lighter-agent); do if grep -q tcp-proxy /proc/$p/cmdline; then ls /proc/$p/fd | wc -l; fi; done' 2>/dev/null \
+		|| echo 0
+}
+# The other half of the rule, alongside: a container that only shuts down
+# its writes keeps its stream, past the probes, for a reply that comes
+# late. The server reads to end of file and answers 75 s later.
+LATE_FILE="$(mktemp -t lighter-m8-late)"
+python3 - "$LATE_FILE" <<'PY' &
+import socket, sys, time
+s = socket.socket()
+s.bind(("0.0.0.0", 0))
+s.listen(1)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+c = s.accept()[0]
+while c.recv(4096):
+    pass
+time.sleep(75)
+c.sendall(b"late")
+c.close()
+PY
+LATE_SERVER=$!
+for _ in $(seq 1 50); do [ -s "$LATE_FILE" ] && break; sleep 0.1; done
+LATE_PORT="$(cat "$LATE_FILE")"
+docker pull -q python:3.12-slim >/dev/null
+docker run --rm python:3.12-slim python3 -c "
+import socket
+c = socket.create_connection(('host.docker.internal', $LATE_PORT))
+c.sendall(b'request')
+c.shutdown(socket.SHUT_WR)
+c.settimeout(150)
+print(c.recv(16).decode())" > "$LATE_FILE" 2>&1 &
+LATE_CLIENT=$!
+before="$(proxy_fds)"
+# All at once: each `nc -w 1` waits out its second on a server that never
+# closes, and two hundred in turn would take long enough for the proxy to
+# let the first go before the count. Its exit status says it gave up, which
+# is not what is measured.
+docker run --rm alpine:3.21 sh -c "for i in \$(seq 1 200); do printf x | nc -w 1 host.docker.internal $NC_PORT >/dev/null 2>&1 & done; wait; true"
+held=$(( $(proxy_fds) - before ))
+started="$(date +%s)"
+left="$held"
+while [ "$left" -gt 8 ] && [ $(( $(date +%s) - started )) -lt 180 ]; do
+	sleep 5
+	left=$(( $(proxy_fds) - before ))
+done
+if [ "$held" -lt 400 ]; then
+	fail "the proxy held only $held descriptors for 200 half-closed streams; the check did not exercise them"
+elif [ "$left" -le 8 ]; then
+	pass "200 streams the container closed, to a server that never does, let go within $(( $(date +%s) - started ))s ($held descriptors back)"
+else
+	fail "the proxy still holds $left of $held descriptors after 180s"
+fi
+kill "$NEVER_CLOSES" 2>/dev/null
+NEVER_CLOSES=""
+wait "$LATE_CLIENT" 2>/dev/null || true
+if [ "$(cat "$LATE_FILE")" = late ]; then
+	pass "a container that only shut down its writes still got a reply 75s later"
+else
+	fail "a half-closed stream lost its late reply: $(tail -1 "$LATE_FILE")"
+fi
+kill "$LATE_SERVER" 2>/dev/null || true
+rm -f "$LATE_FILE"
 
 echo
 echo "==> What a closed lid does"

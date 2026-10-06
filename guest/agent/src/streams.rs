@@ -50,6 +50,14 @@ const PIPE: usize = 4 << 20;
 const REFUSED_WINDOW: Duration = Duration::from_secs(30);
 /// How long a v6 dial waits to see whether Docker's proxy hangs up on it.
 const V6_HANGUP_WAIT: Duration = Duration::from_millis(50);
+/// Keepalive on a container's side of an outbound stream: idle seconds
+/// before the first probe, seconds between probes, and probes unanswered
+/// before the socket fails. See [`keep_alive`].
+const KEEPALIVE: [libc::c_int; 3] = [30, 10, 3];
+/// Accepting a continuous backlog must leave time to carry and close the
+/// streams already held. The listener is level-triggered, so the next turn
+/// sees any connections left queued.
+const ACCEPT_BATCH: usize = 256;
 
 pub fn serve(listener: OwnedFd, route: Route, env: Env) -> std::process::ExitCode {
     let mut lp = match Loop::new(listener, route, env) {
@@ -163,7 +171,7 @@ impl Loop {
     }
 
     fn accept_all(&mut self, now: Instant) {
-        loop {
+        for _ in 0..ACCEPT_BATCH {
             // SAFETY: accepting on a live listener with no interest in the
             // peer address.
             let raw = unsafe {
@@ -176,12 +184,13 @@ impl Loop {
                     Some(libc::EAGAIN) => return,
                     Some(libc::EINTR) | Some(libc::ECONNABORTED) | Some(libc::EPROTO) => continue,
                     Some(libc::EMFILE) | Some(libc::ENFILE) => {
-                        ran_out("descriptors", &e);
-                        if !self.shed() {
-                            self.pause_listening(now);
-                            return;
-                        }
-                        continue;
+                        self.shed(&e);
+                        // A successful shed does not make room: the spare
+                        // was reopened. Carry and close existing streams
+                        // before accepting again, even if clients retry
+                        // fast enough to keep the listener readable.
+                        self.pause_listening(now);
+                        return;
                     }
                     _ => {
                         ran_out("memory for a connection", &e);
@@ -207,9 +216,11 @@ impl Loop {
     }
 
     /// Accepts and drops one waiting connection with the spare descriptor.
-    fn shed(&mut self) -> bool {
-        let Some(spare) = self.spare.take() else { return false };
-        drop(spare);
+    fn shed(&mut self, error: &io::Error) {
+        // Diagnostics also open files. Release the spare before reading
+        // /proc, otherwise EMFILE makes every resource count unavailable.
+        drop(self.spare.take());
+        ran_out("descriptors", error);
         // SAFETY: as in accept_all.
         let raw = unsafe {
             libc::accept4(self.listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC)
@@ -219,7 +230,6 @@ impl Loop {
             drop(unsafe { OwnedFd::from_raw_fd(raw) });
         }
         self.spare = open_spare();
-        raw >= 0
     }
 
     /// Stops accepting for a moment rather than spinning on a failure that
@@ -408,6 +418,7 @@ impl Conn {
                         return None;
                     }
                 }
+                keep_alive(a.as_raw_fd());
                 let mut conn = Conn::new(a, true, State::Dialing, now);
                 conn.dst = Some(dst);
                 conn.wide = crate::accelerator::Wide::open(dst.port());
@@ -840,6 +851,15 @@ impl Conn {
         if forward == Pumped::Done && back == Pumped::Done {
             return Some(Step::Close);
         }
+        // One direction done and the other waiting on its reader: if either
+        // socket has failed, as a container's does once keepalive finds it
+        // gone, nothing more can arrive or be delivered, and waiting would
+        // hold the stream as long as the far end keeps its side open.
+        if (forward == Pumped::Done || back == Pumped::Done)
+            && poll_now(&[a, b], 0).iter().any(|r| r & (libc::POLLERR | libc::POLLNVAL) != 0)
+        {
+            return Some(Step::Close);
+        }
         self.at = [forward, back].iter().filter_map(|p| if let Pumped::RetryAt(t) = p { Some(*t) } else { None }).min();
         None
     }
@@ -1096,6 +1116,31 @@ fn nodelay(fd: RawFd) {
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, std::ptr::addr_of!(one).cast(),
             size_of::<libc::c_int>() as libc::socklen_t)
     };
+}
+
+/// Probes a container's side of an outbound stream once it falls quiet. A
+/// container that closes its end leaves the stream half closed, which is
+/// also what a container that only shut down its writes looks like, and the
+/// far end may never close its own (#57: Home Assistant's polls of devices
+/// that keep idle connections open, until the agent ran out of descriptors).
+/// A socket shut for writing still answers the probes; a closed one stops
+/// existing once its kernel stops waiting for this side's FIN (a minute),
+/// the next probe draws a reset, and the error ends the stream.
+fn keep_alive(fd: RawFd) {
+    let one: libc::c_int = 1;
+    let [idle, interval, count] = KEEPALIVE;
+    // SAFETY: int-sized options on a live socket.
+    unsafe {
+        for (level, name, value) in [
+            (libc::SOL_SOCKET, libc::SO_KEEPALIVE, one),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, interval),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, count),
+        ] {
+            libc::setsockopt(fd, level, name, std::ptr::addr_of!(value).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
 }
 
 fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
@@ -1453,5 +1498,184 @@ mod tests {
         let env = Env { dial_host: dial_fake_host, destination: to_10_1_2_3, joiner: None, host_window: Duration::from_secs(1) };
         let _t = run(Loop::new(l, Route::Unix(path), env).unwrap());
         assert_eq!(round_trip(port, b"ping"), b"reply to ping");
+    }
+
+    /// File limits are per process: isolate the shortage from the other
+    /// tests and put a timeout around a loop that used to shed indefinitely.
+    #[test]
+    fn descriptor_exhaustion_drains_finished_streams_before_shedding_more_clients() {
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "LIGHTER_TEST_EMFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "streams::tests::descriptor_exhaustion_drains_finished_streams_before_shedding_more_clients", "--nocapture"])
+                .env(CHILD, "1").stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().unwrap();
+            let started = Instant::now();
+            while child.try_wait().unwrap().is_none() {
+                if started.elapsed() > Duration::from_secs(10) {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("stream loop did not recover: {}", String::from_utf8_lossy(&output.stderr));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            let log = String::from_utf8_lossy(&output.stderr);
+            assert!(log.contains("out of descriptors"), "the fixture must actually reach EMFILE");
+            assert!(!log.contains("tasks ?"), "diagnostics need room to read /proc");
+            assert!(!log.contains("this process's descriptors 0"), "descriptor count must remain available");
+            return;
+        }
+
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = std::env::temp_dir().join(format!("lighter-emfile-{}.sock", std::process::id()));
+        let server = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).unwrap();
+            socket.write_all(b"reply to ").unwrap();
+            socket.write_all(&request).unwrap();
+        });
+        let (listener, port) = listener();
+        let mut lp = Loop::new(listener, Route::Unix(path.clone()), outbound_env()).unwrap();
+
+        // A finished stream still owns two descriptors until the loop
+        // drives it. Its peers have closed, so both directions can finish.
+        let (a, peer_a) = UnixStream::pair().unwrap();
+        let (b, peer_b) = UnixStream::pair().unwrap();
+        drop(peer_a);
+        drop(peer_b);
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        set_nonblocking(b.as_raw_fd()).unwrap();
+        let mut finished = Conn::new(a.into(), false, State::Copying, Instant::now());
+        finished.b = Some(b.into());
+        (finished.watched_a, finished.watched_b) = finished.interest();
+        lp.watch(libc::EPOLL_CTL_ADD, finished.a.as_raw_fd(), 0, finished.watched_a).unwrap();
+        lp.watch(libc::EPOLL_CTL_ADD, finished.b.as_ref().unwrap().as_raw_fd(), 1, finished.watched_b).unwrap();
+        lp.conns.insert(0, finished);
+        lp.next = 1;
+
+        // Only one queued client must be refused. The next can be served
+        // once the finished stream releases its descriptors.
+        let _refused = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut queued = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        queued.write_all(b"ping").unwrap();
+        queued.shutdown(std::net::Shutdown::Write).unwrap();
+        queued.set_nonblocking(true).unwrap();
+
+        // SAFETY: this test runs alone in its child process. Preserve the
+        // hard limit; the child exits without affecting the parent.
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        limit.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut held = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        lp.turn(Some(Duration::ZERO));
+        assert!(lp.conns.is_empty(), "the finished stream must be closed under EMFILE");
+        // Leave room for the fixture server's accept and copying path.
+        for _ in 0..10 { held.pop(); }
+        let started = Instant::now();
+        let mut response = Vec::new();
+        loop {
+            lp.turn(Some(Duration::from_millis(10)));
+            let mut buf = [0; 64];
+            match queued.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("queued client was needlessly refused: {error}"),
+            }
+            assert!(started.elapsed() < Duration::from_secs(3), "queued client did not recover");
+        }
+        assert_eq!(response, b"reply to ping");
+        server.join().unwrap();
+        drop(lp);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn int_option(fd: RawFd, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut value: libc::c_int = -1;
+        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: an int for the option to fill, on a live socket.
+        assert_eq!(unsafe { libc::getsockopt(fd, level, name, std::ptr::addr_of_mut!(value).cast(), &mut len) }, 0);
+        value
+    }
+
+    #[test]
+    fn a_containers_side_is_probed_once_quiet() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, _) = l.accept().unwrap();
+        keep_alive(a.as_raw_fd());
+        let fd = a.as_raw_fd();
+        assert_eq!(int_option(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), KEEPALIVE[0]);
+        assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), KEEPALIVE[1]);
+        assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT), KEEPALIVE[2]);
+    }
+
+    /// A container that shuts down its writes keeps its stream: the far end
+    /// may still answer. One whose socket then fails, as it does once the
+    /// probes find it gone, loses the stream even though the far end never
+    /// closes its own side (#57: four descriptors held per such stream,
+    /// until the agent had none).
+    #[test]
+    fn a_half_closed_stream_ends_when_the_containers_side_fails() {
+        use std::os::unix::net::UnixStream;
+        let (listener, _) = listener();
+        let mut lp = Loop::new(listener, Route::Outbound, outbound_env()).unwrap();
+
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let container = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, _) = l.accept().unwrap();
+        let (b, far) = UnixStream::pair().unwrap();
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        set_nonblocking(b.as_raw_fd()).unwrap();
+        let mut conn = Conn::new(a.into(), true, State::Copying, Instant::now());
+        conn.b = Some(b.into());
+        (conn.watched_a, conn.watched_b) = conn.interest();
+        lp.watch(libc::EPOLL_CTL_ADD, conn.a.as_raw_fd(), 0, conn.watched_a).unwrap();
+        lp.watch(libc::EPOLL_CTL_ADD, conn.b.as_ref().unwrap().as_raw_fd(), 1, conn.watched_b).unwrap();
+        lp.conns.insert(0, conn);
+        lp.next = 1;
+
+        container.shutdown(std::net::Shutdown::Write).unwrap();
+        for _ in 0..20 {
+            lp.turn(Some(Duration::from_millis(10)));
+        }
+        assert_eq!(lp.conns.len(), 1, "a half-closed stream is still a stream");
+        let mut eof = [0u8; 1];
+        far.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!((&far).read(&mut eof).unwrap(), 0, "the far end is told the container is done");
+
+        // Reset, as the container's kernel answers a probe once its socket
+        // is gone.
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        // SAFETY: a linger struct on a live socket.
+        unsafe {
+            libc::setsockopt(container.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(), size_of::<libc::linger>() as libc::socklen_t);
+        }
+        drop(container);
+        let started = Instant::now();
+        while !lp.conns.is_empty() {
+            lp.turn(Some(Duration::from_millis(10)));
+            assert!(started.elapsed() < Duration::from_secs(3), "the stream outlived its container's socket");
+        }
+        drop(far);
     }
 }

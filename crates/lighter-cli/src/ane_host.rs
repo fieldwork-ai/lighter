@@ -185,13 +185,13 @@ pub fn serve(port: u16, cache: &Path) -> anyhow::Result<()> {
         .init();
     match lighter_vmm::ane::Server::start_at(port, Some(cache)) {
         Ok(_server) => {
-            println!("ready");
+            outln!("ready");
             loop {
                 std::thread::park();
             }
         }
         Err(e) => {
-            println!("{e}");
+            outln!("{e}");
             Err(e.into())
         }
     }
