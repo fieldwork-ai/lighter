@@ -368,8 +368,8 @@ else
 		fi
 		if [ "$(stat -f %u "$SHARE/owned/config.yml")" = "$(id -u)" ] \
 			&& [ "$(xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/config.yml" 2>/dev/null)" = '{"UID":1000,"GID":1000,"mode":644}' ] \
-			&& [ -n "$(xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/recordings/1.mp4" 2>/dev/null)" ]; then
-			pass "on the Mac the files stay yours, the owner recorded as Docker Desktop records it"
+			&& ! xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/recordings/1.mp4" >/dev/null 2>&1; then
+			pass "on the Mac the files stay yours, a chown recorded as Docker Desktop records it and a create not at all"
 		else
 			fail "Mac owner $(stat -f %u "$SHARE/owned/config.yml"), record: $(xattr -p com.docker.grpcfuse.ownership "$SHARE/owned/config.yml" 2>&1)"
 		fi
@@ -498,6 +498,51 @@ else
 			sed 's/^/    /' "$RUN_DIR/docker.err" | tail -5
 		fi
 		chmod -R u+w "$SHARE/repo" 2>/dev/null || true
+
+		# What one non-root container creates, another can write (issue
+		# #55): a build container as the Mac user's 501:20 and an agent
+		# sandbox as 1000 shared a checkout, and each locked the other out
+		# of every directory it had made. A create records no owner, so it
+		# belongs to whoever asks, as under Docker Desktop and OrbStack.
+		mkdir -p "$SHARE/both"
+		chmod 777 "$SHARE/both"
+		u() { docker run --rm --user "$1" -v "$MOUNT/both:/w" alpine:3.21 sh -c "$2" 2>>"$RUN_DIR/docker.err"; }
+		if u "$(id -u):$(id -g)" 'mkdir /w/target && echo a > /w/target/a' \
+			&& u 1000:1000 'touch /w/target/b && mkdir /w/out && echo c > /w/out/c' \
+			&& u "$(id -u):$(id -g)" 'touch /w/out/d && echo more >> /w/out/c' \
+			&& ! xattr -p com.docker.grpcfuse.ownership "$SHARE/both/target" >/dev/null 2>&1 \
+			&& ! xattr -p com.docker.grpcfuse.ownership "$SHARE/both/out/c" >/dev/null 2>&1; then
+			pass "two non-root users write in what each other created, and a create records no owner"
+		else
+			fail "one container user is locked out of what another created"
+			sed 's/^/    /' "$RUN_DIR/docker.err" | tail -5
+		fi
+
+		# The VFS's own owner checks agree (patch 0048): a sticky directory
+		# lets a caller remove what belongs to it, a container's file or a
+		# Mac one, and with protected_symlinks and protected_regular on it
+		# follows and reopens its own, while a file chowned to someone else
+		# stays out of reach.
+		mkdir -p "$SHARE/sticky"
+		chmod 1777 "$SHARE/sticky"
+		printf 'x\n' > "$SHARE/sticky/macfile"
+		if u 1000:1000 'mkdir /w/s && chmod 1777 /w/s && touch /w/s/f && rm /w/s/f' \
+			&& docker run --rm --user 1000:1000 -v "$MOUNT/sticky:/w" alpine:3.21 rm /w/macfile 2>>"$RUN_DIR/docker.err"; then
+			pass "a non-root caller removes its own file and a Mac file from a sticky directory"
+		else
+			fail "a sticky directory refused a caller its own file"
+			sed 's/^/    /' "$RUN_DIR/docker.err" | tail -3
+		fi
+		if docker run --rm --privileged alpine:3.21 sysctl -qw fs.protected_symlinks=1 fs.protected_regular=2 \
+			&& u 1000:1000 'cd /w/s && echo hi > target && ln -s target l && cat l >/dev/null && echo a > f && echo b >> f' \
+			&& docker run --rm -v "$MOUNT/both:/w" alpine:3.21 sh -c 'touch /w/s/theirs && chown 2000:2000 /w/s/theirs' \
+			&& ! u 1000:1000 'echo no >> /w/s/theirs' 2>/dev/null; then
+			pass "with protected_symlinks and protected_regular on, a caller follows and reopens its own, and not another's"
+		else
+			fail "the sticky-directory protections misjudge who owns what"
+			sed 's/^/    /' "$RUN_DIR/docker.err" | tail -3
+		fi
+		docker run --rm --privileged alpine:3.21 sysctl -qw fs.protected_symlinks=0 fs.protected_regular=0 >/dev/null 2>&1 || true
 		unset DOCKER_HOST
 	else
 		fail "the Docker guest did not come up"
