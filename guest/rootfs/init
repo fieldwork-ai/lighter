@@ -787,6 +787,11 @@ table inet lighter {
 	chain inbound {
 		type route hook output priority mangle; policy accept;
 		meta mark 0x4c494e42 ct mark set meta mark
+		# The same for a host-network container's reply: its server is in
+		# this namespace, so the reply is local output rather than
+		# prerouting, and left by eth0 for a client the agent was standing
+		# in for. The mark set here re-routes it, by the same policy route.
+		ct direction reply ct mark 0x4c494e42 meta mark set 0x4c494e43
 	}
 }
 EOF

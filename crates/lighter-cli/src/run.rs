@@ -318,7 +318,21 @@ pub fn machine() -> anyhow::Result<()> {
         crate::config::Publish::Localhost => lighter_vmm::streams::Scope::Localhost,
     };
     let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock(), scope);
-    let ports = lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper, port_health)?;
+    // And what a host-network container listens on, which Docker has no
+    // port bindings to report (#60): the agent finds it from the guest's
+    // sockets, and is asked only while such a container runs.
+    let listeners: Arc<dyn lighter_docker::HostListeners> =
+        Arc::new(AgentListeners::new(home.join("control.sock")));
+    let ports = lighter_docker::PortWatcher::start_with(
+        &paths::docker_socket()?,
+        mapper,
+        port_health,
+        Some(listeners),
+        vec![
+            lighter_vmm::net::GUEST.into(),
+            lighter_vmm::net::GUEST6.into(),
+        ],
+    )?;
 
     // A Mac that slept wakes with a guest whose clock did not.
     let _power = lighter_vmm::wake::Watcher::start(Box::new(Resync {
@@ -463,4 +477,60 @@ extern "C" fn handle_prepare_stop(_signal: libc::c_int) {
 extern "C" fn handle_stop(signal: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Release);
     handle_prepare_stop(signal);
+}
+
+/// Host-network containers' listeners, asked of the agent over the
+/// machine's control channel. One connection, kept: the watcher asks once a
+/// second while a host-network container runs.
+struct AgentListeners {
+    socket: std::path::PathBuf,
+    stream: std::sync::Mutex<Option<std::io::BufReader<std::os::unix::net::UnixStream>>>,
+}
+
+impl AgentListeners {
+    fn new(socket: std::path::PathBuf) -> AgentListeners {
+        AgentListeners {
+            socket,
+            stream: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn ask(
+        &self,
+        slot: &mut Option<std::io::BufReader<std::os::unix::net::UnixStream>>,
+    ) -> std::io::Result<String> {
+        use std::io::{BufRead, Write};
+        if slot.is_none() {
+            let stream = std::os::unix::net::UnixStream::connect(&self.socket)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+            *slot = Some(std::io::BufReader::new(stream));
+        }
+        let reader = slot.as_mut().expect("just connected");
+        reader.get_mut().write_all(b"listeners\n")?;
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::other("the control channel closed"));
+        }
+        Ok(line)
+    }
+}
+
+impl lighter_docker::HostListeners for AgentListeners {
+    fn listeners(&self) -> Result<Vec<lighter_docker::HostListener>, String> {
+        let mut slot = self.stream.lock().expect("listener channel poisoned");
+        // Once more on a fresh connection: the kept one may have closed
+        // since the last question (the agent restarted, the guest rebooted).
+        let line = match self.ask(&mut slot) {
+            Ok(line) => line,
+            Err(_) => {
+                *slot = None;
+                self.ask(&mut slot).map_err(|e| {
+                    *slot = None;
+                    e.to_string()
+                })?
+            }
+        };
+        lighter_docker::parse_listeners(&line)
+    }
 }

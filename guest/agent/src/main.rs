@@ -16,6 +16,7 @@
 mod accelerator;
 mod idle;
 mod inbound;
+mod listeners;
 mod memory_policy;
 mod sockmap;
 mod streams;
@@ -98,6 +99,12 @@ fn main() -> std::process::ExitCode {
             // USB devices from the Mac: each on a vsock stream, attached to
             // vhci-hcd, with /dev/serial/by-id kept (see usb.rs).
             "--usb" => usb = args.next().and_then(|v| v.parse().ok()),
+            // What host-network containers listen on, once, as the
+            // control verb answers it: for looking from a shell.
+            "--listeners" => {
+                print!("{}", listeners::report());
+                return std::process::ExitCode::SUCCESS;
+            }
             "--bpf-rollback-test" => {
                 return match sockmap::check_failed_join() {
                     Ok(()) => std::process::ExitCode::SUCCESS,
@@ -1242,6 +1249,9 @@ fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
         (Some("ping"), _) => "pong\n".into(),
+        // What host-network containers listen on, for the Mac to forward
+        // as it does Docker's published ports (`listeners.rs`).
+        (Some("listeners"), _) => listeners::report(),
         // Which agents init has had to restart, and how often: one line,
         // `restarts tcp-proxy=2 dns=1`, or `restarts none`.
         (Some("restarts"), _) => format!("restarts {}\n", agent_restarts(

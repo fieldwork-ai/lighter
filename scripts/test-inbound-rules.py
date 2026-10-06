@@ -42,6 +42,14 @@ class InboundRules(unittest.TestCase):
     def test_the_inbound_mark_reaches_the_connection(self):
         self.assertIn(f'meta mark {self.mark:#x} ct mark set meta mark', INIT)
 
+    def test_local_replies_route_back_too(self):
+        # A host-network container answers from this namespace: its reply is
+        # output, not prerouting, and needs the same mark there.
+        output = INIT[INIT.index('chain inbound {'):]
+        output = output[:output.index('}')]
+        self.assertIn('type route hook output', output)
+        self.assertRegex(output, rf'ct direction reply ct mark {self.mark:#x} meta mark set 0x[0-9a-f]+')
+
     def test_replies_route_by_a_mark_of_their_own(self):
         reply = re.search(rf'ct mark {self.mark:#x} meta mark set (0x[0-9a-f]+)', INIT)
         self.assertTrue(reply, 'the reply rule')
