@@ -50,6 +50,10 @@ const PIPE: usize = 4 << 20;
 const REFUSED_WINDOW: Duration = Duration::from_secs(30);
 /// How long a v6 dial waits to see whether Docker's proxy hangs up on it.
 const V6_HANGUP_WAIT: Duration = Duration::from_millis(50);
+/// Keepalive on a container's side of an outbound stream: idle seconds
+/// before the first probe, seconds between probes, and probes unanswered
+/// before the socket fails. See [`keep_alive`].
+const KEEPALIVE: [libc::c_int; 3] = [30, 10, 3];
 /// Accepting a continuous backlog must leave time to carry and close the
 /// streams already held. The listener is level-triggered, so the next turn
 /// sees any connections left queued.
@@ -414,6 +418,7 @@ impl Conn {
                         return None;
                     }
                 }
+                keep_alive(a.as_raw_fd());
                 let mut conn = Conn::new(a, true, State::Dialing, now);
                 conn.dst = Some(dst);
                 conn.wide = crate::accelerator::Wide::open(dst.port());
@@ -846,6 +851,15 @@ impl Conn {
         if forward == Pumped::Done && back == Pumped::Done {
             return Some(Step::Close);
         }
+        // One direction done and the other waiting on its reader: if either
+        // socket has failed, as a container's does once keepalive finds it
+        // gone, nothing more can arrive or be delivered, and waiting would
+        // hold the stream as long as the far end keeps its side open.
+        if (forward == Pumped::Done || back == Pumped::Done)
+            && poll_now(&[a, b], 0).iter().any(|r| r & (libc::POLLERR | libc::POLLNVAL) != 0)
+        {
+            return Some(Step::Close);
+        }
         self.at = [forward, back].iter().filter_map(|p| if let Pumped::RetryAt(t) = p { Some(*t) } else { None }).min();
         None
     }
@@ -1102,6 +1116,31 @@ fn nodelay(fd: RawFd) {
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, std::ptr::addr_of!(one).cast(),
             size_of::<libc::c_int>() as libc::socklen_t)
     };
+}
+
+/// Probes a container's side of an outbound stream once it falls quiet. A
+/// container that closes its end leaves the stream half closed, which is
+/// also what a container that only shut down its writes looks like, and the
+/// far end may never close its own (#57: Home Assistant's polls of devices
+/// that keep idle connections open, until the agent ran out of descriptors).
+/// A socket shut for writing still answers the probes; a closed one stops
+/// existing once its kernel stops waiting for this side's FIN (a minute),
+/// the next probe draws a reset, and the error ends the stream.
+fn keep_alive(fd: RawFd) {
+    let one: libc::c_int = 1;
+    let [idle, interval, count] = KEEPALIVE;
+    // SAFETY: int-sized options on a live socket.
+    unsafe {
+        for (level, name, value) in [
+            (libc::SOL_SOCKET, libc::SO_KEEPALIVE, one),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, interval),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, count),
+        ] {
+            libc::setsockopt(fd, level, name, std::ptr::addr_of!(value).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
 }
 
 fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
@@ -1566,5 +1605,77 @@ mod tests {
         server.join().unwrap();
         drop(lp);
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn int_option(fd: RawFd, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut value: libc::c_int = -1;
+        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: an int for the option to fill, on a live socket.
+        assert_eq!(unsafe { libc::getsockopt(fd, level, name, std::ptr::addr_of_mut!(value).cast(), &mut len) }, 0);
+        value
+    }
+
+    #[test]
+    fn a_containers_side_is_probed_once_quiet() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, _) = l.accept().unwrap();
+        keep_alive(a.as_raw_fd());
+        let fd = a.as_raw_fd();
+        assert_eq!(int_option(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), KEEPALIVE[0]);
+        assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), KEEPALIVE[1]);
+        assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT), KEEPALIVE[2]);
+    }
+
+    /// A container that shuts down its writes keeps its stream: the far end
+    /// may still answer. One whose socket then fails, as it does once the
+    /// probes find it gone, loses the stream even though the far end never
+    /// closes its own side (#57: four descriptors held per such stream,
+    /// until the agent had none).
+    #[test]
+    fn a_half_closed_stream_ends_when_the_containers_side_fails() {
+        use std::os::unix::net::UnixStream;
+        let (listener, _) = listener();
+        let mut lp = Loop::new(listener, Route::Outbound, outbound_env()).unwrap();
+
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let container = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, _) = l.accept().unwrap();
+        let (b, far) = UnixStream::pair().unwrap();
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        set_nonblocking(b.as_raw_fd()).unwrap();
+        let mut conn = Conn::new(a.into(), true, State::Copying, Instant::now());
+        conn.b = Some(b.into());
+        (conn.watched_a, conn.watched_b) = conn.interest();
+        lp.watch(libc::EPOLL_CTL_ADD, conn.a.as_raw_fd(), 0, conn.watched_a).unwrap();
+        lp.watch(libc::EPOLL_CTL_ADD, conn.b.as_ref().unwrap().as_raw_fd(), 1, conn.watched_b).unwrap();
+        lp.conns.insert(0, conn);
+        lp.next = 1;
+
+        container.shutdown(std::net::Shutdown::Write).unwrap();
+        for _ in 0..20 {
+            lp.turn(Some(Duration::from_millis(10)));
+        }
+        assert_eq!(lp.conns.len(), 1, "a half-closed stream is still a stream");
+        let mut eof = [0u8; 1];
+        far.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!((&far).read(&mut eof).unwrap(), 0, "the far end is told the container is done");
+
+        // Reset, as the container's kernel answers a probe once its socket
+        // is gone.
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        // SAFETY: a linger struct on a live socket.
+        unsafe {
+            libc::setsockopt(container.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(), size_of::<libc::linger>() as libc::socklen_t);
+        }
+        drop(container);
+        let started = Instant::now();
+        while !lp.conns.is_empty() {
+            lp.turn(Some(Duration::from_millis(10)));
+            assert!(started.elapsed() < Duration::from_secs(3), "the stream outlived its container's socket");
+        }
+        drop(far);
     }
 }
