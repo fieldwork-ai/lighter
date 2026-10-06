@@ -93,6 +93,35 @@ docker volume create models >/dev/null 2>&1 || true
 docker run --rm -v models:/models "$IMAGE" sh -c "[ -f /models/$MODEL ] || curl -sL -o /models/$MODEL $MODEL_URL" >/dev/null
 
 echo
+echo "==> A container that reaches the GPU as its first act is let in"
+# dockerd starts a container's process before it lists the container as
+# running, and the agent's gate finds a stream's container by its address in
+# that list: llama-bench, connecting at once, was refused for it once in a
+# while (2026-10-06). Twenty starts that connect and say nothing.
+docker pull -q alpine:3.21 >/dev/null 2>&1
+before="$(grep -ac "no running container at" "$LOG" || true)"
+for _ in $(seq 1 20); do
+	docker run --rm --device lighter.sh/metal=all alpine:3.21 sh -c \
+		'nc -w 1 "${LIGHTER_METAL%:*}" "${LIGHTER_METAL#*:}" </dev/null' >/dev/null 2>&1
+done
+refused=$(( $(grep -ac "no running container at" "$LOG" || true) - before ))
+[ "$refused" = 0 ] && pass "20 containers connecting as they start were all let in" \
+	|| fail "$refused of 20 containers connecting as they start were refused as not running"
+
+# And one that did not ask for the device is refused: the server parses what
+# it is sent inside the lighter process, so the gate is its only guard.
+port="$(grep -ao "INIT metal=port [0-9]*" "$LOG" | head -1 | awk '{print $3}')"
+before="$(grep -ac "did not ask for lighter.sh/metal; refused" "$LOG" || true)"
+docker run --rm alpine:3.21 nc -w 1 192.168.127.254 "$port" </dev/null >/dev/null 2>&1
+for _ in $(seq 1 30); do
+	[ "$(grep -ac "did not ask for lighter.sh/metal; refused" "$LOG" || true)" -gt "$before" ] && break
+	sleep 0.1
+done
+[ "$(grep -ac "did not ask for lighter.sh/metal; refused" "$LOG" || true)" -gt "$before" ] \
+	&& pass "a container that did not ask for the device is refused" \
+	|| fail "a container without lighter.sh/metal was not refused at port ${port:-unknown}"
+
+echo
 echo "==> llama-bench in a container, layers on the Mac's GPU (--device lighter.sh/metal=all)"
 if out="$(docker run --rm --device lighter.sh/metal=all -v models:/models "$IMAGE" sh -c \
 	'timeout 900 llama-bench -m /models/'"$MODEL"' --rpc "$LIGHTER_METAL" -ngl 99 -p 128 -n 32 -r 3 2>&1' 2>&1)"; then

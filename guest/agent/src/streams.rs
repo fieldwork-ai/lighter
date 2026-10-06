@@ -39,6 +39,8 @@ pub struct Env {
 }
 
 const LISTENER: u64 = u64::MAX;
+/// The accelerator gate's verdicts are ready (`accelerator::Checker`).
+const GATE: u64 = u64::MAX - 1;
 /// In an inbound header's family byte: the client's address follows the
 /// destination's (the host's `HEADER_CLIENT`, `reactor.rs`).
 const HEADER_CLIENT: u8 = 0x80;
@@ -85,6 +87,10 @@ struct Loop {
     /// spinning on a listener that stays readable.
     spare: Option<OwnedFd>,
     listening: bool,
+    /// Streams to an accelerator port, waiting for the gate's verdict, and
+    /// the gate, started by the first of them.
+    gated: HashMap<u64, (OwnedFd, SocketAddr)>,
+    gate: Option<crate::accelerator::Checker>,
 }
 
 impl Loop {
@@ -111,6 +117,8 @@ impl Loop {
             timers: BinaryHeap::new(),
             spare: open_spare(),
             listening: false,
+            gated: HashMap::new(),
+            gate: None,
         };
         lp.listen(true)?;
         let mut lp = lp;
@@ -147,6 +155,8 @@ impl Loop {
                 let token = ev.u64;
                 if token == LISTENER {
                     self.accept_all(now);
+                } else if token == GATE {
+                    self.judged(now);
                 } else {
                     ready.insert(token >> 1);
                 }
@@ -203,14 +213,55 @@ impl Loop {
             let a = unsafe { OwnedFd::from_raw_fd(raw) };
             let id = self.next;
             self.next += 1;
-            if let Some(mut conn) = Conn::accepted(a, &self.route, &self.env, now) {
-                conn.watched_a = conn.interest().0;
-                if let Err(e) = self.watch(libc::EPOLL_CTL_ADD, conn.a.as_raw_fd(), id << 1, conn.watched_a) {
-                    ran_out("epoll watches", &e);
-                    continue;
+            match Conn::accepted(a, &self.route, &self.env, now) {
+                Some(Accepted::Ready(conn)) => self.admit(id, conn, now),
+                Some(Accepted::Gated { a, dst, kind, peer }) => self.hold(id, a, dst, kind, peer),
+                None => {}
+            }
+        }
+    }
+
+    fn admit(&mut self, id: u64, mut conn: Conn, now: Instant) {
+        conn.watched_a = conn.interest().0;
+        if let Err(e) = self.watch(libc::EPOLL_CTL_ADD, conn.a.as_raw_fd(), id << 1, conn.watched_a) {
+            ran_out("epoll watches", &e);
+            return;
+        }
+        self.conns.insert(id, conn);
+        self.drive(id, now);
+    }
+
+    /// Holds a stream to an accelerator port until the gate has decided.
+    /// Unwatched meanwhile: a client that hangs up first is found closed
+    /// when it is let through, as any stream is.
+    fn hold(&mut self, id: u64, a: OwnedFd, dst: SocketAddr, kind: &'static str, peer: std::net::IpAddr) {
+        if self.gate.is_none() {
+            match crate::accelerator::Checker::start() {
+                Ok(gate) => {
+                    if let Err(e) = self.watch(libc::EPOLL_CTL_ADD, gate.wake_fd(), GATE, libc::EPOLLIN as u32) {
+                        ran_out("epoll watches", &e);
+                        return;
+                    }
+                    self.gate = Some(gate);
                 }
-                self.conns.insert(id, conn);
-                self.drive(id, now);
+                Err(e) => {
+                    ran_out("a thread for the accelerator gate", &e);
+                    return;
+                }
+            }
+        }
+        self.gate.as_ref().expect("just started").ask(id, kind, peer);
+        self.gated.insert(id, (a, dst));
+    }
+
+    /// The gate's verdicts: a permitted stream goes on as any outbound one,
+    /// a refused one is dropped, which the container sees as a reset.
+    fn judged(&mut self, now: Instant) {
+        let verdicts = self.gate.as_ref().map(|g| g.verdicts()).unwrap_or_default();
+        for (id, permitted) in verdicts {
+            let Some((a, dst)) = self.gated.remove(&id) else { continue };
+            if permitted && let Some(conn) = Conn::outbound(a, dst, &self.env, now) {
+                self.admit(id, conn, now);
             }
         }
     }
@@ -315,6 +366,13 @@ impl Loop {
     }
 }
 
+/// What an accepted connection is: one to carry, or a stream to an
+/// accelerator port that waits for the gate first.
+enum Accepted {
+    Ready(Conn),
+    Gated { a: OwnedFd, dst: SocketAddr, kind: &'static str, peer: std::net::IpAddr },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
     Wait,
@@ -405,35 +463,37 @@ impl Conn {
         }
     }
 
-    fn accepted(a: OwnedFd, route: &Route, env: &Env, now: Instant) -> Option<Conn> {
+    /// A container's stream, to the Mac.
+    fn outbound(a: OwnedFd, dst: SocketAddr, env: &Env, now: Instant) -> Option<Conn> {
+        keep_alive(a.as_raw_fd());
+        let mut conn = Conn::new(a, true, State::Dialing, now);
+        conn.dst = Some(dst);
+        conn.wide = crate::accelerator::Wide::open(dst.port());
+        conn.dial_host(env).then_some(conn)
+    }
+
+    fn accepted(a: OwnedFd, route: &Route, env: &Env, now: Instant) -> Option<Accepted> {
         match route {
             Route::Outbound => {
                 let dst = (env.destination)(a.as_raw_fd())?;
                 // An accelerator port is reached only by a container that
-                // asked for the device; the connection is dropped otherwise,
-                // which the container sees as a reset.
+                // asked for the device, which the gate decides.
                 if let Some(kind) = crate::accelerator::kind_of(dst.port()) {
                     let peer = peer_ip(a.as_raw_fd())?;
-                    if !crate::accelerator::permitted(kind, peer) {
-                        return None;
-                    }
+                    return Some(Accepted::Gated { a, dst, kind, peer });
                 }
-                keep_alive(a.as_raw_fd());
-                let mut conn = Conn::new(a, true, State::Dialing, now);
-                conn.dst = Some(dst);
-                conn.wide = crate::accelerator::Wide::open(dst.port());
-                conn.dial_host(env).then_some(conn)
+                Conn::outbound(a, dst, env, now).map(Accepted::Ready)
             }
             Route::Inbound => {
                 let _ = crate::vsock::set_buffer(&a, crate::STREAM_WINDOW);
-                Some(Conn::new(a, false, State::Header, now))
+                Some(Accepted::Ready(Conn::new(a, false, State::Header, now)))
             }
             Route::Unix(path) => {
                 let mut conn = Conn::new(a, false, State::Dialing, now);
                 match unix_socket(path) {
                     Ok(b) => {
                         conn.set_b(b, false);
-                        Some(conn)
+                        Some(Accepted::Ready(conn))
                     }
                     Err(e) => {
                         // The errno is the whole diagnosis: "no such file"

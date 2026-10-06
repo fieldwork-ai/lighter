@@ -40,7 +40,10 @@
 //! container; the agent asks dockerd over its socket, by the connection's
 //! source address, and refuses on any doubt.
 
-use std::sync::{Mutex, OnceLock};
+use std::net::IpAddr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 const POLL_NS: &str = "/sys/module/idle/parameters/poll_ns";
 
@@ -84,24 +87,118 @@ pub fn kind_of(port: u16) -> Option<&'static str> {
     devices().iter().find(|&&(p, _)| p == port).map(|&(_, kind)| kind)
 }
 
-/// Whether the container at `peer` holds the CDI device `lighter.sh/<kind>`:
-/// dockerd is asked for the running container with that address, then for
-/// its device requests. Anything short of a clear yes is a no.
-pub fn permitted(kind: &str, peer: std::net::IpAddr) -> bool {
-    // The proxy listens on the v6 wildcard, so a v4 container arrives as an
-    // IPv4-mapped address; dockerd records the plain v4 form.
-    let peer = unmapped(peer);
-    let list = match docker_get("/containers/json") {
-        Ok(body) => body,
-        Err(e) => {
-            eprintln!("lighter-agent: cannot list containers for the {kind} device: {e}");
-            return false;
+/// How long an address no running container has is looked for before its
+/// stream is refused, and how often. dockerd starts a container's process
+/// before it records the container as running, so a process that connects
+/// at once (llama-bench, to the GPU, as its first act) asks before its
+/// container is listed, and was refused for it (m12, 2026-10-06).
+const LISTING_WINDOW: Duration = Duration::from_secs(2);
+const LISTING_PAUSE: Duration = Duration::from_millis(50);
+
+/// The gate's decisions, off the stream loop: dockerd is asked over its
+/// socket, and an answer can be a wait for its start to catch up, which
+/// would stall every other stream in the guest. Streams to accelerator
+/// ports wait here, all against one listing per pause, and their verdicts
+/// come back on `wake`, a descriptor the loop watches.
+pub struct Checker {
+    requests: mpsc::Sender<Request>,
+    verdicts: mpsc::Receiver<(u64, bool)>,
+    wake: OwnedFd,
+}
+
+struct Request {
+    id: u64,
+    kind: &'static str,
+    peer: IpAddr,
+    until: Instant,
+}
+
+impl Checker {
+    pub fn start() -> std::io::Result<Checker> {
+        // SAFETY: a plain eventfd call.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-    };
-    let Some(id) = container_with_address(&list, &peer.to_string()) else {
-        eprintln!("lighter-agent: no running container at {peer} asked for lighter.sh/{kind}");
-        return false;
-    };
+        // SAFETY: a fresh descriptor we own.
+        let wake = unsafe { OwnedFd::from_raw_fd(raw) };
+        let ring = wake.try_clone()?;
+        let (requests, waiting) = mpsc::channel::<Request>();
+        let (answer, verdicts) = mpsc::channel();
+        std::thread::Builder::new().name("accelerator-gate".into()).spawn(move || {
+            let mut pending: Vec<Request> = Vec::new();
+            loop {
+                if pending.is_empty() {
+                    match waiting.recv() {
+                        Ok(request) => pending.push(request),
+                        Err(_) => return,
+                    }
+                } else {
+                    match waiting.recv_timeout(LISTING_PAUSE) {
+                        Ok(request) => pending.push(request),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(LISTING_PAUSE),
+                    }
+                }
+                pending.extend(waiting.try_iter());
+                let listing = docker_get("/containers/json");
+                let now = Instant::now();
+                pending.retain(|r| {
+                    let verdict = match &listing {
+                        Err(e) => {
+                            eprintln!("lighter-agent: cannot list containers for the {} device: {e}", r.kind);
+                            Some(false)
+                        }
+                        Ok(list) => match container_with_address(list, &r.peer.to_string()) {
+                            Some(id) => Some(holds(&id, r.kind, r.peer)),
+                            None if now >= r.until => {
+                                eprintln!("lighter-agent: no running container at {} asked for lighter.sh/{}", r.peer, r.kind);
+                                Some(false)
+                            }
+                            None => None,
+                        },
+                    };
+                    match verdict {
+                        Some(yes) => {
+                            let _ = answer.send((r.id, yes));
+                            let one: u64 = 1;
+                            // SAFETY: eight bytes to our eventfd.
+                            unsafe { libc::write(ring.as_raw_fd(), std::ptr::addr_of!(one).cast(), 8) };
+                            false
+                        }
+                        None => true,
+                    }
+                });
+            }
+        })?;
+        Ok(Checker { requests, verdicts, wake })
+    }
+
+    /// Asks whether the stream `id`, from `peer`, may reach the `kind` device.
+    pub fn ask(&self, id: u64, kind: &'static str, peer: IpAddr) {
+        // The proxy listens on the v6 wildcard, so a v4 container arrives as
+        // an IPv4-mapped address; dockerd records the plain v4 form.
+        let peer = unmapped(peer);
+        let _ = self.requests.send(Request { id, kind, peer, until: Instant::now() + LISTING_WINDOW });
+    }
+
+    pub fn wake_fd(&self) -> RawFd {
+        self.wake.as_raw_fd()
+    }
+
+    /// The verdicts reached since the last call: (stream, permitted).
+    pub fn verdicts(&self) -> Vec<(u64, bool)> {
+        let mut count = 0u64;
+        // SAFETY: eight bytes from our eventfd; nonblocking, so an empty one
+        // returns EAGAIN.
+        unsafe { libc::read(self.wake.as_raw_fd(), std::ptr::addr_of_mut!(count).cast(), 8) };
+        self.verdicts.try_iter().collect()
+    }
+}
+
+/// Whether the running container `id`, at `peer`, holds the CDI device
+/// `lighter.sh/<kind>`. Anything short of a clear yes is a no.
+fn holds(id: &str, kind: &str, peer: IpAddr) -> bool {
     let inspect = match docker_get(&format!("/containers/{id}/json")) {
         Ok(body) => body,
         Err(e) => {
@@ -117,9 +214,9 @@ pub fn permitted(kind: &str, peer: std::net::IpAddr) -> bool {
 }
 
 /// A v4 address in its own form, whether it arrived mapped into v6 or not.
-fn unmapped(peer: std::net::IpAddr) -> std::net::IpAddr {
+fn unmapped(peer: IpAddr) -> IpAddr {
     match peer {
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(peer, std::net::IpAddr::V4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(peer, IpAddr::V4),
         v4 => v4,
     }
 }
