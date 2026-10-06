@@ -38,5 +38,7 @@ Or `lighter update download` then `lighter upgrade --restart` if you installed w
 
 ## Also
 
+- **A container that uses the GPU or Neural Engine as soon as it starts is no longer turned away.** Docker starts a container's process a moment before it lists the container as running, and lighter checks that list before letting a container reach an accelerator: a client that connected at once, as llama-bench does, could be refused as not running. lighter now waits out that moment, without holding up any other connection, and still refuses a container that did not ask for the device.
+- **The machine gives memory back to a Mac that swapped long ago.** A Mac with a lot of swap in use was treated as short of memory for as long as the swap stayed, which can be days after whatever caused it, so the machine held on to memory it had finished with. Swap now counts only while the Mac is still swapping.
 - Linux remains **6.18.52**, with one more option built in, UDP socket diagnostics, which is how lighter finds a host-network UDP service (kernel f4dfc278). The data epoch remains **1**.
 - A machine has room for more devices: 32 instead of 16, so LAN mode and several shared folders of your own fit together.
