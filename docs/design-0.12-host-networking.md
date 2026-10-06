@@ -1,6 +1,6 @@
 # lighter 0.12: host networking and the LAN
 
-Status: design, 2026-10-06. Issue #60: Home Assistant in `network_mode: host` is unreachable from the Mac, and in any mode it discovers nothing on the user's network.
+Status: built on `dev`, 2026-10-06; what changed from the first draft is marked *(as built)*. Issue #60: Home Assistant in `network_mode: host` is unreachable from the Mac, and in any mode it discovers nothing on the user's network.
 
 ## Goals
 
@@ -17,7 +17,7 @@ On this Studio (macOS 27.0.1, M5 Ultra), whose network is Wi-Fi (`en1`; its Ethe
 - **Today**: a host-network server on lighter, Docker Desktop and OrbStack: reachable from the Mac only on OrbStack. Discovery from a container (an mDNS service query, an SSDP search, five seconds of listening): nothing on lighter or Docker Desktop in either mode, one answer on OrbStack in host mode, against 29 service types the Mac's own resolver sees on this network.
 - **The guest's listeners carry their owner** (`ss --cgroup` in the guest): a host-network container's socket is `cgroup:/docker/<id>`; Docker's own proxies and the engine are `cgroup:/engine`. So "a listener in the guest's root network namespace whose cgroup is under `/docker/`" is exactly "a host-network container's listener", with nothing of lighter's or Docker's in it, and no list to keep.
 - **vmnet bridged mode over Wi-Fi** (a 250-line C experiment as root, `.context/bridge-spike/spike.c`): the interface comes up (MTU 1500, frames up to 1514 bytes). Received: the LAN's broadcast and multicast, mDNS from four hosts in five seconds. With a static address of its own (`192.168.50.241`): the router's ARP reply, 3/3 pings to the router, an mDNS query answered by 9 hosts, 5/5 pings from the M5 Pro across the LAN, 3/3 from the Studio itself.
-- **DHCP over Wi-Fi does not give the guest an address.** Wi-Fi carries one MAC per station, so macOS bridges Wi-Fi with MAC address translation: the guest's DISCOVER leaves with the Mac's MAC as source *and* as `chaddr`, the broadcast flag cleared. The router (ASUS, dnsmasq) keys the lease on `chaddr`, ignores the client identifier the guest sends (option 61, which survives), and offers the Mac's own address. On Ethernet there is no translation and DHCP is ordinary; that was not testable here (no cable), and is how every bridged VM on Ethernet works.
+- **DHCP over Wi-Fi first offers the guest the Mac's own address.** Wi-Fi carries one MAC per station, so macOS bridges Wi-Fi with MAC address translation: the guest's DISCOVER leaves with the Mac's MAC as source *and* as `chaddr`, the broadcast flag cleared. The router (ASUS, dnsmasq) keys the lease on `chaddr`, ignores the client identifier the guest sends (option 61, which survives), and offers the Mac's own address. *(As built)* busybox's `udhcpc -a` checks an offer by ARP before taking it; the Mac answers for its own address, the guest declines, and the router offers another from its pool: the guest got `192.168.50.67`, `.85` and `.168` in three runs, each in about ten seconds. So DHCP works on Wi-Fi with this router, and `--lan-address` is for one that keeps re-offering. On Ethernet there is no translation and DHCP is ordinary; that was not testable here (no cable).
 - **Home Assistant chooses its "default" adapter by the source address of a UDP socket connected to `224.0.0.251`** (`homeassistant/components/network/util.py`, `async_get_source_ip(MDNS_TARGET_IP)`), and advertises (zeroconf, HomeKit, SSDP) on that adapter.
 - **vmnet's bridged mode needs root or `com.apple.vm.networking`.** The macOS 26 network API (`vmnet_network_create`, with XPC serialization to hand a network to another process) offers shared and host-only modes only. So without the entitlement, frames for a bridged interface must be relayed by a root process. The entitlement was requested from Apple on 2026-10-06.
 
@@ -77,14 +77,14 @@ The container then sees its real client, as a bridge-network container does (Pi-
 - multicast, `224.0.0.0/4` and `ff00::/8`, so discovery uses the LAN, and so Home Assistant's choice of default adapter (the source address towards `224.0.0.251`) lands on `eth1` and it advertises an address devices can reach;
 - IPv6 router advertisements on `eth1` for the LAN's prefixes and link-local addresses (`accept_ra=2`, since the guest forwards), without their default route (`accept_ra_defrtr=0`): Matter and other IPv6-on-the-LAN protocols work, the guest's IPv6 internet stays on the streams.
 
-The redirect rules match `eth0` only, so nothing on `eth1` enters the streams; this falls out of the existing ruleset.
+*(As built)* The redirect rules first matched `eth0` only, which left a bridge-network container's traffic for the LAN subnet to be forwarded out of `eth1` from its `172.17` address, which nothing on the LAN can answer. They now match forwarded traffic bound for either card (`fib daddr oifname { "eth0", "eth1" }`, `oifname` so the rule loads where `eth1` does not exist), so a bridge-network container reaches the LAN through the streams as it always has, and only the guest's own namespace, which host-network containers share, reaches it directly. m17 sees both: the Mac's server logs the host-network container's request from the guest's LAN address and the bridged one's from the Mac's.
 
 **Getting frames: the helper now, the entitlement later.** Both produce the same thing for the VMM, a source of Ethernet frames behind `NetBackend`:
 
 - *With the entitlement*, the VMM calls `vmnet_start_interface` itself.
 - *Without it*, `lighter-bridge`, a root daemon, does, and relays frames over a `SOCK_DGRAM` socket pair whose other end it passes to the VMM (`SCM_RIGHTS`) after a handshake on its control socket: one datagram per frame, so frame boundaries come free, and a full socket drops a frame as a full NIC ring does. The control connection is the interface's lifetime: the VMM exiting, or crashing, stops the interface.
 
-The helper is installed once, `sudo lighter lan enable`, as a launchd daemon (`/Library/LaunchDaemons/dev.lighter.bridge.plist`, the binary copied to `/Library/PrivilegedHelperTools/`), socket-activated so it runs only while a machine uses it. It does one thing:
+The helper is installed once, `sudo lighter lan enable`, as a launchd daemon (`/Library/LaunchDaemons/dev.lighter.bridge.plist`, the binary copied to `/Library/PrivilegedHelperTools/` after `codesign` checks it is Fieldwork's), socket-activated so it runs only while a machine uses it, and exits a minute after its last client. *(As built)* It ships inside `lighter.app` (`Contents/MacOS/lighter-bridge`): the app's signature and notarization cover it, and the release manifest, which earlier lighters verify by its exact list of four files, is unchanged, so 0.11 still verifies a 0.12 archive. It does one thing:
 
 - It serves only the user who enabled it (the uid recorded at install) and root, and only a client whose code signature is lighter's (`identifier "dev.lighter.machine"` and team `N7N6BNF95K`, checked from the connection's audit token with `SecCodeCreateWithAuditToken`), so another account, or another program, cannot borrow raw access to the network through it.
 - It opens bridged interfaces only, one per connection, at most eight at once.
@@ -114,6 +114,12 @@ sudo lighter lan enable        # once, unless lighter has Apple's entitlement
 lighter restart
 lighter status                 #   lan        192.168.50.241 on Wi-Fi (en1)
 ```
+
+## Also, as built
+
+- **The guest kernel gains `CONFIG_INET_UDP_DIAG`**: TCP's `sock_diag` was built in, UDP's was not, and a host-network DNS or discovery service is UDP.
+- **The LAN card advertises no offloads.** The responder's card offers `VIRTIO_NET_F_CSUM`, which is harmless there; on a card whose frames reach a wire, a partial checksum would arrive as a corrupt one.
+- **Thirty-two virtio slots, from sixteen**: a machine with every device, the LAN card and two shares of the user's own would have run out. Each slot is a 512-byte window and an SPI of 988.
 
 ## Alternatives considered
 
