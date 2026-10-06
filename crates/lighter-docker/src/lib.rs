@@ -221,6 +221,14 @@ pub fn forwardable(addr: IpAddr, own: &[IpAddr]) -> Option<IpAddr> {
     }
 }
 
+/// UDP ports a host-network container's listener is never forwarded from.
+/// 5353 is mDNS: macOS's mDNSResponder holds it on every Mac, so the forward
+/// can never open, and Home Assistant (whose zeroconf binds it) was reported
+/// as a port lighter could not forward for as long as it ran. mDNS is
+/// multicast on the network the container is on; LAN mode is how it reaches
+/// the Mac's.
+const NEVER_FORWARDED_UDP: [u16; 1] = [5353];
+
 /// What host-network containers listening as `listeners` add to what is
 /// forwarded: the listeners of `containers` (the ones on the host network),
 /// at the addresses [`forwardable`] allows.
@@ -232,6 +240,7 @@ pub fn host_published(
     listeners
         .iter()
         .filter(|l| containers.contains(&l.container))
+        .filter(|l| !(l.proto == Proto::Udp && NEVER_FORWARDED_UDP.contains(&l.port)))
         .filter_map(|l| {
             forwardable(l.addr, own).map(|addr| Published {
                 addr,
@@ -722,6 +731,31 @@ mod tests {
             &[],
         );
         assert_eq!(published, HashSet::from([tcp("0.0.0.0", 8123)]));
+    }
+
+    /// Home Assistant's zeroconf: macOS holds 5353 itself, so it is left
+    /// alone, and a UDP service on any other port is forwarded.
+    #[test]
+    fn a_host_network_mdns_socket_is_not_forwarded() {
+        let udp = |port| HostListener {
+            proto: Proto::Udp,
+            addr: "0.0.0.0".parse().unwrap(),
+            port,
+            container: "ha".into(),
+        };
+        let published = host_published(
+            &[udp(5353), udp(1900)],
+            &HashSet::from(["ha".to_string()]),
+            &[],
+        );
+        assert_eq!(
+            published,
+            HashSet::from([Published {
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 1900,
+                proto: Proto::Udp
+            }])
+        );
     }
 
     #[test]
