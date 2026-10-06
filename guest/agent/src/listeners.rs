@@ -12,8 +12,11 @@
 //!
 //! One dump per question over `NETLINK_SOCK_DIAG`: TCP in `LISTEN` and UDP
 //! bound but not connected, each with its cgroup id (`INET_DIAG_CGROUP_ID`)
-//! and, for v6, whether it is v6-only. The Mac asks once a second while a
-//! host-network container runs, and never otherwise.
+//! and, for v6, whether it is v6-only. One thread keeps the answer, looking
+//! again whenever the doorbell (`doorbell.rs`) says a listener may have come
+//! or gone, and the Mac watches it (`watch-listeners`): a server that starts
+//! listening is forwarded in the time a scan and a line take, and nothing on
+//! either side wakes while nothing changes.
 
 use std::collections::HashMap;
 use std::io;
@@ -21,6 +24,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 const NETLINK_SOCK_DIAG: libc::c_int = 4;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
@@ -82,6 +87,116 @@ pub fn report() -> String {
     }
 }
 
+/// The answer the keeper last published, numbered, and how many watch it.
+struct Kept {
+    generation: u64,
+    report: String,
+    watchers: usize,
+}
+
+static KEPT: Mutex<Kept> = Mutex::new(Kept { generation: 0, report: String::new(), watchers: 0 });
+static CHANGED: Condvar = Condvar::new();
+
+/// How long after a bell to look again. A listener rings as it is
+/// released, before it has gone, so one look straight away and another
+/// this long after the last bell.
+const SETTLE: Duration = Duration::from_millis(25);
+/// The least time between looks while bells keep coming, so a storm of
+/// them (a host-network container's musl lookups each close an unconnected
+/// socket) costs a look per this long rather than one per bell.
+const GAP: Duration = Duration::from_millis(10);
+/// Without the doorbell, how often to look while someone watches.
+const POLL: Duration = Duration::from_secs(1);
+/// How often a watch with nothing to say checks its peer is still there.
+const PEER_CHECK: Duration = Duration::from_secs(10);
+
+/// Starts the thread that keeps the answer, and the LAN card's firewall
+/// with it.
+pub fn keep() {
+    let spawned = std::thread::Builder::new().name("listeners".into()).spawn(|| {
+        let bell = match crate::doorbell::Doorbell::attach(ephemeral_low()) {
+            Ok(bell) => Some(bell),
+            Err(e) => {
+                eprintln!("lighter-agent: no listener doorbell, looking once a second while watched: {e}");
+                None
+            }
+        };
+        publish();
+        loop {
+            match &bell {
+                Some(bell) => {
+                    if !bell.wait(if lan_pending() { 1000 } else { -1 }) {
+                        publish();
+                        continue;
+                    }
+                    publish();
+                    loop {
+                        let rang = bell.wait(SETTLE.as_millis() as i32);
+                        publish();
+                        if !rang {
+                            break;
+                        }
+                        std::thread::sleep(GAP);
+                    }
+                }
+                None => {
+                    let kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+                    drop(CHANGED.wait_while(kept, |k| k.watchers == 0).unwrap_or_else(|p| p.into_inner()));
+                    std::thread::sleep(POLL);
+                    publish();
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("lighter-agent: no thread to keep listeners: {e}");
+    }
+}
+
+fn publish() {
+    let report = report();
+    let mut kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+    if kept.report != report {
+        kept.report = report;
+        kept.generation += 1;
+        CHANGED.notify_all();
+    }
+}
+
+/// `watch-listeners`: the `listeners` reply now, and again each time it
+/// changes, until the peer goes. `peer_gone` says whether it has, checked
+/// while there is nothing to say.
+pub fn watch(out: &mut impl io::Write, peer_gone: impl Fn() -> bool) {
+    let mut kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+    kept.watchers += 1;
+    CHANGED.notify_all();
+    let mut seen = None;
+    loop {
+        if seen != Some(kept.generation) {
+            seen = Some(kept.generation);
+            let line = kept.report.clone();
+            drop(kept);
+            let sent = out.write_all(line.as_bytes()).is_ok();
+            kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+            if !sent {
+                break;
+            }
+            continue;
+        }
+        let (again, timeout) = CHANGED.wait_timeout(kept, PEER_CHECK).unwrap_or_else(|p| p.into_inner());
+        kept = again;
+        if timeout.timed_out() && seen == Some(kept.generation) {
+            drop(kept);
+            let gone = peer_gone();
+            kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+            if gone {
+                break;
+            }
+        }
+    }
+    kept.watchers -= 1;
+}
+
 pub fn current() -> io::Result<Vec<Listener>> {
     let containers = containers(Path::new(CGROUP_ROOT));
     if containers.is_empty() {
@@ -101,17 +216,25 @@ pub fn current() -> io::Result<Vec<Listener>> {
     Ok(listeners(&sockets, &containers, ephemeral_low()))
 }
 
+/// The rules last applied to the LAN card's firewall.
+static LAN_APPLIED: Mutex<Option<String>> = Mutex::new(None);
+
+/// Whether LAN mode is on and its firewall has no ports yet: init loads its
+/// table after this agent starts, and until then there is nothing to fill.
+fn lan_pending() -> bool {
+    LAN_APPLIED.lock().unwrap_or_else(|p| p.into_inner()).is_none()
+        && std::fs::read_to_string("/proc/cmdline").is_ok_and(|c| c.split_whitespace().any(|w| w.starts_with("lighter.lan=")))
+}
+
 /// The ports host-network containers listen on, as the LAN card's
 /// firewall admits them. Written only when they change: one `nft` run,
 /// both sets flushed and filled in one transaction.
 fn lan_firewall(found: &[Listener]) {
-    use std::sync::Mutex;
-    static LAST: Mutex<Option<String>> = Mutex::new(None);
     if !Path::new("/run/lighter-lan.nft").exists() {
         return;
     }
     let (rules, _) = lan_rules(found);
-    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let mut last = LAN_APPLIED.lock().unwrap_or_else(|p| p.into_inner());
     if last.as_deref() == Some(rules.as_str()) {
         return;
     }
@@ -442,5 +565,43 @@ mod tests {
         let mut out = Vec::new();
         assert!(matches!(parse(&buf, Proto::Tcp, &mut out), Parsed::Done));
         assert_eq!(out, [sock(Proto::Tcp, "0.0.0.0", 8123, false, 42)]);
+    }
+
+    /// A watcher writing lines into a channel, refusing after `left`.
+    struct Lines(std::sync::mpsc::Sender<String>, usize);
+
+    impl io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.1 == 0 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            self.1 -= 1;
+            self.0.send(String::from_utf8_lossy(buf).into()).unwrap();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn change(report: &str) {
+        let mut kept = KEPT.lock().unwrap();
+        kept.report = report.into();
+        kept.generation += 1;
+        CHANGED.notify_all();
+    }
+
+    #[test]
+    fn a_watch_hears_the_answer_now_and_each_change_until_its_peer_goes() {
+        change("listeners none\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watching = std::thread::spawn(move || watch(&mut Lines(tx, 2), || false));
+        assert_eq!(rx.recv().unwrap(), "listeners none\n");
+        change("listeners tcp 0.0.0.0 8123 abc\n");
+        assert_eq!(rx.recv().unwrap(), "listeners tcp 0.0.0.0 8123 abc\n");
+        // The peer has gone: the next line is refused, and the watch ends.
+        change("listeners none\n");
+        watching.join().unwrap();
+        assert_eq!(KEPT.lock().unwrap().watchers, 0);
     }
 }

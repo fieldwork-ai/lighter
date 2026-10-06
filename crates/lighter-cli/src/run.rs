@@ -347,9 +347,10 @@ pub fn machine() -> anyhow::Result<()> {
     let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock(), scope);
     // And what a host-network container listens on, which Docker has no
     // port bindings to report (#60): the agent finds it from the guest's
-    // sockets, and is asked only while such a container runs.
-    let listeners: Arc<dyn lighter_docker::HostListeners> =
-        Arc::new(AgentListeners::new(home.join("control.sock")));
+    // sockets, and says each time it changes.
+    let listeners: Arc<dyn lighter_docker::HostListeners> = Arc::new(AgentListeners {
+        socket: home.join("control.sock"),
+    });
     let ports = lighter_docker::PortWatcher::start_with(
         &paths::docker_socket()?,
         mapper,
@@ -506,59 +507,51 @@ extern "C" fn handle_stop(signal: libc::c_int) {
     handle_prepare_stop(signal);
 }
 
-/// Host-network containers' listeners, asked of the agent over the
-/// machine's control channel. One connection, kept: the watcher asks once a
-/// second while a host-network container runs.
+/// Host-network containers' listeners, watched on the agent over the
+/// machine's control channel: one connection, on which the agent says what
+/// they listen on and then again each time it changes.
 struct AgentListeners {
     socket: std::path::PathBuf,
-    stream: std::sync::Mutex<Option<std::io::BufReader<std::os::unix::net::UnixStream>>>,
-}
-
-impl AgentListeners {
-    fn new(socket: std::path::PathBuf) -> AgentListeners {
-        AgentListeners {
-            socket,
-            stream: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn ask(
-        &self,
-        slot: &mut Option<std::io::BufReader<std::os::unix::net::UnixStream>>,
-    ) -> std::io::Result<String> {
-        use std::io::{BufRead, Write};
-        if slot.is_none() {
-            let stream = std::os::unix::net::UnixStream::connect(&self.socket)?;
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-            stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
-            *slot = Some(std::io::BufReader::new(stream));
-        }
-        let reader = slot.as_mut().expect("just connected");
-        reader.get_mut().write_all(b"listeners\n")?;
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Err(std::io::Error::other("the control channel closed"));
-        }
-        Ok(line)
-    }
 }
 
 impl lighter_docker::HostListeners for AgentListeners {
-    fn listeners(&self) -> Result<Vec<lighter_docker::HostListener>, String> {
-        let mut slot = self.stream.lock().expect("listener channel poisoned");
-        // Once more on a fresh connection: the kept one may have closed
-        // since the last question (the agent restarted, the guest rebooted).
-        let line = match self.ask(&mut slot) {
-            Ok(line) => line,
-            Err(_) => {
-                *slot = None;
-                self.ask(&mut slot).map_err(|e| {
-                    *slot = None;
-                    e.to_string()
-                })?
+    fn watch(
+        &self,
+        stop: &dyn Fn() -> bool,
+        heard: &mut dyn FnMut(Result<Vec<lighter_docker::HostListener>, String>),
+    ) -> Result<(), String> {
+        use std::io::{BufRead, Write};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&self.socket).map_err(|e| e.to_string())?;
+        stream
+            .write_all(b"watch-listeners\n")
+            .map_err(|e| e.to_string())?;
+        // Only so that `stop` is looked at: the agent is silent while nothing
+        // changes, which is not an error.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .map_err(|e| e.to_string())?;
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => return Err("the control channel closed".into()),
+                Ok(_) if line.ends_with('\n') => {
+                    heard(lighter_docker::parse_listeners(&line));
+                    line.clear();
+                }
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => return Err(e.to_string()),
             }
-        };
-        lighter_docker::parse_listeners(&line)
+            if stop() {
+                return Ok(());
+            }
+        }
     }
 }
 

@@ -235,8 +235,9 @@ $D rm -f m3p-peer-tcp m3p-peer-udp >/dev/null 2>&1
 echo "==> A host-network container's ports, forwarded from the Mac (#60)"
 # Nothing publishes a host-network container's port: Docker has no binding
 # to report, so it was reachable from nothing on the Mac. The agent finds
-# what such a container listens on, and the Mac forwards it as it does a
-# published port, a second or so after the server starts listening.
+# what such a container listens on, the kernel ringing a doorbell when a
+# listener comes or goes, and the Mac forwards it as it does a published
+# port.
 MAC_LAN="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
 $D pull -q python:3.12-slim >/dev/null 2>&1
 $D rm -f m3-hostweb m3-hostlo m3-hostudp >/dev/null 2>&1
@@ -288,6 +289,58 @@ done
 [ "$gone" = 0 ] && pass "the forward is withdrawn when the container stops" \
 	|| fail "18123 still answers on the Mac after its container stopped"
 $D rm -f m3-hostlo m3-hostudp >/dev/null 2>&1
+
+# How long from a server's listen() to its port answering on the Mac, and
+# from its close to the port going: a server waits for a nudge (UDP, already
+# forwarded), then listens, takes one connection and closes. Polled once a
+# second this was up to a second; the doorbell makes it a scan and a line.
+$D rm -f m3-hostlat >/dev/null 2>&1
+$D run -d --name m3-hostlat --network host python:3.12-slim python3 -c '
+import socket
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("0.0.0.0", 15998))
+while True:
+    _, a = u.recvfrom(64)
+    t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    t.bind(("0.0.0.0", 18127)); t.listen()
+    u.sendto(b"listening", a)
+    c, _ = t.accept(); c.close(); t.close()' >/dev/null
+latency="$(python3 - <<'PYEOF'
+import socket, statistics, time
+def nudge():
+    for _ in range(400):
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(0.05)
+        t0 = time.monotonic(); u.sendto(b"go", ("127.0.0.1", 15998))
+        try:
+            u.recvfrom(64); return t0
+        except OSError:
+            pass
+    raise SystemExit("no answer to the nudge")
+def until(want, start):
+    while time.monotonic() - start < 5:
+        s = socket.socket(); s.settimeout(0.5)
+        ok = s.connect_ex(("127.0.0.1", 18127)) == 0
+        s.close()
+        if ok == want:
+            return (time.monotonic() - start) * 1000
+        time.sleep(0.002)
+    return 5000
+up, down = [], []
+for round in range(8):
+    t0 = nudge()
+    ms = until(True, t0)
+    t1 = time.monotonic()
+    gone = until(False, t1)
+    if round:
+        up.append(ms); down.append(gone)
+print(f"{statistics.median(up):.0f} {max(up):.0f} {statistics.median(down):.0f} {max(down):.0f}")
+PYEOF
+)"
+read -r up_med up_max down_med down_max <<<"${latency:-5000 5000 5000 5000}"
+[ "${up_med:-5000}" -lt 150 ] 2>/dev/null && pass "a listen is forwarded in ${up_med} ms (median of 7, at most ${up_max})" \
+	|| fail "a listen took ${up_med:-?} ms to be forwarded (median of 7, at most ${up_max:-?}): ${latency:-no measurement}"
+[ "${down_med:-5000}" -lt 250 ] 2>/dev/null && pass "and withdrawn ${down_med} ms after it closes (at most ${down_max})" \
+	|| fail "a closed listener took ${down_med:-?} ms to be withdrawn (at most ${down_max:-?})"
+$D rm -f m3-hostlat >/dev/null 2>&1
 
 echo "==> HTTP immediately after connection bursts"
 if python3 scripts/test-publish-burst.py --docker-host "unix://$LIGHTER_HOME/docker.sock"; then

@@ -11,7 +11,7 @@ lighter connects containers to your network through the Mac rather than putting 
 
 ## What changed
 
-- **What a host-network container listens on is reachable from the Mac**, TCP and UDP, on `localhost` and, as `lighter config --publish` says, on the Mac's network, exactly as a port you publish with `-p` is: within a second of the server starting, gone when it stops, and the container sees who is calling. A server bound to `127.0.0.1` is on the Mac's loopback only.
+- **What a host-network container listens on is reachable from the Mac**, TCP and UDP, on `localhost` and, as `lighter config --publish` says, on the Mac's network, exactly as a port you publish with `-p` is: within milliseconds of the server starting to listen, gone when it stops, and the container sees who is calling. A server bound to `127.0.0.1` is on the Mac's loopback only.
 - **LAN mode puts the machine on your network**, with a network card and an address of its own:
 
   ```

@@ -14,6 +14,8 @@
 //! ```
 
 mod accelerator;
+mod bpf;
+mod doorbell;
 mod idle;
 mod inbound;
 mod listeners;
@@ -218,6 +220,9 @@ fn main() -> std::process::ExitCode {
 
     if let Some(path) = target {
         return streams::serve(listener.into_fd(), streams::Route::Unix(path.into()), stream_env(None));
+    }
+    if control {
+        listeners::keep();
     }
     loop {
         let stream = match listener.accept() {
@@ -1215,6 +1220,12 @@ fn serve_control(stream: OwnedFd) {
                 }
                 _ => {}
             }
+            // The one verb that keeps the connection: what host-network
+            // containers listen on, now and each time it changes.
+            if line == "watch-listeners" {
+                listeners::watch(&mut writer, || peer_gone(&reader.0));
+                return;
+            }
             let reply = handle_control(&line);
             if writer.write_all(reply.as_bytes()).is_err() {
                 return;
@@ -1225,6 +1236,15 @@ fn serve_control(stream: OwnedFd) {
             return;
         }
     }
+}
+
+/// Whether a control connection's peer has hung up: an end of stream
+/// waiting to be read. Bytes waiting are a peer still there.
+fn peer_gone(fd: &OwnedFd) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: peeking one byte into a buffer we own, without blocking.
+    let n = unsafe { libc::recv(fd.as_raw_fd(), std::ptr::addr_of_mut!(byte).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    n == 0 || (n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN))
 }
 
 /// init's record of restarted agents, one line of arguments per restart, as
