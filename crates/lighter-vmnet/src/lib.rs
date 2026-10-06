@@ -206,8 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn the_bridgeable_interfaces_are_listed() {
-        // Every Mac has at least one network card vmnet can bridge.
-        assert!(!interfaces().is_empty());
+    fn the_bridgeable_interfaces_are_listed_by_name() {
+        // A Mac's cards, or none on a virtual one (a CI runner): names only.
+        for name in interfaces() {
+            assert!(!name.is_empty() && name.len() <= 15 && name.bytes().all(|b| b.is_ascii_alphanumeric()), "{name:?}");
+        }
     }
 }
