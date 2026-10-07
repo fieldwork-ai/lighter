@@ -381,6 +381,19 @@ fn original_destination(msg: &libc::msghdr) -> Option<SocketAddr> {
 /// published port: transparent, bound to the client's own address and port,
 /// and carrying the inbound mark, which the guest's rules use to route the
 /// container's replies back to this socket rather than out to the network.
+/// Whether a caller can be presented to a container as itself. Not an IPv6
+/// link-local one: `fe80::/64` is on-link on every interface, so a bridged
+/// container would look for it on Docker's bridge and its reply would never
+/// reach the agent. Such a caller is presented as the guest, as one from the
+/// Mac itself is. Over UDP it was not presented at all: the bind failed and
+/// the datagram was dropped, so a link-local caller got no answer (#66).
+pub fn presentable(client: SocketAddr) -> bool {
+    match client.ip() {
+        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
+        std::net::IpAddr::V4(_) => true,
+    }
+}
+
 pub fn as_client(kind: libc::c_int, client: SocketAddr) -> Option<std::os::fd::OwnedFd> {
     let family = if client.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: plain socket creation.
@@ -412,4 +425,19 @@ pub fn connect_to(fd: &std::os::fd::OwnedFd, dst: SocketAddr) -> std::io::Result
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_local_caller_is_presented_as_the_guest() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(presentable(a("192.168.50.21:5353")));
+        assert!(presentable(a("[2a02:6b67:ea05:9200::1]:53")));
+        assert!(presentable(a("[fd6c:6967:6874::9]:53")));
+        assert!(!presentable(a("[fe80::5e:1b70:6718:2d9f]:53")));
+        assert!(!presentable(a("[febf::1]:53")));
+    }
 }

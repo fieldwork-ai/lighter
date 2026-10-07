@@ -503,6 +503,7 @@ struct Hold {
     registry: Arc<Registry>,
     open_cache: Arc<OpenCache>,
     volfs: Arc<Volfs>,
+    local: Arc<Local>,
 }
 
 /// Which volumes serve `/.vol/<dev>/<ino>`, by device.
@@ -561,9 +562,42 @@ impl Volfs {
     }
 }
 
+/// Which volumes are on this Mac, by device: a request is served on the
+/// vCPU that asked for it only when its volume is known to be (see
+/// [`Server::may_block`]). A request on a network volume (SMB, NFS, AFP,
+/// WebDAV) waits for the server at the other end, and served on a vCPU it
+/// stopped that CPU for as long: a NAS that hung for 48 seconds froze three
+/// of the guest's CPUs, one for 40, and the guest logged RCU stalls. On a
+/// worker, the same hang stalls only the requests that touch that volume.
+#[derive(Default)]
+struct Local(std::sync::RwLock<std::collections::HashMap<i64, bool>>);
+
+impl Local {
+    fn known(&self, dev: i64) -> Option<bool> {
+        self.0.read().expect("local poisoned").get(&dev).copied()
+    }
+
+    /// Learns from `fd`'s volume. Never on a vCPU: asked of a hung network
+    /// volume, `fstatfs` waits for it too, which is what a vCPU must not do.
+    fn learn(&self, dev: i64, fd: RawFd) {
+        // SAFETY: fstatfs fills the zeroed struct for an open descriptor.
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut fs) } == 0 {
+            let local = fs.f_flags & libc::MNT_LOCAL as u32 != 0;
+            self.0.write().expect("local poisoned").insert(dev, local);
+        }
+    }
+
+    /// Forgets a volume: macOS gives the next one mounted the same number.
+    fn forget(&self, dev: i64) {
+        self.0.write().expect("local poisoned").remove(&dev);
+    }
+}
+
 impl crate::inode::Release for Hold {
     fn release_device(&self, dev: i64) -> usize {
         self.volfs.forget(dev);
+        self.local.forget(dev);
         let inodes = self
             .registry
             .release_device(dev, |id| self.open_cache.evict(id));
@@ -586,6 +620,8 @@ pub struct Server {
     max_write: AtomicU32,
     /// Which of the share's volumes serve `/.vol` identity paths.
     volfs: Arc<Volfs>,
+    /// Which of the share's volumes are on this Mac.
+    local: Arc<Local>,
     /// How many more requests to log in order. See [`Server::trace`].
     trace_left: AtomicUsize,
     /// How long the guest may believe what we tell it.
@@ -817,10 +853,18 @@ impl Server {
             move |id| open_cache.evict(id)
         }));
         let volfs = Arc::new(Volfs::default());
+        // The share's own volume is known from the start, so the common case
+        // is served on the vCPU from the first request.
+        let local = Arc::new(Local::default());
+        if let Ok(root_dir) = std::fs::File::open(root) {
+            use std::os::fd::AsRawFd;
+            local.learn(dev, root_dir.as_raw_fd());
+        }
         let hold = Arc::new(Hold {
             registry: registry.clone(),
             open_cache: open_cache.clone(),
             volfs: volfs.clone(),
+            local: local.clone(),
         });
         pool.enroll(Arc::downgrade(&hold) as std::sync::Weak<dyn crate::inode::Release>);
         let apply = std::sync::Arc::new(crate::apply::Apply::start(root.to_path_buf()));
@@ -865,6 +909,7 @@ impl Server {
             host_gid,
             max_write: AtomicU32::new(MAX_WRITE),
             volfs,
+            local,
             trace_left: AtomicUsize::new(
                 std::env::var("LIGHTER_FS_TRACE")
                     .ok()
@@ -916,6 +961,22 @@ impl Server {
         self.policy.set_pushing(available);
     }
 
+    /// Whether `request` may wait on something other than this Mac: true
+    /// unless the volume of the inode it names is known to be local. Cheap
+    /// and touching no volume, since it is asked on the vCPU deciding
+    /// whether to serve the request itself. A request on a local directory
+    /// can still reach a network volume mounted inside it (a lookup or a
+    /// listing of the mount point); only what the request names is weighed.
+    pub fn may_block(&self, request: &[u8]) -> bool {
+        let Some(header) = InHeader::parse(request) else {
+            return true;
+        };
+        match self.registry.get(header.nodeid) {
+            Some(inode) => self.local.known(inode.dev()) != Some(true),
+            None => true,
+        }
+    }
+
     /// Handles one request, writing the reply into `sink`.
     ///
     /// Returns how many bytes were written, which is zero for the operations
@@ -939,6 +1000,14 @@ impl Server {
         // budget has to be re-checked here, not only on insert. One atomic
         // load when the share is under budget.
         self.registry.reclaim_if_over_budget();
+        // A volume not yet known is learned here, on the worker the request
+        // went to because it was not known (see [`Server::may_block`]).
+        if let Some(inode) = self.registry.get(header.nodeid)
+            && self.local.known(inode.dev()).is_none()
+            && let Ok(held) = inode.reference()
+        {
+            self.local.learn(inode.dev(), held.raw_fd());
+        }
         // The header's own length field bounds the body; a guest that lied
         // about it must not let us read the tail of the previous request.
         let end = (header.len as usize)
@@ -4892,6 +4961,55 @@ impl Drop for Server {
 #[cfg(test)]
 mod volfs_tests {
     use super::*;
+
+    /// A request is served on the vCPU only when its volume is known to be
+    /// this Mac's: the share's own disk from the start, anything else once
+    /// a worker has looked (a NAS that hung froze guest CPUs for 40 s).
+    #[test]
+    fn only_a_request_on_a_known_local_volume_may_be_served_inline() {
+        let dir = tempfile_dir();
+        let server = Server::new(&dir).unwrap();
+        let request = |nodeid: u64| {
+            let mut r = vec![0u8; crate::fuse::IN_HEADER_LEN];
+            r[0..4].copy_from_slice(&(crate::fuse::IN_HEADER_LEN as u32).to_le_bytes());
+            r[16..24].copy_from_slice(&nodeid.to_le_bytes());
+            r
+        };
+        assert!(
+            !server.may_block(&request(1)),
+            "the share's root is on this Mac"
+        );
+        assert!(
+            server.may_block(&request(424_242)),
+            "an inode not known is not assumed local"
+        );
+        assert!(
+            server.may_block(&[0u8; 4]),
+            "nor is a request too short to name one"
+        );
+    }
+
+    #[test]
+    fn a_volume_is_learned_and_forgotten() {
+        let local = Local::default();
+        let disk = std::fs::File::open(std::env::temp_dir()).unwrap();
+        let dev = sys::stat_fd(disk.as_raw_fd()).unwrap().st_dev as i64;
+        assert_eq!(local.known(dev), None);
+        local.learn(dev, disk.as_raw_fd());
+        assert_eq!(local.known(dev), Some(true), "the Mac's own disk is local");
+        local.forget(dev);
+        assert_eq!(
+            local.known(dev),
+            None,
+            "an ejected volume's number is reused"
+        );
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lighter-fs-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     /// Each volume answers for itself: the Mac's own disk names a file by
     /// identity, and one without `/.vol` (devfs here; exFAT, FAT and SMB in

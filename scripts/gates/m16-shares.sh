@@ -20,6 +20,8 @@
 # Drives are disk images: they mount under /Volumes like any drive, and need
 # neither hardware nor root.
 set -euo pipefail
+# Under pipefail `cmd | grep -q` fails whenever grep stops reading before cmd
+# has finished writing, so checks grep captured output instead.
 
 if ! command -v cargo >/dev/null 2>&1; then
 	# shellcheck disable=SC1091
@@ -68,11 +70,16 @@ SMB_D="$HOME/.lighter-gate-smb-d-$$"
 SMB_T="$HOME/.lighter-gate-smb-t-$$"
 
 cleanup() {
-	[ "$FAILED" = 0 ] || cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m16-machine.log" 2>/dev/null || true
+	# By the exit status too: judge records a failure in its pipeline's
+	# subshell, where FAILED does not reach this.
+	local status=$?
+	{ [ "$FAILED" = 0 ] && [ "$status" = 0 ]; } || cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m16-machine.log" 2>/dev/null || true
+	# Unpaused first: unmounting a share whose server is paused hangs.
+	docker unpause lighter-gate-smb >/dev/null 2>&1 || true
 	umount "$SMB_D" 2>/dev/null || true
 	umount "$SMB_T" 2>/dev/null || true
 	rmdir "$SMB_D" "$SMB_T" 2>/dev/null || true
-	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb >/dev/null 2>&1 || true
+	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-reader lighter-gate-ticker lighter-gate-local >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	detach "$APFS"
 	detach "$EXFAT"
@@ -130,7 +137,7 @@ echo
 echo "==> Idle, sharing the home folder alone"
 "$LIGHTER" config --unshare /Users --unshare /Volumes --unshare /var/folders \
 	--share "$HOME" >/dev/null
-if "$LIGHTER" config | grep -q "share      /Volumes"; then
+if grep -q "share      /Volumes" <<<"$("$LIGHTER" config)"; then
 	fail "the home folder chosen alone was turned back into the defaults"
 fi
 "$LIGHTER" start >/dev/null 2>&1 || { fail "lighter start failed"; "$LIGHTER" logs | tail -15; exit 1; }
@@ -144,7 +151,7 @@ echo "==> The defaults"
 # A config from before the defaults shares the home folder alone, and reads
 # as them: the upgrade every existing install takes.
 printf '{"shares": ["%s"]}' "$HOME" > "$LIGHTER_HOME/config.json"
-if "$LIGHTER" config | grep -q "share      /Volumes"; then
+if grep -q "share      /Volumes" <<<"$("$LIGHTER" config)"; then
 	pass "a config from before 0.11.6 reads as the defaults"
 else
 	fail "the home folder did not become the defaults: $("$LIGHTER" config | grep share | tr '\n' ' ')"
@@ -238,7 +245,62 @@ else
 	if mount_smbfs "//lt:lt@localhost/d" "$SMB_D" 2>"$SCRATCH/smb.err" \
 		&& mount_smbfs "//lt:lt@localhost/t" "$SMB_T" 2>>"$SCRATCH/smb.err"; then
 		metadata "$SMB_D" "$SMB_T" | judge "SMB"
-		umount "$SMB_D"; umount "$SMB_T"
+		# A network volume that stops answering stops only what touches
+		# it. Served on the vCPU that asked, a request on it stopped that
+		# CPU for as long: a NAS that hung for 48 s froze three of the
+		# guest's CPUs, one for 40, and the guest logged RCU stalls.
+		# And it holds only its share of the workers: with every worker
+		# of a share waiting on a hung NAS, a file on the Mac's own disk in
+		# the same share waited 38.7 s behind them. Forty lookups in forty
+		# directories, so the guest cannot fold them into a few.
+		for i in $(seq 1 40); do mkdir -p "$SMB_D/d$i"; done
+		LOCAL_PROBE="$HOME/.lighter-gate-local-$$"
+		mkdir -p "$LOCAL_PROBE" && touch "$LOCAL_PROBE/probe"
+		docker run -d --name lighter-gate-smb-reader -v "$SMB_D:/m" "$IMAGE" sh -c \
+			'for i in $(seq 1 40); do (while true; do stat /m/d$i/fresh-$RANDOM$RANDOM >/dev/null 2>&1; done) & done; wait' >/dev/null
+		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
+import os, time
+stop = time.time() + 35; worst = 0.0
+while time.time() < stop:
+    t = time.monotonic(); os.stat("/h/probe"); os.listdir("/h"); worst = max(worst, time.monotonic() - t)
+    time.sleep(0.05)
+print("%.2f" % worst)' >/dev/null
+		docker run -d --name lighter-gate-ticker "$PYTHON" python3 -c '
+import os, threading, time
+n = os.cpu_count(); worst = [0.0] * n; stop = time.time() + 35
+def tick(cpu):
+    os.sched_setaffinity(0, {cpu}); last = time.monotonic()
+    while time.time() < stop:
+        time.sleep(0.05); now = time.monotonic(); worst[cpu] = max(worst[cpu], now - last); last = now
+ts = [threading.Thread(target=tick, args=(c,)) for c in range(n)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print("%.2f" % max(worst))' >/dev/null
+		sleep 5
+		docker pause lighter-gate-smb >/dev/null
+		sleep 20
+		# Measured only if the share lasted the hang: macOS sometimes gives
+		# up on a server that stops answering and drops the share, and the
+		# requests then fail at once, which proves nothing either way.
+		kept=0
+		grep -q "on $SMB_D (smbfs" <<<"$(mount)" && kept=1
+		docker unpause lighter-gate-smb >/dev/null
+		docker wait lighter-gate-ticker lighter-gate-local >/dev/null
+		gap="$(docker logs lighter-gate-ticker 2>&1 | tail -1)"
+		slowest="$(docker logs lighter-gate-local 2>&1 | tail -1)"
+		docker rm -f lighter-gate-ticker lighter-gate-smb-reader lighter-gate-local >/dev/null
+		rm -rf "$LOCAL_PROBE"
+		if [ "$kept" = 1 ]; then
+			awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
+				&& pass "SMB: the server hung for 20 s, and no guest CPU stopped (longest gap ${gap} s)" \
+				|| fail "SMB: with the server hung, a guest CPU stopped for ${gap:-?} s"
+			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
+				&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
+				|| fail "SMB: with the server hung, a local file in the same share waited ${slowest:-?} s"
+		else
+			note "SMB: macOS dropped the share while its server was hung, so the hang was not measured (gap ${gap:-?} s, slowest local ${slowest:-?} s)"
+		fi
+		umount "$SMB_D" 2>/dev/null || true
+		umount "$SMB_T" 2>/dev/null || true
 	else
 		fail "could not mount the shares: $(cat "$SCRATCH/smb.err")"
 	fi
@@ -277,7 +339,7 @@ else
 	fail "the exFAT drive could not be ejected: $(grep -v deprecated "$SCRATCH/detach.err")"
 	holding "$EXFAT"
 fi
-if docker run --rm -v /Volumes:/v "$IMAGE" ls /v 2>/dev/null | grep -qx "$EXFAT"; then
+if grep -qx "$EXFAT" <<<"$(docker run --rm -v /Volumes:/v "$IMAGE" ls /v 2>/dev/null)"; then
 	fail "the guest still lists the ejected drive"
 else
 	pass "the guest no longer lists it"
@@ -312,7 +374,7 @@ if grep -q "lighter-gate-tmp binds /tmp/lighter-gate-$$, .*\$TMPDIR" <<<"$status
 else
 	fail "lighter status does not name the /tmp bind"
 fi
-if "$LIGHTER" status | grep -q "lighter-gate-reader\|/Volumes/$EXFAT"; then
+if grep -q "lighter-gate-reader\|/Volumes/$EXFAT" <<<"$("$LIGHTER" status)"; then
 	fail "lighter status names a bind that is shared"
 fi
 doctor="$("$LIGHTER" doctor 2>&1 || true)"
@@ -323,10 +385,12 @@ else
 	sed 's/^/    /' <<<"$doctor"
 fi
 docker rm -f lighter-gate-unshared lighter-gate-tmp >/dev/null
-if "$LIGHTER" doctor 2>&1 | grep -q "bind mounts.*every one from the Mac is shared"; then
+doctor="$("$LIGHTER" doctor 2>&1 || true)"
+if grep -q "bind mounts.*every one from the Mac is shared" <<<"$doctor"; then
 	pass "and stops once the containers have gone"
 else
 	fail "lighter doctor still warns with the containers gone"
+	sed 's/^/    /' <<<"$doctor"
 fi
 
 echo
@@ -352,10 +416,12 @@ else
 	fail "the machine did not start with a share that is not there"
 	"$LIGHTER" logs | tail -15 | sed 's/^/    /'
 fi
-if "$LIGHTER" doctor 2>&1 | grep -q "not there, so not shared: $MISSING"; then
+doctor="$("$LIGHTER" doctor 2>&1 || true)"
+if grep -q "not there, so not shared: $MISSING" <<<"$doctor"; then
 	pass "lighter doctor names it"
 else
 	fail "lighter doctor does not name the missing share"
+	sed 's/^/    /' <<<"$doctor"
 fi
 "$LIGHTER" config --unshare "$MISSING" >/dev/null \
 	&& pass "lighter config --unshare removes it" \

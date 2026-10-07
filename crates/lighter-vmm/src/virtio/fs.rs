@@ -320,6 +320,9 @@ struct Job {
     /// out of order and out of queue; a completion returned to the wrong ring
     /// is a descriptor id the driver never issued there.
     queue: u16,
+    /// Whether it may wait on a volume not known to be this Mac's
+    /// (`Server::may_block`): its lane, below.
+    remote: bool,
 }
 
 /// A finished request, waiting to go back on the used ring.
@@ -329,7 +332,7 @@ struct Completion {
     queue: u16,
 }
 
-/// Jobs waiting for a worker.
+/// Jobs waiting for a worker, in two lanes.
 ///
 /// A `Mutex<Receiver>` around a channel would be the obvious thing and is
 /// quietly disastrous: a worker blocked in `recv` holds the mutex, so only one
@@ -339,49 +342,91 @@ struct Completion {
 ///
 /// Here the lock is held only long enough to push or pop; waiting happens on
 /// the condition variable, where any number of workers can wait at once.
+///
+/// The lanes are a bulkhead. A request that may wait on a network volume
+/// waits as long as its server does, and with a NAS hung, enough of them held
+/// every worker of the share: a file on the Mac's own disk in the same share
+/// then waited 38.7 seconds behind them. Only `remote_cap` workers take a
+/// remote job at once; the rest of that lane waits here, holding no thread,
+/// and the local lane is always served first.
 struct Queue {
-    jobs: Mutex<Option<VecDeque<Job>>>,
+    jobs: Mutex<Option<Lanes>>,
     arrived: Condvar,
+    remote_cap: usize,
+}
+
+#[derive(Default)]
+struct Lanes {
+    local: VecDeque<Job>,
+    remote: VecDeque<Job>,
+    /// Remote jobs a worker is serving now.
+    remote_busy: usize,
 }
 
 impl Queue {
-    fn new() -> Queue {
+    fn new(remote_cap: usize) -> Queue {
         Queue {
-            jobs: Mutex::new(Some(VecDeque::new())),
+            jobs: Mutex::new(Some(Lanes::default())),
             arrived: Condvar::new(),
+            remote_cap: remote_cap.max(1),
         }
     }
 
     /// Returns false once the queue has been closed.
     fn push(&self, job: Job) -> bool {
         let mut guard = self.jobs.lock().expect("fs job queue poisoned");
-        let Some(queue) = guard.as_mut() else {
+        let Some(lanes) = guard.as_mut() else {
             return false;
         };
-        queue.push_back(job);
+        if job.remote {
+            lanes.remote.push_back(job);
+        } else {
+            lanes.local.push_back(job);
+        }
         drop(guard);
         self.arrived.notify_one();
         true
     }
 
-    /// Blocks until there is a job, or until the queue is closed.
+    /// Blocks until there is a job this worker may take, or until the queue
+    /// is closed. A remote job taken must be given back with [`Queue::done`].
     fn pop(&self) -> Option<Job> {
         let mut guard = self.jobs.lock().expect("fs job queue poisoned");
         loop {
-            if let Some(job) = guard.as_mut()?.pop_front() {
+            let lanes = guard.as_mut()?;
+            if let Some(job) = lanes.local.pop_front() {
+                return Some(job);
+            }
+            if lanes.remote_busy < self.remote_cap
+                && let Some(job) = lanes.remote.pop_front()
+            {
+                lanes.remote_busy += 1;
                 return Some(job);
             }
             guard = self.arrived.wait(guard).expect("fs job queue poisoned");
         }
     }
 
-    /// Whether a worker would find nothing to do.
-    fn is_empty(&self) -> bool {
+    /// A remote job is finished: its place is free for the next.
+    fn done(&self, job_was_remote: bool) {
+        if !job_was_remote {
+            return;
+        }
+        if let Some(lanes) = self.jobs.lock().expect("fs job queue poisoned").as_mut() {
+            lanes.remote_busy -= 1;
+        }
+        self.arrived.notify_one();
+    }
+
+    /// Whether a local job would find a worker's queue empty: what "alone"
+    /// means for serving a request on the vCPU. A remote backlog, waiting on
+    /// a hung server, is no reason to stop.
+    fn local_is_empty(&self) -> bool {
         self.jobs
             .lock()
             .expect("fs job queue poisoned")
             .as_ref()
-            .is_none_or(|queue| queue.is_empty())
+            .is_none_or(|lanes| lanes.local.is_empty())
     }
 
     /// Wakes every worker and lets them retire.
@@ -415,11 +460,14 @@ struct Pool {
 
 impl Pool {
     fn start(server: Arc<Server>, memory: Arc<GuestMemory>, tag: String, waker: Waker) -> Pool {
-        let queue = Arc::new(Queue::new());
         let done: Arc<Mutex<VecDeque<Completion>>> = Arc::new(Mutex::new(VecDeque::new()));
         let waking = Arc::new(AtomicBool::new(false));
 
         let count = workers();
+        // A quarter of the workers for requests that may wait on a network
+        // volume: enough for a NAS in use, few enough that one that hangs
+        // leaves the rest to the Mac's own disks.
+        let queue = Arc::new(Queue::new(count / 4));
         let mut threads = Vec::with_capacity(count);
         for index in 0..count {
             let queue = queue.clone();
@@ -433,8 +481,10 @@ impl Pool {
                 .spawn(move || {
                     raise_server_qos();
                     while let Some(job) = queue.pop() {
+                        let remote = job.remote;
                         let mut sink = ChainSink::new(memory.clone(), job.reply);
                         let written = server.dispatch(&job.request, &mut sink);
+                        queue.done(remote);
                         done.lock()
                             .expect("fs completions poisoned")
                             .push_back(Completion {
@@ -809,8 +859,12 @@ impl VirtioDevice for Fs {
                     // behind it on the ring, or already queued for a worker —
                     // goes to the pool, so concurrency the guest offers is
                     // kept rather than flattened.
-                    let alone = queue.is_empty() && !requests.more_available(mem);
-                    if self.inline.applies(alone) {
+                    let alone = queue.local_is_empty() && !requests.more_available(mem);
+                    // And only on a volume known to be this Mac's: a request
+                    // on a network volume waits for its server, and here
+                    // that stops a CPU of the guest's (lighter_fs::Local).
+                    let remote = self.server.may_block(&request);
+                    if self.inline.applies(alone) && !remote {
                         let mut sink = ChainSink::new(memory.clone(), reply);
                         let written = self.server.dispatch(&request, &mut sink);
                         requests.push_used(mem, head, written as u32);
@@ -823,6 +877,7 @@ impl VirtioDevice for Fs {
                         request,
                         reply,
                         queue: index,
+                        remote,
                     }) {
                         // Every worker is gone. Return the chain rather than
                         // leaking it, so the guest sees an error instead of a
@@ -848,6 +903,69 @@ impl VirtioDevice for Fs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job(remote: bool, head: u16) -> Job {
+        Job {
+            head,
+            request: Vec::new(),
+            reply: Vec::new(),
+            queue: 0,
+            remote,
+        }
+    }
+
+    /// The bulkhead: local jobs first, at most `cap` remote jobs out at once,
+    /// and a finished one frees its place. A NAS that hung held every worker
+    /// and a local file in the same share waited 38.7 s behind it.
+    #[test]
+    fn remote_jobs_take_at_most_their_share_of_the_workers() {
+        let queue = Arc::new(Queue::new(2));
+        for head in 0..3 {
+            assert!(queue.push(job(true, head)));
+        }
+        assert!(queue.push(job(false, 9)));
+        assert!(!queue.local_is_empty());
+        assert_eq!(queue.pop().unwrap().head, 9, "the local job first");
+        assert!(
+            queue.local_is_empty(),
+            "a remote backlog leaves the local lane empty"
+        );
+        assert_eq!(queue.pop().unwrap().head, 0);
+        assert_eq!(queue.pop().unwrap().head, 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = {
+            let queue = queue.clone();
+            std::thread::spawn(move || tx.send(queue.pop().map(|j| j.head)).unwrap())
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the third waits"
+        );
+        queue.push(job(false, 7));
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Some(7),
+            "a local job still gets a worker"
+        );
+        waiting.join().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = {
+            let queue = queue.clone();
+            std::thread::spawn(move || tx.send(queue.pop().map(|j| j.head)).unwrap())
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        queue.done(true);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Some(2),
+            "a finished remote job frees its place"
+        );
+        waiting.join().unwrap();
+    }
 
     #[test]
     fn the_tag_is_advertised_nul_padded() {
