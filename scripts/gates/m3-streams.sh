@@ -432,7 +432,7 @@ function one() {
   s.once("data", () => s.write("X"));
   s.on("error", () => {}); s.on("close", () => { n++; one(); });
 }
-one();' 2>/dev/null)"
+one();' 2>/dev/null || true)"
 sleep 2
 after="$(proxy_fds)"
 kill "$RESET_PID" 2>/dev/null

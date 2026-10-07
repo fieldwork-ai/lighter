@@ -341,7 +341,7 @@ open("/d/meta.tmp", "w").write("x")
 print("noreplace", rename_noreplace("/d/meta.tmp", "/d/meta"))
 open("/d/meta2.tmp", "w").write("y")
 print("onto", rename_noreplace("/d/meta2.tmp", "/d/meta"))
-' 2>&1 | xargs)"
+' 2>&1 | xargs || true)"
 	[ "$got" = "size 12582912 noreplace True onto 17" ] \
 		&& pass "$volume: an O_DIRECT file is created and preallocated; a rename that must not replace does not" \
 		|| fail "$volume: $got"
@@ -365,9 +365,9 @@ if pid == 0:
         print(e); os._exit(1)
 _, status = os.waitpid(pid, 0)
 print(oct(os.stat("/d/srv").st_mode & 0o777), oct(os.stat("/d/srv/db").st_mode & 0o777), os.waitstatus_to_exitcode(status))
-' 2>&1 | xargs)"
+' 2>&1 | xargs || true)"
 [ "$got" = "0o755 0o700 0" ] && pass "exFAT: a chmod is kept, and a service user reaches its own directory" || fail "exFAT permissions: $got"
-again="$(docker run --rm -v "/Volumes/$EXFAT:/d" "$IMAGE" stat -c '%a %u' /d/srv /d/srv/db 2>&1 | xargs)"
+again="$(docker run --rm -v "/Volumes/$EXFAT:/d" "$IMAGE" stat -c '%a %u' /d/srv /d/srv/db 2>&1 | xargs || true)"
 [ "$again" = "755 33 700 100" ] && pass "exFAT: and another container sees it" || fail "exFAT, another container: $again"
 rm -rf "/Volumes/$EXFAT/srv"
 
@@ -381,16 +381,30 @@ docker exec lighter-gate-nested cat /w/x/repo/hello.txt >/dev/null
 touch "$NEST/sess/x/repo" "$NEST/sess/x"
 xattr -w sh.lighter.gate 1 "$NEST/sess/x"
 sleep 2
-got="$(docker exec lighter-gate-nested sh -c 'grep -c " /w/x/repo " /proc/self/mountinfo; cat /w/x/repo/hello.txt' 2>&1 | xargs)"
+got="$(docker exec lighter-gate-nested sh -c 'grep -c " /w/x/repo " /proc/self/mountinfo; cat /w/x/repo/hello.txt' 2>&1 | xargs || true)"
 [ "$got" = "1 hello" ] && pass "the Mac touched and tagged the directories a mount sits in, and it is still there" \
 	|| fail "after the Mac touched the directories a mount sits in: $got"
 echo gone > "$NEST/sess/x/after.txt"
 rm -rf "$NEST/sess/x/after.txt"
 mkdir "$NEST/sess/fresh"
 sleep 1.5
-got="$(docker exec lighter-gate-nested sh -c 'test -e /w/x/after.txt && echo stale || echo gone; test -d /w/fresh && echo seen' 2>&1 | xargs)"
+got="$(docker exec lighter-gate-nested sh -c 'test -e /w/x/after.txt && echo stale || echo gone; test -d /w/fresh && echo seen' 2>&1 | xargs || true)"
 [ "$got" = "gone seen" ] && pass "and names the Mac removed and made are seen as such" || fail "names after the touch: $got"
 docker rm -f lighter-gate-nested >/dev/null
+
+echo
+echo "==> Owners and modes outlive a restart"
+# The shares' roots (/Users, /Volumes) are root's, so nothing marks them as
+# holding records; until 0.12.4 every recorded owner read as root after a
+# restart, until the next chown.
+mkdir -p "$SCRATCH/owned/pg" "/Volumes/$EXFAT/kept"
+docker run --rm -v "$SCRATCH/owned:/h" -v "/Volumes/$EXFAT:/d" "$IMAGE" sh -c \
+	'chown 999:999 /h/pg && chown 100:101 /d/kept && chmod 751 /d/kept' >/dev/null
+"$LIGHTER" restart >/dev/null 2>&1
+got="$(docker run --rm -v "$SCRATCH/owned:/h" -v "/Volumes/$EXFAT:/d" "$IMAGE" stat -c '%u:%g %a' /h/pg /d/kept 2>&1 | xargs || true)"
+[ "$got" = "999:999 755 100:101 751" ] && pass "after a restart: a home-folder owner, and an exFAT owner and mode" \
+	|| fail "after a restart: $got (want 999:999 755 100:101 751)"
+rm -rf "/Volumes/$EXFAT/kept"
 
 echo
 echo "==> Ejecting while the machine runs"
