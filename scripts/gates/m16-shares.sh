@@ -20,6 +20,8 @@
 # Drives are disk images: they mount under /Volumes like any drive, and need
 # neither hardware nor root.
 set -euo pipefail
+# Under pipefail `cmd | grep -q` fails whenever grep stops reading before cmd
+# has finished writing, so checks grep captured output instead.
 
 if ! command -v cargo >/dev/null 2>&1; then
 	# shellcheck disable=SC1091
@@ -135,7 +137,7 @@ echo
 echo "==> Idle, sharing the home folder alone"
 "$LIGHTER" config --unshare /Users --unshare /Volumes --unshare /var/folders \
 	--share "$HOME" >/dev/null
-if "$LIGHTER" config | grep -q "share      /Volumes"; then
+if grep -q "share      /Volumes" <<<"$("$LIGHTER" config)"; then
 	fail "the home folder chosen alone was turned back into the defaults"
 fi
 "$LIGHTER" start >/dev/null 2>&1 || { fail "lighter start failed"; "$LIGHTER" logs | tail -15; exit 1; }
@@ -149,7 +151,7 @@ echo "==> The defaults"
 # A config from before the defaults shares the home folder alone, and reads
 # as them: the upgrade every existing install takes.
 printf '{"shares": ["%s"]}' "$HOME" > "$LIGHTER_HOME/config.json"
-if "$LIGHTER" config | grep -q "share      /Volumes"; then
+if grep -q "share      /Volumes" <<<"$("$LIGHTER" config)"; then
 	pass "a config from before 0.11.6 reads as the defaults"
 else
 	fail "the home folder did not become the defaults: $("$LIGHTER" config | grep share | tr '\n' ' ')"
@@ -280,7 +282,7 @@ print("%.2f" % max(worst))' >/dev/null
 		# up on a server that stops answering and drops the share, and the
 		# requests then fail at once, which proves nothing either way.
 		kept=0
-		mount | grep -q "on $SMB_D (smbfs" && kept=1
+		grep -q "on $SMB_D (smbfs" <<<"$(mount)" && kept=1
 		docker unpause lighter-gate-smb >/dev/null
 		docker wait lighter-gate-ticker lighter-gate-local >/dev/null
 		gap="$(docker logs lighter-gate-ticker 2>&1 | tail -1)"
@@ -337,7 +339,7 @@ else
 	fail "the exFAT drive could not be ejected: $(grep -v deprecated "$SCRATCH/detach.err")"
 	holding "$EXFAT"
 fi
-if docker run --rm -v /Volumes:/v "$IMAGE" ls /v 2>/dev/null | grep -qx "$EXFAT"; then
+if grep -qx "$EXFAT" <<<"$(docker run --rm -v /Volumes:/v "$IMAGE" ls /v 2>/dev/null)"; then
 	fail "the guest still lists the ejected drive"
 else
 	pass "the guest no longer lists it"
@@ -372,7 +374,7 @@ if grep -q "lighter-gate-tmp binds /tmp/lighter-gate-$$, .*\$TMPDIR" <<<"$status
 else
 	fail "lighter status does not name the /tmp bind"
 fi
-if "$LIGHTER" status | grep -q "lighter-gate-reader\|/Volumes/$EXFAT"; then
+if grep -q "lighter-gate-reader\|/Volumes/$EXFAT" <<<"$("$LIGHTER" status)"; then
 	fail "lighter status names a bind that is shared"
 fi
 doctor="$("$LIGHTER" doctor 2>&1 || true)"
@@ -383,10 +385,12 @@ else
 	sed 's/^/    /' <<<"$doctor"
 fi
 docker rm -f lighter-gate-unshared lighter-gate-tmp >/dev/null
-if "$LIGHTER" doctor 2>&1 | grep -q "bind mounts.*every one from the Mac is shared"; then
+doctor="$("$LIGHTER" doctor 2>&1 || true)"
+if grep -q "bind mounts.*every one from the Mac is shared" <<<"$doctor"; then
 	pass "and stops once the containers have gone"
 else
 	fail "lighter doctor still warns with the containers gone"
+	sed 's/^/    /' <<<"$doctor"
 fi
 
 echo
@@ -412,10 +416,12 @@ else
 	fail "the machine did not start with a share that is not there"
 	"$LIGHTER" logs | tail -15 | sed 's/^/    /'
 fi
-if "$LIGHTER" doctor 2>&1 | grep -q "not there, so not shared: $MISSING"; then
+doctor="$("$LIGHTER" doctor 2>&1 || true)"
+if grep -q "not there, so not shared: $MISSING" <<<"$doctor"; then
 	pass "lighter doctor names it"
 else
 	fail "lighter doctor does not name the missing share"
+	sed 's/^/    /' <<<"$doctor"
 fi
 "$LIGHTER" config --unshare "$MISSING" >/dev/null \
 	&& pass "lighter config --unshare removes it" \
