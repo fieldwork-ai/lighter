@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const HEADER_LEN: usize = 12;
 const VHCI: &str = "/sys/devices/platform/vhci_hcd.0";
@@ -121,6 +122,113 @@ fn by_id_for(tty: &str) -> Option<String> {
         &interface,
         port.as_deref(),
     ))
+}
+
+/// A device the Mac attaches at boot (`lighter.usb_expect=vendor:product[:serial]`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Expected {
+    vendor: String,
+    product: String,
+    serial: Option<String>,
+}
+
+impl std::fmt::Display for Expected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.vendor, self.product)
+    }
+}
+
+/// The devices the command line says are coming.
+pub fn expected(cmdline: &str) -> Vec<Expected> {
+    cmdline
+        .split_whitespace()
+        .filter_map(|arg| arg.strip_prefix("lighter.usb_expect="))
+        .filter_map(|spec| {
+            let mut parts = spec.splitn(3, ':');
+            let (vendor, product) = (parts.next()?, parts.next()?);
+            let hex = |p: &str| p.len() == 4 && p.chars().all(|c| c.is_ascii_hexdigit());
+            (hex(vendor) && hex(product)).then(|| Expected {
+                vendor: vendor.to_ascii_lowercase(),
+                product: product.to_ascii_lowercase(),
+                serial: parts.next().filter(|s| !s.is_empty()).map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// How long boot waits for the devices the Mac attaches: past this the
+/// machine starts without them, as it did before it waited at all.
+const EXPECT_WINDOW: Duration = Duration::from_secs(15);
+/// An interface no driver claims is never bound; after this long enumerated,
+/// a device is ready on the ttys it has.
+const BIND_PATIENCE: Duration = Duration::from_secs(1);
+
+/// `--usb-expect`: waits until every device the command line names is in
+/// the guest, bound, and named under `/dev/serial/by-id`, so dockerd starts
+/// no container before them. A container whose `devices:` names a stick not
+/// there yet fails to start, and Docker never retries a start that failed.
+pub fn wait_expected() {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let mut waiting = expected(&cmdline);
+    let start = Instant::now();
+    let mut seen: HashMap<String, Instant> = HashMap::new();
+    while !waiting.is_empty() && start.elapsed() < EXPECT_WINDOW {
+        waiting.retain(|e| {
+            let Some(dev) = find(e) else { return true };
+            let first = *seen.entry(e.to_string()).or_insert_with(Instant::now);
+            if ready(&dev, first.elapsed() >= BIND_PATIENCE) {
+                println!("AGENT usb-expect {e} ready after={}ms", start.elapsed().as_millis());
+                false
+            } else {
+                true
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for e in waiting {
+        println!("AGENT usb-expect {e} not there after={}ms; starting without it", start.elapsed().as_millis());
+    }
+}
+
+/// The device's directory under `/sys/bus/usb/devices`, if it is there.
+fn find(e: &Expected) -> Option<PathBuf> {
+    std::fs::read_dir("/sys/bus/usb/devices").ok()?.flatten().map(|d| d.path()).find(|dev| {
+        read_attr(dev, "idVendor").as_deref() == Some(e.vendor.as_str())
+            && read_attr(dev, "idProduct").as_deref() == Some(e.product.as_str())
+            && e.serial.as_ref().is_none_or(|s| read_attr(dev, "serial").as_ref() == Some(s))
+    })
+}
+
+/// Bound (every interface has its driver, or `patient` says to stop
+/// waiting for one), and every USB tty under it named under `by-id`.
+fn ready(dev: &Path, patient: bool) -> bool {
+    let Some(name) = dev.file_name().and_then(|n| n.to_str()) else { return false };
+    let interfaces: Vec<PathBuf> = std::fs::read_dir(dev)
+        .map(|r| r.flatten().map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&format!("{name}:")))).collect())
+        .unwrap_or_default();
+    if interfaces.is_empty() || (!patient && !interfaces.iter().all(|i| i.join("driver").exists())) {
+        return false;
+    }
+    interfaces.iter().flat_map(|i| ttys_under(i)).all(|tty| {
+        by_id_for(&tty).is_some_and(|n| {
+            std::fs::read_link(Path::new(BY_ID).join(n)).is_ok_and(|to| to == Path::new(&format!("../../{tty}")))
+        })
+    })
+}
+
+/// The USB ttys of an interface: `tty/ttyACM0` for CDC ACM, `ttyUSB0` for a
+/// usb-serial converter.
+fn ttys_under(interface: &Path) -> Vec<String> {
+    let names = |dir: &Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|r| r.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| is_usb_tty(n)).collect())
+            .unwrap_or_default()
+    };
+    let mut ttys = names(&interface.join("tty"));
+    ttys.extend(names(interface));
+    ttys.sort();
+    ttys.dedup();
+    ttys
 }
 
 /// Links, by tty, the names this process made, so a removal takes its own.
@@ -332,6 +440,20 @@ pub fn serve(port: u32) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_expected_devices_come_from_the_command_line() {
+        let found = expected("console=ttyAMA0 lighter.usb_expect=303A:831a:E072A1D9E0CC lighter.share=s:/x lighter.usb_expect=1a86:7523 lighter.usb_expect=bad");
+        assert_eq!(
+            found,
+            vec![
+                Expected { vendor: "303a".into(), product: "831a".into(), serial: Some("E072A1D9E0CC".into()) },
+                Expected { vendor: "1a86".into(), product: "7523".into(), serial: None },
+            ]
+        );
+        assert!(expected("console=ttyAMA0").is_empty());
+    }
+
     use super::*;
 
     const STATUS: &str = "hub port sta spd dev      sockfd local_busid

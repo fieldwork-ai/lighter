@@ -31,6 +31,10 @@ ZBT=303a:831a
 TR=1a86:7523
 ZBT_NAME=/dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00
 TR_NAME=/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+# The CH340's port on the Mac is named for the socket it is in
+# (/dev/cu.usbserial-210, -10, ...), so it is read, not assumed.
+TR_PORT="$("$LIGHTER" usb list 2>/dev/null | awk '/1a86:7523/ {print $NF; exit}')"
+case "$TR_PORT" in /dev/cu.usbserial-*) ;; *) echo "m15: the ThirdReality dongle (1a86:7523) is not plugged in, or is attached elsewhere"; exit 1 ;; esac
 FAILED=0
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
@@ -160,14 +164,14 @@ PY
 sleep 2
 has_name "$ZBT_NAME" && has_name "$TR_NAME" && pass "the names survive the agent's restart" || fail "names after the agent's restart: $(guest_names | xargs)"
 "$LIGHTER" usb detach "$TR" >/dev/null
-wait_for 10 macos_has /dev/cu.usbserial-210 || true
+wait_for 10 macos_has "$TR_PORT" || true
 out="$("$LIGHTER" usb attach "$TR" 2>&1)"
 echo "$out" | grep -q "is attached" && pass "the restarted agent attaches a device" || fail "attach after the agent's restart: $out"
 
 echo "==> A port a Mac program holds is refused"
 "$LIGHTER" usb detach "$TR" >/dev/null
-wait_for 10 macos_has /dev/cu.usbserial-210
-python3 -c 'import time,os; f=os.open("/dev/cu.usbserial-210", os.O_RDWR|os.O_NONBLOCK); time.sleep(60)' &
+wait_for 10 macos_has "$TR_PORT"
+python3 -c 'import sys,time,os; f=os.open(sys.argv[1], os.O_RDWR|os.O_NONBLOCK); time.sleep(60)' "$TR_PORT" &
 HOLD_PID=$!
 sleep 1
 out="$("$LIGHTER" usb attach "$TR" 2>&1)"
@@ -181,8 +185,15 @@ HOLD_PID=""
 wait_for 15 has_name "$TR_NAME" && pass "attached on its own once the port was let go" || fail "not attached after the port was let go: $(guest_names | xargs)"
 
 echo "==> A machine started again attaches its devices again"
+# And a container naming one comes back with it: dockerd starts restart-policy
+# containers at boot, and one whose device was not there yet failed to start
+# and was never retried (Zigbee2MQTT after every restart, until 0.12.1). Boot
+# now waits for the devices the Mac is attaching.
+$D rm -f m15-stick >/dev/null 2>&1
+$D run -d --name m15-stick --restart unless-stopped --device "$ZBT_NAME" alpine:3.21 sleep infinity >/dev/null \
+	|| fail "a container naming $ZBT_NAME did not start"
 "$LIGHTER" stop >/dev/null 2>&1
-if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 10 macos_has /dev/cu.usbserial-210; then
+if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 10 macos_has "$TR_PORT"; then
 	pass "stopped: macOS has both devices back"
 else
 	fail "after stop, macOS has: $(ls /dev/cu.usb* 2>/dev/null | xargs)"
@@ -190,11 +201,15 @@ fi
 "$LIGHTER" start >"$LIGHTER_HOME/start.log" 2>&1 &
 for _ in $(seq 1 90); do $D info >/dev/null 2>&1 && break; sleep 1; done
 wait_for 30 has_name "$ZBT_NAME" && wait_for 10 has_name "$TR_NAME" && pass "started: both attached again" || fail "after start: $(guest_names | xargs)"
+state="$($D inspect m15-stick --format '{{.State.Status}} {{.State.Error}}' 2>&1)"
+[ "${state%% *}" = running ] && pass "a restart-policy container naming the stick came back by itself ($(grep -ao 'usb-expect 303a:831a [a-z ]*after=[0-9]*ms' "$LIGHTER_HOME/machine.log" | tail -1))" \
+	|| fail "a restart-policy container naming the stick did not come back: $state"
+$D rm -f m15-stick >/dev/null 2>&1
 
 echo "==> A machine killed holding them gives them back"
 pid="$(cat "$LIGHTER_HOME/lighter.pid" 2>/dev/null)"
 kill -9 "$pid" 2>/dev/null
-if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 5 macos_has /dev/cu.usbserial-210; then
+if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 5 macos_has "$TR_PORT"; then
 	pass "killed with kill -9: macOS has both devices back"
 else
 	fail "after the machine was killed, macOS has: $(ls /dev/cu.usb* 2>/dev/null | xargs)"

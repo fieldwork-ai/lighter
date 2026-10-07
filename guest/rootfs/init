@@ -651,6 +651,16 @@ if [ -n "$boot_ram_mib" ]; then
         fi
     done
 fi
+# USB devices the Mac attaches, each on its own stream to vhci-hcd: started
+# before dockerd rather than with the other agents, because dockerd waits for
+# the held ones (`lighter.usb_expect=`, at most fifteen seconds). A container
+# whose `devices:` names a stick not there yet fails to start, and Docker
+# never retries a start that failed: Zigbee2MQTT stayed down after every
+# restart, its stick attached four seconds after dockerd was up.
+supervise --usb 2384
+if grep -q lighter.usb_expect= /proc/cmdline; then
+	"$AGENT" --usb-expect
+fi
 # `lighter.dockerd_debug` on the command line: dockerd's debug log, whose
 # timestamps are how a container start is taken apart.
 dockerd_debug=""
@@ -745,8 +755,6 @@ supervise --port 2376 --control
 	supervise --udp-proxy 15202
 	supervise --inbound 2378
 	supervise --udp-inbound
-	# USB devices the Mac attaches: each on its own stream, to vhci-hcd.
-	supervise --usb 2384
 	# DNS answered by the Mac's resolver over the same channel. On eth0's
 	# address rather than loopback: Docker copies this file into every
 	# container and drops loopback nameservers on the way. The agent listens

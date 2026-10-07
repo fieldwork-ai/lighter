@@ -30,7 +30,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 PROFILE="${PROFILE:-release}"
-LIGHTER="target/$PROFILE/lighter"
+LIGHTER="${LIGHTER_BIN:-target/$PROFILE/lighter}"
 IMAGE="alpine:3.21"
 PYTHON="python:3.12-slim"
 # How much more CPU the default shares may cost than the home folder alone,
@@ -80,9 +80,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Building and signing the CLI"
-cargo build $([ "$PROFILE" = release ] && echo --release) -p lighter-cli
-./scripts/sign.sh "$LIGHTER" >/dev/null
+# LIGHTER_BIN runs a built lighter (a release) as it is: re-signing one would
+# replace its signature.
+if [ -z "${LIGHTER_BIN:-}" ]; then
+	echo "==> Building and signing the CLI"
+	cargo build $([ "$PROFILE" = release ] && echo --release) -p lighter-cli
+	./scripts/sign.sh "$LIGHTER" >/dev/null
+fi
 
 echo
 echo "==> Two drives: APFS, and exFAT as most drives are sold"
@@ -202,6 +206,8 @@ judge() {
 		case "$line" in
 		*" ok") pass "$what: ${line% ok}" ;;
 		*" FAIL "*) fail "$what: ${line%% FAIL *} — ${line#* FAIL }" ;;
+		# Anything else is docker's or Python's own error: shown, not dropped.
+		*) [ -n "$line" ] && fail "$what: $line" ;;
 		esac
 	done
 }

@@ -101,6 +101,12 @@ fn main() -> std::process::ExitCode {
             // USB devices from the Mac: each on a vsock stream, attached to
             // vhci-hcd, with /dev/serial/by-id kept (see usb.rs).
             "--usb" => usb = args.next().and_then(|v| v.parse().ok()),
+            // Once, before dockerd: waits for the devices the Mac attaches at
+            // boot (`lighter.usb_expect=`), so no container starts without one.
+            "--usb-expect" => {
+                usb::wait_expected();
+                return std::process::ExitCode::SUCCESS;
+            }
             // What host-network containers listen on, once, as the
             // control verb answers it: for looking from a shell.
             "--listeners" => {

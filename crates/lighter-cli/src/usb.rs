@@ -48,6 +48,48 @@ fn wants(config: &Config) -> Vec<Want> {
         .collect()
 }
 
+/// The boot arguments naming each held device that is plugged in and will
+/// be attached (`lighter.usb_expect=`): the guest starts no container before
+/// they are there. A container whose `devices:` names a stick that is not
+/// there yet fails to start, and Docker never retries a start that failed, so
+/// Zigbee2MQTT stayed down after every restart, the stick attached seconds
+/// later. The same checks as the manager's: a device it would refuse,
+/// or whose port a Mac process holds, is not waited for.
+pub fn boot_args(config: &Config) -> String {
+    let present = iousb::list();
+    wants(config)
+        .iter()
+        .filter(|want| {
+            present.iter().any(|info| {
+                want.spec.matches(info)
+                    && (want.force
+                        || (refusal(info).is_none()
+                            && info
+                                .callout
+                                .as_deref()
+                                .and_then(iousb::port_holder)
+                                .is_none()))
+            })
+        })
+        .map(|want| format!(" lighter.usb_expect={}", boot_spec(&want.spec)))
+        .collect()
+}
+
+/// A spec as a boot argument: the serial only when it is safe on a kernel
+/// command line, which splits on spaces; without it the guest waits for any
+/// device with the ids, which is what was attached.
+fn boot_spec(spec: &Spec) -> String {
+    let safe = spec.serial.as_deref().is_some_and(|s| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    });
+    if safe {
+        spec.to_string()
+    } else {
+        format!("{:04x}:{:04x}", spec.vendor, spec.product)
+    }
+}
+
 fn entries(manager: &Manager) -> Vec<Entry> {
     manager
         .status()
@@ -488,4 +530,24 @@ pub fn ls_serial() -> anyhow::Result<std::process::ExitCode> {
         );
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    #[test]
+    fn a_serial_rides_the_boot_argument_only_when_it_is_safe_there() {
+        let spec = |s: &str| s.parse::<Spec>().unwrap();
+        assert_eq!(
+            boot_spec(&spec("303a:831a:E072A1D9E0CC")),
+            "303a:831a:E072A1D9E0CC"
+        );
+        assert_eq!(boot_spec(&spec("1a86:7523")), "1a86:7523");
+        assert_eq!(
+            boot_spec(&spec("0403:6001:A1 B2")),
+            "0403:6001",
+            "a space would split the command line"
+        );
+    }
 }
