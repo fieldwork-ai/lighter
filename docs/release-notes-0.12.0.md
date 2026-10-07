@@ -21,7 +21,7 @@ lighter connects containers to your network through the Mac rather than putting 
   lighter status               #   lan        192.168.50.85/24 on Wi-Fi en1
   ```
 
-  A host-network container then discovers and is discovered as on a Linux machine: Home Assistant picks the LAN address as its own and advertises it, and its integrations find Hue bridges, Chromecasts, printers, HomeKit and Matter devices, and anything else that announces itself. The machine gets its address from your router; on Wi-Fi, where a router may lease it nothing (the Mac's Wi-Fi carries one MAC), name one with `lighter config --lan-address 192.168.50.240`.
+  A host-network container then discovers and is discovered as on a Linux machine: Home Assistant picks the LAN address as its own and advertises it, and its integrations find what announces itself over mDNS or SSDP: on a home network, a Hue bridge, a printer, a NAS and the router within ten seconds of starting, against nothing without LAN mode. The machine gets its address from your router; on Wi-Fi, where a router may lease it nothing (the Mac's Wi-Fi carries one MAC), name one with `lighter config --lan-address 192.168.50.240`.
 
   Only what needs your network uses it. Everything bound for the internet still leaves through the Mac, so your VPN and proxy settings still apply, and containers on Docker's own networks reach your devices as they always have. Your network can reach only the ports host-network containers listen on, and the ports you publish when `--publish` is `lan`: never lighter's own.
 
