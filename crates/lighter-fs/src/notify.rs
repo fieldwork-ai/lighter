@@ -37,6 +37,10 @@ mod code {
     pub const INC_EPOCH: i32 = 8;
 }
 
+/// `FUSE_EXPIRE_ONLY`: an entry notification that expires the dentry rather
+/// than invalidating it.
+const EXPIRE_ONLY: u32 = 1;
+
 /// How many messages may wait for the guest to supply buffers.
 ///
 /// Generous, because a `git checkout` on the host produces a burst and the
@@ -59,6 +63,13 @@ pub enum Notification {
         parent: u64,
         name: Vec<u8>,
         event: Option<Event>,
+        /// The name no longer exists on the host. Only then is the guest's
+        /// dentry withdrawn at once: withdrawing one detaches every mount at
+        /// or under it, so a container's nested bind mounts vanished whenever
+        /// the Mac touched a directory they sit in (issue #70). A name that
+        /// still exists is only expired, and the guest's next use of it asks
+        /// again and drops it then if it has come to mean a different file.
+        gone: bool,
     },
     /// A file's contents or attributes.
     Inode { nodeid: u64 },
@@ -107,10 +118,12 @@ impl Notification {
                 parent,
                 name,
                 event,
+                gone,
             } => {
                 body.extend_from_slice(&parent.to_le_bytes());
                 body.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                body.extend_from_slice(&0u32.to_le_bytes()); // flags
+                let flags = if *gone { 0 } else { EXPIRE_ONLY };
+                body.extend_from_slice(&flags.to_le_bytes());
                 body.extend_from_slice(name);
                 // The guest requires the terminator and checks for it; without
                 // one it drops the message rather than reading past the name.
@@ -254,6 +267,7 @@ mod tests {
             parent: 7,
             name: b"README.md".to_vec(),
             event: None,
+            gone: true,
         }
         .encode();
 
@@ -274,6 +288,22 @@ mod tests {
         assert_eq!(bytes[41], 0, "the name must be NUL-terminated");
     }
 
+    #[test]
+    fn only_an_entry_that_is_gone_is_invalidated() {
+        let flags = |gone| {
+            let bytes = Notification::Entry {
+                parent: 7,
+                name: b"a".to_vec(),
+                event: None,
+                gone,
+            }
+            .encode();
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap())
+        };
+        assert_eq!(flags(true), 0);
+        assert_eq!(flags(false), EXPIRE_ONLY);
+    }
+
     /// What follows the terminator is the event for the guest's watchers.
     #[test]
     fn an_entry_notification_carries_its_event() {
@@ -282,6 +312,7 @@ mod tests {
                 parent: 7,
                 name: b"a".to_vec(),
                 event,
+                gone: true,
             }
             .encode();
             assert_eq!(bytes.len(), 16 + 16 + 2 + 16);
