@@ -211,6 +211,7 @@ pub fn enable() -> anyhow::Result<std::process::ExitCode> {
     let verified = std::process::Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict", &format!("-R={HELPER_REQUIREMENT}")])
         .arg(&source)
+        .stderr(std::process::Stdio::null())
         .status()?;
     if !verified.success() {
         eprintln!(
@@ -224,8 +225,11 @@ pub fn enable() -> anyhow::Result<std::process::ExitCode> {
     if !uids.contains(&uid) {
         uids.push(uid);
     }
+    // A first install has nothing to unload, and launchctl says so on
+    // stderr ("Boot-out failed: 3: No such process").
     let _ = std::process::Command::new("/bin/launchctl")
         .args(["bootout", &format!("system/{LABEL}")])
+        .stderr(std::process::Stdio::null())
         .status();
     std::fs::create_dir_all("/Library/PrivilegedHelperTools")?;
     let staging = format!("{HELPER}.new");
@@ -262,8 +266,11 @@ pub fn disable() -> anyhow::Result<std::process::ExitCode> {
         eprintln!("lighter: run it with sudo: `sudo lighter lan disable`");
         return Ok(std::process::ExitCode::FAILURE);
     }
+    // A first install has nothing to unload, and launchctl says so on
+    // stderr ("Boot-out failed: 3: No such process").
     let _ = std::process::Command::new("/bin/launchctl")
         .args(["bootout", &format!("system/{LABEL}")])
+        .stderr(std::process::Stdio::null())
         .status();
     for path in [PLIST, HELPER, lighter_vmnet::helper::SOCKET] {
         match std::fs::remove_file(path) {
