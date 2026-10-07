@@ -2948,3 +2948,26 @@ fn a_rename_that_must_not_replace_works_on_a_drive_that_cannot_refuse() {
     assert_eq!(rename(&mut guest, "b.tmp", "taken"), Err(17), "EEXIST, not a replace");
     assert_eq!(std::fs::read(drive.mount.join("taken")).unwrap(), b"kept");
 }
+
+/// `/Users` and `/Volumes` are root's, so the marker that says a share holds
+/// records cannot go on their roots. A share like that reads records from
+/// the start: before, every owner a container recorded in the home folder
+/// read as root after a restart, until the next chown.
+#[test]
+fn an_owner_survives_a_restart_on_a_share_whose_root_cannot_be_marked() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut guest = Guest::new("unmarkable");
+    std::fs::create_dir_all(guest.host("home/pg")).unwrap();
+    std::fs::set_permissions(&guest.root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let home = guest.lookup(1, "home").unwrap();
+    let pg = guest.lookup(home, "pg").unwrap();
+    setattr(&mut guest, pg, fuse::fattr::UID | fuse::fattr::GID, 0, (999, 999));
+
+    let mut restarted = guest.another();
+    let home = restarted.lookup(1, "home").unwrap();
+    let pg = restarted.lookup(home, "pg").unwrap();
+    let reply = restarted.call(op::GETATTR, pg, &[0u8; 16]).unwrap();
+    let owner = (mode_and_owner(&reply).1, mode_and_owner(&reply).2);
+    std::fs::set_permissions(&guest.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(owner, (999, 999), "after a restart");
+}

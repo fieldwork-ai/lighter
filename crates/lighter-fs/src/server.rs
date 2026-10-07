@@ -685,7 +685,10 @@ pub struct Server {
     /// disclaims them, see `dispatch`).
     xattrs: bool,
     /// Whether anything on this share has a container owner recorded
-    /// ([`crate::ownership`]). Until it does, no reply reads a record.
+    /// ([`crate::ownership`]). Until it does, no reply reads a record. A
+    /// share whose root cannot carry the marker (`/Users` and `/Volumes` are
+    /// root's) reads them from the start: otherwise every owner recorded in
+    /// it read as root after a restart, until the next chown.
     ownership: AtomicBool,
     /// The host watcher that keeps the policy honest.
     ///
@@ -956,6 +959,7 @@ impl Server {
                     .ok()
                     .is_some_and(|root| {
                         sys::get_xattr(&root, crate::ownership::MARKER, &mut []).is_ok()
+                            || sys::access(&root, libc::W_OK as u32).is_err()
                     }),
             ),
             settler_stop,
