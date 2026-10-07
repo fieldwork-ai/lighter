@@ -45,11 +45,17 @@ $D info >/dev/null 2>&1 || { fail "machine did not come up"; exit 1; }
 $D pull -q alpine:3.21 >/dev/null 2>&1
 $D pull -q alpine/socat:1.8.0.0 >/dev/null 2>&1
 
-LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+# The card with an address, Ethernet first: the v6 address is taken from the
+# same one (it was always en0's, so a Mac on Wi-Fi skipped every v6 check).
+LAN_IF=""
+for candidate in en0 en1; do
+	if ipconfig getifaddr "$candidate" >/dev/null 2>&1; then LAN_IF="$candidate"; break; fi
+done
+LAN_IP="$([ -n "$LAN_IF" ] && ipconfig getifaddr "$LAN_IF" 2>/dev/null || true)"
 # The Mac's stable global v6 address, not a temporary one (those rotate).
-V6_IP="$(ifconfig en0 2>/dev/null | awk '/inet6/ && /autoconf/ && /secured/ && !/temporary/ {print $2; exit}')"
+V6_IP="$([ -n "$LAN_IF" ] && ifconfig "$LAN_IF" 2>/dev/null | awk '/inet6/ && /autoconf/ && /secured/ && !/temporary/ {print $2; exit}')"
 [ -n "$LAN_IP" ] || skip "no LAN address on en0/en1; LAN checks skipped"
-[ -n "$V6_IP" ] || skip "no global IPv6 address on en0; global v6 checks skipped"
+[ -n "$V6_IP" ] || skip "no global IPv6 address on ${LAN_IF:-en0}; global v6 checks skipped"
 
 http() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" 2>/dev/null; }
 # The code once the listener is up: a publish takes Docker's event, a
