@@ -8,7 +8,7 @@ When lighter restarts, Docker starts every container with a restart policy as so
 
 ## What changed
 
-- **The machine waits for your USB devices before it starts any container.** At boot, lighter tells the machine which held devices are plugged in, and the machine waits until each is attached and has its `/dev/serial/by-id` name before Docker starts. A container naming one comes back with it, as it would on a Linux machine with the stick plugged in. Measured on a Home Assistant Connect ZBT-2: the stick was there 2.4 to 4.4 seconds into boot, and boot waited exactly that long.
+- **The machine waits for your USB devices before it starts any container.** At boot, lighter tells the machine which held devices are plugged in, and the machine waits until each is attached and has its `/dev/serial/by-id` name before Docker starts. A container naming one comes back with it, as it would on a Linux machine with the stick plugged in. Measured on a Home Assistant Connect ZBT-2: the stick was there 2.4 to 4.7 seconds into boot, and boot waited exactly that long.
 - **Nothing waits for a device that is not coming.** Only devices plugged into the Mac are waited for, and never for more than fifteen seconds; a machine with no USB devices starts as before.
 
 ## Upgrading
