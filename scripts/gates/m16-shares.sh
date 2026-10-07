@@ -77,7 +77,7 @@ cleanup() {
 	umount "$SMB_D" 2>/dev/null || true
 	umount "$SMB_T" 2>/dev/null || true
 	rmdir "$SMB_D" "$SMB_T" 2>/dev/null || true
-	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-reader lighter-gate-ticker >/dev/null 2>&1 || true
+	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-reader lighter-gate-ticker lighter-gate-local >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	detach "$APFS"
 	detach "$EXFAT"
@@ -247,8 +247,22 @@ else
 		# it. Served on the vCPU that asked, a request on it stopped that
 		# CPU for as long: a NAS that hung for 48 s froze three of the
 		# guest's CPUs, one for 40, and the guest logged RCU stalls.
+		# And it holds only its share of the workers: with every worker
+		# of a share waiting on a hung NAS, a file on the Mac's own disk in
+		# the same share waited 38.7 s behind them. Forty lookups in forty
+		# directories, so the guest cannot fold them into a few.
+		for i in $(seq 1 40); do mkdir -p "$SMB_D/d$i"; done
+		LOCAL_PROBE="$HOME/.lighter-gate-local-$$"
+		mkdir -p "$LOCAL_PROBE" && touch "$LOCAL_PROBE/probe"
 		docker run -d --name lighter-gate-smb-reader -v "$SMB_D:/m" "$IMAGE" sh -c \
-			'while true; do ls /m >/dev/null 2>&1; cat /m/meta.txt >/dev/null 2>&1; sleep 0.1; done' >/dev/null
+			'for i in $(seq 1 40); do (while true; do stat /m/d$i/fresh-$RANDOM$RANDOM >/dev/null 2>&1; done) & done; wait' >/dev/null
+		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
+import os, time
+stop = time.time() + 35; worst = 0.0
+while time.time() < stop:
+    t = time.monotonic(); os.stat("/h/probe"); os.listdir("/h"); worst = max(worst, time.monotonic() - t)
+    time.sleep(0.05)
+print("%.2f" % worst)' >/dev/null
 		docker run -d --name lighter-gate-ticker "$PYTHON" python3 -c '
 import os, threading, time
 n = os.cpu_count(); worst = [0.0] * n; stop = time.time() + 35
@@ -263,12 +277,17 @@ print("%.2f" % max(worst))' >/dev/null
 		docker pause lighter-gate-smb >/dev/null
 		sleep 20
 		docker unpause lighter-gate-smb >/dev/null
-		docker wait lighter-gate-ticker >/dev/null
+		docker wait lighter-gate-ticker lighter-gate-local >/dev/null
 		gap="$(docker logs lighter-gate-ticker 2>&1 | tail -1)"
-		docker rm -f lighter-gate-ticker lighter-gate-smb-reader >/dev/null
+		slowest="$(docker logs lighter-gate-local 2>&1 | tail -1)"
+		docker rm -f lighter-gate-ticker lighter-gate-smb-reader lighter-gate-local >/dev/null
+		rm -rf "$LOCAL_PROBE"
 		awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
 			&& pass "SMB: the server hung for 20 s, and no guest CPU stopped (longest gap ${gap} s)" \
 			|| fail "SMB: with the server hung, a guest CPU stopped for ${gap:-?} s"
+		awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
+			&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
+			|| fail "SMB: with the server hung, a local file in the same share waited ${slowest:-?} s"
 		umount "$SMB_D"; umount "$SMB_T"
 	else
 		fail "could not mount the shares: $(cat "$SCRATCH/smb.err")"
