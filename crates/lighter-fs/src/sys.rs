@@ -357,18 +357,26 @@ pub fn openat_path(parent: RawFd, name: &CStr, linux_flags: u32, mode: u32) -> R
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// arm64 Linux uses the `asm-generic` numbering; macOS uses its own. The two
+/// The guest's open flags, in arm64 Linux's numbering: the guest kernel is
+/// arm64 whatever a container's own architecture (Rosetta translates an amd64
+/// process's calls). arm64 keeps four flags of its own, where x86-64 uses the
+/// `asm-generic` values: read as x86's, an `O_DIRECT` open was an
+/// `O_DIRECTORY` one, which macOS refuses, and MariaDB could not create a
+/// table on a shared folder (issue #69). macOS uses its own numbering; the two
 /// agree only on the access mode in the low two bits.
-const LINUX_O_CREAT: u32 = 0o100;
-const LINUX_O_EXCL: u32 = 0o200;
+pub const LINUX_O_CREAT: u32 = 0o100;
+pub const LINUX_O_EXCL: u32 = 0o200;
 const LINUX_O_NOCTTY: u32 = 0o400;
 const LINUX_O_TRUNC: u32 = 0o1000;
-const LINUX_O_APPEND: u32 = 0o2000;
+pub const LINUX_O_APPEND: u32 = 0o2000;
 const LINUX_O_NONBLOCK: u32 = 0o4000;
 const LINUX_O_DSYNC: u32 = 0o10000;
-const LINUX_O_DIRECT: u32 = 0o40000;
-const LINUX_O_DIRECTORY: u32 = 0o200000;
-pub const LINUX_O_NOFOLLOW: u32 = 0o400000;
+pub const LINUX_O_DIRECTORY: u32 = 0o40000;
+pub const LINUX_O_NOFOLLOW: u32 = 0o100000;
+const LINUX_O_DIRECT: u32 = 0o200000;
+/// Set by the kernel on every open; macOS files are always large.
+#[cfg(test)]
+const LINUX_O_LARGEFILE: u32 = 0o400000;
 const LINUX_O_SYNC: u32 = 0o4010000;
 
 /// Rewrites guest open flags into host ones.
@@ -1019,8 +1027,21 @@ mod tests {
     /// same bit means something else here.
     #[test]
     fn flags_macos_lacks_are_dropped() {
-        let host = translate_open_flags(LINUX_O_DIRECT | 0o100000 /* O_LARGEFILE */);
+        let host = translate_open_flags(LINUX_O_DIRECT | LINUX_O_LARGEFILE);
         assert_eq!(host, libc::O_RDONLY);
+    }
+
+    /// The numbers an arm64 guest sends, as its own headers spell them.
+    #[test]
+    fn the_guest_flags_are_arm64s() {
+        assert_eq!(
+            (LINUX_O_DIRECTORY, LINUX_O_NOFOLLOW, LINUX_O_DIRECT, LINUX_O_LARGEFILE),
+            (0o40000, 0o100000, 0o200000, 0o400000)
+        );
+        // MariaDB's create (issue #69): an exclusive create that is not a
+        // directory.
+        let host = translate_open_flags(LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_DIRECT | 2);
+        assert_eq!(host & libc::O_DIRECTORY, 0);
     }
 
     #[test]

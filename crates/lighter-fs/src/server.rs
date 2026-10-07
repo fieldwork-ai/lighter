@@ -37,7 +37,10 @@ use crate::fuse::{self, Attr, EntryOut, InHeader, get_name, get_u32, get_u64, op
 use crate::inode::{Inode, Located, OpenDir, OpenFile, Reference, Registry};
 use crate::opencache::OpenCache;
 use crate::stats::Stats;
-use crate::sys::{self, TimeSpec};
+use crate::sys::{
+    self, LINUX_O_APPEND, LINUX_O_CREAT, LINUX_O_DIRECTORY, LINUX_O_EXCL, LINUX_O_NOFOLLOW,
+    TimeSpec,
+};
 
 /// The largest write we accept in one request, and the readahead we permit.
 ///
@@ -267,9 +270,6 @@ fn create_job(
     } = held;
     let keys = crate::apply::Keys::of(&[parent.id(), nodeid]);
     let job = move || {
-        const LINUX_O_CREAT: u32 = 0o100;
-        const LINUX_O_EXCL: u32 = 0o200;
-        const LINUX_O_NOFOLLOW: u32 = 0o400000;
         if inode.is_cancelled() {
             // Replaced before it existed; nothing to make.
             inode.bind_failed(linux::ENOENT);
@@ -740,7 +740,7 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
             let opened = sys::openat_path(
                 parent.raw_fd(),
                 &name,
-                linux_flags | sys::LINUX_O_NOFOLLOW,
+                linux_flags | LINUX_O_NOFOLLOW,
                 0,
             )
             .and_then(|fd| {
@@ -2951,7 +2951,7 @@ impl Server {
             // name: the diagnostic for an `rm -rf` the guest believed had
             // emptied the directory.
             let left: Vec<String> = parent
-                .under_name(&name, |dir, at| sys::openat_path(dir, at, 0o200000, 0))
+                .under_name(&name, |dir, at| sys::openat_path(dir, at, LINUX_O_DIRECTORY, 0))
                 .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
                 .map(|entries| {
                     entries
@@ -3538,8 +3538,7 @@ impl Server {
         // advance one offset between them and each gets half the entries.
         // Measured as ripgrep at 87% of native instead of 97%, and a pnpm
         // install that failed its second repetition.
-        // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
-        let fd = open_inode(&inode, 0o200000)?;
+        let fd = open_inode(&inode, LINUX_O_DIRECTORY)?;
         sys::Dir::from_fd(fd)?.read_all()
     }
 
@@ -3752,7 +3751,6 @@ impl Server {
                     let raw = match &source_fd {
                         Source::Cached(file) if file.readable => file.fd.as_raw_fd(),
                         Source::At(parent_ref, name) => {
-                            const LINUX_O_NOFOLLOW: u32 = 0o400000;
                             opened =
                                 sys::openat_path(parent_ref.raw_fd(), name, LINUX_O_NOFOLLOW, 0)?;
                             opened.as_raw_fd()
@@ -3789,8 +3787,6 @@ impl Server {
                     let clone = |name: &CString| {
                         if let Some(bytes) = &bytes {
                             const LINUX_O_WRONLY: u32 = 1;
-                            const LINUX_O_CREAT: u32 = 0o100;
-                            const LINUX_O_EXCL: u32 = 0o200;
                             let fd = sys::openat_path(
                                 parent_ref.raw_fd(),
                                 name,
@@ -3968,7 +3964,6 @@ impl Server {
         flags: u32,
         mode: u32,
     ) -> Result<Option<Vec<u8>>, i32> {
-        const LINUX_O_EXCL: u32 = 0o200;
         if parent.pending_child(name.to_bytes()).is_some() {
             // Promised already: to the guest this file exists.
             if flags & LINUX_O_EXCL != 0 {
@@ -4250,10 +4245,6 @@ impl Server {
         // common case stays one syscall. O_NOFOLLOW because a trailing
         // symlink belongs to the guest's VFS: it comes back as ELOOP and the
         // guest walks it itself.
-        const LINUX_O_CREAT: u32 = 0o100;
-        const LINUX_O_EXCL: u32 = 0o200;
-        const LINUX_O_NOFOLLOW: u32 = 0o400000;
-        const LINUX_O_APPEND: u32 = 0o2000;
         if self.apply.accepting()
             && let Some(reply) =
                 self.create_pending(&parent, &name, flags, mode & 0o7777 & !umask)?
