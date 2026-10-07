@@ -2815,3 +2815,136 @@ fn a_file_forgotten_before_its_create_lands_is_not_held_open() {
         "held open after the guest forgot them"
     );
 }
+
+/// An exFAT disk image mounted for one test, as most drives are sold.
+struct Exfat {
+    image: PathBuf,
+    mount: PathBuf,
+}
+
+impl Exfat {
+    fn new(name: &str) -> Exfat {
+        let base = std::env::temp_dir().join(format!("lighter-fs-exfat-{name}-{}", std::process::id()));
+        let image = base.with_extension("dmg");
+        let mount = base.join("mnt");
+        std::fs::create_dir_all(&mount).unwrap();
+        let _ = std::fs::remove_file(&image);
+        let made = std::process::Command::new("hdiutil")
+            .args(["create", "-quiet", "-size", "16m", "-fs", "ExFAT", "-volname", "LGTEST"])
+            .arg(&image)
+            .status()
+            .unwrap();
+        assert!(made.success(), "hdiutil create");
+        let attached = std::process::Command::new("hdiutil")
+            .args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .status()
+            .unwrap();
+        assert!(attached.success(), "hdiutil attach");
+        Exfat { image, mount }
+    }
+}
+
+impl Drop for Exfat {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", "-quiet", "-force"])
+            .arg(&self.mount)
+            .status();
+        let _ = std::fs::remove_file(&self.image);
+        let _ = std::fs::remove_dir(&self.mount);
+    }
+}
+
+fn setattr(guest: &mut Guest, nodeid: u64, valid: u32, mode: u32, owner: (u32, u32)) -> Vec<u8> {
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&valid.to_le_bytes());
+    body[68..72].copy_from_slice(&mode.to_le_bytes());
+    body[76..80].copy_from_slice(&owner.0.to_le_bytes());
+    body[80..84].copy_from_slice(&owner.1.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).expect("setattr")
+}
+
+/// fuse_attr_out's mode and owner.
+fn mode_and_owner(reply: &[u8]) -> (u32, u32, u32) {
+    let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+    (word(76) & 0o7777, word(84), word(88))
+}
+
+/// exFAT keeps no permissions, and macOS reports every file there as
+/// `rwx------`. A container's chmod is kept in the ownership record instead,
+/// survives a chown and a restart, and the drive's own bits are untouched
+/// (issue #69: a directory chmodded 755 read back 700, so MariaDB's user
+/// could not reach its own data directory inside it).
+#[test]
+fn a_chmod_on_a_drive_that_keeps_no_permissions_is_kept() {
+    let drive = Exfat::new("chmod");
+    std::fs::create_dir(drive.mount.join("data")).unwrap();
+    let mut guest = Guest::serve(drive.mount.clone(), false);
+    let dir = guest.lookup(1, "data").unwrap();
+    let reply = setattr(&mut guest, dir, fuse::fattr::MODE, 0o755, (0, 0));
+    assert_eq!(mode_and_owner(&reply).0, 0o755, "the reply");
+    let reply = guest.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
+    assert_eq!(mode_and_owner(&reply).0, 0o755, "read again");
+
+    let reply = setattr(&mut guest, dir, fuse::fattr::UID | fuse::fattr::GID, 0, (100, 101));
+    assert_eq!(mode_and_owner(&reply), (0o755, 100, 101), "a chown keeps the mode");
+
+    let mut restarted = guest.another();
+    let dir = restarted.lookup(1, "data").unwrap();
+    let reply = restarted.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
+    assert_eq!(mode_and_owner(&reply), (0o755, 100, 101), "after a restart");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(drive.mount.join("data")).unwrap().permissions().mode() & 0o7777,
+        0o700,
+        "the drive itself has nowhere to keep it"
+    );
+}
+
+/// The drive's own bits stay the truth where it keeps them.
+#[test]
+fn a_chmod_elsewhere_is_the_files_own() {
+    let mut guest = Guest::new("chmod-apfs");
+    std::fs::create_dir(guest.host("data")).unwrap();
+    let dir = guest.lookup(1, "data").unwrap();
+    setattr(&mut guest, dir, fuse::fattr::UID | fuse::fattr::GID, 0, (100, 101));
+    setattr(&mut guest, dir, fuse::fattr::MODE, 0o750, (0, 0));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(guest.host("data")).unwrap().permissions().mode() & 0o7777,
+        0o750
+    );
+    std::fs::set_permissions(guest.host("data"), std::fs::Permissions::from_mode(0o711)).unwrap();
+    let mut restarted = guest.another();
+    let dir = restarted.lookup(1, "data").unwrap();
+    let reply = restarted.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
+    assert_eq!(mode_and_owner(&reply), (0o711, 100, 101), "a chmod on the Mac is seen");
+}
+
+/// exFAT cannot rename without replacing; Linux's own exFAT driver can, the
+/// kernel checking for the target itself. ClickHouse writes its metadata so
+/// (issue #69).
+#[test]
+fn a_rename_that_must_not_replace_works_on_a_drive_that_cannot_refuse() {
+    let drive = Exfat::new("noreplace");
+    std::fs::write(drive.mount.join("a.tmp"), b"new").unwrap();
+    std::fs::write(drive.mount.join("b.tmp"), b"other").unwrap();
+    std::fs::write(drive.mount.join("taken"), b"kept").unwrap();
+    let mut guest = Guest::serve(drive.mount.clone(), false);
+    guest.lookup(1, "a.tmp").unwrap();
+    guest.lookup(1, "b.tmp").unwrap();
+    let rename = |guest: &mut Guest, from: &str, to: &str| {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u64.to_le_bytes());
+        body.extend_from_slice(&fuse::rename::NOREPLACE.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(format!("{from}\0{to}\0").as_bytes());
+        guest.call(op::RENAME2, 1, &body)
+    };
+    rename(&mut guest, "a.tmp", "a").expect("to a free name");
+    assert_eq!(std::fs::read(drive.mount.join("a")).unwrap(), b"new");
+    assert_eq!(rename(&mut guest, "b.tmp", "taken"), Err(17), "EEXIST, not a replace");
+    assert_eq!(std::fs::read(drive.mount.join("taken")).unwrap(), b"kept");
+}

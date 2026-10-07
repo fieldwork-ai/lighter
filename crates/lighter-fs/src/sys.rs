@@ -483,7 +483,19 @@ pub fn rename_at(
         // SAFETY: same, and `renameatx_np` takes exactly these arguments.
         unsafe { renameatx_np(old_parent, old.as_ptr(), new_parent, new.as_ptr(), host) }
     };
-    check(rc).map(|_| ())
+    match check(rc) {
+        // exFAT and FAT cannot refuse to replace, where Linux's own drivers
+        // can: there the kernel looks for the target itself, and so do we.
+        // The server holds both names, so no request of the guest's can come
+        // between the look and the rename; only the Mac could.
+        Err(errno) if errno == errno::linux::EOPNOTSUPP && host == RENAME_EXCL => {
+            if stat_at(new_parent, new).is_ok() {
+                return Err(errno::linux::EEXIST);
+            }
+            rename_at(old_parent, old, new_parent, new, 0)
+        }
+        other => other.map(|_| ()),
+    }
 }
 
 pub fn readlink_at(parent: RawFd, name: &CStr) -> Result<Vec<u8>> {
@@ -663,6 +675,46 @@ pub fn statfs(path: &Path) -> Result<libc::statfs> {
     // SAFETY: valid path, owned output buffer.
     check(unsafe { libc::statfs(c.as_ptr(), &mut st) })?;
     Ok(st)
+}
+
+/// Whether `fd`'s volume keeps permission bits: exFAT and FAT keep none, and
+/// report every file as its user's, `rwx------`, whatever was set. `None` if
+/// the volume cannot say.
+pub fn keeps_permissions(fd: RawFd) -> Option<bool> {
+    #[repr(C, packed(4))]
+    struct Reply {
+        length: u32,
+        capabilities: libc::vol_capabilities_attr_t,
+    }
+    let mut list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // SAFETY: zero is a valid bit pattern for the reply, which is ours.
+    let mut reply: Reply = unsafe { std::mem::zeroed() };
+    // SAFETY: a live descriptor, a well-formed attribute list, and a buffer of
+    // the size passed.
+    let r = unsafe {
+        libc::fgetattrlist(
+            fd,
+            (&raw mut list).cast(),
+            (&raw mut reply).cast(),
+            std::mem::size_of::<Reply>(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let format = libc::VOL_CAPABILITIES_FORMAT;
+    let capabilities = reply.capabilities;
+    let flag = libc::VOL_CAP_FMT_NO_PERMISSIONS;
+    (capabilities.valid[format] & flag != 0).then(|| capabilities.capabilities[format] & flag == 0)
 }
 
 /// Linux `SEEK_DATA` is 3 and `SEEK_HOLE` is 4. macOS has them the other way
