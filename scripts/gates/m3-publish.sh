@@ -414,6 +414,28 @@ if [ -n "$V6_IP" ]; then
 	$D rm -f m3-onmac6 >/dev/null 2>&1
 fi
 
+echo "==> A caller on an IPv6 link-local address"
+# fe80:: is on-link everywhere, so a container could not answer such a caller
+# as itself; it is presented as the guest, as the Mac itself is. Over UDP it
+# was not presented at all, and got no answer (#66). The Mac's own link-local
+# address takes the same path as a neighbour's.
+LL_IP="$([ -n "$LAN_IF" ] && ifconfig "$LAN_IF" 2>/dev/null | awk '/inet6 fe80/ {print $2; exit}' | cut -d% -f1)"
+if [ -n "$LL_IP" ]; then
+	$D rm -f m3-ll >/dev/null 2>&1
+	$D run -d --name m3-ll -p 18160:9/udp alpine/socat:1.8.0.0 -T 5 UDP6-RECVFROM:9,fork EXEC:'/bin/echo udp-ll' >/dev/null 2>&1
+	reply="$(python3 -c '
+import socket, sys
+info = socket.getaddrinfo(sys.argv[1], 18160, type=socket.SOCK_DGRAM)[0]
+for _ in range(20):
+    s = socket.socket(info[0], socket.SOCK_DGRAM); s.settimeout(0.5); s.sendto(b"x", info[4])
+    try:
+        print(s.recvfrom(64)[0].decode().strip()); break
+    except OSError:
+        pass' "$LL_IP%$LAN_IF")"
+	[ "$reply" = udp-ll ] && pass "udp: a link-local caller ($LL_IP) is answered" || fail "udp: a link-local caller got: ${reply:-nothing}"
+	$D rm -f m3-ll >/dev/null 2>&1
+fi
+
 echo "==> HTTP immediately after connection bursts"
 if python3 scripts/test-publish-burst.py --docker-host "unix://$LIGHTER_HOME/docker.sock"; then
 	pass "connection bursts preserve HTTP on all-interface and loopback publishes"

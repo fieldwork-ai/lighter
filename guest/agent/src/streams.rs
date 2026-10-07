@@ -617,7 +617,8 @@ impl Conn {
         let Some(dst) = crate::udp::destination_from(&self.head[..19]) else { return Some(Step::Close) };
         self.dst = Some(dst);
         if need == 38 {
-            self.client = crate::udp::destination_from(&self.head[19..38]).filter(|c| c.is_ipv4() == dst.is_ipv4());
+            self.client = crate::udp::destination_from(&self.head[19..38])
+                .filter(|c| c.is_ipv4() == dst.is_ipv4() && crate::udp::presentable(*c));
         }
         Some(self.dial_target(dst, self.client))
     }

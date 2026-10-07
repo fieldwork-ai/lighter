@@ -126,11 +126,13 @@ pub fn serve(host: crate::Fd) -> std::io::Result<()> {
 /// A non-blocking socket connected to `dst`, so the container's replies are
 /// what it receives and nothing else.
 fn connected(dst: SocketAddr, client: Option<SocketAddr>) -> Option<UdpSocket> {
-    if let Some(client) = client {
-        // As the client, so the container sees who is asking; the guest's
-        // rules route its replies back here (init, the inbound mark).
-        let fd = crate::udp::as_client(libc::SOCK_DGRAM, client)?;
-        crate::udp::connect_to(&fd, dst).ok()?;
+    // As the client, so the container sees who is asking; the guest's rules
+    // route its replies back here (init, the inbound mark). As the guest when
+    // that cannot be done, as TCP does, rather than dropping the datagram.
+    if let Some(client) = client.filter(|c| crate::udp::presentable(*c))
+        && let Some(fd) = crate::udp::as_client(libc::SOCK_DGRAM, client)
+        && crate::udp::connect_to(&fd, dst).is_ok()
+    {
         let socket = UdpSocket::from(fd);
         socket.set_nonblocking(true).ok()?;
         return Some(socket);
