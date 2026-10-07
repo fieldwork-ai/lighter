@@ -113,6 +113,22 @@ fn main() -> std::process::ExitCode {
                 print!("{}", listeners::report());
                 return std::process::ExitCode::SUCCESS;
             }
+            "--joined-reclamation-test" => {
+                let dst = match args.next().and_then(|value| value.parse().ok()) {
+                    Some(dst) => dst,
+                    None => {
+                        eprintln!("joined reclamation: expected HOST:PORT");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+                return match streams::check_joined_reclamation(dst) {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("joined reclamation: {error}");
+                        std::process::ExitCode::FAILURE
+                    }
+                };
+            }
             "--bpf-rollback-test" => {
                 return match sockmap::check_failed_join() {
                     Ok(()) => std::process::ExitCode::SUCCESS,

@@ -890,10 +890,8 @@ impl Conn {
         Some(Step::Wait)
     }
 
-    /// A socket reports HUP once both its directions are shut: its peer's end
-    /// seen, and its own sent by the kernel behind the redirected bytes. HUP
-    /// on both means neither backlog holds anything. An error on either is an
-    /// abort, and the other side is closed with whatever it has.
+    /// HUP on both means neither backlog holds anything. An error on either
+    /// is an abort, and the other side is closed with whatever it has.
     fn joined(&mut self) -> Option<Step> {
         let b = self.b.as_ref()?.as_raw_fd();
         let r = poll_now(&[self.a.as_raw_fd(), b], libc::POLLRDHUP);
@@ -901,6 +899,20 @@ impl Conn {
             return Some(Step::Close);
         }
         if r[0] & libc::POLLHUP != 0 && r[1] & libc::POLLHUP != 0 {
+            return Some(Step::Close);
+        }
+        // A host that stopped both sending and receiving can leave vsock
+        // reporting only RDHUP: its peer is done, but its own write half
+        // never shut down. The TCP end can then reach CLOSE without a
+        // pending socket error, so neither close condition above applies.
+        // HUP alone is insufficient: TCP can report it while its redirected
+        // bytes still wait in vsock's backlog. A zero-byte send changes no
+        // payload and proves that backlog cannot be delivered when it fails
+        // with a terminal write error. A merely write-half-closed host still
+        // accepts the probe, so its pending request is left to drain.
+        let (tcp, host) = if self.a_tcp { (0, 1) } else { (1, 0) };
+        let host_fd = if self.a_tcp { b } else { self.a.as_raw_fd() };
+        if r[tcp] & libc::POLLHUP != 0 && r[host] & libc::POLLRDHUP != 0 && write_ended(host_fd) {
             return Some(Step::Close);
         }
         None
@@ -1252,6 +1264,24 @@ fn poll_now<const N: usize>(fds: &[RawFd; N], events: libc::c_short) -> [libc::c
     p.map(|p| p.revents)
 }
 
+/// Whether a socket has stopped accepting writes, without writing a byte or
+/// shutting it down ahead of a sockmap backlog that may still hold data.
+fn write_ended(fd: RawFd) -> bool {
+    loop {
+        // SAFETY: a live socket and a zero-length buffer. MSG_NOSIGNAL makes
+        // a closed write half an error rather than a process-wide SIGPIPE.
+        let n = unsafe { libc::send(fd, std::ptr::null(), 0, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        if n >= 0 {
+            return false;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EPIPE) | Some(libc::ENOTCONN) | Some(libc::ECONNRESET) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Whether a non-blocking connect has finished: None while it is still in
 /// progress.
 fn connect_result(fd: RawFd) -> Option<io::Result<()>> {
@@ -1409,6 +1439,102 @@ fn take_queued(from: RawFd) -> io::Result<Vec<u8>> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Exercise joined-stream reclamation on the real guest TCP/vsock route.
+/// The host fixture echoes `P`, then resets its TCP socket after reading `X`.
+/// Unlike a copying-path test, this requires a successful kernel sockmap join
+/// and checks both peer-map entries and process descriptors after every close.
+pub fn check_joined_reclamation(dst: SocketAddr) -> io::Result<()> {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    fn dial_host() -> io::Result<OwnedFd> {
+        crate::vsock::connect_nonblocking(crate::STREAM_PORT)
+    }
+    fn destination(_: RawFd) -> Option<SocketAddr> { None }
+    fn descriptors() -> io::Result<usize> {
+        Ok(std::fs::read_dir("/proc/self/fd")?.count())
+    }
+    // Env stores the process-lifetime production joiner. This checker exits
+    // after its run, so the same lifetime is appropriate for its own maps.
+    let joiner = Box::leak(Box::new(crate::sockmap::Joiner::new()?));
+    let env = Env { dial_host, destination, joiner: Some(joiner), host_window: Duration::from_secs(5) };
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let mut lp = Loop::new(listener.into(), Route::Outbound, env)?;
+    let pair_listener = TcpListener::bind("127.0.0.1:0")?;
+    let baseline = descriptors()?;
+    const CYCLES: usize = 32;
+    for cycle in 0..CYCLES {
+        let mut client = TcpStream::connect(pair_listener.local_addr()?)?;
+        let (a, _) = pair_listener.accept()?;
+        client.set_nonblocking(true)?;
+        set_nonblocking(a.as_raw_fd())?;
+        keep_alive(a.as_raw_fd());
+        let mut conn = Conn::new(a.into(), true, State::Dialing, Instant::now());
+        conn.dst = Some(dst);
+        if !conn.dial_host(&lp.env) {
+            return Err(io::Error::other("fixture could not dial the host"));
+        }
+        conn.watched_a = conn.interest().0;
+        let id = lp.next;
+        lp.next += 1;
+        lp.watch(libc::EPOLL_CTL_ADD, conn.a.as_raw_fd(), id << 1, conn.watched_a)?;
+        lp.conns.insert(id, conn);
+        lp.drive(id, Instant::now());
+        client.write_all(b"P")?;
+        let started = Instant::now();
+        loop {
+            lp.turn(Some(Duration::from_millis(10)));
+            let mut byte = [0u8; 1];
+            match client.read(&mut byte) {
+                Ok(1) if byte[0] == b'P' => break,
+                Ok(_) => return Err(io::Error::other("fixture closed without echoing P")),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+                Err(e) => return Err(e),
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                return Err(io::Error::other("fixture did not echo P"));
+            }
+        }
+        if !lp.conns.get(&id).is_some_and(|c| matches!(c.state, State::Joined) && c.joined.is_some()) {
+            return Err(io::Error::other("fixture must exercise the real sockmap joined path"));
+        }
+        client.write_all(b"X")?;
+        let started = Instant::now();
+        let mut client_ended = false;
+        while lp.conns.contains_key(&id) {
+            lp.turn(Some(Duration::from_millis(10)));
+            if !client_ended {
+                let mut byte = [0u8; 1];
+                match client.read(&mut byte) {
+                    Ok(0) => {
+                        client.shutdown(Shutdown::Write)?;
+                        client_ended = true;
+                    }
+                    Ok(_) => return Err(io::Error::other("fixture sent unexpected data after X")),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+                    Err(e) => return Err(e),
+                }
+            }
+            if started.elapsed() > Duration::from_secs(3) {
+                let c = &lp.conns[&id];
+                let a = c.a.as_raw_fd();
+                let b = c.b.as_ref().unwrap().as_raw_fd();
+                return Err(io::Error::other(format!(
+                    "cycle {cycle}: retained joined stream; poll={:?}, host_write_ended={}, peers={}",
+                    poll_now(&[a, b], libc::POLLRDHUP), write_ended(b), joiner.peer_count())));
+            }
+        }
+        drop(client);
+        if joiner.peer_count() != 0 || descriptors()? != baseline {
+            return Err(io::Error::other(format!(
+                "cycle {cycle}: reclamation left peers={} descriptors={} baseline={baseline}",
+                joiner.peer_count(), descriptors()?)));
+        }
+    }
+    println!("joined reclamation: {CYCLES} streams released; peers=0; descriptors={baseline}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1694,6 +1820,87 @@ mod tests {
         assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), KEEPALIVE[0]);
         assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), KEEPALIVE[1]);
         assert_eq!(int_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT), KEEPALIVE[2]);
+    }
+
+    /// A fully shut TCP socket paired with an independent host stream. Unix
+    /// sockets let the unit tests exercise write viability and the half-close
+    /// safety guards; the guest checker covers vsock's different HUP flags.
+    fn joined_with_tcp_hup() -> (Loop, TcpStream, std::os::unix::net::UnixStream) {
+        use std::os::unix::net::UnixStream;
+        let (listener, _) = listener();
+        let mut lp = Loop::new(listener, Route::Outbound, outbound_env()).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let container = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, _) = l.accept().unwrap();
+        let (b, far) = UnixStream::pair().unwrap();
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        set_nonblocking(b.as_raw_fd()).unwrap();
+        container.shutdown(std::net::Shutdown::Write).unwrap();
+        a.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut conn = Conn::new(a.into(), true, State::Joined, Instant::now());
+        conn.b = Some(b.into());
+        (conn.watched_a, conn.watched_b) = conn.interest();
+        lp.watch(libc::EPOLL_CTL_ADD, conn.a.as_raw_fd(), 0, conn.watched_a).unwrap();
+        lp.watch(libc::EPOLL_CTL_ADD, conn.b.as_ref().unwrap().as_raw_fd(), 1, conn.watched_b).unwrap();
+        lp.conns.insert(0, conn);
+        lp.next = 1;
+        let started = Instant::now();
+        while poll_now(&[lp.conns[&0].a.as_raw_fd()], libc::POLLRDHUP)[0] & libc::POLLHUP == 0 {
+            assert!(started.elapsed() < Duration::from_secs(1), "fixture TCP must reach HUP");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        (lp, container, far)
+    }
+
+    #[test]
+    fn write_probe_distinguishes_half_close_without_sending_data() {
+        use std::os::unix::net::UnixStream;
+        let (b, mut far) = UnixStream::pair().unwrap();
+        far.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(!write_ended(b.as_raw_fd()), "a host that stopped sending can still receive");
+        far.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(far.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock,
+            "the probe must not put a byte in the host's stream or shut down writing");
+        far.shutdown(std::net::Shutdown::Read).unwrap();
+        assert!(write_ended(b.as_raw_fd()), "a host that stopped receiving rejects the probe");
+    }
+
+    #[test]
+    fn joined_stream_preserves_a_request_while_the_host_can_still_receive() {
+        let (mut lp, _container, mut far) = joined_with_tcp_hup();
+        far.shutdown(std::net::Shutdown::Write).unwrap();
+        let b = lp.conns[&0].b.as_ref().unwrap().as_raw_fd();
+        assert!(!write_ended(b), "a host that only stopped sending can still receive");
+        lp.turn(Some(Duration::ZERO));
+        assert_eq!(lp.conns.len(), 1, "TCP HUP alone does not mean its redirected backlog drained");
+        assert_eq!(write(b, b"queued request").unwrap(), 14);
+        far.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut request = [0u8; 14];
+        far.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"queued request");
+        lp.close(0);
+    }
+
+    #[test]
+    fn joined_stream_preserves_a_reply_after_the_container_half_closes() {
+        use std::os::unix::net::UnixStream;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut container = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, _) = l.accept().unwrap();
+        let (b, far) = UnixStream::pair().unwrap();
+        container.shutdown(std::net::Shutdown::Write).unwrap();
+        far.shutdown(std::net::Shutdown::Both).unwrap();
+        let mut conn = Conn::new(a.into(), true, State::Joined, Instant::now());
+        conn.b = Some(b.into());
+        assert!(write_ended(conn.b.as_ref().unwrap().as_raw_fd()));
+        assert_eq!(conn.joined(), None, "the host's EOF can still wait behind a redirected reply");
+        assert_eq!(write(conn.a.as_raw_fd(), b"delayed reply").unwrap(), 13);
+        container.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut reply = [0u8; 13];
+        container.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"delayed reply");
+        conn.close(&outbound_env());
     }
 
     /// A container that shuts down its writes keeps its stream: the far end
