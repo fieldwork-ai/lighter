@@ -4766,6 +4766,9 @@ impl Server {
     fn lseek(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let whence = get_u32(body, 16).ok_or(linux::EINVAL)?;
+        // The end, and where data and holes are, as the guest wrote them.
+        let inode = self.inode(nodeid)?;
+        self.settle_while(&inode, |inode| inode.is_dirty() || inode.is_pending());
         let file = self.file_for(nodeid, false)?;
         let at = sys::seek(file.fd.as_raw_fd(), offset, whence)?;
         Ok(at.to_le_bytes().to_vec())
@@ -4775,6 +4778,12 @@ impl Server {
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let length = get_u64(body, 16).ok_or(linux::EINVAL)?;
         let mode = get_u32(body, 24).ok_or(linux::EINVAL)?;
+        // As a truncate: the file must exist (issue #69, a preallocation
+        // straight after the create) and be as the guest wrote it.
+        let inode = self.inode(nodeid)?;
+        self.settle_while(&inode, |inode| {
+            inode.is_dirty() || inode.is_pending() || inode.has_pending_attrs()
+        });
         let file = self.file_for(nodeid, true)?;
         sys::fallocate(file.fd.as_raw_fd(), mode, offset, length)?;
         Ok(Vec::new())

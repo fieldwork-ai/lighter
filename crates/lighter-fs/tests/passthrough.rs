@@ -751,6 +751,64 @@ fn setattr_can_truncate_without_a_handle() {
     );
 }
 
+fn fallocate_body(fh: u64, offset: u64, length: u64, mode: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&fh.to_le_bytes());
+    body.extend_from_slice(&offset.to_le_bytes());
+    body.extend_from_slice(&length.to_le_bytes());
+    body.extend_from_slice(&mode.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body
+}
+
+/// MariaDB's first start creates `ibdata1` and preallocates it at once
+/// (issue #69). The create is still a promise when the FALLOCATE arrives.
+#[test]
+fn a_file_just_created_can_be_preallocated() {
+    let mut guest = Guest::new("fallocate-new");
+    let (nodeid, fh) = guest.create(1, "ibdata1", CREATE_RDWR).unwrap();
+    guest
+        .call(op::FALLOCATE, nodeid, &fallocate_body(fh, 0, 12 << 20, 0))
+        .expect("preallocating a file just created");
+    assert_eq!(std::fs::metadata(guest.host("ibdata1")).unwrap().len(), 12 << 20);
+}
+
+/// A hole is punched in the file as the guest last wrote it, not under bytes
+/// still on their way to it.
+#[test]
+fn a_punched_hole_lands_after_the_writes_before_it() {
+    const PUNCH_HOLE_KEEP_SIZE: u32 = 0x03;
+    let mut guest = Guest::new("fallocate-punch");
+    let (nodeid, fh) = guest.create(1, "punched", CREATE_RDWR).unwrap();
+    guest.write(nodeid, fh, 0, &[b'x'; 8192]).unwrap();
+    guest
+        .call(op::FALLOCATE, nodeid, &fallocate_body(fh, 0, 4096, PUNCH_HOLE_KEEP_SIZE))
+        .expect("punching a hole");
+    let mut body = vec![0u8; 16];
+    body[0..8].copy_from_slice(&fh.to_le_bytes());
+    guest.call(op::FSYNC, nodeid, &body).unwrap();
+    let bytes = std::fs::read(guest.host("punched")).unwrap();
+    assert_eq!(bytes.len(), 8192);
+    assert!(bytes[..4096].iter().all(|&b| b == 0), "the hole reads as zeros");
+    assert!(bytes[4096..].iter().all(|&b| b == b'x'), "the rest as written");
+}
+
+/// SEEK_END on a file just created and written answers its size.
+#[test]
+fn a_file_just_created_can_be_seeked() {
+    const SEEK_END: u32 = 2;
+    let mut guest = Guest::new("lseek-new");
+    let (nodeid, fh) = guest.create(1, "sought", CREATE_RDWR).unwrap();
+    guest.write(nodeid, fh, 0, b"twelve bytes").unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&fh.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes());
+    body.extend_from_slice(&SEEK_END.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let reply = guest.call(op::LSEEK, nodeid, &body).expect("seeking a file just created");
+    assert_eq!(u64::from_le_bytes(reply[0..8].try_into().unwrap()), 12);
+}
+
 /// `mkdir` then `rmdir` on a directory that is not empty. The errno is the
 /// point: macOS `ENOTEMPTY` is 66, and 66 on Linux means something else.
 #[test]
