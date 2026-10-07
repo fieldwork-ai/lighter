@@ -641,7 +641,14 @@ impl Conn {
             }
         }
         self.as_client = false;
-        match tcp_socket(dst).and_then(|fd| start_connect(&fd, dst).map(|_| fd)) {
+        // Marked as the client-side socket is: init's rules send the inbound
+        // mark to Docker's port DNATs, which a port published on one of the
+        // Mac's addresses is reached only through.
+        let marked = |fd: OwnedFd| {
+            crate::udp_inbound::mark_inbound(fd.as_raw_fd());
+            fd
+        };
+        match tcp_socket(dst).map(marked).and_then(|fd| start_connect(&fd, dst).map(|_| fd)) {
             Ok(fd) => {
                 self.set_b(fd, true);
                 self.state = State::Dialing;

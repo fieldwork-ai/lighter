@@ -45,11 +45,17 @@ $D info >/dev/null 2>&1 || { fail "machine did not come up"; exit 1; }
 $D pull -q alpine:3.21 >/dev/null 2>&1
 $D pull -q alpine/socat:1.8.0.0 >/dev/null 2>&1
 
-LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+# The card with an address, Ethernet first: the v6 address is taken from the
+# same one (it was always en0's, so a Mac on Wi-Fi skipped every v6 check).
+LAN_IF=""
+for candidate in en0 en1; do
+	if ipconfig getifaddr "$candidate" >/dev/null 2>&1; then LAN_IF="$candidate"; break; fi
+done
+LAN_IP="$([ -n "$LAN_IF" ] && ipconfig getifaddr "$LAN_IF" 2>/dev/null || true)"
 # The Mac's stable global v6 address, not a temporary one (those rotate).
-V6_IP="$(ifconfig en0 2>/dev/null | awk '/inet6/ && /autoconf/ && /secured/ && !/temporary/ {print $2; exit}')"
+V6_IP="$([ -n "$LAN_IF" ] && ifconfig "$LAN_IF" 2>/dev/null | awk '/inet6/ && /autoconf/ && /secured/ && !/temporary/ {print $2; exit}')"
 [ -n "$LAN_IP" ] || skip "no LAN address on en0/en1; LAN checks skipped"
-[ -n "$V6_IP" ] || skip "no global IPv6 address on en0; global v6 checks skipped"
+[ -n "$V6_IP" ] || skip "no global IPv6 address on ${LAN_IF:-en0}; global v6 checks skipped"
 
 http() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" 2>/dev/null; }
 # The code once the listener is up: a publish takes Docker's event, a
@@ -341,6 +347,72 @@ read -r up_med up_max down_med down_max <<<"${latency:-5000 5000 5000 5000}"
 [ "${down_med:-5000}" -lt 250 ] 2>/dev/null && pass "and withdrawn ${down_med} ms after it closes (at most ${down_max})" \
 	|| fail "a closed listener took ${down_med:-?} ms to be withdrawn (at most ${down_max:-?})"
 $D rm -f m3-hostlat >/dev/null 2>&1
+
+echo "==> A port published on one of the Mac's addresses"
+# `-p 192.168.1.20:9000:9000`: dockerd binds an address the guest does not
+# have, and the container never started (MinIO, 0.12.1). Docker Desktop and
+# OrbStack bind exactly that address on the Mac. It must answer there, not on
+# loopback, and a container must still reach a Mac service on that address.
+if [ -n "$LAN_IP" ]; then
+	$D rm -f m3-onmac m3-onmac-udp >/dev/null 2>&1
+	if $D run -d --name m3-onmac -p "$LAN_IP:18140:8000" python:3.12-slim python3 -m http.server 8000 >/dev/null 2>"$LIGHTER_HOME/onmac.err"; then
+		code=000
+		for _ in $(seq 1 20); do
+			code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://$LAN_IP:18140/" || true)"
+			[ "$code" = 200 ] && break
+			sleep 0.5
+		done
+		lo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:18140/ || true)"
+		[ "$code" = 200 ] && [ "$lo" = 000 ] && pass "tcp: published on $LAN_IP answers there, and not on loopback" \
+			|| fail "tcp: published on $LAN_IP: $code there, $lo on loopback"
+		got="$($D run --rm alpine:3.21 wget -q -T 5 -O /dev/null "http://$LAN_IP:18140/" 2>&1 && echo ok || echo failed)"
+		[ "$got" = ok ] && pass "a container reaches it at that address too" || fail "a container could not reach $LAN_IP:18140"
+	else
+		fail "a container published on $LAN_IP did not start: $(tail -1 "$LIGHTER_HOME/onmac.err")"
+	fi
+	# A Mac service on the same address, not published by Docker: still the Mac's.
+	MAC_PORT_FILE="$(mktemp -t lighter-m3-macport)"
+	python3 -c '
+import http.server, sys
+server = http.server.HTTPServer((sys.argv[2], 0), http.server.SimpleHTTPRequestHandler)
+open(sys.argv[1], "w").write(str(server.server_port))
+server.serve_forever()' "$MAC_PORT_FILE" "$LAN_IP" >/dev/null 2>&1 &
+	MACSRV=$!
+	for _ in $(seq 1 50); do [ -s "$MAC_PORT_FILE" ] && break; sleep 0.1; done
+	got="$($D run --rm alpine:3.21 wget -q -T 5 -O /dev/null "http://$LAN_IP:$(cat "$MAC_PORT_FILE")/" 2>&1 && echo ok || echo failed)"
+	kill "$MACSRV" 2>/dev/null; rm -f "$MAC_PORT_FILE"
+	[ "$got" = ok ] && pass "a container still reaches a Mac service on that address" || fail "a container could not reach the Mac's own service on $LAN_IP"
+	if $D run -d --name m3-onmac-udp -p "$LAN_IP:18141:9/udp" alpine/socat:1.8.0.0 -T 5 UDP-RECVFROM:9,fork EXEC:'/bin/echo udp-onmac' >/dev/null 2>&1; then
+		reply="$(python3 -c '
+import socket, sys
+for _ in range(20):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.5)
+    s.sendto(b"x", (sys.argv[1], 18141))
+    try:
+        print(s.recvfrom(64)[0].decode().strip()); break
+    except OSError:
+        pass' "$LAN_IP")"
+		[ "$reply" = udp-onmac ] && pass "udp: published on $LAN_IP answers there" || fail "udp: published on $LAN_IP answered: ${reply:-nothing}"
+	else
+		fail "a UDP container published on $LAN_IP did not start"
+	fi
+	$D rm -f m3-onmac m3-onmac-udp >/dev/null 2>&1
+fi
+if [ -n "$V6_IP" ]; then
+	$D rm -f m3-onmac6 >/dev/null 2>&1
+	if $D run -d --name m3-onmac6 -p "[$V6_IP]:18142:8000" python:3.12-slim python3 -m http.server --bind :: 8000 >/dev/null 2>"$LIGHTER_HOME/onmac6.err"; then
+		code=000
+		for _ in $(seq 1 20); do
+			code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://[$V6_IP]:18142/" || true)"
+			[ "$code" = 200 ] && break
+			sleep 0.5
+		done
+		[ "$code" = 200 ] && pass "v6: published on $V6_IP answers there" || fail "v6: published on $V6_IP: $code"
+	else
+		fail "a container published on $V6_IP did not start: $(tail -1 "$LIGHTER_HOME/onmac6.err")"
+	fi
+	$D rm -f m3-onmac6 >/dev/null 2>&1
+fi
 
 echo "==> HTTP immediately after connection bursts"
 if python3 scripts/test-publish-burst.py --docker-host "unix://$LIGHTER_HOME/docker.sock"; then
