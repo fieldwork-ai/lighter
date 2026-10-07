@@ -276,19 +276,29 @@ print("%.2f" % max(worst))' >/dev/null
 		sleep 5
 		docker pause lighter-gate-smb >/dev/null
 		sleep 20
+		# Measured only if the share lasted the hang: macOS sometimes gives
+		# up on a server that stops answering and drops the share, and the
+		# requests then fail at once, which proves nothing either way.
+		kept=0
+		mount | grep -q "on $SMB_D (smbfs" && kept=1
 		docker unpause lighter-gate-smb >/dev/null
 		docker wait lighter-gate-ticker lighter-gate-local >/dev/null
 		gap="$(docker logs lighter-gate-ticker 2>&1 | tail -1)"
 		slowest="$(docker logs lighter-gate-local 2>&1 | tail -1)"
 		docker rm -f lighter-gate-ticker lighter-gate-smb-reader lighter-gate-local >/dev/null
 		rm -rf "$LOCAL_PROBE"
-		awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
-			&& pass "SMB: the server hung for 20 s, and no guest CPU stopped (longest gap ${gap} s)" \
-			|| fail "SMB: with the server hung, a guest CPU stopped for ${gap:-?} s"
-		awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
-			&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
-			|| fail "SMB: with the server hung, a local file in the same share waited ${slowest:-?} s"
-		umount "$SMB_D"; umount "$SMB_T"
+		if [ "$kept" = 1 ]; then
+			awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
+				&& pass "SMB: the server hung for 20 s, and no guest CPU stopped (longest gap ${gap} s)" \
+				|| fail "SMB: with the server hung, a guest CPU stopped for ${gap:-?} s"
+			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
+				&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
+				|| fail "SMB: with the server hung, a local file in the same share waited ${slowest:-?} s"
+		else
+			note "SMB: macOS dropped the share while its server was hung, so the hang was not measured (gap ${gap:-?} s, slowest local ${slowest:-?} s)"
+		fi
+		umount "$SMB_D" 2>/dev/null || true
+		umount "$SMB_T" 2>/dev/null || true
 	else
 		fail "could not mount the shares: $(cat "$SCRATCH/smb.err")"
 	fi
