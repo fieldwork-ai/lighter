@@ -31,6 +31,10 @@ ZBT=303a:831a
 TR=1a86:7523
 ZBT_NAME=/dev/serial/by-id/usb-Nabu_Casa_ZBT-2_E072A1D9E0CC-if00
 TR_NAME=/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+# The CH340's port on the Mac is named for the socket it is in
+# (/dev/cu.usbserial-210, -10, ...), so it is read, not assumed.
+TR_PORT="$("$LIGHTER" usb list 2>/dev/null | awk '/1a86:7523/ {print $NF; exit}')"
+case "$TR_PORT" in /dev/cu.usbserial-*) ;; *) echo "m15: the ThirdReality dongle (1a86:7523) is not plugged in, or is attached elsewhere"; exit 1 ;; esac
 FAILED=0
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
@@ -160,14 +164,14 @@ PY
 sleep 2
 has_name "$ZBT_NAME" && has_name "$TR_NAME" && pass "the names survive the agent's restart" || fail "names after the agent's restart: $(guest_names | xargs)"
 "$LIGHTER" usb detach "$TR" >/dev/null
-wait_for 10 macos_has /dev/cu.usbserial-210 || true
+wait_for 10 macos_has "$TR_PORT" || true
 out="$("$LIGHTER" usb attach "$TR" 2>&1)"
 echo "$out" | grep -q "is attached" && pass "the restarted agent attaches a device" || fail "attach after the agent's restart: $out"
 
 echo "==> A port a Mac program holds is refused"
 "$LIGHTER" usb detach "$TR" >/dev/null
-wait_for 10 macos_has /dev/cu.usbserial-210
-python3 -c 'import time,os; f=os.open("/dev/cu.usbserial-210", os.O_RDWR|os.O_NONBLOCK); time.sleep(60)' &
+wait_for 10 macos_has "$TR_PORT"
+python3 -c 'import sys,time,os; f=os.open(sys.argv[1], os.O_RDWR|os.O_NONBLOCK); time.sleep(60)' "$TR_PORT" &
 HOLD_PID=$!
 sleep 1
 out="$("$LIGHTER" usb attach "$TR" 2>&1)"
@@ -189,7 +193,7 @@ $D rm -f m15-stick >/dev/null 2>&1
 $D run -d --name m15-stick --restart unless-stopped --device "$ZBT_NAME" alpine:3.21 sleep infinity >/dev/null \
 	|| fail "a container naming $ZBT_NAME did not start"
 "$LIGHTER" stop >/dev/null 2>&1
-if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 10 macos_has /dev/cu.usbserial-210; then
+if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 10 macos_has "$TR_PORT"; then
 	pass "stopped: macOS has both devices back"
 else
 	fail "after stop, macOS has: $(ls /dev/cu.usb* 2>/dev/null | xargs)"
@@ -205,7 +209,7 @@ $D rm -f m15-stick >/dev/null 2>&1
 echo "==> A machine killed holding them gives them back"
 pid="$(cat "$LIGHTER_HOME/lighter.pid" 2>/dev/null)"
 kill -9 "$pid" 2>/dev/null
-if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 5 macos_has /dev/cu.usbserial-210; then
+if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 5 macos_has "$TR_PORT"; then
 	pass "killed with kill -9: macOS has both devices back"
 else
 	fail "after the machine was killed, macOS has: $(ls /dev/cu.usb* 2>/dev/null | xargs)"
