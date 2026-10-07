@@ -41,21 +41,15 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
 
-// bpf(2) commands and constants, from the UAPI; stable ABI.
-const BPF_MAP_CREATE: libc::c_int = 0;
-const BPF_MAP_LOOKUP_ELEM: libc::c_int = 1;
-const BPF_MAP_UPDATE_ELEM: libc::c_int = 2;
-const BPF_MAP_DELETE_ELEM: libc::c_int = 3;
+use crate::bpf::*;
+
 const BPF_MAP_GET_NEXT_KEY: libc::c_int = 4;
-const BPF_PROG_LOAD: libc::c_int = 5;
-const BPF_PROG_ATTACH: libc::c_int = 8;
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_SOCKMAP: u32 = 15;
 const BPF_PROG_TYPE_SK_SKB: u32 = 14;
 /// `BPF_SK_SKB_VERDICT`: a verdict on each received skb, no stream parser.
 const BPF_SK_SKB_VERDICT: u32 = 38;
 const BPF_ANY: u64 = 0;
-const BPF_PSEUDO_MAP_FD: u8 = 1;
 const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
 const BPF_FUNC_GET_SOCKET_COOKIE: i32 = 46;
 const BPF_FUNC_SK_REDIRECT_MAP: i32 = 52;
@@ -63,35 +57,6 @@ const SO_COOKIE: libc::c_int = 57;
 
 /// How many streams may be joined at once. Each takes two slots.
 const SLOTS: u32 = 65536;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Insn {
-    code: u8,
-    regs: u8,
-    off: i16,
-    imm: i32,
-}
-
-const fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> Insn {
-    Insn {
-        code,
-        regs: (src << 4) | dst,
-        off,
-        imm,
-    }
-}
-
-// Opcode bytes, from the eBPF instruction set.
-const MOV64_REG: u8 = 0xbf;
-const MOV64_IMM: u8 = 0xb7;
-const ADD64_IMM: u8 = 0x07;
-const STX_MEM_DW: u8 = 0x7b;
-const LDX_MEM_W: u8 = 0x61;
-const LD_IMM_DW: u8 = 0x18;
-const JEQ_IMM: u8 = 0x15;
-const CALL: u8 = 0x85;
-const EXIT: u8 = 0x95;
 
 /// The verdict program, with the two map descriptors patched in.
 fn program(peers: RawFd, sockets: RawFd) -> Vec<Insn> {
@@ -116,83 +81,6 @@ fn program(peers: RawFd, sockets: RawFd) -> Vec<Insn> {
         insn(MOV64_IMM, 0, 0, 0, 1),                    // pass: r0 = SK_PASS
         insn(EXIT, 0, 0, 0, 0),                         // exit
     ]
-}
-
-/// `union bpf_attr`, the pieces used here, zero-padded to the union's size.
-#[repr(C)]
-union Attr {
-    map: MapCreate,
-    elem: MapElem,
-    prog: ProgLoad,
-    attach: ProgAttach,
-    zero: [u8; 128],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MapCreate {
-    map_type: u32,
-    key_size: u32,
-    value_size: u32,
-    max_entries: u32,
-    map_flags: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MapElem {
-    map_fd: u32,
-    _pad: u32,
-    key: u64,
-    value: u64,
-    flags: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ProgLoad {
-    prog_type: u32,
-    insn_cnt: u32,
-    insns: u64,
-    license: u64,
-    log_level: u32,
-    log_size: u32,
-    log_buf: u64,
-    kern_version: u32,
-    prog_flags: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ProgAttach {
-    target_fd: u32,
-    attach_bpf_fd: u32,
-    attach_type: u32,
-    attach_flags: u32,
-}
-
-fn bpf(cmd: libc::c_int, attr: &mut Attr) -> io::Result<libc::c_int> {
-    // SAFETY: the attr union is fully initialized (zeroed then written) and
-    // its size is what the kernel expects for these commands.
-    let rc = unsafe { libc::syscall(libc::SYS_bpf, cmd, attr as *mut Attr, size_of::<Attr>() as u32) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(rc as libc::c_int)
-}
-
-fn map_create(map_type: u32, key_size: u32, value_size: u32, max_entries: u32) -> io::Result<OwnedFd> {
-    let mut attr = Attr { zero: [0; 128] };
-    attr.map = MapCreate {
-        map_type,
-        key_size,
-        value_size,
-        max_entries,
-        map_flags: 0,
-    };
-    let fd = bpf(BPF_MAP_CREATE, &mut attr)?;
-    // SAFETY: a fresh descriptor we own.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn map_update(map: RawFd, key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -278,37 +166,9 @@ fn socket_cookie(fd: RawFd) -> io::Result<u64> {
 /// Loads a program and reports errno and the verifier's words, for the
 /// probe below.
 fn try_load(prog_type: u32, insns: &[Insn], log_level: u32, expected_attach: u32) -> String {
-    let mut log = vec![0u8; 64 * 1024];
-    let mut attr = Attr { zero: [0; 128] };
-    attr.prog = ProgLoad {
-        prog_type,
-        insn_cnt: insns.len() as u32,
-        insns: insns.as_ptr() as u64,
-        license: c"GPL".as_ptr() as u64,
-        log_level,
-        log_size: if log_level > 0 { log.len() as u32 } else { 0 },
-        log_buf: if log_level > 0 { log.as_mut_ptr() as u64 } else { 0 },
-        kern_version: 0,
-        prog_flags: 0,
-    };
-    // expected_attach_type sits after prog_name[16] and prog_ifindex.
-    if expected_attach != 0 {
-        // SAFETY: writing a u32 at the union's byte offset 76 (24 + 16 + 4 + 16 + 4 + ... as laid out by the UAPI).
-        unsafe {
-            let base = std::ptr::addr_of_mut!(attr).cast::<u8>();
-            std::ptr::write_unaligned(base.add(76).cast::<u32>(), expected_attach);
-        }
-    }
-    match bpf(BPF_PROG_LOAD, &mut attr) {
-        Ok(fd) => {
-            // SAFETY: a fresh descriptor, closed here.
-            unsafe { libc::close(fd) };
-            "ok".to_string()
-        }
-        Err(e) => {
-            let text = String::from_utf8_lossy(&log);
-            format!("{e}: {}", text.trim_end_matches('\0').trim())
-        }
+    match prog_load(prog_type, expected_attach, insns, log_level) {
+        Ok(_) => "ok".to_string(),
+        Err((e, log)) => format!("{e}: {log}"),
     }
 }
 
@@ -371,30 +231,10 @@ impl Joiner {
         // stream holds two slots and two entries, so this never fills.
         let peers = map_create(BPF_MAP_TYPE_HASH, 8, 4, SLOTS)?;
         let insns = program(peers.as_raw_fd(), targets.as_raw_fd());
-        let mut log = vec![0u8; 64 * 1024];
-        let mut attr = Attr { zero: [0; 128] };
-        attr.prog = ProgLoad {
-            prog_type: BPF_PROG_TYPE_SK_SKB,
-            insn_cnt: insns.len() as u32,
-            insns: insns.as_ptr() as u64,
-            license: c"GPL".as_ptr() as u64,
-            log_level: 1,
-            log_size: log.len() as u32,
-            log_buf: log.as_mut_ptr() as u64,
-            kern_version: 0,
-            prog_flags: 0,
-        };
-        let prog = match bpf(BPF_PROG_LOAD, &mut attr) {
-            Ok(fd) => fd,
-            Err(e) => {
-                let text = String::from_utf8_lossy(&log);
-                let text = text.trim_end_matches('\0');
-                eprintln!("lighter-agent: sockmap program refused: {e}\n{text}");
-                return Err(e);
-            }
-        };
-        // SAFETY: a fresh descriptor we own.
-        let program = unsafe { OwnedFd::from_raw_fd(prog) };
+        let program = prog_load(BPF_PROG_TYPE_SK_SKB, 0, &insns, 1).map_err(|(e, log)| {
+            eprintln!("lighter-agent: sockmap program refused: {e}\n{log}");
+            e
+        })?;
         let mut attr = Attr { zero: [0; 128] };
         attr.attach = ProgAttach {
             target_fd: attach.as_raw_fd() as u32,

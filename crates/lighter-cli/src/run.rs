@@ -148,6 +148,14 @@ pub fn machine() -> anyhow::Result<()> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     ));
+    // Docker Hub through a cache, for the gates (`lighter.registry_mirror`
+    // in init): not a setting, since a user's dockerd is theirs to configure.
+    if let Ok(mirror) = std::env::var("LIGHTER_REGISTRY_MIRROR")
+        && !mirror.is_empty()
+        && !mirror.contains(char::is_whitespace)
+    {
+        cmdline.push_str(&format!(" lighter.registry_mirror={mirror}"));
+    }
     // The Neural Engine service: a process of its own (ane_host.rs says
     // why), on a loopback port the container reaches through the streams;
     // init publishes it as a CDI device. Held for the machine's life.
@@ -252,10 +260,37 @@ pub fn machine() -> anyhow::Result<()> {
         }
     }
 
+    // LAN mode: a second card bridged to one of the Mac's, so the machine
+    // is on the user's network (`lan.rs`). A machine that cannot bridge
+    // starts without it, and `lighter status` and `doctor` say why.
+    let lan = if config.lan {
+        match start_lan(&config, &home) {
+            Ok((lan, kernel_args)) => {
+                cmdline.push_str(&kernel_args);
+                Some(Arc::new(lan))
+            }
+            Err(why) => {
+                tracing::warn!(%why, "LAN mode is on, but the machine starts without its LAN card");
+                let _ = std::fs::write(home.join("lan-error"), &why);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if lan.is_some() {
+        let _ = std::fs::remove_file(home.join("lan-error"));
+    }
+    cmdline.push_str(match config.publish {
+        crate::config::Publish::Lan => " lighter.publish=lan",
+        crate::config::Publish::Localhost => " lighter.publish=localhost",
+    });
+
     // Fixed boots with all of it; native boots on a base and plugs the rest
     // in as the host offers it (`lighter_vmm::virtio::mem`).
     let (ram_bytes, hotplug_bytes) = config.memory_split();
     let machine_config = MachineConfig {
+        lan,
         vcpus: config.vcpus(),
         ram_bytes,
         hotplug_bytes,
@@ -318,7 +353,22 @@ pub fn machine() -> anyhow::Result<()> {
         crate::config::Publish::Localhost => lighter_vmm::streams::Scope::Localhost,
     };
     let mapper = lighter_vmm::streams::PortMapper::new(machine.vsock(), scope);
-    let ports = lighter_docker::PortWatcher::start(&paths::docker_socket()?, mapper, port_health)?;
+    // And what a host-network container listens on, which Docker has no
+    // port bindings to report (#60): the agent finds it from the guest's
+    // sockets, and says each time it changes.
+    let listeners: Arc<dyn lighter_docker::HostListeners> = Arc::new(AgentListeners {
+        socket: home.join("control.sock"),
+    });
+    let ports = lighter_docker::PortWatcher::start_with(
+        &paths::docker_socket()?,
+        mapper,
+        port_health,
+        Some(listeners),
+        vec![
+            lighter_vmm::net::GUEST.into(),
+            lighter_vmm::net::GUEST6.into(),
+        ],
+    )?;
 
     // A Mac that slept wakes with a guest whose clock did not.
     let _power = lighter_vmm::wake::Watcher::start(Box::new(Resync {
@@ -463,4 +513,71 @@ extern "C" fn handle_prepare_stop(_signal: libc::c_int) {
 extern "C" fn handle_stop(signal: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Release);
     handle_prepare_stop(signal);
+}
+
+/// Host-network containers' listeners, watched on the agent over the
+/// machine's control channel: one connection, on which the agent says what
+/// they listen on and then again each time it changes.
+struct AgentListeners {
+    socket: std::path::PathBuf,
+}
+
+impl lighter_docker::HostListeners for AgentListeners {
+    fn watch(
+        &self,
+        stop: &dyn Fn() -> bool,
+        heard: &mut dyn FnMut(Result<Vec<lighter_docker::HostListener>, String>),
+    ) -> Result<(), String> {
+        use std::io::{BufRead, Write};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&self.socket).map_err(|e| e.to_string())?;
+        stream
+            .write_all(b"watch-listeners\n")
+            .map_err(|e| e.to_string())?;
+        // Only so that `stop` is looked at: the agent is silent while nothing
+        // changes, which is not an error.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .map_err(|e| e.to_string())?;
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => return Err("the control channel closed".into()),
+                Ok(_) if line.ends_with('\n') => {
+                    heard(lighter_docker::parse_listeners(&line));
+                    line.clear();
+                }
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            if stop() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Bridges the LAN card, and says what the guest needs to know: how it gets
+/// its address, and the Mac's own on that network, which a Wi-Fi bridge's
+/// router may offer it and it must refuse.
+fn start_lan(
+    config: &crate::config::Config,
+    home: &std::path::Path,
+) -> Result<(lighter_vmm::lan::Lan, String), String> {
+    let interface = crate::lan::interface(&config.lan_interface)?;
+    let address = crate::lan::address_for_guest(&config.lan_address, &interface)?;
+    let mac = crate::lan::mac(home).map_err(|e| format!("cannot keep the LAN card's MAC: {e}"))?;
+    let (lan, how) = crate::lan::connect(&interface, mac)?;
+    tracing::info!(%interface, %address, how, "LAN card bridged");
+    let mut args = format!(" lighter.lan={address}");
+    if let Some((mac_ip, _)) = crate::lan::mac_address(&interface) {
+        args.push_str(&format!(" lighter.lan_avoid={mac_ip}"));
+    }
+    Ok((lan, args))
 }

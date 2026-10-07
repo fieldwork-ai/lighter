@@ -655,6 +655,13 @@ fi
 # timestamps are how a container start is taken apart.
 dockerd_debug=""
 grep -qw lighter.dockerd_debug /proc/cmdline && dockerd_debug="-D"
+# `lighter.registry_mirror=<url>`: Docker Hub pulls through a cache. For the
+# gates, which boot a machine with an empty image store each time and spent
+# Docker Hub's anonymous pull limit for the whole network (2026-10-06).
+registry_mirror=""
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in lighter.registry_mirror=*) registry_mirror="--registry-mirror=${arg#lighter.registry_mirror=}" ;; esac
+done
 # --host-gateway-ip is what `--add-host name:host-gateway` writes. Left unset it
 # is docker0's address in this guest, where nothing of the Mac's listens; it
 # must be HOST_ALIAS (crates/lighter-vmm/src/dns.rs), what host.docker.internal
@@ -665,7 +672,7 @@ sh -c '
 	# BuildKit workers have no explicit OCI OOM score. Their runtime resets
 	# inherited protection so a large build cannot evict all normal containers.
 	export DOCKER_BUILDKIT_RUNC_COMMAND=/sbin/lighter-build-runc
-	exec dockerd $2 \
+	exec dockerd $2 $3 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \
 		--data-root=/var/lib/docker \
@@ -674,7 +681,7 @@ sh -c '
 		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
 		--host-gateway-ip=192.168.127.254 \
 		--seccomp-profile=/etc/docker/seccomp.json \
-		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" &
+		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" "$registry_mirror" &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on
@@ -729,7 +736,10 @@ supervise --port 2376 --control
 # network device, where the VMM answers them itself. `fib daddr oif` is the
 # routing decision itself, so anything bound for a container, this machine,
 # or a bridge is left alone without listing subnets that Docker changes at
-# will.
+# will. A container's traffic for the LAN card (eth1, LAN mode) is carried
+# the same way, as a stream: its source is a bridge address nothing on the
+# LAN could answer. Only the guest's own namespace, which host-network
+# containers share, reaches the LAN directly.
 {
 	supervise --tcp-proxy 15201
 	supervise --udp-proxy 15202
@@ -753,7 +763,7 @@ supervise --port 2376 --control
 table inet lighter {
 	chain prerouting {
 		type nat hook prerouting priority dstnat - 10; policy accept;
-		meta l4proto tcp fib daddr oif "eth0" redirect to :15201
+		meta l4proto tcp iifname != "eth1" fib daddr oifname { "eth0", "eth1" } redirect to :15201
 		ip daddr 192.168.127.2 udp dport 53 dnat ip to 192.168.127.2:15353
 	}
 	chain output {
@@ -781,12 +791,17 @@ table inet lighter {
 		# of its own for the route: the agent's socket carries 0x4c494e42,
 		# and a route on that would send its own packets to lo too.
 		ct direction reply ct mark 0x4c494e42 meta mark set 0x4c494e43 accept
-		meta l4proto udp udp dport != { 67, 68 } fib daddr oif "eth0" tproxy ip to :15202 meta mark set 0x1 accept
-		meta l4proto udp udp dport != { 546, 547 } fib daddr oif "eth0" tproxy ip6 to :15202 meta mark set 0x1 accept
+		meta l4proto udp udp dport != { 67, 68 } iifname != "eth1" fib daddr oifname { "eth0", "eth1" } tproxy ip to :15202 meta mark set 0x1 accept
+		meta l4proto udp udp dport != { 546, 547 } iifname != "eth1" fib daddr oifname { "eth0", "eth1" } tproxy ip6 to :15202 meta mark set 0x1 accept
 	}
 	chain inbound {
 		type route hook output priority mangle; policy accept;
 		meta mark 0x4c494e42 ct mark set meta mark
+		# The same for a host-network container's reply: its server is in
+		# this namespace, so the reply is local output rather than
+		# prerouting, and left by eth0 for a client the agent was standing
+		# in for. The mark set here re-routes it, by the same policy route.
+		ct direction reply ct mark 0x4c494e42 meta mark set 0x4c494e43
 	}
 }
 EOF
@@ -803,6 +818,111 @@ EOF
 		echo "INIT streams=failed"
 	fi
 }
+
+# --- The LAN (0.12) ---------------------------------------------------------
+# With `lighter config --lan on`, the VMM adds a second card bridged to one
+# of the Mac's own (crates/lighter-vmm/src/lan.rs): eth1, on the user's
+# network. It carries the LAN's own subnet, on-link, and multicast, and
+# nothing else: the default route, DNS and published ports stay on eth0 and
+# the streams, so the Mac's VPN and proxies still apply to everything bound
+# for the internet. A multicast route through eth1 is also what makes Home
+# Assistant pick eth1 as its default adapter, since it chooses by the source
+# address towards 224.0.0.251, and advertise an address devices can reach.
+lan="" lan_avoid="" publish="lan"
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	lighter.lan=*) lan="${arg#lighter.lan=}" ;;
+	lighter.lan_avoid=*) lan_avoid="${arg#lighter.lan_avoid=}" ;;
+	lighter.publish=*) publish="${arg#lighter.publish=}" ;;
+	esac
+done
+if [ -n "$lan" ] && [ -e /sys/class/net/eth1 ]; then
+	mkdir -p /run/lighter
+	# The LAN's router advertisements give eth1 its IPv6 addresses (the
+	# guest forwards, so 2 rather than 1), but not a default route.
+	sysctl -q -w net.ipv6.conf.eth1.accept_ra=2 net.ipv6.conf.eth1.accept_ra_defrtr=0 \
+		net.ipv4.conf.eth1.rp_filter=0 2>/dev/null || true
+	# A machine on the network is reachable from it, and the guest listens
+	# on more than a container's ports: new connections reach only what
+	# host-network containers listen on (the agent keeps the two sets from
+	# the same scan that forwards them from the Mac). Multicast and
+	# broadcast are discovery's, and UDP to the ephemeral range reaches
+	# only clients' own sockets, which is where an SSDP or LIFX reply goes.
+	# Docker's published ports, which its DNAT also applies on eth1, pass
+	# only when the publish scope is the LAN.
+	forwarded=drop
+	[ "$publish" = lan ] && forwarded=accept
+	cat > /run/lighter-lan.nft <<NFT
+table inet lighter_lan {
+	set tcp_ports { type inet_service; }
+	set udp_ports { type inet_service; }
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		iifname != "eth1" accept
+		ct state established,related accept
+		meta l4proto { icmp, ipv6-icmp } accept
+		udp dport 68 accept
+		meta pkttype { broadcast, multicast } accept
+		udp dport 32768-60999 accept
+		tcp dport @tcp_ports accept
+		udp dport @udp_ports accept
+		counter drop
+	}
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		iifname "eth1" ct status dnat $forwarded
+		iifname "eth1" counter drop
+	}
+}
+NFT
+	if nft -f /run/lighter-lan.nft 2>/dev/console; then
+		ip link set eth1 up
+		ip route add 224.0.0.0/4 dev eth1 2>/dev/null
+		if [ "$lan" = dhcp ]; then
+			# The address only: routes, DNS and the default are the
+			# streams'. An offer of the Mac's own address (Wi-Fi bridges
+			# by translating the guest's MAC to the Mac's, and a router
+			# that keys leases on it offers the Mac's) is refused.
+			cat > /run/lighter/lan-dhcp <<'DHCP'
+#!/bin/sh
+state=/run/lighter/lan-state
+case "$1" in
+deconfig|leasefail|nak)
+	ip -4 addr flush dev eth1
+	echo waiting > "$state"
+	;;
+bound|renew)
+	if [ -n "$LAN_AVOID" ] && [ "$ip" = "$LAN_AVOID" ]; then
+		ip -4 addr flush dev eth1
+		echo "declined $ip" > "$state"
+		exit 0
+	fi
+	if ! ip -4 addr show dev eth1 | grep -q "inet $ip/"; then
+		ip -4 addr flush dev eth1
+		ip addr add "$ip/$mask" dev eth1
+	fi
+	echo "address $ip/$mask" > "$state"
+	;;
+esac
+DHCP
+			chmod +x /run/lighter/lan-dhcp
+			echo waiting > /run/lighter/lan-state
+			(
+				while true; do
+					LAN_AVOID="$lan_avoid" udhcpc -i eth1 -f -a -R -x hostname:lighter -s /run/lighter/lan-dhcp >/dev/null 2>&1
+					sleep 5
+				done
+			) &
+		else
+			ip addr add "$lan" dev eth1 && echo "address $lan" > /run/lighter/lan-state
+			# Announced, so that the LAN forgets whoever had it last.
+			arping -U -c 2 -I eth1 "${lan%/*}" >/dev/null 2>&1 &
+		fi
+		echo "INIT lan=on mode=$lan"
+	else
+		echo "INIT lan=failed firewall"
+	fi
+fi
 
 # `t=` is seconds since the kernel started, for reading a boot's timeline
 # off the console (the host's log has no clock for these lines).

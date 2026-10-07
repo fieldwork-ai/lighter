@@ -125,6 +125,132 @@ pub fn published_ports(containers: &serde_json::Value) -> HashSet<Published> {
     ports
 }
 
+/// What a host-network container listens on, as the guest agent reports
+/// it (`watch-listeners` on its control channel).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HostListener {
+    pub proto: Proto,
+    pub addr: IpAddr,
+    pub port: u16,
+    pub container: String,
+}
+
+/// Where host-network containers' listeners come from: the guest's agent,
+/// over the machine's control channel.
+pub trait HostListeners: Send + Sync {
+    /// Says what they listen on, at once and each time it changes, until the
+    /// source goes away (an error) or `stop` says to.
+    fn watch(
+        &self,
+        stop: &dyn Fn() -> bool,
+        heard: &mut dyn FnMut(Result<Vec<HostListener>, String>),
+    ) -> Result<(), String>;
+}
+
+/// Parses the agent's reply: `listeners tcp 0.0.0.0 8123 <id>;udp :: 5353
+/// <id>`, `listeners none`, or `listeners error <why>`.
+pub fn parse_listeners(reply: &str) -> Result<Vec<HostListener>, String> {
+    let rest = reply
+        .trim()
+        .strip_prefix("listeners")
+        .ok_or_else(|| format!("unexpected reply: {reply}"))?
+        .trim();
+    if rest == "none" || rest.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(why) = rest.strip_prefix("error") {
+        return Err(why.trim().to_string());
+    }
+    rest.split(';')
+        .map(|entry| {
+            let mut words = entry.split_whitespace();
+            let proto = match words.next() {
+                Some("tcp") => Proto::Tcp,
+                Some("udp") => Proto::Udp,
+                other => return Err(format!("unknown protocol {other:?}")),
+            };
+            let addr = words
+                .next()
+                .and_then(|a| a.parse().ok())
+                .ok_or_else(|| format!("bad address in {entry:?}"))?;
+            let port = words
+                .next()
+                .and_then(|p| p.parse().ok())
+                .ok_or_else(|| format!("bad port in {entry:?}"))?;
+            let container = words.next().unwrap_or_default().to_string();
+            Ok(HostListener {
+                proto,
+                addr,
+                port,
+                container,
+            })
+        })
+        .collect()
+}
+
+/// The containers in a `GET /containers/json` response that use the host
+/// network, by id.
+pub fn host_network_containers(containers: &serde_json::Value) -> HashSet<String> {
+    containers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| {
+            c.get("HostConfig")
+                .and_then(|h| h.get("NetworkMode"))
+                .and_then(|m| m.as_str())
+                == Some("host")
+        })
+        .filter_map(|c| c.get("Id").and_then(|id| id.as_str()).map(String::from))
+        .collect()
+}
+
+/// Where a host-network listener bound to `addr` is forwarded from: every
+/// interface for one on every interface, or on the guest's own address
+/// (`own`), which is what reaching the guest means; loopback for one on
+/// loopback. A bind anywhere else (a Docker bridge, the LAN card) is not
+/// the Mac's to forward.
+pub fn forwardable(addr: IpAddr, own: &[IpAddr]) -> Option<IpAddr> {
+    match addr {
+        a if a.is_unspecified() || a.is_loopback() => Some(a),
+        a if own.contains(&a) => Some(match a {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        }),
+        _ => None,
+    }
+}
+
+/// UDP ports a host-network container's listener is never forwarded from.
+/// 5353 is mDNS: macOS's mDNSResponder holds it on every Mac, so the forward
+/// can never open, and Home Assistant (whose zeroconf binds it) was reported
+/// as a port lighter could not forward for as long as it ran. mDNS is
+/// multicast on the network the container is on; LAN mode is how it reaches
+/// the Mac's.
+const NEVER_FORWARDED_UDP: [u16; 1] = [5353];
+
+/// What host-network containers listening as `listeners` add to what is
+/// forwarded: the listeners of `containers` (the ones on the host network),
+/// at the addresses [`forwardable`] allows.
+pub fn host_published(
+    listeners: &[HostListener],
+    containers: &HashSet<String>,
+    own: &[IpAddr],
+) -> HashSet<Published> {
+    listeners
+        .iter()
+        .filter(|l| containers.contains(&l.container))
+        .filter(|l| !(l.proto == Proto::Udp && NEVER_FORWARDED_UDP.contains(&l.port)))
+        .filter_map(|l| {
+            forwardable(l.addr, own).map(|addr| Published {
+                addr,
+                port: l.port,
+                proto: l.proto,
+            })
+        })
+        .collect()
+}
+
 /// A published port that could not be forwarded, and why. Every address it
 /// was published on is left closed (see [`apply`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,9 +296,28 @@ const RETRY_MOST: Duration = Duration::from_secs(30);
 /// Watches Docker and keeps the host's forwards matching it.
 pub struct PortWatcher;
 
+/// What the watcher's threads share: where Docker is, where forwards go,
+/// what is recorded about them, and what host-network containers were last
+/// heard to listen on, with the guest's own addresses they may bind.
+struct Watched {
+    socket: std::path::PathBuf,
+    mapper: Arc<dyn PortMapper>,
+    health: PortHealth,
+    /// Kept while the agent cannot be reached, so that a moment without it
+    /// does not withdraw their forwards.
+    heard: Mutex<Vec<HostListener>>,
+    own: Vec<IpAddr>,
+    /// Held for a whole reconcile, from asking Docker to applying: three
+    /// threads reconcile, and one that asked before another and applied
+    /// after it would put back what the other had just changed.
+    reconciling: Mutex<()>,
+}
+
 impl PortWatcher {
-    /// Starts a thread that reconciles now and on every container event, and
-    /// one that tries a failed forward again until it opens.
+    /// Starts a thread that reconciles now and on every container event, one
+    /// that tries a failed forward again until it opens, and, given where
+    /// host-network containers' listeners come from, one that reconciles
+    /// each time they change.
     ///
     /// The handle ends the watching: the event stream is dropped and not
     /// reopened, which is what lets dockerd exit at once when the machine
@@ -182,20 +327,45 @@ impl PortWatcher {
         mapper: Arc<dyn PortMapper>,
         health: PortHealth,
     ) -> std::io::Result<Arc<http::Stop>> {
+        Self::start_with(socket, mapper, health, None, Vec::new())
+    }
+
+    /// [`PortWatcher::start`], forwarding host-network containers' listeners
+    /// too: `listeners` reports them, and `own` is the guest's own
+    /// addresses, a bind to which counts as every interface.
+    pub fn start_with(
+        socket: &Path,
+        mapper: Arc<dyn PortMapper>,
+        health: PortHealth,
+        listeners: Option<Arc<dyn HostListeners>>,
+        own: Vec<IpAddr>,
+    ) -> std::io::Result<Arc<http::Stop>> {
         let stop = http::Stop::new();
-        let (events, retries) = (Arc::clone(&stop), Arc::clone(&stop));
-        let (socket, again) = (socket.to_path_buf(), socket.to_path_buf());
-        let (mapper_again, health_again) = (Arc::clone(&mapper), health.clone());
+        let (events, retries, heard) = (Arc::clone(&stop), Arc::clone(&stop), Arc::clone(&stop));
+        let watched = Arc::new(Watched {
+            socket: socket.to_path_buf(),
+            mapper,
+            health,
+            heard: Mutex::new(Vec::new()),
+            own,
+            reconciling: Mutex::new(()),
+        });
+        let (again, listening) = (Arc::clone(&watched), Arc::clone(&watched));
+        if let Some(source) = listeners {
+            std::thread::Builder::new()
+                .name("docker-ports-listeners".into())
+                .spawn(move || Self::listen(&listening, source.as_ref(), &heard))?;
+        }
         std::thread::Builder::new()
             .name("docker-ports".into())
-            .spawn(move || Self::watch(&socket, &mapper, &health, &events))?;
+            .spawn(move || Self::watch(&watched, &events))?;
         std::thread::Builder::new()
             .name("docker-ports-retry".into())
-            .spawn(move || Self::retry(&again, &mapper_again, &health_again, &retries))?;
+            .spawn(move || Self::retry(&again, &retries))?;
         Ok(stop)
     }
 
-    fn watch(socket: &Path, mapper: &Arc<dyn PortMapper>, health: &PortHealth, stop: &http::Stop) {
+    fn watch(watched: &Watched, stop: &http::Stop) {
         // Filters to container events only. URL-encoded because it is a JSON
         // document in a query parameter.
         const EVENTS: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
@@ -204,18 +374,18 @@ impl PortWatcher {
             // Reconcile before watching, not after: containers may already be
             // running from a previous session, and a watcher that only reacted
             // to events would never open their doors.
-            reconcile(socket, mapper, health);
+            reconcile(watched);
 
             // Reconciling INSIDE the callback is the whole point. Setting a
             // flag and acting on it after the call returns looks equivalent and
             // is not: a healthy event stream never returns, so the forwards
             // would only ever be fixed up when Docker went away.
-            let result = http::stream_json(socket, EVENTS, Some(stop), |event| {
+            let result = http::stream_json(&watched.socket, EVENTS, Some(stop), |event| {
                 let status = event.get("status").and_then(|s| s.as_str()).unwrap_or("");
                 // Only lifecycle transitions can change what is published.
                 // Reconciling on every exec_start would be correct and noisy.
                 if matches!(status, "start" | "die" | "destroy" | "pause" | "unpause") {
-                    reconcile(socket, mapper, health);
+                    reconcile(watched);
                 }
             });
 
@@ -233,11 +403,34 @@ impl PortWatcher {
         }
     }
 
+    /// Reconciles each time host-network containers' listeners change: a
+    /// server starts listening when it is ready, which no container event
+    /// marks. Watched again after a pause if the watch ends, which it does
+    /// while the guest's agent restarts.
+    fn listen(watched: &Watched, source: &dyn HostListeners, stop: &http::Stop) {
+        loop {
+            let ended = source.watch(&|| stop.asked(), &mut |answer| match answer {
+                Ok(listeners) => {
+                    *watched.heard.lock().expect("listeners poisoned") = listeners;
+                    reconcile(watched);
+                }
+                Err(e) => tracing::debug!(%e, "the agent could not say what host-network containers listen on"),
+            });
+            if stop.asked() {
+                return;
+            }
+            if let Err(e) = ended {
+                tracing::debug!(%e, "the host-network listener watch ended");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// Tries failed forwards again on a backoff. Without it a port refused
     /// once, because Tailscale Serve or another user's process held it on one
     /// of the Mac's addresses, stayed closed after the conflict cleared until
     /// some unrelated container happened to start or stop.
-    fn retry(socket: &Path, mapper: &Arc<dyn PortMapper>, health: &PortHealth, stop: &http::Stop) {
+    fn retry(watched: &Watched, stop: &http::Stop) {
         let mut pause = RETRY_FIRST;
         loop {
             let until = std::time::Instant::now() + pause;
@@ -247,11 +440,12 @@ impl PortWatcher {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            let health = &watched.health;
             if health.unforwarded().is_empty() {
                 pause = RETRY_FIRST;
                 continue;
             }
-            reconcile(socket, mapper, health);
+            reconcile(watched);
             pause = if health.unforwarded().is_empty() {
                 RETRY_FIRST
             } else {
@@ -261,18 +455,23 @@ impl PortWatcher {
     }
 }
 
-/// Makes the host's forwards match what Docker currently publishes.
-fn reconcile(socket: &Path, mapper: &Arc<dyn PortMapper>, health: &PortHealth) {
-    let containers = match http::get_json(socket, "/containers/json") {
+/// Makes the host's forwards match what Docker currently publishes, and
+/// what host-network containers listen on.
+fn reconcile(watched: &Watched) {
+    let _one = watched.reconciling.lock().expect("reconcile poisoned");
+    let containers = match http::get_json(&watched.socket, "/containers/json") {
         Ok(value) => value,
         Err(e) => {
             tracing::debug!(%e, "could not list containers");
             return;
         }
     };
-    let desired = published_ports(&containers);
-    let mut forwards = health.0.lock().expect("port health poisoned");
-    apply(&desired, mapper.as_ref(), &mut forwards);
+    let mut desired = published_ports(&containers);
+    let host = host_network_containers(&containers);
+    let heard = watched.heard.lock().expect("listeners poisoned").clone();
+    desired.extend(host_published(&heard, &host, &watched.own));
+    let mut forwards = watched.health.0.lock().expect("port health poisoned");
+    apply(&desired, watched.mapper.as_ref(), &mut forwards);
 }
 
 /// Brings `forwards` to `desired`, a port at a time: every address a port is
@@ -467,6 +666,96 @@ mod tests {
             port,
             proto: Proto::Tcp,
         }
+    }
+
+    #[test]
+    fn the_agents_listeners_reply_parses() {
+        let id = "a".repeat(64);
+        let reply = format!("listeners tcp 0.0.0.0 8123 {id};udp :: 5353 {id}\n");
+        let parsed = parse_listeners(&reply).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[1],
+            HostListener {
+                proto: Proto::Udp,
+                addr: "::".parse().unwrap(),
+                port: 5353,
+                container: id
+            }
+        );
+        assert_eq!(parse_listeners("listeners none\n").unwrap(), Vec::new());
+        assert_eq!(
+            parse_listeners("listeners error ENOENT\n").unwrap_err(),
+            "ENOENT"
+        );
+        assert!(parse_listeners("pong").is_err());
+    }
+
+    #[test]
+    fn host_network_containers_are_found_by_their_network_mode() {
+        let found = host_network_containers(&containers(
+            r#"[{"Id": "aaa", "HostConfig": {"NetworkMode": "host"}},
+                {"Id": "bbb", "HostConfig": {"NetworkMode": "bridge"}},
+                {"Id": "ccc"}]"#,
+        ));
+        assert_eq!(found, HashSet::from(["aaa".to_string()]));
+    }
+
+    #[test]
+    fn only_a_wildcard_loopback_or_the_guests_own_address_is_forwarded() {
+        let own: Vec<IpAddr> = vec![
+            "192.168.127.2".parse().unwrap(),
+            "fd6c:6967:6874::2".parse().unwrap(),
+        ];
+        let f = |a: &str| forwardable(a.parse().unwrap(), &own).map(|a| a.to_string());
+        assert_eq!(f("0.0.0.0").as_deref(), Some("0.0.0.0"));
+        assert_eq!(f("::").as_deref(), Some("::"));
+        assert_eq!(f("127.0.0.1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(f("192.168.127.2").as_deref(), Some("0.0.0.0"));
+        assert_eq!(f("fd6c:6967:6874::2").as_deref(), Some("::"));
+        assert_eq!(f("172.17.0.1"), None, "a Docker bridge");
+        assert_eq!(f("192.168.50.241"), None, "the LAN card");
+    }
+
+    #[test]
+    fn only_host_network_containers_listeners_are_published() {
+        let l = |c: &str, port| HostListener {
+            proto: Proto::Tcp,
+            addr: "0.0.0.0".parse().unwrap(),
+            port,
+            container: c.into(),
+        };
+        let published = host_published(
+            &[l("host", 8123), l("bridged", 8000)],
+            &HashSet::from(["host".to_string()]),
+            &[],
+        );
+        assert_eq!(published, HashSet::from([tcp("0.0.0.0", 8123)]));
+    }
+
+    /// Home Assistant's zeroconf: macOS holds 5353 itself, so it is left
+    /// alone, and a UDP service on any other port is forwarded.
+    #[test]
+    fn a_host_network_mdns_socket_is_not_forwarded() {
+        let udp = |port| HostListener {
+            proto: Proto::Udp,
+            addr: "0.0.0.0".parse().unwrap(),
+            port,
+            container: "ha".into(),
+        };
+        let published = host_published(
+            &[udp(5353), udp(1900)],
+            &HashSet::from(["ha".to_string()]),
+            &[],
+        );
+        assert_eq!(
+            published,
+            HashSet::from([Published {
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 1900,
+                proto: Proto::Udp
+            }])
+        );
     }
 
     #[test]

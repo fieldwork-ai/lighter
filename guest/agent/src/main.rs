@@ -14,8 +14,11 @@
 //! ```
 
 mod accelerator;
+mod bpf;
+mod doorbell;
 mod idle;
 mod inbound;
+mod listeners;
 mod memory_policy;
 mod sockmap;
 mod streams;
@@ -98,6 +101,12 @@ fn main() -> std::process::ExitCode {
             // USB devices from the Mac: each on a vsock stream, attached to
             // vhci-hcd, with /dev/serial/by-id kept (see usb.rs).
             "--usb" => usb = args.next().and_then(|v| v.parse().ok()),
+            // What host-network containers listen on, once, as the
+            // control verb answers it: for looking from a shell.
+            "--listeners" => {
+                print!("{}", listeners::report());
+                return std::process::ExitCode::SUCCESS;
+            }
             "--bpf-rollback-test" => {
                 return match sockmap::check_failed_join() {
                     Ok(()) => std::process::ExitCode::SUCCESS,
@@ -211,6 +220,9 @@ fn main() -> std::process::ExitCode {
 
     if let Some(path) = target {
         return streams::serve(listener.into_fd(), streams::Route::Unix(path.into()), stream_env(None));
+    }
+    if control {
+        listeners::keep();
     }
     loop {
         let stream = match listener.accept() {
@@ -1208,6 +1220,12 @@ fn serve_control(stream: OwnedFd) {
                 }
                 _ => {}
             }
+            // The one verb that keeps the connection: what host-network
+            // containers listen on, now and each time it changes.
+            if line == "watch-listeners" {
+                listeners::watch(&mut writer, || peer_gone(&reader.0));
+                return;
+            }
             let reply = handle_control(&line);
             if writer.write_all(reply.as_bytes()).is_err() {
                 return;
@@ -1218,6 +1236,15 @@ fn serve_control(stream: OwnedFd) {
             return;
         }
     }
+}
+
+/// Whether a control connection's peer has hung up: an end of stream
+/// waiting to be read. Bytes waiting are a peer still there.
+fn peer_gone(fd: &OwnedFd) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: peeking one byte into a buffer we own, without blocking.
+    let n = unsafe { libc::recv(fd.as_raw_fd(), std::ptr::addr_of_mut!(byte).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    n == 0 || (n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN))
 }
 
 /// init's record of restarted agents, one line of arguments per restart, as
@@ -1242,6 +1269,11 @@ fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
         (Some("ping"), _) => "pong\n".into(),
+        // What host-network containers listen on, for the Mac to forward
+        // as it does Docker's published ports (`listeners.rs`).
+        (Some("listeners"), _) => listeners::report(),
+        // The LAN card's state, for `lighter status` and `doctor`.
+        (Some("lan"), _) => listeners::lan_report(),
         // Which agents init has had to restart, and how often: one line,
         // `restarts tcp-proxy=2 dns=1`, or `restarts none`.
         (Some("restarts"), _) => format!("restarts {}\n", agent_restarts(

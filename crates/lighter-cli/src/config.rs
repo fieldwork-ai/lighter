@@ -65,6 +65,15 @@ pub struct Config {
     /// usb attach`), attached whenever they are plugged in and the machine
     /// runs.
     pub usb: Vec<UsbDevice>,
+    /// Whether the machine joins the Mac's network with a card of its own
+    /// ("LAN mode", 0.12), so a host-network container can discover and
+    /// be discovered. Off by default.
+    pub lan: bool,
+    /// Which of the Mac's cards it bridges: `auto` for the primary.
+    pub lan_interface: String,
+    /// Its address on the LAN: empty for DHCP, or `192.168.50.240[/24]`
+    /// where the router cannot lease one (Wi-Fi, mostly).
+    pub lan_address: String,
 }
 
 /// A USB device the guest has: `vendor:product[:serial]`, in hex, and
@@ -158,6 +167,9 @@ impl Default for Config {
             metal: true,
             video: true,
             usb: Vec::new(),
+            lan: false,
+            lan_interface: "auto".into(),
+            lan_address: String::new(),
         }
     }
 }
@@ -638,6 +650,9 @@ mod tests {
                 spec: "303a:831a".into(),
                 force: false,
             }],
+            lan: true,
+            lan_interface: "en1".into(),
+            lan_address: "192.168.50.240/24".into(),
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         assert!(
@@ -655,6 +670,11 @@ mod tests {
         assert_eq!(back.resources, Resources::Cooperative);
         assert_eq!(back.cpus, Some(3));
         assert_eq!(back.shares, vec!["/tmp".to_string()]);
+        assert!(back.lan);
+        assert_eq!(
+            (back.lan_interface.as_str(), back.lan_address.as_str()),
+            ("en1", "192.168.50.240/24")
+        );
         assert_eq!(back.publish, Publish::Localhost);
     }
 

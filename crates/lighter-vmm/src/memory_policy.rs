@@ -138,10 +138,16 @@ const STALL_FULL_HURRY: u32 = 1000;
 /// of RAM: memory the guest is handed then comes out of other processes'
 /// compressed pages, whatever level the Mac reports.
 const OVERCOMMITTED_COMPRESSOR_FRACTION: u64 = 4;
-/// Swap in use over this fraction of the Mac's RAM is pressure. Against
-/// RAM, not against the swap files' size: macOS grows and shrinks those to
-/// what is in use, so used-over-total read 83% on a Mac that had drained
-/// its compressor by half, and kept the balloon pinned for nothing.
+/// Swap in use over this fraction of the Mac's RAM is pressure, while it is
+/// moving. Against RAM, not against the swap files' size: macOS grows and
+/// shrinks those to what is in use, so used-over-total read 83% on a Mac
+/// that had drained its compressor by half, and kept the balloon pinned
+/// for nothing. And only while the Mac is still swapping out (within
+/// `PRESSURE_MEMORY` of the last swap-out): swapped pages come back only
+/// when touched, so swap in use stays high for days after the pressure that
+/// put it there, and a Studio with 78% of its memory free, 16.7 GB swapped
+/// and nothing swapped out for an hour read as overcommitted and never
+/// eased its balloon (2026-10-06).
 const OVERCOMMITTED_SWAP_FRACTION: u64 = 8;
 /// Overcommitment ends only once the compressor or swap is under this
 /// fraction of RAM, a fifth below where it began: an 8 GB Mac sat within a
@@ -390,6 +396,10 @@ struct CompressionState {
     /// Whether the host's compressor or swap says it is overcommitted,
     /// whatever level it reports.
     overcommitted: bool,
+    /// The host's swap-outs since boot, from the last sample, and until
+    /// when its swap counts as moving.
+    swapped_out: Option<u64>,
+    swapping_until: Option<Instant>,
     /// Until when a Warn or Critical is remembered.
     pressure_until: Option<Instant>,
     /// Until when a Critical is remembered: the guest does not grow at
@@ -766,6 +776,15 @@ impl Steering {
             .expect("compression policy poisoned");
         state.host_free = Some(sample.free);
         state.host_room = Some(sample.room);
+        let now = Instant::now();
+        if state
+            .swapped_out
+            .is_some_and(|then| sample.swapped_out > then)
+        {
+            state.swapping_until = Some(now + PRESSURE_MEMORY);
+        }
+        state.swapped_out = Some(sample.swapped_out);
+        let moving = state.swapping_until.is_some_and(|until| now < until);
         // In at a quarter (an eighth for swap), out a fifth below that:
         // hysteresis against a host sitting on the line.
         let line = |fraction: u64| {
@@ -778,7 +797,8 @@ impl Steering {
         };
         let compressor_full =
             sample.ram > 0 && sample.compressor > line(OVERCOMMITTED_COMPRESSOR_FRACTION);
-        let swapping = sample.ram > 0 && sample.swap_used > line(OVERCOMMITTED_SWAP_FRACTION);
+        let swapping =
+            moving && sample.ram > 0 && sample.swap_used > line(OVERCOMMITTED_SWAP_FRACTION);
         let overcommitted = compressor_full || swapping;
         if overcommitted != state.overcommitted {
             tracing::info!(
@@ -1477,6 +1497,7 @@ impl HostMemory {
             + u64::from(stats.compressor_page_count);
         Some(HostSample {
             compressed: stats.compressions * self.page,
+            swapped_out: stats.swapouts * self.page,
             free: u64::from(stats.free_count) * self.page,
             room: self.ram.saturating_sub(used * self.page),
             compressor: u64::from(stats.compressor_page_count) * self.page,
@@ -1487,11 +1508,12 @@ impl HostMemory {
     }
 }
 
-/// One reading: how much the host has compressed since boot, what it has
-/// free, what its compressor holds, and its swap.
+/// One reading: how much the host has compressed and swapped out since
+/// boot, what it has free, what its compressor holds, and its swap.
 #[derive(Clone, Copy)]
 struct HostSample {
     compressed: u64,
+    swapped_out: u64,
     free: u64,
     /// RAM less what Activity Monitor calls used: free pages and the Mac's
     /// own file cache, which gives way to anything that asks.
@@ -1909,6 +1931,7 @@ mod tests {
         let (steering, _transport) = steering_for_tests(4 << 30);
         let sample = |free: u64, room: u64| HostSample {
             compressed: 0,
+            swapped_out: 0,
             free,
             room,
             compressor: 0,
@@ -2297,6 +2320,7 @@ mod tests {
         steering.compression.lock().unwrap().pressure_until = None;
         steering.observe(&HostSample {
             compressed: 0,
+            swapped_out: 0,
             free: 256 << 20,
             room: 256 << 20,
             compressor: 0,
@@ -2322,6 +2346,42 @@ mod tests {
         );
     }
 
+    /// Swap in use says the Mac was short once; only swap still moving says
+    /// it is now. The Studio on 2026-10-06: 16.7 GB swapped of 96 GB, over
+    /// the eighth, with 78% free and nothing swapped out in an hour.
+    #[test]
+    fn swap_that_has_stopped_moving_is_history_not_pressure() {
+        let (steering, _transport) = steering_for_tests(16 << 30);
+        let sample = |swapped_out: u64| HostSample {
+            compressed: 0,
+            swapped_out,
+            free: 70 << 30,
+            room: 75 << 30,
+            compressor: 6 << 30,
+            swap_used: 16 << 30,
+            swap_total: 18 << 30,
+            ram: 96 << 30,
+        };
+        let overcommitted = |s: &Steering| s.compression.lock().unwrap().overcommitted;
+        steering.observe(&sample(40 << 30));
+        assert!(
+            !overcommitted(&steering),
+            "a first sample says nothing has moved"
+        );
+        steering.observe(&sample(40 << 30));
+        assert!(!overcommitted(&steering), "swapped, and still");
+        steering.observe(&sample((40 << 30) + (64 << 20)));
+        assert!(overcommitted(&steering), "swapping out again");
+        steering.observe(&sample((40 << 30) + (64 << 20)));
+        assert!(overcommitted(&steering), "a still second within the window");
+        steering.compression.lock().unwrap().swapping_until = Some(Instant::now());
+        steering.observe(&sample((40 << 30) + (64 << 20)));
+        assert!(
+            !overcommitted(&steering),
+            "still for the whole window: history"
+        );
+    }
+
     /// A Mac reporting Normal with a quarter of its RAM in the compressor,
     /// or half its swap in use, is under pressure: the ramp climbs the
     /// Warn cap at the Warn pace.
@@ -2331,6 +2391,7 @@ mod tests {
         healthy(&steering);
         steering.observe(&HostSample {
             compressed: 0,
+            swapped_out: 0,
             free: 1 << 30,
             room: 1 << 30,
             compressor: 13 << 30,
@@ -2342,6 +2403,7 @@ mod tests {
         assert_eq!(target_mib(&transport), 4096, "the Warn cap, at Normal");
         steering.observe(&HostSample {
             compressed: 0,
+            swapped_out: 1 << 20,
             free: 1 << 30,
             room: 1 << 30,
             compressor: 0,
@@ -2362,6 +2424,7 @@ mod tests {
         // not overcommitted. The file's size says nothing.
         steering.observe(&HostSample {
             compressed: 0,
+            swapped_out: 1 << 20,
             free: 1 << 30,
             room: 1 << 30,
             compressor: 0,
@@ -2374,6 +2437,7 @@ mod tests {
         // below it, so a Mac sitting on the line does not flip each poll.
         let sample = |compressor: u64| HostSample {
             compressed: 0,
+            swapped_out: 0,
             free: 1 << 30,
             room: 1 << 30,
             compressor,

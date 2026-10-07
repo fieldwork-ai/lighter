@@ -1,0 +1,16 @@
+[package]
+name = "lighter-bridge"
+description = "lighter's root helper: puts a machine on the Mac's network without com.apple.vm.networking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc.workspace = true
+lighter-vmnet.workspace = true
+
+[build-dependencies]
+cc = "1"
