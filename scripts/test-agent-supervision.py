@@ -20,12 +20,13 @@ class AgentSupervision(unittest.TestCase):
     def test_no_agent_is_started_bare(self):
         bare = [line.strip() for line in INIT.splitlines()
                 if re.match(r'\s*"\$AGENT"\s', line) and 'supervise' not in line]
-        # The one bare call is supervise's own.
-        self.assertEqual(bare, ['"$AGENT" "$@"'], 'an agent started outside supervise')
+        # supervise's own call, and the one-shot wait for USB devices before
+        # dockerd, which exits rather than serving and must block boot.
+        self.assertEqual(bare, ['"$AGENT" "$@"', '"$AGENT" --usb-expect'], 'an agent started outside supervise')
 
     def test_every_service_is_supervised(self):
         supervised = re.findall(r'^\s*supervise (--[a-z-]+)', INIT, re.M)
-        for mode in ['--port', '--tcp-proxy', '--udp-proxy', '--inbound', '--udp-inbound', '--dns']:
+        for mode in ['--port', '--tcp-proxy', '--udp-proxy', '--inbound', '--udp-inbound', '--dns', '--usb']:
             self.assertIn(mode, supervised)
         self.assertEqual(supervised.count('--port'), 2, 'the Docker socket and control')
 

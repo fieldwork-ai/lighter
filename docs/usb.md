@@ -49,7 +49,7 @@ Output:
 
 The path printed on the second line is the stable Linux device name to pass into your container.
 
-You only need to run this command once: lighter remembers attached devices in its configuration, automatically reconnecting them across VM restarts, Mac sleep/wake cycles, and physical replugs.
+You only need to run this command once: lighter remembers attached devices in its configuration, automatically reconnecting them across VM restarts, Mac sleep/wake cycles, and physical replugs. After a restart, the machine waits for the devices the Mac is attaching before it starts any container, so a container that names one with `devices:` comes back with it.
 
 To release the stick back to macOS at any time, run `lighter usb detach 303a:831a`.
 

@@ -224,6 +224,7 @@ pub fn machine() -> anyhow::Result<()> {
             share.path.display()
         ));
     }
+    cmdline.push_str(&crate::usb::boot_args(&config));
     // Rosetta rides its own share, mounted by the guest's init at a fixed
     // place when told; without it amd64 containers fail naming the fix.
     let mut shares = shares;

@@ -181,6 +181,13 @@ HOLD_PID=""
 wait_for 15 has_name "$TR_NAME" && pass "attached on its own once the port was let go" || fail "not attached after the port was let go: $(guest_names | xargs)"
 
 echo "==> A machine started again attaches its devices again"
+# And a container naming one comes back with it: dockerd starts restart-policy
+# containers at boot, and one whose device was not there yet failed to start
+# and was never retried (Zigbee2MQTT after every restart, until 0.12.1). Boot
+# now waits for the devices the Mac is attaching.
+$D rm -f m15-stick >/dev/null 2>&1
+$D run -d --name m15-stick --restart unless-stopped --device "$ZBT_NAME" alpine:3.21 sleep infinity >/dev/null \
+	|| fail "a container naming $ZBT_NAME did not start"
 "$LIGHTER" stop >/dev/null 2>&1
 if wait_for 10 macos_has /dev/cu.usbmodemE072A1D9E0CC1 && wait_for 10 macos_has /dev/cu.usbserial-210; then
 	pass "stopped: macOS has both devices back"
@@ -190,6 +197,10 @@ fi
 "$LIGHTER" start >"$LIGHTER_HOME/start.log" 2>&1 &
 for _ in $(seq 1 90); do $D info >/dev/null 2>&1 && break; sleep 1; done
 wait_for 30 has_name "$ZBT_NAME" && wait_for 10 has_name "$TR_NAME" && pass "started: both attached again" || fail "after start: $(guest_names | xargs)"
+state="$($D inspect m15-stick --format '{{.State.Status}} {{.State.Error}}' 2>&1)"
+[ "${state%% *}" = running ] && pass "a restart-policy container naming the stick came back by itself ($(grep -ao 'usb-expect 303a:831a [a-z ]*after=[0-9]*ms' "$LIGHTER_HOME/machine.log" | tail -1))" \
+	|| fail "a restart-policy container naming the stick did not come back: $state"
+$D rm -f m15-stick >/dev/null 2>&1
 
 echo "==> A machine killed holding them gives them back"
 pid="$(cat "$LIGHTER_HOME/lighter.pid" 2>/dev/null)"
