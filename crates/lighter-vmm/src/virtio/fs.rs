@@ -810,7 +810,10 @@ impl VirtioDevice for Fs {
                     // goes to the pool, so concurrency the guest offers is
                     // kept rather than flattened.
                     let alone = queue.is_empty() && !requests.more_available(mem);
-                    if self.inline.applies(alone) {
+                    // And only on a volume known to be this Mac's: a request
+                    // on a network volume waits for its server, and here
+                    // that stops a CPU of the guest's (lighter_fs::Local).
+                    if self.inline.applies(alone) && !self.server.may_block(&request) {
                         let mut sink = ChainSink::new(memory.clone(), reply);
                         let written = self.server.dispatch(&request, &mut sink);
                         requests.push_used(mem, head, written as u32);

@@ -68,11 +68,16 @@ SMB_D="$HOME/.lighter-gate-smb-d-$$"
 SMB_T="$HOME/.lighter-gate-smb-t-$$"
 
 cleanup() {
-	[ "$FAILED" = 0 ] || cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m16-machine.log" 2>/dev/null || true
+	# By the exit status too: judge records a failure in its pipeline's
+	# subshell, where FAILED does not reach this.
+	local status=$?
+	{ [ "$FAILED" = 0 ] && [ "$status" = 0 ]; } || cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m16-machine.log" 2>/dev/null || true
+	# Unpaused first: unmounting a share whose server is paused hangs.
+	docker unpause lighter-gate-smb >/dev/null 2>&1 || true
 	umount "$SMB_D" 2>/dev/null || true
 	umount "$SMB_T" 2>/dev/null || true
 	rmdir "$SMB_D" "$SMB_T" 2>/dev/null || true
-	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb >/dev/null 2>&1 || true
+	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-reader lighter-gate-ticker >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	detach "$APFS"
 	detach "$EXFAT"
@@ -238,6 +243,32 @@ else
 	if mount_smbfs "//lt:lt@localhost/d" "$SMB_D" 2>"$SCRATCH/smb.err" \
 		&& mount_smbfs "//lt:lt@localhost/t" "$SMB_T" 2>>"$SCRATCH/smb.err"; then
 		metadata "$SMB_D" "$SMB_T" | judge "SMB"
+		# A network volume that stops answering stops only what touches
+		# it. Served on the vCPU that asked, a request on it stopped that
+		# CPU for as long: a NAS that hung for 48 s froze three of the
+		# guest's CPUs, one for 40, and the guest logged RCU stalls.
+		docker run -d --name lighter-gate-smb-reader -v "$SMB_D:/m" "$IMAGE" sh -c \
+			'while true; do ls /m >/dev/null 2>&1; cat /m/meta.txt >/dev/null 2>&1; sleep 0.1; done' >/dev/null
+		docker run -d --name lighter-gate-ticker "$PYTHON" python3 -c '
+import os, threading, time
+n = os.cpu_count(); worst = [0.0] * n; stop = time.time() + 35
+def tick(cpu):
+    os.sched_setaffinity(0, {cpu}); last = time.monotonic()
+    while time.time() < stop:
+        time.sleep(0.05); now = time.monotonic(); worst[cpu] = max(worst[cpu], now - last); last = now
+ts = [threading.Thread(target=tick, args=(c,)) for c in range(n)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print("%.2f" % max(worst))' >/dev/null
+		sleep 5
+		docker pause lighter-gate-smb >/dev/null
+		sleep 20
+		docker unpause lighter-gate-smb >/dev/null
+		docker wait lighter-gate-ticker >/dev/null
+		gap="$(docker logs lighter-gate-ticker 2>&1 | tail -1)"
+		docker rm -f lighter-gate-ticker lighter-gate-smb-reader >/dev/null
+		awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
+			&& pass "SMB: the server hung for 20 s, and no guest CPU stopped (longest gap ${gap} s)" \
+			|| fail "SMB: with the server hung, a guest CPU stopped for ${gap:-?} s"
 		umount "$SMB_D"; umount "$SMB_T"
 	else
 		fail "could not mount the shares: $(cat "$SCRATCH/smb.err")"
