@@ -37,6 +37,10 @@ mod code {
     pub const INC_EPOCH: i32 = 8;
 }
 
+/// `FUSE_EXPIRE_ONLY` in `fuse_notify_inval_entry_out.flags` (FUSE 7.38,
+/// `include/uapi/linux/fuse.h`).
+const EXPIRE_ONLY: u32 = 1 << 0;
+
 /// How many messages may wait for the guest to supply buffers.
 ///
 /// Generous, because a `git checkout` on the host produces a burst and the
@@ -55,10 +59,19 @@ pub enum Notification {
     /// A name in a directory: it may have appeared, vanished, or come to mean
     /// a different file. `event` is what a watcher in the guest should be
     /// told, if anything.
+    ///
+    /// `expire_only` sends `FUSE_EXPIRE_ONLY`: the guest marks the name stale
+    /// so its next use is revalidated with a LOOKUP, but does not
+    /// `d_invalidate()` the dentry. Without it the guest drops the dentry and
+    /// detaches every mount at or under it, which a container's bind mounts
+    /// are. Set it whenever the name still exists on the host: a LOOKUP then
+    /// settles whether it is the same file, and the guest invalidates it
+    /// itself if not.
     Entry {
         parent: u64,
         name: Vec<u8>,
         event: Option<Event>,
+        expire_only: bool,
     },
     /// A file's contents or attributes.
     Inode { nodeid: u64 },
@@ -107,10 +120,12 @@ impl Notification {
                 parent,
                 name,
                 event,
+                expire_only,
             } => {
                 body.extend_from_slice(&parent.to_le_bytes());
                 body.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                body.extend_from_slice(&0u32.to_le_bytes()); // flags
+                let flags = if *expire_only { EXPIRE_ONLY } else { 0 };
+                body.extend_from_slice(&flags.to_le_bytes());
                 body.extend_from_slice(name);
                 // The guest requires the terminator and checks for it; without
                 // one it drops the message rather than reading past the name.
@@ -254,6 +269,7 @@ mod tests {
             parent: 7,
             name: b"README.md".to_vec(),
             event: None,
+            expire_only: false,
         }
         .encode();
 
@@ -282,6 +298,7 @@ mod tests {
                 parent: 7,
                 name: b"a".to_vec(),
                 event,
+                expire_only: false,
             }
             .encode();
             assert_eq!(bytes.len(), 16 + 16 + 2 + 16);
@@ -308,6 +325,24 @@ mod tests {
             })),
             (0, trailer::KNOWN | raise::DELETE | trailer::DIR)
         );
+    }
+
+    /// The flag word of an entry notification is what decides whether the
+    /// guest calls `d_invalidate()` (and so detaches mounts).
+    #[test]
+    fn an_entry_notification_can_ask_to_expire_only() {
+        let flags = |expire_only| {
+            let bytes = Notification::Entry {
+                parent: 7,
+                name: b"a".to_vec(),
+                event: None,
+                expire_only,
+            }
+            .encode();
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap())
+        };
+        assert_eq!(flags(false), 0);
+        assert_eq!(flags(true), 1);
     }
 
     #[test]

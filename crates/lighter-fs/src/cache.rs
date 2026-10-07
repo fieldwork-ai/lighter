@@ -412,6 +412,13 @@ impl crate::fsevents::Observer for Invalidator {
             return;
         };
         self.policy.touched(dev, ino);
+        // The guest's default for this notification is `d_invalidate()`, which
+        // detaches every mount at or under the dentry. A container's bind
+        // mounts are such mounts, and the server cannot see them, so a name
+        // that still exists is only expired: the guest revalidates it with a
+        // LOOKUP on next use and drops it itself if it turned out to be
+        // another file. Only a name that is gone is invalidated outright.
+        let expire_only = now.is_some();
         // A directory the guest has never looked at has nothing cached about
         // it, so there is nothing to withdraw.
         if let Some(nodeid) = self.registry.nodeid_for(dev, ino) {
@@ -420,6 +427,7 @@ impl crate::fsevents::Observer for Invalidator {
                 parent: nodeid,
                 name: name.as_bytes().to_vec(),
                 event: self.event(nodeid, name.as_bytes(), now, flags),
+                expire_only,
             });
         }
     }
@@ -582,5 +590,68 @@ mod tests {
         };
         assert!(!off.caching());
         assert!(Timings::default().caching());
+    }
+
+    /// What the guest is told about a name, as the flags of the one entry
+    /// notification (`fuse_notify_inval_entry_out.flags`) the change produced.
+    fn entry_flags(path: &Path, flags: u32, root: &Path, dir_gone: bool) -> Vec<u32> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let fd = crate::sys::open_root(root).unwrap();
+        let st = crate::sys::stat_fd(fd.as_raw_fd()).unwrap();
+        let registry = Arc::new(crate::inode::Registry::new(fd, st.st_dev as i64, st.st_ino));
+        let child = path.to_path_buf();
+        if !dir_gone {
+            let meta = std::fs::symlink_metadata(&child).unwrap();
+            let cfd = crate::sys::open_path(&child, 0, 0).unwrap();
+            registry.insert(cfd, meta.dev() as i64, meta.ino(), meta.is_dir(), false);
+        }
+        let sink = Arc::new(crate::notify::Sink::new());
+        let invalidator = Invalidator::new(root, Arc::new(policy(0)), registry, sink.clone());
+        crate::fsevents::Observer::changed(&invalidator, path, flags);
+        let mut out = Vec::new();
+        while let Some(m) = sink.take() {
+            if i32::from_le_bytes(m[4..8].try_into().unwrap()) == 3 {
+                out.push(u32::from_le_bytes(m[28..32].try_into().unwrap()));
+            }
+        }
+        out
+    }
+
+    /// Nested bind mounts in the guest sit on dentries of this tree, and the
+    /// guest detaches them when it is told to `d_invalidate()` such a dentry.
+    /// A name that still exists must only be expired.
+    #[test]
+    fn a_name_that_still_exists_is_only_expired_in_the_guest() {
+        use crate::fsevents::flag;
+        let root =
+            std::env::temp_dir().join(format!("lighter-cache-expire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        // touch / xattr of a directory (a mountpoint, or above one)
+        for f in [
+            flag::ITEM_INODE_META_MOD | flag::ITEM_IS_DIR,
+            flag::ITEM_XATTR_MOD | flag::ITEM_IS_DIR,
+            flag::ITEM_CREATED | flag::ITEM_IS_DIR,
+        ] {
+            assert_eq!(
+                entry_flags(&root.join("d"), f, &root, false),
+                vec![1],
+                "{f:#x}"
+            );
+        }
+        // a name that is gone is invalidated outright, as before
+        std::fs::remove_dir(root.join("d")).unwrap();
+        for f in [
+            flag::ITEM_REMOVED | flag::ITEM_IS_DIR,
+            flag::ITEM_RENAMED | flag::ITEM_IS_DIR,
+        ] {
+            assert_eq!(
+                entry_flags(&root.join("d"), f, &root, true),
+                vec![0],
+                "{f:#x}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
