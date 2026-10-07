@@ -402,6 +402,46 @@ code="$($D run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --m
 [ "$code" = 200 ] && pass "egress works after the restart" || fail "egress after the restart: http_code=${code:-none}"
 "$LIGHTER" status 2>/dev/null | grep -q "restarted: tcp-proxy=1" && pass "lighter status reports the restart" || fail "lighter status: $("$LIGHTER" status 2>&1 | grep -i agents || echo 'no agents line')"
 
+echo "==> A stream its server resets is let go (#63)"
+# The Mac's end of a joined stream that its server reset reports only RDHUP;
+# each such stream kept two descriptors until the proxy ran out of them.
+proxy_fds() { guest_sh 'for p in $(pidof lighter-agent); do grep -q -- --tcp-proxy /proc/$p/cmdline && ls /proc/$p/fd | wc -l; done' | head -1; }
+python3 - <<'PY' &
+import socket, struct, threading
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 18097)); srv.listen(128)
+def serve(c):
+    try:
+        if c.recv(1) == b"P": c.sendall(b"P")
+        c.recv(1)
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    finally:
+        c.close()
+while True:
+    c, _ = srv.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+RESET_PID=$!
+sleep 1
+before="$(proxy_fds)"
+done_n="$($D run --rm node:24-alpine node -e '
+const net = require("net");
+let n = 0;
+function one() {
+  if (n === 32) { console.log(n); return; }
+  const s = net.connect(18097, "'"$LAN_IP"'", () => s.write("P"));
+  s.once("data", () => s.write("X"));
+  s.on("error", () => {}); s.on("close", () => { n++; one(); });
+}
+one();' 2>/dev/null)"
+sleep 2
+after="$(proxy_fds)"
+kill "$RESET_PID" 2>/dev/null
+if [ "$done_n" = 32 ] && [ -n "$before" ] && [ "$after" = "$before" ]; then
+	pass "32 streams their server reset left no descriptor behind ($before before and after)"
+else
+	fail "after ${done_n:-0} reset streams the proxy holds ${after:-?} descriptors, ${before:-?} before"
+fi
+
 # Streams in their thousands on every route: containers' connections out,
 # the Mac's in through a published port, and `docker logs -f` through the
 # Docker socket. Every connection is held open, the three agents' thread
