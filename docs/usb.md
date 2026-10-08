@@ -62,6 +62,8 @@ To release the stick back to macOS at any time, run `lighter usb detach 303a:831
 
 ## 3. Run Zigbee2MQTT and Home Assistant
 
+*Setting up Home Assistant from scratch? Start with [Home Assistant on your Mac](home-assistant.md), which puts it on your network so it discovers your devices.*
+
 Here is a ready-to-run Docker Compose stack with Mosquitto (MQTT broker), Zigbee2MQTT, and Home Assistant. Create a new directory and save the following three files:
 
 ### `compose.yaml`
