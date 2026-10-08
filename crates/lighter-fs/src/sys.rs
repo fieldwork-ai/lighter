@@ -357,18 +357,26 @@ pub fn openat_path(parent: RawFd, name: &CStr, linux_flags: u32, mode: u32) -> R
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// arm64 Linux uses the `asm-generic` numbering; macOS uses its own. The two
+/// The guest's open flags, in arm64 Linux's numbering: the guest kernel is
+/// arm64 whatever a container's own architecture (Rosetta translates an amd64
+/// process's calls). arm64 keeps four flags of its own, where x86-64 uses the
+/// `asm-generic` values: read as x86's, an `O_DIRECT` open was an
+/// `O_DIRECTORY` one, which macOS refuses, and MariaDB could not create a
+/// table on a shared folder (issue #69). macOS uses its own numbering; the two
 /// agree only on the access mode in the low two bits.
-const LINUX_O_CREAT: u32 = 0o100;
-const LINUX_O_EXCL: u32 = 0o200;
+pub const LINUX_O_CREAT: u32 = 0o100;
+pub const LINUX_O_EXCL: u32 = 0o200;
 const LINUX_O_NOCTTY: u32 = 0o400;
 const LINUX_O_TRUNC: u32 = 0o1000;
-const LINUX_O_APPEND: u32 = 0o2000;
+pub const LINUX_O_APPEND: u32 = 0o2000;
 const LINUX_O_NONBLOCK: u32 = 0o4000;
 const LINUX_O_DSYNC: u32 = 0o10000;
-const LINUX_O_DIRECT: u32 = 0o40000;
-const LINUX_O_DIRECTORY: u32 = 0o200000;
-pub const LINUX_O_NOFOLLOW: u32 = 0o400000;
+pub const LINUX_O_DIRECTORY: u32 = 0o40000;
+pub const LINUX_O_NOFOLLOW: u32 = 0o100000;
+const LINUX_O_DIRECT: u32 = 0o200000;
+/// Set by the kernel on every open; macOS files are always large.
+#[cfg(test)]
+const LINUX_O_LARGEFILE: u32 = 0o400000;
 const LINUX_O_SYNC: u32 = 0o4010000;
 
 /// Rewrites guest open flags into host ones.
@@ -475,7 +483,19 @@ pub fn rename_at(
         // SAFETY: same, and `renameatx_np` takes exactly these arguments.
         unsafe { renameatx_np(old_parent, old.as_ptr(), new_parent, new.as_ptr(), host) }
     };
-    check(rc).map(|_| ())
+    match check(rc) {
+        // exFAT and FAT cannot refuse to replace, where Linux's own drivers
+        // can: there the kernel looks for the target itself, and so do we.
+        // The server holds both names, so no request of the guest's can come
+        // between the look and the rename; only the Mac could.
+        Err(errno) if errno == errno::linux::EOPNOTSUPP && host == RENAME_EXCL => {
+            if stat_at(new_parent, new).is_ok() {
+                return Err(errno::linux::EEXIST);
+            }
+            rename_at(old_parent, old, new_parent, new, 0)
+        }
+        other => other.map(|_| ()),
+    }
 }
 
 pub fn readlink_at(parent: RawFd, name: &CStr) -> Result<Vec<u8>> {
@@ -655,6 +675,46 @@ pub fn statfs(path: &Path) -> Result<libc::statfs> {
     // SAFETY: valid path, owned output buffer.
     check(unsafe { libc::statfs(c.as_ptr(), &mut st) })?;
     Ok(st)
+}
+
+/// Whether `fd`'s volume keeps permission bits: exFAT and FAT keep none, and
+/// report every file as its user's, `rwx------`, whatever was set. `None` if
+/// the volume cannot say.
+pub fn keeps_permissions(fd: RawFd) -> Option<bool> {
+    #[repr(C, packed(4))]
+    struct Reply {
+        length: u32,
+        capabilities: libc::vol_capabilities_attr_t,
+    }
+    let mut list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // SAFETY: zero is a valid bit pattern for the reply, which is ours.
+    let mut reply: Reply = unsafe { std::mem::zeroed() };
+    // SAFETY: a live descriptor, a well-formed attribute list, and a buffer of
+    // the size passed.
+    let r = unsafe {
+        libc::fgetattrlist(
+            fd,
+            (&raw mut list).cast(),
+            (&raw mut reply).cast(),
+            std::mem::size_of::<Reply>(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let format = libc::VOL_CAPABILITIES_FORMAT;
+    let capabilities = reply.capabilities;
+    let flag = libc::VOL_CAP_FMT_NO_PERMISSIONS;
+    (capabilities.valid[format] & flag != 0).then(|| capabilities.capabilities[format] & flag == 0)
 }
 
 /// Linux `SEEK_DATA` is 3 and `SEEK_HOLE` is 4. macOS has them the other way
@@ -1019,8 +1079,26 @@ mod tests {
     /// same bit means something else here.
     #[test]
     fn flags_macos_lacks_are_dropped() {
-        let host = translate_open_flags(LINUX_O_DIRECT | 0o100000 /* O_LARGEFILE */);
+        let host = translate_open_flags(LINUX_O_DIRECT | LINUX_O_LARGEFILE);
         assert_eq!(host, libc::O_RDONLY);
+    }
+
+    /// The numbers an arm64 guest sends, as its own headers spell them.
+    #[test]
+    fn the_guest_flags_are_arm64s() {
+        assert_eq!(
+            (
+                LINUX_O_DIRECTORY,
+                LINUX_O_NOFOLLOW,
+                LINUX_O_DIRECT,
+                LINUX_O_LARGEFILE
+            ),
+            (0o40000, 0o100000, 0o200000, 0o400000)
+        );
+        // MariaDB's create (issue #69): an exclusive create that is not a
+        // directory.
+        let host = translate_open_flags(LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_DIRECT | 2);
+        assert_eq!(host & libc::O_DIRECTORY, 0);
     }
 
     #[test]

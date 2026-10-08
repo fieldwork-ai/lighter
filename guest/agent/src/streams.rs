@@ -894,6 +894,15 @@ impl Conn {
     /// seen, and its own sent by the kernel behind the redirected bytes. HUP
     /// on both means neither backlog holds anything. An error on either is an
     /// abort, and the other side is closed with whatever it has.
+    ///
+    /// A Mac end that was reset (its server reset the connection) is the one
+    /// end this cannot see: the vsock reports only RDHUP, its own direction
+    /// never shut, and the pair was kept forever (issue #63: 32,749 of them,
+    /// until the proxy ran out of descriptors). Once the TCP end has HUP,
+    /// nothing more comes from it and its FIN went out behind every byte for
+    /// the container; what is left is whether the Mac can still take bytes,
+    /// which only a write can ask. A Mac end that merely stopped sending can,
+    /// and keeps the pair until the container's end has reached it.
     fn joined(&mut self) -> Option<Step> {
         let b = self.b.as_ref()?.as_raw_fd();
         let r = poll_now(&[self.a.as_raw_fd(), b], libc::POLLRDHUP);
@@ -901,6 +910,10 @@ impl Conn {
             return Some(Step::Close);
         }
         if r[0] & libc::POLLHUP != 0 && r[1] & libc::POLLHUP != 0 {
+            return Some(Step::Close);
+        }
+        let ((tcp, mac), mac_fd) = if self.a_tcp { ((r[0], r[1]), b) } else { ((r[1], r[0]), self.a.as_raw_fd()) };
+        if tcp & libc::POLLHUP != 0 && mac & libc::POLLRDHUP != 0 && takes_no_writes(mac_fd) {
             return Some(Step::Close);
         }
         None
@@ -1252,6 +1265,25 @@ fn poll_now<const N: usize>(fds: &[RawFd; N], events: libc::c_short) -> [libc::c
     p.map(|p| p.revents)
 }
 
+/// Whether a socket would refuse a write, asked with a write of nothing: no
+/// byte reaches its stream and its own direction is not shut, either of which
+/// would overtake what a sockmap backlog still holds for it.
+fn takes_no_writes(fd: RawFd) -> bool {
+    loop {
+        // SAFETY: a live socket and an empty buffer. MSG_NOSIGNAL makes a
+        // refused write an error rather than the process's SIGPIPE.
+        let n = unsafe { libc::send(fd, std::ptr::null(), 0, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        if n >= 0 {
+            return false;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EPIPE | libc::ENOTCONN | libc::ECONNRESET) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Whether a non-blocking connect has finished: None while it is still in
 /// progress.
 fn connect_result(fd: RawFd) -> Option<io::Result<()>> {
@@ -1414,6 +1446,50 @@ fn take_queued(from: RawFd) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe the joined path asks a Mac end with: a peer that stopped
+    /// sending still reads, and nothing reaches it; one that stopped
+    /// reading refuses.
+    #[test]
+    fn a_write_of_nothing_asks_whether_the_peer_still_reads() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(!takes_no_writes(ours.as_raw_fd()), "it stopped sending, not reading");
+        theirs.set_nonblocking(true).unwrap();
+        assert_eq!(
+            theirs.read(&mut [0u8; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "and the probe put nothing in its stream"
+        );
+        theirs.shutdown(std::net::Shutdown::Read).unwrap();
+        assert!(takes_no_writes(ours.as_raw_fd()), "it stopped reading");
+    }
+
+    /// A joined pair whose container end is done is released once the Mac
+    /// end can take nothing more (issue #63), and not while it still can.
+    #[test]
+    fn a_joined_pair_is_released_when_the_mac_end_was_reset() {
+        use std::os::unix::net::UnixStream;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let container = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (a, _) = l.accept().unwrap();
+        container.shutdown(std::net::Shutdown::Write).unwrap();
+        a.shutdown(std::net::Shutdown::Write).unwrap();
+        let started = Instant::now();
+        while poll_now(&[a.as_raw_fd()], libc::POLLRDHUP)[0] & libc::POLLHUP == 0 {
+            assert!(started.elapsed() < Duration::from_secs(2), "the TCP end must reach HUP");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (b, mac) = UnixStream::pair().unwrap();
+        let mut conn = Conn::new(a.into(), true, State::Joined, Instant::now());
+        conn.b = Some(b.into());
+        mac.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(conn.joined().is_none(), "the Mac still reads what the container sent");
+        mac.shutdown(std::net::Shutdown::Read).unwrap();
+        assert!(matches!(conn.joined(), Some(Step::Close)), "the Mac end is gone");
+    }
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};

@@ -420,6 +420,7 @@ impl crate::fsevents::Observer for Invalidator {
                 parent: nodeid,
                 name: name.as_bytes().to_vec(),
                 event: self.event(nodeid, name.as_bytes(), now, flags),
+                gone: now.is_none(),
             });
         }
     }
@@ -459,6 +460,48 @@ mod tests {
         registry.insert(app, at.st_dev as i64, at.st_ino, true, false);
         invalidator.changed(&root.join("app/cache/tmp123"), flag::ITEM_CREATED);
         assert!(!sink.is_empty(), "a directory the guest knows hears of it");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A change to a name that still exists only expires the guest's entry
+    /// for it; invalidating it would detach every mount at or under it
+    /// (issue #70). A name that is gone is withdrawn at once.
+    #[test]
+    fn only_a_name_that_is_gone_is_withdrawn_at_once() {
+        use crate::fsevents::{Observer, flag};
+        use std::os::fd::AsRawFd;
+        let scratch =
+            std::env::temp_dir().join(format!("lighter-cache-expire-{}", std::process::id()));
+        std::fs::create_dir_all(scratch.join("mountpoint")).unwrap();
+        let root = scratch.canonicalize().unwrap();
+        let fd = crate::sys::open_root(&root).unwrap();
+        let st = crate::sys::stat_fd(fd.as_raw_fd()).unwrap();
+        let registry = Arc::new(crate::inode::Registry::new(fd, st.st_dev as i64, st.st_ino));
+        let sink = Arc::new(crate::notify::Sink::new());
+        let policy = Arc::new(Policy::new(Timings::POLLED, Timings::PUSHED));
+        let invalidator = Invalidator::new(&root, policy, registry, sink.clone());
+        // The flags of the entry notifications the sink holds.
+        let entry_flags = || {
+            let mut flags = Vec::new();
+            while let Some(bytes) = sink.take() {
+                if i32::from_le_bytes(bytes[4..8].try_into().unwrap()) == 3 {
+                    flags.push(u32::from_le_bytes(bytes[28..32].try_into().unwrap()));
+                }
+            }
+            flags
+        };
+
+        invalidator.changed(
+            &root.join("mountpoint"),
+            flag::ITEM_INODE_META_MOD | flag::ITEM_IS_DIR,
+        );
+        assert_eq!(entry_flags(), [1], "touched: expired only");
+        std::fs::remove_dir(root.join("mountpoint")).unwrap();
+        invalidator.changed(
+            &root.join("mountpoint"),
+            flag::ITEM_REMOVED | flag::ITEM_IS_DIR,
+        );
+        assert_eq!(entry_flags(), [0], "removed: withdrawn");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

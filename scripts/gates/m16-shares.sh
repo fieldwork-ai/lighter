@@ -79,7 +79,7 @@ cleanup() {
 	umount "$SMB_D" 2>/dev/null || true
 	umount "$SMB_T" 2>/dev/null || true
 	rmdir "$SMB_D" "$SMB_T" 2>/dev/null || true
-	docker rm -f lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-reader lighter-gate-ticker lighter-gate-local >/dev/null 2>&1 || true
+	docker rm -f lighter-gate-nested lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-reader lighter-gate-ticker lighter-gate-local >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	detach "$APFS"
 	detach "$EXFAT"
@@ -323,6 +323,88 @@ for volume in "$APFS" "$EXFAT"; do
 		|| fail "$volume: the container still reads: ${seen:-nothing}"
 	docker rm -f lighter-gate-reader >/dev/null
 done
+
+echo
+echo "==> What a database does on a drive (#69)"
+# InnoDB opens its files O_DIRECT and preallocates them at once; ClickHouse
+# writes its metadata with a rename that must not replace (renameat2 is 276).
+for volume in "$APFS" "$EXFAT"; do
+	got="$(docker run --rm -v "/Volumes/$volume:/d" "$PYTHON" python3 -c '
+import ctypes, os
+fd = os.open("/d/ibdata1", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_DIRECT, 0o660)
+os.posix_fallocate(fd, 0, 12 << 20)
+print("size", os.fstat(fd).st_size)
+libc = ctypes.CDLL(None, use_errno=True)
+def rename_noreplace(a, b):
+    return libc.syscall(276, -100, a.encode(), -100, b.encode(), 1) == 0 or ctypes.get_errno()
+open("/d/meta.tmp", "w").write("x")
+print("noreplace", rename_noreplace("/d/meta.tmp", "/d/meta"))
+open("/d/meta2.tmp", "w").write("y")
+print("onto", rename_noreplace("/d/meta2.tmp", "/d/meta"))
+' 2>&1 | xargs || true)"
+	[ "$got" = "size 12582912 noreplace True onto 17" ] \
+		&& pass "$volume: an O_DIRECT file is created and preallocated; a rename that must not replace does not" \
+		|| fail "$volume: $got"
+	rm -f "/Volumes/$volume/ibdata1" "/Volumes/$volume/meta" "/Volumes/$volume/meta2.tmp"
+done
+# exFAT keeps no permissions: a container's chmod is kept in its record. The
+# shape of Borg Backup Server's start: a directory for one service user inside
+# one owned by another, reached by the first.
+got="$(docker run --rm -v "/Volumes/$EXFAT:/d" "$PYTHON" python3 -c '
+import os
+os.makedirs("/d/srv/db")
+os.chown("/d/srv", 33, 33); os.chmod("/d/srv", 0o755)
+os.chown("/d/srv/db", 100, 101); os.chmod("/d/srv/db", 0o700)
+pid = os.fork()
+if pid == 0:
+    os.setgid(101); os.setuid(100)
+    try:
+        open("/d/srv/db/aria_log_control", "w").write("x")
+        os._exit(0)
+    except OSError as e:
+        print(e); os._exit(1)
+_, status = os.waitpid(pid, 0)
+print(oct(os.stat("/d/srv").st_mode & 0o777), oct(os.stat("/d/srv/db").st_mode & 0o777), os.waitstatus_to_exitcode(status))
+' 2>&1 | xargs || true)"
+[ "$got" = "0o755 0o700 0" ] && pass "exFAT: a chmod is kept, and a service user reaches its own directory" || fail "exFAT permissions: $got"
+again="$(docker run --rm -v "/Volumes/$EXFAT:/d" "$IMAGE" stat -c '%a %u' /d/srv /d/srv/db 2>&1 | xargs || true)"
+[ "$again" = "755 33 700 100" ] && pass "exFAT: and another container sees it" || fail "exFAT, another container: $again"
+rm -rf "/Volumes/$EXFAT/srv"
+
+echo
+echo "==> A container's nested mounts outlive a change on the Mac (#70)"
+NEST="$SCRATCH/nested"
+mkdir -p "$NEST/sess/x/repo" "$NEST/repo"
+echo hello > "$NEST/repo/hello.txt"
+docker run -d --name lighter-gate-nested -v "$NEST/sess:/w" -v "$NEST/repo:/w/x/repo:ro" "$IMAGE" sleep 600 >/dev/null
+docker exec lighter-gate-nested cat /w/x/repo/hello.txt >/dev/null
+touch "$NEST/sess/x/repo" "$NEST/sess/x"
+xattr -w sh.lighter.gate 1 "$NEST/sess/x"
+sleep 2
+got="$(docker exec lighter-gate-nested sh -c 'grep -c " /w/x/repo " /proc/self/mountinfo; cat /w/x/repo/hello.txt' 2>&1 | xargs || true)"
+[ "$got" = "1 hello" ] && pass "the Mac touched and tagged the directories a mount sits in, and it is still there" \
+	|| fail "after the Mac touched the directories a mount sits in: $got"
+echo gone > "$NEST/sess/x/after.txt"
+rm -rf "$NEST/sess/x/after.txt"
+mkdir "$NEST/sess/fresh"
+sleep 1.5
+got="$(docker exec lighter-gate-nested sh -c 'test -e /w/x/after.txt && echo stale || echo gone; test -d /w/fresh && echo seen' 2>&1 | xargs || true)"
+[ "$got" = "gone seen" ] && pass "and names the Mac removed and made are seen as such" || fail "names after the touch: $got"
+docker rm -f lighter-gate-nested >/dev/null
+
+echo
+echo "==> Owners and modes outlive a restart"
+# The shares' roots (/Users, /Volumes) are root's, so nothing marks them as
+# holding records; until 0.12.4 every recorded owner read as root after a
+# restart, until the next chown.
+mkdir -p "$SCRATCH/owned/pg" "/Volumes/$EXFAT/kept"
+docker run --rm -v "$SCRATCH/owned:/h" -v "/Volumes/$EXFAT:/d" "$IMAGE" sh -c \
+	'chown 999:999 /h/pg && chown 100:101 /d/kept && chmod 751 /d/kept' >/dev/null
+"$LIGHTER" restart >/dev/null 2>&1
+got="$(docker run --rm -v "$SCRATCH/owned:/h" -v "/Volumes/$EXFAT:/d" "$IMAGE" stat -c '%u:%g %a' /h/pg /d/kept 2>&1 | xargs || true)"
+[ "$got" = "999:999 755 100:101 751" ] && pass "after a restart: a home-folder owner, and an exFAT owner and mode" \
+	|| fail "after a restart: $got (want 999:999 755 100:101 751)"
+rm -rf "/Volumes/$EXFAT/kept"
 
 echo
 echo "==> Ejecting while the machine runs"

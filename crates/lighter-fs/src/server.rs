@@ -37,7 +37,10 @@ use crate::fuse::{self, Attr, EntryOut, InHeader, get_name, get_u32, get_u64, op
 use crate::inode::{Inode, Located, OpenDir, OpenFile, Reference, Registry};
 use crate::opencache::OpenCache;
 use crate::stats::Stats;
-use crate::sys::{self, TimeSpec};
+use crate::sys::{
+    self, LINUX_O_APPEND, LINUX_O_CREAT, LINUX_O_DIRECTORY, LINUX_O_EXCL, LINUX_O_NOFOLLOW,
+    TimeSpec,
+};
 
 /// The largest write we accept in one request, and the readahead we permit.
 ///
@@ -267,9 +270,6 @@ fn create_job(
     } = held;
     let keys = crate::apply::Keys::of(&[parent.id(), nodeid]);
     let job = move || {
-        const LINUX_O_CREAT: u32 = 0o100;
-        const LINUX_O_EXCL: u32 = 0o200;
-        const LINUX_O_NOFOLLOW: u32 = 0o400000;
         if inode.is_cancelled() {
             // Replaced before it existed; nothing to make.
             inode.bind_failed(linux::ENOENT);
@@ -503,7 +503,7 @@ struct Hold {
     registry: Arc<Registry>,
     open_cache: Arc<OpenCache>,
     volfs: Arc<Volfs>,
-    local: Arc<Local>,
+    volumes: Arc<Volumes>,
 }
 
 /// Which volumes serve `/.vol/<dev>/<ino>`, by device.
@@ -562,19 +562,34 @@ impl Volfs {
     }
 }
 
-/// Which volumes are on this Mac, by device: a request is served on the
-/// vCPU that asked for it only when its volume is known to be (see
-/// [`Server::may_block`]). A request on a network volume (SMB, NFS, AFP,
-/// WebDAV) waits for the server at the other end, and served on a vCPU it
-/// stopped that CPU for as long: a NAS that hung for 48 seconds froze three
-/// of the guest's CPUs, one for 40, and the guest logged RCU stalls. On a
-/// worker, the same hang stalls only the requests that touch that volume.
+/// What the share's volumes are, by device, learned once each.
 #[derive(Default)]
-struct Local(std::sync::RwLock<std::collections::HashMap<i64, bool>>);
+struct Volumes(std::sync::RwLock<std::collections::HashMap<i64, Volume>>);
 
-impl Local {
-    fn known(&self, dev: i64) -> Option<bool> {
-        self.0.read().expect("local poisoned").get(&dev).copied()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Volume {
+    /// On this Mac: a request is served on the vCPU that asked for it only
+    /// when its volume is known to be (see [`Server::may_block`]). A request
+    /// on a network volume (SMB, NFS, AFP, WebDAV) waits for the server at
+    /// the other end, and served on a vCPU it stopped that CPU for as long: a
+    /// NAS that hung for 48 seconds froze three of the guest's CPUs, one for
+    /// 40, and the guest logged RCU stalls. On a worker, the same hang stalls
+    /// only the requests that touch that volume.
+    local: bool,
+    /// Keeps permission bits. On a volume that does not (exFAT, FAT) a
+    /// container's chmod is kept in its ownership record (issue #69).
+    permissions: bool,
+}
+
+impl Volumes {
+    fn known(&self, dev: i64) -> Option<Volume> {
+        self.0.read().expect("volumes poisoned").get(&dev).copied()
+    }
+
+    /// Whether `dev` keeps permission bits; a volume not yet learned is
+    /// taken to, as every volume once was.
+    fn keeps_permissions(&self, dev: i64) -> bool {
+        self.known(dev).is_none_or(|volume| volume.permissions)
     }
 
     /// Learns from `fd`'s volume. Never on a vCPU: asked of a hung network
@@ -583,21 +598,27 @@ impl Local {
         // SAFETY: fstatfs fills the zeroed struct for an open descriptor.
         let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatfs(fd, &mut fs) } == 0 {
-            let local = fs.f_flags & libc::MNT_LOCAL as u32 != 0;
-            self.0.write().expect("local poisoned").insert(dev, local);
+            let volume = Volume {
+                local: fs.f_flags & libc::MNT_LOCAL as u32 != 0,
+                permissions: sys::keeps_permissions(fd).unwrap_or(true),
+            };
+            self.0
+                .write()
+                .expect("volumes poisoned")
+                .insert(dev, volume);
         }
     }
 
     /// Forgets a volume: macOS gives the next one mounted the same number.
     fn forget(&self, dev: i64) {
-        self.0.write().expect("local poisoned").remove(&dev);
+        self.0.write().expect("volumes poisoned").remove(&dev);
     }
 }
 
 impl crate::inode::Release for Hold {
     fn release_device(&self, dev: i64) -> usize {
         self.volfs.forget(dev);
-        self.local.forget(dev);
+        self.volumes.forget(dev);
         let inodes = self
             .registry
             .release_device(dev, |id| self.open_cache.evict(id));
@@ -620,8 +641,8 @@ pub struct Server {
     max_write: AtomicU32,
     /// Which of the share's volumes serve `/.vol` identity paths.
     volfs: Arc<Volfs>,
-    /// Which of the share's volumes are on this Mac.
-    local: Arc<Local>,
+    /// What each of the share's volumes is.
+    volumes: Arc<Volumes>,
     /// How many more requests to log in order. See [`Server::trace`].
     trace_left: AtomicUsize,
     /// How long the guest may believe what we tell it.
@@ -667,7 +688,10 @@ pub struct Server {
     /// disclaims them, see `dispatch`).
     xattrs: bool,
     /// Whether anything on this share has a container owner recorded
-    /// ([`crate::ownership`]). Until it does, no reply reads a record.
+    /// ([`crate::ownership`]). Until it does, no reply reads a record. A
+    /// share whose root cannot carry the marker (`/Users` and `/Volumes` are
+    /// root's) reads them from the start: otherwise every owner recorded in
+    /// it read as root after a restart, until the next chown.
     ownership: AtomicBool,
     /// The host watcher that keeps the policy honest.
     ///
@@ -737,20 +761,16 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
         Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
         Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0),
         Located::At(parent, name) => {
-            let opened = sys::openat_path(
-                parent.raw_fd(),
-                &name,
-                linux_flags | sys::LINUX_O_NOFOLLOW,
-                0,
-            )
-            .and_then(|fd| {
-                let st = sys::stat_fd(fd.as_raw_fd())?;
-                if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
-                    Ok(fd)
-                } else {
-                    Err(linux::ESTALE)
-                }
-            });
+            let opened =
+                sys::openat_path(parent.raw_fd(), &name, linux_flags | LINUX_O_NOFOLLOW, 0)
+                    .and_then(|fd| {
+                        let st = sys::stat_fd(fd.as_raw_fd())?;
+                        if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
+                            Ok(fd)
+                        } else {
+                            Err(linux::ESTALE)
+                        }
+                    });
             match opened {
                 Ok(fd) => Ok(fd),
                 // The name has moved on; the file may not have.
@@ -855,16 +875,16 @@ impl Server {
         let volfs = Arc::new(Volfs::default());
         // The share's own volume is known from the start, so the common case
         // is served on the vCPU from the first request.
-        let local = Arc::new(Local::default());
+        let volumes = Arc::new(Volumes::default());
         if let Ok(root_dir) = std::fs::File::open(root) {
             use std::os::fd::AsRawFd;
-            local.learn(dev, root_dir.as_raw_fd());
+            volumes.learn(dev, root_dir.as_raw_fd());
         }
         let hold = Arc::new(Hold {
             registry: registry.clone(),
             open_cache: open_cache.clone(),
             volfs: volfs.clone(),
-            local: local.clone(),
+            volumes: volumes.clone(),
         });
         pool.enroll(Arc::downgrade(&hold) as std::sync::Weak<dyn crate::inode::Release>);
         let apply = std::sync::Arc::new(crate::apply::Apply::start(root.to_path_buf()));
@@ -909,7 +929,7 @@ impl Server {
             host_gid,
             max_write: AtomicU32::new(MAX_WRITE),
             volfs,
-            local,
+            volumes,
             trace_left: AtomicUsize::new(
                 std::env::var("LIGHTER_FS_TRACE")
                     .ok()
@@ -938,6 +958,7 @@ impl Server {
                     .ok()
                     .is_some_and(|root| {
                         sys::get_xattr(&root, crate::ownership::MARKER, &mut []).is_ok()
+                            || sys::access(&root, libc::W_OK as u32).is_err()
                     }),
             ),
             settler_stop,
@@ -972,7 +993,10 @@ impl Server {
             return true;
         };
         match self.registry.get(header.nodeid) {
-            Some(inode) => self.local.known(inode.dev()) != Some(true),
+            Some(inode) => !self
+                .volumes
+                .known(inode.dev())
+                .is_some_and(|volume| volume.local),
             None => true,
         }
     }
@@ -1003,10 +1027,10 @@ impl Server {
         // A volume not yet known is learned here, on the worker the request
         // went to because it was not known (see [`Server::may_block`]).
         if let Some(inode) = self.registry.get(header.nodeid)
-            && self.local.known(inode.dev()).is_none()
+            && self.volumes.known(inode.dev()).is_none()
             && let Ok(held) = inode.reference()
         {
-            self.local.learn(inode.dev(), held.raw_fd());
+            self.volumes.learn(inode.dev(), held.raw_fd());
         }
         // The header's own length field bounds the body; a guest that lied
         // about it must not let us read the tail of the previous request.
@@ -1926,14 +1950,19 @@ impl Server {
     /// the caller has it: a first lookup replies before the inode's place is
     /// set. Otherwise the place is used, and with neither the record is read.
     fn recorded_owner(&self, inode: &Inode, parent: Option<&Inode>) -> Option<(u32, u32)> {
+        self.record_of(inode, parent).recorded()
+    }
+
+    /// The inode's record, read if it may have one ([`Self::recorded_owner`]).
+    fn record_of(&self, inode: &Inode, parent: Option<&Inode>) -> crate::ownership::Owner {
         use crate::ownership::Owner;
         if !self.ownership.load(Ordering::Relaxed) {
-            return None;
+            return Owner::Mac;
         }
-        let owner = match inode.owner() {
+        match inode.owner() {
             // A pending inode has no host file to read yet, and no record:
             // a create records no owner, only a chown does.
-            Owner::Unknown if inode.is_pending() => return None,
+            Owner::Unknown if inode.is_pending() => Owner::Mac,
             Owner::Unknown => {
                 let unmarked = match parent {
                     Some(parent) => !self.may_hold_owned(parent),
@@ -1944,14 +1973,27 @@ impl Server {
                 let owner = if unmarked {
                     Owner::Mac
                 } else {
-                    self.read_owner(inode)?
+                    match self.read_owner(inode) {
+                        Some(owner) => owner,
+                        None => return Owner::Mac,
+                    }
                 };
                 inode.set_owner(owner);
                 owner
             }
             known => known,
-        };
-        owner.recorded()
+        }
+    }
+
+    /// The permission bits the guest sees: the record's, on a volume that
+    /// keeps none of its own, else the file's.
+    fn permissions_of(&self, inode: &Inode) -> Result<u32, i32> {
+        if !self.volumes.keeps_permissions(inode.dev())
+            && let Some(mode) = self.record_of(inode, None).mode()
+        {
+            return Ok(mode);
+        }
+        Ok(self.stat_of(inode)?.st_mode as u32 & 0o7777)
     }
 
     /// Whether anything directly inside a directory may have a record: its
@@ -1988,7 +2030,7 @@ impl Server {
         let path = self.path(inode).ok()?;
         let mut record = [0u8; 128];
         Some(match sys::get_xattr(&path, RECORD, &mut record) {
-            Ok(len) => parse(&record[..len]).map_or(Owner::Mac, |(uid, gid)| Owner::Set(uid, gid)),
+            Ok(len) => parse(&record[..len]).unwrap_or(Owner::Mac),
             Err(errno) if errno == linux::ENODATA || errno == linux::ERANGE => Owner::Mac,
             Err(_) => return None,
         })
@@ -1996,16 +2038,24 @@ impl Server {
 
     /// A recorded owner laid over what the host stat says.
     fn own(&self, inode: &Inode, parent: Option<&Inode>, attr: &mut Attr) {
-        if let Some((uid, gid)) = self.recorded_owner(inode, parent) {
+        let record = self.record_of(inode, parent);
+        if let Some((uid, gid)) = record.recorded() {
             attr.uid = uid;
             attr.gid = gid;
             attr.flags = 0;
         }
+        if let Some(mode) = record.mode()
+            && !self.volumes.keeps_permissions(inode.dev())
+        {
+            attr.mode = (attr.mode & !0o7777) | mode;
+        }
     }
 
-    /// Records a container's owner for a file, or clears the record when the
-    /// owner is root again, which the Mac user already appears as. The file's
-    /// directory is marked, so that the record is looked for.
+    /// Records a container's owner and the file's permission bits, or clears
+    /// the record when the owner is root again, which the Mac user already
+    /// appears as — except on a volume that keeps no permissions, where the
+    /// record is the only place the bits are kept. The file's directory is
+    /// marked, so that the record is looked for.
     fn record_owner(
         &self,
         inode: &Inode,
@@ -2015,7 +2065,7 @@ impl Server {
         mode: u32,
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode};
-        if (uid, gid) == (0, 0) {
+        if (uid, gid) == (0, 0) && self.volumes.keeps_permissions(inode.dev()) {
             match with_owner_write(path, || sys::remove_xattr(path, RECORD)) {
                 Err(errno) if errno != linux::ENODATA => return Err(errno),
                 _ => {}
@@ -2044,7 +2094,7 @@ impl Server {
         with_owner_write(path, || {
             sys::set_xattr(path, RECORD, &encode(uid, gid, mode), 0)
         })?;
-        inode.set_owner(Owner::Set(uid, gid));
+        inode.set_owner(Owner::Set(uid, gid, Some(mode & 0o7777)));
         Ok(())
     }
 
@@ -2377,6 +2427,8 @@ impl Server {
                 == 0
             || inode.is_dir
             || inode.is_symlink
+            // Kept in the record, which needs the file.
+            || (valid & fuse::fattr::MODE != 0 && !self.volumes.keeps_permissions(inode.dev()))
         {
             return Ok(None);
         }
@@ -2595,8 +2647,13 @@ impl Server {
         let path = self.path(&inode)?;
 
         if valid & fuse::fattr::MODE != 0 {
-            let mode = get_u32(body, 68).ok_or(linux::EINVAL)?;
-            sys::chmod_at(libc::AT_FDCWD, &path, mode & 0o7777)?;
+            let mode = get_u32(body, 68).ok_or(linux::EINVAL)? & 0o7777;
+            if self.volumes.keeps_permissions(inode.dev()) {
+                sys::chmod_at(libc::AT_FDCWD, &path, mode)?;
+            } else {
+                let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
+                self.record_owner(&inode, None, &path, owner, mode)?;
+            }
         }
 
         if valid & (fuse::fattr::UID | fuse::fattr::GID) != 0 {
@@ -2607,7 +2664,7 @@ impl Server {
             let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
             let wanted = self.requested_owner(valid, body, owner)?;
             if wanted != owner {
-                let mode = self.stat_of(&inode)?.st_mode as u32;
+                let mode = self.permissions_of(&inode)?;
                 self.record_owner(&inode, None, &path, wanted, mode)?;
             }
         }
@@ -2951,7 +3008,9 @@ impl Server {
             // name: the diagnostic for an `rm -rf` the guest believed had
             // emptied the directory.
             let left: Vec<String> = parent
-                .under_name(&name, |dir, at| sys::openat_path(dir, at, 0o200000, 0))
+                .under_name(&name, |dir, at| {
+                    sys::openat_path(dir, at, LINUX_O_DIRECTORY, 0)
+                })
                 .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
                 .map(|entries| {
                     entries
@@ -3538,8 +3597,7 @@ impl Server {
         // advance one offset between them and each gets half the entries.
         // Measured as ripgrep at 87% of native instead of 97%, and a pnpm
         // install that failed its second repetition.
-        // 0o200000 is Linux's O_DIRECTORY; the translation layer maps it.
-        let fd = open_inode(&inode, 0o200000)?;
+        let fd = open_inode(&inode, LINUX_O_DIRECTORY)?;
         sys::Dir::from_fd(fd)?.read_all()
     }
 
@@ -3752,7 +3810,6 @@ impl Server {
                     let raw = match &source_fd {
                         Source::Cached(file) if file.readable => file.fd.as_raw_fd(),
                         Source::At(parent_ref, name) => {
-                            const LINUX_O_NOFOLLOW: u32 = 0o400000;
                             opened =
                                 sys::openat_path(parent_ref.raw_fd(), name, LINUX_O_NOFOLLOW, 0)?;
                             opened.as_raw_fd()
@@ -3789,8 +3846,6 @@ impl Server {
                     let clone = |name: &CString| {
                         if let Some(bytes) = &bytes {
                             const LINUX_O_WRONLY: u32 = 1;
-                            const LINUX_O_CREAT: u32 = 0o100;
-                            const LINUX_O_EXCL: u32 = 0o200;
                             let fd = sys::openat_path(
                                 parent_ref.raw_fd(),
                                 name,
@@ -3968,7 +4023,6 @@ impl Server {
         flags: u32,
         mode: u32,
     ) -> Result<Option<Vec<u8>>, i32> {
-        const LINUX_O_EXCL: u32 = 0o200;
         if parent.pending_child(name.to_bytes()).is_some() {
             // Promised already: to the guest this file exists.
             if flags & LINUX_O_EXCL != 0 {
@@ -4250,10 +4304,6 @@ impl Server {
         // common case stays one syscall. O_NOFOLLOW because a trailing
         // symlink belongs to the guest's VFS: it comes back as ELOOP and the
         // guest walks it itself.
-        const LINUX_O_CREAT: u32 = 0o100;
-        const LINUX_O_EXCL: u32 = 0o200;
-        const LINUX_O_NOFOLLOW: u32 = 0o400000;
-        const LINUX_O_APPEND: u32 = 0o2000;
         if self.apply.accepting()
             && let Some(reply) =
                 self.create_pending(&parent, &name, flags, mode & 0o7777 & !umask)?
@@ -4766,6 +4816,9 @@ impl Server {
     fn lseek(&self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let whence = get_u32(body, 16).ok_or(linux::EINVAL)?;
+        // The end, and where data and holes are, as the guest wrote them.
+        let inode = self.inode(nodeid)?;
+        self.settle_while(&inode, |inode| inode.is_dirty() || inode.is_pending());
         let file = self.file_for(nodeid, false)?;
         let at = sys::seek(file.fd.as_raw_fd(), offset, whence)?;
         Ok(at.to_le_bytes().to_vec())
@@ -4775,6 +4828,12 @@ impl Server {
         let offset = get_u64(body, 8).ok_or(linux::EINVAL)?;
         let length = get_u64(body, 16).ok_or(linux::EINVAL)?;
         let mode = get_u32(body, 24).ok_or(linux::EINVAL)?;
+        // As a truncate: the file must exist (issue #69, a preallocation
+        // straight after the create) and be as the guest wrote it.
+        let inode = self.inode(nodeid)?;
+        self.settle_while(&inode, |inode| {
+            inode.is_dirty() || inode.is_pending() || inode.has_pending_attrs()
+        });
         let file = self.file_for(nodeid, true)?;
         sys::fallocate(file.fd.as_raw_fd(), mode, offset, length)?;
         Ok(Vec::new())
@@ -4991,15 +5050,22 @@ mod volfs_tests {
 
     #[test]
     fn a_volume_is_learned_and_forgotten() {
-        let local = Local::default();
+        let volumes = Volumes::default();
         let disk = std::fs::File::open(std::env::temp_dir()).unwrap();
         let dev = sys::stat_fd(disk.as_raw_fd()).unwrap().st_dev as i64;
-        assert_eq!(local.known(dev), None);
-        local.learn(dev, disk.as_raw_fd());
-        assert_eq!(local.known(dev), Some(true), "the Mac's own disk is local");
-        local.forget(dev);
+        assert_eq!(volumes.known(dev), None);
+        volumes.learn(dev, disk.as_raw_fd());
         assert_eq!(
-            local.known(dev),
+            volumes.known(dev),
+            Some(Volume {
+                local: true,
+                permissions: true
+            }),
+            "the Mac's own disk is local, and keeps permissions"
+        );
+        volumes.forget(dev);
+        assert_eq!(
+            volumes.known(dev),
             None,
             "an ejected volume's number is reused"
         );
