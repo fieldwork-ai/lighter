@@ -63,6 +63,9 @@ cleanup() {
 	[ -n "$VMM_PID" ] && kill -9 "$VMM_PID" 2>/dev/null || true
 	# The VMM's log outlives the run directory, because a failure names it.
 	mkdir -p .logs && cp "$LOG" .logs/m6-last-boot.log 2>/dev/null || true
+	# A failed run's log is kept apart, so a rerun cannot overwrite the one
+	# that explains it.
+	[ "$FAILED" = 0 ] || cp "$LOG" ".logs/m6-failed-$(date +%Y%m%d-%H%M%S).log" 2>/dev/null || true
 	rm -rf "$RUN_DIR"
 	rm -rf "${ROOTFS_DIR:-}"
 }
@@ -279,6 +282,8 @@ puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
 at_warn="$(field ballooned_mib)"
 guest_mib=8192
 step=$(( guest_mib / 256 )); [ "$step" -lt 32 ] && step=32
+swapouts() { vm_stat | awk '/Swapouts/ { gsub("\\.", "", $2); print $2 }'; }
+swapped_before="$(swapouts)"
 echo normal > "$PRESSURE_FILE"
 sleep 15
 after="$(field ballooned_mib)"
@@ -288,7 +293,17 @@ floor=$(( at_warn - 10 * step - 64 ))
 [ "${after:-0}" -ge "$floor" ] && pass "Normal is a plateau: ${after} of ${at_warn} MiB held 15s later (eases ${step} MiB/s at most)" || fail "Normal was a cliff: ${after:-0} of ${at_warn} MiB left after 15s, ${floor} expected"
 sleep 60
 later="$(field ballooned_mib)"
-[ "${later:-0}" -lt "${after:-0}" ] && pass "and it eases: ${later} MiB after another 60s" || fail "it did not ease: ${later:-0} MiB after another 60s (was ${after:-0})"
+# Swap on the Mac within the last minute is overcommitment, and the policy
+# rightly holds the balloon through it: a Mac that swapped in the window
+# says nothing about easing either way.
+swapped=$(( $(swapouts) - swapped_before ))
+if [ "${later:-0}" -lt "${after:-0}" ]; then
+	pass "and it eases: ${later} MiB after another 60s"
+elif [ "$swapped" -gt 0 ]; then
+	note "easing not measured: the Mac swapped out ${swapped} pages in the window, and the balloon rightly held (${later:-0} MiB)"
+else
+	fail "it did not ease: ${later:-0} MiB after another 60s (was ${after:-0}), with no swap on the Mac"
+fi
 # The reported workflow: the host flapping between Warn and Normal. The
 # balloon must ride it out where it is, not cycle to nothing and back.
 first=""
