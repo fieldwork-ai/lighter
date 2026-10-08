@@ -33,14 +33,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 PROFILE="${PROFILE:-release}"
-LIGHTER="target/$PROFILE/lighter"
+LIGHTER="${LIGHTER_BIN:-target/$PROFILE/lighter}"
 FAILED=0
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
 note() { printf '  \033[33m··\033[0m   %s\n' "$*"; }
 
-if [ -z "${LIGHTER_BRIDGE_SOCKET:-}" ] && [ ! -S /var/run/dev.lighter.bridge.sock ]; then
-	echo "m17: skipped, no network helper (install it with sudo lighter lan enable, or set LIGHTER_BRIDGE_SOCKET)"
+# A release build's app holds com.apple.vm.networking and bridges by itself;
+# a source build needs the helper.
+entitled() {
+	codesign -d --entitlements - --xml "$(dirname "$LIGHTER")/../share/lighter/lighter.app" 2>/dev/null \
+		| grep -q com.apple.vm.networking
+}
+if [ -z "${LIGHTER_BRIDGE_SOCKET:-}" ] && [ ! -S /var/run/dev.lighter.bridge.sock ] && ! entitled; then
+	echo "m17: skipped, no network helper and no entitlement (install the helper with sudo lighter lan enable, set LIGHTER_BRIDGE_SOCKET, or run a release build with LIGHTER_BIN)"
 	exit 0
 fi
 
@@ -56,9 +62,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Building and signing the CLI"
-cargo build $([ "$PROFILE" = release ] && echo --release) -p lighter-cli >/dev/null 2>&1 || { echo "build failed"; exit 1; }
-./scripts/sign.sh "$LIGHTER" >/dev/null
+if [ -z "${LIGHTER_BIN:-}" ]; then
+	echo "==> Building and signing the CLI"
+	cargo build $([ "$PROFILE" = release ] && echo --release) -p lighter-cli >/dev/null 2>&1 || { echo "build failed"; exit 1; }
+	./scripts/sign.sh "$LIGHTER" >/dev/null
+fi
 
 echo "==> A machine on the network"
 "$LIGHTER" config --lan on >/dev/null
@@ -74,6 +82,11 @@ done
 GUEST="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<<"$state" | head -1)"
 if [ -n "$GUEST" ] && ! grep -q "not on the network\|no address" <<<"$state"; then
 	pass "the machine has an address on the network: ${state#  lan        }"
+	if entitled && [ -z "${LIGHTER_BRIDGE_SOCKET:-}" ]; then
+		sed 's/\x1b\[[0-9;]*m//g' "$LIGHTER_HOME/machine.log" | grep -aq 'how="in process"' \
+			&& pass "lighter bridged it by itself, with no helper (com.apple.vm.networking)" \
+			|| fail "an entitled build did not bridge in process: $(grep -a 'LAN card' "$LIGHTER_HOME/machine.log" | tail -1)"
+	fi
 else
 	fail "no address on the network: ${state:-lighter status says nothing about it}"
 	"$LIGHTER" doctor 2>&1 | grep -A2 LAN | sed 's/^/    /'

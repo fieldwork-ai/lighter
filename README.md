@@ -175,9 +175,9 @@ docker run --rm --device lighter.sh/metal=all -v ./models:/models llama-cpp-rpc 
 ## Home lab: Frigate, Home Assistant, Pi-hole
 
 - **Frigate supports lighter upstream** ([frigate#24453](https://github.com/blakeblackshear/frigate/pull/24453), in Frigate's next release): its `onnx` detector runs on the Neural Engine, and `preset-apple-silicon-h264` / `-h265` decode cameras on the media engine. On an 8 GB M1, one detector keeps up with 14 cameras (YOLOv9-s), against 3 for Frigate's ZMQ detector on the Mac. For today's Frigate, [`examples/frigate-ane`](examples/frigate-ane) adds the detector to Frigate's own image.
-- **Home Assistant** runs as it does anywhere else, with its media, databases and config on shared folders. Its voice pipeline's speech-to-text runs on the Mac's GPU: [`examples/whisper-metal`](examples/whisper-metal) is a Wyoming whisper service that transcribes an 11 s clip in 1.3 s, against 5.8 s on the CPU.
+- **Home Assistant** runs as it does anywhere else, and with LAN mode it discovers your devices by itself: [Home Assistant on your Mac](docs/home-assistant.md) is a five-step guide. Its voice pipeline's speech-to-text runs on the Mac's GPU: [`examples/whisper-metal`](examples/whisper-metal) is a Wyoming whisper service that transcribes an 11 s clip in 1.3 s, against 5.8 s on the CPU.
 
-- **Host networking and discovery:** a `network_mode: host` container is reachable from the Mac like a published port. For device discovery (mDNS and SSDP), LAN mode gives the machine its own address on your network: `sudo lighter lan enable`, then `lighter config --lan on` and `lighter restart`. See the [0.12.0 release notes](docs/release-notes-0.12.0.md).
+- **Host networking and discovery:** a `network_mode: host` container is reachable from the Mac like a published port. For device discovery (mDNS and SSDP), LAN mode gives the machine its own address on your network: `lighter config --lan on`, then `lighter restart`. No `sudo` and no helper since 0.12.5, which holds Apple's VM Networking entitlement; a build of your own still needs `sudo lighter lan enable` once. See the [0.12.0 release notes](docs/release-notes-0.12.0.md).
 
 - **Zigbee and Z-Wave sticks:** `lighter usb attach <vendor:product>` hands a stick plugged into the Mac to the guest, under the `/dev/serial/by-id` name Linux gives it. See the [USB guide](docs/usb.md).
 

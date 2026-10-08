@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The released lighter.app, which runs the machine. -->
+	<key>com.apple.security.hypervisor</key>
+	<true/>
+	<!-- Starts a bridged vmnet interface without root (LAN mode). Restricted:
+	     Apple granted it to team N7N6BNF95K, and it holds only in a binary
+	     signed with Fieldwork's Developer ID inside a bundle carrying
+	     assets/lighter.provisionprofile. The CLI in bin/ has no bundle to carry
+	     the profile, so it never gets this: macOS would refuse to launch it. -->
+	<key>com.apple.vm.networking</key>
+	<true/>
+</dict>
+</plist>

@@ -73,12 +73,13 @@ enum UsbAction {
 
 #[derive(Subcommand)]
 enum LanAction {
-    /// Install lighter's network helper (run with sudo): what puts the
-    /// machine on the Mac's network until lighter has Apple's entitlement.
+    /// Install lighter's network helper (run with sudo). Only a build of
+    /// your own needs it: a release puts the machine on the network itself.
     Enable,
     /// Remove the helper (run with sudo).
     Disable,
-    /// Whether the helper is installed, and which network cards it can use.
+    /// Whether the helper is needed or installed, and which network cards
+    /// can be bridged.
     Status,
 }
 
@@ -184,7 +185,8 @@ enum Command {
         unshare: Vec<String>,
         /// Put the machine on the Mac's network with a card of its own, so a
         /// host-network container can discover and be discovered (`on` or
-        /// `off`, the default). Needs `sudo lighter lan enable` once.
+        /// `off`, the default). A build of your own needs `sudo lighter lan
+        /// enable` once; a release needs nothing.
         #[arg(long, value_enum)]
         lan: Option<config::Toggle>,
         /// Which of the Mac's network cards LAN mode bridges (`auto`, the

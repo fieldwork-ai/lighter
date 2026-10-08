@@ -85,6 +85,16 @@ TPL
 	set -a; source "$WORK/creds.env"; set +a
 	op read "op://Shared/$CERT_ITEM/p12" --out-file "$WORK/cert.p12" >/dev/null
 	op read "op://Shared/$ASC_ITEM/p8" --out-file "$WORK/AuthKey.p8" >/dev/null
+	# Kept for the next run, which then asks 1Password nothing. Opt-in: this
+	# leaves the Developer ID signing identity on disk, readable by its owner
+	# alone, until .context/cert.p12 and its two companions are deleted.
+	if [ "${LIGHTER_RELEASE_CREDENTIALS_SAVE:-}" = 1 ]; then
+		(umask 077
+		 cp "$WORK/creds.env" "$CACHE/apple.local.env"
+		 cp "$WORK/cert.p12" "$CACHE/cert.p12"
+		 cp "$WORK/AuthKey.p8" "$CACHE/AuthKey.p8")
+		echo "    saved them to $CACHE for later runs"
+	fi
 fi
 
 # Ephemeral keychain for non-interactive codesigning
@@ -148,6 +158,8 @@ cp target/release/lighter "$APP/Contents/MacOS/lighter"
 cp target/release/lighter-bridge "$APP/Contents/MacOS/lighter-bridge"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 cp assets/lighter.icns "$APP/Contents/Resources/lighter.icns"
+# What lets the app hold com.apple.vm.networking (entitlements-app.plist).
+cp assets/lighter.provisionprofile "$APP/Contents/embedded.provisionprofile"
 
 # --- sign --------------------------------------------------------------------
 echo "==> Signing binaries with Developer ID and hardened runtime"
@@ -180,7 +192,7 @@ codesign --sign "$IDENTITY" \
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist"
 
 codesign --sign "$IDENTITY" \
-	--entitlements entitlements.plist \
+	--entitlements entitlements-app.plist \
 	--force \
 	--options runtime \
 	--timestamp \
@@ -190,6 +202,8 @@ echo "==> Verifying signatures"
 codesign --verify --verbose=2 "$STAGE/bin/lighter"
 codesign --verify --verbose=2 --deep "$APP"
 codesign --verify --verbose=2 -R='anchor apple generic and identifier "dev.lighter.bridge" and certificate leaf[subject.OU] = "N7N6BNF95K"' "$APP/Contents/MacOS/lighter-bridge"
+codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.vm.networking" \
+	|| { echo "error: lighter.app does not carry com.apple.vm.networking" >&2; exit 1; }
 
 # --- notarize ----------------------------------------------------------------
 if [ -z "$SKIP_NOTARIZE" ]; then
