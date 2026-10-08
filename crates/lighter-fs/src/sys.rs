@@ -1087,7 +1087,12 @@ mod tests {
     #[test]
     fn the_guest_flags_are_arm64s() {
         assert_eq!(
-            (LINUX_O_DIRECTORY, LINUX_O_NOFOLLOW, LINUX_O_DIRECT, LINUX_O_LARGEFILE),
+            (
+                LINUX_O_DIRECTORY,
+                LINUX_O_NOFOLLOW,
+                LINUX_O_DIRECT,
+                LINUX_O_LARGEFILE
+            ),
             (0o40000, 0o100000, 0o200000, 0o400000)
         );
         // MariaDB's create (issue #69): an exclusive create that is not a

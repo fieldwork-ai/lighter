@@ -491,10 +491,16 @@ mod tests {
             flags
         };
 
-        invalidator.changed(&root.join("mountpoint"), flag::ITEM_INODE_META_MOD | flag::ITEM_IS_DIR);
+        invalidator.changed(
+            &root.join("mountpoint"),
+            flag::ITEM_INODE_META_MOD | flag::ITEM_IS_DIR,
+        );
         assert_eq!(entry_flags(), [1], "touched: expired only");
         std::fs::remove_dir(root.join("mountpoint")).unwrap();
-        invalidator.changed(&root.join("mountpoint"), flag::ITEM_REMOVED | flag::ITEM_IS_DIR);
+        invalidator.changed(
+            &root.join("mountpoint"),
+            flag::ITEM_REMOVED | flag::ITEM_IS_DIR,
+        );
         assert_eq!(entry_flags(), [0], "removed: withdrawn");
         std::fs::remove_dir_all(&root).unwrap();
     }

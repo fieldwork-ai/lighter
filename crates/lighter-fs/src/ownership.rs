@@ -123,8 +123,14 @@ mod tests {
             parse(br#"{"UID":405,"GID":82,"mode":2770}"#),
             Some(Owner::Set(405, 82, Some(0o2770)))
         );
-        assert_eq!(parse(br#"{"UID":501,"GID":20}"#), Some(Owner::Set(501, 20, None)));
-        assert_eq!(parse(br#"{ "GID" : 7 , "UID" : 3 }"#), Some(Owner::Set(3, 7, None)));
+        assert_eq!(
+            parse(br#"{"UID":501,"GID":20}"#),
+            Some(Owner::Set(501, 20, None))
+        );
+        assert_eq!(
+            parse(br#"{ "GID" : 7 , "UID" : 3 }"#),
+            Some(Owner::Set(3, 7, None))
+        );
         assert_eq!(
             parse(br#"{"UID":3,"GID":7,"mode":789}"#),
             Some(Owner::Set(3, 7, None)),

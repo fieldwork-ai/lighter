@@ -602,7 +602,10 @@ impl Volumes {
                 local: fs.f_flags & libc::MNT_LOCAL as u32 != 0,
                 permissions: sys::keeps_permissions(fd).unwrap_or(true),
             };
-            self.0.write().expect("volumes poisoned").insert(dev, volume);
+            self.0
+                .write()
+                .expect("volumes poisoned")
+                .insert(dev, volume);
         }
     }
 
@@ -758,20 +761,16 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
         Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
         Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0),
         Located::At(parent, name) => {
-            let opened = sys::openat_path(
-                parent.raw_fd(),
-                &name,
-                linux_flags | LINUX_O_NOFOLLOW,
-                0,
-            )
-            .and_then(|fd| {
-                let st = sys::stat_fd(fd.as_raw_fd())?;
-                if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
-                    Ok(fd)
-                } else {
-                    Err(linux::ESTALE)
-                }
-            });
+            let opened =
+                sys::openat_path(parent.raw_fd(), &name, linux_flags | LINUX_O_NOFOLLOW, 0)
+                    .and_then(|fd| {
+                        let st = sys::stat_fd(fd.as_raw_fd())?;
+                        if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
+                            Ok(fd)
+                        } else {
+                            Err(linux::ESTALE)
+                        }
+                    });
             match opened {
                 Ok(fd) => Ok(fd),
                 // The name has moved on; the file may not have.
@@ -994,7 +993,10 @@ impl Server {
             return true;
         };
         match self.registry.get(header.nodeid) {
-            Some(inode) => !self.volumes.known(inode.dev()).is_some_and(|volume| volume.local),
+            Some(inode) => !self
+                .volumes
+                .known(inode.dev())
+                .is_some_and(|volume| volume.local),
             None => true,
         }
     }
@@ -3006,7 +3008,9 @@ impl Server {
             // name: the diagnostic for an `rm -rf` the guest believed had
             // emptied the directory.
             let left: Vec<String> = parent
-                .under_name(&name, |dir, at| sys::openat_path(dir, at, LINUX_O_DIRECTORY, 0))
+                .under_name(&name, |dir, at| {
+                    sys::openat_path(dir, at, LINUX_O_DIRECTORY, 0)
+                })
                 .and_then(|fd| sys::Dir::from_fd(fd)?.read_all())
                 .map(|entries| {
                     entries
@@ -5053,7 +5057,10 @@ mod volfs_tests {
         volumes.learn(dev, disk.as_raw_fd());
         assert_eq!(
             volumes.known(dev),
-            Some(Volume { local: true, permissions: true }),
+            Some(Volume {
+                local: true,
+                permissions: true
+            }),
             "the Mac's own disk is local, and keeps permissions"
         );
         volumes.forget(dev);

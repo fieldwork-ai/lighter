@@ -770,7 +770,10 @@ fn a_file_just_created_can_be_preallocated() {
     guest
         .call(op::FALLOCATE, nodeid, &fallocate_body(fh, 0, 12 << 20, 0))
         .expect("preallocating a file just created");
-    assert_eq!(std::fs::metadata(guest.host("ibdata1")).unwrap().len(), 12 << 20);
+    assert_eq!(
+        std::fs::metadata(guest.host("ibdata1")).unwrap().len(),
+        12 << 20
+    );
 }
 
 /// A hole is punched in the file as the guest last wrote it, not under bytes
@@ -782,15 +785,25 @@ fn a_punched_hole_lands_after_the_writes_before_it() {
     let (nodeid, fh) = guest.create(1, "punched", CREATE_RDWR).unwrap();
     guest.write(nodeid, fh, 0, &[b'x'; 8192]).unwrap();
     guest
-        .call(op::FALLOCATE, nodeid, &fallocate_body(fh, 0, 4096, PUNCH_HOLE_KEEP_SIZE))
+        .call(
+            op::FALLOCATE,
+            nodeid,
+            &fallocate_body(fh, 0, 4096, PUNCH_HOLE_KEEP_SIZE),
+        )
         .expect("punching a hole");
     let mut body = vec![0u8; 16];
     body[0..8].copy_from_slice(&fh.to_le_bytes());
     guest.call(op::FSYNC, nodeid, &body).unwrap();
     let bytes = std::fs::read(guest.host("punched")).unwrap();
     assert_eq!(bytes.len(), 8192);
-    assert!(bytes[..4096].iter().all(|&b| b == 0), "the hole reads as zeros");
-    assert!(bytes[4096..].iter().all(|&b| b == b'x'), "the rest as written");
+    assert!(
+        bytes[..4096].iter().all(|&b| b == 0),
+        "the hole reads as zeros"
+    );
+    assert!(
+        bytes[4096..].iter().all(|&b| b == b'x'),
+        "the rest as written"
+    );
 }
 
 /// SEEK_END on a file just created and written answers its size.
@@ -805,7 +818,9 @@ fn a_file_just_created_can_be_seeked() {
     body.extend_from_slice(&0u64.to_le_bytes());
     body.extend_from_slice(&SEEK_END.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    let reply = guest.call(op::LSEEK, nodeid, &body).expect("seeking a file just created");
+    let reply = guest
+        .call(op::LSEEK, nodeid, &body)
+        .expect("seeking a file just created");
     assert_eq!(u64::from_le_bytes(reply[0..8].try_into().unwrap()), 12);
 }
 
@@ -2824,13 +2839,16 @@ struct Exfat {
 
 impl Exfat {
     fn new(name: &str) -> Exfat {
-        let base = std::env::temp_dir().join(format!("lighter-fs-exfat-{name}-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("lighter-fs-exfat-{name}-{}", std::process::id()));
         let image = base.with_extension("dmg");
         let mount = base.join("mnt");
         std::fs::create_dir_all(&mount).unwrap();
         let _ = std::fs::remove_file(&image);
         let made = std::process::Command::new("hdiutil")
-            .args(["create", "-quiet", "-size", "16m", "-fs", "ExFAT", "-volname", "LGTEST"])
+            .args([
+                "create", "-quiet", "-size", "16m", "-fs", "ExFAT", "-volname", "LGTEST",
+            ])
             .arg(&image)
             .status()
             .unwrap();
@@ -2888,8 +2906,18 @@ fn a_chmod_on_a_drive_that_keeps_no_permissions_is_kept() {
     let reply = guest.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
     assert_eq!(mode_and_owner(&reply).0, 0o755, "read again");
 
-    let reply = setattr(&mut guest, dir, fuse::fattr::UID | fuse::fattr::GID, 0, (100, 101));
-    assert_eq!(mode_and_owner(&reply), (0o755, 100, 101), "a chown keeps the mode");
+    let reply = setattr(
+        &mut guest,
+        dir,
+        fuse::fattr::UID | fuse::fattr::GID,
+        0,
+        (100, 101),
+    );
+    assert_eq!(
+        mode_and_owner(&reply),
+        (0o755, 100, 101),
+        "a chown keeps the mode"
+    );
 
     let mut restarted = guest.another();
     let dir = restarted.lookup(1, "data").unwrap();
@@ -2897,7 +2925,11 @@ fn a_chmod_on_a_drive_that_keeps_no_permissions_is_kept() {
     assert_eq!(mode_and_owner(&reply), (0o755, 100, 101), "after a restart");
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
-        std::fs::metadata(drive.mount.join("data")).unwrap().permissions().mode() & 0o7777,
+        std::fs::metadata(drive.mount.join("data"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
         0o700,
         "the drive itself has nowhere to keep it"
     );
@@ -2909,18 +2941,32 @@ fn a_chmod_elsewhere_is_the_files_own() {
     let mut guest = Guest::new("chmod-apfs");
     std::fs::create_dir(guest.host("data")).unwrap();
     let dir = guest.lookup(1, "data").unwrap();
-    setattr(&mut guest, dir, fuse::fattr::UID | fuse::fattr::GID, 0, (100, 101));
+    setattr(
+        &mut guest,
+        dir,
+        fuse::fattr::UID | fuse::fattr::GID,
+        0,
+        (100, 101),
+    );
     setattr(&mut guest, dir, fuse::fattr::MODE, 0o750, (0, 0));
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
-        std::fs::metadata(guest.host("data")).unwrap().permissions().mode() & 0o7777,
+        std::fs::metadata(guest.host("data"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
         0o750
     );
     std::fs::set_permissions(guest.host("data"), std::fs::Permissions::from_mode(0o711)).unwrap();
     let mut restarted = guest.another();
     let dir = restarted.lookup(1, "data").unwrap();
     let reply = restarted.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
-    assert_eq!(mode_and_owner(&reply), (0o711, 100, 101), "a chmod on the Mac is seen");
+    assert_eq!(
+        mode_and_owner(&reply),
+        (0o711, 100, 101),
+        "a chmod on the Mac is seen"
+    );
 }
 
 /// exFAT cannot rename without replacing; Linux's own exFAT driver can, the
@@ -2945,7 +2991,11 @@ fn a_rename_that_must_not_replace_works_on_a_drive_that_cannot_refuse() {
     };
     rename(&mut guest, "a.tmp", "a").expect("to a free name");
     assert_eq!(std::fs::read(drive.mount.join("a")).unwrap(), b"new");
-    assert_eq!(rename(&mut guest, "b.tmp", "taken"), Err(17), "EEXIST, not a replace");
+    assert_eq!(
+        rename(&mut guest, "b.tmp", "taken"),
+        Err(17),
+        "EEXIST, not a replace"
+    );
     assert_eq!(std::fs::read(drive.mount.join("taken")).unwrap(), b"kept");
 }
 
@@ -2961,7 +3011,13 @@ fn an_owner_survives_a_restart_on_a_share_whose_root_cannot_be_marked() {
     std::fs::set_permissions(&guest.root, std::fs::Permissions::from_mode(0o555)).unwrap();
     let home = guest.lookup(1, "home").unwrap();
     let pg = guest.lookup(home, "pg").unwrap();
-    setattr(&mut guest, pg, fuse::fattr::UID | fuse::fattr::GID, 0, (999, 999));
+    setattr(
+        &mut guest,
+        pg,
+        fuse::fattr::UID | fuse::fattr::GID,
+        0,
+        (999, 999),
+    );
 
     let mut restarted = guest.another();
     let home = restarted.lookup(1, "home").unwrap();
