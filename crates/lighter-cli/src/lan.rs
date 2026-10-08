@@ -1,6 +1,7 @@
 //! The machine on the Mac's network: choosing the card, holding the MAC,
-//! bridging through vmnet in this process or through the root helper, and
-//! installing that helper (`sudo lighter lan enable`).
+//! bridging through vmnet in this process (a release, which holds
+//! `com.apple.vm.networking`) or through the root helper (a build of one's
+//! own), and installing that helper (`sudo lighter lan enable`).
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,28 @@ pub fn socket() -> PathBuf {
 /// Whether the helper is installed.
 pub fn installed() -> bool {
     Path::new(PLIST).exists() && Path::new(HELPER).exists()
+}
+
+/// Whether this installation's machine bridges by itself, needing no helper:
+/// a release's lighter.app holds `com.apple.vm.networking`; the ad hoc
+/// bundle a checkout builds cannot.
+pub fn needs_no_helper() -> bool {
+    crate::paths::guest_dir()
+        .map(|guest| guest.join("lighter.app"))
+        .is_ok_and(|app| carries_vm_networking(&app))
+}
+
+/// Asked of `codesign`, as `doctor` asks of the hypervisor entitlement: an
+/// entitlement counts only under a valid signature.
+fn carries_vm_networking(path: &Path) -> bool {
+    path.exists()
+        && std::process::Command::new("/usr/bin/codesign")
+            .args(["-d", "--entitlements", "-", "--xml"])
+            .arg(path)
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout).contains("com.apple.vm.networking")
+            })
 }
 
 /// The card to bridge: the one named, or for `auto` the Mac's primary
@@ -175,13 +198,18 @@ pub fn connect(
     interface: &str,
     mac: [u8; 6],
 ) -> Result<(lighter_vmm::lan::Lan, &'static str), String> {
-    if let Ok(lan) = lighter_vmm::lan::Lan::in_process(interface, mac) {
-        return Ok((lan, "in process"));
-    }
+    let refused = match lighter_vmm::lan::Lan::in_process(interface, mac) {
+        Ok(lan) => return Ok((lan, "in process")),
+        Err(why) => why,
+    };
     let socket = socket();
     if !socket.exists() {
         return Err(
-            "lighter's network helper is not installed: run `sudo lighter lan enable`".into(),
+            if std::env::current_exe().is_ok_and(|exe| carries_vm_networking(&exe)) {
+                format!("vmnet would not bridge {interface}: {refused}")
+            } else {
+                "lighter's network helper is not installed: run `sudo lighter lan enable`".into()
+            },
         );
     }
     lighter_vmm::lan::Lan::via_helper(&socket, interface, mac)
@@ -294,8 +322,15 @@ pub fn status() -> anyhow::Result<std::process::ExitCode> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    } else if needs_no_helper() {
+        println!("  helper     not needed: this lighter bridges by itself");
     } else {
         println!("  helper     not installed (`sudo lighter lan enable`)");
+    }
+    if installed() && needs_no_helper() {
+        println!(
+            "             this lighter bridges by itself; `sudo lighter lan disable` removes the helper"
+        );
     }
     let interfaces = lighter_vmnet::interfaces();
     println!(

@@ -318,7 +318,7 @@ pub fn run() -> Vec<Finding> {
                 Some(crate::machine::LanState::Missing(why)) => Finding::warn(
                     "LAN",
                     format!("not on the network: {why}"),
-                    if crate::lan::installed() {
+                    if crate::lan::installed() || crate::lan::needs_no_helper() {
                         "check `lighter lan status`, then `lighter restart`"
                     } else {
                         "install lighter's network helper with `sudo lighter lan enable`, then `lighter restart`"
