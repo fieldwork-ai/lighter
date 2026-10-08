@@ -85,6 +85,16 @@ TPL
 	set -a; source "$WORK/creds.env"; set +a
 	op read "op://Shared/$CERT_ITEM/p12" --out-file "$WORK/cert.p12" >/dev/null
 	op read "op://Shared/$ASC_ITEM/p8" --out-file "$WORK/AuthKey.p8" >/dev/null
+	# Kept for the next run, which then asks 1Password nothing. Opt-in: this
+	# leaves the Developer ID signing identity on disk, readable by its owner
+	# alone, until .context/cert.p12 and its two companions are deleted.
+	if [ "${LIGHTER_RELEASE_CREDENTIALS_SAVE:-}" = 1 ]; then
+		(umask 077
+		 cp "$WORK/creds.env" "$CACHE/apple.local.env"
+		 cp "$WORK/cert.p12" "$CACHE/cert.p12"
+		 cp "$WORK/AuthKey.p8" "$CACHE/AuthKey.p8")
+		echo "    saved them to $CACHE for later runs"
+	fi
 fi
 
 # Ephemeral keychain for non-interactive codesigning
