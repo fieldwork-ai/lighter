@@ -409,7 +409,7 @@ proxy_fds() { guest_sh 'for p in $(pidof lighter-agent); do grep -q -- --tcp-pro
 python3 - <<'PY' &
 import socket, struct, threading
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", 18097)); srv.listen(128)
+srv.bind(("0.0.0.0", 18091)); srv.listen(128)
 def serve(c):
     try:
         if c.recv(1) == b"P": c.sendall(b"P")
@@ -422,13 +422,15 @@ while True:
 PY
 RESET_PID=$!
 sleep 1
+kill -0 "$RESET_PID" 2>/dev/null || fail "the resetting server on the Mac did not start"
 before="$(proxy_fds)"
 done_n="$($D run --rm node:24-alpine node -e '
 const net = require("net");
 let n = 0;
+setTimeout(() => { console.log(n); process.exit(0); }, 30000);
 function one() {
-  if (n === 32) { console.log(n); return; }
-  const s = net.connect(18097, "'"$LAN_IP"'", () => s.write("P"));
+  if (n === 32) { console.log(n); process.exit(0); }
+  const s = net.connect(18091, "'"$LAN_IP"'", () => s.write("P"));
   s.once("data", () => s.write("X"));
   s.on("error", () => {}); s.on("close", () => { n++; one(); });
 }
