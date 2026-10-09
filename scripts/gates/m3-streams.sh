@@ -283,6 +283,23 @@ $D run --rm alpine:3.21 nslookup example.com >/dev/null 2>&1 && pass "DNS from a
 got="$($D run --rm alpine:3.21 sh -c 'apk add -q bind-tools >/dev/null 2>&1 && dig +time=5 +tries=1 +short @8.8.8.8 example.com A' 2>/dev/null | grep -c '^[0-9]')"
 [ "${got:-0}" -gt 0 ] && pass "UDP to an external resolver (dig @8.8.8.8)" || fail "external resolver over UDP: dig got nothing"
 $D run --rm alpine:3.21 ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && pass "ICMP from a container" || fail "ping failed"
+# traceroute: the guest and the gateway are hops, and so is the first router
+# beyond the Mac, by UDP probes (busybox's default) and by ICMP (-I). As
+# streams nothing could see a TTL run out, and 0.12 answered no hop at all.
+# The Mac's own first hop is what the third must be.
+first="$(traceroute -n -m 1 -w 2 -q 1 1.1.1.1 2>/dev/null | awk 'NR==2 {print $2}')"
+for how in "" "-I"; do
+	hops="$($D run --rm alpine:3.21 traceroute $how -n -m 3 -w 2 -q 1 1.1.1.1 2>/dev/null | awk 'NR>1 {print $2}' | tr '\n' ' ')"
+	label="traceroute${how:+ $how}"
+	case "$first" in
+	""|"*") want="192.168.127.1 " ;; # the Mac's first hop does not answer it either
+	*) want="192.168.127.1 $first " ;;
+	esac
+	case "$hops" in
+	*"$want"*) pass "$label: the gateway, then the Mac's first hop ($hops)" ;;
+	*) fail "$label found ${hops:-no hops}; wanted ${want% }" ;;
+	esac
+done
 
 # ipv6: a container has an address and a default route of its own either
 # way; with a v6 route on the Mac a v6 destination is reached over TCP, UDP

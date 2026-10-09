@@ -2,6 +2,8 @@
 
 9 October 2026. One harness, the same checks against each runtime, on the same Mac and network, one runtime at a time.
 
+Since: 0.13.0 closes three of the four gaps below: the Mac reaches containers by IP and by name ([design](design-0.13-direct-access.md)), traceroute answers the same hops as from the Mac, and ping to a device on the network works with LAN mode on.
+
 ## Method
 
 - **The Mac under test:** the M5 Ultra Mac Studio (`192.168.50.25` on Wi-Fi, `en1`), with native IPv6 from the router and Tailscale connected. The daily lighter kept running throughout; every test port is in the 40000s.

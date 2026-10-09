@@ -26,6 +26,11 @@ lighter status
 - **macOS may ask whether an app can find devices on your local network** the first time it connects to a container directly, as it does for a printer or a NAS. Apple's own tools, such as `curl`, are exempt.
 - `lighter config --direct off` turns it off.
 
+## Also
+
+- **traceroute works from a container**, by UDP (`traceroute`, the default) and by ICMP (`traceroute -I`, `mtr`): the same route the Mac takes, after two hops inside, the container's bridge and lighter's gateway. Containers' traffic leaves through the Mac as streams, where nothing on the way could see a TTL run out, so traceroute found no hop at all. Probes with a short TTL now go as packets, sent on from the Mac one TTL shorter, and the routers' answers come back to the container, without root.
+- **With LAN mode on, a container on Docker's network pings devices on your network** again. Its echo went out by the LAN card and the reply was turned away there.
+
 ## Upgrading
 
 ```
