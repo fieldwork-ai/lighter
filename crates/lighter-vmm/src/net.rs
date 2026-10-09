@@ -90,6 +90,12 @@ pub struct Counters {
     pub icmp_local: AtomicU64,
     pub icmp_forwarded: AtomicU64,
     pub icmp_replied: AtomicU64,
+    /// Packets whose TTL ran out at the gateway, answered with time
+    /// exceeded; and UDP probes (traceroute's) sent from the Mac.
+    pub expired: AtomicU64,
+    pub probes: AtomicU64,
+    /// Errors from the world (time exceeded, unreachable) passed in.
+    pub icmp_errors: AtomicU64,
     /// Neighbour solicitations for the gateway, answered.
     pub ndp: AtomicU64,
     pub icmp6_local: AtomicU64,
@@ -114,6 +120,9 @@ pub struct Network {
     /// The same for ICMPv6; its replies come back without an IP header,
     /// the source from `recvfrom`.
     icmp6: Option<Arc<OwnedFd>>,
+    /// UDP the guest sends with a short TTL (traceroute's probes), which
+    /// leaves as packets rather than streams.
+    probes: Option<Arc<Probes>>,
     counters: Arc<Counters>,
 }
 
@@ -135,6 +144,13 @@ impl Network {
                 None
             }
         };
+        let probes = match Probes::open() {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                tracing::warn!(%e, "no UDP probe socket; traceroute from a container stops at the gateway");
+                None
+            }
+        };
         tracing::info!(
             gateway = GATEWAY_IP,
             guest = GUEST_IP,
@@ -146,6 +162,7 @@ impl Network {
             mtu,
             icmp,
             icmp6,
+            probes,
             counters: Arc::new(Counters::default()),
         })
     }
@@ -181,6 +198,8 @@ impl Network {
         let responder = Responder {
             icmp: self.icmp.clone(),
             icmp6: self.icmp6.clone(),
+            probes: self.probes.clone(),
+            icmp_ttl: std::sync::atomic::AtomicU8::new(0),
             counters: self.counters.clone(),
         };
         let deliver_inbox = inbox.clone();
@@ -207,8 +226,23 @@ impl Network {
                 }
                 tracing::debug!("network responder stopped");
             })?;
+        if let Some(probes) = &self.probes {
+            let probes = probes.clone();
+            let inbox = inbox.clone();
+            let wake_rx = wake_rx.clone();
+            std::thread::Builder::new()
+                .name("net-probes".into())
+                .spawn(move || {
+                    probes.read_replies(|frame| {
+                        if Net::enqueue_received(&inbox, frame) {
+                            wake_rx();
+                        }
+                    })
+                })?;
+        }
         if let Some(icmp) = &self.icmp {
             let icmp = icmp.clone();
+            let probes = self.probes.clone();
             let counters = self.counters.clone();
             let inbox = inbox.clone();
             let wake_rx = wake_rx.clone();
@@ -229,11 +263,20 @@ impl Network {
                             }
                             break;
                         }
-                        if let Some(frame) = echo_reply_frame(&buf[..n as usize]) {
-                            counters.icmp_replied.fetch_add(1, Ordering::Relaxed);
-                            if Net::enqueue_received(&inbox, frame) {
-                                wake_rx();
+                        let datagram = &buf[..n as usize];
+                        let frame = match echo_reply_frame(datagram) {
+                            Some(frame) => {
+                                counters.icmp_replied.fetch_add(1, Ordering::Relaxed);
+                                Some(frame)
                             }
+                            None => error_frame(datagram, probes.as_deref()).inspect(|_| {
+                                counters.icmp_errors.fetch_add(1, Ordering::Relaxed);
+                            }),
+                        };
+                        if let Some(frame) = frame
+                            && Net::enqueue_received(&inbox, frame)
+                        {
+                            wake_rx();
                         }
                     }
                     tracing::debug!("ICMP reader stopped");
@@ -298,6 +341,9 @@ impl Drop for Network {
 struct Responder {
     icmp: Option<Arc<OwnedFd>>,
     icmp6: Option<Arc<OwnedFd>>,
+    probes: Option<Arc<Probes>>,
+    // The TTL the ICMP socket was last set to, so it is set only on change.
+    icmp_ttl: std::sync::atomic::AtomicU8,
     counters: Arc<Counters>,
 }
 
@@ -318,9 +364,21 @@ impl Responder {
             }
             Some(Seen::IcmpForward) => {
                 if let Some(icmp) = &self.icmp
-                    && forward_echo(icmp.as_raw_fd(), frame)
+                    && forward_echo(icmp.as_raw_fd(), frame, &self.icmp_ttl)
                 {
                     self.counters.icmp_forwarded.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Some(Seen::Expired) => {
+                self.counters.expired.fetch_add(1, Ordering::Relaxed);
+                time_exceeded(frame)
+            }
+            Some(Seen::UdpProbe) => {
+                if let Some(probes) = &self.probes
+                    && probes.send(frame)
+                {
+                    self.counters.probes.fetch_add(1, Ordering::Relaxed);
                 }
                 None
             }
@@ -374,6 +432,12 @@ enum Seen {
     IcmpLocal,
     /// Echo to anywhere else: sent on the host's ICMP socket.
     IcmpForward,
+    /// A packet for beyond the gateway with no TTL left: time exceeded,
+    /// from the gateway, as a router answers.
+    Expired,
+    /// UDP other than DHCP with a short TTL, which init lets through as
+    /// packets rather than streams: traceroute's probes.
+    UdpProbe,
     /// A neighbour solicitation for the v6 gateway: answered here.
     NeighbourSolicit,
     /// ICMPv6 echo to the v6 gateway: answered here.
@@ -437,10 +501,21 @@ fn classify(frame: &[u8]) -> Option<Seen> {
             let ihl = ipv4_header_len(packet);
             match packet[9] {
                 PROTO_UDP => {
-                    let udp = packet.get(ihl..)?;
+                    let udp = packet.get(ihl..ihl + 8)?;
                     let src = u16::from_be_bytes([udp[0], udp[1]]);
                     let dst = u16::from_be_bytes([udp[2], udp[3]]);
-                    (src == DHCP_CLIENT_PORT && dst == DHCP_SERVER_PORT).then_some(Seen::Dhcp)
+                    if src == DHCP_CLIENT_PORT && dst == DHCP_SERVER_PORT {
+                        Some(Seen::Dhcp)
+                    } else if !routable(ipv4_dst(packet)) {
+                        None
+                    } else if packet[8] > PROBE_TTL {
+                        // Escaped the streams: a bug, not a probe.
+                        None
+                    } else if packet[8] <= 1 {
+                        Some(Seen::Expired)
+                    } else {
+                        Some(Seen::UdpProbe)
+                    }
                 }
                 PROTO_ICMP => {
                     let icmp = packet.get(ihl..)?;
@@ -450,6 +525,8 @@ fn classify(frame: &[u8]) -> Option<Seen> {
                     let dst = ipv4_dst(packet);
                     Some(if dst == GATEWAY || dst == HOST_ALIAS {
                         Seen::IcmpLocal
+                    } else if packet[8] <= 1 {
+                        Seen::Expired
                     } else {
                         Seen::IcmpForward
                     })
@@ -623,7 +700,11 @@ fn echo_reply_local(frame: &[u8]) -> Option<Vec<u8>> {
 /// address the guest named. The kernel fills the IP header; the identifier
 /// and sequence travel as they are, which is how the reply finds its way
 /// back into a frame.
-fn forward_echo(fd: libc::c_int, frame: &[u8]) -> bool {
+///
+/// The gateway is a hop: the request leaves the Mac with one less TTL than
+/// it reached the card with, so that traceroute's probes run out where
+/// they would on a network and the routers' errors come back (`error_frame`).
+fn forward_echo(fd: libc::c_int, frame: &[u8], last_ttl: &std::sync::atomic::AtomicU8) -> bool {
     let Some(packet) = ipv4(frame) else {
         return false;
     };
@@ -632,6 +713,7 @@ fn forward_echo(fd: libc::c_int, frame: &[u8]) -> bool {
     if icmp.len() < 8 {
         return false;
     }
+    set_ttl(fd, packet[8].saturating_sub(1), last_ttl);
     let dst = ipv4_dst(packet);
     let addr = libc::sockaddr_in {
         sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
@@ -687,6 +769,277 @@ fn icmp_socket(family: libc::c_int) -> io::Result<OwnedFd> {
     }
     // SAFETY: the descriptor is ours and open.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Sets a socket's TTL when it differs from what it was last set to.
+fn set_ttl(fd: libc::c_int, ttl: u8, last: &std::sync::atomic::AtomicU8) {
+    if last.swap(ttl, Ordering::Relaxed) == ttl {
+        return;
+    }
+    let value = libc::c_int::from(ttl);
+    // SAFETY: an int option on a live socket.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TTL,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Whether the card should send a packet for `dst` on: not the gateway's
+/// own addresses, not multicast or broadcast.
+fn routable(dst: Ipv4Addr) -> bool {
+    dst != GATEWAY
+        && dst != HOST_ALIAS
+        && dst != GUEST
+        && !dst.is_multicast()
+        && !dst.is_broadcast()
+        && !dst.is_unspecified()
+}
+
+// --- Hops (traceroute) -------------------------------------------------------
+//
+// TCP and UDP leave the guest as streams, so nothing on the way can see a
+// TTL run out, and traceroute found no hops at all. The guest's divert rule
+// lets UDP with a short TTL through as packets (init: `ip ttl < 31`); the card
+// is then a hop like any router. A packet that reaches it with nothing left
+// gets time exceeded from the gateway; the rest leave the Mac with one less,
+// and the errors routers send back (macOS hands every ICMP error to an
+// unprivileged ICMP socket, IP header and all) are turned into the errors
+// the guest would have had, quoting what it sent, so that its connection
+// tracking passes them to the container. Echo does the same on the ICMP
+// socket (`forward_echo`).
+
+/// What the guest sent, kept so an error can quote it.
+struct Probe {
+    /// The guest's IP header and the first eight bytes of its UDP.
+    quote: Vec<u8>,
+    src_port: u16,
+    sent: std::time::Instant,
+}
+
+/// The Mac's side of traceroute's UDP: one socket, and the probes it sent
+/// by destination, since each probe goes to a port of its own.
+struct Probes {
+    fd: OwnedFd,
+    port: u16,
+    ttl: std::sync::atomic::AtomicU8,
+    sent: std::sync::Mutex<std::collections::HashMap<(Ipv4Addr, u16), Probe>>,
+}
+
+/// How many probes are remembered, and for how long: traceroute waits a
+/// few seconds per probe and sends at most a few hundred.
+const PROBES_KEPT: usize = 4096;
+/// The most TTL a probe has: init lets UDP below 31 through as packets
+/// (`ip ttl < 31`), and a container's loses one more in the guest.
+const PROBE_TTL: u8 = 30;
+const PROBE_LIFE: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Probes {
+    fn open() -> io::Result<Probes> {
+        // SAFETY: a socket call with constant arguments.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor is ours and open.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        addr.sin_family = libc::AF_INET as u8;
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        // SAFETY: binding to any port on any address, then reading it back
+        // into a sockaddr_in of the length given.
+        unsafe {
+            if libc::bind(
+                fd.as_raw_fd(),
+                (&addr as *const libc::sockaddr_in).cast(),
+                len,
+            ) < 0
+                || libc::getsockname(
+                    fd.as_raw_fd(),
+                    (&mut addr as *mut libc::sockaddr_in).cast(),
+                    &mut len,
+                ) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Probes {
+            fd,
+            port: u16::from_be(addr.sin_port),
+            ttl: std::sync::atomic::AtomicU8::new(0),
+            sent: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Sends a probe the guest transmitted on from the Mac, one TTL less.
+    fn send(&self, frame: &[u8]) -> bool {
+        let Some(packet) = ipv4(frame) else {
+            return false;
+        };
+        let ihl = ipv4_header_len(packet);
+        let Some(udp) = packet.get(ihl..ihl + 8) else {
+            return false;
+        };
+        let (dst, src_port) = (ipv4_dst(packet), u16::from_be_bytes([udp[0], udp[1]]));
+        let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+        let payload = &packet[ihl + 8..];
+        {
+            let mut sent = self.sent.lock().expect("probes poisoned");
+            if sent.len() >= PROBES_KEPT {
+                sent.retain(|_, p| p.sent.elapsed() < PROBE_LIFE);
+                if sent.len() >= PROBES_KEPT {
+                    return false;
+                }
+            }
+            sent.insert(
+                (dst, dst_port),
+                Probe {
+                    quote: packet[..ihl + 8].to_vec(),
+                    src_port,
+                    sent: std::time::Instant::now(),
+                },
+            );
+        }
+        set_ttl(self.fd.as_raw_fd(), packet[8] - 1, &self.ttl);
+        let addr = libc::sockaddr_in {
+            sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            sin_family: libc::AF_INET as u8,
+            sin_port: dst_port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(dst.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: the buffer and the address are valid for the call.
+        let n = unsafe {
+            libc::sendto(
+                self.fd.as_raw_fd(),
+                payload.as_ptr().cast(),
+                payload.len(),
+                0,
+                (&addr as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        n == payload.len() as isize
+    }
+
+    /// What was sent to `dst`:`port` from this socket's `src_port`.
+    fn quote(&self, dst: Ipv4Addr, port: u16, src_port: u16) -> Option<(Vec<u8>, u16)> {
+        if src_port != self.port {
+            return None;
+        }
+        let sent = self.sent.lock().expect("probes poisoned");
+        let probe = sent.get(&(dst, port))?;
+        (probe.sent.elapsed() < PROBE_LIFE).then(|| (probe.quote.clone(), probe.src_port))
+    }
+
+    /// A destination that answers a probe (`traceroute -p 53`, say) is
+    /// answered in the guest as on a network: the reply, to the port the
+    /// probe came from.
+    fn read_replies(&self, mut deliver: impl FnMut(Vec<u8>)) {
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            // SAFETY: a buffer of its length and an address of its size.
+            let n = unsafe {
+                libc::recvfrom(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    (&mut from as *mut libc::sockaddr_in).cast(),
+                    &mut len,
+                )
+            };
+            if n < 0 {
+                match io::Error::last_os_error().kind() {
+                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionRefused => continue,
+                    _ => break,
+                }
+            }
+            let src = Ipv4Addr::from(u32::from_be(from.sin_addr.s_addr));
+            let src_port = u16::from_be(from.sin_port);
+            if let Some((_, guest_port)) = self.quote(src, src_port, self.port) {
+                deliver(udp_frame(
+                    GUEST_MAC,
+                    src,
+                    GUEST,
+                    src_port,
+                    guest_port,
+                    &buf[..n as usize],
+                ));
+            }
+        }
+        tracing::debug!("probe reader stopped");
+    }
+}
+
+/// Time exceeded, from the gateway, for a packet that reached it with no
+/// TTL to go on: its header and first eight bytes quoted.
+fn time_exceeded(frame: &[u8]) -> Option<Vec<u8>> {
+    let packet = ipv4(frame)?;
+    let ihl = ipv4_header_len(packet);
+    let quote = packet.get(..ihl + 8)?;
+    Some(icmp_error_frame(GATEWAY, 11, 0, quote))
+}
+
+/// An ICMP error to the guest, from `from`, quoting `quote`.
+fn icmp_error_frame(from: Ipv4Addr, kind: u8, code: u8, quote: &[u8]) -> Vec<u8> {
+    let mut icmp = vec![kind, code, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(quote);
+    let sum = checksum(&icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    ipv4_frame(GUEST_MAC, from, GUEST, PROTO_ICMP, 64, &icmp)
+}
+
+/// An error a router or the destination sent the Mac about something the
+/// card sent on (time exceeded, unreachable), as the guest would have had
+/// it: about an echo, with the quoted header's source made the guest's;
+/// about a probe, quoting the probe as the guest sent it. Anything else it
+/// says nothing about.
+fn error_frame(datagram: &[u8], probes: Option<&Probes>) -> Option<Vec<u8>> {
+    if datagram.first()? >> 4 != 4 {
+        return None;
+    }
+    let outer = ipv4_header_len(datagram);
+    let from = ipv4_src(datagram);
+    let icmp = datagram.get(outer..)?;
+    let (kind, code) = (*icmp.first()?, *icmp.get(1)?);
+    if kind != 3 && kind != 11 {
+        return None;
+    }
+    let inner = icmp.get(8..)?;
+    if inner.len() < 20 || inner[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = ipv4_header_len(inner);
+    let first8 = inner.get(ihl..ihl + 8)?;
+    let dst = ipv4_dst(inner);
+    match inner[9] {
+        PROTO_ICMP if first8[0] == 8 => {
+            let mut quote = inner[..ihl + 8].to_vec();
+            quote[12..16].copy_from_slice(&GUEST.octets());
+            quote[10] = 0;
+            quote[11] = 0;
+            let sum = checksum(&quote[..ihl]);
+            quote[10..12].copy_from_slice(&sum.to_be_bytes());
+            Some(icmp_error_frame(from, kind, code, &quote))
+        }
+        PROTO_UDP => {
+            let src_port = u16::from_be_bytes([first8[0], first8[1]]);
+            let dst_port = u16::from_be_bytes([first8[2], first8[3]]);
+            let (quote, _) = probes?.quote(dst, dst_port, src_port)?;
+            Some(icmp_error_frame(from, kind, code, &quote))
+        }
+        _ => None,
+    }
 }
 
 // --- IPv6 --------------------------------------------------------------------
@@ -1255,4 +1608,92 @@ mod tests {
     fn the_guest_mac_is_the_one_the_lease_is_keyed_on() {
         assert_eq!(GUEST_MAC, [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
     }
+
+    fn with_ttl(mut frame: Vec<u8>, ttl: u8) -> Vec<u8> {
+        frame[14 + 8] = ttl;
+        frame[24] = 0;
+        frame[25] = 0;
+        let sum = checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&sum.to_be_bytes());
+        frame
+    }
+
+    fn guest_udp(dst: Ipv4Addr, src_port: u16, dst_port: u16, ttl: u8) -> Vec<u8> {
+        let mut f = udp_frame(GATEWAY_MAC, GUEST, dst, src_port, dst_port, b"probe");
+        f[6..12].copy_from_slice(&GUEST_MAC);
+        with_ttl(f, ttl)
+    }
+
+    const FAR: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+    const ROUTER: Ipv4Addr = Ipv4Addr::new(192, 168, 50, 1);
+    const MAC_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 50, 25);
+
+    #[test]
+    fn a_short_ttl_is_a_hop_and_udp_is_only_a_probe() {
+        assert_eq!(classify(&guest_udp(FAR, 40000, 33434, 1)), Some(Seen::Expired));
+        assert_eq!(classify(&guest_udp(FAR, 40000, 33434, 5)), Some(Seen::UdpProbe));
+        assert_eq!(classify(&guest_udp(Ipv4Addr::new(239, 255, 255, 250), 40000, 1900, 2)), None);
+        assert_eq!(classify(&with_ttl(echo_request(FAR, 7, 1, b"x"), 1)), Some(Seen::Expired));
+        assert_eq!(classify(&with_ttl(echo_request(FAR, 7, 1, b"x"), 9)), Some(Seen::IcmpForward));
+        assert_eq!(classify(&with_ttl(echo_request(GATEWAY, 7, 1, b"x"), 1)), Some(Seen::IcmpLocal));
+    }
+
+    #[test]
+    fn time_exceeded_comes_from_the_gateway_quoting_the_packet() {
+        let probe = guest_udp(FAR, 40000, 33434, 1);
+        let reply = time_exceeded(&probe).unwrap();
+        let packet = ipv4(&reply).unwrap();
+        assert_eq!((ipv4_src(packet), ipv4_dst(packet), packet[9]), (GATEWAY, GUEST, PROTO_ICMP));
+        let icmp = &packet[20..];
+        assert_eq!((icmp[0], icmp[1]), (11, 0));
+        assert_eq!(checksum(icmp), 0);
+        assert_eq!(&icmp[8..], &probe[14..14 + 28], "the guest's header and eight bytes");
+    }
+
+    /// What macOS hands the ICMP socket: the router's IP header, its ICMP
+    /// error, and the Mac's own packet quoted.
+    fn router_error(kind: u8, quoted_proto: u8, first8: &[u8]) -> Vec<u8> {
+        let mut inner = ipv4_frame(GATEWAY_MAC, MAC_ADDR, FAR, quoted_proto, 1, first8)[14..].to_vec();
+        inner.truncate(28);
+        let mut icmp = vec![kind, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&inner);
+        ipv4_frame(GATEWAY_MAC, ROUTER, MAC_ADDR, PROTO_ICMP, 250, &icmp)[14..].to_vec()
+    }
+
+    #[test]
+    fn a_routers_error_about_an_echo_reaches_the_guest_as_its_own() {
+        let echo = [8, 0, 0x12, 0x34, 0, 7, 0, 1];
+        let frame = error_frame(&router_error(11, PROTO_ICMP, &echo), None).unwrap();
+        let packet = ipv4(&frame).unwrap();
+        assert_eq!((ipv4_src(packet), ipv4_dst(packet)), (ROUTER, GUEST));
+        let icmp = &packet[20..];
+        assert_eq!(icmp[0], 11);
+        assert_eq!(checksum(icmp), 0);
+        let quoted = &icmp[8..];
+        assert_eq!((ipv4_src(quoted), ipv4_dst(quoted)), (GUEST, FAR));
+        assert_eq!(checksum(&quoted[..20]), 0, "the quoted header's checksum is redone");
+        assert_eq!(&quoted[20..28], &echo);
+    }
+
+    #[test]
+    fn a_routers_error_about_a_probe_quotes_what_the_guest_sent() {
+        let probes = Probes::open().unwrap();
+        let probe = guest_udp(FAR, 40001, 33435, 4);
+        // Recorded as `send` records it, without sending.
+        probes.sent.lock().unwrap().insert(
+            (FAR, 33435),
+            Probe { quote: probe[14..14 + 28].to_vec(), src_port: 40001, sent: std::time::Instant::now() },
+        );
+        let mut udp = probes.port.to_be_bytes().to_vec();
+        udp.extend_from_slice(&33435u16.to_be_bytes());
+        udp.extend_from_slice(&[0, 13, 0, 0]);
+        let frame = error_frame(&router_error(11, PROTO_UDP, &udp), Some(&probes)).unwrap();
+        let icmp = &ipv4(&frame).unwrap()[20..];
+        assert_eq!(&icmp[8..], &probe[14..14 + 28]);
+        // Another socket's datagram to the same place is not ours.
+        let mut other = (probes.port ^ 1).to_be_bytes().to_vec();
+        other.extend_from_slice(&udp[2..]);
+        assert!(error_frame(&router_error(11, PROTO_UDP, &other), Some(&probes)).is_none());
+    }
+
 }

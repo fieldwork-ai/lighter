@@ -848,6 +848,11 @@ table inet lighter {
 		# of its own for the route: the agent's socket carries 0x4c494e42,
 		# and a route on that would send its own packets to lo too.
 		ct direction reply ct mark 0x4c494e42 meta mark set 0x4c494e43 accept
+		# traceroute's probes, UDP with a short TTL, go on as packets: as
+		# streams nothing on the way could see the TTL run out. The card
+		# is a hop that sends them on from the Mac and passes the routers'
+		# errors back (crates/lighter-vmm/src/net.rs, PROBE_TTL).
+		meta l4proto udp ip ttl < 31 fib daddr type unicast accept
 		meta l4proto udp udp dport != { 67, 68 } iifname != "eth1" fib daddr oifname { "eth0", "eth1" } tproxy ip to :15202 meta mark set 0x1 accept
 		meta l4proto udp udp dport != { 546, 547 } iifname != "eth1" fib daddr oifname { "eth0", "eth1" } tproxy ip6 to :15202 meta mark set 0x1 accept
 	}
@@ -971,6 +976,10 @@ table inet lighter_lan {
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
 		iifname "eth1" ct status dnat $forwarded
+		# What answers a container's own packets: a ping's reply, a
+		# router's error to its traceroute. Without it a bridge
+		# container's ping to a device on the LAN went unanswered.
+		iifname "eth1" ct state established,related accept
 		iifname "eth1" counter drop
 	}
 }
