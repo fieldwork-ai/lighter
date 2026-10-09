@@ -58,6 +58,7 @@ online() { route -n get default >/dev/null 2>&1 && $CURL -s -m 3 -o /dev/null ht
 
 echo "==> A machine with containers"
 [ "${LIGHTER_GATE_LAN:-}" = 1 ] && "$LIGHTER" config --lan on >/dev/null
+"$LIGHTER" config --direct on >/dev/null
 "$LIGHTER" start >/dev/null 2>&1 || { fail "lighter start failed"; exit 1; }
 docker pull -q alpine:3.21 >/dev/null 2>&1
 docker pull -q python:3.12-slim >/dev/null 2>&1

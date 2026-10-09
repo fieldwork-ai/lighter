@@ -364,6 +364,11 @@ pub fn run() -> Vec<Finding> {
                     },
                 ),
             });
+        } else {
+            findings.push(Finding::good(
+                "direct access",
+                "off: `lighter config --direct on` reaches containers at their own addresses and as NAME.lighter.local",
+            ));
         }
         findings.push(if report.unforwarded.is_empty() {
             Finding::good("published ports", "all forwarded")

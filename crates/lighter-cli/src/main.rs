@@ -199,7 +199,9 @@ enum Command {
         #[arg(long, value_name = "ADDRESS")]
         lan_address: Option<String>,
         /// Whether the Mac reaches containers directly, at their own
-        /// addresses and as `name.lighter.local` (`on`, the default, or `off`).
+        /// addresses and as `name.lighter.local` (`on`, or `off`, the
+        /// default). While on, macOS's packet filter runs for the whole Mac,
+        /// which costs some throughput everywhere.
         #[arg(long, value_enum)]
         direct: Option<config::Toggle>,
         /// The /16 containers' addresses come from, for reaching them

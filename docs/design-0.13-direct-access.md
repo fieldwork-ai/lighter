@@ -28,6 +28,10 @@ Containers resolve the names too: their DNS is the Mac's resolver.
 
 Nothing but the Mac is on the link. Another device has no route to `S` (checked from the M1: its route is the router's), and the names are answered only on the link, so its own query gets nothing.
 
+## Off by default: macOS's packet filter
+
+Any vmnet host network turns macOS's packet filter (pf) on for the whole Mac while it is up: `pfctl -s info` reads Enabled the moment one starts, with Apple's Internet Sharing anchors, and Disabled again once it stops. The macOS 26 configuration API with NAT44, NAT66, DHCP, the DNS proxy and router advertisements all disabled turns it on just the same; a bridged vmnet interface (LAN mode) does not. OrbStack's network turns it on too. pf then sees every packet on the Mac, loopback included. Measured on the M5 Ultra (2026-10-09), interleaved, three rounds: a container's published port to the Mac fell from 95-105 Gb/s to 70-86, the Mac to a container from 72-82 to 72-75, and native loopback between two Mac programs, nothing of lighter's involved, from 131 to 88 Gb/s with a vmnet interface of another process's up. A container reached through the link runs at about 6 Gb/s (the relay, 1500-byte frames) against 41 through a published port for the same download. So direct access is a setting, off unless asked for (`lighter config --direct on`): every other feature here works without it.
+
 ## Limits
 
 - Networks made before 0.13, or with a subnet of their own, are outside `S`; `lighter status` and `doctor` list them. Recreating a Compose project puts it inside.

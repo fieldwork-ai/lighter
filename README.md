@@ -198,7 +198,7 @@ docker run --rm --device lighter.sh/metal=all -v ./models:/models llama-cpp-rpc 
 
 - **Docker and Compose:** a registered Docker context; `docker`, `docker compose` and third-party tooling work unchanged.
 - **Kubernetes with kind:** single- and multi-node clusters with `kind`, `kubectl` and `helm`. See the [Kubernetes guide](docs/kubernetes.md).
-- **Containers by address and name:** the Mac reaches every container at its own IP, or as `web.lighter.local` (`db.shop.lighter.local` for a Compose service), with no port published and no root. See the [0.13.0 release notes](docs/release-notes-0.13.0.md).
+- **Containers by address and name:** with `lighter config --direct on`, the Mac reaches every container at its own IP, or as `web.lighter.local` (`db.shop.lighter.local` for a Compose service), with no port published and no root. See the [0.13.0 release notes](docs/release-notes-0.13.0.md).
 - **Ports and IPv6:** published ports (`-p 8080:80`) bind on the Mac; IPv6 wherever the Mac has it.
 - **Shared folders that behave:** changes on either side seen in milliseconds.
 - **Cooperative resources (experimental):** `lighter config --resources cooperative` uses every core and grows memory as containers need it, up to twice the Mac's RAM, giving it back when they stop. See the [0.10.0 release notes](docs/release-notes-0.10.0.md).

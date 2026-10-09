@@ -250,17 +250,6 @@ pub fn machine() -> anyhow::Result<()> {
     {
         cmdline.push_str(" lighter.nosockmap");
     }
-    // `LIGHTER_CMDLINE_EXTRA`: words appended to the guest's command line,
-    // for an A/B of an agent or kernel knob on a machine run from the CLI
-    // (the benchmark harness has the same).
-    if let Ok(extra) = std::env::var("LIGHTER_CMDLINE_EXTRA") {
-        let extra = extra.trim();
-        if !extra.is_empty() {
-            cmdline.push(' ');
-            cmdline.push_str(extra);
-        }
-    }
-
     // LAN mode: a second card bridged to one of the Mac's, so the machine
     // is on the user's network (`lan.rs`). A machine that cannot bridge
     // starts without it, and `lighter status` and `doctor` say why.
@@ -314,6 +303,18 @@ pub fn machine() -> anyhow::Result<()> {
         crate::config::Publish::Lan => " lighter.publish=lan",
         crate::config::Publish::Localhost => " lighter.publish=localhost",
     });
+
+    // `LIGHTER_CMDLINE_EXTRA`: words appended to the guest's command line,
+    // for an A/B of an agent or kernel knob on a machine run from the CLI
+    // (the benchmark harness has the same). Last, so that a word here
+    // overrides one lighter set: init takes the last of each.
+    if let Ok(extra) = std::env::var("LIGHTER_CMDLINE_EXTRA") {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(extra);
+        }
+    }
 
     // Fixed boots with all of it; native boots on a base and plugs the rest
     // in as the host offers it (`lighter_vmm::virtio::mem`).

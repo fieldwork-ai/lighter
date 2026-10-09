@@ -76,7 +76,10 @@ pub struct Config {
     pub lan_address: String,
     /// Whether the Mac reaches containers directly, at their own addresses
     /// and as `name.lighter.local`, over a network of the Mac and the
-    /// machine alone (`link.rs`, 0.13). On by default.
+    /// machine alone (`link.rs`, 0.13). Off by default: a vmnet host network
+    /// has macOS turn its packet filter on for the whole Mac while it is up,
+    /// which costs every app's loopback a third of its throughput and
+    /// lighter's published ports 15-20% (measured 2026-10-09).
     pub direct: bool,
     /// The /16 that network and Docker's networks are on: empty for the
     /// one chosen when it was first made.
@@ -177,7 +180,7 @@ impl Default for Config {
             lan: false,
             lan_interface: "auto".into(),
             lan_address: String::new(),
-            direct: true,
+            direct: false,
             direct_subnet: String::new(),
         }
     }

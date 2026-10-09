@@ -2,7 +2,7 @@
 
 9 October 2026. One harness, the same checks against each runtime, on the same Mac and network, one runtime at a time.
 
-Since: 0.13.0 closes three of the four gaps below: the Mac reaches containers by IP and by name ([design](design-0.13-direct-access.md)), traceroute answers the same hops as from the Mac, and ping to a device on the network works with LAN mode on.
+Since: 0.13.0 closes the four gaps below: the Mac reaches containers by IP and by name, as a setting ([design](design-0.13-direct-access.md), which says why it is one), a host-network container's `localhost` is the Mac's, traceroute answers the same hops as from the Mac, and ping to a device on the network works with LAN mode on.
 
 ## Method
 

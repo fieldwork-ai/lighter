@@ -72,6 +72,7 @@ PY
 ip_of() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$1" | awk '{print $1}'; }
 
 echo "==> A machine with the link"
+"$LIGHTER" config --direct on >/dev/null
 "$LIGHTER" start >/dev/null 2>&1 || { fail "lighter start failed"; "$LIGHTER" logs | tail -15; exit 1; }
 docker pull -q python:3.12-slim >/dev/null 2>&1
 docker pull -q alpine:3.21 >/dev/null 2>&1
