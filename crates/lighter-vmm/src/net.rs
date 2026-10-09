@@ -1630,12 +1630,35 @@ mod tests {
 
     #[test]
     fn a_short_ttl_is_a_hop_and_udp_is_only_a_probe() {
-        assert_eq!(classify(&guest_udp(FAR, 40000, 33434, 1)), Some(Seen::Expired));
-        assert_eq!(classify(&guest_udp(FAR, 40000, 33434, 5)), Some(Seen::UdpProbe));
-        assert_eq!(classify(&guest_udp(Ipv4Addr::new(239, 255, 255, 250), 40000, 1900, 2)), None);
-        assert_eq!(classify(&with_ttl(echo_request(FAR, 7, 1, b"x"), 1)), Some(Seen::Expired));
-        assert_eq!(classify(&with_ttl(echo_request(FAR, 7, 1, b"x"), 9)), Some(Seen::IcmpForward));
-        assert_eq!(classify(&with_ttl(echo_request(GATEWAY, 7, 1, b"x"), 1)), Some(Seen::IcmpLocal));
+        assert_eq!(
+            classify(&guest_udp(FAR, 40000, 33434, 1)),
+            Some(Seen::Expired)
+        );
+        assert_eq!(
+            classify(&guest_udp(FAR, 40000, 33434, 5)),
+            Some(Seen::UdpProbe)
+        );
+        assert_eq!(
+            classify(&guest_udp(
+                Ipv4Addr::new(239, 255, 255, 250),
+                40000,
+                1900,
+                2
+            )),
+            None
+        );
+        assert_eq!(
+            classify(&with_ttl(echo_request(FAR, 7, 1, b"x"), 1)),
+            Some(Seen::Expired)
+        );
+        assert_eq!(
+            classify(&with_ttl(echo_request(FAR, 7, 1, b"x"), 9)),
+            Some(Seen::IcmpForward)
+        );
+        assert_eq!(
+            classify(&with_ttl(echo_request(GATEWAY, 7, 1, b"x"), 1)),
+            Some(Seen::IcmpLocal)
+        );
     }
 
     #[test]
@@ -1643,17 +1666,25 @@ mod tests {
         let probe = guest_udp(FAR, 40000, 33434, 1);
         let reply = time_exceeded(&probe).unwrap();
         let packet = ipv4(&reply).unwrap();
-        assert_eq!((ipv4_src(packet), ipv4_dst(packet), packet[9]), (GATEWAY, GUEST, PROTO_ICMP));
+        assert_eq!(
+            (ipv4_src(packet), ipv4_dst(packet), packet[9]),
+            (GATEWAY, GUEST, PROTO_ICMP)
+        );
         let icmp = &packet[20..];
         assert_eq!((icmp[0], icmp[1]), (11, 0));
         assert_eq!(checksum(icmp), 0);
-        assert_eq!(&icmp[8..], &probe[14..14 + 28], "the guest's header and eight bytes");
+        assert_eq!(
+            &icmp[8..],
+            &probe[14..14 + 28],
+            "the guest's header and eight bytes"
+        );
     }
 
     /// What macOS hands the ICMP socket: the router's IP header, its ICMP
     /// error, and the Mac's own packet quoted.
     fn router_error(kind: u8, quoted_proto: u8, first8: &[u8]) -> Vec<u8> {
-        let mut inner = ipv4_frame(GATEWAY_MAC, MAC_ADDR, FAR, quoted_proto, 1, first8)[14..].to_vec();
+        let mut inner =
+            ipv4_frame(GATEWAY_MAC, MAC_ADDR, FAR, quoted_proto, 1, first8)[14..].to_vec();
         inner.truncate(28);
         let mut icmp = vec![kind, 0, 0, 0, 0, 0, 0, 0];
         icmp.extend_from_slice(&inner);
@@ -1671,7 +1702,11 @@ mod tests {
         assert_eq!(checksum(icmp), 0);
         let quoted = &icmp[8..];
         assert_eq!((ipv4_src(quoted), ipv4_dst(quoted)), (GUEST, FAR));
-        assert_eq!(checksum(&quoted[..20]), 0, "the quoted header's checksum is redone");
+        assert_eq!(
+            checksum(&quoted[..20]),
+            0,
+            "the quoted header's checksum is redone"
+        );
         assert_eq!(&quoted[20..28], &echo);
     }
 
@@ -1682,7 +1717,11 @@ mod tests {
         // Recorded as `send` records it, without sending.
         probes.sent.lock().unwrap().insert(
             (FAR, 33435),
-            Probe { quote: probe[14..14 + 28].to_vec(), src_port: 40001, sent: std::time::Instant::now() },
+            Probe {
+                quote: probe[14..14 + 28].to_vec(),
+                src_port: 40001,
+                sent: std::time::Instant::now(),
+            },
         );
         let mut udp = probes.port.to_be_bytes().to_vec();
         udp.extend_from_slice(&33435u16.to_be_bytes());
@@ -1695,5 +1734,4 @@ mod tests {
         other.extend_from_slice(&udp[2..]);
         assert!(error_frame(&router_error(11, PROTO_UDP, &other), Some(&probes)).is_none());
     }
-
 }
