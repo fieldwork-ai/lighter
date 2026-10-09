@@ -1,6 +1,6 @@
 # lighter 0.13.0
 
-Your Mac now reaches every container directly, at its own address and by name, with no port published and nothing to install:
+Your Mac now reaches every container directly, at its own address and by name, with no port published and nothing to install; a host-network container's `localhost` is your Mac's; and containers see your Mac's DNS for every kind of record:
 
 ```
 docker run -d --name web nginx
@@ -25,6 +25,11 @@ lighter status
 - **Networks you made before upgrading keep their old addresses** (`172.x`), so the Mac reaches their containers by published ports only, as before, until you make them again: `docker compose down` then `docker compose up` for a Compose project. `lighter status` and `lighter doctor` list any such networks. The same applies to a network you create with a subnet of your own.
 - **macOS may ask whether an app can find devices on your local network** the first time it connects to a container directly, as it does for a printer or a NAS. Apple's own tools, such as `curl`, are exempt.
 - `lighter config --direct off` turns it off.
+
+## And
+
+- **`localhost` in a host-network container reaches your Mac.** A container with `network_mode: host` that connects to `localhost:5432` reaches the database on your Mac, as it would if it ran on the Mac itself, over IPv4 and IPv6. A port something in lighter listens on (another host-network container, a published port) still goes there first, as on Linux, and a port nobody listens on, anywhere, is refused straight away, so `nc -z` and wait-for-port checks keep telling the truth. Containers on Docker's own networks keep a `localhost` of their own, as always; they reach the Mac at `host.docker.internal`.
+- **Every DNS record type comes from your Mac's resolver.** Addresses always did, so a VPN's internal names, `/etc/resolver` files and `.local` names already worked in containers. TXT, SRV, MX, PTR and the rest went straight to your network's nameserver, which knows none of those: now they get the same answers as the Mac. A VPN's internal SRV records resolve, and a container can browse the services on your network by DNS-SD (`dig PTR _services._dns-sd._udp.local`).
 
 ## Also
 

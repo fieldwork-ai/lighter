@@ -384,6 +384,24 @@ for _ in $(seq 1 20); do
 done
 [ "$got" = "<!DOCTYPE HTML>" ] && pass "a port a host-network container listens on stays in the guest" || fail "127.0.0.1:18127 did not reach the guest's own server: '${got}'"
 $D rm -f m3-hostlo2 >/dev/null 2>&1
+# Nobody listens on this port, in the guest or on the Mac: refused, as it
+# would be on the Mac, not accepted and then dropped, which a port check
+# (`nc -z`, a wait-for-it loop) would read as up.
+free="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+got="$($D run --rm --network host python:3.12-slim python3 -c "
+import socket
+for host in ('127.0.0.1', '::1'):
+    s = socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET)
+    s.settimeout(5)
+    try:
+        s.connect((host, $free)); print('accepted', end=' ')
+    except ConnectionRefusedError:
+        print('refused', end=' ')
+    except Exception as e:
+        print(type(e).__name__, end=' ')
+" 2>&1)"
+[ "$got" = "refused refused " ] && pass "a localhost port nobody listens on is refused, both families" \
+	|| fail "a localhost port nobody listens on: ${got:-nothing} (wanted refused, refused)"
 if $D run --rm alpine:3.21 wget -q -T 3 -O - "http://127.0.0.1:$lo4/" >/dev/null 2>&1; then
 	fail "a bridge container reached the Mac's loopback through its own localhost"
 else

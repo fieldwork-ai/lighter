@@ -11,6 +11,7 @@
 //! resolver has no API for those.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -109,8 +110,14 @@ pub fn answer(
 ) -> Option<Vec<u8>> {
     let q = parse_question(&query)?;
     if q.qclass != CLASS_IN || (q.qtype != TYPE_A && q.qtype != TYPE_AAAA) {
-        // Forwarded raw to the Mac's nameserver, answered whenever it does.
-        forward_raw(query, id, deliver);
+        // The Mac's resolver, for any type; raw to its nameserver only when
+        // the resolver cannot say.
+        crate::workers::run("dns-records", crate::qos::CONNECTION_STACK, move || {
+            match crate::sysdns::query(&q.name, q.qtype, q.qclass, Duration::from_secs(5)) {
+                Some(answer) => deliver(id, records_reply(&query, &q, answer)),
+                None => forward_raw(query, id, deliver),
+            }
+        });
         return None;
     }
     let want_v6 = q.qtype == TYPE_AAAA;
@@ -146,8 +153,90 @@ fn resolve_local(name: &str, want_v6: bool) -> Result<Vec<IpAddr>, ()> {
         } else {
             vec![GATEWAY.into()]
         }),
-        _ => Err(()),
+        name => match loopback_question(name) {
+            Some(port) => Ok(if loopback_in_use(port, want_v6) {
+                vec![if want_v6 {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                } else {
+                    Ipv4Addr::LOCALHOST.into()
+                }]
+            } else {
+                Vec::new()
+            }),
+            None => Err(()),
+        },
     }
+}
+
+/// The guest agent's question about the Mac's loopback (its `loopback.rs`):
+/// `<port>.tcp.loopback.lighter.internal`.
+fn loopback_question(name: &str) -> Option<u16> {
+    name.strip_suffix(".tcp.loopback.lighter.internal")?
+        .parse()
+        .ok()
+        .filter(|port| *port != 0)
+}
+
+/// Whether something on the Mac holds its loopback address at `port`,
+/// which is what a listener there does: a bind of the address, without
+/// `SO_REUSEADDR`, fails with "in use". Nothing connects, so a server sees
+/// only the connection the guest then makes. A listener on the wildcard
+/// holds loopback too, and a dual-stack one both families'.
+fn loopback_in_use(port: u16, v6: bool) -> bool {
+    let (family, addr): (libc::c_int, SocketAddr) = if v6 {
+        (libc::AF_INET6, (std::net::Ipv6Addr::LOCALHOST, port).into())
+    } else {
+        (libc::AF_INET, (Ipv4Addr::LOCALHOST, port).into())
+    };
+    // SAFETY: a socket call with constant arguments.
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return true;
+    }
+    // SAFETY: the descriptor is ours.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let bound = match addr {
+        SocketAddr::V4(a) => {
+            let sin = libc::sockaddr_in {
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as u8,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(a.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: a sockaddr_in of its size, on a live socket.
+            unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    (&sin as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(a) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as u8,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: a.ip().octets(),
+                },
+                sin6_scope_id: 0,
+            };
+            // SAFETY: a sockaddr_in6 of its size, on a live socket.
+            unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    (&sin6 as *const libc::sockaddr_in6).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    bound != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EADDRINUSE)
 }
 
 /// A non-address question, sent raw to the Mac's nameserver on a socket of
@@ -244,6 +333,44 @@ fn reply(query: &[u8], q: &Question, addrs: &[IpAddr], rcode: u8) -> Vec<u8> {
             }
         }
     }
+    out
+}
+
+/// A reply carrying what the Mac's resolver said about a question of any
+/// type: its records, each under its own name (a CNAME's target's records
+/// are not the question's), or none.
+fn records_reply(query: &[u8], q: &Question, answer: crate::sysdns::Answer) -> Vec<u8> {
+    let (records, rcode) = match answer {
+        crate::sysdns::Answer::Records(r) => (r, 0),
+        crate::sysdns::Answer::NoData => (Vec::new(), 0),
+        crate::sysdns::Answer::NoName => (Vec::new(), 3),
+    };
+    let mut answers = Vec::new();
+    let mut count = 0u16;
+    for r in &records {
+        let Some(name) = crate::sysdns::wire_name(&r.name) else {
+            continue;
+        };
+        if r.rdata.len() > u16::MAX as usize {
+            continue;
+        }
+        answers.extend_from_slice(&name);
+        answers.extend_from_slice(&r.rtype.to_be_bytes());
+        answers.extend_from_slice(&q.qclass.to_be_bytes());
+        answers.extend_from_slice(&r.ttl.to_be_bytes());
+        answers.extend_from_slice(&(r.rdata.len() as u16).to_be_bytes());
+        answers.extend_from_slice(&r.rdata);
+        count += 1;
+    }
+    let mut out = Vec::with_capacity(q.end + answers.len());
+    out.extend_from_slice(&query[..2]);
+    out.push(0x80 | (query[2] & 0x01));
+    out.push(0x80 | (rcode & 0x0f));
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&query[12..q.end]);
+    out.extend_from_slice(&answers);
     out
 }
 
@@ -363,5 +490,40 @@ mod tests {
             vec![IpAddr::V4(GATEWAY)]
         );
         assert!(resolve("host.docker.internal", true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_macs_loopback_is_in_use_where_something_listens() {
+        assert_eq!(loopback_question("5432.tcp.loopback.lighter.internal"), Some(5432));
+        assert_eq!(loopback_question("0.tcp.loopback.lighter.internal"), None);
+        assert_eq!(loopback_question("x.tcp.loopback.lighter.internal"), None);
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        assert!(loopback_in_use(port, false));
+        assert!(!loopback_in_use(port, true), "a v4 listener does not hold ::1");
+        drop(v4);
+        assert!(!loopback_in_use(port, false));
+        let wild = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        assert!(loopback_in_use(wild.local_addr().unwrap().port(), false), "the wildcard holds loopback");
+    }
+
+    #[test]
+    fn records_of_any_type_are_answered_under_their_own_names() {
+        let mut query = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x04mail\x07example\x03com\x00");
+        query.extend_from_slice(&[0, 15, 0, 1]); // MX
+        let q = parse_question(&query).unwrap();
+        let answer = crate::sysdns::Answer::Records(vec![
+            crate::sysdns::Record { name: "mail.example.com".into(), rtype: 5, ttl: 30, rdata: b"\x02mx\x07example\x03com\x00".to_vec() },
+            crate::sysdns::Record { name: "mx.example.com".into(), rtype: 15, ttl: 60, rdata: b"\x00\x0a\x02mx\x07example\x03com\x00".to_vec() },
+        ]);
+        let reply = records_reply(&query, &q, answer);
+        assert_eq!(&reply[..2], &[0xab, 0xcd]);
+        assert_eq!(reply[3] & 0x0f, 0);
+        assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 2);
+        let second = reply.windows(16).position(|w| w == b"\x02mx\x07example\x03com\x00\x00\x0f".get(..16).unwrap());
+        assert!(second.is_some(), "the MX under the CNAME's target");
+        let none = records_reply(&query, &q, crate::sysdns::Answer::NoName);
+        assert_eq!((none[3] & 0x0f, u16::from_be_bytes([none[6], none[7]])), (3, 0));
     }
 }

@@ -817,6 +817,18 @@ table inet lighter {
 	# listeners.rs): every port until the agent's first look, so nothing
 	# goes to the Mac on a guess.
 	set local_tcp { type inet_service; flags interval; elements = { 0-65535 } }
+	# The SYN of a connection the redirect below would carry to the Mac's
+	# loopback waits while the agent asks the Mac whether anything there
+	# listens (loopback.rs): refused here with a reset if not, so the client
+	# sees "connection refused" rather than a connection that then drops.
+	# With no agent on the queue, `bypass` lets it through.
+	chain loopback {
+		type filter hook output priority dstnat - 20; policy accept;
+		meta mark 0x4c4f4f52 reject with tcp reset
+		meta mark 0x4c494e42 accept
+		ip daddr 127.0.0.0/8 tcp flags & (syn | ack) == syn tcp dport != @local_tcp queue num 7 bypass
+		ip6 daddr ::1 tcp flags & (syn | ack) == syn tcp dport != @local_tcp queue num 7 bypass
+	}
 	chain prerouting {
 		type nat hook prerouting priority dstnat - 10; policy accept;
 		meta l4proto tcp iifname != "eth1" fib daddr oifname { "eth0", "eth1" } redirect to :15201

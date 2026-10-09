@@ -34,3 +34,13 @@ Nothing but the Mac is on the link. Another device has no route to `S` (checked 
 - IPv4 only. Containers' IPv6 still leaves through the streams.
 - macOS's Local Network privacy covers the link as it covers any local network: an app it has not asked about gets `EHOSTUNREACH` (Homebrew's Python did), and Apple's own tools are exempt.
 - An address in `S` that nothing has times out from the Mac (no ARP reply) rather than failing at once.
+
+## Also in 0.13
+
+**traceroute** (`crates/lighter-vmm/src/net.rs`, the hops section). UDP with a TTL under 31 skips the streams (init's divert rule) and reaches the card as packets; the card is a router hop: time exceeded from the gateway for a packet with nothing left, otherwise sent on from the Mac one TTL shorter (a UDP socket for probes, the ICMP socket for echo), and the errors macOS hands every unprivileged ICMP socket (checked: time exceeded for both echo and UDP probes, IP header included) turned into the errors the guest would have had, quoting what it sent, so its connection tracking passes them to the container. Full-TTL UDP reaching the card is still dropped: it means something escaped the streams.
+
+**LAN mode's forward chain** accepts what answers a container's own packets (`ct state established,related`); a bridge container's ping to a LAN device left by `eth1` and its reply was dropped.
+
+**localhost for host-network containers** (`guest/agent/src/loopback.rs`, `listeners.rs`). Init redirects a connection to `127.0.0.0/8` or `::1` to the agent, and so to the Mac's loopback, on a port in no guest listener's set (`local_tcp`, kept by the agent from the same scan as the host-network listeners, every port until its first look). Its SYN first waits in `nft queue 7` while the agent asks the VMM, over the DNS stream, `<port>.tcp.loopback.lighter.internal`; the VMM answers from a bind of that loopback address without `SO_REUSEADDR` (in use means something holds it: checked for listeners on the address, the wildcard and a dual-stack v6 socket), and a no is refused with a reset by a mark on the requeued SYN. Without that, the agent accepted every such connection and the Mac's refusal arrived as a reset after it, which `nc -z` reads as open. The bind holds the address for microseconds; a Mac service binding in that same instant would be refused once.
+
+**Every DNS type from the Mac's resolver** (`crates/lighter-vmm/src/sysdns.rs`): `DNSServiceQueryRecord`, the resolver `getaddrinfo` uses, for everything that is not A or AAAA, each record under its own name; a raw forward to `resolv.conf`'s first nameserver only when the resolver cannot say. One loss: the resolver reports a missing name and a name without that type alike, so both answer NOERROR with no records.

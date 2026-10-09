@@ -19,6 +19,7 @@ mod doorbell;
 mod idle;
 mod inbound;
 mod listeners;
+mod loopback;
 mod memory_policy;
 mod sockmap;
 mod streams;
@@ -229,6 +230,7 @@ fn main() -> std::process::ExitCode {
     }
     if control {
         listeners::keep();
+        loopback::start((std::net::Ipv4Addr::new(192, 168, 127, 2), DNS_LISTEN).into());
     }
     loop {
         let stream = match listener.accept() {
