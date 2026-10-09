@@ -328,7 +328,7 @@ done
 # The policy's own word on whether the Mac is overcommitted (its
 # compressor over a quarter of RAM, or swap over an eighth while it is
 # still swapping): while it is, the balloon rightly holds, quiet or not.
-overcommitted="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a "host overcommitment changed" | tail -1)"
+overcommitted="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a "host overcommitment changed" | tail -1 || true)"
 if [ -n "$eased" ]; then
 	pass "and it eases: ${later} MiB, $((waited + 15))s after Normal"
 elif [[ "$overcommitted" == *"overcommitted=true"* ]]; then

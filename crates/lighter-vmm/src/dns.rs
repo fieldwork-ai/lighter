@@ -113,17 +113,19 @@ pub fn answer(
         // Asked where the Mac would ask: the nameserver its configuration
         // picks for the name (a VPN's, an /etc/resolver file's, the
         // default), whose reply is exact, a missing name included; or, for
-        // `.local`, its resolver, which asks by multicast and cannot tell a
-        // missing name from a missing type, nor needs to.
+        // `.local`, the networks themselves, by multicast DNS.
         crate::workers::run("dns-records", crate::qos::CONNECTION_STACK, move || {
             let route = crate::sysdns::route(&q.name);
-            if let Some(crate::sysdns::Route::Server(server)) = route
-                && let Some(reply) = forward_to(&query, server)
-            {
-                return deliver(id, reply);
-            }
-            match crate::sysdns::query(&q.name, q.qtype, q.qclass, Duration::from_secs(5)) {
-                Some(answer) => deliver(id, records_reply(&query, &q, answer)),
+            tracing::debug!(name = %q.name, qtype = q.qtype, ?route, "a question for the Mac's resolvers");
+            match route {
+                Some(crate::sysdns::Route::Mdns) => {
+                    let answer = crate::sysdns::multicast(&q.name, q.qtype, Duration::from_secs(1));
+                    deliver(id, records_reply(&query, &q, answer));
+                }
+                Some(crate::sysdns::Route::Server(server)) => match forward_to(&query, server) {
+                    Some(reply) => deliver(id, reply),
+                    None => forward_raw(query, id, deliver),
+                },
                 None => forward_raw(query, id, deliver),
             }
         });
