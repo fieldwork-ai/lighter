@@ -494,17 +494,26 @@ mod tests {
 
     #[test]
     fn the_macs_loopback_is_in_use_where_something_listens() {
-        assert_eq!(loopback_question("5432.tcp.loopback.lighter.internal"), Some(5432));
+        assert_eq!(
+            loopback_question("5432.tcp.loopback.lighter.internal"),
+            Some(5432)
+        );
         assert_eq!(loopback_question("0.tcp.loopback.lighter.internal"), None);
         assert_eq!(loopback_question("x.tcp.loopback.lighter.internal"), None);
         let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = v4.local_addr().unwrap().port();
         assert!(loopback_in_use(port, false));
-        assert!(!loopback_in_use(port, true), "a v4 listener does not hold ::1");
+        assert!(
+            !loopback_in_use(port, true),
+            "a v4 listener does not hold ::1"
+        );
         drop(v4);
         assert!(!loopback_in_use(port, false));
         let wild = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        assert!(loopback_in_use(wild.local_addr().unwrap().port(), false), "the wildcard holds loopback");
+        assert!(
+            loopback_in_use(wild.local_addr().unwrap().port(), false),
+            "the wildcard holds loopback"
+        );
     }
 
     #[test]
@@ -514,16 +523,31 @@ mod tests {
         query.extend_from_slice(&[0, 15, 0, 1]); // MX
         let q = parse_question(&query).unwrap();
         let answer = crate::sysdns::Answer::Records(vec![
-            crate::sysdns::Record { name: "mail.example.com".into(), rtype: 5, ttl: 30, rdata: b"\x02mx\x07example\x03com\x00".to_vec() },
-            crate::sysdns::Record { name: "mx.example.com".into(), rtype: 15, ttl: 60, rdata: b"\x00\x0a\x02mx\x07example\x03com\x00".to_vec() },
+            crate::sysdns::Record {
+                name: "mail.example.com".into(),
+                rtype: 5,
+                ttl: 30,
+                rdata: b"\x02mx\x07example\x03com\x00".to_vec(),
+            },
+            crate::sysdns::Record {
+                name: "mx.example.com".into(),
+                rtype: 15,
+                ttl: 60,
+                rdata: b"\x00\x0a\x02mx\x07example\x03com\x00".to_vec(),
+            },
         ]);
         let reply = records_reply(&query, &q, answer);
         assert_eq!(&reply[..2], &[0xab, 0xcd]);
         assert_eq!(reply[3] & 0x0f, 0);
         assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 2);
-        let second = reply.windows(16).position(|w| w == b"\x02mx\x07example\x03com\x00\x00\x0f".get(..16).unwrap());
+        let second = reply
+            .windows(16)
+            .position(|w| w == b"\x02mx\x07example\x03com\x00\x00\x0f".get(..16).unwrap());
         assert!(second.is_some(), "the MX under the CNAME's target");
         let none = records_reply(&query, &q, crate::sysdns::Answer::NoName);
-        assert_eq!((none[3] & 0x0f, u16::from_be_bytes([none[6], none[7]])), (3, 0));
+        assert_eq!(
+            (none[3] & 0x0f, u16::from_be_bytes([none[6], none[7]])),
+            (3, 0)
+        );
     }
 }

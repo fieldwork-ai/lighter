@@ -246,7 +246,10 @@ mod tests {
     #[test]
     fn presentation_names_become_wire_labels() {
         assert_eq!(wire_name("example.com").unwrap(), b"\x07example\x03com\x00");
-        assert_eq!(wire_name("example.com.").unwrap(), b"\x07example\x03com\x00");
+        assert_eq!(
+            wire_name("example.com.").unwrap(),
+            b"\x07example\x03com\x00"
+        );
         assert_eq!(
             wire_name(r"My\032Printer._ipp._tcp.local").unwrap(),
             b"\x0aMy Printer\x04_ipp\x04_tcp\x05local\x00"
@@ -262,7 +265,12 @@ mod tests {
         let answer = query("localhost", 1, 1, Duration::from_secs(3));
         match answer {
             Some(Answer::Records(records)) => {
-                assert!(records.iter().any(|r| r.rtype == 1 && r.rdata == [127, 0, 0, 1]), "{records:?}")
+                assert!(
+                    records
+                        .iter()
+                        .any(|r| r.rtype == 1 && r.rdata == [127, 0, 0, 1]),
+                    "{records:?}"
+                )
             }
             other => panic!("localhost has an A record: {other:?}"),
         }
