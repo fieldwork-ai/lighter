@@ -138,6 +138,23 @@ pub fn answer(
     if let Some(addrs) = cache_get(&q.name, want_v6) {
         return Some(reply(&query, &q, &addrs, 0));
     }
+    // A `.local` name the merged way, as for any other type: the Mac's
+    // resolver alone, through `getaddrinfo`, gave a container nothing on the
+    // M1, 0.12.5 included, while the Mac itself resolved the same name.
+    if is_local(&q.name) {
+        crate::workers::run("dns-local", crate::qos::CONNECTION_STACK, move || {
+            let rtype = if want_v6 { TYPE_AAAA } else { TYPE_A };
+            let addrs = local_addrs(
+                crate::sysdns::local(&q.name, rtype, Duration::from_secs(1)),
+                want_v6,
+            );
+            if !addrs.is_empty() {
+                cache_put(&q.name, want_v6, &addrs);
+            }
+            deliver(id, reply(&query, &q, &addrs, 0));
+        });
+        return None;
+    }
     crate::workers::run("dns-lookup", crate::qos::CONNECTION_STACK, move || {
         let out = match resolve(&q.name, want_v6) {
             Ok(addrs) => {
@@ -261,6 +278,41 @@ fn loopback_in_use(port: u16, v6: bool, udp: bool) -> bool {
         }
     };
     bound != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EADDRINUSE)
+}
+
+/// Whether a name is multicast DNS's.
+fn is_local(name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name == "local" || name.ends_with(".local")
+}
+
+/// The addresses of one family in an answer, without IPv6 link-local ones,
+/// which a container could not reach through the Mac.
+fn local_addrs(answer: crate::sysdns::Answer, want_v6: bool) -> Vec<IpAddr> {
+    let crate::sysdns::Answer::Records(records) = answer else {
+        return Vec::new();
+    };
+    let mut out: Vec<IpAddr> = Vec::new();
+    for r in records {
+        let ip: Option<IpAddr> = match (r.rtype, r.rdata.len()) {
+            (TYPE_A, 4) => <[u8; 4]>::try_from(&r.rdata[..])
+                .ok()
+                .map(|b| Ipv4Addr::from(b).into()),
+            (TYPE_AAAA, 16) => <[u8; 16]>::try_from(&r.rdata[..])
+                .ok()
+                .map(std::net::Ipv6Addr::from)
+                .filter(|v6| !v6.is_unicast_link_local())
+                .map(IpAddr::from),
+            _ => None,
+        };
+        if let Some(ip) = ip
+            && ip.is_ipv6() == want_v6
+            && !out.contains(&ip)
+        {
+            out.push(ip);
+        }
+    }
+    out
 }
 
 /// A question sent as it is to `server`, and its reply if one comes within

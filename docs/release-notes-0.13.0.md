@@ -35,6 +35,7 @@ lighter status
 
 - **traceroute works from a container**, by UDP (`traceroute`, the default) and by ICMP (`traceroute -I`, `mtr`): the same route the Mac takes, after two hops inside, the container's bridge and lighter's gateway. Containers' traffic leaves through the Mac as streams, where nothing on the way could see a TTL run out, so traceroute found no hop at all. Probes with a short TTL now go as packets, sent on from the Mac one TTL shorter, and the routers' answers come back to the container, without root.
 - **A host-network container's UDP reaches the internet.** Its own resolver (`dig @1.1.1.1`), NTP, QUIC and the like went nowhere: a container on Docker's network was carried, but the machine's own traffic, which host-network containers share, was not. It is now.
+- **Containers resolve `.local` names on every Mac.** On some (an M1 on macOS 26.6, here), a container could resolve no `.local` name at all, a printer's or another Mac's, though the Mac itself could: macOS was telling lighter's machine nothing. lighter now also asks the network itself, and gets the answer the Mac would.
 - **With LAN mode on, a container on Docker's network pings devices on your network** again. Its echo went out by the LAN card and the reply was turned away there.
 
 ## Upgrading

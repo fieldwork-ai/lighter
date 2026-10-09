@@ -175,6 +175,23 @@ impl Names {
         unique(&mut answers);
         additional.retain(|r| !answers.contains(r));
         unique(&mut additional);
+        // A one-shot query from an ordinary port (RFC 6762's legacy
+        // unicast, as lighter's own resolver asks, `sysdns::multicast`) is
+        // answered straight back to that port, as an ordinary DNS reply: its
+        // id, its question, no cache-flush bits.
+        if src_port != MDNS_PORT {
+            let id = u16::from_be_bytes([query[0], query[1]]);
+            let message = response_to(id, &query[12..at], questions, &answers, &additional, TTL);
+            return Some(udp_frame(
+                self.mac,
+                frame_src_mac(frame)?,
+                self.ip,
+                src,
+                MDNS_PORT,
+                src_port,
+                &message,
+            ));
+        }
         let message = response(&answers, &additional, TTL);
         // A question asking for a unicast answer (QU) gets one, as RFC 6762
         // allows; otherwise the answer goes to the group, as the Mac sends.
@@ -379,10 +396,28 @@ fn write_name(out: &mut Vec<u8>, name: &str) {
 }
 
 fn response(answers: &[Record], additional: &[Record], ttl: u32) -> Vec<u8> {
-    let mut out = vec![0, 0, 0x84, 0x00, 0, 0];
+    response_to(0, &[], 0, answers, additional, ttl)
+}
+
+/// A response with `id`, echoing `questions` (their bytes and count): a
+/// legacy unicast reply when there are some, which carries no cache-flush
+/// bits; multicast DNS's own when not.
+fn response_to(
+    id: u16,
+    question: &[u8],
+    questions: u16,
+    answers: &[Record],
+    additional: &[Record],
+    ttl: u32,
+) -> Vec<u8> {
+    let flush = if questions == 0 { CACHE_FLUSH } else { 0 };
+    let mut out = id.to_be_bytes().to_vec();
+    out.extend_from_slice(&[0x84, 0x00]);
+    out.extend_from_slice(&questions.to_be_bytes());
     out.extend_from_slice(&(answers.len() as u16).to_be_bytes());
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&(additional.len() as u16).to_be_bytes());
+    out.extend_from_slice(question);
     for record in answers.iter().chain(additional) {
         let owner = out.len();
         let name = match record {
@@ -408,7 +443,7 @@ fn response(answers: &[Record], additional: &[Record], ttl: u32) -> Vec<u8> {
             }
         };
         out.extend_from_slice(&rtype.to_be_bytes());
-        out.extend_from_slice(&(CLASS_IN | CACHE_FLUSH).to_be_bytes());
+        out.extend_from_slice(&(CLASS_IN | flush).to_be_bytes());
         out.extend_from_slice(&ttl.to_be_bytes());
         out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         out.extend_from_slice(&rdata);
@@ -759,6 +794,42 @@ mod tests {
             n.answer(&solicit(host, "fd99::5".parse().unwrap()))
                 .is_none(),
             "off the link"
+        );
+    }
+
+    #[test]
+    fn a_one_shot_query_is_answered_straight_back() {
+        let mut q = vec![0xbe, 0xef, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        write_name(&mut q, "web.lighter.local");
+        q.extend_from_slice(&TYPE_A.to_be_bytes());
+        q.extend_from_slice(&CLASS_IN.to_be_bytes());
+        let frame = udp_frame(MAC_MAC, MDNS_MAC, MAC, MDNS_GROUP, 40000, MDNS_PORT, &q);
+        let reply = names().answer(&frame).unwrap();
+        let ip = &reply[14..];
+        assert_eq!(
+            Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]),
+            MAC,
+            "to the asker"
+        );
+        assert_eq!(
+            u16::from_be_bytes([reply[36], reply[37]]),
+            40000,
+            "at its port"
+        );
+        let msg = &reply[42..];
+        assert_eq!(&msg[0..2], &[0xbe, 0xef], "its id");
+        assert_eq!(
+            u16::from_be_bytes([msg[4], msg[5]]),
+            1,
+            "its question echoed"
+        );
+        let (_, after_q) = read_name(msg, 12).unwrap();
+        let (_, next) = read_name(msg, after_q + 4).unwrap();
+        assert_eq!(u16::from_be_bytes([msg[next], msg[next + 1]]), TYPE_A);
+        assert_eq!(
+            u16::from_be_bytes([msg[next + 2], msg[next + 3]]),
+            CLASS_IN,
+            "no cache-flush bit"
         );
     }
 }
