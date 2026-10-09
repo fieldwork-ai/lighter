@@ -110,9 +110,18 @@ pub fn answer(
 ) -> Option<Vec<u8>> {
     let q = parse_question(&query)?;
     if q.qclass != CLASS_IN || (q.qtype != TYPE_A && q.qtype != TYPE_AAAA) {
-        // The Mac's resolver, for any type; raw to its nameserver only when
-        // the resolver cannot say.
+        // Asked where the Mac would ask: the nameserver its configuration
+        // picks for the name (a VPN's, an /etc/resolver file's, the
+        // default), whose reply is exact, a missing name included; or, for
+        // `.local`, its resolver, which asks by multicast and cannot tell a
+        // missing name from a missing type, nor needs to.
         crate::workers::run("dns-records", crate::qos::CONNECTION_STACK, move || {
+            let route = crate::sysdns::route(&q.name);
+            if let Some(crate::sysdns::Route::Server(server)) = route
+                && let Some(reply) = forward_to(&query, server)
+            {
+                return deliver(id, reply);
+            }
             match crate::sysdns::query(&q.name, q.qtype, q.qclass, Duration::from_secs(5)) {
                 Some(answer) => deliver(id, records_reply(&query, &q, answer)),
                 None => forward_raw(query, id, deliver),
@@ -154,7 +163,7 @@ fn resolve_local(name: &str, want_v6: bool) -> Result<Vec<IpAddr>, ()> {
             vec![GATEWAY.into()]
         }),
         name => match loopback_question(name) {
-            Some(port) => Ok(if loopback_in_use(port, want_v6) {
+            Some((port, udp)) => Ok(if loopback_in_use(port, want_v6, udp) {
                 vec![if want_v6 {
                     std::net::Ipv6Addr::LOCALHOST.into()
                 } else {
@@ -169,27 +178,40 @@ fn resolve_local(name: &str, want_v6: bool) -> Result<Vec<IpAddr>, ()> {
 }
 
 /// The guest agent's question about the Mac's loopback (its `loopback.rs`):
-/// `<port>.tcp.loopback.lighter.internal`.
-fn loopback_question(name: &str) -> Option<u16> {
-    name.strip_suffix(".tcp.loopback.lighter.internal")?
-        .parse()
+/// `<port>.tcp.loopback.lighter.internal`, or `udp`; the port and whether
+/// it is UDP's.
+fn loopback_question(name: &str) -> Option<(u16, bool)> {
+    let rest = name.strip_suffix(".loopback.lighter.internal")?;
+    let (port, proto) = rest.split_once('.')?;
+    let udp = match proto {
+        "tcp" => false,
+        "udp" => true,
+        _ => return None,
+    };
+    port.parse()
         .ok()
         .filter(|port| *port != 0)
+        .map(|port| (port, udp))
 }
 
-/// Whether something on the Mac holds its loopback address at `port`,
-/// which is what a listener there does: a bind of the address, without
+/// Whether something on the Mac holds its loopback address at `port`, of
+/// TCP or UDP, which is what a listener or a bound socket there does: a bind of the address, without
 /// `SO_REUSEADDR`, fails with "in use". Nothing connects, so a server sees
 /// only the connection the guest then makes. A listener on the wildcard
 /// holds loopback too, and a dual-stack one both families'.
-fn loopback_in_use(port: u16, v6: bool) -> bool {
+fn loopback_in_use(port: u16, v6: bool, udp: bool) -> bool {
     let (family, addr): (libc::c_int, SocketAddr) = if v6 {
         (libc::AF_INET6, (std::net::Ipv6Addr::LOCALHOST, port).into())
     } else {
         (libc::AF_INET, (Ipv4Addr::LOCALHOST, port).into())
     };
     // SAFETY: a socket call with constant arguments.
-    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    let kind = if udp {
+        libc::SOCK_DGRAM
+    } else {
+        libc::SOCK_STREAM
+    };
+    let fd = unsafe { libc::socket(family, kind, 0) };
     if fd < 0 {
         return true;
     }
@@ -237,6 +259,29 @@ fn loopback_in_use(port: u16, v6: bool) -> bool {
         }
     };
     bound != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EADDRINUSE)
+}
+
+/// A question sent as it is to `server`, and its reply if one comes within
+/// three seconds.
+fn forward_to(query: &[u8], server: SocketAddr) -> Option<Vec<u8>> {
+    let local: SocketAddr = if server.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let udp = UdpSocket::bind(local).ok()?;
+    udp.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    udp.connect(server).ok()?;
+    udp.send(query).ok()?;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = udp.recv(&mut buf).ok()?;
+        // The reply to this question: its id, and a response.
+        if n >= 12 && buf[0..2] == query[0..2] && buf[2] & 0x80 != 0 {
+            buf.truncate(n);
+            return Some(buf);
+        }
+    }
 }
 
 /// A non-address question, sent raw to the Mac's nameserver on a socket of
@@ -496,24 +541,35 @@ mod tests {
     fn the_macs_loopback_is_in_use_where_something_listens() {
         assert_eq!(
             loopback_question("5432.tcp.loopback.lighter.internal"),
-            Some(5432)
+            Some((5432, false))
         );
+        assert_eq!(
+            loopback_question("8125.udp.loopback.lighter.internal"),
+            Some((8125, true))
+        );
+        assert_eq!(loopback_question("1.sctp.loopback.lighter.internal"), None);
         assert_eq!(loopback_question("0.tcp.loopback.lighter.internal"), None);
         assert_eq!(loopback_question("x.tcp.loopback.lighter.internal"), None);
         let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = v4.local_addr().unwrap().port();
-        assert!(loopback_in_use(port, false));
+        assert!(loopback_in_use(port, false, false));
         assert!(
-            !loopback_in_use(port, true),
+            !loopback_in_use(port, true, false),
             "a v4 listener does not hold ::1"
         );
         drop(v4);
-        assert!(!loopback_in_use(port, false));
+        assert!(!loopback_in_use(port, false, false));
         let wild = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         assert!(
-            loopback_in_use(wild.local_addr().unwrap().port(), false),
+            loopback_in_use(wild.local_addr().unwrap().port(), false, false),
             "the wildcard holds loopback"
         );
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(loopback_in_use(
+            udp.local_addr().unwrap().port(),
+            false,
+            true
+        ));
     }
 
     #[test]

@@ -29,6 +29,7 @@ unsafe extern "C" {
     fn lighter_host_link_start(
         host_ip: *const c_char,
         mask: *const c_char,
+        host_ip6: *const c_char,
         network: *const u8,
         fd: c_int,
         mtu: *mut u32,
@@ -91,16 +92,19 @@ impl Bridge {
     }
 
     /// A network of the Mac and the guest alone. The Mac gets an interface
-    /// at `host`, on a subnet of `mask`, and a route to that subnet through
-    /// it; nothing else can reach it. `network` identifies it, so the same
+    /// at `host`, on a subnet of `mask` (and at `host6`, on its /64), and a
+    /// route to that subnet through it; nothing else can reach it. `network` identifies it, so the same
     /// identifier joins the same network.
     pub fn host_link(
         host: Ipv4Addr,
         mask: Ipv4Addr,
+        host6: Option<std::net::Ipv6Addr>,
         network: [u8; 16],
     ) -> Result<(Bridge, OwnedFd), String> {
         let host = CString::new(host.to_string()).expect("an address has no NUL");
         let mask = CString::new(mask.to_string()).expect("an address has no NUL");
+        let host6 = CString::new(host6.map(|a| a.to_string()).unwrap_or_default())
+            .expect("an address has no NUL");
         Self::started(|fd, mtu, max_packet, err, errlen| {
             // SAFETY: NUL-terminated addresses, a sixteen-byte identifier,
             // and the rest as `started` passes them.
@@ -108,6 +112,7 @@ impl Bridge {
                 lighter_host_link_start(
                     host.as_ptr(),
                     mask.as_ptr(),
+                    host6.as_ptr(),
                     network.as_ptr(),
                     fd,
                     mtu,

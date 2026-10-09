@@ -282,12 +282,21 @@ $D run --rm alpine:3.21 nslookup example.com >/dev/null 2>&1 && pass "DNS from a
 # was once exempt from the divert, and those datagrams were dropped)
 got="$($D run --rm alpine:3.21 sh -c 'apk add -q bind-tools >/dev/null 2>&1 && dig +time=5 +tries=1 +short @8.8.8.8 example.com A' 2>/dev/null | grep -c '^[0-9]')"
 [ "${got:-0}" -gt 0 ] && pass "UDP to an external resolver (dig @8.8.8.8)" || fail "external resolver over UDP: dig got nothing"
+# The same from a host-network container, whose UDP is the guest's own
+# output, which TPROXY does not see: it went out the card as packets and
+# was dropped there until 0.13 (NTP, QUIC, a resolver of its own).
+got="$($D run --rm --network host alpine:3.21 sh -c 'apk add -q bind-tools >/dev/null 2>&1 && dig +time=5 +tries=1 +short @8.8.8.8 example.com A' 2>/dev/null | grep -c '^[0-9]')"
+[ "${got:-0}" -gt 0 ] && pass "UDP to an external resolver from a host-network container" || fail "a host-network container's UDP to 8.8.8.8 got nothing"
 # Every record type is the Mac's resolver's, which is what knows `.local`,
 # /etc/resolver and a VPN's scoped resolvers: the services this Mac
 # advertises, browsed by DNS-SD's PTR from a container. Sent raw to the
 # network's nameserver, as non-address types were, it found none.
 got="$($D run --rm alpine:3.21 sh -c 'apk add -q bind-tools >/dev/null 2>&1 && dig +time=5 +tries=1 +short PTR _services._dns-sd._udp.local' 2>/dev/null | grep -c '\._tcp\.local\.\|\._udp\.local\.')"
 [ "${got:-0}" -gt 0 ] && pass "DNS-SD from a container: the Mac's .local services ($got kinds)" || fail "a container's PTR _services._dns-sd._udp.local found nothing"
+# And exactly: a name that does not exist is NXDOMAIN, one that does but
+# lacks the type is NOERROR, as the nameserver the Mac would ask says.
+got="$($D run --rm alpine:3.21 sh -c 'apk add -q bind-tools >/dev/null 2>&1; for q in "lighter-nosuchname-zz9.google.com TXT" "google.com SRV"; do dig +time=5 +tries=1 $q | grep -o "status: [A-Z]*" | cut -d" " -f2; done' 2>/dev/null | tr '\n' ' ')"
+[ "$got" = "NXDOMAIN NOERROR " ] && pass "a missing name is NXDOMAIN, a missing type NOERROR" || fail "DNS status for a missing name and type: '${got}' (wanted NXDOMAIN NOERROR)"
 $D run --rm alpine:3.21 ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && pass "ICMP from a container" || fail "ping failed"
 # traceroute: the guest and the gateway are hops, and so is the first router
 # beyond the Mac, by UDP probes (busybox's default) and by ICMP (-I). As

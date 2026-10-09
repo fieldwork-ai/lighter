@@ -288,7 +288,10 @@ pub fn machine() -> anyhow::Result<()> {
     // says why.
     let link = if config.direct {
         match crate::link::plan(&home, &config.direct_subnet).and_then(|plan| {
-            let names = Arc::new(lighter_vmm::mdns::Names::new(plan.mac, plan.guest()));
+            let names = Arc::new(
+                lighter_vmm::mdns::Names::new(plan.mac, plan.guest())
+                    .with_ipv6(plan.guest6(), plan.host6()),
+            );
             Ok((crate::link::connect(&plan, names.clone())?, plan, names))
         }) {
             Ok((card, plan, names)) => {
@@ -404,7 +407,7 @@ pub fn machine() -> anyhow::Result<()> {
             ports.clone(),
             Arc::new(crate::link::Names(names)),
             move |ip| plan.contains(ip),
-            plan.guest(),
+            vec![plan.guest().into(), plan.guest6().into()],
         )?;
     }
 

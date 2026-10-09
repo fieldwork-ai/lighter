@@ -162,17 +162,20 @@ struct lighter_bridge *lighter_bridge_start(const char *ifname, const uint8_t ma
 }
 
 // A network between the Mac and the guest alone: the Mac gets an interface
-// (bridge100 and on) at `host_ip`/`mask`, with a route to the subnet, and
+// (bridge100 and on) at `host_ip`/`mask`, and at `host_ip6` on its /64 when
+// given, with a route to each subnet, and
 // nothing is shared with any other network. `network` names it, so a VM
 // started again with the same identifier joins the same network.
-struct lighter_bridge *lighter_host_link_start(const char *host_ip, const char *mask, const uint8_t network[16], int fd,
-                                               uint32_t *mtu_out, uint32_t *max_packet_out, char *err,
-                                               size_t errlen) {
+struct lighter_bridge *lighter_host_link_start(const char *host_ip, const char *mask, const char *host_ip6,
+                                               const uint8_t network[16], int fd, uint32_t *mtu_out,
+                                               uint32_t *max_packet_out, char *err, size_t errlen) {
 	xpc_object_t desc = xpc_dictionary_create(NULL, NULL, 0);
 	xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, VMNET_HOST_MODE);
 	xpc_dictionary_set_uuid(desc, vmnet_network_identifier_key, network);
 	xpc_dictionary_set_string(desc, vmnet_host_ip_address_key, host_ip);
 	xpc_dictionary_set_string(desc, vmnet_host_subnet_mask_key, mask);
+	// The Mac's IPv6 address on it, on a /64 vmnet routes to it.
+	if (host_ip6 && *host_ip6) xpc_dictionary_set_string(desc, vmnet_host_ipv6_address_key, host_ip6);
 	xpc_dictionary_set_bool(desc, vmnet_allocate_mac_address_key, false);
 	return start(desc, "host", fd, mtu_out, max_packet_out, err, errlen);
 }

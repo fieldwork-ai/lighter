@@ -613,9 +613,12 @@ link_args=""
 for arg in $(cat /proc/cmdline); do
 	case "$arg" in lighter.link=*) link="${arg#lighter.link=}" ;; esac
 done
+link_v6cidr="fd6c:6967:6874:d0c::/64"
 if [ -n "$link" ]; then
 	link_net="${link%%,*}"
 	link_mac="${link#*,}"
+	link_p6=""
+	case "$link_mac" in *,*) link_p6="${link_mac#*,}"; link_mac="${link_mac%%,*}" ;; esac
 	link_dev=""
 	for dev in /sys/class/net/*; do
 		[ "$(cat "$dev/address" 2>/dev/null)" = "$link_mac" ] && link_dev="${dev##*/}"
@@ -624,12 +627,31 @@ if [ -n "$link" ]; then
 	if [ -n "$link_dev" ] && [ "$link_ab" != "$link_net" ]; then
 		[ "$link_dev" = link0 ] || ip link set "$link_dev" name link0
 		sysctl -q -w net.ipv4.conf.link0.proxy_arp=1 net.ipv4.conf.link0.rp_filter=0 \
-			net.ipv6.conf.link0.disable_ipv6=1 2>/dev/null || true
+			2>/dev/null || true
 		ip addr add "$link_ab.0.2/24" dev link0
 		ip link set link0 up
 		ip route add unreachable "$link_net" 2>/dev/null || true
 		link_args="--bip=$link_ab.1.1/24 --default-address-pool=base=$link_net,size=24 --allow-direct-routing"
-		echo "INIT link=$link_ab.0.2 was=$link_dev"
+		# IPv6 the same way, on the link's /64 (`P`, its first 48 bits on
+		# the command line): Docker's default bridge P:0:1::/80 and a
+		# network made with IPv6 an /80 of the lower half, the pool; the
+		# Mac P:0:ffff::1 and the card P:0:ffff::2 at the top, out of the
+		# pool's way, since Docker's IPv6 allocator does not step around a
+		# subnet the guest routes as its IPv4 one does (a network was given
+		# the card's own /80, and a container its address). The card
+		# answers the Mac's neighbour solicitations for all of it
+		# (crates/lighter-vmm/src/mdns.rs).
+		if [ -n "$link_p6" ]; then
+			sysctl -q -w net.ipv6.conf.link0.disable_ipv6=0 net.ipv6.conf.link0.accept_ra=0 2>/dev/null || true
+			if ip -6 addr add "$link_p6:0:ffff::2/80" dev link0 nodad 2>/dev/null; then
+				ip -6 route add unreachable "$link_p6::/64" 2>/dev/null || true
+				link_v6cidr="$link_p6:0:1::/80"
+				link_args="$link_args --default-address-pool=base=$link_p6::/65,size=80"
+			else
+				echo "INIT link6=failed"
+			fi
+		fi
+		echo "INIT link=$link_ab.0.2 v6=${link_p6:+$link_p6:0:ffff::2} was=$link_dev"
 	else
 		echo "INIT link=missing mac=$link_mac"
 	fi
@@ -732,10 +754,10 @@ sh -c '
 		--data-root=/var/lib/docker \
 		--storage-driver=overlay2 \
 		--mtu="$1" \
-		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
+		--ipv6 --fixed-cidr-v6 "$5" --ip6tables \
 		--host-gateway-ip=192.168.127.254 \
 		--seccomp-profile=/etc/docker/seccomp.json \
-		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" "$registry_mirror" "$link_args" &
+		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" "$registry_mirror" "$link_args" "$link_v6cidr" &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on
@@ -817,17 +839,24 @@ table inet lighter {
 	# listeners.rs): every port until the agent's first look, so nothing
 	# goes to the Mac on a guess.
 	set local_tcp { type inet_service; flags interval; elements = { 0-65535 } }
+	set local_udp { type inet_service; flags interval; elements = { 0-65535 } }
 	# The SYN of a connection the redirect below would carry to the Mac's
 	# loopback waits while the agent asks the Mac whether anything there
 	# listens (loopback.rs): refused here with a reset if not, so the client
-	# sees "connection refused" rather than a connection that then drops.
-	# With no agent on the queue, `bypass` lets it through.
+	# sees "connection refused" rather than a connection that then drops;
+	# kept in the guest (its mark, 0x4c4f4f4c) if a listener there is too
+	# new for `local_tcp`. With no agent on the queue, `bypass` lets it on.
 	chain loopback {
 		type filter hook output priority dstnat - 20; policy accept;
-		meta mark 0x4c4f4f52 reject with tcp reset
-		meta mark 0x4c494e42 accept
+		meta mark 0x4c4f4f52 meta l4proto tcp reject with tcp reset
+		meta mark 0x4c4f4f52 reject
+		meta mark { 0x4c494e42, 0x4c4f4f4c } accept
 		ip daddr 127.0.0.0/8 tcp flags & (syn | ack) == syn tcp dport != @local_tcp queue num 7 bypass
 		ip6 daddr ::1 tcp flags & (syn | ack) == syn tcp dport != @local_tcp queue num 7 bypass
+		# The first datagram of a flow the same way: refused with port
+		# unreachable where the Mac has nothing, as on the Mac.
+		ip daddr 127.0.0.0/8 ct state new udp dport != @local_udp queue num 7 bypass
+		ip6 daddr ::1 ct state new udp dport != @local_udp queue num 7 bypass
 	}
 	chain prerouting {
 		type nat hook prerouting priority dstnat - 10; policy accept;
@@ -845,6 +874,7 @@ table inet lighter {
 		# would be on the Mac: a port nothing in the guest listens on is
 		# carried to the Mac's own loopback, where the stream's far end
 		# connects to the same address.
+		meta mark 0x4c4f4f4c return
 		ip daddr 127.0.0.0/8 tcp dport != @local_tcp redirect to :15201
 		ip6 daddr ::1 tcp dport != @local_tcp redirect to :15201
 		meta l4proto tcp oifname "eth0" redirect to :15201
@@ -875,6 +905,16 @@ table inet lighter {
 		# is a hop that sends them on from the Mac and passes the routers'
 		# errors back (crates/lighter-vmm/src/net.rs, PROBE_TTL).
 		meta l4proto udp ip ttl < 31 fib daddr type unicast accept
+		# UDP to loopback on a port nothing in the guest has bound is the
+		# Mac's loopback's, as TCP is (`local_udp`); its replies, the
+		# agent's, are the reply direction and stay.
+		iifname "lo" ip daddr 127.0.0.0/8 udp dport != @local_udp ct direction original meta mark != 0x4c4f4f4c tproxy ip to :15202 meta mark set 0x1 accept
+		iifname "lo" ip6 daddr ::1 udp dport != @local_udp ct direction original meta mark != 0x4c4f4f4c tproxy ip6 to :15202 meta mark set 0x1 accept
+		# The guest's own UDP for beyond the card, looped through lo by its
+		# mark (the route chain below); `fib daddr oif` reads lo for these,
+		# so the rules after this one would not take them.
+		iifname "lo" meta mark 0x1 meta nfproto ipv4 meta l4proto udp tproxy ip to :15202 accept
+		iifname "lo" meta mark 0x1 meta nfproto ipv6 meta l4proto udp tproxy ip6 to :15202 accept
 		meta l4proto udp udp dport != { 67, 68 } iifname != "eth1" fib daddr oifname { "eth0", "eth1" } tproxy ip to :15202 meta mark set 0x1 accept
 		meta l4proto udp udp dport != { 546, 547 } iifname != "eth1" fib daddr oifname { "eth0", "eth1" } tproxy ip6 to :15202 meta mark set 0x1 accept
 	}
@@ -886,6 +926,14 @@ table inet lighter {
 		# prerouting, and left by eth0 for a client the agent was standing
 		# in for. The mark set here re-routes it, by the same policy route.
 		ct direction reply ct mark 0x4c494e42 meta mark set 0x4c494e43
+		# The guest's own UDP for beyond the card (a host-network
+		# container's NTP, QUIC, a resolver of its own): TPROXY sees only
+		# what is forwarded, so these went out eth0 as packets, and the
+		# card drops UDP. Marked, the policy route below loops each through
+		# lo, where the divert rule above hands it to the agent like a
+		# container's. A probe's short TTL and DHCP stay packets.
+		meta mark 0 ct direction original oifname "eth0" ip ttl > 30 fib daddr type unicast udp dport != { 67, 68 } meta mark set 0x1
+		meta mark 0 ct direction original oifname "eth0" ip6 hoplimit > 30 fib daddr type unicast udp dport != { 546, 547 } meta mark set 0x1
 	}
 }
 EOF
@@ -939,9 +987,16 @@ EOF
 				[ "$tries" -ge 120 ] && { echo "INIT link-forward=no-chain"; exit 0; }
 				sleep 0.5
 			done
-			iptables -C DOCKER-USER -i link0 -j ACCEPT 2>/dev/null \
-				|| iptables -I DOCKER-USER 1 -i link0 -j ACCEPT 2>/dev/console \
-				|| echo "INIT link-forward=failed"
+			for tables in iptables ip6tables; do
+				until "$tables" -t filter -L DOCKER-USER -n >/dev/null 2>&1; do
+					tries=$((tries + 1))
+					[ "$tries" -ge 120 ] && { echo "INIT link-forward=$tables-no-chain"; exit 0; }
+					sleep 0.5
+				done
+				"$tables" -C DOCKER-USER -i link0 -j ACCEPT 2>/dev/null \
+					|| "$tables" -I DOCKER-USER 1 -i link0 -j ACCEPT 2>/dev/console \
+					|| echo "INIT link-forward=$tables-failed"
+			done
 		) &
 	fi
 }

@@ -10,9 +10,12 @@
 //! redirect; no, and init's rule refuses it with a reset, which the client
 //! sees as "connection refused", as it would on the Mac.
 //!
+//! UDP the same way: a flow's first datagram waits, and goes on to the
+//! Mac, stays in the guest, or is refused with port unreachable.
+//!
 //! The Mac is asked through the DNS stream the guest already has: a
-//! question for `<port>.tcp.loopback.lighter.internal`, A for 127.0.0.1 and
-//! AAAA for ::1, answered by the VMM from a bind of that address (in use
+//! question for `<port>.tcp.loopback.lighter.internal` (or `udp`), A for
+//! 127.0.0.1 and AAAA for ::1, answered by the VMM from a bind of that address (in use
 //! means something holds it) with the address, or with nothing.
 //!
 //! Without this thread the queue's `bypass` lets the SYN through, and the
@@ -27,6 +30,8 @@ use std::time::Duration;
 pub const QUEUE: u16 = 7;
 /// init's mark for "refuse this one".
 const REFUSE: u32 = 0x4c4f_4f52;
+/// init's mark for "this one is the guest's": no redirect.
+const LOCAL: u32 = 0x4c4f_4f4c;
 
 const NETLINK_NETFILTER: libc::c_int = 12;
 const NFNL_SUBSYS_QUEUE: u16 = 3;
@@ -67,11 +72,15 @@ pub fn start(dns: SocketAddr) {
                     return;
                 }
             };
-            let open = match destination(&packet) {
-                Some((v6, port)) => ask(dns, v6, port).unwrap_or(true),
-                None => true,
+            let sent = match destination(&packet) {
+                // Held here, by something too new for `local_tcp` or
+                // `local_udp` (a server that connects to itself as it
+                // starts): stays in the guest, its mark keeping it from the
+                // redirect and the divert.
+                Some(d) if held(d) => queue.verdict(id, NF_ACCEPT, Some(LOCAL)),
+                Some(d) if ask(dns, d) == Some(false) => queue.verdict(id, NF_REPEAT, Some(REFUSE)),
+                _ => queue.verdict(id, NF_ACCEPT, None),
             };
-            let sent = if open { queue.verdict(id, NF_ACCEPT, None) } else { queue.verdict(id, NF_REPEAT, Some(REFUSE)) };
             if let Err(e) = sent {
                 eprintln!("lighter-agent: loopback verdict: {e}");
             }
@@ -82,24 +91,38 @@ pub fn start(dns: SocketAddr) {
     }
 }
 
-/// The family and port a queued SYN is for.
-pub fn destination(packet: &[u8]) -> Option<(bool, u16)> {
-    let (v6, l4) = match packet.first()? >> 4 {
-        4 => (false, usize::from(packet[0] & 0x0f) * 4),
-        6 => (true, 40),
-        _ => return None,
-    };
-    let tcp = packet.get(l4..l4 + 4)?;
-    Some((v6, u16::from_be_bytes([tcp[2], tcp[3]])))
+/// What a queued packet is for: a TCP SYN's or a UDP flow's first datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dest {
+    pub v6: bool,
+    pub udp: bool,
+    pub port: u16,
 }
 
-/// The question for the VMM: `<port>.tcp.loopback.lighter.internal`, A or
-/// AAAA, with `id`.
-pub fn question(id: u16, v6: bool, port: u16) -> Vec<u8> {
+/// What a queued packet is for.
+pub fn destination(packet: &[u8]) -> Option<Dest> {
+    let (v6, proto, l4) = match packet.first()? >> 4 {
+        4 => (false, *packet.get(9)?, usize::from(packet[0] & 0x0f) * 4),
+        6 => (true, *packet.get(6)?, 40),
+        _ => return None,
+    };
+    let udp = match proto {
+        6 => false,
+        17 => true,
+        _ => return None,
+    };
+    let l4 = packet.get(l4..l4 + 4)?;
+    Some(Dest { v6, udp, port: u16::from_be_bytes([l4[2], l4[3]]) })
+}
+
+/// The question for the VMM: `<port>.tcp.loopback.lighter.internal` (or
+/// `udp`), A or AAAA, with `id`.
+pub fn question(id: u16, d: Dest) -> Vec<u8> {
+    let Dest { v6, udp, port } = d;
     let mut q = Vec::with_capacity(64);
     q.extend_from_slice(&id.to_be_bytes());
     q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
-    for label in [port.to_string().as_str(), "tcp", "loopback", "lighter", "internal"] {
+    for label in [port.to_string().as_str(), if udp { "udp" } else { "tcp" }, "loopback", "lighter", "internal"] {
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
     }
@@ -118,12 +141,68 @@ pub fn says_open(reply: &[u8], id: u16) -> Option<bool> {
     Some(u16::from_be_bytes([reply[6], reply[7]]) > 0)
 }
 
+/// Whether something in the guest holds its own loopback at the port now:
+/// a bind of the address, without `SO_REUSEADDR`, fails with "in use"
+/// where a listener (or a bound UDP socket) on it or on the wildcard is. Asked of the kernel as the
+/// SYN waits, because `local_tcp` follows a new listener a scan later.
+fn held(d: Dest) -> bool {
+    let Dest { v6, udp, port } = d;
+    let (family, addr): (libc::c_int, std::net::SocketAddr) = if v6 {
+        (libc::AF_INET6, (std::net::Ipv6Addr::LOCALHOST, port).into())
+    } else {
+        (libc::AF_INET, (Ipv4Addr::LOCALHOST, port).into())
+    };
+    // SAFETY: a socket call with constant arguments.
+    let kind = if udp { libc::SOCK_DGRAM } else { libc::SOCK_STREAM };
+    let raw = unsafe { libc::socket(family, kind | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return false;
+    }
+    // SAFETY: a fresh descriptor we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let (storage, len) = sockaddr(addr);
+    // SAFETY: a socket address of the length given, on a live socket.
+    let bound = unsafe { libc::bind(fd.as_raw_fd(), std::ptr::addr_of!(storage).cast(), len) };
+    bound != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EADDRINUSE)
+}
+
+fn sockaddr(addr: std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: all-zero is a valid sockaddr_storage.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        std::net::SocketAddr::V4(a) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: a sockaddr_in fits in the storage.
+            unsafe { std::ptr::write(std::ptr::addr_of_mut!(storage).cast(), sin) };
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        std::net::SocketAddr::V6(a) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+                sin6_scope_id: 0,
+            };
+            // SAFETY: a sockaddr_in6 fits in the storage.
+            unsafe { std::ptr::write(std::ptr::addr_of_mut!(storage).cast(), sin6) };
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (storage, len as libc::socklen_t)
+}
+
 /// Asks the Mac; `None` when it did not say in time.
-fn ask(dns: SocketAddr, v6: bool, port: u16) -> Option<bool> {
+fn ask(dns: SocketAddr, d: Dest) -> Option<bool> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.set_read_timeout(Some(ASK_TIMEOUT)).ok()?;
-    let id = (std::process::id() as u16) ^ port;
-    socket.send_to(&question(id, v6, port), dns).ok()?;
+    let id = (std::process::id() as u16) ^ d.port ^ u16::from(d.udp);
+    socket.send_to(&question(id, d), dns).ok()?;
     let mut buf = [0u8; 512];
     loop {
         let (n, _) = socket.recv_from(&mut buf).ok()?;
@@ -248,21 +327,26 @@ mod tests {
     fn a_syns_family_and_port() {
         let mut v4 = vec![0x45u8; 40];
         v4[20..24].copy_from_slice(&[0xc3, 0x50, 0x15, 0x38]); // 50000 -> 5432
-        assert_eq!(destination(&v4), Some((false, 5432)));
+        v4[9] = 6;
+        assert_eq!(destination(&v4), Some(Dest { v6: false, udp: false, port: 5432 }));
+        v4[9] = 17;
+        assert_eq!(destination(&v4), Some(Dest { v6: false, udp: true, port: 5432 }));
         let mut v6 = vec![0u8; 60];
         v6[0] = 0x60;
+        v6[6] = 6;
         v6[40..44].copy_from_slice(&[0xc3, 0x50, 0x1f, 0x90]);
-        assert_eq!(destination(&v6), Some((true, 8080)));
+        assert_eq!(destination(&v6), Some(Dest { v6: true, udp: false, port: 8080 }));
         assert_eq!(destination(&[0x45; 10]), None);
     }
 
     #[test]
     fn the_question_names_the_port_and_the_answer_is_whether_there_is_one() {
-        let q = question(0x1234, false, 5432);
+        let q = question(0x1234, Dest { v6: false, udp: false, port: 5432 });
         let name: Vec<u8> = q[12..q.len() - 4].to_vec();
         assert_eq!(name, b"\x045432\x03tcp\x08loopback\x07lighter\x08internal\x00");
         assert_eq!(&q[q.len() - 4..], &[0, 1, 0, 1]);
-        let v6 = question(1, true, 1);
+        let v6 = question(1, Dest { v6: true, udp: true, port: 1 });
+        assert!(v6.windows(4).any(|w| w == b"\x03udp"));
         assert_eq!(&v6[v6.len() - 4..], &[0, 28, 0, 1]);
         let mut reply = q.clone();
         reply[2] |= 0x80;
@@ -290,5 +374,19 @@ mod tests {
         msg.extend_from_slice(&[0, 0, 0, 7]);
         msg.extend_from_slice(&attrs);
         assert_eq!(packet(&msg), Some((9, payload.to_vec())));
+    }
+
+    #[test]
+    fn a_fresh_listener_here_is_held() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tcp = |port| Dest { v6: false, udp: false, port };
+        assert!(held(tcp(port)));
+        drop(listener);
+        assert!(!held(tcp(port)));
+        let wild = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        assert!(held(tcp(wild.local_addr().unwrap().port())), "the wildcard holds loopback");
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(held(Dest { v6: false, udp: true, port: udp.local_addr().unwrap().port() }));
     }
 }

@@ -139,10 +139,18 @@ pub fn query(name: &str, rtype: u16, class: u16, wait: Duration) -> Option<Answe
     if error != 0 {
         return None;
     }
-    let deadline = Instant::now() + wait;
     // A `.local` answer comes from whoever answers, a moment apart: past
-    // the first batch, a little longer for the rest.
+    // the first batch, a little longer for the rest. And with nothing
+    // cached the resolver says "no such record" at once, before it has
+    // asked anyone, so for these a negative is only what is left when no
+    // one has answered in a second and a half.
     let linger = name.ends_with(".local") || name.ends_with(".local.");
+    let deadline = Instant::now()
+        + if linger {
+            wait.min(Duration::from_millis(1500))
+        } else {
+            wait
+        };
     let mut settled_at: Option<Instant> = None;
     loop {
         let now = Instant::now();
@@ -173,10 +181,10 @@ pub fn query(name: &str, rtype: u16, class: u16, wait: Duration) -> Option<Answe
         if got.error.is_some() {
             break;
         }
-        if got.batch_done && (!got.records.is_empty() || got.negative.is_some()) {
-            if !linger || got.records.is_empty() {
-                break;
-            }
+        if got.batch_done && !linger && (!got.records.is_empty() || got.negative.is_some()) {
+            break;
+        }
+        if got.batch_done && linger && !got.records.is_empty() {
             settled_at.get_or_insert_with(Instant::now);
             got.batch_done = false;
         }
@@ -192,6 +200,112 @@ pub fn query(name: &str, rtype: u16, class: u16, wait: Duration) -> Option<Answe
         Some(_) => Some(Answer::NoData),
         None => None,
     }
+}
+
+/// Where the Mac sends a question for a name: to multicast DNS, or to a
+/// nameserver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    Mdns,
+    Server(std::net::SocketAddr),
+}
+
+/// A resolver from the Mac's DNS configuration (`scutil --dns`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resolver {
+    domain: Option<String>,
+    nameservers: Vec<std::net::SocketAddr>,
+    order: u32,
+    mdns: bool,
+}
+
+/// The resolvers of the main configuration, before its scoped copies.
+fn parse_resolvers(text: &str) -> Vec<Resolver> {
+    let main = text
+        .split("DNS configuration (for scoped queries)")
+        .next()
+        .unwrap_or("");
+    let mut out = Vec::new();
+    for block in main.split("resolver #").skip(1) {
+        let mut r = Resolver {
+            domain: None,
+            nameservers: Vec::new(),
+            order: u32::MAX,
+            mdns: false,
+        };
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "domain" => r.domain = Some(value.trim_end_matches('.').to_ascii_lowercase()),
+                k if k.starts_with("nameserver[") => {
+                    // A link-local address carries its interface, which
+                    // a socket needs to reach it: `fe80::1%en0`.
+                    let (ip, scope) = value.split_once('%').unwrap_or((value, ""));
+                    match ip.parse::<std::net::IpAddr>() {
+                        Ok(std::net::IpAddr::V6(v6)) => {
+                            let index = std::ffi::CString::new(scope)
+                                // SAFETY: a NUL-terminated name.
+                                .map(|n| unsafe { libc::if_nametoindex(n.as_ptr()) })
+                                .unwrap_or(0);
+                            r.nameservers
+                                .push(std::net::SocketAddrV6::new(v6, 53, 0, index).into());
+                        }
+                        Ok(ip) => r.nameservers.push((ip, 53).into()),
+                        Err(_) => {}
+                    }
+                }
+                "order" => r.order = value.parse().unwrap_or(u32::MAX),
+                "options" => r.mdns = value.split_whitespace().any(|o| o == "mdns"),
+                _ => {}
+            }
+        }
+        out.push(r);
+    }
+    out
+}
+
+/// Where the Mac's configuration sends a question for `name`: the resolver
+/// whose domain is the longest that `name` is in, else the first by order
+/// of those for every domain. `None` when it has none with a nameserver.
+fn route_in(resolvers: &[Resolver], name: &str) -> Option<Route> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let within = |d: &str| name == d || name.ends_with(&format!(".{d}"));
+    let chosen = resolvers
+        .iter()
+        .filter(|r| r.domain.as_deref().is_some_and(within))
+        .max_by_key(|r| r.domain.as_ref().map_or(0, String::len))
+        .or_else(|| {
+            resolvers
+                .iter()
+                .filter(|r| r.domain.is_none() && !r.nameservers.is_empty())
+                .min_by_key(|r| r.order)
+        })?;
+    if chosen.mdns {
+        return Some(Route::Mdns);
+    }
+    Some(Route::Server(*chosen.nameservers.first()?))
+}
+
+/// Where the Mac would send a question for `name`, from its configuration
+/// as of the last ten seconds, read when asked.
+pub fn route(name: &str) -> Option<Route> {
+    static CACHE: std::sync::Mutex<Option<(Instant, Vec<Resolver>)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = cache
+        .as_ref()
+        .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(10));
+    if !fresh {
+        let text = std::process::Command::new("/usr/sbin/scutil")
+            .arg("--dns")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        *cache = Some((Instant::now(), parse_resolvers(&text)));
+    }
+    route_in(&cache.as_ref().expect("filled above").1, name)
 }
 
 /// A name in presentation form (`My\032Printer._ipp._tcp.local`) as wire
@@ -274,5 +388,80 @@ mod tests {
             }
             other => panic!("localhost has an A record: {other:?}"),
         }
+    }
+
+    const SCUTIL: &str = "DNS configuration
+
+resolver #1
+  search domain[0] : taile41d51.ts.net
+  nameserver[0] : 100.100.100.100
+  if_index : 41 (utun7)
+  flags    : Supplemental, Request A records, Request AAAA records
+  order    : 101600
+
+resolver #2
+  nameserver[0] : 2a02:6b67:ea05:9200::1
+  nameserver[1] : 192.168.50.1
+  order    : 200000
+
+resolver #3
+  domain   : taile41d51.ts.net.
+  nameserver[0] : 100.100.100.100
+  order    : 101601
+
+resolver #4
+  domain   : corp.example
+  nameserver[0] : fe80::1%en0
+  order    : 101700
+
+resolver #5
+  domain   : local
+  options  : mdns
+  timeout  : 5
+  order    : 300000
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  nameserver[0] : 192.168.50.1
+  order    : 1
+";
+
+    #[test]
+    fn a_name_goes_where_the_macs_configuration_sends_it() {
+        let resolvers = parse_resolvers(SCUTIL);
+        assert_eq!(resolvers.len(), 5, "the scoped copies left out");
+        let at = |ip: &str| {
+            Some(Route::Server(
+                (ip.parse::<std::net::IpAddr>().unwrap(), 53).into(),
+            ))
+        };
+        let scoped = |ip: &str| {
+            let v6: std::net::Ipv6Addr = ip.parse().unwrap();
+            let index = unsafe { libc::if_nametoindex(c"en0".as_ptr()) };
+            Some(Route::Server(
+                std::net::SocketAddrV6::new(v6, 53, 0, index).into(),
+            ))
+        };
+        assert_eq!(
+            route_in(&resolvers, "example.com"),
+            at("100.100.100.100"),
+            "the default, by order"
+        );
+        assert_eq!(
+            route_in(&resolvers, "host.taile41d51.ts.net"),
+            at("100.100.100.100")
+        );
+        assert_eq!(
+            route_in(&resolvers, "_ldap._tcp.dc.corp.example."),
+            scoped("fe80::1"),
+            "with its interface"
+        );
+        assert_eq!(route_in(&resolvers, "printer.local"), Some(Route::Mdns));
+        assert_eq!(
+            route_in(&resolvers, "notcorp.example"),
+            at("100.100.100.100"),
+            "a suffix is whole labels"
+        );
     }
 }

@@ -18,7 +18,7 @@
 //! somewhere (a VPN's, a LAN's) is passed over when choosing, and refused
 //! with a reason when it later becomes one.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -49,17 +49,55 @@ impl Link {
         Ipv4Addr::new(a, b, 0, 2)
     }
 
-    pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        ip.octets()[..2] == self.subnet.octets()[..2]
+    /// The link's IPv6 /64: a unique-local prefix whose 40-bit global ID
+    /// is the network identifier's first five bytes (random, as RFC 4193
+    /// asks), subnet 0, so it is kept with the rest of the link.
+    pub fn prefix6(&self) -> Ipv6Addr {
+        let n = self.network;
+        Ipv6Addr::new(
+            0xfd00 | u16::from(n[0]),
+            u16::from_be_bytes([n[1], n[2]]),
+            u16::from_be_bytes([n[3], n[4]]),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
     }
 
-    /// What the guest is told: the subnet and the card's MAC, by which it
-    /// finds the card whatever number it got.
+    /// The Mac's IPv6 address on the link, and the machine's: at the top
+    /// of the /64 (`P:0:ffff::/80`), because Docker's IPv6 pool is its
+    /// lower half and, unlike its IPv4 one, does not step around a subnet
+    /// the guest already routes.
+    pub fn host6(&self) -> Ipv6Addr {
+        Ipv6Addr::from(u128::from(self.prefix6()) | (0xffff << 48) | 1)
+    }
+
+    pub fn guest6(&self) -> Ipv6Addr {
+        Ipv6Addr::from(u128::from(self.prefix6()) | (0xffff << 48) | 2)
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => v4.octets()[..2] == self.subnet.octets()[..2],
+            IpAddr::V6(v6) => v6.segments()[..4] == self.prefix6().segments()[..4],
+        }
+    }
+
+    /// What the guest is told: the subnet, the card's MAC, by which it
+    /// finds the card whatever number it got, and the IPv6 prefix's first
+    /// 48 bits written out (`fd12:0:5678`), which init builds addresses on:
+    /// the compressed form a /64 prints as can drop groups.
     pub fn kernel_arg(&self) -> String {
+        let g = self.prefix6().segments();
         format!(
-            " lighter.link={}/16,{}",
+            " lighter.link={}/16,{},{:x}:{:x}:{:x}",
             self.subnet,
-            lighter_vmnet::helper::mac_text(self.mac)
+            lighter_vmnet::helper::mac_text(self.mac),
+            g[0],
+            g[1],
+            g[2]
         )
     }
 
@@ -276,6 +314,7 @@ pub fn connect(
     lighter_vmm::lan::Lan::host_link(
         link.host(),
         Ipv4Addr::new(255, 255, 0, 0),
+        Some(link.host6()),
         link.network,
         link.mac,
         names,
@@ -413,8 +452,20 @@ default            link#41            UCSIg               utun7
         assert_eq!(Link::parse(&link.text()), Some(link));
         assert_eq!(link.host(), Ipv4Addr::new(10, 211, 0, 1));
         assert_eq!(link.guest(), Ipv4Addr::new(10, 211, 0, 2));
-        assert!(link.contains(Ipv4Addr::new(10, 211, 7, 9)));
-        assert!(!link.contains(Ipv4Addr::new(10, 212, 0, 1)));
+        assert!(link.contains(Ipv4Addr::new(10, 211, 7, 9).into()));
+        assert!(!link.contains(Ipv4Addr::new(10, 212, 0, 1).into()));
+        let p = link.prefix6();
+        assert_eq!(p.segments()[0] >> 8, 0xfd, "unique-local");
+        assert_eq!(p.segments()[4..], [0, 0, 0, 0]);
+        assert_eq!(link.host6().segments()[4..], [0xffff, 0, 0, 1]);
+        assert_eq!(link.guest6().segments()[4..], [0xffff, 0, 0, 2]);
+        assert!(link.contains(Ipv6Addr::from(u128::from(p) | (1 << 64 >> 16) | 5).into()));
+        assert!(!link.contains("fd6c:6967:6874:d0c::2".parse::<IpAddr>().unwrap()));
+        let g = p.segments();
+        assert!(
+            link.kernel_arg()
+                .ends_with(&format!(",{:x}:{:x}:{:x}", g[0], g[1], g[2]))
+        );
     }
 
     #[test]

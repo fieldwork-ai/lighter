@@ -11,13 +11,15 @@
 //! gets no answer, since another lighter's link may hold it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 
 const MDNS_PORT: u16 = 5353;
 const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_MAC: [u8; 6] = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb];
 const TYPE_A: u16 = 1;
+const ICMP6_NEIGHBOUR_SOLICIT: u8 = 135;
+const ICMP6_NEIGHBOUR_ADVERT: u8 = 136;
 const TYPE_AAAA: u16 = 28;
 const TYPE_NSEC: u16 = 47;
 const TYPE_ANY: u16 = 255;
@@ -29,9 +31,12 @@ const TTL: u32 = 10;
 
 /// The names the link answers for, and the machine's place on it.
 pub struct Names {
-    records: Mutex<BTreeMap<String, BTreeSet<Ipv4Addr>>>,
+    records: Mutex<BTreeMap<String, BTreeSet<IpAddr>>>,
     mac: [u8; 6],
     ip: Ipv4Addr,
+    // The guest's IPv6 address on the link and the Mac's: the link's /64
+    // is the guest's, apart from the Mac's address (`neighbour`).
+    ip6: Option<(Ipv6Addr, Ipv6Addr)>,
     // Where an announcement goes: the link's socket, once the card has one.
     link: Mutex<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
 }
@@ -43,8 +48,15 @@ impl Names {
             records: Mutex::new(BTreeMap::new()),
             mac,
             ip,
+            ip6: None,
             link: Mutex::new(None),
         }
+    }
+
+    /// The link's IPv6: the guest at `guest`, the Mac at `host`, on a /64.
+    pub fn with_ipv6(mut self, guest: Ipv6Addr, host: Ipv6Addr) -> Names {
+        self.ip6 = Some((guest, host));
+        self
     }
 
     /// Where announcements go from now on.
@@ -56,17 +68,20 @@ impl Names {
     /// changed is announced, so the Mac's cache follows at once rather
     /// than when its copy expires: a goodbye (TTL 0) for an address a name
     /// no longer has, and a name's new addresses.
-    pub fn set(&self, records: BTreeMap<String, BTreeSet<Ipv4Addr>>) {
+    pub fn set(&self, records: BTreeMap<String, BTreeSet<IpAddr>>) {
         let mut held = self.records.lock().expect("names poisoned");
-        let pairs = |r: &BTreeMap<String, BTreeSet<Ipv4Addr>>| -> BTreeSet<(String, Ipv4Addr)> {
+        // A `*.` name is answered for the names under it and never
+        // announced as itself: multicast DNS has no wildcards.
+        let pairs = |r: &BTreeMap<String, BTreeSet<IpAddr>>| -> BTreeSet<(String, IpAddr)> {
             r.iter()
+                .filter(|(n, _)| !n.starts_with("*."))
                 .flat_map(|(n, ips)| ips.iter().map(move |ip| (n.clone(), *ip)))
                 .collect()
         };
         let (before, after) = (pairs(&held), pairs(&records));
         let gone: Vec<Record> = before
             .difference(&after)
-            .map(|(n, ip)| Record::A(n.clone(), *ip))
+            .map(|(n, ip)| Record::address(n, *ip))
             .collect();
         // A name whose addresses changed is announced whole, since each
         // record carries the cache-flush bit.
@@ -74,7 +89,7 @@ impl Names {
         let fresh: Vec<Record> = after
             .iter()
             .filter(|(n, _)| changed.contains(n))
-            .map(|(n, ip)| Record::A(n.clone(), *ip))
+            .map(|(n, ip)| Record::address(n, *ip))
             .collect();
         *held = records;
         drop(held);
@@ -104,6 +119,9 @@ impl Names {
     /// The answer to a frame from the Mac, when it is a question about a
     /// name held here.
     pub fn answer(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        if let Some(advert) = self.neighbour(frame) {
+            return Some(advert);
+        }
         let (src, src_port, query) = mdns_query(frame)?;
         // A query's own answers, or a response: not a question.
         if query.len() < 12 || query[2] & 0x80 != 0 {
@@ -121,24 +139,34 @@ impl Names {
             let qclass = u16::from_be_bytes([*query.get(next + 2)?, *query.get(next + 3)?]);
             at = next + 4;
             unicast &= qclass & 0x8000 != 0;
-            let Some(ips) = records.get(&name.to_ascii_lowercase()) else {
+            let Some(ips) = lookup(&records, &name.to_ascii_lowercase()) else {
                 continue;
             };
-            let a = |out: &mut Vec<Record>| {
-                out.extend(ips.iter().map(|ip| Record::A(name.clone(), *ip)))
+            let of = |v6: bool| -> Vec<Record> {
+                ips.iter()
+                    .filter(|ip| ip.is_ipv6() == v6)
+                    .map(|ip| Record::address(&name, *ip))
+                    .collect()
             };
             // As macOS answers for its own name: the addresses asked for as
-            // answers, and the NSEC that says there is nothing else always
-            // as additional, never as an answer, which is how mDNSResponder
-            // takes it as a negative for the other types.
-            match qtype {
-                TYPE_A | TYPE_ANY => a(&mut answers),
-                TYPE_AAAA | TYPE_NSEC => a(&mut additional),
-                _ => {}
-            }
-            if matches!(qtype, TYPE_A | TYPE_ANY | TYPE_AAAA | TYPE_NSEC) {
-                additional.push(Record::Nsec(name.clone()));
-            }
+            // answers, the other family's beside them, and the NSEC that
+            // says what the name has always as additional, never as an
+            // answer, which is how mDNSResponder takes it as a negative
+            // for a family the name lacks.
+            let (asked, other) = match qtype {
+                TYPE_A => (of(false), of(true)),
+                TYPE_AAAA => (of(true), of(false)),
+                TYPE_ANY => ([of(false), of(true)].concat(), Vec::new()),
+                TYPE_NSEC => (Vec::new(), [of(false), of(true)].concat()),
+                _ => continue,
+            };
+            answers.extend(asked);
+            additional.extend(other);
+            additional.push(Record::Nsec(
+                name.clone(),
+                ips.iter().any(IpAddr::is_ipv4),
+                ips.iter().any(IpAddr::is_ipv6),
+            ));
         }
         drop(records);
         if answers.is_empty() && additional.is_empty() {
@@ -161,6 +189,73 @@ impl Names {
     }
 }
 
+impl Names {
+    /// The Mac asking who has an address on the link's /64: the guest's
+    /// card has every one but the Mac's own, as `proxy_arp` has every
+    /// container's IPv4 address. Answered here because Linux proxies
+    /// IPv6 neighbours only one listed address at a time, and Docker's
+    /// come and go. A solicitation from no address is duplicate address
+    /// detection, which only the Mac does, for its own: never answered.
+    fn neighbour(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        let (guest, host) = self.ip6?;
+        if frame.get(12..14)? != [0x86, 0xdd] {
+            return None;
+        }
+        let ip = frame.get(14..)?;
+        if ip.len() < 40 + 24 || ip[6] != 58 || ip[7] != 255 {
+            return None;
+        }
+        let src = Ipv6Addr::from(<[u8; 16]>::try_from(&ip[8..24]).ok()?);
+        let icmp = &ip[40..];
+        if icmp[0] != ICMP6_NEIGHBOUR_SOLICIT || src.is_unspecified() {
+            return None;
+        }
+        let target = Ipv6Addr::from(<[u8; 16]>::try_from(&icmp[8..24]).ok()?);
+        if target == host || target.segments()[..4] != guest.segments()[..4] {
+            return None;
+        }
+        // Solicited and override, the target, our link-layer address.
+        let mut advert = vec![ICMP6_NEIGHBOUR_ADVERT, 0, 0, 0, 0x60, 0, 0, 0];
+        advert.extend_from_slice(&target.octets());
+        advert.extend_from_slice(&[2, 1]);
+        advert.extend_from_slice(&self.mac);
+        let from = link_local(self.mac);
+        let sum = icmp6_checksum(from, src, &advert);
+        advert[2..4].copy_from_slice(&sum.to_be_bytes());
+        let mut out = Vec::with_capacity(14 + 40 + advert.len());
+        out.extend_from_slice(frame.get(6..12)?);
+        out.extend_from_slice(&self.mac);
+        out.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+        out.extend_from_slice(&(advert.len() as u16).to_be_bytes());
+        out.extend_from_slice(&[58, 255]);
+        out.extend_from_slice(&from.octets());
+        out.extend_from_slice(&src.octets());
+        out.extend_from_slice(&advert);
+        Some(out)
+    }
+}
+
+/// The link-local address a card with `mac` has (EUI-64).
+fn link_local(mac: [u8; 6]) -> Ipv6Addr {
+    Ipv6Addr::new(
+        0xfe80,
+        0,
+        0,
+        0,
+        u16::from_be_bytes([mac[0] ^ 0x02, mac[1]]),
+        u16::from_be_bytes([mac[2], 0xff]),
+        u16::from_be_bytes([0xfe, mac[3]]),
+        u16::from_be_bytes([mac[4], mac[5]]),
+    )
+}
+
+fn icmp6_checksum(src: Ipv6Addr, dst: Ipv6Addr, icmp: &[u8]) -> u16 {
+    let mut sum = checksum(0, &src.octets());
+    sum = checksum(sum, &dst.octets());
+    sum += icmp.len() as u32 + 58;
+    fold(checksum(sum, icmp))
+}
+
 fn unique(records: &mut Vec<Record>) {
     let mut seen = Vec::new();
     records.retain(|r| {
@@ -172,11 +267,49 @@ fn unique(records: &mut Vec<Record>) {
     });
 }
 
+/// The addresses for `name`: its own, else a `*.` name above it holds it
+/// (`*.myapp.local`), else it is under a container's own name
+/// (`api.web.lighter.local` is `web`'s), the nearest first.
+fn lookup<'a>(
+    records: &'a BTreeMap<String, BTreeSet<IpAddr>>,
+    name: &str,
+) -> Option<&'a BTreeSet<IpAddr>> {
+    if let Some(ips) = records.get(name) {
+        return Some(ips);
+    }
+    let mut rest = name;
+    while let Some((_, parent)) = rest.split_once('.') {
+        if parent == "local" || parent == "lighter.local" {
+            return None;
+        }
+        if let Some(ips) = records.get(&format!("*.{parent}")) {
+            return Some(ips);
+        }
+        if parent.ends_with(".lighter.local")
+            && let Some(ips) = records.get(parent)
+        {
+            return Some(ips);
+        }
+        rest = parent;
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Record {
     A(String, Ipv4Addr),
-    /// The name has an A record and nothing else.
-    Nsec(String),
+    Aaaa(String, Ipv6Addr),
+    /// What the name has: A records, AAAA records; nothing else.
+    Nsec(String, bool, bool),
+}
+
+impl Record {
+    fn address(name: &str, ip: IpAddr) -> Record {
+        match ip {
+            IpAddr::V4(v4) => Record::A(name.to_string(), v4),
+            IpAddr::V6(v6) => Record::Aaaa(name.to_string(), v6),
+        }
+    }
 }
 
 /// An IPv4 UDP datagram to port 5353 inside an Ethernet frame: its source,
@@ -253,17 +386,24 @@ fn response(answers: &[Record], additional: &[Record], ttl: u32) -> Vec<u8> {
     for record in answers.iter().chain(additional) {
         let owner = out.len();
         let name = match record {
-            Record::A(name, _) | Record::Nsec(name) => name,
+            Record::A(name, _) | Record::Aaaa(name, _) | Record::Nsec(name, ..) => name,
         };
         write_name(&mut out, name);
         let (rtype, rdata) = match record {
             Record::A(_, ip) => (TYPE_A, ip.octets().to_vec()),
-            // The next name is the name itself, by a pointer to it, and
-            // the only type it has is A: window 0, one byte of bitmap.
-            Record::Nsec(_) => {
+            Record::Aaaa(_, ip) => (TYPE_AAAA, ip.octets().to_vec()),
+            // The next name is the name itself, by a pointer to it, and the
+            // types it has: window 0, A in the first byte's bit 1, AAAA in
+            // the fourth's bit 4.
+            Record::Nsec(_, a, aaaa) => {
                 let pointer = 0xc000 | owner as u16;
                 let mut rdata = pointer.to_be_bytes().to_vec();
-                rdata.extend_from_slice(&[0, 1, 0x40]);
+                let first = if *a { 0x40 } else { 0 };
+                if *aaaa {
+                    rdata.extend_from_slice(&[0, 4, first, 0, 0, 0x08]);
+                } else {
+                    rdata.extend_from_slice(&[0, 1, first]);
+                }
                 (TYPE_NSEC, rdata)
             }
         };
@@ -347,7 +487,7 @@ mod tests {
         let names = Names::new(GUEST_MAC, GUEST);
         names.set(BTreeMap::from([(
             "web.lighter.local".to_string(),
-            BTreeSet::from([Ipv4Addr::new(10, 211, 1, 2)]),
+            BTreeSet::from([IpAddr::V4(Ipv4Addr::new(10, 211, 1, 2))]),
         )]));
         names
     }
@@ -480,7 +620,7 @@ mod tests {
         n.attach(std::sync::Arc::new(near));
         n.set(BTreeMap::from([(
             "web.lighter.local".to_string(),
-            BTreeSet::from([Ipv4Addr::new(10, 211, 1, 9)]),
+            BTreeSet::from([IpAddr::V4(Ipv4Addr::new(10, 211, 1, 9))]),
         )]));
         let mut frames = Vec::new();
         let mut buf = [0u8; 2048];
@@ -526,5 +666,99 @@ mod tests {
         let mut sum = checksum(0, &reply[26..34]);
         sum += 17 + udp.len() as u32;
         assert_eq!(fold(checksum(sum, udp)), 0);
+    }
+
+    #[test]
+    fn subdomains_and_wildcards_answer() {
+        let n = Names::new(GUEST_MAC, GUEST);
+        n.set(BTreeMap::from([
+            (
+                "web.lighter.local".to_string(),
+                BTreeSet::from([IpAddr::V4(Ipv4Addr::new(10, 211, 1, 2))]),
+            ),
+            (
+                "*.myapp.local".to_string(),
+                BTreeSet::from([IpAddr::V4(Ipv4Addr::new(10, 211, 1, 3))]),
+            ),
+        ]));
+        let a = |name: &str| {
+            n.answer(&query(&[(name, TYPE_A)], true))
+                .map(|r| parse(&r).1[0].3.clone())
+        };
+        assert_eq!(
+            a("api.web.lighter.local"),
+            Some(vec![10, 211, 1, 2]),
+            "under a container's name"
+        );
+        assert_eq!(
+            a("v2.api.myapp.local"),
+            Some(vec![10, 211, 1, 3]),
+            "under a wildcard"
+        );
+        assert_eq!(a("myapp.local"), None, "a wildcard is not its own parent");
+        assert_eq!(a("other.lighter.local"), None);
+    }
+
+    #[test]
+    fn a_name_with_both_families_answers_each_and_says_so() {
+        let n = names();
+        let v6: Ipv6Addr = "fd12:3456:789a::1:0:0:2".parse().unwrap();
+        n.set(BTreeMap::from([(
+            "web.lighter.local".to_string(),
+            BTreeSet::from([IpAddr::V4(Ipv4Addr::new(10, 211, 1, 2)), IpAddr::V6(v6)]),
+        )]));
+        let (_, records) = parse(
+            &n.answer(&query(&[("web.lighter.local", TYPE_AAAA)], true))
+                .unwrap(),
+        );
+        assert_eq!(
+            (records[0].0, records[0].2, records[0].3.clone()),
+            (0, TYPE_AAAA, v6.octets().to_vec())
+        );
+        let nsec = records.iter().find(|r| r.2 == TYPE_NSEC).unwrap();
+        assert_eq!(&nsec.3[2..], &[0, 4, 0x40, 0, 0, 0x08], "A and AAAA");
+    }
+
+    fn solicit(src: Ipv6Addr, target: Ipv6Addr) -> Vec<u8> {
+        let mut icmp = vec![ICMP6_NEIGHBOUR_SOLICIT, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&target.octets());
+        let mut f = vec![0x33, 0x33, 0xff, 0, 0, 2];
+        f.extend_from_slice(&MAC_MAC);
+        f.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+        f.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+        f.extend_from_slice(&[58, 255]);
+        f.extend_from_slice(&src.octets());
+        f.extend_from_slice(&target.octets());
+        f.extend_from_slice(&icmp);
+        f
+    }
+
+    #[test]
+    fn the_card_has_every_address_on_the_link_but_the_macs() {
+        let host: Ipv6Addr = "fd12:3456:789a::1".parse().unwrap();
+        let guest: Ipv6Addr = "fd12:3456:789a::2".parse().unwrap();
+        let n = Names::new(GUEST_MAC, GUEST).with_ipv6(guest, host);
+        let container: Ipv6Addr = "fd12:3456:789a:0:1::5".parse().unwrap();
+        let advert = n
+            .answer(&solicit(host, container))
+            .expect("a container's address");
+        assert_eq!(&advert[0..6], &MAC_MAC);
+        let icmp = &advert[54..];
+        assert_eq!((icmp[0], icmp[4]), (ICMP6_NEIGHBOUR_ADVERT, 0x60));
+        assert_eq!(&icmp[8..24], &container.octets());
+        assert_eq!(&icmp[26..32], &GUEST_MAC);
+        let from = Ipv6Addr::from(<[u8; 16]>::try_from(&advert[22..38]).unwrap());
+        assert_eq!(icmp6_checksum(from, host, icmp), 0, "the checksum verifies");
+        assert!(n.answer(&solicit(host, host)).is_none(), "the Mac's own");
+        assert!(
+            n.answer(&solicit(Ipv6Addr::UNSPECIFIED, container))
+                .is_none(),
+            "duplicate address detection"
+        );
+        assert!(
+            n.answer(&solicit(host, "fd99::5".parse().unwrap()))
+                .is_none(),
+            "off the link"
+        );
     }
 }

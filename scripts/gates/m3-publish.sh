@@ -402,6 +402,41 @@ for host in ('127.0.0.1', '::1'):
 " 2>&1)"
 [ "$got" = "refused refused " ] && pass "a localhost port nobody listens on is refused, both families" \
 	|| fail "a localhost port nobody listens on: ${got:-nothing} (wanted refused, refused)"
+# UDP: a datagram to the Mac's loopback is answered from there; one to a
+# port nobody has bound is refused (port unreachable, a connected socket's
+# ECONNREFUSED); one to a socket in the guest stays there.
+UDP_FILE="$(mktemp -t lighter-m3-udp)"
+python3 - "$UDP_FILE" >/dev/null 2>&1 <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 0))
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+while True:
+    data, peer = s.recvfrom(2048)
+    s.sendto(b"mac:" + data, peer)
+PY
+UDPSRV=$!
+for _ in $(seq 1 50); do [ -s "$UDP_FILE" ] && break; sleep 0.1; done
+udp_port="$(cat "$UDP_FILE")"; rm -f "$UDP_FILE"
+udp_free="$(python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+got="$($D run --rm --network host python:3.12-slim python3 -c "
+import socket
+c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); c.settimeout(5)
+c.sendto(b'hi', ('127.0.0.1', $udp_port))
+try: print(c.recvfrom(100)[0].decode(), end=' ')
+except Exception as e: print(type(e).__name__, end=' ')
+d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); d.settimeout(5); d.connect(('127.0.0.1', $udp_free)); d.send(b'x')
+try: d.recv(10); print('answered', end=' ')
+except ConnectionRefusedError: print('refused', end=' ')
+except Exception as e: print(type(e).__name__, end=' ')
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('127.0.0.1', 0)); s.settimeout(5)
+c.sendto(b'here', s.getsockname())
+try: print(s.recvfrom(100)[0].decode())
+except Exception as e: print(type(e).__name__)
+" 2>&1)"
+[ "$got" = "mac:hi refused here" ] && pass "UDP too: the Mac's loopback answers, a closed port is refused, a guest socket keeps its own" \
+	|| fail "UDP to localhost from a host-network container: '${got}' (wanted 'mac:hi refused here')"
+kill "$UDPSRV" 2>/dev/null; wait "$UDPSRV" 2>/dev/null
 if $D run --rm alpine:3.21 wget -q -T 3 -O - "http://127.0.0.1:$lo4/" >/dev/null 2>&1; then
 	fail "a bridge container reached the Mac's loopback through its own localhost"
 else

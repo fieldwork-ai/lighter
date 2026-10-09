@@ -94,11 +94,12 @@ impl Lan {
     pub fn host_link(
         host: std::net::Ipv4Addr,
         mask: std::net::Ipv4Addr,
+        host6: Option<std::net::Ipv6Addr>,
         network: [u8; 16],
         mac: [u8; 6],
         names: Arc<crate::mdns::Names>,
     ) -> Result<Lan, String> {
-        let (bridge, frames) = lighter_vmnet::Bridge::host_link(host, mask, network)?;
+        let (bridge, frames) = lighter_vmnet::Bridge::host_link(host, mask, host6, network)?;
         let mtu = bridge.mtu.clamp(576, 9000) as u16;
         let mut link = Lan::with(
             frames,

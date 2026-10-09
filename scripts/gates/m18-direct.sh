@@ -14,7 +14,9 @@
 #      too, so getaddrinfo does not wait out mDNS's five seconds)
 #   5. a removed container's name stops resolving at once
 #   6. containers resolve the names too, through the Mac's resolver
-#   7. an address in the subnet that nothing has fails, and does not loop
+#   7. IPv6 the same, for the default bridge and a network made with IPv6;
+#      names a label chooses, and names under a container's own
+#   8. an address in the subnet that nothing has fails, and does not loop
 #
 # Needs com.apple.vm.networking: a release build (LIGHTER_BIN), or a
 # package made with `scripts/package-release.sh <version> --skip-notarize`.
@@ -41,8 +43,8 @@ fi
 export LIGHTER_HOME="$(mktemp -d -t lighter-m18-home)"
 export DOCKER_HOST="unix://$LIGHTER_HOME/docker.sock"
 cleanup() {
-	docker rm -f m18-web m18-db-1 m18-db-2 m18-host m18-other >/dev/null 2>&1 || true
-	docker network rm m18-net >/dev/null 2>&1 || true
+	docker rm -f m18-web m18-db-1 m18-db-2 m18-host m18-other m18-v6 m18-v6b m18-named >/dev/null 2>&1 || true
+	docker network rm m18-net m18-net6 >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	[ "$FAILED" = 0 ] || { mkdir -p "$ROOT/.logs"; cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m18-machine.log" 2>/dev/null; } || true
 	rm -rf "$LIGHTER_HOME"
@@ -145,6 +147,41 @@ code="$(get "http://m18-host.lighter.local:18181/" 3)"
 [ "$code" = 200 ] && pass "and a host-network container by its name" || fail "the host-network container by name failed ($code)"
 got="$(docker run --rm alpine:3.21 sh -c 'nslookup m18-web.lighter.local 2>/dev/null | grep -A1 "^Name" | grep -oE "[0-9]+(\.[0-9]+){3}"' | head -1)"
 [ "$got" = "$WEB" ] && pass "a container resolves the names too ($got)" || fail "a container resolved m18-web.lighter.local to '${got}'"
+
+# IPv6: a container on the default bridge has an address on the link's
+# /64, and one on a network made with IPv6 does too; both answer the Mac
+# by it and by name, in both families at once.
+docker run -d --name m18-v6 python:3.12-slim python3 -m http.server --bind :: 8000 >/dev/null
+docker network create --ipv6 m18-net6 >/dev/null
+docker run -d --name m18-v6b --network m18-net6 python:3.12-slim python3 -m http.server --bind :: 8000 >/dev/null
+for c in m18-v6 m18-v6b; do
+	v6="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' "$c")"
+	code=000
+	for _ in $(seq 1 30); do
+		code="$(get "http://[$v6]:8000/" 2)"
+		[ "$code" = 200 ] && break
+		sleep 0.5
+	done
+	[ "$code" = 200 ] && pass "$c answers the Mac over IPv6 at $v6" || fail "$c at [$v6]:8000 did not answer the Mac ($code)"
+	both="$(/usr/bin/python3 -c "
+import socket
+print(len({i[0] for i in socket.getaddrinfo('$c.lighter.local', 80, 0, socket.SOCK_STREAM)}))")"
+	[ "$both" = 2 ] && pass "$c.lighter.local has both families" || fail "$c.lighter.local resolved to ${both:-no} families"
+done
+got="$("$CURL" -s -6 -m 5 -o /dev/null -w '%{http_code}' http://m18-v6.lighter.local:8000/ || true)"
+[ "$got" = 200 ] && pass "curl -6 http://m18-v6.lighter.local:8000/ answers" || fail "curl -6 by name: $got"
+docker rm -f m18-v6 m18-v6b >/dev/null 2>&1; docker network rm m18-net6 >/dev/null 2>&1
+
+# Names a container's owner chooses (`lighter.domains`, any .local name,
+# `*.` for all under one), and any name under a container's own.
+docker run -d --name m18-named --label "lighter.domains=m18-app.local,*.m18-wild.local" \
+	python:3.12-slim python3 -m http.server 80 >/dev/null
+NAMED="$(ip_of m18-named)"
+sleep 2
+check_name m18-app.local "$NAMED"
+check_name api.v2.m18-wild.local "$NAMED"
+check_name admin.m18-named.lighter.local "$NAMED"
+docker rm -f m18-named >/dev/null 2>&1
 
 # A goodbye clears the Mac's cache at once; without one the name would
 # outlive its container by its TTL.
