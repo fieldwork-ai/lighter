@@ -24,6 +24,7 @@
 //! restarts. A reconciler recovers from that by construction.
 
 pub mod http;
+pub mod names;
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};

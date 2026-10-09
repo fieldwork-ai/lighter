@@ -598,6 +598,43 @@ if [ -e /sys/class/net/eth0 ]; then
 		&& echo "INIT ipv6=ok" || echo "INIT ipv6=failed"
 fi
 
+# --- The link (0.13) --------------------------------------------------------
+# `lighter.link=S/16,MAC`: a card on a network of the Mac and this machine
+# alone (crates/lighter-cli/src/link.rs), on which the Mac is S.0.1. It is
+# found by its MAC, since its number depends on whether LAN mode's card is
+# there too, and named link0. Docker's networks are made inside S (the
+# dockerd flags below), and proxy ARP has link0 answer the Mac for every
+# address routed to one of them, so the Mac's packets for a container come
+# here and are forwarded to it. The rest of S is unreachable rather than
+# routed by default: proxied too, a connection to an unused address went
+# out eth0 as a stream back to the Mac, which sent it here again.
+link=""
+link_args=""
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in lighter.link=*) link="${arg#lighter.link=}" ;; esac
+done
+if [ -n "$link" ]; then
+	link_net="${link%%,*}"
+	link_mac="${link#*,}"
+	link_dev=""
+	for dev in /sys/class/net/*; do
+		[ "$(cat "$dev/address" 2>/dev/null)" = "$link_mac" ] && link_dev="${dev##*/}"
+	done
+	link_ab="${link_net%.0.0/16}"
+	if [ -n "$link_dev" ] && [ "$link_ab" != "$link_net" ]; then
+		[ "$link_dev" = link0 ] || ip link set "$link_dev" name link0
+		sysctl -q -w net.ipv4.conf.link0.proxy_arp=1 net.ipv4.conf.link0.rp_filter=0 \
+			net.ipv6.conf.link0.disable_ipv6=1 2>/dev/null || true
+		ip addr add "$link_ab.0.2/24" dev link0
+		ip link set link0 up
+		ip route add unreachable "$link_net" 2>/dev/null || true
+		link_args="--bip=$link_ab.1.1/24 --default-address-pool=base=$link_net,size=24 --allow-direct-routing"
+		echo "INIT link=$link_ab.0.2 was=$link_dev"
+	else
+		echo "INIT link=missing mac=$link_mac"
+	fi
+fi
+
 # --- The engine -----------------------------------------------------------
 # dockerd is pointed at the containerd started above. It connects at once
 # when the socket is there, and gives up in a way that reads as "containerd
@@ -689,7 +726,7 @@ sh -c '
 	# BuildKit workers have no explicit OCI OOM score. Their runtime resets
 	# inherited protection so a large build cannot evict all normal containers.
 	export DOCKER_BUILDKIT_RUNC_COMMAND=/sbin/lighter-build-runc
-	exec dockerd $2 $3 \
+	exec dockerd $2 $3 $4 \
 		--host=unix:///run/docker.sock \
 		--containerd=/run/containerd/containerd.sock \
 		--data-root=/var/lib/docker \
@@ -698,7 +735,7 @@ sh -c '
 		--ipv6 --fixed-cidr-v6 fd6c:6967:6874:d0c::/64 --ip6tables \
 		--host-gateway-ip=192.168.127.254 \
 		--seccomp-profile=/etc/docker/seccomp.json \
-		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" "$registry_mirror" &
+		>/var/log/dockerd.log 2>&1' engine "$link_mtu" "$dockerd_debug" "$registry_mirror" "$link_args" &
 DOCKERD_PID=$!
 
 # Waiting for the socket rather than sleeping: dockerd's start time depends on
@@ -863,6 +900,23 @@ EOF
 	}
 	to_docker iptables 127.0.0.0/8
 	to_docker ip6tables ::1/128
+	# The Mac's connections over the link reach any container, published
+	# or not, as they would on a Linux host's own bridge: Docker drops
+	# traffic from outside its bridges to an unpublished port, and its
+	# DOCKER-USER chain, consulted first, is where a host lets it in.
+	if [ -n "$link_args" ]; then
+		(
+			tries=0
+			until iptables -t filter -L DOCKER-USER -n >/dev/null 2>&1; do
+				tries=$((tries + 1))
+				[ "$tries" -ge 120 ] && { echo "INIT link-forward=no-chain"; exit 0; }
+				sleep 0.5
+			done
+			iptables -C DOCKER-USER -i link0 -j ACCEPT 2>/dev/null \
+				|| iptables -I DOCKER-USER 1 -i link0 -j ACCEPT 2>/dev/console \
+				|| echo "INIT link-forward=failed"
+		) &
+	fi
 }
 
 # --- The LAN (0.12) ---------------------------------------------------------

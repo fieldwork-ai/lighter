@@ -128,6 +128,10 @@ pub struct MachineConfig {
     /// the user's network. Placed after every other device, so it is eth1
     /// and nothing else moves.
     pub lan: Option<Arc<crate::lan::Lan>>,
+    /// The link (`Lan::host_link`): a card on a network of the Mac and the
+    /// machine alone, through which the Mac reaches containers at their own
+    /// addresses. Placed after the LAN card; the guest finds it by MAC.
+    pub link: Option<Arc<crate::lan::Lan>>,
 }
 
 impl Default for MachineConfig {
@@ -154,6 +158,7 @@ impl Default for MachineConfig {
             video: false,
             video_aperture_bytes: 2 << 30,
             lan: None,
+            link: None,
         }
     }
 }
@@ -497,12 +502,16 @@ impl Machine {
             (slot, doorbell)
         });
 
-        let lan_inbox = Net::new_inbox();
-        let lan_slot = config.lan.as_ref().map(|lan| {
-            let slot = virtio.len();
-            virtio.push(Box::new(lan.device(lan_inbox.clone())));
-            slot
-        });
+        let wired: Vec<_> = [&config.lan, &config.link]
+            .into_iter()
+            .flatten()
+            .map(|card| {
+                let inbox = Net::new_inbox();
+                let slot = virtio.len();
+                virtio.push(Box::new(card.device(inbox.clone())));
+                (card.clone(), inbox, slot)
+            })
+            .collect();
 
         let virtio_slots = virtio.len();
         let mut virtio_devices = Vec::with_capacity(virtio_slots);
@@ -747,25 +756,25 @@ impl Machine {
         // in WFI, which is exactly when a guest is waiting for one; and when
         // the device has parked on a full outbox it is the responder that has
         // the transmit ring looked at again.
-        if let (Some(lan), Some(slot)) = (&config.lan, lan_slot) {
+        for (card, inbox, slot) in wired {
             let rx_transport = virtio_devices[slot].clone();
             let tx_transport = virtio_devices[slot].clone();
-            lan.spawn(
-                lan_inbox,
+            card.spawn(
+                inbox,
                 move || {
                     rx_transport
                         .lock()
-                        .expect("lan transport poisoned")
+                        .expect("wired card transport poisoned")
                         .service_queue(virtio::net::RX_QUEUE);
                 },
                 move || {
                     tx_transport
                         .lock()
-                        .expect("lan transport poisoned")
+                        .expect("wired card transport poisoned")
                         .service_queue(virtio::net::TX_QUEUE);
                 },
             )?;
-            tracing::info!(interface = lan.interface(), mac = %lighter_vmnet::helper::mac_text(lan.mac()), "the machine's LAN card is bridged");
+            tracing::info!(interface = card.interface(), mac = %lighter_vmnet::helper::mac_text(card.mac()), "the machine's wired card is up");
         }
         if let (Some(network), Some(slot)) = (&network, net_slot) {
             let rx_transport = virtio_devices[slot].clone();

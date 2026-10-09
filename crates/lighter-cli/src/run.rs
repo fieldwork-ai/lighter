@@ -282,6 +282,31 @@ pub fn machine() -> anyhow::Result<()> {
     if lan.is_some() {
         let _ = std::fs::remove_file(home.join("lan-error"));
     }
+    // Direct access: the link, a network of the Mac and the machine alone,
+    // on which containers have addresses the Mac can reach (`link.rs`). A
+    // machine that cannot make it starts without it, and `lighter status`
+    // says why.
+    let link = if config.direct {
+        match crate::link::plan(&home, &config.direct_subnet).and_then(|plan| {
+            let names = Arc::new(lighter_vmm::mdns::Names::new(plan.mac, plan.guest()));
+            Ok((crate::link::connect(&plan, names.clone())?, plan, names))
+        }) {
+            Ok((card, plan, names)) => {
+                cmdline.push_str(&plan.kernel_arg());
+                tracing::info!(subnet = %plan.subnet, mac = %lighter_vmnet::helper::mac_text(plan.mac), "the link is up");
+                let _ = std::fs::remove_file(home.join("link-error"));
+                Some((Arc::new(card), plan, names))
+            }
+            Err(why) => {
+                tracing::warn!(%why, "the machine starts without the link; containers are reached by published ports only");
+                let _ = std::fs::write(home.join("link-error"), &why);
+                None
+            }
+        }
+    } else {
+        let _ = std::fs::remove_file(home.join("link-error"));
+        None
+    };
     cmdline.push_str(match config.publish {
         crate::config::Publish::Lan => " lighter.publish=lan",
         crate::config::Publish::Localhost => " lighter.publish=localhost",
@@ -292,6 +317,7 @@ pub fn machine() -> anyhow::Result<()> {
     let (ram_bytes, hotplug_bytes) = config.memory_split();
     let machine_config = MachineConfig {
         lan,
+        link: link.as_ref().map(|(card, ..)| card.clone()),
         vcpus: config.vcpus(),
         ram_bytes,
         hotplug_bytes,
@@ -370,6 +396,17 @@ pub fn machine() -> anyhow::Result<()> {
             lighter_vmm::net::GUEST6.into(),
         ],
     )?;
+
+    // Containers' names on the Mac, for the addresses the link reaches.
+    if let Some((_, plan, names)) = link {
+        lighter_docker::names::watch(
+            &paths::docker_socket()?,
+            ports.clone(),
+            Arc::new(crate::link::Names(names)),
+            move |ip| plan.contains(ip),
+            plan.guest(),
+        )?;
+    }
 
     // A Mac that slept wakes with a guest whose clock did not.
     let _power = lighter_vmm::wake::Watcher::start(Box::new(Resync {

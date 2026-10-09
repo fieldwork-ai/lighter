@@ -41,6 +41,7 @@ pub mod kernel;
 pub mod lan;
 pub mod layout;
 pub mod machine;
+pub mod mdns;
 pub mod memory;
 pub mod memory_policy;
 pub mod mempressure;
