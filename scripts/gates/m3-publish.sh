@@ -348,6 +348,49 @@ read -r up_med up_max down_med down_max <<<"${latency:-5000 5000 5000 5000}"
 	|| fail "a closed listener took ${down_med:-?} ms to be withdrawn (at most ${down_max:-?})"
 $D rm -f m3-hostlat >/dev/null 2>&1
 
+echo "==> A host-network container's localhost is the Mac's too"
+# A port nothing in the guest listens on is the Mac's own loopback, both
+# families; one a host-network container listens on stays in the guest; a
+# bridge container's localhost is its own.
+$D run -d --name m3-hostlo2 --network host python:3.12-slim python3 -m http.server 18127 --bind 127.0.0.1 >/dev/null
+LO_FILE="$(mktemp -t lighter-m3-lo)"
+python3 - "$LO_FILE" >/dev/null 2>&1 <<'PY' &
+import http.server, socket, sys, threading
+class V6(http.server.HTTPServer):
+    address_family = socket.AF_INET6
+class Mac(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"mac")
+    def log_message(self, *a): pass
+v4 = http.server.HTTPServer(("127.0.0.1", 0), Mac)
+v6 = V6(("::1", 0), Mac)
+open(sys.argv[1], "w").write(f"{v4.server_port} {v6.server_port}")
+threading.Thread(target=v6.serve_forever, daemon=True).start()
+v4.serve_forever()
+PY
+LOSRV=$!
+for _ in $(seq 1 50); do [ -s "$LO_FILE" ] && break; sleep 0.1; done
+read -r lo4 lo6 < "$LO_FILE"
+rm -f "$LO_FILE"
+got="$($D run --rm --network host alpine:3.21 wget -q -T 5 -O - "http://127.0.0.1:$lo4/" 2>/dev/null)"
+[ "$got" = mac ] && pass "a host-network container reaches the Mac's 127.0.0.1:$lo4" || fail "127.0.0.1:$lo4 from a host-network container: '${got}'"
+got="$($D run --rm --network host alpine:3.21 wget -q -T 5 -O - "http://[::1]:$lo6/" 2>/dev/null)"
+[ "$got" = mac ] && pass "and the Mac's [::1]:$lo6" || fail "[::1]:$lo6 from a host-network container: '${got}'"
+got=""
+for _ in $(seq 1 20); do
+	got="$($D run --rm --network host alpine:3.21 wget -q -T 5 -O - "http://127.0.0.1:18127/" 2>/dev/null | head -c 15)"
+	[ -n "$got" ] && break
+	sleep 0.5
+done
+[ "$got" = "<!DOCTYPE HTML>" ] && pass "a port a host-network container listens on stays in the guest" || fail "127.0.0.1:18127 did not reach the guest's own server: '${got}'"
+$D rm -f m3-hostlo2 >/dev/null 2>&1
+if $D run --rm alpine:3.21 wget -q -T 3 -O - "http://127.0.0.1:$lo4/" >/dev/null 2>&1; then
+	fail "a bridge container reached the Mac's loopback through its own localhost"
+else
+	pass "a bridge container's localhost is still its own"
+fi
+kill "$LOSRV" 2>/dev/null; wait "$LOSRV" 2>/dev/null
+
 echo "==> A port published on one of the Mac's addresses"
 # `-p 192.168.1.20:9000:9000`: dockerd binds an address the guest does not
 # have, and the container never started (MinIO, 0.12.1). Docker Desktop and
