@@ -119,7 +119,7 @@ pub fn answer(
             tracing::debug!(name = %q.name, qtype = q.qtype, ?route, "a question for the Mac's resolvers");
             match route {
                 Some(crate::sysdns::Route::Mdns) => {
-                    let answer = crate::sysdns::multicast(&q.name, q.qtype, Duration::from_secs(1));
+                    let answer = crate::sysdns::local(&q.name, q.qtype, Duration::from_secs(1));
                     deliver(id, records_reply(&query, &q, answer));
                 }
                 Some(crate::sysdns::Route::Server(server)) => match forward_to(&query, server) {

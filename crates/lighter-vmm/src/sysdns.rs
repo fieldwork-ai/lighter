@@ -8,16 +8,55 @@
 //! VPN's internal SRV record, or a `.local` service a container browses
 //! for, was not found. Now each goes where the Mac's configuration sends
 //! its name ([`route`]): to that nameserver, whose reply is exact, or, for
-//! `.local`, out by multicast DNS from here ([`multicast`]).
+//! `.local`, to multicast DNS ([`local`]).
 //!
-//! Not through `DNSServiceQueryRecord`, which is the Mac's resolver for any
-//! type: a process with an app's identity, as the machine's is, was told
-//! nothing at all by it on the M1, where a plain tool asking the same got
-//! thirty answers in 4 ms. Its "no such record" also stands for a missing
-//! name and a missing type alike.
+//! `.local` is asked both of the Mac's resolver and by a multicast query
+//! from here ([`local`]), since each has given nothing where the other
+//! answered. The resolver is not the path for other names: its "no such
+//! record" stands for a missing name and a missing type alike.
 
+use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::raw::{c_char, c_int, c_void};
 use std::time::{Duration, Instant};
+
+type DNSServiceRef = *mut c_void;
+type QueryCallback = extern "C" fn(
+    DNSServiceRef,
+    u32,
+    u32,
+    i32,
+    *const c_char,
+    u16,
+    u16,
+    u16,
+    *const c_void,
+    u32,
+    *mut c_void,
+);
+
+const MORE_COMING: u32 = 0x1;
+const ADD: u32 = 0x2;
+const RETURN_INTERMEDIATES: u32 = 0x1000;
+const TIMEOUT: u32 = 0x10000;
+const NO_SUCH_NAME: i32 = -65538;
+const NO_SUCH_RECORD: i32 = -65554;
+
+unsafe extern "C" {
+    fn DNSServiceQueryRecord(
+        sd: *mut DNSServiceRef,
+        flags: u32,
+        interface: u32,
+        fullname: *const c_char,
+        rrtype: u16,
+        rrclass: u16,
+        callback: QueryCallback,
+        context: *mut c_void,
+    ) -> i32;
+    fn DNSServiceRefSockFD(sd: DNSServiceRef) -> c_int;
+    fn DNSServiceProcessResult(sd: DNSServiceRef) -> i32;
+    fn DNSServiceRefDeallocate(sd: DNSServiceRef);
+}
 
 /// One record of an answer: its owner name (presentation form, without the
 /// final dot), type, TTL and data as it goes on the wire.
@@ -36,6 +75,172 @@ pub enum Answer {
     /// The name exists without records of the type, or does not exist.
     NoData,
     NoName,
+}
+
+#[derive(Default)]
+struct Collected {
+    records: Vec<Record>,
+    negative: Option<i32>,
+    error: Option<i32>,
+    batch_done: bool,
+}
+
+extern "C" fn on_record(
+    _: DNSServiceRef,
+    flags: u32,
+    _: u32,
+    error: i32,
+    fullname: *const c_char,
+    rrtype: u16,
+    _: u16,
+    rdlen: u16,
+    rdata: *const c_void,
+    ttl: u32,
+    context: *mut c_void,
+) {
+    // SAFETY: the context is the `Collected` `query` passed, alive for the
+    // whole query; the strings and data are valid for this call.
+    let got = unsafe { &mut *context.cast::<Collected>() };
+    match error {
+        0 if flags & ADD != 0 => {
+            let name = unsafe { CStr::from_ptr(fullname) }.to_string_lossy();
+            let data = unsafe { std::slice::from_raw_parts(rdata.cast::<u8>(), rdlen as usize) };
+            got.records.push(Record {
+                name: name.trim_end_matches('.').to_string(),
+                rtype: rrtype,
+                ttl,
+                rdata: data.to_vec(),
+            });
+        }
+        0 => {}
+        NO_SUCH_RECORD | NO_SUCH_NAME => got.negative = Some(error),
+        e => got.error = Some(e),
+    }
+    if flags & MORE_COMING == 0 {
+        got.batch_done = true;
+    }
+}
+
+/// Asks the Mac's resolver (mDNSResponder) for `name`'s records of
+/// `rtype` in `class`, waiting at most `wait`. `None` when it could not
+/// say: not running, timed out, refused the question.
+pub fn resolver(name: &str, rtype: u16, class: u16, wait: Duration) -> Option<Answer> {
+    let fullname = CString::new(name).ok()?;
+    let mut got = Collected::default();
+    let mut sd: DNSServiceRef = std::ptr::null_mut();
+    // SAFETY: an out-pointer, a NUL-terminated name, a callback that lives
+    // forever and a context that outlives the reference (deallocated below
+    // before `got` goes).
+    let error = unsafe {
+        DNSServiceQueryRecord(
+            &mut sd,
+            RETURN_INTERMEDIATES | TIMEOUT,
+            0,
+            fullname.as_ptr(),
+            rtype,
+            class,
+            on_record,
+            std::ptr::addr_of_mut!(got).cast(),
+        )
+    };
+    if error != 0 {
+        return None;
+    }
+    // A `.local` answer comes from whoever answers, a moment apart: past
+    // the first batch, a little longer for the rest. And with nothing
+    // cached the resolver says "no such record" at once, before it has
+    // asked anyone, so for these a negative is only what is left when no
+    // one has answered in a second and a half.
+    let linger = name.ends_with(".local") || name.ends_with(".local.");
+    let deadline = Instant::now()
+        + if linger {
+            wait.min(Duration::from_millis(1500))
+        } else {
+            wait
+        };
+    let mut settled_at: Option<Instant> = None;
+    loop {
+        let now = Instant::now();
+        let until = match settled_at {
+            Some(at) => (at + Duration::from_millis(150)).min(deadline),
+            None => deadline,
+        };
+        if now >= until {
+            break;
+        }
+        // SAFETY: a live reference's descriptor.
+        let fd = unsafe { DNSServiceRefSockFD(sd) };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = (until - now).as_millis().min(i32::MAX as u128) as c_int;
+        // SAFETY: one pollfd.
+        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+            continue;
+        }
+        // SAFETY: a live reference with something to read; the callback
+        // writes into `got`.
+        if unsafe { DNSServiceProcessResult(sd) } != 0 {
+            break;
+        }
+        if got.error.is_some() {
+            break;
+        }
+        if got.batch_done && !linger && (!got.records.is_empty() || got.negative.is_some()) {
+            break;
+        }
+        if got.batch_done && linger && !got.records.is_empty() {
+            settled_at.get_or_insert_with(Instant::now);
+            got.batch_done = false;
+        }
+    }
+    // SAFETY: the reference is live and not used again; no callback runs
+    // after this, so `got` is ours alone.
+    unsafe { DNSServiceRefDeallocate(sd) };
+    if !got.records.is_empty() {
+        return Some(Answer::Records(got.records));
+    }
+    match got.negative {
+        Some(NO_SUCH_NAME) => Some(Answer::NoName),
+        Some(_) => Some(Answer::NoData),
+        None => None,
+    }
+}
+
+/// A `.local` question, asked both ways at once and the answers merged:
+/// by the Mac's resolver ([`resolver`]) and by a multicast query from here
+/// ([`multicast`]). Each has been found to give nothing where the other
+/// answered: the resolver told the machine's process nothing on the M1,
+/// and on the Studio the query from here never left the Mac (the process
+/// may not send to the network itself until macOS's Local Network
+/// permission allows it, while mDNSResponder asks on its behalf).
+pub fn local(name: &str, rtype: u16, wait: Duration) -> Answer {
+    let asked = name.to_string();
+    let by_resolver = std::thread::Builder::new()
+        .name("dns-local".into())
+        .spawn(move || resolver(&asked, rtype, 1, wait));
+    let mut records = match multicast(name, rtype, wait) {
+        Answer::Records(r) => r,
+        _ => Vec::new(),
+    };
+    if let Ok(Ok(Some(Answer::Records(more)))) = by_resolver.map(|h| h.join()) {
+        for record in more {
+            if !records.iter().any(|r| {
+                r.rtype == record.rtype
+                    && r.rdata == record.rdata
+                    && r.name.eq_ignore_ascii_case(&record.name)
+            }) {
+                records.push(record);
+            }
+        }
+    }
+    if records.is_empty() {
+        Answer::NoData
+    } else {
+        Answer::Records(records)
+    }
 }
 
 /// Asks the networks the Mac is on, by multicast DNS, for `name`'s records
