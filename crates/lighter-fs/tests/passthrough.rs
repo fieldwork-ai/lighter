@@ -3144,3 +3144,28 @@ fn an_owner_survives_a_restart_on_a_share_whose_root_cannot_be_marked() {
     std::fs::set_permissions(&guest.root, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(owner, (999, 999), "after a restart");
 }
+
+/// A file deleted while open stays on an SMB share as `.smbdelete…` until
+/// its last close. It is gone, as an unlinked file is on Linux: listed, a
+/// Postgres initdb tried to fsync one and failed when it went. On the Mac's
+/// own disk the name is a name like any other.
+#[test]
+fn a_file_deleted_while_open_is_not_listed_on_a_network_share() {
+    let mut guest = on_a_network_share("network-smbdelete");
+    std::fs::write(guest.host("kept"), b"x").unwrap();
+    std::fs::write(guest.host(".smbdeleteAAAd1ea4.4"), b"x").unwrap();
+    let names = guest.list(1, 4096, true);
+    assert!(names.contains(&"kept".to_string()), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with(".smbdelete")),
+        "{names:?}"
+    );
+
+    let mut local = Guest::new("local-smbdelete");
+    std::fs::write(local.host(".smbdeleteAAAd1ea4.4"), b"x").unwrap();
+    let names = local.list(1, 4096, false);
+    assert!(
+        names.contains(&".smbdeleteAAAd1ea4.4".to_string()),
+        "{names:?}"
+    );
+}

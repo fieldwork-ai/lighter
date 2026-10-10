@@ -1220,22 +1220,45 @@ impl Server {
     }
 
     /// Whether `request` may wait on something other than this Mac: true
-    /// unless the volume of the inode it names is known to be local. Cheap
-    /// and touching no volume, since it is asked on the vCPU deciding
-    /// whether to serve the request itself. A request on a local directory
-    /// can still reach a network volume mounted inside it (a lookup or a
-    /// listing of the mount point); only what the request names is weighed.
+    /// unless the volume of the inode it names is known to be local, and the
+    /// inode is not a directory a network volume is mounted in (a lookup or
+    /// a listing there reaches the mount point, [`crate::mounts`]). Cheap and
+    /// touching no volume, since it is asked on the vCPU deciding whether to
+    /// serve the request itself.
+    ///
+    /// A FORGET is weighed by every inode it names: forgetting the last
+    /// lookup closes the descriptors held for the file, and on a network
+    /// volume a close is a round trip to its server.
     pub fn may_block(&self, request: &[u8]) -> bool {
         let Some(header) = InHeader::parse(request) else {
             return true;
         };
-        match self.registry.get(header.nodeid) {
-            Some(inode) => !self
-                .volumes
-                .known(inode.dev())
-                .is_some_and(|volume| volume.local),
-            None => true,
+        match header.opcode {
+            op::INTERRUPT => false,
+            op::BATCH_FORGET => {
+                let end = (header.len as usize)
+                    .min(request.len())
+                    .max(fuse::IN_HEADER_LEN);
+                let body = &request[fuse::IN_HEADER_LEN..end];
+                let Some(count) = get_u32(body, 0) else {
+                    return false;
+                };
+                (0..count as usize)
+                    .map_while(|index| get_u64(body, 8 + index * 16))
+                    .any(|nodeid| !self.surely_local(nodeid))
+            }
+            _ => !self.surely_local(header.nodeid),
         }
+    }
+
+    /// Whether a request on `nodeid` is known to stay on this Mac.
+    fn surely_local(&self, nodeid: u64) -> bool {
+        self.registry.get(nodeid).is_some_and(|inode| {
+            self.volumes
+                .known(inode.dev())
+                .is_some_and(|volume| volume.local)
+                && !crate::mounts::holds_network_mount(inode.dev(), inode.ino())
+        })
     }
 
     /// Handles one request, writing the reply into `sink`.
@@ -5051,6 +5074,14 @@ impl Server {
             } else {
                 self.list(nodeid)?
             };
+            // A file deleted while open stays on an SMB share as
+            // `.smbdelete…` until its last close ([`await_smb_deletes`]). It
+            // is gone, as an unlinked file is gone from its directory on
+            // Linux: listed, Postgres's initdb tried to fsync one and failed
+            // when it went.
+            if self.volumes.network(parent.dev()) {
+                listed.retain(|entry| !entry.name.starts_with(b".smbdelete"));
+            }
             if !gone.is_empty() || !promised.is_empty() {
                 if self.debug_listing {
                     let dropped: Vec<String> = listed
@@ -5428,10 +5459,13 @@ mod volfs_tests {
 
     /// A request is served on the vCPU only when its volume is known to be
     /// this Mac's: the share's own disk from the start, anything else once
-    /// a worker has looked (a NAS that hung froze guest CPUs for 40 s).
+    /// a worker has looked (a NAS that hung froze guest CPUs for 40 s), and
+    /// not in a directory a network volume is mounted in.
     #[test]
     fn only_a_request_on_a_known_local_volume_may_be_served_inline() {
-        let dir = tempfile_dir();
+        // Its own directory: the mount pretended below is process-wide.
+        let dir = tempfile_dir().join("mounted-in");
+        std::fs::create_dir_all(&dir).unwrap();
         let server = Server::new(&dir).unwrap();
         let request = |nodeid: u64| {
             let mut r = vec![0u8; crate::fuse::IN_HEADER_LEN];
@@ -5451,6 +5485,52 @@ mod volfs_tests {
             server.may_block(&[0u8; 4]),
             "nor is a request too short to name one"
         );
+        let root = server.registry.get(1).unwrap();
+        crate::mounts::tests::PRETENDED
+            .lock()
+            .unwrap()
+            .push((root.dev(), root.ino()));
+        assert!(
+            server.may_block(&request(1)),
+            "nor a directory a network volume is mounted in: a lookup there waits on its server"
+        );
+    }
+
+    /// A FORGET is served on the vCPU only when every inode it names is on
+    /// this Mac: the last forget of a file closes its descriptors, and on a
+    /// network volume a close waits on the server. An INTERRUPT touches no
+    /// volume at all.
+    #[test]
+    fn a_forget_is_served_inline_only_when_all_it_names_is_local() {
+        let dir = tempfile_dir();
+        let server = Server::new(&dir).unwrap();
+        let request = |opcode: u32, nodeid: u64, body: &[u8]| {
+            let len = crate::fuse::IN_HEADER_LEN + body.len();
+            let mut r = vec![0u8; crate::fuse::IN_HEADER_LEN];
+            r[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+            r[4..8].copy_from_slice(&opcode.to_le_bytes());
+            r[16..24].copy_from_slice(&nodeid.to_le_bytes());
+            r.extend_from_slice(body);
+            r
+        };
+        let batch = |nodeids: &[u64]| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&(nodeids.len() as u32).to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            for nodeid in nodeids {
+                body.extend_from_slice(&nodeid.to_le_bytes());
+                body.extend_from_slice(&1u64.to_le_bytes());
+            }
+            body
+        };
+        assert!(!server.may_block(&request(op::FORGET, 1, &1u64.to_le_bytes())));
+        assert!(server.may_block(&request(op::FORGET, 424_242, &1u64.to_le_bytes())));
+        assert!(!server.may_block(&request(op::BATCH_FORGET, 0, &batch(&[1, 1]))));
+        assert!(
+            server.may_block(&request(op::BATCH_FORGET, 0, &batch(&[1, 424_242]))),
+            "one inode not known to be local sends the batch to a worker"
+        );
+        assert!(!server.may_block(&request(op::INTERRUPT, 0, &[0u8; 8])));
     }
 
     /// A record the server will not overwrite is removed and made again; any
