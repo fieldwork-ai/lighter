@@ -15,11 +15,20 @@
 //! has chowned something elsewhere. The share's root is marked with the first
 //! record anywhere under it, and a share whose root is not marked reads
 //! nothing at all.
+//!
+//! The record also holds the permission bits a container set wherever the
+//! file's own cannot be trusted to: on a volume that keeps none (exFAT, FAT),
+//! and on a network share, whose server may refuse a chmod, accept one and
+//! change nothing, or give a new file permissions of its own (#69). A record
+//! written on a network share says so (`"kept":1`); one without it may be a
+//! chown's from before, holding bits a later chmod has since changed on the
+//! file itself.
 
 use std::ffi::CStr;
 
 /// The record: `{"UID":1000,"GID":1000,"mode":644}`, owner in the guest's
-/// numbering and the mode's octal digits written as a decimal number.
+/// numbering and the mode's octal digits written as a decimal number, with
+/// `"kept":1` when the mode is the file's in containers wherever it is.
 pub const RECORD: &CStr = c"com.docker.grpcfuse.ownership";
 
 /// On a directory with an owned entry directly inside it, and on the share's
@@ -42,10 +51,16 @@ pub enum Owner {
     /// No record: the Mac user, which the guest sees as root.
     Mac,
     /// A container's chown, in the guest's numbering, and the permission
-    /// bits the record holds. The bits stand in for the file's own only on a
+    /// bits the record holds. The bits stand in for the file's own on a
     /// volume that keeps none (exFAT, FAT), where a chmod has nowhere else to
-    /// go; elsewhere the file's own are the truth.
-    Set(u32, u32, Option<u32>),
+    /// go, and wherever they are `kept`; elsewhere the file's own are the
+    /// truth.
+    Set {
+        uid: u32,
+        gid: u32,
+        mode: Option<u32>,
+        kept: bool,
+    },
 }
 
 impl Owner {
@@ -54,8 +69,8 @@ impl Owner {
     /// only for its mode, root being how the Mac user already appears.
     pub fn recorded(self) -> Option<(u32, u32)> {
         match self {
-            Owner::Set(0, 0, _) => None,
-            Owner::Set(uid, gid, _) => Some((uid, gid)),
+            Owner::Set { uid: 0, gid: 0, .. } => None,
+            Owner::Set { uid, gid, .. } => Some((uid, gid)),
             Owner::Unknown | Owner::Mac => None,
         }
     }
@@ -63,8 +78,19 @@ impl Owner {
     /// The permission bits recorded, if any.
     pub fn mode(self) -> Option<u32> {
         match self {
-            Owner::Set(_, _, mode) => mode,
+            Owner::Set { mode, .. } => mode,
             Owner::Unknown | Owner::Mac => None,
+        }
+    }
+
+    /// The permission bits recorded as the file's in containers on any
+    /// volume, if the record says so.
+    pub fn kept_mode(self) -> Option<u32> {
+        match self {
+            Owner::Set {
+                mode, kept: true, ..
+            } => mode,
+            _ => None,
         }
     }
 }
@@ -74,9 +100,15 @@ pub fn is_ours(name: &[u8]) -> bool {
     name == RECORD.to_bytes() || name == MARKER.to_bytes()
 }
 
-/// The record for an owner and the file's current permission bits.
-pub fn encode(uid: u32, gid: u32, mode: u32) -> Vec<u8> {
-    format!(r#"{{"UID":{uid},"GID":{gid},"mode":{:o}}}"#, mode & 0o7777).into_bytes()
+/// The record for an owner and the file's permission bits, `kept` if the
+/// bits are the file's in containers whatever the file itself says.
+pub fn encode(uid: u32, gid: u32, mode: u32, kept: bool) -> Vec<u8> {
+    let kept = if kept { r#","kept":1"# } else { "" };
+    format!(
+        r#"{{"UID":{uid},"GID":{gid},"mode":{:o}{kept}}}"#,
+        mode & 0o7777
+    )
+    .into_bytes()
 }
 
 /// The owner a record names, and its permission bits if it has them; `None`
@@ -86,7 +118,12 @@ pub fn parse(record: &[u8]) -> Option<Owner> {
     let mode = digits(text, "mode")
         .and_then(|digits| u32::from_str_radix(digits, 8).ok())
         .map(|mode| mode & 0o7777);
-    Some(Owner::Set(field(text, "UID")?, field(text, "GID")?, mode))
+    Some(Owner::Set {
+        uid: field(text, "UID")?,
+        gid: field(text, "GID")?,
+        kept: mode.is_some() && field(text, "kept") == Some(1),
+        mode,
+    })
 }
 
 /// A non-negative integer field of a flat JSON object. The record is written
@@ -110,30 +147,46 @@ fn digits<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
 
+    fn set(uid: u32, gid: u32, mode: Option<u32>, kept: bool) -> Owner {
+        Owner::Set {
+            uid,
+            gid,
+            mode,
+            kept,
+        }
+    }
+
     #[test]
     fn a_record_round_trips() {
-        let record = encode(1000, 82, 0o100755);
+        let record = encode(1000, 82, 0o100755, false);
         assert_eq!(record, br#"{"UID":1000,"GID":82,"mode":755}"#);
-        assert_eq!(parse(&record), Some(Owner::Set(1000, 82, Some(0o755))));
+        assert_eq!(parse(&record), Some(set(1000, 82, Some(0o755), false)));
+        let record = encode(0, 0, 0o700, true);
+        assert_eq!(record, br#"{"UID":0,"GID":0,"mode":700,"kept":1}"#);
+        let kept = parse(&record).unwrap();
+        assert_eq!(kept, set(0, 0, Some(0o700), true));
+        assert_eq!(kept.kept_mode(), Some(0o700));
+        assert_eq!(kept.recorded(), None, "a kept mode alone names no owner");
+        assert_eq!(set(1000, 82, Some(0o755), false).kept_mode(), None);
     }
 
     #[test]
     fn docker_desktops_record_is_read() {
         assert_eq!(
             parse(br#"{"UID":405,"GID":82,"mode":2770}"#),
-            Some(Owner::Set(405, 82, Some(0o2770)))
+            Some(set(405, 82, Some(0o2770), false))
         );
         assert_eq!(
             parse(br#"{"UID":501,"GID":20}"#),
-            Some(Owner::Set(501, 20, None))
+            Some(set(501, 20, None, false))
         );
         assert_eq!(
             parse(br#"{ "GID" : 7 , "UID" : 3 }"#),
-            Some(Owner::Set(3, 7, None))
+            Some(set(3, 7, None, false))
         );
         assert_eq!(
             parse(br#"{"UID":3,"GID":7,"mode":789}"#),
-            Some(Owner::Set(3, 7, None)),
+            Some(set(3, 7, None, false)),
             "a mode that is not octal is no mode"
         );
     }

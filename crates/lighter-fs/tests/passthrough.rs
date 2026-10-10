@@ -2969,6 +2969,123 @@ fn a_chmod_elsewhere_is_the_files_own() {
     );
 }
 
+/// A guest whose share is taken for a network share, as a NAS mounted under
+/// `/Volumes` is.
+fn on_a_network_share(name: &str) -> Guest {
+    let guest = Guest::new(name);
+    guest.server.assume_network_share();
+    guest
+}
+
+/// The same share served again, as after a restart.
+fn restarted_on_a_network_share(guest: &Guest) -> Guest {
+    let restarted = guest.another();
+    restarted.server.assume_network_share();
+    restarted
+}
+
+fn set_host_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A network share's server decides permissions for itself: a QNAP's refuses
+/// every chmod and makes every new file `rwxrwxr-x`, another accepts a chmod
+/// and changes nothing. What a container set — at a mkdir, a create, a
+/// chmod — is what it reads back whatever the server did, and after a
+/// restart (#69: Borg Backup Server stopped at its first chmod; a Postgres
+/// data directory made `0700` would have read `0755` on its next start).
+#[test]
+fn on_a_network_share_the_modes_a_container_sets_are_kept() {
+    let mut guest = on_a_network_share("network-modes");
+    let mut body = 0o700u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("db"));
+    guest.call(op::MKDIR, 1, &body).expect("mkdir");
+    guest.create_mode(1, "key", 0x8241, 0o600).expect("create");
+    std::fs::write(guest.host("conf"), b"x").unwrap();
+    let conf = guest.lookup(1, "conf").unwrap();
+    let reply = setattr(&mut guest, conf, fuse::fattr::MODE, 0o640, (0, 0));
+    assert_eq!(mode_and_owner(&reply).0, 0o640, "the reply");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    // The server's say: what a QNAP gives every file, or a chmod ignored.
+    for name in ["db", "key", "conf"] {
+        set_host_mode(&guest.host(name), 0o775);
+    }
+    let mut restarted = restarted_on_a_network_share(&guest);
+    for (name, mode) in [("db", 0o700), ("key", 0o600), ("conf", 0o640)] {
+        let nodeid = restarted.lookup(1, name).unwrap();
+        let reply = restarted.call(op::GETATTR, nodeid, &[0u8; 16]).unwrap();
+        assert_eq!(mode_and_owner(&reply).0, mode, "{name}");
+        let record = record_on_host(&guest.host(name)).unwrap_or_default();
+        assert!(record.contains(r#""kept":1"#), "{name}: {record}");
+    }
+}
+
+/// A chown and a chmod on a network share are kept together, in either
+/// order, and the owner survives the chmod.
+#[test]
+fn on_a_network_share_an_owner_and_a_mode_are_kept_together() {
+    let mut guest = on_a_network_share("network-owner");
+    std::fs::create_dir(guest.host("data")).unwrap();
+    let dir = guest.lookup(1, "data").unwrap();
+    setattr(
+        &mut guest,
+        dir,
+        fuse::fattr::UID | fuse::fattr::GID,
+        0,
+        (100, 101),
+    );
+    let reply = setattr(&mut guest, dir, fuse::fattr::MODE, 0o750, (0, 0));
+    assert_eq!(mode_and_owner(&reply), (0o750, 100, 101), "the reply");
+    set_host_mode(&guest.host("data"), 0o775);
+    let mut restarted = restarted_on_a_network_share(&guest);
+    let dir = restarted.lookup(1, "data").unwrap();
+    let reply = restarted.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
+    assert_eq!(mode_and_owner(&reply), (0o750, 100, 101), "after a restart");
+}
+
+/// A record written before modes were kept on network shares holds the
+/// bits of its chown, which a later chmod may since have changed on the
+/// file itself: its owner counts, its bits do not.
+#[test]
+fn on_a_network_share_a_record_from_before_leaves_the_files_own_bits() {
+    let guest = Guest::new("network-old-record");
+    std::fs::create_dir(guest.host("data")).unwrap();
+    set_host_mode(&guest.host("data"), 0o700);
+    let path = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    lighter_fs::sys::set_xattr(
+        &path(&guest.host("data")),
+        lighter_fs::ownership::RECORD,
+        br#"{"UID":100,"GID":101,"mode":755}"#,
+        0,
+    )
+    .unwrap();
+    lighter_fs::sys::set_xattr(&path(&guest.root), lighter_fs::ownership::MARKER, b"1", 0).unwrap();
+    let mut restarted = restarted_on_a_network_share(&guest);
+    let dir = restarted.lookup(1, "data").unwrap();
+    let reply = restarted.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
+    assert_eq!(mode_and_owner(&reply), (0o700, 100, 101));
+}
+
+/// On the Mac's own disk a file takes its bits, and nothing is recorded.
+#[test]
+fn on_the_macs_own_disk_a_new_files_bits_are_its_own() {
+    let mut guest = Guest::new("local-modes");
+    guest.create_mode(1, "key", 0x8241, 0o600).expect("create");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(guest.host("key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert_eq!(record_on_host(&guest.host("key")), None);
+}
+
 /// exFAT cannot rename without replacing; Linux's own exFAT driver can, the
 /// kernel checking for the target itself. ClickHouse writes its metadata so
 /// (issue #69).

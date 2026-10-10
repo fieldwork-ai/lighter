@@ -870,6 +870,46 @@ pub fn remove_xattr(path: &CStr, name: &CStr) -> Result<()> {
     check(unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), XATTR_NOFOLLOW) }).map(|_| ())
 }
 
+/// [`get_xattr`] of a file already open: one the apply queue has just made
+/// or changed, which has no path it could be asked by.
+pub fn get_xattr_fd(fd: RawFd, name: &CStr, buf: &mut [u8]) -> Result<usize> {
+    // SAFETY: a live descriptor, a valid NUL-terminated name, and a buffer we
+    // own of the length we pass.
+    check_size(unsafe {
+        libc::fgetxattr(
+            fd,
+            name.as_ptr(),
+            buffer_or_null(buf) as *mut libc::c_void,
+            buf.len(),
+            0,
+            0,
+        )
+    })
+}
+
+/// [`remove_xattr`] of a file already open.
+pub fn remove_xattr_fd(fd: RawFd, name: &CStr) -> Result<()> {
+    // SAFETY: a live descriptor and a valid NUL-terminated name.
+    check(unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) }).map(|_| ())
+}
+
+/// [`set_xattr`] of a file already open.
+pub fn set_xattr_fd(fd: RawFd, name: &CStr, value: &[u8]) -> Result<()> {
+    // SAFETY: a live descriptor, a valid name, and a buffer we own of the
+    // stated length.
+    check(unsafe {
+        libc::fsetxattr(
+            fd,
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+            0,
+        )
+    })
+    .map(|_| ())
+}
+
 /// `faccessat` with the caller's effective identity, which is the only one this
 /// process has.
 pub fn access(path: &CStr, mask: u32) -> Result<()> {

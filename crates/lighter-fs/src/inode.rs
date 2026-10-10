@@ -94,6 +94,9 @@ pub struct Inode {
     /// whether it still names this file is settled by `(dev, ino)` after the
     /// reopen, never assumed.
     parked_at: Mutex<Option<Parked>>,
+    /// The birth time of the file this inode is, on a volume whose numbers do
+    /// not identify a file alone ([`Registry::identified`]); `None` elsewhere.
+    born: Mutex<Option<(i64, i64)>>,
     /// The name the guest last reached this inode by; see [`Place`].
     place: Mutex<Option<Place>>,
     /// The reference bit of a clock: set on use, cleared as the reclaimer
@@ -386,6 +389,7 @@ impl Inode {
         Inode {
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
+            born: Mutex::new(None),
             place: Mutex::new(None),
             used: AtomicBool::new(true),
             held: AtomicBool::new(true),
@@ -432,6 +436,7 @@ impl Inode {
         Inode {
             fd: RwLock::new(None),
             parked_at: Mutex::new(None),
+            born: Mutex::new(None),
             place: Mutex::new(None),
             used: AtomicBool::new(true),
             held: AtomicBool::new(false),
@@ -1317,6 +1322,31 @@ impl Inode {
     /// The descriptor is what settles it: it still points at whatever it was
     /// opened on, so if that file has been unlinked its link count is zero, and
     /// if the number now belongs to something else the numbers no longer match.
+    /// The birth time this inode was registered with, if its volume needs one.
+    pub fn born(&self) -> Option<(i64, i64)> {
+        *self.born.lock().expect("birth time poisoned")
+    }
+
+    /// Records the file's birth time: when it is registered, and again after
+    /// a change of its times, which moves it back if the new modification
+    /// time is the earlier (macOS does so on every volume).
+    pub fn set_born(&self, born: Option<(i64, i64)>) {
+        if born.is_some() {
+            *self.born.lock().expect("birth time poisoned") = born;
+        }
+    }
+
+    /// Whether this inode is the file now at `(dev, ino)` born at `born`: the
+    /// numbers alone, where a volume's numbers identify a file, and the birth
+    /// time too where they do not.
+    fn is_file(&self, dev: i64, ino: u64, born: Option<(i64, i64)>) -> bool {
+        let same_birth = match (born, self.born()) {
+            (Some(theirs), Some(ours)) => theirs == ours,
+            _ => true,
+        };
+        same_birth && self.still_is(dev, ino)
+    }
+
     fn still_is(&self, dev: i64, ino: u64) -> bool {
         // A parked file with a place is checked by its name: one fstatat
         // against the parent's descriptor, with the birth time recorded at
@@ -1461,6 +1491,10 @@ pub struct Registry {
     /// install, a create costs 26 microseconds on one thread and 39 under
     /// sixteen, and the difference is this.
     by_identity: [RwLock<HashMap<(i64, u64), u64>>; SHARDS],
+    /// Volumes whose numbers do not identify a file alone, where a birth time
+    /// is part of a file's identity ([`Registry::identified`]): network
+    /// shares, as the server learns them.
+    by_birth: RwLock<std::collections::HashSet<i64>>,
     next_id: AtomicU64,
     /// How many metadata descriptors the inode table is holding open.
     ///
@@ -1563,6 +1597,7 @@ impl Registry {
         Registry {
             by_id,
             by_identity,
+            by_birth: RwLock::new(std::collections::HashSet::new()),
             next_id: AtomicU64::new(ROOT_ID + 1),
             census,
             budget: descriptor_budget(),
@@ -1630,7 +1665,73 @@ impl Registry {
     /// guest has seen before would otherwise cost an `openat` every time, and a
     /// package install looks up the same few thousand directories tens of
     /// thousands of times.
-    pub fn relookup(&self, dev: i64, ino: u64) -> Option<u64> {
+    /// Whether files on `dev` are told apart by their birth time as well as
+    /// their numbers: set for a network share as it is learned.
+    pub fn identify_by_birth(&self, dev: i64, by_birth: bool) {
+        let mut devs = self.by_birth.write().expect("birth volumes poisoned");
+        if by_birth {
+            devs.insert(dev);
+        } else {
+            devs.remove(&dev);
+        }
+    }
+
+    /// Whether files on `dev` are told apart by birth time as well.
+    pub fn identifies_by_birth(&self, dev: i64) -> bool {
+        self.by_birth
+            .read()
+            .expect("birth volumes poisoned")
+            .contains(&dev)
+    }
+
+    /// Moves an inode to the numbers its file has after a rename, on a volume
+    /// that numbers a file by its name ([`Registry::identified`]). Renamed
+    /// there, a file takes the numbers of its new name, which the next lookup
+    /// of that name asks for; still under its old ones, it was not found, and
+    /// was opened again as another file, through a second vnode that had not
+    /// seen the first one's writes: a file written and renamed over another
+    /// read back empty, as Postgres's `pg_internal.init` did (#69). Whatever
+    /// held the new numbers loses them, and stays for whoever holds it.
+    pub fn renumber(&self, id: u64, dev: i64, ino: u64, birthtime: Option<(i64, i64)>) {
+        if !self.identifies_by_birth(dev) {
+            return;
+        }
+        let Some(inode) = self.get(id) else {
+            return;
+        };
+        let old = inode.ino();
+        if old != ino {
+            // One shard at a time: the two may differ, and `insert` takes them
+            // one at a time too.
+            {
+                let mut identity = self.by_identity[identity_shard(old)]
+                    .write()
+                    .expect("identity table poisoned");
+                if identity.get(&(dev, old)) == Some(&id) {
+                    identity.remove(&(dev, old));
+                }
+            }
+            inode.ino.store(ino, Ordering::Relaxed);
+            self.by_identity[identity_shard(ino)]
+                .write()
+                .expect("identity table poisoned")
+                .insert((dev, ino), id);
+        }
+        inode.set_born(self.born_on(dev, birthtime));
+    }
+
+    /// A birth time from a stat, where its volume needs one.
+    fn born_on(&self, dev: i64, birthtime: Option<(i64, i64)>) -> Option<(i64, i64)> {
+        birthtime.filter(|_| {
+            self.by_birth
+                .read()
+                .expect("birth volumes poisoned")
+                .contains(&dev)
+        })
+    }
+
+    pub fn relookup(&self, dev: i64, ino: u64, birthtime: Option<(i64, i64)>) -> Option<u64> {
+        let born = self.born_on(dev, birthtime);
         let id = *self.by_identity[identity_shard(ino)]
             .read()
             .expect("identity table poisoned")
@@ -1640,7 +1741,7 @@ impl Registry {
             .expect("inode table poisoned")
             .get(&id)
             .cloned()?;
-        if !inode.still_is(dev, ino) {
+        if !inode.is_file(dev, ino, born) {
             self.retire_identity(id, dev, ino);
             return None;
         }
@@ -1658,7 +1759,22 @@ impl Registry {
     /// removals were somebody else's — and `rm -rf` of a tree the guest had
     /// just made was refused ENOTEMPTY, on a host slow enough for the reuse
     /// to land inside the window.
-    pub fn identified(&self, dev: i64, ino: u64) -> Option<Arc<Inode>> {
+    ///
+    /// `born` is the birth time of the file found at the numbers, given where
+    /// the numbers name a place rather than a file: an SMB share whose server
+    /// offers no file ids (Samba's default with `fruit`) has macOS number
+    /// every file by its name, so a file made again under a name, or renamed
+    /// over one, has the numbers of the file it replaced, and a descriptor on
+    /// that one still answers to them after it is gone. Postgres replaces its
+    /// catalog's cache file so, and read the old one back: "cache lookup
+    /// failed for index 2662" on its next connection (#69).
+    pub fn identified(
+        &self,
+        dev: i64,
+        ino: u64,
+        birthtime: Option<(i64, i64)>,
+    ) -> Option<Arc<Inode>> {
+        let born = self.born_on(dev, birthtime);
         let id = *self.by_identity[identity_shard(ino)]
             .read()
             .expect("identity table poisoned")
@@ -1668,7 +1784,7 @@ impl Registry {
             .expect("inode table poisoned")
             .get(&id)
             .cloned()?;
-        if !inode.still_is(dev, ino) {
+        if !inode.is_file(dev, ino, born) {
             self.retire_identity(id, dev, ino);
             return None;
         }
@@ -1722,7 +1838,16 @@ impl Registry {
     /// `fd` is only installed if this is a new inode; otherwise it is dropped
     /// and the existing descriptor kept, which is what keeps one file to one
     /// descriptor however many names it has.
-    pub fn insert(&self, fd: OwnedFd, dev: i64, ino: u64, is_dir: bool, is_symlink: bool) -> u64 {
+    pub fn insert(
+        &self,
+        fd: OwnedFd,
+        dev: i64,
+        ino: u64,
+        is_dir: bool,
+        is_symlink: bool,
+        birthtime: Option<(i64, i64)>,
+    ) -> u64 {
+        let born = self.born_on(dev, birthtime);
         // Two threads can miss `relookup` for the same file at once; the
         // identity map is the arbiter, and the loser's descriptor is dropped.
         let mut identity = self.by_identity[identity_shard(ino)]
@@ -1739,7 +1864,7 @@ impl Registry {
                 .get(&id)
                 .cloned();
             if let Some(inode) = existing
-                && inode.still_is(dev, ino)
+                && inode.is_file(dev, ino, born)
             {
                 let mut lookups = inode.lookups.lock().expect("lookup count poisoned");
                 *lookups = lookups.saturating_add(1);
@@ -1758,6 +1883,7 @@ impl Registry {
             1,
             self.census.clone(),
         ));
+        inode.set_born(born);
         inode.id.store(id, Ordering::Relaxed);
         // Admission control, and the difference between degrading and
         // seizing. A full share used to admit the newcomer and lean on the
@@ -1839,6 +1965,7 @@ impl Registry {
         ));
         inode.id.store(id, Ordering::Relaxed);
         inode.bind_parked(dev, ino, birthtime);
+        inode.set_born(self.born_on(dev, Some(birthtime)));
         self.by_id[shard(id)]
             .lock()
             .expect("inode table poisoned")
@@ -1866,8 +1993,17 @@ impl Registry {
     /// nodeid — a FORGET may have raced the apply — and if no other entry
     /// claimed these numbers first, which the same lock arbitration as
     /// [`Registry::insert`] settles.
-    pub fn bind_pending(&self, id: u64, inode: &Arc<Inode>, fd: OwnedFd, dev: i64, ino: u64) {
+    pub fn bind_pending(
+        &self,
+        id: u64,
+        inode: &Arc<Inode>,
+        fd: OwnedFd,
+        dev: i64,
+        ino: u64,
+        birthtime: Option<(i64, i64)>,
+    ) {
         inode.bind(fd, dev, ino);
+        inode.set_born(self.born_on(dev, birthtime));
         // The same admission control as `insert`: a bind must not push the
         // descriptor count past the budget, or a create storm larger than the
         // budget outruns the sweep and climbs to the kernel's ceiling. A
@@ -1892,6 +2028,7 @@ impl Registry {
         birthtime: (i64, i64),
     ) {
         inode.bind_parked(dev, ino, birthtime);
+        inode.set_born(self.born_on(dev, Some(birthtime)));
         self.claim_identity(id, dev, ino);
         self.release_if_unwanted(id);
     }
@@ -1914,13 +2051,14 @@ impl Registry {
     }
 
     fn claim_identity(&self, id: u64, dev: i64, ino: u64) {
-        let still_known = self.by_id[shard(id)]
+        let claimant = self.by_id[shard(id)]
             .lock()
             .expect("inode table poisoned")
-            .contains_key(&id);
-        if !still_known {
+            .get(&id)
+            .cloned();
+        let Some(claimant) = claimant else {
             return;
-        }
+        };
         // An occupant that is no longer that identity gives up the slot.
         // APFS recycles inode numbers briskly: a directory removed and made
         // again gets its old number back while the registry still holds the
@@ -1943,7 +2081,7 @@ impl Registry {
                 .expect("inode table poisoned")
                 .get(other)
                 .cloned();
-            inode.is_none_or(|inode| !inode.still_is(dev, ino))
+            inode.is_none_or(|inode| !inode.is_file(dev, ino, claimant.born()))
         });
         let mut identity = self.by_identity[identity_shard(ino)]
             .write()
@@ -2468,8 +2606,15 @@ mod tests {
         let scratch = Scratch::new("names");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("original");
-        let first = reg.insert(fd, dev, ino, false, false);
-        let second = reg.insert(scratch.link("original", "alias"), dev, ino, false, false);
+        let first = reg.insert(fd, dev, ino, false, false, None);
+        let second = reg.insert(
+            scratch.link("original", "alias"),
+            dev,
+            ino,
+            false,
+            false,
+            None,
+        );
         assert_eq!(first, second);
         assert_eq!(reg.inode_count(), 2, "root plus the one file");
     }
@@ -2481,8 +2626,8 @@ mod tests {
         let scratch = Scratch::new("forget");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("counted");
-        let id = reg.insert(fd, dev, ino, false, false);
-        assert_eq!(reg.relookup(dev, ino), Some(id), "a second lookup");
+        let id = reg.insert(fd, dev, ino, false, false, None);
+        assert_eq!(reg.relookup(dev, ino, None), Some(id), "a second lookup");
 
         reg.forget(id, 1);
         assert!(reg.get(id).is_some(), "one forget of two must not drop it");
@@ -2497,7 +2642,7 @@ mod tests {
         let scratch = Scratch::new("batch");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("counted");
-        let id = reg.insert(fd, dev, ino, false, false);
+        let id = reg.insert(fd, dev, ino, false, false, None);
         reg.forget(id, u64::MAX);
         assert!(reg.get(id).is_none());
         reg.forget(id, 1);
@@ -2520,7 +2665,7 @@ mod tests {
         let scratch = Scratch::new("reinsert");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("here");
-        let first = reg.insert(fd, dev, ino, false, false);
+        let first = reg.insert(fd, dev, ino, false, false, None);
         reg.forget(first, 1);
         let second = reg.insert(
             crate::sys::open_path(&scratch.path().join("here"), 0, 0).unwrap(),
@@ -2528,6 +2673,7 @@ mod tests {
             ino,
             false,
             false,
+            None,
         );
         assert_ne!(first, second);
     }
@@ -2540,12 +2686,61 @@ mod tests {
     /// genuinely does hand out again. It must not be given the first file's
     /// nodeid, because the guest would then treat two files as one.
     #[test]
+    fn numbers_that_name_a_place_are_told_apart_by_birth() {
+        // An SMB share without file ids numbers a file by its name, and a
+        // descriptor on a file that was replaced still answers to the numbers:
+        // here the first file stays where it is, which is how such a share
+        // looks to `still_is`, and only the birth time differs.
+        let scratch = Scratch::new("by-birth");
+        let reg = scratch.registry();
+        let (held, dev, ino) = scratch.file("pg_internal.init");
+        let first_born = Some((1_000, 0));
+        let replacement_born = Some((2_000, 0));
+
+        let local = reg.insert(held, dev, ino, false, false, first_born);
+        assert_eq!(
+            reg.relookup(dev, ino, replacement_born),
+            Some(local),
+            "where numbers identify a file, a birth time is not asked"
+        );
+
+        // A share learned as one whose numbers name a place.
+        let fresh = Scratch::new("by-birth-net");
+        let reg = fresh.registry();
+        reg.identify_by_birth(dev, true);
+        let (held, dev, ino) = fresh.file("pg_internal.init");
+        let first = reg.insert(held, dev, ino, false, false, first_born);
+        assert_eq!(
+            reg.relookup(dev, ino, first_born),
+            Some(first),
+            "the same file, born when it was"
+        );
+        assert!(
+            reg.relookup(dev, ino, replacement_born).is_none(),
+            "another file at the same numbers is not this one"
+        );
+        // The numbers again, as the share gives its replacement.
+        let successor = fresh.link("pg_internal.init", "successor");
+        let second = reg.insert(successor, dev, ino, false, false, replacement_born);
+        assert_ne!(first, second, "the replacement is an inode of its own");
+        assert!(
+            reg.identified(dev, ino, replacement_born)
+                .is_some_and(|inode| inode.id() == second),
+            "and is what the numbers name now"
+        );
+        assert!(
+            reg.get(first).is_some(),
+            "the first is kept for whoever holds it"
+        );
+    }
+
+    #[test]
     fn a_reused_inode_number_does_not_alias_onto_the_dead_file() {
         let scratch = Scratch::new("reuse");
         let reg = scratch.registry();
 
         let (held, dev, ino) = scratch.file("doomed");
-        let first = reg.insert(held, dev, ino, false, false);
+        let first = reg.insert(held, dev, ino, false, false, None);
 
         // The name goes; our descriptor, and the guest's nodeid, remain.
         std::fs::remove_file(scratch.path().join("doomed")).unwrap();
@@ -2558,10 +2753,10 @@ mod tests {
         let (fresh, _, _) = scratch.file("successor");
 
         assert!(
-            reg.relookup(dev, ino).is_none(),
+            reg.relookup(dev, ino, None).is_none(),
             "the dead file must stop answering to its old numbers"
         );
-        let second = reg.insert(fresh, dev, ino, false, false);
+        let second = reg.insert(fresh, dev, ino, false, false, None);
         assert_ne!(
             first, second,
             "two different files were given the same nodeid"
@@ -2576,7 +2771,7 @@ mod tests {
         let scratch = Scratch::new("park-revive");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("parked");
-        let id = reg.insert(fd, dev, ino, false, false);
+        let id = reg.insert(fd, dev, ino, false, false, None);
         let inode = reg.get(id).unwrap();
 
         assert!(inode.park(), "an ordinary file must be parkable");
@@ -2599,7 +2794,7 @@ mod tests {
         let scratch = Scratch::new("park-stolen");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("victim");
-        let id = reg.insert(fd, dev, ino, false, false);
+        let id = reg.insert(fd, dev, ino, false, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
 
@@ -2622,7 +2817,7 @@ mod tests {
         let scratch = Scratch::new("park-unlinked");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("doomed");
-        let id = reg.insert(fd, dev, ino, false, false);
+        let id = reg.insert(fd, dev, ino, false, false, None);
         std::fs::remove_file(scratch.0.join("doomed")).unwrap();
 
         let inode = reg.get(id).unwrap();
@@ -2645,7 +2840,7 @@ mod tests {
         let scratch = Scratch::new("volfs");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("original");
-        let id = reg.insert(fd, dev, ino, false, false);
+        let id = reg.insert(fd, dev, ino, false, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
         std::fs::rename(scratch.0.join("original"), scratch.0.join("moved")).unwrap();
@@ -2665,7 +2860,7 @@ mod tests {
         let scratch = Scratch::new("volfs-gone");
         let reg = scratch.registry();
         let (fd, dev, ino) = scratch.file("doomed");
-        let id = reg.insert(fd, dev, ino, false, false);
+        let id = reg.insert(fd, dev, ino, false, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
         std::fs::remove_file(scratch.0.join("doomed")).unwrap();
@@ -2689,7 +2884,7 @@ mod tests {
         let root_held = reg.descriptor_usage().0;
 
         let (fd, dev, ino) = scratch.file("counted");
-        let id = reg.insert(fd, dev, ino, false, false);
+        let id = reg.insert(fd, dev, ino, false, false, None);
         assert_eq!(reg.descriptor_usage().0, root_held + 1);
 
         let inode = reg.get(id).unwrap();
@@ -2732,7 +2927,7 @@ mod tests {
 
         for n in 0..2000 {
             let (fd, dev, ino) = scratch.file(&format!("f{n}"));
-            reg.insert(fd, dev, ino, false, false);
+            reg.insert(fd, dev, ino, false, false, None);
         }
 
         let (open, budget) = reg.descriptor_usage();
@@ -2769,7 +2964,7 @@ mod tests {
         const FILES: usize = 24_000;
         for n in 0..FILES {
             let (fd, dev, ino) = scratch.file(&format!("b{n}"));
-            reg.insert(fd, dev, ino, false, false);
+            reg.insert(fd, dev, ino, false, false, None);
         }
 
         let (open, budget) = reg.descriptor_usage();
@@ -2798,7 +2993,7 @@ mod tests {
         let mut worst = 0usize;
         for n in 0..1200 {
             let (fd, dev, ino) = scratch.file(&format!("h{n}"));
-            ids.push(reg.insert(fd, dev, ino, false, false));
+            ids.push(reg.insert(fd, dev, ino, false, false, None));
             // Everything stays hot — and parked inodes are revived, the way
             // an install re-walks the tree it is writing.
             if n % 64 == 0 {
