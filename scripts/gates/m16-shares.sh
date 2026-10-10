@@ -368,6 +368,29 @@ for i in range(40):
 print(stale)' 2>&1 | tail -1 || true)"
 	[ "$got" = 0 ] && pass "$2: a file replaced by a rename, or made again under its name, reads back as the new one" \
 		|| fail "$2: $got of 80 replaced files read back stale"
+	# As Postgres makes a WAL segment: written under a temporary name and
+	# synced, renamed into place, opened by its new name, written, synced
+	# and read back. The rename is queued; the guest may forget the file and
+	# look it up again before it lands, and a sync by the new name must find
+	# it ("could not locate a valid checkpoint record", ENOENT on the sync).
+	got="$(docker run --rm -v "$1:/s" "$PYTHON" python3 -c '
+import os
+os.chdir("/s"); bad = 0
+for i in range(100):
+    fd = os.open("xlogtemp", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.pwrite(fd, bytes(65536), 0); os.fsync(fd); os.close(fd)
+    seg = "%024X" % (i + 1)
+    os.rename("xlogtemp", seg)
+    try:
+        fd = os.open(seg, os.O_RDWR); page = b"checkpoint %d" % i
+        os.pwrite(fd, page, 0); os.fsync(fd); os.close(fd)
+        fd = os.open(seg, os.O_RDONLY); bad += os.pread(fd, len(page), 0) != page; os.close(fd)
+    except OSError:
+        bad += 1
+    os.unlink(seg)
+print(bad)' 2>&1 | tail -1 || true)"
+	[ "$got" = 0 ] && pass "$2: a file renamed into place is synced and read back by its new name" \
+		|| fail "$2: $got of 100 files renamed into place could not be synced or read back"
 }
 
 echo

@@ -180,6 +180,16 @@ pub struct Inode {
     pending_gone: Mutex<std::collections::HashSet<Vec<u8>>>,
     /// Mirror of `pending_gone.len()`, same reason as `pending_count`.
     gone_count: AtomicUsize,
+    /// Names promised to this inode by queued renames and links, which
+    /// resolve to it until their jobs land. It outlives the guest's memory
+    /// of it until then: a reset of the guest's caches has it forget every
+    /// nodeid and look each name up again, and a promise whose inode had
+    /// gone sent the lookup to a host that had not renamed yet (Postgres:
+    /// "could not locate a valid checkpoint record").
+    promised: AtomicUsize,
+    /// The guest forgot this inode while a name was still promised to it;
+    /// the job that keeps the last promise finishes the forget.
+    forget_deferred: AtomicBool,
     /// Queued operations that will change this inode's *metadata* — an
     /// unlink of one of its names changes the link count — counted so a
     /// GETATTR knows a host stat would be stale.
@@ -410,6 +420,8 @@ impl Inode {
             pending_count: AtomicUsize::new(0),
             pending_gone: Mutex::new(std::collections::HashSet::new()),
             gone_count: AtomicUsize::new(0),
+            promised: AtomicUsize::new(0),
+            forget_deferred: AtomicBool::new(false),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
             owner: Mutex::new(crate::ownership::Owner::Unknown),
@@ -457,6 +469,8 @@ impl Inode {
             pending_count: AtomicUsize::new(0),
             pending_gone: Mutex::new(std::collections::HashSet::new()),
             gone_count: AtomicUsize::new(0),
+            promised: AtomicUsize::new(0),
+            forget_deferred: AtomicBool::new(false),
             meta_shadow: AtomicU32::new(0),
             settle_seq: AtomicU64::new(0),
             owner: Mutex::new(crate::ownership::Owner::Unknown),
@@ -598,6 +612,26 @@ impl Inode {
     /// that withdraws its entry has the guest forget the nodeid and look the
     /// name up again, and it must find the same inode, or the promises are
     /// lost to whatever the second inode resolves.
+    /// A name is promised to this inode by a queued rename or link.
+    pub fn promise(&self) {
+        self.promised.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The job behind a [`Inode::promise`] has landed. True when it kept
+    /// the last promise and the guest had forgotten the inode meanwhile: the
+    /// caller finishes the forget (`Registry::release_if_unwanted`). Only
+    /// then: an inode the guest has not forgotten may have no lookups of its
+    /// own and still be in use, as a held create's is.
+    pub fn unpromise(&self) -> bool {
+        self.promised.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.forget_deferred.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether a queued rename or link still names this inode.
+    pub fn is_promised(&self) -> bool {
+        self.promised.load(Ordering::Acquire) != 0
+    }
+
     pub fn has_promises(&self) -> bool {
         self.pending_count.load(Ordering::Relaxed) != 0
             || !self
@@ -2043,6 +2077,7 @@ impl Registry {
             .is_some_and(|inode| {
                 !inode.is_pending()
                     && !inode.has_promises()
+                    && !inode.is_promised()
                     && *inode.lookups.lock().expect("lookup count poisoned") == 0
             });
         if unwanted {
@@ -2150,6 +2185,13 @@ impl Registry {
         if inode.is_pending() || inode.has_promises() {
             return;
         }
+        // Marked before it is checked, so a job keeping the last promise in
+        // between finds the mark and finishes this forget itself.
+        inode.forget_deferred.store(true, Ordering::Release);
+        if inode.is_promised() {
+            return;
+        }
+        inode.forget_deferred.store(false, Ordering::Release);
         let identity = (inode.dev(), inode.ino());
         let forwarded = inode.forwarded();
         table.remove(&id);

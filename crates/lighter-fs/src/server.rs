@@ -3538,9 +3538,11 @@ impl Server {
         old_parent.remove_pending_child(old.to_bytes(), nodeid);
         self.registry.release_if_unwanted(old_parent.id());
         old_parent.add_pending_gone(old.to_bytes());
+        inode.promise();
         new_parent.add_pending_child(new.to_bytes(), nodeid);
         let job = {
             let registry = self.registry.clone();
+            let inode = inode.clone();
             let old_parent = old_parent.clone();
             let new_parent = new_parent.clone();
             let old = old.clone();
@@ -3598,6 +3600,9 @@ impl Server {
                 registry.release_if_unwanted(old_parent.id());
                 new_parent.remove_pending_child(new.to_bytes(), nodeid);
                 registry.release_if_unwanted(new_parent.id());
+                if inode.unpromise() {
+                    registry.release_if_unwanted(nodeid);
+                }
                 if let Some(displaced) = &displaced {
                     displaced.unshadow_meta();
                 }
@@ -3902,6 +3907,7 @@ impl Server {
         }
         self.materialize_why(nodeid, 6);
         target.link_acked();
+        target.promise();
         parent.add_pending_child(name.to_bytes(), nodeid);
         let job = {
             let registry = self.registry.clone();
@@ -3934,6 +3940,9 @@ impl Server {
                 target.link_applied();
                 parent.remove_pending_child(name.to_bytes(), nodeid);
                 registry.release_if_unwanted(parent.id());
+                if target.unpromise() {
+                    registry.release_if_unwanted(nodeid);
+                }
             }
         };
         let seq = self.apply.push(crate::apply::Job::of(
@@ -3981,6 +3990,11 @@ impl Server {
         if inode.is_dir {
             return Err(linux::EISDIR);
         }
+        // A name the guest was given by a queued rename or link is one the
+        // host does not have yet, and a file whose descriptor was parked is
+        // reopened by it: Postgres's fsync of a WAL segment it had just
+        // renamed into place failed with ENOENT. The job lands first.
+        self.settle_while(&inode, |inode| inode.is_promised());
         // Read-write when a write is coming, read-only otherwise: most files
         // are only ever read, and asking for write access to a read-only file
         // fails outright rather than degrading.

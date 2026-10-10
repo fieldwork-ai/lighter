@@ -3169,3 +3169,52 @@ fn a_file_deleted_while_open_is_not_listed_on_a_network_share() {
         "{names:?}"
     );
 }
+
+/// A queued rename promises the new name to the file it moves. The guest
+/// may forget that file before the job lands — a reset of its caches has it
+/// forget every nodeid and look each name up again — and the promise must
+/// still resolve to the file: dropped from the registry, its lookup went to
+/// a host that had not renamed yet, and Postgres, writing its first WAL
+/// segment under a temporary name and renaming it into place, read back
+/// "could not locate a valid checkpoint record". A queued link likewise.
+#[test]
+fn a_file_forgotten_while_its_rename_is_queued_is_found_by_its_new_name() {
+    let mut guest = Guest::new("forget-during-rename");
+    let before = guest.server.live_inodes();
+    std::fs::write(guest.host("tmp"), b"checkpoint").unwrap();
+    std::fs::write(guest.host("linked"), b"link me").unwrap();
+    let moved = guest.lookup(1, "tmp").unwrap();
+    let target = guest.lookup(1, "linked").unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    guest.server.hold_apply();
+
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("tmp"));
+    body.extend_from_slice(&name_body("seg"));
+    guest.call(op::RENAME, 1, &body).expect("rename");
+    let mut body = target.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("hard"));
+    guest.call(op::LINK, 1, &body).expect("link");
+
+    // The guest's caches are reset: it forgets both, lookups and all.
+    guest.call(op::FORGET, moved, &1u64.to_le_bytes()).ok();
+    guest.call(op::FORGET, target, &2u64.to_le_bytes()).ok();
+    let found = guest.lookup(1, "seg");
+    let hard = guest.lookup(1, "hard");
+    guest.server.release_apply();
+    assert_eq!(found, Ok(moved), "the renamed file, by its new name");
+    assert_eq!(hard, Ok(target), "the linked file, by its new name");
+
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert_eq!(std::fs::read(guest.host("seg")).unwrap(), b"checkpoint");
+    assert_eq!(std::fs::read(guest.host("hard")).unwrap(), b"link me");
+
+    // Forgotten again, both go: a forget put off for a promise is finished.
+    guest.call(op::FORGET, moved, &1u64.to_le_bytes()).ok();
+    guest.call(op::FORGET, target, &1u64.to_le_bytes()).ok();
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "nothing is kept past its promises"
+    );
+}
