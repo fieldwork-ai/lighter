@@ -14,8 +14,8 @@ pub type Order = (u64, i64);
 
 /// One input buffer, as the codec read it.
 pub struct Unit {
-    /// The stream's parameters changed with this buffer, so the
-    /// VideoToolbox session must be rebuilt before it is decoded.
+    /// The stream's coded format changed with this buffer. The decoder must
+    /// check whether its VideoToolbox session accepts the new description.
     pub changed: bool,
     /// What VideoToolbox decodes, in the layout the format description
     /// says; empty when there is nothing to decode (parameter sets alone).

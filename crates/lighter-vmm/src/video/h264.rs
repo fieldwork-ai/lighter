@@ -21,6 +21,7 @@
 use super::bits::{BitWriter, Bits, escape, unescape};
 use super::codec::{FormatDescription, Order, Parser, Unit, annexb_nals, length_prefixed};
 use super::vt_sys as vt;
+use std::collections::BTreeMap;
 
 /// What the decoder needs from an SPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,7 +42,7 @@ pub struct Sps {
 /// Parses an SPS NAL (header byte included). `None` if it is not one, or
 /// ends before the fields this needs.
 pub fn parse(nal: &[u8]) -> Option<Sps> {
-    if nal.first()? & 0x1f != 7 {
+    if nal.first()? & 0x1f != NAL_SPS {
         return None;
     }
     let rbsp = unescape(&nal[1..]);
@@ -51,6 +52,7 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
     r.bits(8)?; // level_idc
     r.ue()?; // seq_parameter_set_id
     let mut separate_colour_plane = false;
+    // Profiles with the chroma_format_idc / bit-depth / scaling-list syntax.
     if matches!(
         profile_idc,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
@@ -72,18 +74,19 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
             }
         }
     }
-    let log2_max_frame_num = r.ue()? + 4;
+    let log2_max_frame_num = r.ue()?.checked_add(4)?;
     let poc_type = r.ue()?;
     let mut log2_max_poc_lsb = 0;
     match poc_type {
         0 => {
-            log2_max_poc_lsb = r.ue()? + 4;
+            log2_max_poc_lsb = r.ue()?.checked_add(4)?;
         }
         1 => {
             r.bit()?; // delta_pic_order_always_zero_flag
             r.se()?; // offset_for_non_ref_pic
             r.se()?; // offset_for_top_to_bottom_field
             let n = r.ue()?;
+            // num_ref_frames_in_pic_order_cnt_cycle is at most 255.
             for _ in 0..n.min(255) {
                 r.se()?;
             }
@@ -155,12 +158,56 @@ pub struct Slice {
     pub poc_lsb: u32,
 }
 
+/// Read the SPS ID without requiring our optional order parser to understand
+/// the rest of the SPS.
+fn sps_id(nal: &[u8]) -> Option<u32> {
+    if nal_type(nal) != NAL_SPS {
+        return None;
+    }
+    let rbsp = unescape(nal.get(1..nal.len().min(64))?);
+    let mut r = Bits::new(&rbsp);
+    r.bits(24)?; // profile_idc, constraint flags, level_idc
+    r.ue() // seq_parameter_set_id
+}
+
+/// The parameter-set ID is before the SPS-dependent part of a slice header.
+fn slice_pps_id(nal: &[u8]) -> Option<u32> {
+    if !matches!(nal_type(nal), 1 | 5) {
+        return None;
+    }
+    let rbsp = unescape(nal.get(1..nal.len().min(64))?);
+    let mut r = Bits::new(&rbsp);
+    r.ue()?; // first_mb_in_slice
+    r.ue()?; // slice_type
+    r.ue()
+}
+
+/// A PPS identifies the SPS used to interpret its slices. The rest of the
+/// PPS belongs to VideoToolbox, not to this presentation-order parser.
+fn pps_ids(nal: &[u8]) -> Option<(u32, u32)> {
+    if nal_type(nal) != NAL_PPS {
+        return None;
+    }
+    // Both IDs are at the start; unescape only this prefix for lookup.
+    let rbsp = unescape(nal.get(1..nal.len().min(64))?);
+    let mut r = Bits::new(&rbsp);
+    let pps_id = r.ue()?;
+    let sps_id = r.ue()?;
+    Some((pps_id, sps_id))
+}
+
 /// Reads a coded slice NAL's header (header byte included). `None` for any
 /// other NAL, or one that ends first.
 pub fn slice(nal: &[u8], sps: &Sps) -> Option<Slice> {
     let header = *nal.first()?;
     let kind = header & 0x1f;
     if kind != 1 && kind != 5 {
+        return None;
+    }
+    // Only our local picture-order parser needs these widths; VideoToolbox
+    // still receives the raw parameter sets and picture when they exceed them.
+    if sps.log2_max_frame_num > u64::BITS || (sps.poc_type == 0 && sps.log2_max_poc_lsb > u32::BITS)
+    {
         return None;
     }
     // The fields sit in the first few bytes; 64 is generous.
@@ -236,9 +283,19 @@ fn nal_type(nal: &[u8]) -> u8 {
 /// pictures.
 #[derive(Default)]
 pub struct Stream {
-    sps: Vec<u8>,
-    pps: Vec<u8>,
-    info: Option<Sps>,
+    sps: BTreeMap<u32, (Vec<u8>, Option<Sps>)>,
+    pps: BTreeMap<u32, (Vec<u8>, u32)>,
+    active: Option<(u32, u32)>, // SPS ID, PPS ID
+    // As on main, raw sets remain available to VideoToolbox even if our
+    // limited parser cannot identify or interpret them.
+    latest_sps: Vec<u8>,
+    latest_pps: Vec<u8>,
+    latest_info: Option<Sps>,
+    described_sps: Vec<u8>,
+    /// PPS updates may arrive in their own V4L2 buffer. Deliver them with
+    /// the next picture rather than asking VT to decode an empty picture.
+    pending_pps: BTreeMap<u32, Vec<u8>>,
+    pending_unparsed_pps: Option<Vec<u8>>,
     /// IDRs seen: each restarts the picture order count.
     epoch: u64,
     poc: PocCounter,
@@ -251,7 +308,7 @@ impl Stream {
     /// count from `frame_num` and offsets in the SPS, and nothing seen in
     /// practice uses it with B-frames; it is left in decode order.
     fn order_of(&mut self, nals: &[&[u8]], seq: i64) -> Order {
-        let Some(info) = self.info else {
+        let Some(info) = self.active_sets().and_then(|(_, _, info)| info) else {
             return (self.epoch, seq);
         };
         let Some(slice) = nals.iter().find_map(|n| slice(n, &info)) else {
@@ -266,33 +323,105 @@ impl Stream {
             (self.epoch, seq)
         }
     }
+
+    fn active_sets(&self) -> Option<(&[u8], &[u8], Option<Sps>)> {
+        if let Some((sps_id, pps_id)) = self.active
+            && let (Some((sps, info)), Some((pps, linked_sps_id))) =
+                (self.sps.get(&sps_id), self.pps.get(&pps_id))
+            && sps_id == *linked_sps_id
+        {
+            return Some((sps, pps, *info));
+        }
+        (!self.latest_sps.is_empty() && !self.latest_pps.is_empty()).then_some((
+            self.latest_sps.as_slice(),
+            self.latest_pps.as_slice(),
+            self.latest_info,
+        ))
+    }
 }
 
 impl Parser for Stream {
     fn unit(&mut self, data: &[u8], seq: i64) -> Unit {
         let nals = annexb_nals(data);
-        let mut changed = false;
+        let mut unparsed_set = false;
         for nal in &nals {
             match nal_type(nal) {
-                NAL_SPS if self.sps.as_slice() != *nal => {
-                    self.sps = nal.to_vec();
-                    self.info = parse(nal);
-                    changed = true;
+                NAL_SPS => {
+                    self.latest_sps = nal.to_vec();
+                    self.latest_info = parse(nal);
+                    if let Some(id) = sps_id(nal) {
+                        self.sps.insert(id, (nal.to_vec(), self.latest_info));
+                    } else {
+                        unparsed_set = true;
+                    }
                 }
-                NAL_PPS if self.pps.as_slice() != *nal => {
-                    self.pps = nal.to_vec();
-                    changed = true;
+                NAL_PPS => {
+                    self.latest_pps = nal.to_vec();
+                    if let Some((pps_id, sps_id)) = pps_ids(nal) {
+                        self.pps.insert(pps_id, (nal.to_vec(), sps_id));
+                    } else {
+                        unparsed_set = true;
+                    }
                 }
                 _ => {}
             }
         }
-        // Every slice NAL (and SEI) goes to VideoToolbox length-prefixed;
-        // the parameter sets are in the format description.
-        let sample = length_prefixed(
-            nals.iter()
-                .copied()
-                .filter(|n| !matches!(nal_type(n), NAL_SPS | NAL_PPS | NAL_AUD)),
-        );
+        // Slices select their own PPS, and that PPS selects the SPS. A newly
+        // announced PPS must not silently change the active picture's syntax.
+        if let Some(picture) = nals.iter().find(|nal| matches!(nal_type(nal), 1 | 5)) {
+            self.active = (|| {
+                let pps_id = slice_pps_id(picture)?;
+                let sps_id = self.pps.get(&pps_id)?.1;
+                self.sps.contains_key(&sps_id).then_some((sps_id, pps_id))
+            })();
+        } else if unparsed_set {
+            self.active = None;
+        } else if self.active.is_none() {
+            self.active = self.pps.iter().find_map(|(&pps_id, (_, sps_id))| {
+                self.sps.contains_key(sps_id).then_some((*sps_id, pps_id))
+            });
+        }
+        // Deliver PPS updates with a coded picture so VideoToolbox can apply
+        // them without discarding decoded reference frames. SPS changes update
+        // the format description instead; its fallback may strip malformed VUI.
+        // If V4L2 supplies a PPS without a picture, hold it for the next slice.
+        let has_slice = nals.iter().any(|n| matches!(nal_type(n), 1 | 5));
+        let sample = if has_slice {
+            let sample = length_prefixed(
+                self.pending_unparsed_pps
+                    .iter()
+                    .map(Vec::as_slice)
+                    .chain(self.pending_pps.values().map(Vec::as_slice))
+                    .chain(
+                        nals.iter()
+                            .copied()
+                            .filter(|n| !matches!(nal_type(n), NAL_SPS | NAL_AUD)),
+                    ),
+            );
+            self.pending_pps.clear();
+            self.pending_unparsed_pps = None;
+            sample
+        } else {
+            for nal in &nals {
+                if let Some((id, _)) = pps_ids(nal) {
+                    // Retain only the most recent definition of each ID.
+                    self.pending_pps.insert(id, nal.to_vec());
+                } else if nal_type(nal) == NAL_PPS {
+                    self.pending_unparsed_pps = Some(nal.to_vec());
+                }
+            }
+            Vec::new()
+        };
+        // A new SPS may change the coded format; the decoder asks VT whether
+        // its existing session can accept the new description. PPS-only
+        // changes are delivered in-band and never force that check.
+        let selected_sps = self.active_sets().map(|(sps, _, _)| sps.to_vec());
+        let changed = selected_sps
+            .as_deref()
+            .is_some_and(|sps| sps != self.described_sps.as_slice());
+        if let Some(sps) = selected_sps {
+            self.described_sps = sps;
+        }
         let order = self.order_of(&nals, seq);
         Unit {
             changed,
@@ -302,13 +431,11 @@ impl Parser for Stream {
     }
 
     fn format_description(&self) -> Option<Result<FormatDescription, vt::OSStatus>> {
-        if self.sps.is_empty() || self.pps.is_empty() {
-            return None;
-        }
+        let (sps, pps, _) = self.active_sets()?;
         Some(
-            FormatDescription::from_parameter_sets(false, &[&self.sps, &self.pps]).or_else(|st| {
-                let stripped = without_vui(&self.sps).ok_or(st)?;
-                let desc = FormatDescription::from_parameter_sets(false, &[&stripped, &self.pps])?;
+            FormatDescription::from_parameter_sets(false, &[sps, pps]).or_else(|st| {
+                let stripped = without_vui(sps).ok_or(st)?;
+                let desc = FormatDescription::from_parameter_sets(false, &[&stripped, pps])?;
                 tracing::info!(
                     st,
                     "VideoToolbox refused the stream's SPS; decoding it without its VUI"
@@ -319,7 +446,7 @@ impl Parser for Stream {
     }
 
     fn reorder_depth(&self) -> Option<u32> {
-        self.info.and_then(|i| i.reorder)
+        self.active_sets().and_then(|(_, _, info)| info?.reorder)
     }
 
     fn ten_bit(&self) -> bool {
@@ -571,21 +698,60 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_sample_carries_the_slices_and_leaves_parameter_sets_out() {
-        let data = [
-            &[0u8, 0, 0, 1, 0x67, 9][..],
-            &[0, 0, 0, 1, 0x68, 9],
-            &[0, 0, 0, 1, 0x09, 0xf0],
-            &[0, 0, 0, 1, 0x65, 1, 2, 3],
-            &[0, 0, 0, 1, 0x06, 7],
-        ]
-        .concat();
+    fn a_sample_carries_pps_updates_with_its_picture() {
+        let sps = X264_HIGH_BF2;
+        let pps = REOLINK_PPS;
+        let picture = slice_nal(0);
+        let data = annexb(&[sps, pps, &[0x09, 0xf0], &picture, &[0x06, 7]]);
         let unit = Stream::default().unit(&data, 0);
         assert!(unit.changed);
         assert_eq!(
             unit.sample,
-            vec![0, 0, 0, 4, 0x65, 1, 2, 3, 0, 0, 0, 2, 0x06, 7]
+            length_prefixed([pps, picture.as_slice(), &[0x06, 7]].into_iter())
         );
+    }
+
+    #[test]
+    fn pps_updates_remain_in_band_without_changing_the_session() {
+        let pps0 = pps_nal(0, 0);
+        let pps1 = pps_nal(1, 0);
+        let picture0 = slice_nal(0);
+        let picture1 = slice_nal(1);
+        let mut stream = Stream::default();
+        let first = stream.unit(&annexb(&[X264_HIGH_BF2, &pps0, &picture0]), 0);
+        assert!(first.changed);
+        assert_eq!(stream.active, Some((0, 0)));
+
+        let update = stream.unit(&annexb(&[&pps1]), 1);
+        assert!(!update.changed);
+        assert!(update.sample.is_empty());
+        // Switching PPS IDs with the same SPS must preserve the reference
+        // pictures held by the VideoToolbox session.
+        let next = stream.unit(&annexb(&[&picture1]), 2);
+        assert!(!next.changed);
+        assert_eq!(stream.active, Some((0, 1)));
+        assert_eq!(
+            next.sample,
+            length_prefixed([pps1.as_slice(), picture1.as_slice()].into_iter())
+        );
+    }
+
+    #[test]
+    fn slices_select_their_own_sps_instead_of_the_latest_announced_one() {
+        let second_sps = sps_with_id_one(X264_HIGH_BF2);
+        assert_eq!(sps_id(&second_sps), Some(1));
+        let pps0 = pps_nal(0, 0);
+        let pps1 = pps_nal(1, 1);
+        let picture0 = slice_nal(0);
+        let picture1 = slice_nal(1);
+        let mut stream = Stream::default();
+        stream.unit(&annexb(&[X264_HIGH_BF2, &pps0, &picture0]), 0);
+        let update = stream.unit(&annexb(&[&second_sps, &pps1, &picture0]), 1);
+        assert!(!update.changed);
+        assert_eq!(stream.active, Some((0, 0)));
+        let selected = stream.unit(&annexb(&[&picture1]), 2);
+        assert!(selected.changed);
+        assert_eq!(stream.active, Some((1, 1)));
     }
 
     #[test]
@@ -622,5 +788,53 @@ pub(crate) mod tests {
             self.bits(1, 1); // rbsp stop bit
             self.out
         }
+    }
+
+    fn annexb(nals: &[&[u8]]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for nal in nals {
+            data.extend_from_slice(&[0, 0, 0, 1]);
+            data.extend_from_slice(nal);
+        }
+        data
+    }
+
+    fn pps_nal(id: u32, sps_id: u32) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.ue(id);
+        w.ue(sps_id);
+        let mut nal = vec![0x68];
+        nal.extend(w.finish());
+        nal
+    }
+
+    fn slice_nal(pps_id: u32) -> Vec<u8> {
+        let sps = parse(X264_HIGH_BF2).unwrap();
+        let mut w = Writer::default();
+        w.ue(0); // first_mb_in_slice
+        w.ue(0); // P slice
+        w.ue(pps_id);
+        w.bits(0, sps.log2_max_frame_num);
+        w.bits(0, sps.log2_max_poc_lsb);
+        let mut nal = vec![0x41];
+        nal.extend(w.finish());
+        nal
+    }
+
+    fn sps_with_id_one(nal: &[u8]) -> Vec<u8> {
+        let rbsp = unescape(&nal[1..]);
+        let mut r = Bits::new(&rbsp);
+        let mut w = Writer::default();
+        for _ in 0..24 {
+            w.bits(r.bit().unwrap() as u64, 1);
+        }
+        assert_eq!(r.ue(), Some(0));
+        w.ue(1);
+        while let Some(bit) = r.bit() {
+            w.bits(bit as u64, 1);
+        }
+        let mut output = vec![nal[0]];
+        output.extend(escape(&w.out));
+        output
     }
 }
