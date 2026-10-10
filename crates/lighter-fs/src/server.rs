@@ -922,6 +922,33 @@ fn birth(st: &libc::stat) -> Option<(i64, i64)> {
     Some((st.st_birthtime, st.st_birthtime_nsec))
 }
 
+/// Gives what an SMB share holds as `.smbdelete…` in a directory being
+/// removed up to a second to go: a file deleted while a descriptor on it was
+/// open, which macOS's SMB client keeps under that name until it closes. A
+/// container's file deleted with nothing open on it is closed here once the
+/// guest forgets it, which follows the unlink and can follow an `rmdir`
+/// straight behind it: Postgres, removing its sorts' temporary directories,
+/// found them not empty about once in four runs. A file something still has
+/// open stays, and the rmdir fails as it would on the Mac.
+fn await_smb_deletes(list: impl Fn() -> Result<Vec<sys::DirEntry>, i32>) {
+    for _ in 0..100 {
+        let waiting =
+            list().is_ok_and(|entries| entries.iter().any(|e| e.name.starts_with(b".smbdelete")));
+        if !waiting {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A directory's entries, by its parent and name.
+fn listing_at(parent: &Inode, name: &CStr) -> Result<Vec<sys::DirEntry>, i32> {
+    let fd = parent.under_name(name, |dir, at| {
+        sys::openat_path(dir, at, LINUX_O_DIRECTORY, 0)
+    })?;
+    sys::Dir::from_fd(fd)?.read_all()
+}
+
 /// Sets one of our records, replacing one the server will not overwrite.
 ///
 /// Samba stores a dot-file as hidden once its times are set (`hide dot
@@ -3104,6 +3131,11 @@ impl Server {
                 .pending_children_snapshot()
                 .iter()
                 .any(|(name, _)| !gone.contains(name));
+            let waited = std::time::Instant::now();
+            if !occupied && !child.is_pending() && self.volumes.network(child.dev()) {
+                await_smb_deletes(|| self.list(child.id()));
+            }
+            let waited = waited.elapsed();
             if !occupied {
                 if child.is_pending() {
                     // Nothing on the host yet; nothing promised inside.
@@ -3135,6 +3167,7 @@ impl Server {
                         entry_promised_inside = known.as_ref().map(|(_, i)| i.pending_children_snapshot().len()).unwrap_or(0),
                         promised_gone = ?gone.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>(),
                         listed = listing.len(),
+                        waited_ms = waited.as_millis() as u64,
                         child = child.id(),
                         queued = self.apply.depth(),
                         held = self.deferred.map.lock().expect("held creates poisoned").len(),
@@ -3171,10 +3204,21 @@ impl Server {
                 let registry = self.registry.clone();
                 let parent = parent.clone();
                 let name = name.clone();
+                let network = self.volumes.network(parent.dev());
+                let child = child.clone();
                 move || {
-                    if let Err(errno) =
-                        parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, true))
-                    {
+                    let rmdir =
+                        || parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, true));
+                    let mut removed = rmdir();
+                    if removed == Err(linux::ENOTEMPTY) && network {
+                        // Unlinks queued ahead of it may have left files the
+                        // SMB client is holding until they close.
+                        await_smb_deletes(|| {
+                            sys::Dir::from_fd(open_inode(&child, LINUX_O_DIRECTORY)?)?.read_all()
+                        });
+                        removed = rmdir();
+                    }
+                    if let Err(errno) = removed {
                         tracing::warn!(
                             errno,
                             name = %name.to_string_lossy(),
@@ -3279,7 +3323,11 @@ impl Server {
                 "NAME-DEBUG unlink taking the synchronous path"
             );
         }
-        let result = parent.under_name(&name, |under, at| sys::unlink_at(under, at, dir));
+        let mut result = parent.under_name(&name, |under, at| sys::unlink_at(under, at, dir));
+        if dir && result == Err(linux::ENOTEMPTY) && self.volumes.network(parent.dev()) {
+            await_smb_deletes(|| listing_at(&parent, &name));
+            result = parent.under_name(&name, |under, at| sys::unlink_at(under, at, dir));
+        }
         if dir && result == Err(linux::ENOTEMPTY) && self.stats.enabled() {
             // What the host still holds, and what this server knows of each
             // name: the diagnostic for an `rm -rf` the guest believed had

@@ -257,7 +257,7 @@ smb_permissions() {
 			printf "A=1\n" > .ownership && touch -d @1 .ownership
 			chown 33:33 .ownership && chown 34:34 .ownership && chmod 644 .ownership
 			setpriv --reuid 100 --regid 101 --clear-groups touch srv/data/aria_log_control; w=$?
-			echo "$(stat -c "%a:%u" db key srv srv/data conf .ownership) write=$w"' 2>&1 | xargs || true)"
+			echo "$(stat -c "%a:%u" db key srv srv/data conf .ownership) write=$w"' 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
 		[ "$got" = "700:0 600:0 755:33 700:100 640:0 644:34 write=0" ] \
 			&& pass "SMB $share: what a container sets is what it sees, and a service user reaches its own directory" \
 			|| fail "SMB $share: $got"
@@ -272,8 +272,13 @@ smb_permissions() {
 	for share in q n; do
 		local dir
 		case "$share" in q) dir="$SMB_Q" ;; n) dir="$SMB_N" ;; esac
-		again="$(docker run --rm -v "$dir:/s" "$IMAGE" stat -c "%a:%u" /s/db /s/key /s/srv /s/srv/data /s/conf /s/.ownership 2>&1 | xargs || true)"
-		mac="$(stat -f %Lp "$dir/db" "$dir/key" | xargs)"
+		# The Mac now and then gives up on a server inside the machine it is
+		# serving, and drops the share; the files are on the server, so the
+		# share is mounted again to read them.
+		grep -q "on $dir (smbfs" <<<"$(mount)" \
+			|| mount_smbfs "//lt:lt@localhost/$share" "$dir" 2>>"$SCRATCH/smb.err" || true
+		again="$(docker run --rm -v "$dir:/s" "$IMAGE" stat -c "%a:%u" /s/db /s/key /s/srv /s/srv/data /s/conf /s/.ownership 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
+		mac="$(stat -f %Lp "$dir/db" "$dir/key" 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
 		[ "$again" = "700:0 600:0 755:33 700:100 640:0 644:34" ] \
 			&& pass "SMB $share: and a new container sees the same, while the server keeps its own ($mac)" \
 			|| fail "SMB $share, a new container: $again (the Mac sees $mac)"
@@ -284,13 +289,17 @@ smb_permissions() {
 }
 
 # A server that offers file ids, as a QNAP does: numbers that follow a file
-# rather than a name. Mounted once the other server is gone, and by the Mac's
-# network address where it has one: the Mac's client keeps its session with a
-# server on localhost after the last unmount, takes any other port on localhost
-# for that server, and the mount times out.
+# rather than a name. Mounted by the Mac's network address, before the hang
+# below: the Mac's client takes any port on localhost for the server it already
+# has a session with there, and after that server has hung it will not open a
+# new session to this Mac for a while; either way the mount times out.
 smb_file_ids() {
 	local got host
-	host="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
+	host="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+	if [ -z "$host" ]; then
+		note "SMB with file ids: skipped, this Mac has no network address to reach the second server by"
+		return
+	fi
 	docker run -d --name lighter-gate-smb-fid -p 4460:445 lighter-gate-smb \
 		smbd --foreground --no-process-group --configfile=/etc/samba/smb-fid.conf >/dev/null
 	for _ in $(seq 1 40); do nc -z 127.0.0.1 4460 2>/dev/null && break; sleep 0.25; done
@@ -300,7 +309,7 @@ smb_file_ids() {
 		got="$(docker run --rm -v "$SMB_F:/s" "$PYTHON" sh -c '
 			cd /s && umask 077 && mkdir db && touch key && umask 022
 			mkdir srv && chown 100:101 srv && chmod 700 srv
-			echo "$(stat -c "%a:%u" db key srv)"' 2>&1 | xargs || true)"
+			echo "$(stat -c "%a:%u" db key srv)"' 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
 		[ "$got" = "700:0 600:0 700:100" ] && pass "SMB with file ids: what a container sets is what it sees" \
 			|| fail "SMB with file ids: $got"
 		umount "$SMB_F" 2>/dev/null || true
@@ -332,7 +341,7 @@ for i in range(40):
     os.unlink(f"log{i}")
     open(f"log{i}", "w").write(f"second {i}")
     stale += open(f"log{i}").read() != f"second {i}"
-print(stale)' 2>&1 | tail -1)"
+print(stale)' 2>&1 | tail -1 || true)"
 	[ "$got" = 0 ] && pass "$2: a file replaced by a rename, or made again under its name, reads back as the new one" \
 		|| fail "$2: $got of 80 replaced files read back stale"
 }
@@ -356,6 +365,7 @@ else
 		&& mount_smbfs "//lt:lt@localhost/t" "$SMB_T" 2>>"$SCRATCH/smb.err"; then
 		metadata "$SMB_D" "$SMB_T" | judge "SMB"
 		smb_permissions
+		smb_file_ids
 		# A network volume that stops answering stops only what touches
 		# it. Served on the vCPU that asked, a request on it stopped that
 		# CPU for as long: a NAS that hung for 48 s froze three of the
@@ -416,7 +426,6 @@ print("%.2f" % max(worst))' >/dev/null
 		fail "could not mount the shares: $(cat "$SCRATCH/smb.err")"
 	fi
 	docker rm -f lighter-gate-smb >/dev/null
-	smb_file_ids
 fi
 
 echo
