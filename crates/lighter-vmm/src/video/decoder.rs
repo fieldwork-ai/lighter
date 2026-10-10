@@ -5,9 +5,10 @@
 //! order, with the input's timestamp on each. VideoToolbox wants the same
 //! stream the other way round: parameter sets in a format description and
 //! each NAL length-prefixed. So a buffer is split at its start codes, an SPS
-//! or PPS updates the description (and a new resolution is a source-change
+//! updates the SPS description (and a new resolution is a source-change
 //! event the guest must answer with new CAPTURE buffers before anything
-//! more is read back), and the rest goes to the session as one sample.
+//! more is read back). PPS updates travel with the next picture so the
+//! decoder can keep its references; the rest goes to the session as one sample.
 //! Decoding is synchronous, and VideoToolbox driven a sample at a time
 //! hands frames back in decode order, so the session reorders them itself:
 //! frames wait in a buffer sorted by picture order count, read from each
@@ -522,11 +523,33 @@ impl Session {
                 // consumed and nothing comes of it.
                 None => {}
                 Some(Ok(desc)) => {
-                    if let Some(old) = self.vt.take() {
-                        old.flush();
-                        self.collect(true);
+                    // Reuse the session for a compatible format-description update so decoded
+                    // reference frames remain available to subsequent inter-predicted pictures.
+                    if let Some(vt) = self.vt.as_mut().filter(|vt| {
+                        desc.dimensions() == vt.dims
+                            && self.parser.ten_bit() == self.ten_bit
+                            && unsafe {
+                                vt::VTDecompressionSessionCanAcceptFormatDescription(
+                                    vt.session, desc.0,
+                                ) != 0
+                            }
+                    }) {
+                        vt.desc = desc;
+                        if let Some(depth) = self.parser.reorder_depth() {
+                            self.depth = depth;
+                            self.depth_declared = true;
+                        } else {
+                            // Keep the existing buffering, but allow a stream
+                            // whose new SPS omits the bound to teach us more.
+                            self.depth_declared = false;
+                        }
+                    } else {
+                        if let Some(old) = self.vt.take() {
+                            old.flush();
+                            self.collect(true);
+                        }
+                        self.start_session(desc);
                     }
-                    self.start_session(desc);
                 }
                 Some(Err(st)) => {
                     tracing::warn!(st, codec = ?self.codec, "VideoToolbox refused the stream's parameter sets");
@@ -1272,6 +1295,31 @@ mod tests {
         let sink = Arc::new(Mutex::new(VecDeque::new()));
         let vt = VtSession::new(desc, false, sink).expect("a session");
         assert_eq!(vt.dims, (896, 512));
+    }
+
+    #[test]
+    fn a_reused_session_can_learn_reordering_when_the_new_sps_omits_the_bound() {
+        use crate::video::h264::tests::REOLINK_PPS;
+        // x264 High profile, 1920x1080, with a VUI declaring two reorder frames.
+        let sps = &[
+            0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00,
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58,
+        ];
+        let mut s = Session::new(Codec::H264);
+        let params = |sps: &[u8]| [&[0u8, 0, 0, 1][..], sps, &[0, 0, 0, 1], REOLINK_PPS].concat();
+        let stamp = bindings::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        s.feed(params(sps), 0, stamp).unwrap();
+        let session = s.vt.as_ref().expect("initial session").session;
+        assert_eq!(s.depth, 2);
+        assert!(s.depth_declared);
+        let no_vui = h264::without_vui(sps).unwrap();
+        s.feed(params(&no_vui), 1, stamp).unwrap();
+        assert_eq!(s.vt.as_ref().expect("updated session").session, session);
+        assert_eq!(s.depth, 2);
+        assert!(!s.depth_declared);
     }
 
     #[test]

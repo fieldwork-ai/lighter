@@ -40,6 +40,7 @@ FAILED=0
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }
 command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg is required on the host to make the clip (brew install ffmpeg)" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required to make the PPS fixture" >&2; exit 1; }
 
 echo "==> Building guest artifacts if missing"
 [ -f "$KERNEL" ] || ./guest/kernel/build.sh
@@ -90,6 +91,44 @@ RACE="$RUN_DIR/race.h264"
 ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=640x368:rate=20" -t 3 \
 	-c:v libx264 -preset veryfast -pix_fmt yuv420p -g 40 -bf 0 -threads 1 -f h264 "$RACE" 2>&1 | sed 's/^/    /' || true
 [ -s "$RACE" ] && pass "raw clip for the STREAMOFF client" || { fail "no raw clip"; exit 1; }
+# Generate 180 x264 I/P pictures. Insert a PPS before picture 3 that changes
+# only pic_init_qs_minus26, which these pictures do not use. Software output
+# must remain identical; the VideoToolbox path must preserve all 180 frames.
+PPS_RAW="$RUN_DIR/pps-original.h264"; PPS_UPDATED="$RUN_DIR/pps-updated.h264"
+PPS_CLIP="$RUN_DIR/pps.mkv"
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=1920x1080:rate=30" -frames:v 180 -c:v libx264 -preset medium -threads 4 -bf 0 -g 60 -b:v 6M -f h264 "$PPS_RAW"
+python3 scripts/gates/fixtures/x264-pps-variation.py "$PPS_RAW" "$PPS_UPDATED"
+ffmpeg -nostdin -hide_banner -loglevel error -y -i "$PPS_RAW" -pix_fmt yuv420p -f framemd5 "$RUN_DIR/pps-original.framemd5"
+ffmpeg -nostdin -hide_banner -loglevel error -y -i "$PPS_UPDATED" -pix_fmt yuv420p -f framemd5 "$RUN_DIR/pps-updated.framemd5"
+cmp "$RUN_DIR/pps-original.framemd5" "$RUN_DIR/pps-updated.framemd5" ||
+	{ fail "PPS fixture changes software-decoded pictures"; exit 1; }
+ffmpeg -nostdin -hide_banner -loglevel error -y -f h264 -r 30 -i "$PPS_UPDATED" -c:v copy "$PPS_CLIP"
+pass "x264 clip: compatible PPS update before picture 3, 180 frames"
+# Switch to a second PPS ID, and separately to a second SPS/PPS pair, then
+# return to the original pair without reannouncing it. Both streams must
+# decode to the same pictures as their unmodified source.
+IDS_RAW="$RUN_DIR/ids-original.h264"
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=30" -frames:v 90 -c:v libx264 -preset medium -threads 1 -profile:v baseline -bf 0 -g 90 -b:v 2M -f h264 "$IDS_RAW"
+ffmpeg -nostdin -hide_banner -loglevel error -y -f h264 -r 30 -i "$IDS_RAW" -pix_fmt yuv420p -f framemd5 "$RUN_DIR/ids-original.md5"
+for mode in pps-id sps-id; do
+	modified="$RUN_DIR/$mode.h264"
+	python3 scripts/gates/fixtures/x264-pps-variation.py "$IDS_RAW" "$modified" "$mode"
+	ffmpeg -nostdin -hide_banner -loglevel error -y -f h264 -r 30 -i "$modified" -pix_fmt yuv420p -f framemd5 "$RUN_DIR/$mode.md5"
+	cmp -s "$RUN_DIR/ids-original.md5" "$RUN_DIR/$mode.md5" ||
+		{ fail "$mode fixture changes software-decoded pictures"; exit 1; }
+	ffmpeg -nostdin -hide_banner -loglevel error -y -f h264 -r 30 -i "$modified" -c:v copy "$RUN_DIR/$mode.mkv"
+	pass "$mode clip: 90 unchanged pictures across an ID switch"
+done
+# Remove the VUI (and therefore the reorder bound) before picture 3 of a
+# Main-profile B-frame stream. Its coded pictures and reference chain stay
+# unchanged, and the same VT session must continue ordering those pictures.
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=30" -frames:v 90 -c:v libx264 -preset medium -threads 1 -profile:v main -bf 2 -g 90 -x264-params "b-adapt=0:scenecut=0" -f h264 "$RUN_DIR/reorder-original.h264"
+python3 scripts/gates/fixtures/x264-pps-variation.py "$RUN_DIR/reorder-original.h264" "$RUN_DIR/no-reorder-bound.h264" no-reorder-bound
+# MP4 accepts the raw B-frame stream's DTS-only timing; no edit list may
+# trim its leading pictures. The decode check disables frame-rate conversion.
+ffmpeg -nostdin -hide_banner -loglevel error -y -r 30 -i "$RUN_DIR/no-reorder-bound.h264" -c:v copy -use_editlist 0 "$RUN_DIR/no-reorder-bound.mp4"
+ffmpeg -nostdin -hide_banner -loglevel error -y -i "$RUN_DIR/reorder-original.h264" -pix_fmt yuv420p -f framemd5 "$RUN_DIR/reorder-original.md5"
+
 # HEVC: eight bits with B-frames, ten bits, and a camera-shaped one without.
 HEVC8="$RUN_DIR/hevc8.mkv"; HEVC10="$RUN_DIR/hevc10.mkv"; HEVCCAM="$RUN_DIR/hevccam.mkv"
 ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30" -t 2 \
@@ -109,7 +148,7 @@ ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30"
 
 echo
 echo "==> Booting the Docker guest with the video decoder"
-"$BIN" \
+LIGHTER_LOG=info,lighter_vmm::video=debug "$BIN" \
 	--kernel "$KERNEL" \
 	--disk "$ROOTFS" \
 	--disk "$DATA" --disk-size-gib 16 \
@@ -146,6 +185,13 @@ docker cp "$HEVCCAM" "$container:/hevccam.mkv" >/dev/null
 docker cp "$VP98" "$container:/vp9_8.webm" >/dev/null
 docker cp "$VP910" "$container:/vp9_10.webm" >/dev/null
 docker cp "$RACE" "$container:/race.h264" >/dev/null
+docker cp "$PPS_CLIP" "$container:/pps.mkv" >/dev/null
+for mode in pps-id sps-id; do
+	docker cp "$RUN_DIR/$mode.mkv" "$container:/$mode.mkv" >/dev/null
+done
+for fixture in no-reorder-bound.mp4 reorder-original.md5; do
+	docker cp "$RUN_DIR/$fixture" "$container:/$fixture" >/dev/null
+done
 docker cp "$ROOT/scripts/gates/fixtures/v4l2-streamoff-race.py" "$container:/race.py" >/dev/null
 docker start "$container" >/dev/null
 in_container() { docker exec "$container" bash -c "$1" 2>&1; }
@@ -185,6 +231,66 @@ rm -f /tmp/sw.yuv /tmp/hw.yuv')"
 		pass "a stream with nothing to reorder decodes to its end and exits"
 	else
 		fail "the camera-shaped clip did not finish: $(tr '\n' ' ' <<<"$cam")"
+	fi
+
+	pps="$(in_container '
+timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error \
+    -i /pps.mkv -pix_fmt yuv420p -f framemd5 /tmp/pps-sw.md5
+sw_exit=$?
+timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error \
+    -c:v h264_v4l2m2m -i /pps.mkv -pix_fmt yuv420p \
+    -f framemd5 /tmp/pps-hw.md5
+hw_exit=$?
+grep -v "^#" /tmp/pps-sw.md5 > /tmp/pps-sw.frames
+grep -v "^#" /tmp/pps-hw.md5 > /tmp/pps-hw.frames
+if cmp -s /tmp/pps-sw.frames /tmp/pps-hw.frames; then match=same; else match=differ; fi
+echo "PPS_RESULT $sw_exit $hw_exit $(wc -l < /tmp/pps-hw.frames) $match"
+')"
+	echo "$pps" | sed 's/^/    /'
+	if [ "$(awk '/^PPS_RESULT/ {print $2, $3, $4, $5}' <<<"$pps")" = "0 0 180 same" ]; then
+		pass "H.264 PPS update: all 180 frames match software decode"
+	else
+		fail "H.264 PPS update lost or changed frames: $(grep '^PPS_RESULT' <<<"$pps")"
+	fi
+	for mode in pps-id sps-id; do
+		ids="$(in_container "
+mode=$mode
+timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error -i /\$mode.mkv -pix_fmt yuv420p -f framemd5 /tmp/ids-sw.md5
+sw_exit=\$?
+timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error -c:v h264_v4l2m2m -i /\$mode.mkv -pix_fmt yuv420p -f framemd5 /tmp/ids-hw.md5
+hw_exit=\$?
+grep -v '^#' /tmp/ids-sw.md5 > /tmp/ids-sw.frames
+grep -v '^#' /tmp/ids-hw.md5 > /tmp/ids-hw.frames
+if cmp -s /tmp/ids-sw.frames /tmp/ids-hw.frames; then match=same; else match=differ; fi
+echo IDS_RESULT \$sw_exit \$hw_exit \$(wc -l < /tmp/ids-hw.frames) \$match
+")"
+		echo "$ids" | sed 's/^/    /'
+		if [ "$(awk '/^IDS_RESULT/ {print $2, $3, $4, $5}' <<<"$ids")" = "0 0 90 same" ]; then
+			pass "H.264 $mode switch: all 90 frames match software decode"
+		else
+			fail "H.264 $mode switch lost or changed frames: $(grep '^IDS_RESULT' <<<"$ids")"
+		fi
+	done
+
+	# Compare ordered picture hashes to the original source; the MP4's raw
+	# stream timestamps must not cause frame-rate conversion or lost pictures.
+	edge="$(in_container '
+timeout -s KILL 60 ffmpeg -nostdin -y -hide_banner -loglevel error -i /no-reorder-bound.mp4 -vsync 0 -pix_fmt yuv420p -f framemd5 /tmp/edge-sw.md5
+sw_exit=$?
+timeout -s KILL 60 ffmpeg -nostdin -y -hide_banner -loglevel error -c:v h264_v4l2m2m -i /no-reorder-bound.mp4 -vsync 0 -pix_fmt yuv420p -f framemd5 /tmp/edge-hw.md5
+hw_exit=$?
+grep -v "^#" /tmp/edge-sw.md5 | awk -F, "{print \$NF}" > /tmp/edge-sw.frames
+grep -v "^#" /tmp/edge-hw.md5 | awk -F, "{print \$NF}" > /tmp/edge-hw.frames
+grep -v "^#" /reorder-original.md5 | awk -F, "{print \$NF}" > /tmp/edge-expected.frames
+match=differ
+if cmp -s /tmp/edge-sw.frames /tmp/edge-expected.frames && cmp -s /tmp/edge-hw.frames /tmp/edge-expected.frames; then match=same; fi
+echo "EDGE_RESULT $sw_exit $hw_exit $(wc -l < /tmp/edge-hw.frames) $match"
+')"
+	echo "$edge" | sed 's/^/    /'
+	if [ "$(awk '/^EDGE_RESULT/ {print $2, $3, $4, $5}' <<<"$edge")" = "0 0 90 same" ]; then
+		pass "H.264 no-reorder-bound: all 90 frames match the source and software decode"
+	else
+		fail "H.264 no-reorder-bound: output differs: $(grep '^EDGE_RESULT' <<<"$edge")"
 	fi
 
 	# HEVC: every frame of the 8-bit clip identical to software decode; the
