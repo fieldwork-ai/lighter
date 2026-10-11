@@ -54,7 +54,11 @@ trap cleanup EXIT
 echo "==> Booting with streams"
 "$LIGHTER" start >"$LIGHTER_HOME/start.log" 2>&1 &
 for _ in $(seq 1 60); do $D info >/dev/null 2>&1 && break; sleep 1; done
-$D info >/dev/null 2>&1 || { fail "machine did not come up"; exit 1; }
+$D info >/dev/null 2>&1 || {
+	fail "machine did not come up"
+	tail -20 "$LIGHTER_HOME/start.log" "$LIGHTER_HOME/machine.log" 2>/dev/null | sed 's/^/    /'
+	exit 1
+}
 grep -q "INIT streams=on" "$LIGHTER_HOME/machine.log" && pass "the guest installed its redirect" || fail "guest: $(grep -o 'INIT streams=.*' "$LIGHTER_HOME/machine.log" || echo 'no streams line')"
 if python3 - <<'PY'
 import os, socket, sys
