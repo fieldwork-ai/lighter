@@ -43,10 +43,13 @@ vmstat() { probe "grep -E '^$1 ' /proc/vmstat | awk '{print \$2}'"; }
 zones() { probe "awk '/^Node/{z=\$4} /managed/{printf \"%s=%d MiB \", z, \$2*4/1024}' /proc/zoneinfo"; }
 note "zones: $(zones)"
 order="$(probe 'cat /sys/module/page_reporting/parameters/page_reporting_order')"
-# The agent sets the order: its rest order once it runs, the pageblock
-# order while containers churn; the kernel's default (0034) is what holds
-# before it speaks.
-[ "${order:-0}" -ge 4 ] && [ "${order:-0}" -le 9 ] && pass "free page reporting at order ${order}" || fail "reporting order is ${order}"
+# The agent sets the order: its rest order (3, two host pages) once it runs,
+# the pageblock order (9) while containers churn; the kernel's default (4,
+# patch 0034) is what holds before it speaks.
+case "${order:-}" in
+3 | 4 | 9) pass "free page reporting at order ${order}" ;;
+*) fail "reporting order is ${order:-unset}, not the agent's 3 or 9 or the kernel's 4" ;;
+esac
 movable="$(probe "awk '/^Node/{z=\$4} /managed/{if (z==\"Movable\") print \$2}' /proc/zoneinfo")"
 [ "${movable:-0}" -eq 0 ] && pass "one zone: nothing managed in ZONE_MOVABLE" || fail "ZONE_MOVABLE manages ${movable} pages; the guest should be one zone"
 sleep 5
