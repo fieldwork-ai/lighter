@@ -27,7 +27,10 @@ def _install():
 
     class InferenceSession(session):
         def __init__(self, path_or_bytes, sess_options=None, providers=None, provider_options=None, **kwargs):
-            if providers in (None, ["CPUExecutionProvider"]):
+            # A session that saves its optimized graph (Immich 3 prepares each model so, then runs the copy)
+            # cannot hold compiled nodes; the session that runs the saved graph gets the provider.
+            saving = sess_options is not None and sess_options.optimized_model_filepath
+            if providers in (None, ["CPUExecutionProvider"]) and not saving:
                 sess_options = sess_options or ort.SessionOptions()
                 # The devices choose the providers; a list besides them is refused.
                 sess_options.add_provider_for_devices(devices, {})
