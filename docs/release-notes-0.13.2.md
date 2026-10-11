@@ -33,4 +33,4 @@ Or `lighter update download` then `lighter upgrade --restart` if you installed w
 
 ## Also
 
-- Linux remains **6.18.52**, with the video driver changes (kernel 8bb6c70d). The data epoch remains **1**.
+- Linux remains **6.18.52**, with the video driver changes (kernel a94fa71c). The data epoch remains **1**.
