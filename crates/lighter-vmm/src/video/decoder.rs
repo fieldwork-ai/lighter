@@ -392,6 +392,8 @@ struct Available {
     index: u32,
     ptr: *mut u8,
     len: usize,
+    /// The CAPTURE format it was queued for.
+    generation: u64,
 }
 
 unsafe impl Send for Available {}
@@ -399,11 +401,20 @@ unsafe impl Send for Available {}
 /// What the next free CAPTURE buffer is for.
 enum Ready {
     /// A frame, and the coded size and pixel format CAPTURE was formatted
-    /// for when it was decoded, which is the layout the guest reads it with.
-    Frame(Decoded, (u32, u32), u32),
+    /// for when it was decoded, which is the layout the guest reads it with,
+    /// and that format's generation.
+    Frame(Decoded, (u32, u32), u32, u64),
     /// An empty buffer flagged LAST: the end of a drain, or of the frames
-    /// of the old resolution when it changes while CAPTURE streams.
-    Last,
+    /// of the old format when it changes while CAPTURE streams.
+    Last(u64),
+}
+
+impl Ready {
+    fn generation(&self) -> u64 {
+        match self {
+            Ready::Frame(.., generation) | Ready::Last(generation) => *generation,
+        }
+    }
 }
 
 /// The codecs the decoder takes, by their V4L2 pixel format.
@@ -461,9 +472,16 @@ pub struct Session {
     ten_bit: bool,
     capture_fourcc: u32,
     sink: Arc<Sink>,
-    /// What the CAPTURE queue is formatted for. Follows the stream unless
-    /// the guest set something larger.
+    /// What the CAPTURE queue is formatted for: the stream's size, or a
+    /// larger one the guest set since the stream last changed it.
     coded_size: (u32, u32),
+    /// One more at each change of CAPTURE's format the guest is told of. A
+    /// frame goes only into a buffer queued for its own: the guest's buffers
+    /// from before a change are the old format's until it restarts CAPTURE
+    /// or sends START (the change is an implicit drain, dev-decoder
+    /// 4.5.1.9), however large, and a frame put in one after the LAST
+    /// buffer would be lost with it.
+    generation: u64,
     /// The size of an OUTPUT buffer: the guest's, within bounds.
     input_size: u32,
     stream: StreamParams,
@@ -518,6 +536,7 @@ impl Session {
             events: VecDeque::new(),
             accepting_output: true,
             capture_streaming: false,
+            generation: 0,
         }
     }
 
@@ -615,8 +634,8 @@ impl Session {
         };
         let dims = vt.dims;
         self.vt = Some(vt);
-        let bits_changed = ten_bit != self.ten_bit;
-        if bits_changed {
+        let fourcc = self.capture_fourcc;
+        if ten_bit != self.ten_bit {
             self.ten_bit = ten_bit;
             // NV12 by default even for a ten-bit stream: ffmpeg's V4L2
             // wrapper takes the format the device reports after a source
@@ -626,25 +645,31 @@ impl Session {
                 self.capture_fourcc = NV12;
             }
         }
-        if dims != self.stream.coded_size || bits_changed {
+        // The guest is told of a change only when what it reads CAPTURE
+        // with changes: a stream that turns ten-bit while CAPTURE stays NV12
+        // asks nothing of it, and ffmpeg, finding the format it asks after
+        // the event unchanged, keeps the buffers it has and stops at the
+        // LAST buffer as at the end of the stream.
+        if dims != self.stream.coded_size || self.capture_fourcc != fourcc {
             tracing::info!(
                 from = format_args!("{}x{}", self.stream.coded_size.0, self.stream.coded_size.1),
                 to = format_args!("{}x{}", dims.0, dims.1),
                 ten_bit,
                 "video stream resolution"
             );
-            // Mid-stream, the old resolution's frames (all flushed) end
-            // with a LAST buffer before any of the new one.
+            // Mid-stream, the old format's frames (all flushed) end with a
+            // LAST buffer before any of the new one.
             if self.capture_streaming {
-                self.ready.push_back(Ready::Last);
+                self.ready.push_back(Ready::Last(self.generation));
             }
+            self.generation += 1;
             self.stream.coded_size = dims;
             self.stream.visible_rect = Rect::new(0, 0, dims.0, dims.1);
-            if dims.0 > self.coded_size.0 || dims.1 > self.coded_size.1 {
-                self.coded_size = dims;
-            }
-            // The guest answers with buffers of the new size; frames
-            // decoded meanwhile wait for them.
+            // What the guest reads after the event is the new stream's,
+            // smaller too (dev-decoder 4.5.1.9): kept at the larger size, a
+            // stream that shrank looked unchanged, and ffmpeg stopped at the
+            // old size's LAST buffer.
+            self.coded_size = dims;
             self.events
                 .push_back(VideoDecoderBackendEvent::StreamFormatChanged);
         }
@@ -710,27 +735,37 @@ impl Session {
         while !self.reorder.is_empty() && (flush || self.reorder.len() as u32 > self.depth) {
             let frame = self.reorder.remove(0);
             self.last_out = Some(frame.order);
-            self.ready
-                .push_back(Ready::Frame(frame, self.coded_size, self.capture_fourcc));
+            self.ready.push_back(Ready::Frame(
+                frame,
+                self.coded_size,
+                self.capture_fourcc,
+                self.generation,
+            ));
         }
     }
 
-    /// Fills queued CAPTURE buffers from `ready`, oldest first.
+    /// Fills queued CAPTURE buffers from `ready`, oldest first, each frame
+    /// into the first buffer queued for its format.
     fn emit_frames(&mut self) {
         while let Some(next) = self.ready.front() {
-            let Some(out) = self.available.pop_front() else {
+            let generation = next.generation();
+            let Some(at) = self
+                .available
+                .iter()
+                .position(|b| b.generation == generation)
+            else {
                 return;
             };
-            if let Ready::Frame(_, coded, fourcc) = next
+            let out = self.available.remove(at).expect("found");
+            if let Ready::Frame(_, coded, fourcc, _) = next
                 && out.len < frame_size(*coded, *fourcc)
             {
-                // A buffer from before a resolution change is too small for
-                // what is now decoded: the frame waits for the new ones.
-                self.available.push_front(out);
+                // A buffer the guest made smaller than its format says.
+                self.available.insert(at, out);
                 return;
             }
             let event = match self.ready.pop_front().expect("checked") {
-                Ready::Frame(frame, coded, fourcc) => {
+                Ready::Frame(frame, coded, fourcc, _) => {
                     let used = copy_frame(&frame, coded, fourcc, out.ptr, out.len);
                     tracing::trace!(buffer = out.index, order = ?frame.order, used, "video frame out");
                     VideoDecoderBackendEvent::FrameCompleted {
@@ -740,7 +775,7 @@ impl Session {
                         is_last: false,
                     }
                 }
-                Ready::Last => VideoDecoderBackendEvent::FrameCompleted {
+                Ready::Last(_) => VideoDecoderBackendEvent::FrameCompleted {
                     buffer_id: out.index,
                     timestamp: bindings::timeval {
                         tv_sec: 0,
@@ -938,6 +973,7 @@ impl VideoDecoderBackendSession for Session {
             index,
             ptr: plane.bytes_mut().as_mut_ptr(),
             len,
+            generation: self.generation,
         });
         self.emit_frames();
         Ok(())
@@ -953,7 +989,7 @@ impl VideoDecoderBackendSession for Session {
             buffers = self.available.len(),
             "video drain"
         );
-        self.ready.push_back(Ready::Last);
+        self.ready.push_back(Ready::Last(self.generation));
         self.emit_frames();
         Ok(())
     }
@@ -962,6 +998,10 @@ impl VideoDecoderBackendSession for Session {
         self.available.clear();
         self.events
             .retain(|e| !matches!(e, VideoDecoderBackendEvent::FrameCompleted { .. }));
+        // What an old format had left goes with its buffers: ffmpeg turns
+        // CAPTURE off as soon as it reads the change, before its LAST buffer.
+        let generation = self.generation;
+        self.ready.retain(|r| r.generation() == generation);
         Ok(())
     }
 
@@ -979,6 +1019,27 @@ impl VideoDecoderBackendSession for Session {
 
     fn stream_params(&self) -> StreamParams {
         self.stream.clone()
+    }
+
+    /// START: the guest goes on with the buffers it has, which are the
+    /// current format's from here, and so is what an earlier one left. The
+    /// drain it ends is over, so an earlier format's LAST buffer, if START
+    /// came before it was handed out, never is: ffmpeg sends START as soon
+    /// as it reads a change that needs no new buffers, and a LAST read
+    /// after it would end its stream.
+    fn resume(&mut self) {
+        let generation = self.generation;
+        self.ready
+            .retain(|r| !matches!(r, Ready::Last(older) if *older != generation));
+        for r in &mut self.ready {
+            if let Ready::Frame(.., g) = r {
+                *g = generation;
+            }
+        }
+        for buffer in &mut self.available {
+            buffer.generation = generation;
+        }
+        self.emit_frames();
     }
 
     fn streaming_state(&mut self, direction: QueueDirection, streaming: bool) {
@@ -1231,8 +1292,8 @@ mod tests {
         s.ready
             .iter()
             .filter_map(|r| match r {
-                Ready::Frame(f, _, _) => Some(f.timestamp.tv_sec),
-                Ready::Last => None,
+                Ready::Frame(f, ..) => Some(f.timestamp.tv_sec),
+                Ready::Last(_) => None,
             })
             .collect()
     }
@@ -1367,11 +1428,7 @@ mod tests {
         s.drain().unwrap();
         assert!(s.events.is_empty());
         let mut shm = Shm::new(1).unwrap();
-        s.available.push_back(Available {
-            index: 5,
-            ptr: shm.bytes_mut().as_mut_ptr(),
-            len: shm.len,
-        });
+        s.available.push_back(buffer(&mut shm, 5, 0));
         s.emit_frames();
         assert!(matches!(
             s.events.pop_front(),
@@ -1400,6 +1457,133 @@ mod tests {
         s.seq = 1;
         returned(&mut s, 2, 1);
         assert!(s.in_flight.is_empty());
+    }
+
+    fn frame(seq: i64) -> Decoded {
+        Decoded {
+            pixels: std::ptr::null(),
+            seq,
+            order: (0, seq),
+            timestamp: bindings::timeval {
+                tv_sec: seq,
+                tv_usec: 0,
+            },
+        }
+    }
+
+    fn buffer(shm: &mut Shm, index: u32, generation: u64) -> Available {
+        Available {
+            index,
+            ptr: shm.bytes_mut().as_mut_ptr(),
+            len: shm.len,
+            generation,
+        }
+    }
+
+    /// The CAPTURE buffers handed back since last asked, and which was LAST.
+    fn completed(s: &mut Session) -> Vec<(u32, bool)> {
+        let mut out = Vec::new();
+        s.events.retain(|e| match e {
+            VideoDecoderBackendEvent::FrameCompleted {
+                buffer_id, is_last, ..
+            } => {
+                out.push((*buffer_id, *is_last));
+                false
+            }
+            _ => true,
+        });
+        out
+    }
+
+    #[test]
+    fn a_stream_that_shrinks_tells_the_guest_its_new_size() {
+        use crate::video::h264::tests::{REOLINK_PPS, baseline_sps};
+        let annexb = |nals: &[&[u8]]| -> Vec<u8> {
+            nals.iter()
+                .flat_map(|nal| [&[0u8, 0, 0, 1][..], nal].concat())
+                .collect()
+        };
+        let stamp = bindings::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        // x264's 1920x1080, then a 640x480 Baseline.
+        let big: &[u8] = &[
+            0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00,
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58,
+        ];
+        let mut s = Session::new(Codec::H264);
+        s.feed(annexb(&[big, REOLINK_PPS]), 0, stamp).unwrap();
+        s.capture_streaming = true;
+        let before = s.generation;
+        s.events.clear();
+        s.feed(annexb(&[&baseline_sps(0, 0, 0), REOLINK_PPS]), 1, stamp)
+            .unwrap();
+        let f = s.capture_format();
+        assert_eq!((f.width, f.height), (640, 480));
+        assert_eq!(s.generation, before + 1);
+        assert!(matches!(s.ready.back(), Some(Ready::Last(g)) if *g == before));
+        assert!(
+            s.events
+                .iter()
+                .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
+        );
+    }
+
+    #[test]
+    fn a_new_formats_frames_wait_for_buffers_queued_for_it() {
+        let mut s = Session::new(Codec::H264);
+        let (mut a, mut b, mut c) = (
+            Shm::new(1).unwrap(),
+            Shm::new(1).unwrap(),
+            Shm::new(1).unwrap(),
+        );
+        // After a change: two buffers the guest had, each big enough, the
+        // old format's LAST and a frame of the new one.
+        s.generation = 1;
+        s.available.push_back(buffer(&mut a, 0, 0));
+        s.available.push_back(buffer(&mut b, 1, 0));
+        s.ready.push_back(Ready::Last(0));
+        s.ready.push_back(Ready::Frame(frame(1), (16, 16), NV12, 1));
+        s.emit_frames();
+        assert_eq!(completed(&mut s), vec![(0, true)]);
+        // CAPTURE off and on again, with a buffer for the new format.
+        s.clear_output_buffers().unwrap();
+        s.available.push_back(buffer(&mut c, 2, 1));
+        s.emit_frames();
+        assert_eq!(completed(&mut s), vec![(2, false)]);
+    }
+
+    #[test]
+    fn turning_capture_off_drops_what_an_old_format_left() {
+        let mut s = Session::new(Codec::H264);
+        s.generation = 1;
+        s.ready.push_back(Ready::Frame(frame(1), (16, 16), NV12, 0));
+        s.ready.push_back(Ready::Last(0));
+        s.ready.push_back(Ready::Frame(frame(2), (16, 16), NV12, 1));
+        s.clear_output_buffers().unwrap();
+        assert_eq!(ready_stamps(&s), vec![2]);
+        assert_eq!(s.ready.len(), 1);
+    }
+
+    #[test]
+    fn start_goes_on_with_the_buffers_the_guest_kept() {
+        // ffmpeg sends START as soon as it reads a change that needs no new
+        // buffers, before the old format's LAST is handed out; a LAST read
+        // after it would end its stream.
+        let mut s = Session::new(Codec::H264);
+        let mut a = Shm::new(1).unwrap();
+        s.generation = 1;
+        s.ready.push_back(Ready::Last(0));
+        s.ready.push_back(Ready::Frame(frame(1), (16, 16), NV12, 1));
+        s.resume();
+        // The old LAST is gone; the frame waits for a buffer.
+        assert_eq!(s.ready.len(), 1);
+        assert!(matches!(s.ready.front(), Some(Ready::Frame(..))));
+        s.available.push_back(buffer(&mut a, 0, 0));
+        s.resume();
+        assert_eq!(completed(&mut s), vec![(0, false)]);
+        assert!(s.ready.is_empty());
     }
 
     #[test]

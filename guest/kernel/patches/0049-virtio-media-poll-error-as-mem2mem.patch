@@ -1,0 +1,66 @@
+# virtio-media v9: answer poll with an error only when neither queue can make progress, as
+# v4l2-mem2mem does (v4l2_m2m_poll_for_data). The driver answered EPOLLERR whenever CAPTURE was not
+# streaming, but a decoder turns CAPTURE off in the middle of a dynamic resolution change while its
+# OUTPUT queue streams on (dev-decoder 4.5.1.9). Debian's ffmpeg 5.1 (h264_v4l2m2m) polls CAPTURE in
+# that window, with the buffers it has just freed for the new size, and on POLLERR walks them and
+# segfaults, so a stream that changed resolution ended ffmpeg as soon as the device reported the new size.
+diff --git a/drivers/media/virtio/virtio_media_driver.c b/drivers/media/virtio/virtio_media_driver.c
+--- a/drivers/media/virtio/virtio_media_driver.c
++++ b/drivers/media/virtio/virtio_media_driver.c
+@@ -619,30 +619,37 @@
+ 		&session->queues[output_type];
+ 	__poll_t req_events = poll_requested_events(wait);
+ 	__poll_t rc = 0;
++	bool capture_idle, output_idle;
+
+ 	poll_wait(file, &session->dqbuf_wait, wait);
+ 	poll_wait(file, &session->fh.wait, wait);
+
+ 	mutex_lock(&session->queues_lock);
+-	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
+-		if (!capture_queue->streaming ||
+-		    (capture_queue->queued_bufs == 0 &&
+-		     list_empty(&capture_queue->pending_dqbufs)))
+-			rc |= EPOLLERR;
+-		else if (!list_empty(&capture_queue->pending_dqbufs) ||
+-			 capture_queue->is_capture_last)
+-			/* After the LAST buffer, DQBUF answers EPIPE at once;
+-			 * say so, as vb2 does, or a client polling for the
+-			 * next frame after end of stream waits forever. */
+-			rc |= EPOLLIN | EPOLLRDNORM;
+-	}
+-	if (req_events & (EPOLLOUT | EPOLLWRNORM)) {
+-		if (!output_queue->streaming)
+-			rc |= EPOLLERR;
+-		else if (output_queue->queued_bufs <
+-			 output_queue->allocated_bufs)
+-			rc |= EPOLLOUT | EPOLLWRNORM;
+-	}
++	/* An error only when neither queue can make progress, as
++	 * v4l2-mem2mem: CAPTURE off while OUTPUT streams is a resolution
++	 * change, and a client polling through it must not be told the
++	 * device failed. */
++	capture_idle = !capture_queue->streaming ||
++		       (capture_queue->queued_bufs == 0 &&
++			list_empty(&capture_queue->pending_dqbufs) &&
++			!capture_queue->is_capture_last);
++	output_idle = !output_queue->streaming ||
++		      (output_queue->queued_bufs == 0 &&
++		       list_empty(&output_queue->pending_dqbufs));
++	if (capture_idle && output_idle)
++		rc |= EPOLLERR;
++	if ((req_events & (EPOLLIN | EPOLLRDNORM)) &&
++	    capture_queue->streaming &&
++	    (!list_empty(&capture_queue->pending_dqbufs) ||
++	     capture_queue->is_capture_last))
++		/* After the LAST buffer, DQBUF answers EPIPE at once;
++		 * say so, as vb2 does, or a client polling for the
++		 * next frame after end of stream waits forever. */
++		rc |= EPOLLIN | EPOLLRDNORM;
++	if ((req_events & (EPOLLOUT | EPOLLWRNORM)) &&
++	    output_queue->streaming &&
++	    output_queue->queued_bufs < output_queue->allocated_bufs)
++		rc |= EPOLLOUT | EPOLLWRNORM;
+ 	mutex_unlock(&session->queues_lock);
+
+ 	if (v4l2_event_pending(&session->fh))

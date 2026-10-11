@@ -130,13 +130,24 @@ ffmpeg -nostdin -hide_banner -loglevel error -y -r 30 -i "$RUN_DIR/no-reorder-bo
 ffmpeg -nostdin -hide_banner -loglevel error -y -i "$RUN_DIR/reorder-original.h264" -pix_fmt yuv420p -f framemd5 "$RUN_DIR/reorder-original.md5"
 # A second SPS and PPS, at another size, sent before picture 3 and named by
 # no slice: nothing about the stream changes, every picture decodes as before.
-ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=30" -frames:v 1 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -f h264 "$RUN_DIR/other-size.h264"
-python3 -I scripts/gates/fixtures/h264-parameter-sets.py "$IDS_RAW" "$RUN_DIR/unused-sps.h264" unused-sps "$RUN_DIR/other-size.h264"
+SMALL="$RUN_DIR/small.h264"
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "mandelbrot=size=320x180:rate=30" -frames:v 30 -c:v libx264 -preset medium -threads 1 -profile:v baseline -pix_fmt yuv420p -bf 0 -g 30 -f h264 "$SMALL"
+python3 -I scripts/gates/fixtures/h264-parameter-sets.py "$IDS_RAW" "$RUN_DIR/unused-sps.h264" unused-sps "$SMALL"
 ffmpeg -nostdin -hide_banner -loglevel error -y -f h264 -r 30 -i "$RUN_DIR/unused-sps.h264" -pix_fmt yuv420p -f framemd5 "$RUN_DIR/unused-sps.md5"
 cmp -s "$RUN_DIR/ids-original.md5" "$RUN_DIR/unused-sps.md5" ||
 	{ fail "unused-sps fixture changes software-decoded pictures"; exit 1; }
 ffmpeg -nostdin -hide_banner -loglevel error -y -f h264 -r 30 -i "$RUN_DIR/unused-sps.h264" -c:v copy "$RUN_DIR/unused-sps.mkv"
 pass "unused-sps clip: 90 unchanged pictures with a 320x180 SPS sent at picture 3"
+# A stream whose size changes as it plays, as a camera's does when its
+# resolution is changed: 640x360 then 320x180, and the other way round.
+# Software, scaling nothing, decodes each to its two clips' frames at their
+# own sizes.
+cat "$IDS_RAW" "$SMALL" > "$RUN_DIR/shrink.h264"
+cat "$SMALL" "$IDS_RAW" > "$RUN_DIR/grow.h264"
+for change in shrink grow; do
+	ffmpeg -nostdin -hide_banner -loglevel error -y -f h264 -r 30 -i "$RUN_DIR/$change.h264" -c:v copy "$RUN_DIR/$change.mkv"
+done
+pass "size-change clips: 90 frames at 640x360 and 30 at 320x180, in each order"
 
 # HEVC: eight bits with B-frames, ten bits, and a camera-shaped one without.
 HEVC8="$RUN_DIR/hevc8.mkv"; HEVC10="$RUN_DIR/hevc10.mkv"; HEVCCAM="$RUN_DIR/hevccam.mkv"
@@ -195,7 +206,7 @@ docker cp "$VP98" "$container:/vp9_8.webm" >/dev/null
 docker cp "$VP910" "$container:/vp9_10.webm" >/dev/null
 docker cp "$RACE" "$container:/race.h264" >/dev/null
 docker cp "$PPS_CLIP" "$container:/pps.mkv" >/dev/null
-for mode in pps-id sps-id unused-sps; do
+for mode in pps-id sps-id unused-sps shrink grow; do
 	docker cp "$RUN_DIR/$mode.mkv" "$container:/$mode.mkv" >/dev/null
 done
 for fixture in no-reorder-bound.mp4 reorder-original.md5; do
@@ -278,6 +289,28 @@ echo IDS_RESULT \$sw_exit \$hw_exit \$(wc -l < /tmp/ids-hw.frames) \$match
 			pass "H.264 $mode: all 90 frames match software decode"
 		else
 			fail "H.264 $mode lost or changed frames: $(grep '^IDS_RESULT' <<<"$ids")"
+		fi
+	done
+
+	# A size change mid-stream: the device says so when the new size
+	# arrives, and ffmpeg takes new CAPTURE buffers and goes on.
+	for change in shrink grow; do
+		sizes="$(in_container "
+change=$change
+timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error -i /\$change.mkv -noautoscale -pix_fmt yuv420p -f framemd5 /tmp/size-sw.md5
+sw_exit=\$?
+timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error -c:v h264_v4l2m2m -i /\$change.mkv -noautoscale -pix_fmt yuv420p -f framemd5 /tmp/size-hw.md5
+hw_exit=\$?
+grep -v '^#' /tmp/size-sw.md5 | awk -F, '{print \$5, \$NF}' > /tmp/size-sw.frames
+grep -v '^#' /tmp/size-hw.md5 | awk -F, '{print \$5, \$NF}' > /tmp/size-hw.frames
+if cmp -s /tmp/size-sw.frames /tmp/size-hw.frames; then match=same; else match=differ; fi
+echo SIZE_RESULT \$sw_exit \$hw_exit \$(wc -l < /tmp/size-hw.frames) \$match
+")"
+		echo "$sizes" | sed 's/^/    /'
+		if [ "$(awk '/^SIZE_RESULT/ {print $2, $3, $4, $5}' <<<"$sizes")" = "0 0 120 same" ]; then
+			pass "H.264 $change mid-stream: all 120 frames, at both sizes, match software decode"
+		else
+			fail "H.264 $change mid-stream: $(grep '^SIZE_RESULT' <<<"$sizes")"
 		fi
 	done
 
