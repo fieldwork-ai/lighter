@@ -125,7 +125,7 @@ pub fn keep() {
         loop {
             match &bell {
                 Some(bell) => {
-                    if !bell.wait(if lan_pending() { 1000 } else { -1 }) {
+                    if !bell.wait(if lan_pending() || local_pending() { 1000 } else { -1 }) {
                         publish();
                         continue;
                     }
@@ -154,6 +154,7 @@ pub fn keep() {
 }
 
 fn publish() {
+    local_firewall();
     let report = report();
     let mut kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
     if kept.report != report {
@@ -214,6 +215,89 @@ pub fn current() -> io::Result<Vec<Listener>> {
         }
     }
     Ok(listeners(&sockets, &containers, ephemeral_low()))
+}
+
+/// The ports loopback reaches something on in the guest's own namespace,
+/// of one protocol: a TCP listener or a bound UDP socket on a loopback or
+/// wildcard address, a container's or anything else's (Docker's proxies,
+/// this agent). A host-network container's `localhost` on any other port
+/// is the Mac's own loopback, as if the container were on the Mac (init's
+/// `local_tcp` and `local_udp`); on these it stays in the guest, as on
+/// Linux.
+pub fn local_ports(sockets: &[Socket], proto: Proto) -> Vec<u16> {
+    let mut ports: Vec<u16> = sockets
+        .iter()
+        .filter(|s| s.proto == proto && s.port != 0)
+        .filter(|s| s.addr.is_loopback() || s.addr.is_unspecified() || matches!(s.addr, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())))
+        .map(|s| s.port)
+        .collect();
+    ports.sort();
+    ports.dedup();
+    ports
+}
+
+/// The nft input that makes init's `local_tcp` and `local_udp` exactly
+/// these, in one transaction.
+fn local_rules(tcp: &[u16], udp: &[u16]) -> String {
+    let mut rules = String::new();
+    for (set, ports) in [("local_tcp", tcp), ("local_udp", udp)] {
+        rules.push_str(&format!("flush set inet lighter {set}\n"));
+        if !ports.is_empty() {
+            let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+            rules.push_str(&format!("add element inet lighter {set} {{ {} }}\n", list.join(", ")));
+        }
+    }
+    rules
+}
+
+/// The rules last applied to `local_tcp`.
+static LOCAL_APPLIED: Mutex<Option<String>> = Mutex::new(None);
+
+/// Keeps `local_tcp` and `local_udp` in step with what listens. Until it is first filled
+/// it holds every port, so nothing goes to the Mac on a guess.
+fn local_firewall() {
+    let mut sockets = Vec::new();
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        for (protocol, states) in [(libc::IPPROTO_TCP, 1 << TCP_LISTEN), (libc::IPPROTO_UDP, 1 << TCP_CLOSE)] {
+            match dump(family, protocol as u8, states) {
+                Ok(found) => sockets.extend(found),
+                Err(e) => {
+                    eprintln!("lighter-agent: cannot list the guest's sockets for localhost: {e}");
+                    return;
+                }
+            }
+        }
+    }
+    let rules = local_rules(&local_ports(&sockets, Proto::Tcp), &local_ports(&sockets, Proto::Udp));
+    let mut last = LOCAL_APPLIED.lock().unwrap_or_else(|p| p.into_inner());
+    if last.as_deref() == Some(rules.as_str()) {
+        return;
+    }
+    if apply_nft(&rules) {
+        *last = Some(rules);
+    }
+}
+
+/// Whether `local_tcp` has not been filled yet: init loads its table after
+/// this agent starts.
+fn local_pending() -> bool {
+    LOCAL_APPLIED.lock().unwrap_or_else(|p| p.into_inner()).is_none()
+}
+
+/// Runs `nft -f -` on `rules`; whether it took them.
+fn apply_nft(rules: &str) -> bool {
+    std::process::Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().expect("piped").write_all(rules.as_bytes())?;
+            child.wait()
+        })
+        .is_ok_and(|status| status.success())
 }
 
 /// The rules last applied to the LAN card's firewall.
@@ -603,5 +687,27 @@ mod tests {
         change("listeners none\n");
         watching.join().unwrap();
         assert_eq!(KEPT.lock().unwrap().watchers, 0);
+    }
+
+    #[test]
+    fn localhost_stays_in_the_guest_only_where_something_listens_for_it() {
+        let sock = |addr: &str, port: u16| Socket { proto: Proto::Tcp, addr: addr.parse().unwrap(), port, v6only: false, cgroup: 1 };
+        let sockets = [
+            sock("0.0.0.0", 15201),        // the agent
+            sock("127.0.0.1", 5432),       // a host-network database on loopback
+            sock("::", 8123),              // Home Assistant, both families
+            sock("192.168.127.2", 9000),   // the guest's own address only: loopback misses it
+            sock("::ffff:127.0.0.1", 6379),
+        ];
+        assert_eq!(local_ports(&sockets, Proto::Tcp), [5432, 6379, 8123, 15201]);
+        let mut udp = sock("0.0.0.0", 53);
+        udp.proto = Proto::Udp;
+        assert_eq!(local_ports(&[udp.clone()], Proto::Udp), [53]);
+        assert!(local_ports(&[udp], Proto::Tcp).is_empty());
+        assert_eq!(
+            local_rules(&[22, 8123], &[53]),
+            "flush set inet lighter local_tcp\nadd element inet lighter local_tcp { 22, 8123 }\nflush set inet lighter local_udp\nadd element inet lighter local_udp { 53 }\n"
+        );
+        assert_eq!(local_rules(&[], &[]), "flush set inet lighter local_tcp\nflush set inet lighter local_udp\n");
     }
 }

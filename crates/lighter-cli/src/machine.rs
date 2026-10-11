@@ -40,6 +40,9 @@ pub struct Status {
     /// `waiting`, `declined <the Mac's address>`), or why the machine
     /// started without it. None when LAN mode is off.
     pub lan: Option<LanState>,
+    /// Direct access: the link's subnet and Docker's networks outside it,
+    /// or why the machine started without it. None when it is off.
+    pub direct: Option<Result<(std::net::Ipv4Addr, Vec<String>), String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +312,14 @@ pub fn status() -> anyhow::Result<Status> {
     } else {
         None
     };
+    let direct = if pid.is_some() && crate::config::Config::load().is_ok_and(|c| c.direct) {
+        paths::home().ok().map(|home| {
+            crate::link::state(&home)
+                .map(|subnet| (subnet, crate::link::networks_outside(&socket, subnet)))
+        })
+    } else {
+        None
+    };
     let agent_restarts = pid
         .and_then(|_| control("restarts").ok())
         .and_then(|reply| reply.strip_prefix("restarts ").map(str::to_owned))
@@ -324,6 +335,7 @@ pub fn status() -> anyhow::Result<Status> {
         unforwarded,
         unshared,
         lan,
+        direct,
     })
 }
 

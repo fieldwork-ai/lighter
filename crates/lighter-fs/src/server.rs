@@ -193,6 +193,8 @@ struct Held {
     writes: Vec<(u64, Vec<u8>)>,
     bytes: usize,
     since: std::time::Instant,
+    /// On a network share: where the file's bits are kept once it exists.
+    keep: Option<Arc<Modes>>,
 }
 
 /// Bytes one held file may accumulate before its create is queued, and all
@@ -266,6 +268,7 @@ fn create_job(
         flags,
         mode,
         writes,
+        keep,
         ..
     } = held;
     let keys = crate::apply::Keys::of(&[parent.id(), nodeid]);
@@ -311,9 +314,22 @@ fn create_job(
             Ok((fd, mut st)) => {
                 // The bytes promised while the create was held back are the
                 // create's to keep — and then the attributes, since a write
-                // moves the time and the last promise made wins.
-                for (offset, data) in &writes {
-                    inode.write_applied(write_fully(fd.as_raw_fd(), data, *offset));
+                // moves the time and the last promise made wins. Counted as
+                // applied only once the file is bound: until then a lookup
+                // answers from the promise, whose size is what was written,
+                // and counted at once that size went back to zero while the
+                // file was still a promise. A lookup in that window was told
+                // the file was empty, and the guest read nothing from it:
+                // every few runs on an SMB share, where the window is a round
+                // trip or three, for a file written and renamed over another
+                // (#69).
+                let written: Vec<_> = writes
+                    .iter()
+                    .map(|(offset, data)| write_fully(fd.as_raw_fd(), data, *offset))
+                    .collect();
+                if let Some(modes) = &keep {
+                    let mode = inode.pending_meta().map_or(mode, |meta| meta.mode);
+                    modes.keep(&inode, Some(&parent), fd.as_raw_fd(), mode & 0o7777);
                 }
                 if let Some(meta) = inode.pending_meta() {
                     if meta.mode & 0o7777 != mode & 0o7777 {
@@ -361,9 +377,14 @@ fn create_job(
                     }),
                 );
                 match meta {
-                    Some(meta) => {
-                        registry.bind_pending(nodeid, &inode, meta, st.st_dev as i64, st.st_ino)
-                    }
+                    Some(meta) => registry.bind_pending(
+                        nodeid,
+                        &inode,
+                        meta,
+                        st.st_dev as i64,
+                        st.st_ino,
+                        birth(&st),
+                    ),
                     None => registry.bind_pending_parked(
                         nodeid,
                         &inode,
@@ -371,6 +392,9 @@ fn create_job(
                         st.st_ino,
                         (st.st_birthtime, st.st_birthtime_nsec),
                     ),
+                }
+                for result in written {
+                    inode.write_applied(result);
                 }
             }
             Err(errno) => {
@@ -383,7 +407,7 @@ fn create_job(
                     .ok()
                     .and_then(|r| sys::stat_at(r.raw_fd(), &name).ok())
                     .map(|st| {
-                        let known = registry.identified(st.st_dev as i64, st.st_ino);
+                        let known = registry.identified(st.st_dev as i64, st.st_ino, birth(&st));
                         format!(
                             "ino={} size={} nodeid={:?} pending={:?}",
                             st.st_ino,
@@ -425,18 +449,22 @@ fn materialize_held(
     park_creates: bool,
     nodeid: u64,
 ) -> bool {
-    let held = holding
-        .map
-        .lock()
-        .expect("held creates poisoned")
-        .remove(&nodeid);
-    let Some(held) = held else {
+    // Taken from the map and queued under the map's lock. Let go of between
+    // the two, a rename that found the create gone took it for queued and
+    // was queued first: its job ran before the create, and failed ENOENT
+    // ("an acknowledged rename failed to apply"), and the create then made
+    // the file under the name the guest had renamed away. Postgres's
+    // `pg_internal.init`, on an SMB share, where the gap is long enough to
+    // land in (#69). Nothing the queue runs takes this lock.
+    let mut map = holding.map.lock().expect("held creates poisoned");
+    let Some(held) = map.remove(&nodeid) else {
         return false;
     };
     holding.bytes.fetch_sub(held.bytes, Ordering::Relaxed);
     let parent = held.parent.clone();
     let inode = registry.get(nodeid);
     let Some(inode) = inode else {
+        drop(map);
         // Forgotten before it was made: nothing to make.
         parent.remove_pending_child(held.name.to_bytes(), nodeid);
         registry.release_if_unwanted(parent.id());
@@ -450,6 +478,7 @@ fn materialize_held(
         inode.clone(),
         held,
     ));
+    drop(map);
     parent.settled_by(seq);
     inode.settled_by(seq);
     true
@@ -592,9 +621,17 @@ impl Volumes {
         self.known(dev).is_none_or(|volume| volume.permissions)
     }
 
+    /// Whether `dev` is known to be a network share, whose permissions its
+    /// server decides ([`Modes`]).
+    fn network(&self, dev: i64) -> bool {
+        self.known(dev).is_some_and(|volume| !volume.local)
+    }
+
     /// Learns from `fd`'s volume. Never on a vCPU: asked of a hung network
     /// volume, `fstatfs` waits for it too, which is what a vCPU must not do.
-    fn learn(&self, dev: i64, fd: RawFd) {
+    /// The registry is told whether files there need their birth times to be
+    /// told apart ([`Registry::identified`]).
+    fn learn(&self, dev: i64, fd: RawFd, registry: &Registry) {
         // SAFETY: fstatfs fills the zeroed struct for an open descriptor.
         let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatfs(fd, &mut fs) } == 0 {
@@ -602,6 +639,7 @@ impl Volumes {
                 local: fs.f_flags & libc::MNT_LOCAL as u32 != 0,
                 permissions: sys::keeps_permissions(fd).unwrap_or(true),
             };
+            registry.identify_by_birth(dev, !volume.local);
             self.0
                 .write()
                 .expect("volumes poisoned")
@@ -615,10 +653,130 @@ impl Volumes {
     }
 }
 
+/// Whether a chmod failed because the server would not take it, rather than
+/// because the file is not there to change.
+fn refused(errno: i32) -> bool {
+    errno == linux::EACCES || errno == linux::EPERM || errno == linux::EOPNOTSUPP
+}
+
+/// The permission bits containers set on a network share, kept in each
+/// file's ownership record ([`crate::ownership`]) as well as tried on the
+/// file itself (#69).
+///
+/// A share's server decides permissions for itself. A QNAP's Samba, with
+/// inherited ACLs, refuses every client's chmod, its owner's included, and
+/// gives every new file `rwxrwxr-x`; another accepts a chmod and changes
+/// nothing, and the Mac's SMB client reports the bits it asked for until its
+/// cache lapses, so a check after the fact is fooled for seconds. A database
+/// that made its directory `0700` would find it `0755` on its next start.
+/// So the bits a container sets are recorded, from the request or from the
+/// apply queue's job, and read back in place of the file's: a server that
+/// takes the chmod shows them to the Mac and the network too, and one that
+/// does not still cannot change what containers see. This is where Docker
+/// Desktop keeps them, in its format.
+struct Modes {
+    root: PathBuf,
+    /// [`Server::ownership`], which the first record turns on.
+    ownership: Arc<AtomicBool>,
+    registry: Arc<Registry>,
+    /// A share that cannot hold extended attributes cannot keep anything;
+    /// said once, not once per file.
+    warned: AtomicBool,
+}
+
+impl Modes {
+    /// Records `mode` as the bits of the file `fd` holds open, keeping the
+    /// owner it has recorded, if any. On failure the file shows the server's
+    /// bits, as it did before, and the failure is said once.
+    fn keep(&self, inode: &Inode, parent: Option<&Inode>, fd: RawFd, mode: u32) {
+        if let Err(errno) = self.try_keep(inode, parent, fd, mode)
+            && !self.warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                errno,
+                "a container's permissions could not be kept on a network share; containers see the server's own there"
+            );
+        }
+    }
+
+    fn try_keep(
+        &self,
+        inode: &Inode,
+        parent: Option<&Inode>,
+        fd: RawFd,
+        mode: u32,
+    ) -> Result<(), i32> {
+        use crate::ownership::{MARKER, Mark, Owner, RECORD, encode, parse};
+        let (uid, gid) = match inode.owner() {
+            Owner::Set { uid, gid, .. } => (uid, gid),
+            Owner::Mac => (0, 0),
+            Owner::Unknown => {
+                let mut record = [0u8; 128];
+                match sys::get_xattr_fd(fd, RECORD, &mut record) {
+                    Ok(len) => parse(&record[..len])
+                        .and_then(|owner| owner.recorded())
+                        .unwrap_or((0, 0)),
+                    Err(errno) if errno == linux::ENODATA || errno == linux::ERANGE => (0, 0),
+                    Err(errno) => return Err(errno),
+                }
+            }
+        };
+        self.mark_root();
+        let place = if parent.is_none() {
+            inode.place()
+        } else {
+            None
+        };
+        if let Some(parent) = parent.or(place.as_ref().map(|(parent, _)| &**parent))
+            && parent.mark() != Mark::Marked
+        {
+            // Before the record, as [`Server::record_owner`] marks it.
+            sys::set_xattr_fd(parent.reference()?.raw_fd(), MARKER, b"1")?;
+            parent.set_mark(Mark::Marked);
+        }
+        let record = encode(uid, gid, mode, true);
+        set_ours(
+            || sys::set_xattr_fd(fd, RECORD, &record),
+            || sys::remove_xattr_fd(fd, RECORD),
+        )?;
+        inode.set_owner(Owner::Set {
+            uid,
+            gid,
+            mode: Some(mode & 0o7777),
+            kept: true,
+        });
+        Ok(())
+    }
+
+    /// From the first record on, this share reads them, now and after a
+    /// restart: the marker on its root is what a new server looks for.
+    fn mark_root(&self) {
+        if self.ownership.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let marked = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes())
+            .map_err(|_| linux::EINVAL)
+            .and_then(|root| sys::set_xattr(&root, crate::ownership::MARKER, b"1", 0));
+        match marked {
+            Ok(()) => {
+                if let Some(root) = self.registry.get(1) {
+                    root.set_mark(crate::ownership::Mark::Marked);
+                }
+            }
+            Err(errno) => tracing::warn!(
+                root = %self.root.display(),
+                errno,
+                "could not mark the share as recording owners; they will be read again only after the next chown"
+            ),
+        }
+    }
+}
+
 impl crate::inode::Release for Hold {
     fn release_device(&self, dev: i64) -> usize {
         self.volfs.forget(dev);
         self.volumes.forget(dev);
+        self.registry.identify_by_birth(dev, false);
         let inodes = self
             .registry
             .release_device(dev, |id| self.open_cache.evict(id));
@@ -692,7 +850,9 @@ pub struct Server {
     /// share whose root cannot carry the marker (`/Users` and `/Volumes` are
     /// root's) reads them from the start: otherwise every owner recorded in
     /// it read as root after a restart, until the next chown.
-    ownership: AtomicBool,
+    ownership: Arc<AtomicBool>,
+    /// Keeps container permissions on network shares. See [`Modes`].
+    modes: Arc<Modes>,
     /// The host watcher that keeps the policy honest.
     ///
     /// Held rather than used: dropping it stops the stream, after which every
@@ -754,6 +914,61 @@ fn with_owner_write<T>(path: &CStr, op: impl Fn() -> Result<T, i32>) -> Result<T
     let done = op();
     sys::chmod_at(libc::AT_FDCWD, path, mode)?;
     done
+}
+
+/// A stat's birth time, for the registry to tell files apart by where their
+/// numbers alone cannot ([`Registry::identified`]).
+fn birth(st: &libc::stat) -> Option<(i64, i64)> {
+    Some((st.st_birthtime, st.st_birthtime_nsec))
+}
+
+/// Gives what an SMB share holds as `.smbdelete…` in a directory being
+/// removed up to a second to go: a file deleted while a descriptor on it was
+/// open, which macOS's SMB client keeps under that name until it closes. A
+/// container's file deleted with nothing open on it is closed here once the
+/// guest forgets it, which follows the unlink and can follow an `rmdir`
+/// straight behind it: Postgres, removing its sorts' temporary directories,
+/// found them not empty about once in four runs. A file something still has
+/// open stays, and the rmdir fails as it would on the Mac.
+fn await_smb_deletes(list: impl Fn() -> Result<Vec<sys::DirEntry>, i32>) {
+    for _ in 0..100 {
+        let waiting =
+            list().is_ok_and(|entries| entries.iter().any(|e| e.name.starts_with(b".smbdelete")));
+        if !waiting {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A directory's entries, by its parent and name.
+fn listing_at(parent: &Inode, name: &CStr) -> Result<Vec<sys::DirEntry>, i32> {
+    let fd = parent.under_name(name, |dir, at| {
+        sys::openat_path(dir, at, LINUX_O_DIRECTORY, 0)
+    })?;
+    sys::Dir::from_fd(fd)?.read_all()
+}
+
+/// Sets one of our records, replacing one the server will not overwrite.
+///
+/// Samba stores a dot-file as hidden once its times are set (`hide dot
+/// files` with `store dos attributes`, a QNAP's defaults), and SMB refuses to
+/// overwrite any part of a hidden file, an extended attribute's stream
+/// included, unless the request says it is hidden, which the Mac's client
+/// does not: Borg Backup Server's chown of its `.ownership` failed with
+/// EACCES, and so does `xattr -w` from the Mac. Removed first, the record is
+/// created rather than overwritten, which the server allows.
+fn set_ours(
+    set: impl Fn() -> Result<(), i32>,
+    remove: impl Fn() -> Result<(), i32>,
+) -> Result<(), i32> {
+    match set() {
+        Err(errno) if errno == linux::EACCES => match remove() {
+            Ok(()) => set(),
+            Err(_) => Err(errno),
+        },
+        done => done,
+    }
 }
 
 fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i32> {
@@ -878,7 +1093,7 @@ impl Server {
         let volumes = Arc::new(Volumes::default());
         if let Ok(root_dir) = std::fs::File::open(root) {
             use std::os::fd::AsRawFd;
-            volumes.learn(dev, root_dir.as_raw_fd());
+            volumes.learn(dev, root_dir.as_raw_fd(), &registry);
         }
         let hold = Arc::new(Hold {
             registry: registry.clone(),
@@ -921,6 +1136,20 @@ impl Server {
                 })
                 .expect("failed to spawn the filesystem settler thread")
         };
+        let ownership = Arc::new(AtomicBool::new(
+            std::ffi::CString::new(root.as_os_str().as_encoded_bytes())
+                .ok()
+                .is_some_and(|root| {
+                    sys::get_xattr(&root, crate::ownership::MARKER, &mut []).is_ok()
+                        || sys::access(&root, libc::W_OK as u32).is_err()
+                }),
+        ));
+        let modes = Arc::new(Modes {
+            root: root.to_path_buf(),
+            ownership: ownership.clone(),
+            registry: registry.clone(),
+            warned: AtomicBool::new(false),
+        });
         Ok(Server {
             root: root.to_path_buf(),
             root_dev: dev,
@@ -953,14 +1182,8 @@ impl Server {
                 .ok()
                 .map(|n| n.into_bytes()),
             xattrs: std::env::var("LIGHTER_FS_XATTR").as_deref() != Ok("0"),
-            ownership: AtomicBool::new(
-                std::ffi::CString::new(root.as_os_str().as_encoded_bytes())
-                    .ok()
-                    .is_some_and(|root| {
-                        sys::get_xattr(&root, crate::ownership::MARKER, &mut []).is_ok()
-                            || sys::access(&root, libc::W_OK as u32).is_err()
-                    }),
-            ),
+            ownership,
+            modes,
             settler_stop,
             settler: std::sync::Mutex::new(Some(settler)),
             _watcher: watcher,
@@ -969,6 +1192,20 @@ impl Server {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Takes the share's own volume for a network share, so that tests can
+    /// reach what only a NAS otherwise would ([`Modes`]).
+    #[doc(hidden)]
+    pub fn assume_network_share(&self) {
+        self.registry.identify_by_birth(self.root_dev, true);
+        self.volumes.0.write().expect("volumes poisoned").insert(
+            self.root_dev,
+            Volume {
+                local: false,
+                permissions: true,
+            },
+        );
     }
 
     /// Invalidations waiting for the transport to carry them.
@@ -983,22 +1220,45 @@ impl Server {
     }
 
     /// Whether `request` may wait on something other than this Mac: true
-    /// unless the volume of the inode it names is known to be local. Cheap
-    /// and touching no volume, since it is asked on the vCPU deciding
-    /// whether to serve the request itself. A request on a local directory
-    /// can still reach a network volume mounted inside it (a lookup or a
-    /// listing of the mount point); only what the request names is weighed.
+    /// unless the volume of the inode it names is known to be local, and the
+    /// inode is not a directory a network volume is mounted in (a lookup or
+    /// a listing there reaches the mount point, [`crate::mounts`]). Cheap and
+    /// touching no volume, since it is asked on the vCPU deciding whether to
+    /// serve the request itself.
+    ///
+    /// A FORGET is weighed by every inode it names: forgetting the last
+    /// lookup closes the descriptors held for the file, and on a network
+    /// volume a close is a round trip to its server.
     pub fn may_block(&self, request: &[u8]) -> bool {
         let Some(header) = InHeader::parse(request) else {
             return true;
         };
-        match self.registry.get(header.nodeid) {
-            Some(inode) => !self
-                .volumes
-                .known(inode.dev())
-                .is_some_and(|volume| volume.local),
-            None => true,
+        match header.opcode {
+            op::INTERRUPT => false,
+            op::BATCH_FORGET => {
+                let end = (header.len as usize)
+                    .min(request.len())
+                    .max(fuse::IN_HEADER_LEN);
+                let body = &request[fuse::IN_HEADER_LEN..end];
+                let Some(count) = get_u32(body, 0) else {
+                    return false;
+                };
+                (0..count as usize)
+                    .map_while(|index| get_u64(body, 8 + index * 16))
+                    .any(|nodeid| !self.surely_local(nodeid))
+            }
+            _ => !self.surely_local(header.nodeid),
         }
+    }
+
+    /// Whether a request on `nodeid` is known to stay on this Mac.
+    fn surely_local(&self, nodeid: u64) -> bool {
+        self.registry.get(nodeid).is_some_and(|inode| {
+            self.volumes
+                .known(inode.dev())
+                .is_some_and(|volume| volume.local)
+                && !crate::mounts::holds_network_mount(inode.dev(), inode.ino())
+        })
     }
 
     /// Handles one request, writing the reply into `sink`.
@@ -1030,7 +1290,8 @@ impl Server {
             && self.volumes.known(inode.dev()).is_none()
             && let Ok(held) = inode.reference()
         {
-            self.volumes.learn(inode.dev(), held.raw_fd());
+            self.volumes
+                .learn(inode.dev(), held.raw_fd(), &self.registry);
         }
         // The header's own length field bounds the body; a guest that lied
         // about it must not let us read the tail of the previous request.
@@ -1795,7 +2056,7 @@ impl Server {
         let entry = match entry {
             Err(PARK_ON_ENTRY) => {
                 let (dev, ino) = (st.st_dev as i64, st.st_ino);
-                let nodeid = match self.registry.relookup(dev, ino) {
+                let nodeid = match self.registry.relookup(dev, ino, birth(&st)) {
                     Some(existing) => existing,
                     None => {
                         let id = self.registry.insert_parked(
@@ -1840,11 +2101,11 @@ impl Server {
         // An inode we already hold needs no second descriptor. Worth the extra
         // branch: this is the single hottest path in the whole server, and the
         // descriptor it skips opening is most of the cost of a repeated lookup.
-        let nodeid = match self.registry.relookup(dev, ino) {
+        let nodeid = match self.registry.relookup(dev, ino, birth(&st)) {
             Some(existing) => existing,
             None => self
                 .registry
-                .insert(reference()?, dev, ino, is_dir, is_symlink),
+                .insert(reference()?, dev, ino, is_dir, is_symlink, birth(&st)),
         };
 
         // Validity is asked of the *parent*, because that is what the host
@@ -1985,15 +2246,27 @@ impl Server {
         }
     }
 
-    /// The permission bits the guest sees: the record's, on a volume that
-    /// keeps none of its own, else the file's.
+    /// The permission bits the guest sees: the record's where it holds them
+    /// ([`Self::recorded_mode`]), else the file's.
     fn permissions_of(&self, inode: &Inode) -> Result<u32, i32> {
-        if !self.volumes.keeps_permissions(inode.dev())
-            && let Some(mode) = self.record_of(inode, None).mode()
-        {
+        if let Some(mode) = self.recorded_mode(inode, self.record_of(inode, None)) {
             return Ok(mode);
         }
         Ok(self.stat_of(inode)?.st_mode as u32 & 0o7777)
+    }
+
+    /// The bits a record holds in place of the file's own: any it has on a
+    /// volume that keeps none, and those it keeps ([`Modes`]) on a network
+    /// share. On the Mac's own disks the file's are the truth, a chmod
+    /// there being one the file takes.
+    fn recorded_mode(&self, inode: &Inode, record: crate::ownership::Owner) -> Option<u32> {
+        if !self.volumes.keeps_permissions(inode.dev()) {
+            record.mode()
+        } else if self.volumes.network(inode.dev()) {
+            record.kept_mode()
+        } else {
+            None
+        }
     }
 
     /// Whether anything directly inside a directory may have a record: its
@@ -2044,9 +2317,7 @@ impl Server {
             attr.gid = gid;
             attr.flags = 0;
         }
-        if let Some(mode) = record.mode()
-            && !self.volumes.keeps_permissions(inode.dev())
-        {
+        if let Some(mode) = self.recorded_mode(inode, record) {
             attr.mode = (attr.mode & !0o7777) | mode;
         }
     }
@@ -2065,7 +2336,8 @@ impl Server {
         mode: u32,
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode};
-        if (uid, gid) == (0, 0) && self.volumes.keeps_permissions(inode.dev()) {
+        let kept = self.volumes.network(inode.dev());
+        if (uid, gid) == (0, 0) && self.volumes.keeps_permissions(inode.dev()) && !kept {
             match with_owner_write(path, || sys::remove_xattr(path, RECORD)) {
                 Err(errno) if errno != linux::ENODATA => return Err(errno),
                 _ => {}
@@ -2073,7 +2345,7 @@ impl Server {
             inode.set_owner(Owner::Mac);
             return Ok(());
         }
-        self.records_owners();
+        self.modes.mark_root();
         let place = if parent.is_none() {
             inode.place()
         } else {
@@ -2091,33 +2363,38 @@ impl Server {
             })?;
             parent.set_mark(Mark::Marked);
         }
+        let record = encode(uid, gid, mode, kept);
         with_owner_write(path, || {
-            sys::set_xattr(path, RECORD, &encode(uid, gid, mode), 0)
+            set_ours(
+                || sys::set_xattr(path, RECORD, &record, 0),
+                || sys::remove_xattr(path, RECORD),
+            )
         })?;
-        inode.set_owner(Owner::Set(uid, gid, Some(mode & 0o7777)));
+        inode.set_owner(Owner::Set {
+            uid,
+            gid,
+            mode: Some(mode & 0o7777),
+            kept,
+        });
         Ok(())
     }
 
-    /// From the first record on, this share reads them, now and after a
-    /// restart: the marker on its root is what a new server looks for.
-    fn records_owners(&self) {
-        if self.ownership.swap(true, Ordering::SeqCst) {
+    /// On a network share, keeps the bits a file was just made with
+    /// ([`Modes`]), and answers with them: the entry was read from the
+    /// server, which may have given the file bits of its own.
+    fn keep_made(&self, parent: &Inode, entry: &mut EntryOut, mode: u32) {
+        if !self.volumes.network(parent.dev()) {
             return;
         }
-        let marked = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes())
-            .map_err(|_| linux::EINVAL)
-            .and_then(|root| sys::set_xattr(&root, crate::ownership::MARKER, b"1", 0));
-        match marked {
-            Ok(()) => {
-                if let Some(root) = self.registry.get(1) {
-                    root.set_mark(crate::ownership::Mark::Marked);
-                }
-            }
-            Err(errno) => tracing::warn!(
-                root = %self.root.display(),
-                errno,
-                "could not mark the share as recording owners; they will be read again only after the next chown"
-            ),
+        let Some(inode) = self.registry.get(entry.nodeid) else {
+            return;
+        };
+        let Ok(fd) = inode.reference() else {
+            return;
+        };
+        self.modes.keep(&inode, Some(parent), fd.raw_fd(), mode);
+        if let Some(mode) = inode.owner().kept_mode() {
+            entry.attr.mode = (entry.attr.mode & !0o7777) | mode;
         }
     }
 
@@ -2465,11 +2742,7 @@ impl Server {
                 inode
                     .attr_override()
                     .and_then(|over| over.mode)
-                    .or_else(|| {
-                        self.stat_inode(nodeid, inode)
-                            .ok()
-                            .map(|st| st.st_mode as u32 & 0o7777)
-                    })
+                    .or_else(|| self.permissions_of(inode).ok())
             };
             if change.mode == current_mode {
                 change.mode = None;
@@ -2530,6 +2803,10 @@ impl Server {
                 let inode = inode.clone();
                 let open_cache = self.open_cache.clone();
                 let batch = batch.clone();
+                let keep = self
+                    .volumes
+                    .network(inode.dev())
+                    .then(|| self.modes.clone());
                 move || {
                     let change = inode
                         .take_attr_batch(&batch)
@@ -2544,11 +2821,25 @@ impl Server {
                             None => via(&inode)?,
                         };
                         if let Some(mode) = change.mode {
-                            match &via {
-                                Via::Raw(raw) => sys::chmod_fd(*raw, mode)?,
-                                Via::Fd(fd) => sys::chmod_fd(fd.raw_fd(), mode)?,
-                                Via::At(parent, name) => {
-                                    sys::chmod_at(parent.raw_fd(), name, mode)?
+                            let changed = match &via {
+                                Via::Raw(raw) => sys::chmod_fd(*raw, mode),
+                                Via::Fd(fd) => sys::chmod_fd(fd.raw_fd(), mode),
+                                Via::At(parent, name) => sys::chmod_at(parent.raw_fd(), name, mode),
+                            };
+                            match changed {
+                                Ok(()) => {}
+                                Err(errno) if keep.is_some() && refused(errno) => {}
+                                Err(errno) => return Err(errno),
+                            }
+                            if let Some(modes) = &keep {
+                                match &via {
+                                    Via::Raw(raw) => modes.keep(&inode, None, *raw, mode),
+                                    Via::Fd(fd) => modes.keep(&inode, None, fd.raw_fd(), mode),
+                                    Via::At(parent, name) => {
+                                        let file =
+                                            sys::open_reference(parent.raw_fd(), name, false)?;
+                                        modes.keep(&inode, None, file.as_raw_fd(), mode);
+                                    }
                                 }
                             }
                         }
@@ -2563,6 +2854,17 @@ impl Server {
                                 Via::Fd(fd) => sys::utimes_fd(fd.raw_fd(), atime, mtime)?,
                                 Via::At(parent, name) => {
                                     sys::utimes_at(parent.raw_fd(), name, atime, mtime)?
+                                }
+                            }
+                            // As the synchronous path keeps it.
+                            if keep.is_some() {
+                                let st = match &via {
+                                    Via::Raw(raw) => sys::stat_fd(*raw),
+                                    Via::Fd(fd) => sys::stat_fd(fd.raw_fd()),
+                                    Via::At(parent, name) => sys::stat_at(parent.raw_fd(), name),
+                                };
+                                if let Ok(st) = st {
+                                    inode.set_born(birth(&st));
                                 }
                             }
                         }
@@ -2648,11 +2950,25 @@ impl Server {
 
         if valid & fuse::fattr::MODE != 0 {
             let mode = get_u32(body, 68).ok_or(linux::EINVAL)? & 0o7777;
+            let network = self.volumes.network(inode.dev());
+            let mut refusal = None;
             if self.volumes.keeps_permissions(inode.dev()) {
-                sys::chmod_at(libc::AT_FDCWD, &path, mode)?;
-            } else {
+                match sys::chmod_at(libc::AT_FDCWD, &path, mode) {
+                    Ok(()) => {}
+                    // The server's call; the record keeps the container's.
+                    Err(errno) if network && refused(errno) => refusal = Some(errno),
+                    Err(errno) => return Err(errno),
+                }
+            }
+            if network || !self.volumes.keeps_permissions(inode.dev()) {
                 let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
-                self.record_owner(&inode, None, &path, owner, mode)?;
+                match self.record_owner(&inode, None, &path, owner, mode) {
+                    Ok(()) => {}
+                    // Taken by the file itself, which is as much as a share
+                    // without extended attributes can do.
+                    Err(_) if network && refusal.is_none() => {}
+                    Err(errno) => return Err(refusal.unwrap_or(errno)),
+                }
             }
         }
 
@@ -2691,6 +3007,13 @@ impl Server {
                 pick(fuse::fattr::ATIME, fuse::fattr::ATIME_NOW, 32, 56),
                 pick(fuse::fattr::MTIME, fuse::fattr::MTIME_NOW, 40, 60),
             )?;
+            // An earlier modification time moves the birth time back with it,
+            // and on a network share the birth time is part of who the file is.
+            if self.volumes.network(inode.dev())
+                && let Ok(st) = sys::stat_at(libc::AT_FDCWD, &path)
+            {
+                inode.set_born(birth(&st));
+            }
         }
 
         if valid & fuse::fattr::SIZE != 0 {
@@ -2756,7 +3079,8 @@ impl Server {
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
         parent.under_name(&name, |dir, at| sys::mknod_at(dir, at, mode & !umask, rdev))?;
-        let entry = self.entry(&parent, &name)?;
+        let mut entry = self.entry(&parent, &name)?;
+        self.keep_made(&parent, &mut entry, mode & !umask & 0o7777);
         Ok(self.entry_reply(&entry))
     }
 
@@ -2778,7 +3102,8 @@ impl Server {
         }
         self.settle_while(&parent, |parent| parent.is_pending());
         parent.under_name(&name, |dir, at| sys::mkdir_at(dir, at, mode))?;
-        let entry = self.entry(&parent, &name)?;
+        let mut entry = self.entry(&parent, &name)?;
+        self.keep_made(&parent, &mut entry, mode);
         Ok(self.entry_reply(&entry))
     }
 
@@ -2807,7 +3132,9 @@ impl Server {
         if dir
             && self.apply.accepting()
             && let Ok(st) = parent.under_name(&name, sys::stat_at)
-            && let Some(child) = self.registry.identified(st.st_dev as i64, st.st_ino)
+            && let Some(child) = self
+                .registry
+                .identified(st.st_dev as i64, st.st_ino, birth(&st))
         {
             // RMDIR, acknowledged: the guest removes a directory it has
             // emptied, and its unlinks are queued ahead of this by the
@@ -2827,6 +3154,11 @@ impl Server {
                 .pending_children_snapshot()
                 .iter()
                 .any(|(name, _)| !gone.contains(name));
+            let waited = std::time::Instant::now();
+            if !occupied && !child.is_pending() && self.volumes.network(child.dev()) {
+                await_smb_deletes(|| self.list(child.id()));
+            }
+            let waited = waited.elapsed();
             if !occupied {
                 if child.is_pending() {
                     // Nothing on the host yet; nothing promised inside.
@@ -2845,7 +3177,7 @@ impl Server {
                     .ok()
                     .and_then(|st| {
                         self.registry
-                            .identified(st.st_dev as i64, st.st_ino)
+                            .identified(st.st_dev as i64, st.st_ino, birth(&st))
                             .map(|i| (i.id(), i))
                     });
                     tracing::warn!(
@@ -2858,6 +3190,7 @@ impl Server {
                         entry_promised_inside = known.as_ref().map(|(_, i)| i.pending_children_snapshot().len()).unwrap_or(0),
                         promised_gone = ?gone.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>(),
                         listed = listing.len(),
+                        waited_ms = waited.as_millis() as u64,
                         child = child.id(),
                         queued = self.apply.depth(),
                         held = self.deferred.map.lock().expect("held creates poisoned").len(),
@@ -2894,10 +3227,21 @@ impl Server {
                 let registry = self.registry.clone();
                 let parent = parent.clone();
                 let name = name.clone();
+                let network = self.volumes.network(parent.dev());
+                let child = child.clone();
                 move || {
-                    if let Err(errno) =
-                        parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, true))
-                    {
+                    let rmdir =
+                        || parent.under_name(&name, |dir, at| sys::unlink_at(dir, at, true));
+                    let mut removed = rmdir();
+                    if removed == Err(linux::ENOTEMPTY) && network {
+                        // Unlinks queued ahead of it may have left files the
+                        // SMB client is holding until they close.
+                        await_smb_deletes(|| {
+                            sys::Dir::from_fd(open_inode(&child, LINUX_O_DIRECTORY)?)?.read_all()
+                        });
+                        removed = rmdir();
+                    }
+                    if let Err(errno) = removed {
                         tracing::warn!(
                             errno,
                             name = %name.to_string_lossy(),
@@ -2939,10 +3283,10 @@ impl Server {
             // lookup left every unlinked file one FORGET short of release —
             // pinned in the table with its descriptor, until the sweep had
             // nothing left it was allowed to park.
-            let target_out = parent
-                .under_name(&name, sys::stat_at)
-                .ok()
-                .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino));
+            let target_out = parent.under_name(&name, sys::stat_at).ok().and_then(|st| {
+                self.registry
+                    .identified(st.st_dev as i64, st.st_ino, birth(&st))
+            });
             if let Some(target) = &target_out {
                 target.shadow_meta();
             }
@@ -3002,7 +3346,11 @@ impl Server {
                 "NAME-DEBUG unlink taking the synchronous path"
             );
         }
-        let result = parent.under_name(&name, |under, at| sys::unlink_at(under, at, dir));
+        let mut result = parent.under_name(&name, |under, at| sys::unlink_at(under, at, dir));
+        if dir && result == Err(linux::ENOTEMPTY) && self.volumes.network(parent.dev()) {
+            await_smb_deletes(|| listing_at(&parent, &name));
+            result = parent.under_name(&name, |under, at| sys::unlink_at(under, at, dir));
+        }
         if dir && result == Err(linux::ENOTEMPTY) && self.stats.enabled() {
             // What the host still holds, and what this server knows of each
             // name: the diagnostic for an `rm -rf` the guest believed had
@@ -3018,7 +3366,7 @@ impl Server {
                         .filter(|e| e.name != b"." && e.name != b"..")
                         .take(12)
                         .map(|e| {
-                            let known = self.registry.identified(parent.dev(), e.ino);
+                            let known = self.registry.identified(parent.dev(), e.ino, None);
                             format!(
                                 "{}:{}",
                                 String::from_utf8_lossy(&e.name),
@@ -3132,7 +3480,10 @@ impl Server {
                         return Ok(None);
                     };
                 }
-                match self.registry.identified(st.st_dev as i64, st.st_ino) {
+                match self
+                    .registry
+                    .identified(st.st_dev as i64, st.st_ino, birth(&st))
+                {
                     Some(inode) => inode.id(),
                     None => {
                         self.stats.count("rename-none=3");
@@ -3164,7 +3515,10 @@ impl Server {
             new_parent
                 .under_name(new, sys::stat_at)
                 .ok()
-                .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
+                .and_then(|st| {
+                    self.registry
+                        .identified(st.st_dev as i64, st.st_ino, birth(&st))
+                })
         };
         if let Some(displaced) = &displaced {
             if displaced.is_dir {
@@ -3184,31 +3538,71 @@ impl Server {
         old_parent.remove_pending_child(old.to_bytes(), nodeid);
         self.registry.release_if_unwanted(old_parent.id());
         old_parent.add_pending_gone(old.to_bytes());
+        inode.promise();
         new_parent.add_pending_child(new.to_bytes(), nodeid);
         let job = {
             let registry = self.registry.clone();
+            let inode = inode.clone();
             let old_parent = old_parent.clone();
             let new_parent = new_parent.clone();
             let old = old.clone();
             let new = new.clone();
             let displaced = displaced.clone();
             move || {
-                if let Err(errno) = old_parent.under_name(&old, |old_dir, old_at| {
-                    new_parent.under_name(&new, |new_dir, new_at| {
-                        sys::rename_at(old_dir, old_at, new_dir, new_at, 0)
+                let rename = || {
+                    old_parent.under_name(&old, |old_dir, old_at| {
+                        new_parent.under_name(&new, |new_dir, new_at| {
+                            sys::rename_at(old_dir, old_at, new_dir, new_at, 0)
+                        })
                     })
-                }) {
-                    tracing::warn!(
+                };
+                let mut renamed = rename();
+                // An SMB server now and then refuses a rename with ENOENT
+                // while its source is there and its target free, and takes
+                // it a few milliseconds later: with four Postgres at once on
+                // one share, about once a run, on the cache file every backend
+                // replaces, and never with one alone. Acknowledged, it has to
+                // land; tried again in this job, it stays ordered among the
+                // others on its names.
+                if renamed == Err(linux::ENOENT) && registry.identifies_by_birth(new_parent.dev()) {
+                    for attempt in 0..8u32 {
+                        if old_parent.under_name(&old, sys::stat_at).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5 << attempt.min(4)));
+                        renamed = rename();
+                        tracing::debug!(
+                            attempt,
+                            ok = renamed.is_ok(),
+                            "a refused rename tried again"
+                        );
+                        if renamed != Err(linux::ENOENT) {
+                            break;
+                        }
+                    }
+                }
+                match renamed {
+                    Ok(()) => {
+                        if registry.identifies_by_birth(new_parent.dev())
+                            && let Ok(st) = new_parent.under_name(&new, sys::stat_at)
+                        {
+                            registry.renumber(nodeid, st.st_dev as i64, st.st_ino, birth(&st));
+                        }
+                    }
+                    Err(errno) => tracing::warn!(
                         errno,
                         from = %old.to_string_lossy(),
                         to = %new.to_string_lossy(),
                         "an acknowledged rename failed to apply"
-                    );
+                    ),
                 }
                 old_parent.remove_pending_gone(old.to_bytes());
                 registry.release_if_unwanted(old_parent.id());
                 new_parent.remove_pending_child(new.to_bytes(), nodeid);
                 registry.release_if_unwanted(new_parent.id());
+                if inode.unpromise() {
+                    registry.release_if_unwanted(nodeid);
+                }
                 if let Some(displaced) = &displaced {
                     displaced.unshadow_meta();
                 }
@@ -3278,11 +3672,30 @@ impl Server {
         });
         phase("rename-us-3-settle-names", t2);
         let t3 = std::time::Instant::now();
+        // Renumbered after, where its volume numbers files by name.
+        let moved = if self.registry.identifies_by_birth(old_parent.dev()) {
+            old_parent
+                .under_name(&old, sys::stat_at)
+                .ok()
+                .and_then(|st| {
+                    self.registry
+                        .identified(st.st_dev as i64, st.st_ino, birth(&st))
+                })
+        } else {
+            None
+        };
         old_parent.under_name(&old, |old_dir, old_at| {
             new_parent.under_name(&new, |new_dir, new_at| {
                 sys::rename_at(old_dir, old_at, new_dir, new_at, flags)
             })
         })?;
+        if let Some(moved) = moved
+            && let Ok(st) = new_parent.under_name(&new, sys::stat_at)
+        {
+            moved.set_place(&new_parent, &new);
+            self.registry
+                .renumber(moved.id(), st.st_dev as i64, st.st_ino, birth(&st));
+        }
         phase("rename-us-4-host", t3);
         phase("rename-us-total", t0);
         Ok(Vec::new())
@@ -3389,6 +3802,8 @@ impl Server {
             let inode = inode.clone();
             let name = name.clone();
             let is_symlink = matches!(kind, crate::inode::PendingKind::Symlink);
+            let keep =
+                (!is_symlink && self.volumes.network(parent.dev())).then(|| self.modes.clone());
             move || {
                 let result = (|| {
                     let fd = parent.under_name(&name, |dir, at| {
@@ -3413,7 +3828,18 @@ impl Server {
                                 "NAME-DEBUG mkdir job applied, binding"
                             );
                         }
-                        registry.bind_pending(nodeid, &inode, fd, st.st_dev as i64, st.st_ino);
+                        if let Some(modes) = &keep {
+                            let mode = inode.pending_meta().map_or(mode, |meta| meta.mode);
+                            modes.keep(&inode, Some(&parent), fd.as_raw_fd(), mode & 0o7777);
+                        }
+                        registry.bind_pending(
+                            nodeid,
+                            &inode,
+                            fd,
+                            st.st_dev as i64,
+                            st.st_ino,
+                            birth(&st),
+                        );
                     }
                     Err(errno) => {
                         tracing::warn!(
@@ -3481,6 +3907,7 @@ impl Server {
         }
         self.materialize_why(nodeid, 6);
         target.link_acked();
+        target.promise();
         parent.add_pending_child(name.to_bytes(), nodeid);
         let job = {
             let registry = self.registry.clone();
@@ -3513,6 +3940,9 @@ impl Server {
                 target.link_applied();
                 parent.remove_pending_child(name.to_bytes(), nodeid);
                 registry.release_if_unwanted(parent.id());
+                if target.unpromise() {
+                    registry.release_if_unwanted(nodeid);
+                }
             }
         };
         let seq = self.apply.push(crate::apply::Job::of(
@@ -3560,6 +3990,11 @@ impl Server {
         if inode.is_dir {
             return Err(linux::EISDIR);
         }
+        // A name the guest was given by a queued rename or link is one the
+        // host does not have yet, and a file whose descriptor was parked is
+        // reopened by it: Postgres's fsync of a WAL segment it had just
+        // renamed into place failed with ENOENT. The job lands first.
+        self.settle_while(&inode, |inode| inode.is_promised());
         // Read-write when a write is coming, read-only otherwise: most files
         // are only ever read, and asking for write access to a read-only file
         // fails outright rather than degrading.
@@ -3729,10 +4164,10 @@ impl Server {
         } else if parent.is_pending() {
             None
         } else {
-            parent
-                .under_name(&name, sys::stat_at)
-                .ok()
-                .and_then(|st| self.registry.identified(st.st_dev as i64, st.st_ino))
+            parent.under_name(&name, sys::stat_at).ok().and_then(|st| {
+                self.registry
+                    .identified(st.st_dev as i64, st.st_ino, birth(&st))
+            })
         };
         // The guest keeps its dentry and inode across the clone and reads
         // the result through the nodeid it already holds, so whatever it
@@ -4067,6 +4502,10 @@ impl Server {
             writes: Vec::new(),
             bytes: 0,
             since: std::time::Instant::now(),
+            keep: self
+                .volumes
+                .network(parent.dev())
+                .then(|| self.modes.clone()),
         };
         if self.defer_creates {
             self.deferred
@@ -4375,8 +4814,11 @@ impl Server {
         if st.st_mode & 0o170000 == 0o040000 {
             return Err(linux::EISDIR);
         }
-        let entry =
+        let mut entry =
             self.entry_with_reference(&parent, st, self.apply.applied(), || sys::dup(&fd))?;
+        if created {
+            self.keep_made(&parent, &mut entry, mode & 0o7777 & !umask);
+        }
         // No handle: the guest never sends RELEASE for a file it CREATEd once
         // OPEN has answered ENOSYS (6.18 `fuse_file_put` ends the release
         // locally under `no_open`), so a descriptor named by `fh` would be
@@ -4646,6 +5088,14 @@ impl Server {
             } else {
                 self.list(nodeid)?
             };
+            // A file deleted while open stays on an SMB share as
+            // `.smbdelete…` until its last close ([`await_smb_deletes`]). It
+            // is gone, as an unlinked file is gone from its directory on
+            // Linux: listed, Postgres's initdb tried to fsync one and failed
+            // when it went.
+            if self.volumes.network(parent.dev()) {
+                listed.retain(|entry| !entry.name.starts_with(b".smbdelete"));
+            }
             if !gone.is_empty() || !promised.is_empty() {
                 if self.debug_listing {
                     let dropped: Vec<String> = listed
@@ -5023,10 +5473,13 @@ mod volfs_tests {
 
     /// A request is served on the vCPU only when its volume is known to be
     /// this Mac's: the share's own disk from the start, anything else once
-    /// a worker has looked (a NAS that hung froze guest CPUs for 40 s).
+    /// a worker has looked (a NAS that hung froze guest CPUs for 40 s), and
+    /// not in a directory a network volume is mounted in.
     #[test]
     fn only_a_request_on_a_known_local_volume_may_be_served_inline() {
-        let dir = tempfile_dir();
+        // Its own directory: the mount pretended below is process-wide.
+        let dir = tempfile_dir().join("mounted-in");
+        std::fs::create_dir_all(&dir).unwrap();
         let server = Server::new(&dir).unwrap();
         let request = |nodeid: u64| {
             let mut r = vec![0u8; crate::fuse::IN_HEADER_LEN];
@@ -5046,6 +5499,86 @@ mod volfs_tests {
             server.may_block(&[0u8; 4]),
             "nor is a request too short to name one"
         );
+        let root = server.registry.get(1).unwrap();
+        crate::mounts::tests::PRETENDED
+            .lock()
+            .unwrap()
+            .push((root.dev(), root.ino()));
+        assert!(
+            server.may_block(&request(1)),
+            "nor a directory a network volume is mounted in: a lookup there waits on its server"
+        );
+    }
+
+    /// A FORGET is served on the vCPU only when every inode it names is on
+    /// this Mac: the last forget of a file closes its descriptors, and on a
+    /// network volume a close waits on the server. An INTERRUPT touches no
+    /// volume at all.
+    #[test]
+    fn a_forget_is_served_inline_only_when_all_it_names_is_local() {
+        let dir = tempfile_dir();
+        let server = Server::new(&dir).unwrap();
+        let request = |opcode: u32, nodeid: u64, body: &[u8]| {
+            let len = crate::fuse::IN_HEADER_LEN + body.len();
+            let mut r = vec![0u8; crate::fuse::IN_HEADER_LEN];
+            r[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+            r[4..8].copy_from_slice(&opcode.to_le_bytes());
+            r[16..24].copy_from_slice(&nodeid.to_le_bytes());
+            r.extend_from_slice(body);
+            r
+        };
+        let batch = |nodeids: &[u64]| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&(nodeids.len() as u32).to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            for nodeid in nodeids {
+                body.extend_from_slice(&nodeid.to_le_bytes());
+                body.extend_from_slice(&1u64.to_le_bytes());
+            }
+            body
+        };
+        assert!(!server.may_block(&request(op::FORGET, 1, &1u64.to_le_bytes())));
+        assert!(server.may_block(&request(op::FORGET, 424_242, &1u64.to_le_bytes())));
+        assert!(!server.may_block(&request(op::BATCH_FORGET, 0, &batch(&[1, 1]))));
+        assert!(
+            server.may_block(&request(op::BATCH_FORGET, 0, &batch(&[1, 424_242]))),
+            "one inode not known to be local sends the batch to a worker"
+        );
+        assert!(!server.may_block(&request(op::INTERRUPT, 0, &[0u8; 8])));
+    }
+
+    /// A record the server will not overwrite is removed and made again; any
+    /// other failure is the write's own.
+    #[test]
+    fn a_record_the_server_will_not_overwrite_is_made_again() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let refusing_once = std::cell::Cell::new(true);
+        let made = set_ours(
+            || {
+                calls.borrow_mut().push("set");
+                if refusing_once.replace(false) {
+                    Err(linux::EACCES)
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                calls.borrow_mut().push("remove");
+                Ok(())
+            },
+        );
+        assert_eq!(made, Ok(()));
+        assert_eq!(*calls.borrow(), ["set", "remove", "set"]);
+
+        assert_eq!(
+            set_ours(|| Err(linux::EACCES), || Err(linux::EACCES)),
+            Err(linux::EACCES),
+            "nothing to remove: the refusal stands"
+        );
+        assert_eq!(
+            set_ours(|| Err(linux::ENOENT), || panic!("not asked")),
+            Err(linux::ENOENT)
+        );
     }
 
     #[test]
@@ -5054,7 +5587,12 @@ mod volfs_tests {
         let disk = std::fs::File::open(std::env::temp_dir()).unwrap();
         let dev = sys::stat_fd(disk.as_raw_fd()).unwrap().st_dev as i64;
         assert_eq!(volumes.known(dev), None);
-        volumes.learn(dev, disk.as_raw_fd());
+        let registry = Registry::new(
+            std::os::fd::OwnedFd::from(std::fs::File::open(std::env::temp_dir()).unwrap()),
+            dev,
+            0,
+        );
+        volumes.learn(dev, disk.as_raw_fd(), &registry);
         assert_eq!(
             volumes.known(dev),
             Some(Volume {

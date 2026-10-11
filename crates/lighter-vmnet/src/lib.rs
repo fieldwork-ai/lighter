@@ -1,7 +1,8 @@
-//! A vmnet bridged interface, relayed to a datagram socket.
+//! A vmnet interface, relayed to a datagram socket.
 //!
-//! [`Bridge::start`] puts an interface on one of the Mac's network cards and
-//! gives back the near end of a `SOCK_DGRAM` socket pair: each datagram
+//! [`Bridge::start`] puts an interface on one of the Mac's network cards,
+//! and [`Bridge::host_link`] on a network of the Mac and the guest alone;
+//! each gives back the near end of a `SOCK_DGRAM` socket pair: each datagram
 //! read from it is a frame from the network, and each written is a frame
 //! for it. The relay (`relay.c`) holds the far end. Starting a bridged
 //! interface needs root, or `com.apple.vm.networking`; the root helper runs
@@ -11,6 +12,7 @@
 pub mod helper;
 
 use std::ffi::{CStr, CString};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -18,6 +20,17 @@ unsafe extern "C" {
     fn lighter_bridge_start(
         ifname: *const c_char,
         mac: *const u8,
+        fd: c_int,
+        mtu: *mut u32,
+        max_packet: *mut u32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> *mut c_void;
+    fn lighter_host_link_start(
+        host_ip: *const c_char,
+        mask: *const c_char,
+        host_ip6: *const c_char,
+        network: *const u8,
         fd: c_int,
         mtu: *mut u32,
         max_packet: *mut u32,
@@ -60,24 +73,73 @@ impl Bridge {
     /// Bridges `interface` (`en0`, `en1`). Returns the bridge and the near
     /// end of its socket.
     pub fn start(interface: &str, mac: [u8; 6]) -> Result<(Bridge, OwnedFd), String> {
-        let (near, far) = socket_pair().map_err(|e| format!("socketpair: {e}"))?;
         let name = CString::new(interface).map_err(|_| "bad interface name".to_string())?;
+        Self::started(|fd, mtu, max_packet, err, errlen| {
+            // SAFETY: a NUL-terminated name, a six-byte MAC, and the rest
+            // as `started` passes them.
+            unsafe {
+                lighter_bridge_start(
+                    name.as_ptr(),
+                    mac.as_ptr(),
+                    fd,
+                    mtu,
+                    max_packet,
+                    err,
+                    errlen,
+                )
+            }
+        })
+    }
+
+    /// A network of the Mac and the guest alone. The Mac gets an interface
+    /// at `host`, on a subnet of `mask` (and at `host6`, on its /64), and a
+    /// route to that subnet through it; nothing else can reach it. `network` identifies it, so the same
+    /// identifier joins the same network.
+    pub fn host_link(
+        host: Ipv4Addr,
+        mask: Ipv4Addr,
+        host6: Option<std::net::Ipv6Addr>,
+        network: [u8; 16],
+    ) -> Result<(Bridge, OwnedFd), String> {
+        let host = CString::new(host.to_string()).expect("an address has no NUL");
+        let mask = CString::new(mask.to_string()).expect("an address has no NUL");
+        let host6 = CString::new(host6.map(|a| a.to_string()).unwrap_or_default())
+            .expect("an address has no NUL");
+        Self::started(|fd, mtu, max_packet, err, errlen| {
+            // SAFETY: NUL-terminated addresses, a sixteen-byte identifier,
+            // and the rest as `started` passes them.
+            unsafe {
+                lighter_host_link_start(
+                    host.as_ptr(),
+                    mask.as_ptr(),
+                    host6.as_ptr(),
+                    network.as_ptr(),
+                    fd,
+                    mtu,
+                    max_packet,
+                    err,
+                    errlen,
+                )
+            }
+        })
+    }
+
+    /// Makes the pair and runs `start` on its far end: a live descriptor
+    /// the relay keeps using (held in the Bridge), out-pointers to locals,
+    /// and an error buffer of the length given.
+    fn started(
+        start: impl FnOnce(c_int, *mut u32, *mut u32, *mut c_char, usize) -> *mut c_void,
+    ) -> Result<(Bridge, OwnedFd), String> {
+        let (near, far) = socket_pair().map_err(|e| format!("socketpair: {e}"))?;
         let (mut mtu, mut max_packet) = (0u32, 0u32);
         let mut err = [0 as c_char; 256];
-        // SAFETY: a NUL-terminated name, a six-byte MAC, a live descriptor
-        // the relay keeps using (held in the Bridge), and out-pointers to
-        // locals.
-        let raw = unsafe {
-            lighter_bridge_start(
-                name.as_ptr(),
-                mac.as_ptr(),
-                far.as_raw_fd(),
-                &mut mtu,
-                &mut max_packet,
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        };
+        let raw = start(
+            far.as_raw_fd(),
+            &mut mtu,
+            &mut max_packet,
+            err.as_mut_ptr(),
+            err.len(),
+        );
         if raw.is_null() {
             // SAFETY: the relay NUL-terminates what it writes.
             let why = unsafe { CStr::from_ptr(err.as_ptr()) }

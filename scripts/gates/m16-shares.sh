@@ -68,6 +68,22 @@ detach() {
 
 SMB_D="$HOME/.lighter-gate-smb-d-$$"
 SMB_T="$HOME/.lighter-gate-smb-t-$$"
+SMB_Q="$HOME/.lighter-gate-smb-q-$$"
+SMB_N="$HOME/.lighter-gate-smb-n-$$"
+SMB_F="$HOME/.lighter-gate-smb-f-$$"
+
+# Unmounts an SMB share as Finder would, through Disk Arbitration: lighter
+# lets go of what its shares hold on a volume when asked, and a bare umount
+# asks no one, so it failed as busy, left the share mounted after its server
+# had gone, and the next look at it waited out the Mac's SMB timeout.
+# A share Disk Arbitration could not unmount is named in REFUSED.
+REFUSED=""
+smb_unmount() {
+	grep -q "on $1 (smbfs" <<<"$(mount)" || return 0
+	diskutil unmount "$1" >/dev/null 2>&1 && return 0
+	REFUSED="$REFUSED $(basename "$1")"
+	umount -f "$1" 2>/dev/null || true
+}
 
 cleanup() {
 	# By the exit status too: judge records a failure in its pipeline's
@@ -76,10 +92,13 @@ cleanup() {
 	{ [ "$FAILED" = 0 ] && [ "$status" = 0 ]; } || cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m16-machine.log" 2>/dev/null || true
 	# Unpaused first: unmounting a share whose server is paused hangs.
 	docker unpause lighter-gate-smb >/dev/null 2>&1 || true
-	umount "$SMB_D" 2>/dev/null || true
-	umount "$SMB_T" 2>/dev/null || true
-	rmdir "$SMB_D" "$SMB_T" 2>/dev/null || true
-	docker rm -f lighter-gate-nested lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-reader lighter-gate-ticker lighter-gate-local >/dev/null 2>&1 || true
+	smb_unmount "$SMB_D"
+	smb_unmount "$SMB_T"
+	smb_unmount "$SMB_Q"
+	smb_unmount "$SMB_N"
+	smb_unmount "$SMB_F"
+	rmdir "$SMB_D" "$SMB_T" "$SMB_Q" "$SMB_N" "$SMB_F" 2>/dev/null || true
+	docker rm -f lighter-gate-nested lighter-gate-reader lighter-gate-unshared lighter-gate-tmp lighter-gate-smb lighter-gate-smb-fid lighter-gate-smb-reader lighter-gate-crossing lighter-gate-ticker lighter-gate-local >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	detach "$APFS"
 	detach "$EXFAT"
@@ -227,6 +246,153 @@ echo "==> Metadata on a drive with no identity paths (#53)"
 docker pull -q "$PYTHON" >/dev/null
 metadata "/Volumes/$EXFAT" "/Volumes/$APFS" | judge "exFAT"
 
+# Mounts an SMB share once its server answers. The port answers on the Mac
+# as soon as the container is up, before smbd inside it listens, so only a
+# mount can say the server is ready; one tried too soon fails at once with
+# "Operation timed out".
+smb_mount() {
+	for _ in $(seq 1 20); do
+		mount_smbfs "$1" "$2" 2>"$SCRATCH/smb.last" && return 0
+		sleep 0.5
+	done
+	cat "$SCRATCH/smb.last" >>"$SCRATCH/smb.err"
+	return 1
+}
+
+# A NAS decides permissions for itself (#69). On a share served as a QNAP
+# serves one, every chmod is refused and every new file is rwxrwxr-x; on
+# another a chmod is accepted and changes nothing. A container must still see
+# exactly what it set: Borg Backup Server stopped at its first chmod, and a
+# data directory made 0700 would read 0755 by its database's next start.
+smb_permissions() {
+	mkdir -p "$SMB_Q" "$SMB_N"
+	if ! smb_mount "//lt:lt@localhost/q" "$SMB_Q" || ! smb_mount "//lt:lt@localhost/n" "$SMB_N"; then
+		fail "could not mount the permission shares: $(cat "$SCRATCH/smb.err")"
+		return
+	fi
+	local share got again mac
+	for share in q n "d"; do
+		local dir
+		case "$share" in q) dir="$SMB_Q" ;; n) dir="$SMB_N" ;; *) dir="$SMB_D" ;; esac
+		got="$(docker run --rm -v "$dir:/s" "$PYTHON" sh -c '
+			cd /s && umask 077 && mkdir db && touch key && umask 022
+			mkdir srv && chown 33:33 srv && chmod 755 srv
+			mkdir srv/data && chown 100:101 srv/data && chmod 700 srv/data
+			touch conf && chmod 640 conf
+			printf "A=1\n" > .ownership && touch -d @1 .ownership
+			chown 33:33 .ownership && chown 34:34 .ownership && chmod 644 .ownership
+			setpriv --reuid 100 --regid 101 --clear-groups touch srv/data/aria_log_control; w=$?
+			echo "$(stat -c "%a:%u" db key srv srv/data conf .ownership) write=$w"' 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
+		[ "$got" = "700:0 600:0 755:33 700:100 640:0 644:34 write=0" ] \
+			&& pass "SMB $share: what a container sets is what it sees, and a service user reaches its own directory" \
+			|| fail "SMB $share: $got"
+	done
+	# The Mac's SMB client reports the bits it set until its cache lapses;
+	# what counts is what a container sees once the server's own are back.
+	for _ in $(seq 1 30); do
+		mac="$(stat -f %Lp "$SMB_N/db" 2>/dev/null)"
+		[ "$mac" != 700 ] && break
+		sleep 1
+	done
+	for share in q n; do
+		local dir
+		case "$share" in q) dir="$SMB_Q" ;; n) dir="$SMB_N" ;; esac
+		# The Mac now and then gives up on a server inside the machine it is
+		# serving, and drops the share; the files are on the server, so the
+		# share is mounted again to read them.
+		grep -q "on $dir (smbfs" <<<"$(mount)" \
+			|| mount_smbfs "//lt:lt@localhost/$share" "$dir" 2>>"$SCRATCH/smb.err" || true
+		again="$(docker run --rm -v "$dir:/s" "$IMAGE" stat -c "%a:%u" /s/db /s/key /s/srv /s/srv/data /s/conf /s/.ownership 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
+		mac="$(stat -f %Lp "$dir/db" "$dir/key" 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
+		[ "$again" = "700:0 600:0 755:33 700:100 640:0 644:34" ] \
+			&& pass "SMB $share: and a new container sees the same, while the server keeps its own ($mac)" \
+			|| fail "SMB $share, a new container: $again (the Mac sees $mac)"
+	done
+	smb_unmount "$SMB_Q"
+	smb_unmount "$SMB_N"
+	replaced "$SMB_D" "SMB"
+}
+
+# A server that offers file ids, as a QNAP does: numbers that follow a file
+# rather than a name. Mounted by the Mac's network address, before the hang
+# below: the Mac's client takes any port on localhost for the server it already
+# has a session with there, and after that server has hung it will not open a
+# new session to this Mac for a while; either way the mount times out.
+smb_file_ids() {
+	local got host
+	host="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+	if [ -z "$host" ]; then
+		note "SMB with file ids: skipped, this Mac has no network address to reach the second server by"
+		return
+	fi
+	docker run -d --name lighter-gate-smb-fid -p 4460:445 lighter-gate-smb \
+		smbd --foreground --no-process-group --configfile=/etc/samba/smb-fid.conf >/dev/null
+	mkdir -p "$SMB_F"
+	if smb_mount "//lt:lt@$host:4460/f" "$SMB_F"; then
+		replaced "$SMB_F" "SMB with file ids"
+		got="$(docker run --rm -v "$SMB_F:/s" "$PYTHON" sh -c '
+			cd /s && umask 077 && mkdir db && touch key && umask 022
+			mkdir srv && chown 100:101 srv && chmod 700 srv
+			echo "$(stat -c "%a:%u" db key srv)"' 2>&1 | tr '\n' ' ' | sed 's/ $//' || true)"
+		[ "$got" = "700:0 600:0 700:100" ] && pass "SMB with file ids: what a container sets is what it sees" \
+			|| fail "SMB with file ids: $got"
+		smb_unmount "$SMB_F"
+	else
+		fail "could not mount the file-id share: $(cat "$SCRATCH/smb.err")"
+	fi
+	docker rm -f lighter-gate-smb-fid >/dev/null
+}
+
+# A file renamed over another, or made again under its name, reads back as the
+# new one. Samba with fruit offers no file ids, so macOS numbers each file by
+# its name and a replacement has the numbers of the file it replaced: Postgres
+# replaces its catalog cache so, and read the old one back ("cache lookup
+# failed for index 2662"); a file written and renamed into place read back
+# empty now and then (#69).
+replaced() {
+	local got
+	got="$(docker run --rm -v "$1:/s" "$PYTHON" python3 -c '
+import os
+os.chdir("/s"); stale = 0
+for i in range(40):
+    open(f"cache{i}", "w").write(f"old {i}")
+    open(f"cache{i}").read()
+    open(f"cache{i}.tmp", "w").write(f"new {i}")
+    os.rename(f"cache{i}.tmp", f"cache{i}")
+    stale += open(f"cache{i}").read() != f"new {i}"
+    open(f"log{i}", "w").write(f"first {i}")
+    open(f"log{i}").read()
+    os.unlink(f"log{i}")
+    open(f"log{i}", "w").write(f"second {i}")
+    stale += open(f"log{i}").read() != f"second {i}"
+print(stale)' 2>&1 | tail -1 || true)"
+	[ "$got" = 0 ] && pass "$2: a file replaced by a rename, or made again under its name, reads back as the new one" \
+		|| fail "$2: $got of 80 replaced files read back stale"
+	# As Postgres makes a WAL segment: written under a temporary name and
+	# synced, renamed into place, opened by its new name, written, synced
+	# and read back. The rename is queued; the guest may forget the file and
+	# look it up again before it lands, and a sync by the new name must find
+	# it ("could not locate a valid checkpoint record", ENOENT on the sync).
+	got="$(docker run --rm -v "$1:/s" "$PYTHON" python3 -c '
+import os
+os.chdir("/s"); bad = 0
+for i in range(100):
+    fd = os.open("xlogtemp", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.pwrite(fd, bytes(65536), 0); os.fsync(fd); os.close(fd)
+    seg = "%024X" % (i + 1)
+    os.rename("xlogtemp", seg)
+    try:
+        fd = os.open(seg, os.O_RDWR); page = b"checkpoint %d" % i
+        os.pwrite(fd, page, 0); os.fsync(fd); os.close(fd)
+        fd = os.open(seg, os.O_RDONLY); bad += os.pread(fd, len(page), 0) != page; os.close(fd)
+    except OSError:
+        bad += 1
+    os.unlink(seg)
+print(bad)' 2>&1 | tail -1 || true)"
+	[ "$got" = 0 ] && pass "$2: a file renamed into place is synced and read back by its new name" \
+		|| fail "$2: $got of 100 files renamed into place could not be synced or read back"
+}
+
 echo
 echo "==> Metadata between two SMB shares (#53)"
 # The report's own setup: two shares mounted with mount_smbfs, bind-mounted
@@ -237,14 +403,14 @@ if lsof -nP -iTCP:445 -sTCP:LISTEN >/dev/null 2>&1; then
 else
 	docker build -q -t lighter-gate-smb scripts/gates/fixtures/smb >/dev/null
 	docker run -d --name lighter-gate-smb -p 445:445 lighter-gate-smb >/dev/null
-	for _ in $(seq 1 40); do nc -z 127.0.0.1 445 2>/dev/null && break; sleep 0.25; done
 	mkdir -p "$SMB_D" "$SMB_T"
 	# By name rather than address: the Mac's SMB client keeps a session to
 	# a server it has just used, and refuses a second mount of the same
 	# share by the same spelling until it lets go ("File exists").
-	if mount_smbfs "//lt:lt@localhost/d" "$SMB_D" 2>"$SCRATCH/smb.err" \
-		&& mount_smbfs "//lt:lt@localhost/t" "$SMB_T" 2>>"$SCRATCH/smb.err"; then
+	if smb_mount "//lt:lt@localhost/d" "$SMB_D" && smb_mount "//lt:lt@localhost/t" "$SMB_T"; then
 		metadata "$SMB_D" "$SMB_T" | judge "SMB"
+		smb_permissions
+		smb_file_ids
 		# A network volume that stops answering stops only what touches
 		# it. Served on the vCPU that asked, a request on it stopped that
 		# CPU for as long: a NAS that hung for 48 s froze three of the
@@ -258,6 +424,12 @@ else
 		mkdir -p "$LOCAL_PROBE" && touch "$LOCAL_PROBE/probe"
 		docker run -d --name lighter-gate-smb-reader -v "$SMB_D:/m" "$IMAGE" sh -c \
 			'for i in $(seq 1 40); do (while true; do stat /m/d$i/fresh-$RANDOM$RANDOM >/dev/null 2>&1; done) & done; wait' >/dev/null
+		# And the directory the share is mounted in: a lookup there of the
+		# mount point is a request on the Mac's own disk by its node, but it
+		# waits on the server; served on a vCPU it stopped the machine until
+		# macOS gave up on the server, ten minutes (crate::mounts).
+		docker run -d --name lighter-gate-crossing -v "$(dirname "$SMB_D"):/h:ro" "$IMAGE" sh -c \
+			"while true; do ls -a /h >/dev/null 2>&1; stat /h/$(basename "$SMB_D") >/dev/null 2>&1; done" >/dev/null
 		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
 import os, time
 stop = time.time() + 35; worst = 0.0
@@ -287,7 +459,7 @@ print("%.2f" % max(worst))' >/dev/null
 		docker wait lighter-gate-ticker lighter-gate-local >/dev/null
 		gap="$(docker logs lighter-gate-ticker 2>&1 | tail -1)"
 		slowest="$(docker logs lighter-gate-local 2>&1 | tail -1)"
-		docker rm -f lighter-gate-ticker lighter-gate-smb-reader lighter-gate-local >/dev/null
+		docker rm -f lighter-gate-ticker lighter-gate-smb-reader lighter-gate-crossing lighter-gate-local >/dev/null
 		rm -rf "$LOCAL_PROBE"
 		if [ "$kept" = 1 ]; then
 			awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
@@ -299,8 +471,11 @@ print("%.2f" % max(worst))' >/dev/null
 		else
 			note "SMB: macOS dropped the share while its server was hung, so the hang was not measured (gap ${gap:-?} s, slowest local ${slowest:-?} s)"
 		fi
-		umount "$SMB_D" 2>/dev/null || true
-		umount "$SMB_T" 2>/dev/null || true
+		smb_unmount "$SMB_D"
+		smb_unmount "$SMB_T"
+		[ -z "$REFUSED" ] \
+			&& pass "SMB: every share unmounts as Finder unmounts it, after containers have used it" \
+			|| fail "SMB: Disk Arbitration could not unmount$REFUSED: lighter held files there"
 	else
 		fail "could not mount the shares: $(cat "$SCRATCH/smb.err")"
 	fi

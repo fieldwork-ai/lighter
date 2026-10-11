@@ -27,7 +27,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 PROFILE="${PROFILE:-release}"
-LIGHTER="target/$PROFILE/lighter"
+LIGHTER="${LIGHTER_BIN:-target/$PROFILE/lighter}"
 COMPOSE="scripts/gates/fixtures/daily.yml"
 # Under $HOME, because that is what the machine shares by default and a bind
 # mount of a path the guest cannot see produces an empty directory rather than
@@ -69,9 +69,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Building and signing the CLI"
-cargo build $([ "$PROFILE" = release ] && echo --release) -p lighter-cli
-./scripts/sign.sh "$LIGHTER" >/dev/null
+if [ -z "${LIGHTER_BIN:-}" ]; then
+	echo "==> Building and signing the CLI"
+	cargo build $([ "$PROFILE" = release ] && echo --release) -p lighter-cli
+	./scripts/sign.sh "$LIGHTER" >/dev/null
+fi
 
 # The stack bind-mounts this, and nginx has to find something to serve.
 echo "<h1>lighter</h1>" > "$SHARE/index.html"

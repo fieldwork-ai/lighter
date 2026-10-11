@@ -457,7 +457,14 @@ mod tests {
 
         let app = crate::sys::open_root(&root.join("app/cache")).unwrap();
         let at = crate::sys::stat_fd(app.as_raw_fd()).unwrap();
-        registry.insert(app, at.st_dev as i64, at.st_ino, true, false);
+        registry.insert(
+            app,
+            at.st_dev as i64,
+            at.st_ino,
+            true,
+            false,
+            Some((at.st_birthtime, at.st_birthtime_nsec)),
+        );
         invalidator.changed(&root.join("app/cache/tmp123"), flag::ITEM_CREATED);
         assert!(!sink.is_empty(), "a directory the guest knows hears of it");
         std::fs::remove_dir_all(&root).unwrap();

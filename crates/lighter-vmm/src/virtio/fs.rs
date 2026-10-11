@@ -807,9 +807,19 @@ impl VirtioDevice for Fs {
                 // The high-priority queue carries FORGET and INTERRUPT: bounded,
                 // allocation-free, and required not to queue behind a slow
                 // `stat`. They are served here, on the vCPU, deliberately.
+                //
+                // Except a FORGET that may wait on a server: the last one for
+                // a file on a network volume closes its descriptors, and a
+                // close there is a round trip. Served here, one stopped this
+                // CPU until the server answered, and with the server inside
+                // this machine (Samba in a container, sharing back to the
+                // Mac) it never could: the machine waited out the Mac's SMB
+                // timeout. A FORGET has no reply for the guest to wait on,
+                // so a worker's lateness costs nothing.
                 let Some(memory) = self.memory.clone() else {
                     return Serviced::NONE;
                 };
+                let pool = self.pool.as_ref().map(|pool| pool.queue.clone());
                 let Some(hiprio) = queues.get_mut(HIPRIO_QUEUE as usize) else {
                     return Serviced::NONE;
                 };
@@ -817,6 +827,23 @@ impl VirtioDevice for Fs {
                 while let Some(chain) = hiprio.pop(mem) {
                     let head = chain.head();
                     let (request, reply) = Fs::split(mem, chain);
+                    if let Some(pool) = &pool
+                        && self.server.may_block(&request)
+                    {
+                        let job = Job {
+                            head,
+                            request,
+                            reply,
+                            queue: HIPRIO_QUEUE,
+                            remote: true,
+                        };
+                        if pool.push(job) {
+                            continue;
+                        }
+                        hiprio.push_used(mem, head, 0);
+                        used = true;
+                        continue;
+                    }
                     let mut sink = ChainSink::new(memory.clone(), reply);
                     let written = self.server.dispatch(&request, &mut sink);
                     hiprio.push_used(mem, head, written as u32);

@@ -677,6 +677,70 @@ pub fn statfs(path: &Path) -> Result<libc::statfs> {
     Ok(st)
 }
 
+/// The Mac's mounted volumes: where each is mounted, and whether it is local.
+///
+/// `MNT_NOWAIT` reads the kernel's table as it stands, so a network volume
+/// whose server has stopped answering is listed without being asked.
+pub fn mounts() -> Vec<(PathBuf, bool)> {
+    // SAFETY: a null buffer asks only for the count.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // Room for a few mounted between the count and the read.
+    let mut table: Vec<libc::statfs> = vec![unsafe { std::mem::zeroed() }; count as usize + 8];
+    let bytes = (table.len() * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+    // SAFETY: `table` is an owned buffer of `bytes` bytes.
+    let filled = unsafe { libc::getfsstat(table.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    table
+        .iter()
+        .take(filled.max(0) as usize)
+        .map(|fs| {
+            // SAFETY: the kernel NUL-terminates f_mntonname within its array.
+            let on = unsafe { CStr::from_ptr(fs.f_mntonname.as_ptr()) };
+            (
+                PathBuf::from(OsStr::from_bytes(on.to_bytes())),
+                fs.f_flags & libc::MNT_LOCAL as u32 != 0,
+            )
+        })
+        .collect()
+}
+
+/// A kqueue that wakes on the Mac's filesystem events: a volume mounted or
+/// unmounted among them.
+pub fn filesystem_events() -> Result<OwnedFd> {
+    // SAFETY: no arguments; the descriptor is owned at once.
+    let kq = unsafe { OwnedFd::from_raw_fd(check(libc::kqueue())?) };
+    let change = libc::kevent {
+        ident: 0,
+        filter: libc::EVFILT_FS,
+        flags: libc::EV_ADD | libc::EV_CLEAR,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one change from an owned struct, no events read back.
+    check(unsafe {
+        libc::kevent(
+            kq.as_raw_fd(),
+            &change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    })?;
+    Ok(kq)
+}
+
+/// Waits for the next event on a [`filesystem_events`] queue.
+pub fn next_filesystem_event(kq: RawFd) -> Result<()> {
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    // SAFETY: an owned output buffer for one event, no timeout.
+    check(unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) })
+        .map(|_| ())
+}
+
 /// Whether `fd`'s volume keeps permission bits: exFAT and FAT keep none, and
 /// report every file as its user's, `rwx------`, whatever was set. `None` if
 /// the volume cannot say.
@@ -868,6 +932,46 @@ pub fn list_xattr(path: &CStr, buf: &mut [u8]) -> Result<usize> {
 pub fn remove_xattr(path: &CStr, name: &CStr) -> Result<()> {
     // SAFETY: two valid NUL-terminated strings.
     check(unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), XATTR_NOFOLLOW) }).map(|_| ())
+}
+
+/// [`get_xattr`] of a file already open: one the apply queue has just made
+/// or changed, which has no path it could be asked by.
+pub fn get_xattr_fd(fd: RawFd, name: &CStr, buf: &mut [u8]) -> Result<usize> {
+    // SAFETY: a live descriptor, a valid NUL-terminated name, and a buffer we
+    // own of the length we pass.
+    check_size(unsafe {
+        libc::fgetxattr(
+            fd,
+            name.as_ptr(),
+            buffer_or_null(buf) as *mut libc::c_void,
+            buf.len(),
+            0,
+            0,
+        )
+    })
+}
+
+/// [`remove_xattr`] of a file already open.
+pub fn remove_xattr_fd(fd: RawFd, name: &CStr) -> Result<()> {
+    // SAFETY: a live descriptor and a valid NUL-terminated name.
+    check(unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) }).map(|_| ())
+}
+
+/// [`set_xattr`] of a file already open.
+pub fn set_xattr_fd(fd: RawFd, name: &CStr, value: &[u8]) -> Result<()> {
+    // SAFETY: a live descriptor, a valid name, and a buffer we own of the
+    // stated length.
+    check(unsafe {
+        libc::fsetxattr(
+            fd,
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+            0,
+        )
+    })
+    .map(|_| ())
 }
 
 /// `faccessat` with the caller's effective identity, which is the only one this

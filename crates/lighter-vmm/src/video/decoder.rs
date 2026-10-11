@@ -293,6 +293,15 @@ impl VtSession {
         })
     }
 
+    /// Whether the session can go on with `desc` in place of its own: the
+    /// same picture size, and VideoToolbox's word for the rest.
+    fn accepts(&self, desc: &FormatDescription) -> bool {
+        desc.dimensions() == self.dims
+            && unsafe {
+                vt::VTDecompressionSessionCanAcceptFormatDescription(self.session, desc.0) != 0
+            }
+    }
+
     /// Decodes one access unit, its NALs length-prefixed in `avcc`; `seq`
     /// comes back with the frame.
     fn decode(&self, avcc: &mut [u8], seq: i64) -> Result<(), vt::OSStatus> {
@@ -521,6 +530,23 @@ impl Session {
                 // Nothing decodable yet (no parameter sets): the buffer is
                 // consumed and nothing comes of it.
                 None => {}
+                // A session that can take the new description keeps the
+                // pictures it has decoded, which those after it are
+                // predicted from: an encoder may send a new PPS, or a new
+                // SPS for the same pictures, between keyframes.
+                Some(Ok(desc))
+                    if self.parser.ten_bit() == self.ten_bit
+                        && self.vt.as_ref().is_some_and(|vt| vt.accepts(&desc)) =>
+                {
+                    self.vt.as_mut().expect("checked").desc = desc;
+                    self.take_depth(false);
+                    tracing::debug!(
+                        codec = ?self.codec,
+                        depth = self.depth,
+                        declared = self.depth_declared,
+                        "video stream parameters changed; session kept"
+                    );
+                }
                 Some(Ok(desc)) => {
                     if let Some(old) = self.vt.take() {
                         old.flush();
@@ -571,19 +597,7 @@ impl Session {
     /// A VideoToolbox session for the stream as the parser now describes
     /// it, and what that changes for the guest.
     fn start_session(&mut self, desc: FormatDescription) {
-        match self.parser.reorder_depth() {
-            Some(n) => {
-                self.depth = n;
-                self.depth_declared = true;
-            }
-            // Unsaid: start at none, which costs a camera without B-frames
-            // nothing, and learn from the first frame that arrives behind
-            // one already handed on.
-            None => {
-                self.depth = 0;
-                self.depth_declared = false;
-            }
-        }
+        self.take_depth(true);
         let ten_bit = self.parser.ten_bit();
         tracing::debug!(
             codec = ?self.codec,
@@ -633,6 +647,25 @@ impl Session {
             // decoded meanwhile wait for them.
             self.events
                 .push_back(VideoDecoderBackendEvent::StreamFormatChanged);
+        }
+    }
+
+    /// How many frames to hold back, as the SPS now says. Unsaid, a new
+    /// session starts at none, which costs a camera without B-frames
+    /// nothing, and a kept one at what it held; either learns from the first
+    /// frame that arrives behind one already handed on.
+    fn take_depth(&mut self, new_session: bool) {
+        match self.parser.reorder_depth() {
+            Some(n) => {
+                self.depth = n;
+                self.depth_declared = true;
+            }
+            None => {
+                if new_session {
+                    self.depth = 0;
+                }
+                self.depth_declared = false;
+            }
         }
     }
 
@@ -1272,6 +1305,60 @@ mod tests {
         let sink = Arc::new(Mutex::new(VecDeque::new()));
         let vt = VtSession::new(desc, false, sink).expect("a session");
         assert_eq!(vt.dims, (896, 512));
+    }
+
+    #[test]
+    fn new_parameters_for_the_same_pictures_keep_the_session() {
+        use crate::video::h264::tests::{REOLINK_PPS, baseline_sps, pps};
+        let stamp = bindings::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let annexb = |nals: &[&[u8]]| -> Vec<u8> {
+            nals.iter()
+                .flat_map(|nal| [&[0u8, 0, 0, 1][..], nal].concat())
+                .collect()
+        };
+        // x264 High profile, 1920x1080, with a VUI declaring two reorder
+        // frames, and the same SPS without it.
+        let sps: &[u8] = &[
+            0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00,
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58,
+        ];
+        let no_vui = h264::without_vui(sps).unwrap();
+        let mut s = Session::new(Codec::H264);
+        s.feed(annexb(&[sps, REOLINK_PPS]), 0, stamp).unwrap();
+        let session = s.vt.as_ref().expect("a session").session;
+        // Held, so no later session can be given its address: a session
+        // released and one made after it may share one.
+        unsafe { vt::CFRetain(session) };
+        assert_eq!((s.depth, s.depth_declared), (2, true));
+        s.events.clear();
+        // A new PPS under the same id.
+        s.feed(annexb(&[&pps(0, 0, 3)]), 1, stamp).unwrap();
+        assert_eq!(s.vt.as_ref().unwrap().session, session);
+        // The SPS no longer saying how deep: the depth it held stays, but
+        // may be learned from here.
+        s.feed(annexb(&[&no_vui]), 2, stamp).unwrap();
+        assert_eq!(s.vt.as_ref().unwrap().session, session);
+        assert_eq!((s.depth, s.depth_declared), (2, false));
+        assert!(
+            !s.events
+                .iter()
+                .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
+        );
+        // Another size is another session, and the guest is told.
+        s.feed(annexb(&[&baseline_sps(0, 0, 0), REOLINK_PPS]), 3, stamp)
+            .unwrap();
+        assert_ne!(s.vt.as_ref().unwrap().session, session);
+        assert_eq!(s.vt.as_ref().unwrap().dims, (640, 480));
+        assert_eq!((s.depth, s.depth_declared), (0, true));
+        assert!(
+            s.events
+                .iter()
+                .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
+        );
+        unsafe { vt::CFRelease(session) };
     }
 
     #[test]

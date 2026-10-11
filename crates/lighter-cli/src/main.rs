@@ -20,6 +20,7 @@ mod doctor;
 mod installation;
 mod instance;
 mod lan;
+mod link;
 mod localnet;
 mod machine;
 mod mounts;
@@ -197,6 +198,16 @@ enum Command {
         /// one (Wi-Fi, mostly): `192.168.50.240`, or `auto` for DHCP.
         #[arg(long, value_name = "ADDRESS")]
         lan_address: Option<String>,
+        /// Whether the Mac reaches containers directly, at their own
+        /// addresses and as `name.lighter.local` (`on`, or `off`, the
+        /// default). While on, macOS's packet filter runs for the whole Mac,
+        /// which costs some throughput everywhere.
+        #[arg(long, value_enum)]
+        direct: Option<config::Toggle>,
+        /// The /16 containers' addresses come from, for reaching them
+        /// directly: `10.211.0.0/16`, or `auto` for the one already chosen.
+        #[arg(long, value_name = "SUBNET")]
+        direct_subnet: Option<String>,
     },
     /// Put the guest's clock right.
     ///
@@ -385,6 +396,8 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             lan,
             lan_interface,
             lan_address,
+            direct,
+            direct_subnet,
         } => configure(Settings {
             resources,
             cpus,
@@ -402,6 +415,8 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             lan,
             lan_interface,
             lan_address,
+            direct,
+            direct_subnet,
         }),
         Command::Resync => {
             let now = std::time::SystemTime::now()
@@ -567,6 +582,22 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             machine::LanState::Missing(why) => outln!("  lan        not on the network: {why}"),
         }
     }
+    match &status.direct {
+        Some(Ok((subnet, outside))) => {
+            outln!(
+                "  direct     containers at their own addresses ({subnet}/16) and as NAME.{}",
+                lighter_docker::names::DOMAIN
+            );
+            if !outside.is_empty() {
+                outln!(
+                    "             except on {}, outside it (made before it, or with a subnet of their own)",
+                    outside.join(", ")
+                );
+            }
+        }
+        Some(Err(why)) => outln!("  direct     off: {why}"),
+        None => {}
+    }
     for mount in &status.unshared {
         outln!(
             "  mounts     {} binds {}, which is not shared: {}",
@@ -627,6 +658,8 @@ struct Settings {
     lan: Option<config::Toggle>,
     lan_interface: Option<String>,
     lan_address: Option<String>,
+    direct: Option<config::Toggle>,
+    direct_subnet: Option<String>,
 }
 
 /// Writes what `lighter config` was given into `config`, saying whether
@@ -649,6 +682,8 @@ fn apply(config: &mut config::Config, settings: Settings) -> Result<bool, String
         lan,
         lan_interface,
         lan_address,
+        direct,
+        direct_subnet,
     } = settings;
     let changed = resources.is_some()
         || cpus.is_some()
@@ -665,7 +700,9 @@ fn apply(config: &mut config::Config, settings: Settings) -> Result<bool, String
         || !unshare.is_empty()
         || lan.is_some()
         || lan_interface.is_some()
-        || lan_address.is_some();
+        || lan_address.is_some()
+        || direct.is_some()
+        || direct_subnet.is_some();
     for path in &unshare {
         config.unshare(path)?;
     }
@@ -733,6 +770,17 @@ fn apply(config: &mut config::Config, settings: Settings) -> Result<bool, String
         // starts off the network.
         lan::address_for_guest(&address, "lo0")?;
         config.lan_address = address;
+    }
+    if let Some(direct) = direct {
+        config.direct = direct.into();
+    }
+    if let Some(subnet) = direct_subnet {
+        config.direct_subnet = if subnet == "auto" {
+            String::new()
+        } else {
+            link::parse_subnet(&subnet)?;
+            subnet
+        };
     }
     if let Some(python) = torch_python {
         config.torch_python = if python == "auto" {
@@ -830,6 +878,14 @@ fn configure(settings: Settings) -> anyhow::Result<std::process::ExitCode> {
     } else {
         outln!("  lan        off");
     }
+    outln!(
+        "  direct     {}",
+        match (config.direct, config.direct_subnet.as_str()) {
+            (false, _) => "off".to_string(),
+            (true, "") => "on".to_string(),
+            (true, subnet) => format!("on, containers in {subnet}"),
+        }
+    );
     Ok(std::process::ExitCode::SUCCESS)
 }
 

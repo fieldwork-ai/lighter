@@ -283,7 +283,6 @@ at_warn="$(field ballooned_mib)"
 guest_mib=8192
 step=$(( guest_mib / 256 )); [ "$step" -lt 32 ] && step=32
 swapouts() { vm_stat | awk '/Swapouts/ { gsub("\\.", "", $2); print $2 }'; }
-swapped_before="$(swapouts)"
 echo normal > "$PRESSURE_FILE"
 sleep 15
 after="$(field ballooned_mib)"
@@ -291,18 +290,53 @@ after="$(field ballooned_mib)"
 # that eases looks like fifteen seconds in. A cliff is gone at once.
 floor=$(( at_warn - 10 * step - 64 ))
 [ "${after:-0}" -ge "$floor" ] && pass "Normal is a plateau: ${after} of ${at_warn} MiB held 15s later (eases ${step} MiB/s at most)" || fail "Normal was a cliff: ${after:-0} of ${at_warn} MiB left after 15s, ${floor} expected"
-sleep 60
-later="$(field ballooned_mib)"
-# Swap on the Mac within the last minute is overcommitment, and the policy
-# rightly holds the balloon through it: a Mac that swapped in the window
-# says nothing about easing either way.
-swapped=$(( $(swapouts) - swapped_before ))
-if [ "${later:-0}" -lt "${after:-0}" ]; then
-	pass "and it eases: ${later} MiB after another 60s"
-elif [ "$swapped" -gt 0 ]; then
-	note "easing not measured: the Mac swapped out ${swapped} pages in the window, and the balloon rightly held (${later:-0} MiB)"
+# Easing waits on two things, by design: a minute's memory of the Warn
+# (`PRESSURE_MEMORY`, against a level that flaps), and five polls in a row
+# with the Mac compressing nothing, nor swapping for a minute. A Mac compresses in
+# bursts whatever lighter does (a six-second one at 171 thousand pages a
+# second, with nothing of ours running, on 2026-10-09), and a single look
+# at 75 seconds left ten seconds for both to line up: it failed twice that
+# way on the Studio. So the gate watches what the policy watches, second by
+# second, for up to two and a half minutes past the Warn's memory, and
+# judges the balloon only against a stretch the Mac stayed quiet for.
+compressions() { vm_stat | awk '/^Compressions/ { gsub("\\.", "", $2); print $2 }'; }
+remembered_until=$(( SECONDS + 60 - 15 ))
+quiet=0 longest=0 eased="" waited=0
+last_c="$(compressions)" last_s="$(swapouts)"
+while [ "$waited" -lt 210 ]; do
+	sleep 1
+	waited=$((waited + 1))
+	c="$(compressions)" s="$(swapouts)"
+	# A swap-out is remembered for a minute too (`swapping_until`).
+	[ "$s" != "$last_s" ] && remembered_until=$(( SECONDS + 60 ))
+	if [ "$c" = "$last_c" ] && [ "$SECONDS" -ge "$remembered_until" ]; then
+		quiet=$((quiet + 1))
+	else
+		quiet=0
+	fi
+	last_c="$c" last_s="$s"
+	[ "$quiet" -gt "$longest" ] && longest="$quiet"
+	later="$(field ballooned_mib)"
+	if [ "${later:-0}" -lt "${after:-0}" ]; then
+		eased=yes
+		break
+	fi
+	# Five quiet polls to start, a step a second after: ten quiet seconds
+	# with nothing given back is a balloon that does not ease.
+	[ "$quiet" -ge 10 ] && break
+done
+# The policy's own word on whether the Mac is overcommitted (its
+# compressor over a quarter of RAM, or swap over an eighth while it is
+# still swapping): while it is, the balloon rightly holds, quiet or not.
+overcommitted="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a "host overcommitment changed" | tail -1 || true)"
+if [ -n "$eased" ]; then
+	pass "and it eases: ${later} MiB, $((waited + 15))s after Normal"
+elif [[ "$overcommitted" == *"overcommitted=true"* ]]; then
+	note "easing not measured: the Mac is overcommitted ($(grep -oE 'compressor_mib=[0-9]+|swap_used_mib=[0-9]+' <<<"$overcommitted" | tr '\n' ' ')), and the balloon rightly held (${later:-0} MiB)"
+elif [ "$quiet" -ge 10 ]; then
+	fail "it did not ease: ${later:-0} MiB (was ${after:-0}) though the Mac compressed and swapped nothing for ${quiet}s"
 else
-	fail "it did not ease: ${later:-0} MiB after another 60s (was ${after:-0}), with no swap on the Mac"
+	note "easing not measured: the Mac was compressing or swapping throughout (longest quiet stretch ${longest}s), and the balloon rightly held (${later:-0} MiB)"
 fi
 # The reported workflow: the host flapping between Warn and Normal. The
 # balloon must ride it out where it is, not cycle to nothing and back.

@@ -2969,6 +2969,123 @@ fn a_chmod_elsewhere_is_the_files_own() {
     );
 }
 
+/// A guest whose share is taken for a network share, as a NAS mounted under
+/// `/Volumes` is.
+fn on_a_network_share(name: &str) -> Guest {
+    let guest = Guest::new(name);
+    guest.server.assume_network_share();
+    guest
+}
+
+/// The same share served again, as after a restart.
+fn restarted_on_a_network_share(guest: &Guest) -> Guest {
+    let restarted = guest.another();
+    restarted.server.assume_network_share();
+    restarted
+}
+
+fn set_host_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A network share's server decides permissions for itself: a QNAP's refuses
+/// every chmod and makes every new file `rwxrwxr-x`, another accepts a chmod
+/// and changes nothing. What a container set — at a mkdir, a create, a
+/// chmod — is what it reads back whatever the server did, and after a
+/// restart (#69: Borg Backup Server stopped at its first chmod; a Postgres
+/// data directory made `0700` would have read `0755` on its next start).
+#[test]
+fn on_a_network_share_the_modes_a_container_sets_are_kept() {
+    let mut guest = on_a_network_share("network-modes");
+    let mut body = 0o700u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("db"));
+    guest.call(op::MKDIR, 1, &body).expect("mkdir");
+    guest.create_mode(1, "key", 0x8241, 0o600).expect("create");
+    std::fs::write(guest.host("conf"), b"x").unwrap();
+    let conf = guest.lookup(1, "conf").unwrap();
+    let reply = setattr(&mut guest, conf, fuse::fattr::MODE, 0o640, (0, 0));
+    assert_eq!(mode_and_owner(&reply).0, 0o640, "the reply");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    // The server's say: what a QNAP gives every file, or a chmod ignored.
+    for name in ["db", "key", "conf"] {
+        set_host_mode(&guest.host(name), 0o775);
+    }
+    let mut restarted = restarted_on_a_network_share(&guest);
+    for (name, mode) in [("db", 0o700), ("key", 0o600), ("conf", 0o640)] {
+        let nodeid = restarted.lookup(1, name).unwrap();
+        let reply = restarted.call(op::GETATTR, nodeid, &[0u8; 16]).unwrap();
+        assert_eq!(mode_and_owner(&reply).0, mode, "{name}");
+        let record = record_on_host(&guest.host(name)).unwrap_or_default();
+        assert!(record.contains(r#""kept":1"#), "{name}: {record}");
+    }
+}
+
+/// A chown and a chmod on a network share are kept together, in either
+/// order, and the owner survives the chmod.
+#[test]
+fn on_a_network_share_an_owner_and_a_mode_are_kept_together() {
+    let mut guest = on_a_network_share("network-owner");
+    std::fs::create_dir(guest.host("data")).unwrap();
+    let dir = guest.lookup(1, "data").unwrap();
+    setattr(
+        &mut guest,
+        dir,
+        fuse::fattr::UID | fuse::fattr::GID,
+        0,
+        (100, 101),
+    );
+    let reply = setattr(&mut guest, dir, fuse::fattr::MODE, 0o750, (0, 0));
+    assert_eq!(mode_and_owner(&reply), (0o750, 100, 101), "the reply");
+    set_host_mode(&guest.host("data"), 0o775);
+    let mut restarted = restarted_on_a_network_share(&guest);
+    let dir = restarted.lookup(1, "data").unwrap();
+    let reply = restarted.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
+    assert_eq!(mode_and_owner(&reply), (0o750, 100, 101), "after a restart");
+}
+
+/// A record written before modes were kept on network shares holds the
+/// bits of its chown, which a later chmod may since have changed on the
+/// file itself: its owner counts, its bits do not.
+#[test]
+fn on_a_network_share_a_record_from_before_leaves_the_files_own_bits() {
+    let guest = Guest::new("network-old-record");
+    std::fs::create_dir(guest.host("data")).unwrap();
+    set_host_mode(&guest.host("data"), 0o700);
+    let path = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    lighter_fs::sys::set_xattr(
+        &path(&guest.host("data")),
+        lighter_fs::ownership::RECORD,
+        br#"{"UID":100,"GID":101,"mode":755}"#,
+        0,
+    )
+    .unwrap();
+    lighter_fs::sys::set_xattr(&path(&guest.root), lighter_fs::ownership::MARKER, b"1", 0).unwrap();
+    let mut restarted = restarted_on_a_network_share(&guest);
+    let dir = restarted.lookup(1, "data").unwrap();
+    let reply = restarted.call(op::GETATTR, dir, &[0u8; 16]).unwrap();
+    assert_eq!(mode_and_owner(&reply), (0o700, 100, 101));
+}
+
+/// On the Mac's own disk a file takes its bits, and nothing is recorded.
+#[test]
+fn on_the_macs_own_disk_a_new_files_bits_are_its_own() {
+    let mut guest = Guest::new("local-modes");
+    guest.create_mode(1, "key", 0x8241, 0o600).expect("create");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(guest.host("key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert_eq!(record_on_host(&guest.host("key")), None);
+}
+
 /// exFAT cannot rename without replacing; Linux's own exFAT driver can, the
 /// kernel checking for the target itself. ClickHouse writes its metadata so
 /// (issue #69).
@@ -3026,4 +3143,78 @@ fn an_owner_survives_a_restart_on_a_share_whose_root_cannot_be_marked() {
     let owner = (mode_and_owner(&reply).1, mode_and_owner(&reply).2);
     std::fs::set_permissions(&guest.root, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(owner, (999, 999), "after a restart");
+}
+
+/// A file deleted while open stays on an SMB share as `.smbdelete…` until
+/// its last close. It is gone, as an unlinked file is on Linux: listed, a
+/// Postgres initdb tried to fsync one and failed when it went. On the Mac's
+/// own disk the name is a name like any other.
+#[test]
+fn a_file_deleted_while_open_is_not_listed_on_a_network_share() {
+    let mut guest = on_a_network_share("network-smbdelete");
+    std::fs::write(guest.host("kept"), b"x").unwrap();
+    std::fs::write(guest.host(".smbdeleteAAAd1ea4.4"), b"x").unwrap();
+    let names = guest.list(1, 4096, true);
+    assert!(names.contains(&"kept".to_string()), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with(".smbdelete")),
+        "{names:?}"
+    );
+
+    let mut local = Guest::new("local-smbdelete");
+    std::fs::write(local.host(".smbdeleteAAAd1ea4.4"), b"x").unwrap();
+    let names = local.list(1, 4096, false);
+    assert!(
+        names.contains(&".smbdeleteAAAd1ea4.4".to_string()),
+        "{names:?}"
+    );
+}
+
+/// A queued rename promises the new name to the file it moves. The guest
+/// may forget that file before the job lands — a reset of its caches has it
+/// forget every nodeid and look each name up again — and the promise must
+/// still resolve to the file: dropped from the registry, its lookup went to
+/// a host that had not renamed yet, and Postgres, writing its first WAL
+/// segment under a temporary name and renaming it into place, read back
+/// "could not locate a valid checkpoint record". A queued link likewise.
+#[test]
+fn a_file_forgotten_while_its_rename_is_queued_is_found_by_its_new_name() {
+    let mut guest = Guest::new("forget-during-rename");
+    let before = guest.server.live_inodes();
+    std::fs::write(guest.host("tmp"), b"checkpoint").unwrap();
+    std::fs::write(guest.host("linked"), b"link me").unwrap();
+    let moved = guest.lookup(1, "tmp").unwrap();
+    let target = guest.lookup(1, "linked").unwrap();
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    guest.server.hold_apply();
+
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("tmp"));
+    body.extend_from_slice(&name_body("seg"));
+    guest.call(op::RENAME, 1, &body).expect("rename");
+    let mut body = target.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("hard"));
+    guest.call(op::LINK, 1, &body).expect("link");
+
+    // The guest's caches are reset: it forgets both, lookups and all.
+    guest.call(op::FORGET, moved, &1u64.to_le_bytes()).ok();
+    guest.call(op::FORGET, target, &2u64.to_le_bytes()).ok();
+    let found = guest.lookup(1, "seg");
+    let hard = guest.lookup(1, "hard");
+    guest.server.release_apply();
+    assert_eq!(found, Ok(moved), "the renamed file, by its new name");
+    assert_eq!(hard, Ok(target), "the linked file, by its new name");
+
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
+    assert_eq!(std::fs::read(guest.host("seg")).unwrap(), b"checkpoint");
+    assert_eq!(std::fs::read(guest.host("hard")).unwrap(), b"link me");
+
+    // Forgotten again, both go: a forget put off for a promise is finished.
+    guest.call(op::FORGET, moved, &1u64.to_le_bytes()).ok();
+    guest.call(op::FORGET, target, &1u64.to_le_bytes()).ok();
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "nothing is kept past its promises"
+    );
 }

@@ -87,7 +87,11 @@ printf '{"usb":[{"spec":"%s"},{"spec":"%s"}]}\n' "$ZBT" "$TR" > "$LIGHTER_HOME/c
 echo "==> Booting with both devices in the configuration"
 "$LIGHTER" start >"$LIGHTER_HOME/start.log" 2>&1 &
 for _ in $(seq 1 90); do $D info >/dev/null 2>&1 && break; sleep 1; done
-$D info >/dev/null 2>&1 || { fail "machine did not come up"; exit 1; }
+$D info >/dev/null 2>&1 || {
+	fail "machine did not come up"
+	tail -20 "$LIGHTER_HOME/start.log" "$LIGHTER_HOME/machine.log" 2>/dev/null | sed 's/^/    /'
+	exit 1
+}
 
 echo "==> Attached at start"
 if wait_for 30 has_name "$ZBT_NAME" && wait_for 10 has_name "$TR_NAME"; then

@@ -16,6 +16,7 @@
 //!   server    one request in, one reply out
 //!     ├── fuse       the wire format, and nothing else
 //!     ├── inode      what a nodeid and an fh mean
+//!     ├── mounts     where a network volume is mounted
 //!     ├── opencache  descriptors held once the guest stops reporting opens
 //!     ├── notify     telling the guest to forget something
 //!     ├── cache      how long the guest may believe an answer
@@ -31,6 +32,7 @@ pub mod errno;
 pub mod fsevents;
 pub mod fuse;
 pub mod inode;
+pub mod mounts;
 pub mod notify;
 pub mod opencache;
 pub mod ownership;

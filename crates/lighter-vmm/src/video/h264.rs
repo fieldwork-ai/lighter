@@ -17,10 +17,16 @@
 //! What that order IS comes from each slice header's picture order count
 //! (8.2.1), not from the timestamps the guest put on the packets, which a
 //! client may set to anything.
+//!
+//! A stream may carry several parameter sets at once, each under its own id,
+//! and a slice names the one it is coded with (7.4.1.2.1): the slice its PPS,
+//! the PPS its SPS. So they are kept by id, and the SPS a slice names is the
+//! one its order is read with and its format description is made from.
 
 use super::bits::{BitWriter, Bits, escape, unescape};
 use super::codec::{FormatDescription, Order, Parser, Unit, annexb_nals, length_prefixed};
 use super::vt_sys as vt;
+use std::collections::BTreeMap;
 
 /// What the decoder needs from an SPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,12 +78,14 @@ pub fn parse(nal: &[u8]) -> Option<Sps> {
             }
         }
     }
-    let log2_max_frame_num = r.ue()? + 4;
+    // Both widths are at most 16 bits (7.4.2.1.1); anything wider is not an
+    // SPS a slice header can be read with.
+    let log2_max_frame_num = r.ue().filter(|&n| n <= 12)? + 4;
     let poc_type = r.ue()?;
     let mut log2_max_poc_lsb = 0;
     match poc_type {
         0 => {
-            log2_max_poc_lsb = r.ue()? + 4;
+            log2_max_poc_lsb = r.ue().filter(|&n| n <= 12)? + 4;
         }
         1 => {
             r.bit()?; // delta_pic_order_always_zero_flag
@@ -153,6 +161,41 @@ pub struct Slice {
     pub reference: bool,
     /// `pic_order_cnt_lsb`, when the SPS counts in type 0; else 0.
     pub poc_lsb: u32,
+}
+
+/// The id an SPS is known by (header byte included), at most 31.
+fn sps_id(nal: &[u8]) -> Option<u32> {
+    if nal_type(nal) != NAL_SPS {
+        return None;
+    }
+    let rbsp = unescape(&nal[1..nal.len().min(16)]);
+    let mut r = Bits::new(&rbsp);
+    r.bits(24)?; // profile_idc, constraint flags, level_idc
+    r.ue().filter(|&id| id <= 31)
+}
+
+/// A PPS's own id, at most 255, and the id of the SPS it names.
+fn pps_ids(nal: &[u8]) -> Option<(u32, u32)> {
+    if nal_type(nal) != NAL_PPS {
+        return None;
+    }
+    let rbsp = unescape(&nal[1..nal.len().min(16)]);
+    let mut r = Bits::new(&rbsp);
+    let pps = r.ue().filter(|&id| id <= 255)?;
+    let sps = r.ue().filter(|&id| id <= 31)?;
+    Some((pps, sps))
+}
+
+/// The id of the PPS a coded slice names.
+fn slice_pps_id(nal: &[u8]) -> Option<u32> {
+    if !matches!(nal_type(nal), 1 | 5) {
+        return None;
+    }
+    let rbsp = unescape(&nal[1..nal.len().min(16)]);
+    let mut r = Bits::new(&rbsp);
+    r.ue()?; // first_mb_in_slice
+    r.ue()?; // slice_type
+    r.ue()
 }
 
 /// Reads a coded slice NAL's header (header byte included). `None` for any
@@ -236,9 +279,16 @@ fn nal_type(nal: &[u8]) -> u8 {
 /// pictures.
 #[derive(Default)]
 pub struct Stream {
-    sps: Vec<u8>,
-    pps: Vec<u8>,
-    info: Option<Sps>,
+    /// Each SPS by id, as sent and as read.
+    sps: BTreeMap<u32, (Vec<u8>, Option<Sps>)>,
+    /// Each PPS by id, as sent, with the id of the SPS it names.
+    pps: BTreeMap<u32, (Vec<u8>, u32)>,
+    /// The PPS the last slice named, or before any slice the last one sent.
+    active: Option<u32>,
+    /// Whether a slice has named one yet.
+    named: bool,
+    /// The SPS the session's format description was last made from.
+    described: Option<u32>,
     /// IDRs seen: each restarts the picture order count.
     epoch: u64,
     poc: PocCounter,
@@ -251,7 +301,7 @@ impl Stream {
     /// count from `frame_num` and offsets in the SPS, and nothing seen in
     /// practice uses it with B-frames; it is left in decode order.
     fn order_of(&mut self, nals: &[&[u8]], seq: i64) -> Order {
-        let Some(info) = self.info else {
+        let Some(info) = self.active_sps().and_then(|(_, _, info)| info) else {
             return (self.epoch, seq);
         };
         let Some(slice) = nals.iter().find_map(|n| slice(n, &info)) else {
@@ -266,26 +316,46 @@ impl Stream {
             (self.epoch, seq)
         }
     }
+
+    /// The SPS the active PPS names: its id, as sent, and as read.
+    fn active_sps(&self) -> Option<(u32, &[u8], Option<Sps>)> {
+        let (_, id) = self.pps.get(&self.active?)?;
+        let (sent, info) = self.sps.get(id)?;
+        Some((*id, sent, *info))
+    }
 }
 
 impl Parser for Stream {
     fn unit(&mut self, data: &[u8], seq: i64) -> Unit {
         let nals = annexb_nals(data);
+        // A parameter set sent again as it was changes nothing; one sent
+        // with new contents may change what the session decodes.
         let mut changed = false;
         for nal in &nals {
-            match nal_type(nal) {
-                NAL_SPS if self.sps.as_slice() != *nal => {
-                    self.sps = nal.to_vec();
-                    self.info = parse(nal);
+            if let Some(id) = sps_id(nal)
+                && self.sps.get(&id).is_none_or(|(sent, _)| sent != nal)
+            {
+                self.sps.insert(id, (nal.to_vec(), parse(nal)));
+                changed = true;
+            } else if let Some((id, sps)) = pps_ids(nal) {
+                if self.pps.get(&id).is_none_or(|(sent, _)| sent != nal) {
+                    self.pps.insert(id, (nal.to_vec(), sps));
                     changed = true;
                 }
-                NAL_PPS if self.pps.as_slice() != *nal => {
-                    self.pps = nal.to_vec();
-                    changed = true;
+                if !self.named {
+                    self.active = Some(id);
                 }
-                _ => {}
             }
         }
+        if let Some(id) = nals.iter().find_map(|n| slice_pps_id(n))
+            && self.pps.contains_key(&id)
+        {
+            self.active = Some(id);
+            self.named = true;
+        }
+        let sps = self.active_sps().map(|(id, _, _)| id);
+        changed |= sps != self.described;
+        self.described = sps;
         // Every slice NAL (and SEI) goes to VideoToolbox length-prefixed;
         // the parameter sets are in the format description.
         let sample = length_prefixed(
@@ -301,25 +371,33 @@ impl Parser for Stream {
         }
     }
 
+    /// The active SPS and every PPS that names it, so that a slice may name
+    /// any of them without a new description.
     fn format_description(&self) -> Option<Result<FormatDescription, vt::OSStatus>> {
-        if self.sps.is_empty() || self.pps.is_empty() {
-            return None;
-        }
-        Some(
-            FormatDescription::from_parameter_sets(false, &[&self.sps, &self.pps]).or_else(|st| {
-                let stripped = without_vui(&self.sps).ok_or(st)?;
-                let desc = FormatDescription::from_parameter_sets(false, &[&stripped, &self.pps])?;
-                tracing::info!(
-                    st,
-                    "VideoToolbox refused the stream's SPS; decoding it without its VUI"
-                );
-                Ok(desc)
-            }),
-        )
+        let (id, sps, _) = self.active_sps()?;
+        let pps: Vec<&[u8]> = self
+            .pps
+            .values()
+            .filter(|(_, named)| *named == id)
+            .map(|(sent, _)| sent.as_slice())
+            .collect();
+        let with = |sps: &[u8]| {
+            let sets: Vec<&[u8]> = std::iter::once(sps).chain(pps.iter().copied()).collect();
+            FormatDescription::from_parameter_sets(false, &sets)
+        };
+        Some(with(sps).or_else(|st| {
+            let stripped = without_vui(sps).ok_or(st)?;
+            let desc = with(&stripped)?;
+            tracing::info!(
+                st,
+                "VideoToolbox refused the stream's SPS; decoding it without its VUI"
+            );
+            Ok(desc)
+        }))
     }
 
     fn reorder_depth(&self) -> Option<u32> {
-        self.info.and_then(|i| i.reorder)
+        self.active_sps().and_then(|(_, _, info)| info?.reorder)
     }
 
     fn ten_bit(&self) -> bool {
@@ -448,19 +526,18 @@ pub(crate) mod tests {
         assert_eq!(sps.reorder, Some(2), "{sps:?}");
     }
 
-    #[test]
-    fn baseline_without_vui_reorders_nothing() {
-        // Baseline, level 3.0, sps_id 0, log2_max_frame_num 4, poc
-        // type 0, log2_max_poc_lsb 4, 1 ref, no gaps, 40x30 MBs, frame_mbs_only,
-        // direct_8x8, no cropping, no VUI.
+    /// Baseline, level 3.0, the given id, log2_max_frame_num 4 + `frame`,
+    /// poc type 0, log2_max_poc_lsb 4 + `poc`, 1 ref, no gaps, 40x30 MBs,
+    /// frame_mbs_only, direct_8x8, no cropping, no VUI.
+    pub(crate) fn baseline_sps(id: u32, frame: u32, poc: u32) -> Vec<u8> {
         let mut w = Writer::default();
         w.bits(66, 8);
         w.bits(0xc0, 8);
         w.bits(30, 8);
+        w.ue(id);
+        w.ue(frame);
         w.ue(0);
-        w.ue(0);
-        w.ue(0);
-        w.ue(0);
+        w.ue(poc);
         w.ue(1);
         w.bits(0, 1);
         w.ue(39);
@@ -471,6 +548,56 @@ pub(crate) mod tests {
         w.bits(0, 1);
         let mut nal = vec![0x67];
         nal.extend(w.finish());
+        nal
+    }
+
+    /// A CABAC PPS with the given id, naming the given SPS, and
+    /// `pic_init_qp_minus26` written as the Exp-Golomb code `qp`.
+    pub(crate) fn pps(id: u32, sps: u32, qp: u32) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.ue(id);
+        w.ue(sps);
+        w.bits(1, 1); // entropy_coding_mode_flag
+        w.bits(0, 1); // bottom_field_pic_order_in_frame_present_flag
+        w.ue(0); // num_slice_groups_minus1
+        w.ue(0); // num_ref_idx_l0_default_active_minus1
+        w.ue(0); // num_ref_idx_l1_default_active_minus1
+        w.bits(0, 3); // weighted_pred_flag, weighted_bipred_idc
+        w.ue(qp); // pic_init_qp_minus26
+        w.ue(0); // pic_init_qs_minus26
+        w.ue(0); // chroma_qp_index_offset
+        w.bits(0b100, 3); // deblocking control, constrained intra, redundant_pic_cnt
+        let mut nal = vec![0x68];
+        nal.extend(w.finish());
+        nal
+    }
+
+    /// A reference slice header naming PPS `pps`, read with `sps`: a P
+    /// slice, or an I slice of an IDR picture.
+    fn slice_nal(pps: u32, sps: &Sps, poc_lsb: u64, idr: bool) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.ue(0); // first_mb_in_slice
+        w.ue(if idr { 7 } else { 5 }); // slice_type
+        w.ue(pps);
+        w.bits(0, sps.log2_max_frame_num);
+        if idr {
+            w.ue(0); // idr_pic_id
+        }
+        w.bits(poc_lsb, sps.log2_max_poc_lsb);
+        let mut nal = vec![if idr { 0x65 } else { 0x41 }];
+        nal.extend(w.finish());
+        nal
+    }
+
+    fn annexb(nals: &[&[u8]]) -> Vec<u8> {
+        nals.iter()
+            .flat_map(|nal| [&[0u8, 0, 0, 1][..], nal].concat())
+            .collect()
+    }
+
+    #[test]
+    fn baseline_without_vui_reorders_nothing() {
+        let mut nal = baseline_sps(0, 0, 0);
         let sps = parse(&nal).expect("parses");
         assert_eq!((sps.profile_idc, sps.reorder), (66, Some(0)));
         assert_eq!(
@@ -572,20 +699,113 @@ pub(crate) mod tests {
 
     #[test]
     fn a_sample_carries_the_slices_and_leaves_parameter_sets_out() {
-        let data = [
-            &[0u8, 0, 0, 1, 0x67, 9][..],
-            &[0, 0, 0, 1, 0x68, 9],
-            &[0, 0, 0, 1, 0x09, 0xf0],
-            &[0, 0, 0, 1, 0x65, 1, 2, 3],
-            &[0, 0, 0, 1, 0x06, 7],
-        ]
-        .concat();
+        let data = annexb(&[
+            X264_HIGH_BF2,
+            REOLINK_PPS,
+            &[0x09, 0xf0],
+            &[0x65, 0x88, 2, 3],
+            &[0x06, 7],
+        ]);
         let unit = Stream::default().unit(&data, 0);
         assert!(unit.changed);
         assert_eq!(
             unit.sample,
-            vec![0, 0, 0, 4, 0x65, 1, 2, 3, 0, 0, 0, 2, 0x06, 7]
+            vec![0, 0, 0, 4, 0x65, 0x88, 2, 3, 0, 0, 0, 2, 0x06, 7]
         );
+    }
+
+    #[test]
+    fn parameter_sets_sent_again_as_they_were_change_nothing() {
+        let mut stream = Stream::default();
+        let info = parse(X264_HIGH_BF2).unwrap();
+        let first = annexb(&[X264_HIGH_BF2, REOLINK_PPS, &slice_nal(0, &info, 0, false)]);
+        assert!(stream.unit(&first, 0).changed);
+        assert!(!stream.unit(&first, 1).changed);
+        // The same id with new contents is a change.
+        let other = pps(0, 0, 1);
+        assert!(
+            stream
+                .unit(&annexb(&[&other, &slice_nal(0, &info, 2, false)]), 2)
+                .changed
+        );
+    }
+
+    #[test]
+    fn a_slice_is_read_with_the_sps_its_pps_names() {
+        // SPS 0 is x264's 1080p, reordering 2 frames, with a 6-bit lsb;
+        // SPS 1 is a 640x480 Baseline that reorders none, with an 8-bit one.
+        let high = parse(X264_HIGH_BF2).unwrap();
+        let base_nal = baseline_sps(1, 0, 4);
+        let base = parse(&base_nal).unwrap();
+        assert_ne!(high.log2_max_poc_lsb, base.log2_max_poc_lsb);
+        let (pps0, pps1) = (pps(0, 0, 0), pps(1, 1, 0));
+        let mut stream = Stream::default();
+        stream.unit(&annexb(&[X264_HIGH_BF2, &pps0]), 0);
+        let unit = stream.unit(&annexb(&[&slice_nal(0, &high, 4, false)]), 1);
+        assert_eq!(stream.reorder_depth(), Some(2));
+        assert_eq!(unit.order.1, 4);
+        // Announcing the second pair ahead of its slices describes the
+        // stream no differently: its slices still name the first.
+        stream.unit(&annexb(&[&base_nal, &pps1]), 2);
+        let unit = stream.unit(&annexb(&[&slice_nal(0, &high, 6, false)]), 3);
+        assert!(!unit.changed);
+        assert_eq!(stream.reorder_depth(), Some(2));
+        assert_eq!(unit.order.1, 6);
+        assert_eq!(
+            stream.format_description().unwrap().unwrap().dimensions(),
+            (1920, 1080)
+        );
+        // A slice naming PPS 1 moves to SPS 1: a new description, the
+        // smaller size, and its own lsb width to read the slice with.
+        let unit = stream.unit(&annexb(&[&slice_nal(1, &base, 100, true)]), 4);
+        assert!(unit.changed);
+        assert_eq!(stream.reorder_depth(), Some(0));
+        assert_eq!(unit.order.1, 100);
+        assert_eq!(
+            stream.format_description().unwrap().unwrap().dimensions(),
+            (640, 480)
+        );
+    }
+
+    #[test]
+    fn every_pps_of_the_active_sps_is_in_the_description() {
+        // So a slice may switch between them, and back, with no new one.
+        let info = parse(X264_HIGH_BF2).unwrap();
+        let (pps0, pps1) = (pps(0, 0, 0), pps(1, 0, 2));
+        let mut stream = Stream::default();
+        stream.unit(
+            &annexb(&[X264_HIGH_BF2, &pps0, &pps1, &slice_nal(0, &info, 0, false)]),
+            0,
+        );
+        for (seq, id) in [(1, 1), (2, 0), (3, 1)] {
+            let unit = stream.unit(
+                &annexb(&[&slice_nal(id, &info, 2 * seq as u64, false)]),
+                seq,
+            );
+            assert!(!unit.changed);
+        }
+        let desc = stream.format_description().unwrap().unwrap();
+        let mut count = 0usize;
+        let st = unsafe {
+            vt::CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                desc.0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!((st, count), (0, 3));
+    }
+
+    #[test]
+    fn an_sps_wider_than_the_standard_allows_is_refused() {
+        // A guest may send anything; 16 bits is the most either field takes.
+        assert!(parse(&baseline_sps(0, 12, 12)).is_some());
+        assert!(parse(&baseline_sps(0, 13, 0)).is_none());
+        assert!(parse(&baseline_sps(0, 0, 13)).is_none());
+        assert!(parse(&baseline_sps(0, u32::MAX - 1, 0)).is_none());
     }
 
     #[test]
