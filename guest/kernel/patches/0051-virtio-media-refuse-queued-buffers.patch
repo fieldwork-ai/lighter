@@ -1,0 +1,21 @@
+# virtio-media: refuse to queue a buffer that is already queued, or completed and not yet dequeued,
+# with EINVAL as vb2 does. The driver sent the second QBUF to the device, which took it, so a buffer
+# could be queued twice; v4l2-compliance queues one twice to check that the second is refused.
+diff --git a/drivers/media/virtio/virtio_media_ioctls.c b/drivers/media/virtio/virtio_media_ioctls.c
+--- a/drivers/media/virtio/virtio_media_ioctls.c
++++ b/drivers/media/virtio/virtio_media_ioctls.c
+@@ -884,6 +884,14 @@
+ 	if (b->index >= queue->allocated_bufs)
+ 		return -EINVAL;
+ 	buffer = &queue->buffers[b->index];
++
++	/*
++	 * As vb2: a buffer the device holds, or has completed for userspace to
++	 * dequeue, cannot be queued again.
++	 */
++	if (buffer->buffer.flags & (V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_DONE))
++		return -EINVAL;
++
+ 	prepared = buffer->buffer.flags & V4L2_BUF_FLAG_PREPARED;
+ 
+ 	/*

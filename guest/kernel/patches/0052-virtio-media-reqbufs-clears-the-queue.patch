@@ -1,0 +1,27 @@
+# virtio-media: clear a queue's state on every REQBUFS, as vb2 frees a queue's buffers whatever the
+# count, not only on REQBUFS(0). A buffer queued before a REQBUFS that reallocated the queue still
+# counted in queued_bufs, so poll never reported the queue writable again (v4l2-compliance's
+# streaming test queues buffers, reallocates, and waits on poll), and one waiting to be dequeued
+# stayed linked into pending_dqbufs from the buffer array REQBUFS freed.
+diff --git a/drivers/media/virtio/virtio_media_ioctls.c b/drivers/media/virtio/virtio_media_ioctls.c
+--- a/drivers/media/virtio/virtio_media_ioctls.c
++++ b/drivers/media/virtio/virtio_media_ioctls.c
+@@ -730,9 +730,15 @@
+ 
+ 	queue = &session->queues[b->type];
+ 
+-	/* REQBUFS(0) is an implicit STREAMOFF. */
+-	if (b->count == 0)
+-		virtio_media_clear_queue(session, queue);
++	/*
++	 * REQBUFS frees the queue's buffers, as vb2's does, whatever the count:
++	 * none stays queued or waiting to be dequeued (and REQBUFS(0) is an
++	 * implicit STREAMOFF). Kept, a buffer queued before it still counted in
++	 * queued_bufs, so poll never reported the queue writable again, and a
++	 * pending one stayed linked into pending_dqbufs from the array freed
++	 * below.
++	 */
++	virtio_media_clear_queue(session, queue);
+ 
+ 	if (b->count > 0) {
+ 		buffers = vzalloc(sizeof(struct virtio_media_buffer) * b->count);

@@ -213,6 +213,7 @@ for fixture in no-reorder-bound.mp4 reorder-original.md5; do
 	docker cp "$RUN_DIR/$fixture" "$container:/$fixture" >/dev/null
 done
 docker cp "$ROOT/scripts/gates/fixtures/v4l2-streamoff-race.py" "$container:/race.py" >/dev/null
+docker cp "$ROOT/scripts/gates/fixtures/size-change-frames.py" "$container:/size-change-frames.py" >/dev/null
 docker start "$container" >/dev/null
 in_container() { docker exec "$container" bash -c "$1" 2>&1; }
 if ! in_container 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ffmpeg v4l-utils python3 >/dev/null 2>&1' >/dev/null; then
@@ -293,24 +294,30 @@ echo IDS_RESULT \$sw_exit \$hw_exit \$(wc -l < /tmp/ids-hw.frames) \$match
 	done
 
 	# A size change mid-stream: the device says so when the new size
-	# arrives, and ffmpeg takes new CAPTURE buffers and goes on.
+	# arrives, hands back the old size's frames, and stops until ffmpeg has
+	# new CAPTURE buffers. Timing decides how many old frames ffmpeg itself
+	# throws away (size-change-frames.py), so each clip plays five times;
+	# a run that loses anything else fails.
 	for change in shrink grow; do
 		sizes="$(in_container "
 change=$change
 timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error -i /\$change.mkv -noautoscale -pix_fmt yuv420p -f framemd5 /tmp/size-sw.md5
-sw_exit=\$?
-timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error -c:v h264_v4l2m2m -i /\$change.mkv -noautoscale -pix_fmt yuv420p -f framemd5 /tmp/size-hw.md5
-hw_exit=\$?
+echo SIZE_SW \$?
 grep -v '^#' /tmp/size-sw.md5 | awk -F, '{print \$5, \$NF}' > /tmp/size-sw.frames
-grep -v '^#' /tmp/size-hw.md5 | awk -F, '{print \$5, \$NF}' > /tmp/size-hw.frames
-if cmp -s /tmp/size-sw.frames /tmp/size-hw.frames; then match=same; else match=differ; fi
-echo SIZE_RESULT \$sw_exit \$hw_exit \$(wc -l < /tmp/size-hw.frames) \$match
+for run in 1 2 3 4 5; do
+	timeout -s KILL 90 ffmpeg -nostdin -y -hide_banner -loglevel error -c:v h264_v4l2m2m -i /\$change.mkv -noautoscale -pix_fmt yuv420p -f framemd5 /tmp/size-hw.md5
+	hw_exit=\$?
+	grep -v '^#' /tmp/size-hw.md5 | awk -F, '{print \$5, \$NF}' > /tmp/size-hw.frames
+	echo SIZE_RUN \$hw_exit \$(python3 -I /size-change-frames.py /tmp/size-sw.frames /tmp/size-hw.frames)
+done
 ")"
 		echo "$sizes" | sed 's/^/    /'
-		if [ "$(awk '/^SIZE_RESULT/ {print $2, $3, $4, $5}' <<<"$sizes")" = "0 0 120 same" ]; then
-			pass "H.264 $change mid-stream: all 120 frames, at both sizes, match software decode"
+		runs="$(grep -c '^SIZE_RUN 0 \(exact\|dropped [0-9]*\)$' <<<"$sizes")"
+		exact="$(grep -c '^SIZE_RUN 0 exact$' <<<"$sizes")"
+		if grep -q '^SIZE_SW 0$' <<<"$sizes" && [ "$runs" = 5 ]; then
+			pass "H.264 $change mid-stream: 5 runs, every frame at both sizes matches software decode in $exact; the rest lack only frames ffmpeg drops at the change"
 		else
-			fail "H.264 $change mid-stream: $(grep '^SIZE_RESULT' <<<"$sizes")"
+			fail "H.264 $change mid-stream: $(grep '^SIZE_' <<<"$sizes" | tr '\n' ';')"
 		fi
 	done
 
