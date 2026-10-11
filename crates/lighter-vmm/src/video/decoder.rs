@@ -482,6 +482,12 @@ pub struct Session {
     /// 4.5.1.9), however large, and a frame put in one after the LAST
     /// buffer would be lost with it.
     generation: u64,
+    /// The generation CAPTURE buffers are queued for: behind `generation`
+    /// from a change until the guest restarts CAPTURE or sends START. A
+    /// buffer the guest queues in between is the old format's too: ffmpeg
+    /// hands one back as soon as it has read the old format's last frame,
+    /// and a frame of the new one put in it is lost when CAPTURE turns off.
+    resumed: u64,
     /// The size of an OUTPUT buffer: the guest's, within bounds.
     input_size: u32,
     stream: StreamParams,
@@ -537,6 +543,7 @@ impl Session {
             accepting_output: true,
             capture_streaming: false,
             generation: 0,
+            resumed: 0,
         }
     }
 
@@ -973,7 +980,7 @@ impl VideoDecoderBackendSession for Session {
             index,
             ptr: plane.bytes_mut().as_mut_ptr(),
             len,
-            generation: self.generation,
+            generation: self.resumed,
         });
         self.emit_frames();
         Ok(())
@@ -1029,6 +1036,7 @@ impl VideoDecoderBackendSession for Session {
     /// after it would end its stream.
     fn resume(&mut self) {
         let generation = self.generation;
+        self.resumed = generation;
         self.ready
             .retain(|r| !matches!(r, Ready::Last(older) if *older != generation));
         for r in &mut self.ready {
@@ -1047,6 +1055,13 @@ impl VideoDecoderBackendSession for Session {
             self.capture_streaming = streaming;
             if streaming {
                 self.accepting_output = true;
+                // Buffers queued while CAPTURE was off are for the format
+                // the guest has turned it back on for.
+                self.resumed = self.generation;
+                for buffer in &mut self.available {
+                    buffer.generation = self.generation;
+                }
+                self.emit_frames();
             }
         }
     }
@@ -1552,6 +1567,29 @@ mod tests {
         s.available.push_back(buffer(&mut c, 2, 1));
         s.emit_frames();
         assert_eq!(completed(&mut s), vec![(2, false)]);
+    }
+
+    #[test]
+    fn buffers_queued_before_the_guest_goes_on_wait_for_it() {
+        let mut s = Session::new(Codec::H264);
+        let queue = |s: &mut Session, index| {
+            let mut backing = Backing::new(QueueType::VideoCaptureMplane, index, &[1]).unwrap();
+            s.use_as_output(index, &mut backing).unwrap();
+            backing
+        };
+        // A change, after the old format's LAST has gone out: the guest
+        // hands a buffer back before it reads the change.
+        s.generation = 1;
+        s.ready.push_back(Ready::Frame(frame(1), (16, 16), NV12, 1));
+        let _a = queue(&mut s, 0);
+        assert_eq!(completed(&mut s), vec![]);
+        // It turns CAPTURE off, queues new buffers and turns it on.
+        s.clear_output_buffers().unwrap();
+        s.streaming_state(QueueDirection::Capture, false);
+        let _b = queue(&mut s, 1);
+        assert_eq!(completed(&mut s), vec![]);
+        s.streaming_state(QueueDirection::Capture, true);
+        assert_eq!(completed(&mut s), vec![(1, false)]);
     }
 
     #[test]

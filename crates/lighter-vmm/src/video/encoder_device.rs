@@ -330,7 +330,11 @@ pub struct EncoderSession {
     headers_sent: bool,
     eos_subscribed: bool,
     ctrl_subscriptions: ControlSubscriptions,
+    /// The next CAPTURE buffer's sequence number, and OUTPUT's: V4L2
+    /// numbers each queue's buffers in the order it returns them, from 0 at
+    /// each STREAMON.
     sequence: u32,
+    input_sequence: u32,
 }
 
 // The VideoToolbox session is used from whichever thread holds the
@@ -372,6 +376,7 @@ impl EncoderSession {
             eos_subscribed: false,
             ctrl_subscriptions: ControlSubscriptions::default(),
             sequence: 0,
+            input_sequence: 0,
         }
     }
 
@@ -729,6 +734,8 @@ where
         }
         let buffer = &mut session.input[index as usize];
         buffer.v4l2.clear_flags(BufferFlags::QUEUED);
+        buffer.v4l2.set_sequence(session.input_sequence);
+        session.input_sequence += 1;
         if error {
             buffer.v4l2.add_flags(BufferFlags::ERROR);
         }
@@ -1097,6 +1104,10 @@ where
             count
         };
         let buffers = if queue == QueueType::VideoOutputMplane {
+            // The buffers it held go, and with them any still waiting to be
+            // encoded: kept, their indices would be encoded again from the
+            // new buffers.
+            session.waiting.clear();
             &mut session.input
         } else {
             session.available.clear();
@@ -1171,14 +1182,19 @@ where
         if buffer.memory() != MemoryType::Mmap {
             return Err(libc::EINVAL);
         }
-        let plane = buffer.get_first_plane();
-        let (bytesused, length) = (*plane.bytesused, *plane.length);
+        let bytesused = *buffer.get_first_plane().bytesused;
+        // The plane's length is the one allocated, not the guest's: V4L2
+        // ignores what a client passes for an MMAP buffer, and one that
+        // passed 0 would get 0 back from DQBUF and fail to queue it again.
+        if queue.direction() == QueueDirection::Output
+            && bytesused > *host.v4l2.get_first_plane().length
+        {
+            return Err(libc::EINVAL);
+        }
         host.v4l2
             .set_flags(BufferFlags::TIMESTAMP_COPY | BufferFlags::QUEUED);
         host.v4l2.set_timestamp(buffer.timestamp());
-        let host_plane = host.v4l2.get_first_plane_mut();
-        *host_plane.bytesused = bytesused;
-        *host_plane.length = length;
+        *host.v4l2.get_first_plane_mut().bytesused = bytesused;
         let reply = host.v4l2.clone();
         match queue.direction() {
             QueueDirection::Output => {
@@ -1208,11 +1224,17 @@ where
                 if session.input.is_empty() {
                     return Err(libc::EINVAL);
                 }
+                if !session.output_streaming {
+                    session.input_sequence = 0;
+                }
                 session.output_streaming = true;
             }
             QueueType::VideoCaptureMplane => {
                 if session.output.is_empty() {
                     return Err(libc::EINVAL);
+                }
+                if !session.capture_streaming {
+                    session.sequence = 0;
                 }
                 session.capture_streaming = true;
                 session.available.extend(session.parked.drain(..));

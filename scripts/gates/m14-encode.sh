@@ -193,10 +193,11 @@ docker rm -f "$bw" >/dev/null 2>&1 || true
 echo
 echo "==> ffmpeg 7.1 and GStreamer (${TRIXIE})"
 tx="$(docker create --device lighter.sh/video=all "$TRIXIE" sleep infinity)"
+docker cp "$ROOT/scripts/gates/fixtures/v4l2-stream-hdr.py" "$tx:/v4l2-stream-hdr.py" >/dev/null
 docker start "$tx" >/dev/null
 in_tx() { docker exec "$tx" bash -c "$HELPERS$1" 2>&1; }
-if ! in_tx 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends ffmpeg gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-base v4l-utils >/dev/null 2>&1' >/dev/null; then
-	fail "the container could not install ffmpeg, GStreamer and v4l-utils (network?)"
+if ! in_tx 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends ffmpeg gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-base v4l-utils python3 >/dev/null 2>&1' >/dev/null; then
+	fail "the container could not install ffmpeg, GStreamer, v4l-utils and python3 (network?)"
 else
 	out="$(in_tx '
 # ffmpeg 7.1 drains until no CAPTURE buffer is queued; with its default
@@ -218,22 +219,25 @@ echo "GST10 $(frames /tmp/g10.mp4) $(ffprobe -v error -show_entries stream=profi
 	[ "$(grep ^GST264 <<<"$out")" = "GST264 120 Main" ] && pass "GStreamer: 120 frames, the profile it negotiated" || fail "GStreamer H.264: $(grep ^GST264 <<<"$out")"
 	[ "$(grep ^GSTBF <<<"$out")" = "GSTBF 120 2" ] && pass "B-frames on request, with GStreamer holding every frame's buffer" || fail "GStreamer B-frames: $(grep ^GSTBF <<<"$out")"
 	[ "$(grep ^GST10 <<<"$out")" = "GST10 60 Main 10,yuv420p10le" ] && pass "HEVC Main 10 on request" || fail "GStreamer Main 10: $(grep ^GST10 <<<"$out")"
-	# v4l2-compliance holds both devices to what V4L2 promises clients. The
-	# encoder passes it whole. The decoder fails one test the host cannot
-	# answer: the guest driver takes VIDIOC_G_PARM for every device, so the
-	# V4L2 core refuses a bad buffer type with EINVAL before the device can
-	# say ENOTTY, which is what a stateful decoder must answer.
+	# A stream for the decoder, an access unit to a buffer: v4l2-ctl and
+	# v4l2-compliance stream it, where a decoder given nothing parses nothing.
+	in_tx 'ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=640x360:rate=30 -frames:v 60 -c:v libx264 -profile:v main -bf 2 -g 30 -f h264 /tmp/stream.h264 && python3 -I /v4l2-stream-hdr.py /tmp/stream.h264 /tmp/stream.hdr' >/dev/null
+	# v4l2-ctl follows the V4L2 sequence to the letter, as ffmpeg does not:
+	# it queues CAPTURE buffers without a plane length, which V4L2 ignores
+	# for MMAP, and requeues each with the 0 the device then returned, and
+	# it sets up CAPTURE again at the source change. 60 frames of 640x360.
+	ctl="$(in_tx 'timeout -s KILL 60 v4l2-ctl -d /dev/video0 --stream-mmap --stream-out-mmap --stream-from-hdr /tmp/stream.hdr --stream-to /tmp/ctl.nv12 --stream-count 60 --stream-poll >/dev/null 2>&1; echo "CTL $? $(stat -c %s /tmp/ctl.nv12 2>/dev/null)"')"
+	[ "$(grep ^CTL <<<"$ctl")" = "CTL 0 $((60 * 640 * 360 * 3 / 2))" ] && pass "v4l2-ctl decodes all 60 frames" || fail "v4l2-ctl decode: $(grep ^CTL <<<"$ctl")"
+	# v4l2-compliance, streaming tests included (the decoder's from the
+	# stream above), holds both devices to what V4L2 promises clients, and
+	# both pass it whole.
 	for dev in video0 video1; do
-		# It exits nonzero on any failure, including the one allowed.
-		report="$(in_tx "v4l2-compliance -d /dev/$dev 2>&1" || true)"
-		failures="$(grep -E "^[[:space:]]*fail:" <<<"$report" | sed "s/^[[:space:]]*//" || true)"
+		args="-d /dev/$dev -s"
+		[ "$dev" = video0 ] && args="$args --stream-from-hdr /tmp/stream.hdr"
+		report="$(in_tx "v4l2-compliance $args 2>&1" || true)"
+		failures="$(grep -E "^[[:space:]]*fail:" <<<"$report" || true)"
 		total="$(grep "^Total" <<<"$report" || true)"
-		if [ "$dev" = video0 ]; then
-			allowed="fail: v4l2-test-formats.cpp(1445): node->is_m2m && !is_stateful_enc"
-		else
-			allowed=""
-		fi
-		if [ -n "$total" ] && [ "$failures" = "$allowed" ]; then
+		if [ -n "$total" ] && [ -z "$failures" ]; then
 			pass "v4l2-compliance /dev/$dev: ${total#*: }"
 		else
 			fail "v4l2-compliance /dev/$dev: ${total:-no report}"; grep -E "fail:|FAIL" <<<"$report" | sed 's/^/    /'
