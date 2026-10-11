@@ -250,17 +250,6 @@ pub fn machine() -> anyhow::Result<()> {
     {
         cmdline.push_str(" lighter.nosockmap");
     }
-    // `LIGHTER_CMDLINE_EXTRA`: words appended to the guest's command line,
-    // for an A/B of an agent or kernel knob on a machine run from the CLI
-    // (the benchmark harness has the same).
-    if let Ok(extra) = std::env::var("LIGHTER_CMDLINE_EXTRA") {
-        let extra = extra.trim();
-        if !extra.is_empty() {
-            cmdline.push(' ');
-            cmdline.push_str(extra);
-        }
-    }
-
     // LAN mode: a second card bridged to one of the Mac's, so the machine
     // is on the user's network (`lan.rs`). A machine that cannot bridge
     // starts without it, and `lighter status` and `doctor` say why.
@@ -282,16 +271,57 @@ pub fn machine() -> anyhow::Result<()> {
     if lan.is_some() {
         let _ = std::fs::remove_file(home.join("lan-error"));
     }
+    // Direct access: the link, a network of the Mac and the machine alone,
+    // on which containers have addresses the Mac can reach (`link.rs`). A
+    // machine that cannot make it starts without it, and `lighter status`
+    // says why.
+    let link = if config.direct {
+        match crate::link::plan(&home, &config.direct_subnet).and_then(|plan| {
+            let names = Arc::new(
+                lighter_vmm::mdns::Names::new(plan.mac, plan.guest())
+                    .with_ipv6(plan.guest6(), plan.host6()),
+            );
+            Ok((crate::link::connect(&plan, names.clone())?, plan, names))
+        }) {
+            Ok((card, plan, names)) => {
+                cmdline.push_str(&plan.kernel_arg());
+                tracing::info!(subnet = %plan.subnet, mac = %lighter_vmnet::helper::mac_text(plan.mac), "the link is up");
+                let _ = std::fs::remove_file(home.join("link-error"));
+                Some((Arc::new(card), plan, names))
+            }
+            Err(why) => {
+                tracing::warn!(%why, "the machine starts without the link; containers are reached by published ports only");
+                let _ = std::fs::write(home.join("link-error"), &why);
+                None
+            }
+        }
+    } else {
+        let _ = std::fs::remove_file(home.join("link-error"));
+        None
+    };
     cmdline.push_str(match config.publish {
         crate::config::Publish::Lan => " lighter.publish=lan",
         crate::config::Publish::Localhost => " lighter.publish=localhost",
     });
+
+    // `LIGHTER_CMDLINE_EXTRA`: words appended to the guest's command line,
+    // for an A/B of an agent or kernel knob on a machine run from the CLI
+    // (the benchmark harness has the same). Last, so that a word here
+    // overrides one lighter set: init takes the last of each.
+    if let Ok(extra) = std::env::var("LIGHTER_CMDLINE_EXTRA") {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(extra);
+        }
+    }
 
     // Fixed boots with all of it; native boots on a base and plugs the rest
     // in as the host offers it (`lighter_vmm::virtio::mem`).
     let (ram_bytes, hotplug_bytes) = config.memory_split();
     let machine_config = MachineConfig {
         lan,
+        link: link.as_ref().map(|(card, ..)| card.clone()),
         vcpus: config.vcpus(),
         ram_bytes,
         hotplug_bytes,
@@ -370,6 +400,17 @@ pub fn machine() -> anyhow::Result<()> {
             lighter_vmm::net::GUEST6.into(),
         ],
     )?;
+
+    // Containers' names on the Mac, for the addresses the link reaches.
+    if let Some((_, plan, names)) = link {
+        lighter_docker::names::watch(
+            &paths::docker_socket()?,
+            ports.clone(),
+            Arc::new(crate::link::Names(names)),
+            move |ip| plan.contains(ip),
+            vec![plan.guest().into(), plan.guest6().into()],
+        )?;
+    }
 
     // A Mac that slept wakes with a guest whose clock did not.
     let _power = lighter_vmm::wake::Watcher::start(Box::new(Resync {

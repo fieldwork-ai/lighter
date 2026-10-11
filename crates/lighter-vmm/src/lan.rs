@@ -11,6 +11,10 @@
 //! one frame per datagram (`lighter_vmnet`). The relay runs in this process
 //! when lighter holds `com.apple.vm.networking`, and in the root helper
 //! (`lighter-bridge`) otherwise; the card sees the same socket either way.
+//!
+//! The same card carries the link ([`Lan::host_link`]): a vmnet host-only
+//! network of the Mac and the machine alone, which is what lets the Mac
+//! reach containers at their own addresses. It runs in this process only.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -45,6 +49,11 @@ pub struct Lan {
     mac: [u8; 6],
     mtu: u16,
     interface: String,
+    // Names its threads and log lines: "lan" or "link".
+    label: &'static str,
+    // The link's: containers' names, answered before the guest sees the
+    // question (`mdns`).
+    names: Option<Arc<crate::mdns::Names>>,
     _keep: Keep,
 }
 
@@ -54,7 +63,14 @@ impl Lan {
         let held = lighter_vmnet::helper::connect(socket, interface, mac)?;
         let frames = held.frames.try_clone()?;
         let mtu = held.mtu.clamp(576, 9000) as u16;
-        Ok(Lan::with(frames, mtu, interface, mac, Keep::Helper(held)))
+        Ok(Lan::with(
+            frames,
+            mtu,
+            interface,
+            "lan",
+            mac,
+            Keep::Helper(held),
+        ))
     }
 
     /// Bridges `interface` in this process, which needs root or
@@ -66,18 +82,54 @@ impl Lan {
             frames,
             mtu,
             interface,
+            "lan",
             mac,
             Keep::InProcess(bridge),
         ))
     }
 
-    fn with(frames: OwnedFd, mtu: u16, interface: &str, mac: [u8; 6], keep: Keep) -> Lan {
+    /// The link: a host-only network on which the Mac is `host`, on a
+    /// subnet of `mask`, answering the Mac's questions about `names`.
+    /// Needs `com.apple.vm.networking` (or root).
+    pub fn host_link(
+        host: std::net::Ipv4Addr,
+        mask: std::net::Ipv4Addr,
+        host6: Option<std::net::Ipv6Addr>,
+        network: [u8; 16],
+        mac: [u8; 6],
+        names: Arc<crate::mdns::Names>,
+    ) -> Result<Lan, String> {
+        let (bridge, frames) = lighter_vmnet::Bridge::host_link(host, mask, host6, network)?;
+        let mtu = bridge.mtu.clamp(576, 9000) as u16;
+        let mut link = Lan::with(
+            frames,
+            mtu,
+            &format!("host-only {host}"),
+            "link",
+            mac,
+            Keep::InProcess(bridge),
+        );
+        names.attach(link.frames.clone());
+        link.names = Some(names);
+        Ok(link)
+    }
+
+    fn with(
+        frames: OwnedFd,
+        mtu: u16,
+        interface: &str,
+        label: &'static str,
+        mac: [u8; 6],
+        keep: Keep,
+    ) -> Lan {
         Lan {
             frames: Arc::new(frames),
             outbox: Outbox::new(),
             mac,
             mtu,
             interface: interface.to_string(),
+            label,
+            names: None,
             _keep: keep,
         }
     }
@@ -112,9 +164,9 @@ impl Lan {
         wake_rx: impl Fn() + Send + 'static,
         wake_tx: impl Fn() + Send + 'static,
     ) -> io::Result<()> {
-        let (frames, outbox) = (self.frames.clone(), self.outbox.clone());
+        let (frames, outbox, label) = (self.frames.clone(), self.outbox.clone(), self.label);
         std::thread::Builder::new()
-            .name("lan-tx".into())
+            .name(format!("{label}-tx"))
             .spawn(move || {
                 crate::qos::raise_interactive();
                 while let Some((batch, parked)) = outbox.take() {
@@ -133,11 +185,11 @@ impl Lan {
                         wake_tx();
                     }
                 }
-                tracing::debug!("lan transmit stopped");
+                tracing::debug!("{label} transmit stopped");
             })?;
-        let frames = self.frames.clone();
+        let (frames, names) = (self.frames.clone(), self.names.clone());
         std::thread::Builder::new()
-            .name("lan-rx".into())
+            .name(format!("{label}-rx"))
             .spawn(move || {
                 crate::qos::raise_interactive();
                 let mut buf = vec![0u8; 65_550];
@@ -155,6 +207,20 @@ impl Lan {
                     if n == 0 {
                         break;
                     }
+                    let answer = |frame: &[u8]| {
+                        if let Some(reply) = names.as_ref().and_then(|n| n.answer(frame)) {
+                            // SAFETY: a frame buffer of its own length, on a live socket.
+                            unsafe {
+                                libc::send(
+                                    frames.as_raw_fd(),
+                                    reply.as_ptr().cast(),
+                                    reply.len(),
+                                    libc::MSG_DONTWAIT,
+                                );
+                            }
+                        }
+                    };
+                    answer(&buf[..n as usize]);
                     let mut queued = Net::enqueue_received(&inbox, buf[..n as usize].to_vec());
                     // Everything already waiting goes in the same wake.
                     loop {
@@ -170,13 +236,14 @@ impl Lan {
                         if more <= 0 {
                             break;
                         }
+                        answer(&buf[..more as usize]);
                         queued |= Net::enqueue_received(&inbox, buf[..more as usize].to_vec());
                     }
                     if queued {
                         wake_rx();
                     }
                 }
-                tracing::info!("the LAN card's frames stopped");
+                tracing::info!("the {label} card's frames stopped");
             })?;
         Ok(())
     }
@@ -210,7 +277,7 @@ mod tests {
     #[test]
     fn frames_cross_both_ways() {
         let (near, far) = lighter_vmnet::socket_pair().unwrap();
-        let lan = Lan::with(near, 1500, "en9", random_mac(), Keep::Nothing);
+        let lan = Lan::with(near, 1500, "en9", "lan", random_mac(), Keep::Nothing);
         let inbox = Net::new_inbox();
         let (woke_tx, woke_rx) = std::sync::mpsc::channel();
         lan.spawn(

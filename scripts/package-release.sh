@@ -97,6 +97,14 @@ TPL
 	fi
 fi
 
+# With the screen locked, codesign cannot evaluate the identity's chain and
+# fails halfway through with "unable to build chain to self-signed root" and
+# errSecInternalComponent; said here instead.
+if [ "$(ioreg -n Root -d1 -a | plutil -extract IOConsoleLocked raw - 2>/dev/null)" = true ]; then
+	echo "error: the Mac's screen is locked; Developer ID signing needs it unlocked" >&2
+	exit 1
+fi
+
 # Ephemeral keychain for non-interactive codesigning
 KEYCHAIN="$WORK/build.keychain"
 KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
@@ -163,7 +171,7 @@ cp assets/lighter.provisionprofile "$APP/Contents/embedded.provisionprofile"
 
 # --- sign --------------------------------------------------------------------
 echo "==> Signing binaries with Developer ID and hardened runtime"
-codesign --sign "$IDENTITY" \
+codesign --sign "$IDENTITY" --keychain "$KEYCHAIN" \
 	--entitlements entitlements.plist \
 	--force \
 	--options runtime \
@@ -176,13 +184,16 @@ import hashlib, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 files = {}
 for name in ('bin/lighter', 'share/lighter/Image', 'share/lighter/rootfs.ext4', 'share/lighter/kernel.version'):
+    digest = hashlib.sha256()
     with (root/name).open('rb') as f:
-        files[name] = hashlib.file_digest(f, 'sha256').hexdigest()
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            digest.update(chunk)
+    files[name] = digest.hexdigest()
 manifest = dict(schema=1, version=sys.argv[2], kernel_version=(root/'share/lighter/kernel.version').read_text().strip(), data_epoch=1, files=files)
 (root/'share/lighter/lighter.app/Contents/Resources/release.json').write_text(json.dumps(manifest, indent=2)+'\n')
 PYMANIFEST
 # Nested code is signed before the bundle that seals it.
-codesign --sign "$IDENTITY" \
+codesign --sign "$IDENTITY" --keychain "$KEYCHAIN" \
 	--identifier dev.lighter.bridge \
 	--force \
 	--options runtime \
@@ -191,7 +202,7 @@ codesign --sign "$IDENTITY" \
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist"
 
-codesign --sign "$IDENTITY" \
+codesign --sign "$IDENTITY" --keychain "$KEYCHAIN" \
 	--entitlements entitlements-app.plist \
 	--force \
 	--options runtime \

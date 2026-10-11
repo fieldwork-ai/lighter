@@ -33,6 +33,8 @@ GATES=(
 	"m8  daily driver:m8-daily.sh"
 	"m16 shared folders and drives:m16-shares.sh"
 	"m17 the machine on the network:m17-lan.sh"
+	"m18 the Mac reaches containers:m18-direct.sh"
+	"m19 network changes (opt-in):m19-network-change.sh"
 	"m9  gpu:m9-gpu.sh"
 	"m10 neural engine:m10-ane.sh"
 	"m11 pytorch:m11-mps.sh"

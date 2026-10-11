@@ -327,6 +327,49 @@ pub fn run() -> Vec<Finding> {
                 None => Finding::warn("LAN", "the machine does not say", "`lighter restart`"),
             });
         }
+        // Direct access: whether the Mac reaches containers at their own
+        // addresses, and which networks it does not.
+        if crate::config::Config::load().is_ok_and(|c| c.direct) {
+            findings.push(match crate::link::state(&home) {
+                Ok(subnet) => {
+                    let outside = paths::docker_socket()
+                        .map(|socket| crate::link::networks_outside(&socket, subnet))
+                        .unwrap_or_default();
+                    if outside.is_empty() {
+                        Finding::good(
+                            "direct access",
+                            format!(
+                                "containers at their own addresses in {subnet}/16 and as NAME.{}",
+                                lighter_docker::names::DOMAIN
+                            ),
+                        )
+                    } else {
+                        Finding::warn(
+                            "direct access",
+                            format!(
+                                "the Mac reaches containers on {} by published ports only: outside {subnet}/16, made before it or with a subnet of their own",
+                                outside.join(", ")
+                            ),
+                            "make them again without a subnet of their own: `docker compose down` then `up` for a Compose project",
+                        )
+                    }
+                }
+                Err(why) => Finding::warn(
+                    "direct access",
+                    format!("off: {why}"),
+                    if why.contains("routes") {
+                        "choose a subnet the Mac does not use with `lighter config --direct-subnet 10.x.0.0/16`, then `lighter restart`"
+                    } else {
+                        "`lighter restart`; or turn it off with `lighter config --direct off`"
+                    },
+                ),
+            });
+        } else {
+            findings.push(Finding::good(
+                "direct access",
+                "off: `lighter config --direct on` reaches containers at their own addresses and as NAME.lighter.local",
+            ));
+        }
         findings.push(if report.unforwarded.is_empty() {
             Finding::good("published ports", "all forwarded")
         } else {

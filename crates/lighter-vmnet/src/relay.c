@@ -1,12 +1,13 @@
-// A vmnet bridged interface, relayed to a datagram socket.
+// A vmnet interface, bridged to one of the Mac's cards or host-only,
+// relayed to a datagram socket.
 //
 // Both directions run on one serial dispatch queue: vmnet's "packets
 // available" event drains the interface into the socket, and a read source
 // on the socket drains it into the interface. One frame is one datagram, so
 // the far end needs no framing, and a full socket drops a frame as a full
-// NIC ring does. The far end is the VMM's LAN card, in this process when
-// lighter holds com.apple.vm.networking, or in another when a root helper
-// runs this for it.
+// NIC ring does. The far end is the VMM's LAN or link card, in this process
+// when lighter holds com.apple.vm.networking, or, for the LAN, in another
+// when a root helper runs this for it.
 #include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -87,20 +88,17 @@ static void drain_socket(struct lighter_bridge *b) {
 	}
 }
 
-struct lighter_bridge *lighter_bridge_start(const char *ifname, const uint8_t mac[6], int fd, uint32_t *mtu_out,
-                                            uint32_t *max_packet_out, char *err, size_t errlen) {
-	(void)mac; // the guest's frames carry its own; vmnet bridges them as they are
+// Starts the interface `desc` describes and relays it to `fd`. Takes `desc`.
+static struct lighter_bridge *start(xpc_object_t desc, const char *what, int fd, uint32_t *mtu_out,
+                                    uint32_t *max_packet_out, char *err, size_t errlen) {
 	struct lighter_bridge *b = calloc(1, sizeof *b);
 	if (!b) {
+		xpc_release(desc);
 		set_error(err, errlen, "out of memory", 0);
 		return NULL;
 	}
 	b->fd = fd;
 	b->queue = dispatch_queue_create("dev.lighter.bridge", DISPATCH_QUEUE_SERIAL);
-	xpc_object_t desc = xpc_dictionary_create(NULL, NULL, 0);
-	xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, VMNET_BRIDGED_MODE);
-	xpc_dictionary_set_string(desc, vmnet_shared_interface_name_key, ifname);
-	xpc_dictionary_set_bool(desc, vmnet_allocate_mac_address_key, false);
 	dispatch_semaphore_t started = dispatch_semaphore_create(0);
 	__block vmnet_return_t status = VMNET_FAILURE;
 	__block uint64_t mtu = 0, max_packet = 0;
@@ -114,14 +112,18 @@ struct lighter_bridge *lighter_bridge_start(const char *ifname, const uint8_t ma
 	});
 	xpc_release(desc);
 	if (!b->iface) {
-		set_error(err, errlen, "vmnet refused the bridged interface (root, or com.apple.vm.networking, is needed)", 0);
+		char why[160];
+		snprintf(why, sizeof why, "vmnet refused the %s interface (root, or com.apple.vm.networking, is needed)", what);
+		set_error(err, errlen, why, 0);
 		dispatch_release(b->queue);
 		free(b);
 		return NULL;
 	}
 	if (dispatch_semaphore_wait(started, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0 ||
 	    status != VMNET_SUCCESS) {
-		set_error(err, errlen, "vmnet could not start the bridged interface", (long)status);
+		char why[160];
+		snprintf(why, sizeof why, "vmnet could not start the %s interface", what);
+		set_error(err, errlen, why, (long)status);
 		dispatch_release(started);
 		dispatch_release(b->queue);
 		free(b);
@@ -147,6 +149,35 @@ struct lighter_bridge *lighter_bridge_start(const char *ifname, const uint8_t ma
 	if (mtu_out) *mtu_out = (uint32_t)mtu;
 	if (max_packet_out) *max_packet_out = (uint32_t)b->max_packet;
 	return b;
+}
+
+struct lighter_bridge *lighter_bridge_start(const char *ifname, const uint8_t mac[6], int fd, uint32_t *mtu_out,
+                                            uint32_t *max_packet_out, char *err, size_t errlen) {
+	(void)mac; // the guest's frames carry its own; vmnet bridges them as they are
+	xpc_object_t desc = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, VMNET_BRIDGED_MODE);
+	xpc_dictionary_set_string(desc, vmnet_shared_interface_name_key, ifname);
+	xpc_dictionary_set_bool(desc, vmnet_allocate_mac_address_key, false);
+	return start(desc, "bridged", fd, mtu_out, max_packet_out, err, errlen);
+}
+
+// A network between the Mac and the guest alone: the Mac gets an interface
+// (bridge100 and on) at `host_ip`/`mask`, and at `host_ip6` on its /64 when
+// given, with a route to each subnet, and
+// nothing is shared with any other network. `network` names it, so a VM
+// started again with the same identifier joins the same network.
+struct lighter_bridge *lighter_host_link_start(const char *host_ip, const char *mask, const char *host_ip6,
+                                               const uint8_t network[16], int fd, uint32_t *mtu_out,
+                                               uint32_t *max_packet_out, char *err, size_t errlen) {
+	xpc_object_t desc = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, VMNET_HOST_MODE);
+	xpc_dictionary_set_uuid(desc, vmnet_network_identifier_key, network);
+	xpc_dictionary_set_string(desc, vmnet_host_ip_address_key, host_ip);
+	xpc_dictionary_set_string(desc, vmnet_host_subnet_mask_key, mask);
+	// The Mac's IPv6 address on it, on a /64 vmnet routes to it.
+	if (host_ip6 && *host_ip6) xpc_dictionary_set_string(desc, vmnet_host_ipv6_address_key, host_ip6);
+	xpc_dictionary_set_bool(desc, vmnet_allocate_mac_address_key, false);
+	return start(desc, "host", fd, mtu_out, max_packet_out, err, errlen);
 }
 
 void lighter_bridge_counters(struct lighter_bridge *b, uint64_t out[3]) {

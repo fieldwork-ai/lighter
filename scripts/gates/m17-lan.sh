@@ -152,10 +152,18 @@ MAC_SERVER=$!
 for _ in $(seq 1 50); do [ -s "$PORT_FILE" ] && break; sleep 0.1; done
 PORT="$(cat "$PORT_FILE")"
 rm -f "$PORT_FILE"
+ROUTER="$(route -n get default 2>/dev/null | awk '/gateway:/ {print $2}')"
 for mode in host bridge; do
 	got="$(docker run --rm --network "$mode" alpine:3.21 wget -q -T 5 -O /dev/null "http://$MAC_LAN:$PORT/" 2>&1 && echo ok || echo failed)"
 	[ "$got" = ok ] && pass "a $mode-network container reaches a device on the network (the Mac, $MAC_LAN)" \
 		|| fail "a $mode-network container could not reach $MAC_LAN:$PORT"
+	# The router, which answers ping: a bridge container's echo leaves by
+	# the LAN card, and its reply was dropped there until 0.13.
+	if docker run --rm --network "$mode" alpine:3.21 ping -c 2 -W 3 "$ROUTER" >/dev/null 2>&1; then
+		pass "a $mode-network container pings a device on the network (the router, $ROUTER)"
+	else
+		fail "a $mode-network container's ping to $ROUTER went unanswered"
+	fi
 done
 
 if [ "$FAILED" = 0 ]; then
