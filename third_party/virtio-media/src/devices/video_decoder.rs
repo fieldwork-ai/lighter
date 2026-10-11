@@ -1428,6 +1428,9 @@ where
                     }
                     session.try_send_pending_output_buffers()?;
                 }
+                // START also ends the implicit drain of a format change
+                // (dev-decoder 4.5.1.9), which leaves the state running.
+                session.backend_session.resume();
             }
             DecoderCmd::Pause { .. } => {
                 if matches!(session.state, VideoDecoderStreamingState::Running) {
