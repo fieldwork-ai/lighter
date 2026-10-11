@@ -149,6 +149,8 @@ unsafe extern "C" {
     pub static kCFTypeDictionaryKeyCallBacks: c_void;
     pub static kCFTypeDictionaryValueCallBacks: c_void;
     pub fn CFRelease(cf: CFTypeRef);
+    #[cfg(test)]
+    pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     pub static kCFBooleanTrue: CFBooleanRef;
     pub static kCFBooleanFalse: CFBooleanRef;
     pub static kCFTypeArrayCallBacks: c_void;

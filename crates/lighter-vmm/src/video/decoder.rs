@@ -1329,6 +1329,9 @@ mod tests {
         let mut s = Session::new(Codec::H264);
         s.feed(annexb(&[sps, REOLINK_PPS]), 0, stamp).unwrap();
         let session = s.vt.as_ref().expect("a session").session;
+        // Held, so no later session can be given its address: a session
+        // released and one made after it may share one.
+        unsafe { vt::CFRetain(session) };
         assert_eq!((s.depth, s.depth_declared), (2, true));
         s.events.clear();
         // A new PPS under the same id.
@@ -1355,6 +1358,7 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
         );
+        unsafe { vt::CFRelease(session) };
     }
 
     #[test]
