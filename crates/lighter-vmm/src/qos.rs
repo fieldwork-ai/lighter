@@ -12,15 +12,16 @@
 //!
 //! The vCPUs themselves run at the default class, so a guest building at
 //! full tilt competes with the Mac's windows no harder than any other
-//! process. The one exception is scoped: while a container has a stream
-//! open to one of the accelerator servers (the Neural Engine, ggml on
-//! Metal, PyTorch on MPS) the vCPUs are overridden to the interactive
-//! class for that stream's life, because the request loop on such a
-//! stream is a wake of the guest per message, and a vCPU thread at the
-//! default class on a busy Mac is woken late: llama.cpp over the ggml
-//! server on an M1 ran at 63 tokens a second one run and 80 the next until
-//! the override, and 82 to 85 with it, against 106 for a native client.
-//! Nobody is waiting on anything else while a model answers.
+//! process. The one exception is scoped: while a container's stream to one
+//! of the accelerator servers (the Neural Engine, ggml on Metal, PyTorch on
+//! MPS) runs a request loop, the vCPUs are overridden to the interactive
+//! class, because such a loop is a wake of the guest per message, and a vCPU
+//! thread at the default class on a busy Mac is woken late: llama.cpp over
+//! the ggml server on an M1 ran at 63 tokens a second one run and 80 the
+//! next until the override, and 82 to 85 with it, against 106 for a native
+//! client. Nobody is waiting on anything else while a model answers. A
+//! stream that is merely open, or answers a few times a second, is no such
+//! loop (see [`Pace`]).
 
 use std::ffi::c_void;
 use std::net::SocketAddr;
@@ -104,6 +105,79 @@ pub fn is_accelerator(addr: SocketAddr) -> bool {
             .contains(&addr.port())
 }
 
+/// Whether a stream to an accelerator server is running a request loop, and
+/// the vCPUs held at the interactive class while it is.
+///
+/// Busy is [`BUSY`] replies within [`WINDOW`]: a token loop answers every
+/// ten milliseconds or so, a detector a few times a second. Held for the
+/// stream's life, the boost kept every vCPU of a Mac running Frigate at the
+/// interactive class for as long as its detector ran, which never ends:
+/// Frigate on one camera, 30 vCPUs, spent a fifth more energy with it than
+/// without (powermetrics' energy impact, 558 against 448) and asked nothing
+/// of it. The boost ends once replies have been quiet for [`HOLD`].
+pub struct Pace {
+    window: std::time::Instant,
+    replies: u32,
+    busy: Option<std::time::Instant>,
+    boost: Option<Boost>,
+}
+
+/// How long [`BUSY`] replies may take and still be a request loop.
+pub const WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+/// Replies within [`WINDOW`] that make a request loop.
+pub const BUSY: u32 = 4;
+/// How long a request loop may go quiet before the vCPUs drop back. Long
+/// enough to span the pause between one answer and the next prompt, so a
+/// conversation does not start each answer on vCPUs at the default class: on
+/// the M1 at half a second, llama-bench's generation, short runs with pauses
+/// between them, read 78 tokens a second one run against 84 for 0.13.2.
+pub const HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Pace {
+    pub fn new(now: std::time::Instant) -> Pace {
+        Pace {
+            window: now,
+            replies: 0,
+            busy: None,
+            boost: None,
+        }
+    }
+
+    /// A reply arrived. Returns true if this one started the boost.
+    pub fn reply(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.window) >= WINDOW {
+            self.window = now;
+            self.replies = 0;
+        }
+        self.replies += 1;
+        if self.replies < BUSY {
+            return false;
+        }
+        self.busy = Some(now);
+        if self.boost.is_some() {
+            return false;
+        }
+        self.boost = Some(Boost::vcpus());
+        tracing::debug!("accelerator request loop: vCPUs at the interactive class");
+        true
+    }
+
+    /// Ends the boost once replies have been quiet for [`HOLD`]. Returns
+    /// whether the vCPUs are still held.
+    pub fn settle(&mut self, now: std::time::Instant) -> bool {
+        if self
+            .busy
+            .is_some_and(|busy| now.duration_since(busy) >= HOLD)
+        {
+            self.busy = None;
+            if self.boost.take().is_some() {
+                tracing::debug!("accelerator request loop quiet: vCPUs back to the default class");
+            }
+        }
+        self.boost.is_some()
+    }
+}
+
 /// The vCPUs held at the interactive class until this is dropped. Each
 /// holder has its own overrides, so two streams overlap without either
 /// ending the other's early.
@@ -146,5 +220,49 @@ pub fn raise_interactive() {
     let rc = unsafe { pthread_set_qos_class_self_np(USER_INTERACTIVE, 0) };
     if rc != 0 {
         tracing::debug!(rc, "could not raise the thread's QoS");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn replies(pace: &mut Pace, start: Instant, every: Duration, n: u32) -> Instant {
+        let mut now = start;
+        for _ in 0..n {
+            now += every;
+            pace.reply(now);
+        }
+        now
+    }
+
+    #[test]
+    fn a_token_loop_holds_the_vcpus_and_lets_go_once_quiet() {
+        let start = Instant::now();
+        let mut pace = Pace::new(start);
+        let end = replies(&mut pace, start, Duration::from_millis(10), 50);
+        assert!(pace.settle(end));
+        // The last busy reply is the last that completed a window's BUSY.
+        assert!(pace.settle(end + HOLD - Duration::from_millis(20)));
+        assert!(!pace.settle(end + HOLD));
+    }
+
+    #[test]
+    fn a_detector_a_few_times_a_second_never_does() {
+        let start = Instant::now();
+        let mut pace = Pace::new(start);
+        let end = replies(&mut pace, start, Duration::from_millis(180), 200);
+        assert!(!pace.settle(end));
+    }
+
+    #[test]
+    fn a_loop_that_starts_again_is_held_again() {
+        let start = Instant::now();
+        let mut pace = Pace::new(start);
+        let end = replies(&mut pace, start, Duration::from_millis(10), 10);
+        assert!(!pace.settle(end + HOLD));
+        let end = replies(&mut pace, end + HOLD, Duration::from_millis(10), 10);
+        assert!(pace.settle(end));
     }
 }
