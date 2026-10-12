@@ -167,6 +167,33 @@ impl Identity {
     }
 
     pub fn read(home: &Path) -> io::Result<Option<Self>> {
+        let Some(identity) = Self::recorded(home)? else {
+            return Ok(None);
+        };
+        // A record is only authoritative while the daemon holds the home lock.
+        if !locked(home)? || !identity.alive()? {
+            return Ok(None);
+        }
+        Ok(Some(identity))
+    }
+
+    /// The machine that published this home's record and has exited, but
+    /// whose lock is still held: macOS closes a killed process's descriptors
+    /// only once it has torn its memory down, a fifth of a second for a
+    /// 10 GiB guest and longer on a struggling Mac. Until then the home is
+    /// neither running nor free.
+    pub fn exiting(home: &Path) -> io::Result<Option<Self>> {
+        let Some(identity) = Self::recorded(home)? else {
+            return Ok(None);
+        };
+        if !locked(home)? || identity.alive()? {
+            return Ok(None);
+        }
+        Ok(Some(identity))
+    }
+
+    /// The record in this home, if it was written for this home.
+    fn recorded(home: &Path) -> io::Result<Option<Self>> {
         let bytes = match std::fs::read(home.join("machine.identity")) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -180,15 +207,16 @@ impl Identity {
         if identity.home != home || identity.device != meta.dev() || identity.inode != meta.ino() {
             return Ok(None);
         }
-        // A record is only authoritative while the daemon holds the home lock.
-        let lock = OpenOptions::new()
-            .read(true)
-            .open(home.join("machine.lock"))?;
-        if try_lock(&lock)? || !identity.alive()? {
-            return Ok(None);
-        }
         Ok(Some(identity))
     }
+}
+
+/// Whether something holds the home's lifetime lock.
+fn locked(home: &Path) -> io::Result<bool> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .open(home.join("machine.lock"))?;
+    Ok(!try_lock(&lock)?)
 }
 
 /// Whether `pid` has exited and waits only to be reaped (or is gone).
@@ -274,6 +302,13 @@ impl Instance {
         std::fs::rename(staging, self.home.join("machine.identity"))?;
         self.published = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Instance {
+    pub(crate) fn lock_fd(&self) -> std::os::fd::RawFd {
+        self._lock.as_raw_fd()
     }
 }
 

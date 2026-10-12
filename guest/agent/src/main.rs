@@ -1008,8 +1008,10 @@ const HOST_CONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(
 /// no visible cause: the control channel that would carry a diagnosis rides
 /// the same device. So after a few streams have each tried for the whole
 /// window (`HOST_CONNECT_WINDOW`) the guest reports its own state the one
-/// way that still reaches the host — the console: sysrq's memory summary,
-/// blocked tasks, and every task's stack, once.
+/// way that still reaches the host — the console: sysrq's memory summary
+/// and blocked tasks, once. Not every task's stack: that overran the
+/// kernel's log buffer and lost most of all three (#84). The host, seeing
+/// this line, samples its own threads.
 fn host_lost() {
     use std::sync::atomic::Ordering;
     if HOST_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1 < 3 {
@@ -1018,8 +1020,9 @@ fn host_lost() {
     if HOST_LOST_REPORTED.swap(true, Ordering::Relaxed) {
         return;
     }
+    // The host watches its console for this line (`HOST_LOST`, lighter-vmm's dump.rs).
     eprintln!("lighter-agent: the host has stopped answering; dumping the guest's state to the console");
-    for key in ["m", "w", "t"] {
+    for key in ["m", "w"] {
         let _ = std::fs::write("/proc/sysrq-trigger", key);
     }
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
