@@ -350,7 +350,10 @@ impl Machine {
             None
         };
         let uart_irq = Arc::new(GicSpi::new(gic.clone(), UART_SPI)?);
-        let uart = Arc::new(Mutex::new(Pl011::new(Box::new(io::stdout()), uart_irq)));
+        let uart = Arc::new(Mutex::new(Pl011::new(
+            Box::new(crate::dump::HostLostWatch::new(io::stdout())),
+            uart_irq,
+        )));
         let mut bus = MmioBus::new();
         bus.register(layout.uart, uart.clone())?;
 

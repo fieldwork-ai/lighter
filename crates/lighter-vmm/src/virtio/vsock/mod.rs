@@ -1022,8 +1022,26 @@ impl VsockShared {
     }
 
     /// Every connection's state on one line each, for `LIGHTER_STREAM_TRACE`.
+    /// Within a second: the probe for a stalled machine must not join the
+    /// stall, and state locked that long is itself the answer.
     pub fn trace_lines(&self) -> Vec<String> {
-        let inner = self.lock();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let inner = loop {
+            match self.inner.try_lock() {
+                Ok(inner) => break inner,
+                Err(std::sync::TryLockError::WouldBlock)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return vec!["vsock state locked for a second".into()];
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return vec!["vsock state poisoned".into()];
+                }
+            }
+        };
         let mut lines = vec![format!(
             "vsock queues held={} completed={:?} outbox={}",
             inner.held,

@@ -94,6 +94,12 @@ fn legacy_machine(home: &Path) -> anyhow::Result<Option<LegacyMachine>> {
     if pid == 0 || pid > i32::MAX as u32 {
         return Ok(None);
     }
+    // A machine from 0.4.0 on publishes a record beside its PID file. One
+    // still there with nobody answering to it is a machine that is exiting,
+    // whose control socket is going away mid-question (#84), not a legacy one.
+    if home.join("machine.identity").exists() {
+        return Ok(None);
+    }
     let Ok(lock) = std::fs::File::open(home.join("machine.lock")) else {
         return Ok(None);
     };
@@ -151,14 +157,41 @@ fn stop_legacy(mut machine: LegacyMachine, wait: Duration) -> anyhow::Result<boo
     Ok(true)
 }
 
+/// How long a machine that has exited may take to let go of its home.
+const RELEASE_WAIT: Duration = Duration::from_secs(60);
+
+/// Waits until the machine that published `exited` has let go of the home:
+/// its lock is free, or a successor (launchd's crash recovery) owns it.
+fn wait_for_release(home: &Path, exited: &crate::instance::Identity) -> anyhow::Result<()> {
+    let deadline = Instant::now() + RELEASE_WAIT;
+    while crate::instance::Identity::exiting(home)?.as_ref() == Some(exited) {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "machine {} has exited, but macOS has not released it after {}s; start it again once `ps -p {}` no longer lists it",
+                exited.pid(),
+                RELEASE_WAIT.as_secs(),
+                exited.pid()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 /// Starts a machine and waits for Docker to answer.
 pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
+    let home = paths::home()?;
+    std::fs::create_dir_all(&home)?;
+    if let Some(exited) = crate::instance::Identity::exiting(&home)? {
+        eprintln!(
+            "The last machine (pid {}) is still exiting; waiting for macOS to release it…",
+            exited.pid()
+        );
+        wait_for_release(&home, &exited)?;
+    }
     if let Some(pid) = running_pid()? {
         anyhow::bail!("lighter is already running (pid {pid})");
     }
-
-    let home = paths::home()?;
-    std::fs::create_dir_all(&home)?;
     let socket = paths::docker_socket()?;
     let log = paths::log_file()?;
     // From the bundle, not from wherever the CLI binary happens to sit:
@@ -240,17 +273,16 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
 
 /// Asks the machine to stop, and waits for it.
 pub fn stop(wait: Duration) -> anyhow::Result<bool> {
-    let Some(identity) = crate::instance::Identity::read(&paths::home()?)? else {
-        return match legacy_machine(&paths::home()?)? {
+    let home = paths::home()?;
+    let Some(identity) = crate::instance::Identity::read(&home)? else {
+        return match legacy_machine(&home)? {
             Some(machine) => stop_legacy(machine, wait),
             None => Ok(false),
         };
     };
     // Signal the recorded process generation, not just its PID. The daemon
     // asks its own guest to sync/power off while it still holds the home lock.
-    if crate::storage_status::query(&paths::home()?, identity.pid())
-        .is_ok_and(|s| !s.waiting.is_empty())
-    {
+    if crate::storage_status::query(&home, identity.pid()).is_ok_and(|s| !s.waiting.is_empty()) {
         eprintln!(
             "Storage is waiting for host disk space. Stopping now may lose unfinished writes."
         );
@@ -261,6 +293,7 @@ pub fn stop(wait: Duration) -> anyhow::Result<bool> {
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if !identity.alive()? {
+            wait_for_release(&home, &identity)?;
             return Ok(true);
         }
         std::thread::sleep(
@@ -275,6 +308,9 @@ pub fn stop(wait: Duration) -> anyhow::Result<bool> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    // Stopped means gone, its lock included: a `restart` starts the next
+    // machine straight after, and `upgrade` takes the lock itself.
+    wait_for_release(&home, &identity)?;
     // Never unlink state from this process: launchd may already have started
     // a successor. The owner cleans up, or the next owner does under its lock.
     Ok(true)
@@ -525,5 +561,80 @@ mod lan_state_tests {
             Some(LanState::Declined("192.168.50.174".into()))
         );
         assert_eq!(LanState::parse("lan off"), None);
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::os::unix::process::CommandExt;
+
+    /// A machine killed while its lock outlives it (#84): macOS keeps a
+    /// killed process's descriptors until its memory is torn down. A sleeper
+    /// inheriting the lock stands in for that teardown, and exiting without
+    /// destructors leaves the record, PID file and socket as SIGKILL does.
+    #[test]
+    fn killed_child() {
+        let Some(home) = std::env::var_os("LIGHTER_TEST_KILLED_HOME") else {
+            return;
+        };
+        let home = Path::new(&home);
+        let mut owner = crate::instance::Instance::acquire(home).unwrap().unwrap();
+        owner.publish().unwrap();
+        let _control = UnixListener::bind(home.join("control.sock")).unwrap();
+        let fd = owner.lock_fd();
+        let mut teardown = std::process::Command::new("/bin/sleep");
+        teardown.arg("1").stdout(std::process::Stdio::null());
+        // SAFETY: fcntl between fork and exec, on a descriptor this process owns.
+        unsafe {
+            teardown.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        teardown.spawn().unwrap();
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_killed_machine_is_waited_out_rather_than_misread() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "machine::exit_tests::killed_child"])
+            .env("LIGHTER_TEST_KILLED_HOME", home.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let exited = crate::instance::Identity::exiting(home.path())
+            .unwrap()
+            .expect("an exited machine still holding its lock is exiting");
+        assert!(
+            crate::instance::Identity::read(home.path())
+                .unwrap()
+                .is_none()
+        );
+        // Before #84's fix this authenticated the dying socket's peer and
+        // failed with its errno: EINVAL, or here ECONNREFUSED.
+        assert!(legacy_machine(home.path()).unwrap().is_none());
+        assert!(
+            crate::instance::Instance::acquire(home.path())
+                .unwrap()
+                .is_none()
+        );
+        wait_for_release(home.path(), &exited).unwrap();
+        assert!(
+            crate::instance::Identity::exiting(home.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::instance::Instance::acquire(home.path())
+                .unwrap()
+                .is_some()
+        );
     }
 }
