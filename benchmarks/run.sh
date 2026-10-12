@@ -544,7 +544,8 @@ bench_disk_gib() {
 	[ -n "$gib" ] && [ "$gib" -gt 64 ] 2>/dev/null && echo "$gib" || echo 64
 }
 
-# The guest's idle poll window, as the product sets it (`config::idle_poll_ns`):
+# The guest's idle poll window, as the product sets it (`config::idle_poll_ns`),
+# given as the resting window too:
 # 50 µs where the vCPUs fill the Mac's cores, 200 where cores are left for
 # the share's server. Last on the command line wins, so LIGHTER_CMDLINE_EXTRA
 # can still override it.
@@ -552,7 +553,7 @@ bench_idle_poll_ns() {
 	local cores; cores="$(sysctl -n hw.ncpu)"
 	if [ "${BENCH_CPUS:-8}" -ge "$cores" ]; then echo 50000; else echo 200000; fi
 }
-# The rest of the CLI's idle-poll policy (`config::idle_poll_args`).
+# The rest of the CLI's idle-poll policy (`config::idle_poll_cmdline`).
 bench_idle_poll_args() {
 	local cores; cores="$(sysctl -n hw.ncpu)"
 	if [ "${BENCH_CPUS:-8}" -ge "$cores" ]; then echo "idle.poll_timeouts=0 idle.poll_cost_ns=100000"; fi
@@ -635,7 +636,7 @@ setup_lighter() {
 		${ROSETTA_DIR:+--share "rosetta:$ROSETTA_DIR"} \
 		--no-tty --cpus "${BENCH_CPUS:-8}" --memory-mib "$(bench_memory_mib)" \
 		${LIGHTER_BENCH_VMM_ARGS:-} \
-		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init cgroup_disable=pressure swiotlb=noforce idle.poll_ns=$(bench_idle_poll_ns) $(bench_idle_poll_args) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")}${ROSETTA_DIR:+ lighter.rosetta} ${LIGHTER_CMDLINE_EXTRA:-}" \
+		--cmdline "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init cgroup_disable=pressure swiotlb=noforce idle.poll_ns=$(bench_idle_poll_ns) idle.poll_local_ns=$(bench_idle_poll_ns) $(bench_idle_poll_args) lighter.time=$(date +%s) lighter.share=bench:/mnt/bench ${LIGHTER_BENCH_DEV_AGENT:+lighter.share=dev:/mnt/dev lighter.devagent=/mnt/dev/$(basename "$LIGHTER_BENCH_DEV_AGENT")}${ROSETTA_DIR:+ lighter.rosetta} ${LIGHTER_CMDLINE_EXTRA:-}" \
 		>"$BOOT_LOG" 2>&1 &
 	VMM_PID=$!
 	disown "$VMM_PID" 2>/dev/null || true
