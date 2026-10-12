@@ -1,0 +1,164 @@
+# idle: back off polling by idle entries, not time. 0039's backoff stopped polling for 10 ms, doubling
+# to 250 ms, after an epoch of polls that did not pay; a CPU woken a few dozen times a second (Frigate:
+# a camera's frames and its Python threads' timers, about 37 idle entries a second per vCPU on 30)
+# came out of the 10 ms before its next idle entry, so polling went on as if there were no backoff:
+# 11,703 backoffs started in three and a half minutes and polling unchanged. The backoff is now that
+# many idle entries skipped, poll_epoch (16) at first, doubling to idle.poll_backoff_max (1024) while
+# polling still does not pay; a run of short sleeps still ends it early, and a model talking still
+# polls through it. idle.backoffs reports, per CPU, backoffs started, ended early by short sleeps, and
+# polls let through by accelerator traffic.
+diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
+--- a/arch/arm64/kernel/idle.c
++++ b/arch/arm64/kernel/idle.c
+@@ -111,9 +111,13 @@
+  * CPU. So only a poll another CPU ended grows the window, a poll that timed
+  * out halves it, and every poll_epoch polls the CPU weighs the spinning
+  * against the wakeups it caught: more than poll_cost_ns a catch, or none,
+- * and it stops polling for a backoff that doubles from 10 ms to
+- * poll_backoff_max_ns while polling keeps not paying. A thread pool's
+- * handoffs, which polling exists for, pay every epoch and never back off.
++ * and it skips polling on its next idle entries, poll_epoch of them at first
++ * and twice as many each time polling still does not pay, up to
++ * poll_backoff_max. A thread pool's handoffs, which polling exists for, pay
++ * every epoch and never back off. The backoff is counted in idle entries, not
++ * time: a CPU woken a few dozen times a second, by a camera's frames and its
++ * Python threads' timers, came out of a 10 ms backoff before its next idle
++ * entry, and Frigate's spinning went on as if there were none.
+  */
+ static DEFINE_PER_CPU(bool, idle_poll_block_grow);
+ static bool idle_poll_timeouts = true;
+@@ -122,17 +126,22 @@
+ module_param_named(poll_epoch, idle_poll_epoch, uint, 0644);
+ static unsigned int idle_poll_cost_ns = 50000;
+ module_param_named(poll_cost_ns, idle_poll_cost_ns, uint, 0644);
+-static unsigned int idle_poll_backoff_max_ns = 250 * NSEC_PER_MSEC;
+-module_param_named(poll_backoff_max_ns, idle_poll_backoff_max_ns, uint, 0644);
++static unsigned int idle_poll_backoff_max = 1024;
++module_param_named(poll_backoff_max, idle_poll_backoff_max, uint, 0644);
+ static DEFINE_PER_CPU(u32, idle_poll_epoch_n);
+ static DEFINE_PER_CPU(u32, idle_poll_epoch_hits);
+ static DEFINE_PER_CPU(u64, idle_poll_epoch_ns);
+-static DEFINE_PER_CPU(u64, idle_poll_off_until);
+-static DEFINE_PER_CPU(u64, idle_poll_backoff_ns);
++static DEFINE_PER_CPU(u32, idle_poll_skip);
++/* Per CPU: backoffs started, backoffs a run of short sleeps ended early, and
++ * polls let through a backoff because a model was talking. */
++enum { BACKOFF_STARTED, BACKOFF_RESUMED, BACKOFF_BYPASSED, BACKOFF_KINDS };
++static DEFINE_PER_CPU(u64, idle_poll_backoffs[BACKOFF_KINDS]);
++
++static DEFINE_PER_CPU(u32, idle_poll_backoff);
+ /* A backoff ends early on poll_resume_after short sleeps in a row: work
+  * that hands off back and forth (a DNS query, a request loop) is over in
+- * milliseconds, before a backoff of up to a quarter of a second would let
+- * polling look again, and a trickle's short sleeps rarely come in a row. */
++ * milliseconds, before a long backoff would let polling look again, and a
++ * trickle's short sleeps rarely come in a row. */
+ static unsigned int idle_poll_resume_after = 4;
+ module_param_named(poll_resume_after, idle_poll_resume_after, uint, 0644);
+ static DEFINE_PER_CPU(u32, idle_poll_short_run);
+@@ -255,8 +264,11 @@
+ 
+ 	if (block_ns <= local && !timer_due) {
+ 		if (idle_poll_resume_after &&
+-		    __this_cpu_inc_return(idle_poll_short_run) >= idle_poll_resume_after)
+-			__this_cpu_write(idle_poll_off_until, 0);
++		    __this_cpu_inc_return(idle_poll_short_run) >= idle_poll_resume_after) {
++			if (__this_cpu_read(idle_poll_skip))
++				__this_cpu_inc(idle_poll_backoffs[BACKOFF_RESUMED]);
++			__this_cpu_write(idle_poll_skip, 0);
++		}
+ 	} else {
+ 		__this_cpu_write(idle_poll_short_run, 0);
+ 	}
+@@ -296,6 +308,22 @@
+ 	__this_cpu_write(idle_poll_block_ns, block_ns);
+ 	__this_cpu_write(idle_poll_block_timer, timer_due);
+ 	__this_cpu_write(idle_poll_block_pending, true);
++}
++
++/* Whether this idle entry may poll: not while backed off, unless a model is
++ * talking. Each entry spent backed off counts one off the backoff. */
++static bool __cpuidle idle_poll_allowed(void)
++{
++	u32 skip = __this_cpu_read(idle_poll_skip);
++
++	if (!skip)
++		return true;
++	if (idle_traffic_recent()) {
++		__this_cpu_inc(idle_poll_backoffs[BACKOFF_BYPASSED]);
++		return true;
++	}
++	__this_cpu_write(idle_poll_skip, skip - 1);
++	return false;
+ }
+ 
+ /* Returns true if a wakeup arrived while polling, so WFI is not needed. */
+@@ -327,8 +355,26 @@
+ };
+ module_param_cb(polled, &idle_polled_ops, NULL, 0444);
+ 
++static int idle_backoffs_get(char *buffer, const struct kernel_param *kp)
++{
++	int cpu, len = 0;
++
++	for_each_possible_cpu(cpu)
++		len += sysfs_emit_at(buffer, len, "%llu/%llu/%llu ",
++				     per_cpu(idle_poll_backoffs[BACKOFF_STARTED], cpu),
++				     per_cpu(idle_poll_backoffs[BACKOFF_RESUMED], cpu),
++				     per_cpu(idle_poll_backoffs[BACKOFF_BYPASSED], cpu));
++	len += sysfs_emit_at(buffer, len, "\n");
++	return len;
++}
++
++static const struct kernel_param_ops idle_backoffs_ops = {
++	.get = idle_backoffs_get,
++};
++module_param_cb(backoffs, &idle_backoffs_ops, NULL, 0444);
++
+ /* Books a finished poll and, every poll_epoch, decides whether to go on. */
+-static void __cpuidle idle_poll_account(unsigned int kind, u64 spent_ns, u64 now)
++static void __cpuidle idle_poll_account(unsigned int kind, u64 spent_ns)
+ {
+ 	u32 limit = __this_cpu_read(idle_poll_limit_ns);
+ 	/* A poll that caught its wakeup paid, whatever ended it: another
+@@ -355,14 +401,15 @@
+ 	if (n < idle_poll_epoch)
+ 		return;
+ 	if (!hits || spent > (u64)hits * idle_poll_cost_ns) {
+-		u64 backoff = __this_cpu_read(idle_poll_backoff_ns);
++		u32 backoff = __this_cpu_read(idle_poll_backoff);
+ 
+-		backoff = backoff ? min_t(u64, backoff * 2, idle_poll_backoff_max_ns) :
+-				    min_t(u64, 10 * NSEC_PER_MSEC, idle_poll_backoff_max_ns);
+-		__this_cpu_write(idle_poll_backoff_ns, backoff);
+-		__this_cpu_write(idle_poll_off_until, now + backoff);
++		backoff = backoff ? min(backoff * 2, idle_poll_backoff_max) :
++				    min(idle_poll_epoch, idle_poll_backoff_max);
++		__this_cpu_write(idle_poll_backoff, backoff);
++		__this_cpu_write(idle_poll_skip, backoff);
++		__this_cpu_inc(idle_poll_backoffs[BACKOFF_STARTED]);
+ 	} else {
+-		__this_cpu_write(idle_poll_backoff_ns, 0);
++		__this_cpu_write(idle_poll_backoff, 0);
+ 	}
+ 	__this_cpu_write(idle_poll_epoch_n, 0);
+ 	__this_cpu_write(idle_poll_epoch_hits, 0);
+@@ -404,7 +451,7 @@
+ 		kind = kstat_cpu_irqs_sum(smp_processor_id()) != irqs ?
+ 			POLLED_IRQ : POLLED_REMOTE;
+ 	now = local_clock_noinstr();
+-	idle_poll_account(kind, now - *start, now);
++	idle_poll_account(kind, now - *start);
+ 	return woke;
+ }
+ 
+@@ -429,8 +476,7 @@
+ 	next_timer = idle_next_timer_ns();
+ 	if (__this_cpu_read(idle_poll_limit_ns) &&
+ 	    !__this_cpu_read(idle_poll_halt_next) &&
+-	    (local_clock_noinstr() >= __this_cpu_read(idle_poll_off_until) ||
+-	     idle_traffic_recent())) {
++	    idle_poll_allowed()) {
+ 		bool woke = idle_poll(&start);
+ 
+ 		__this_cpu_write(idle_poll_halt_next, !woke);

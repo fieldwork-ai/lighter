@@ -300,7 +300,9 @@ impl Config {
 }
 
 /// How long an idle vCPU may spin for a wakeup before it sleeps, in
-/// nanoseconds (guest patch 0011's `idle.poll_ns`).
+/// nanoseconds: the window it rests at (guest patch 0011's
+/// `idle.poll_local_ns`) and, until a container talks to an accelerator, its
+/// cap (`idle.poll_ns`).
 ///
 /// The spin is what makes a cross-vCPU wakeup a cache line instead of an
 /// interrupt and a host scheduler round trip — most of an install's wall
@@ -314,8 +316,18 @@ pub fn idle_poll_ns(cpus: u32) -> u32 {
     if cpus >= num_cpus() { 50_000 } else { 200_000 }
 }
 
-/// The rest of the idle poll's policy for the same machine, as kernel
-/// command-line arguments (guest patch 0039).
+/// The idle poll's policy, as kernel command-line arguments (guest patches
+/// 0011, 0039 and 0053).
+///
+/// The resting window is given on its own as well as the cap. The agent
+/// raises the cap to 5 ms while a container has a stream open to an
+/// accelerator (`guest/agent/src/accelerator.rs`), so that a model's token
+/// loop keeps a vCPU awake between messages; the kernel rests at the lesser
+/// of the cap and `idle.poll_local_ns`, whose own default is 200 µs, so with
+/// only the cap given every idle vCPU of a Mac the vCPUs fill rested at
+/// 200 µs for as long as a detector held its stream: Frigate on one camera,
+/// 30 vCPUs of 30, spun 0.14 of a core, against 0.06 with the resting
+/// window held at 50 µs.
 ///
 /// Where the vCPUs leave cores free, a poll that times out halves the
 /// window and polling backs off above 50 µs of spinning a wakeup caught:
@@ -324,12 +336,13 @@ pub fn idle_poll_ns(cpus: u32) -> u32 {
 /// it on every timeout cost an eight-core M1's npm install on the guest's
 /// disk 12% (8.75 s against 7.8); there the window keeps 0011's rules and
 /// the backoff waits for 100 µs a catch (8.2 s, pnpm unchanged).
-pub fn idle_poll_args(cpus: u32) -> &'static str {
+pub fn idle_poll_cmdline(cpus: u32) -> String {
+    let window = idle_poll_ns(cpus);
+    let mut args = format!(" idle.poll_ns={window} idle.poll_local_ns={window}");
     if cpus >= num_cpus() {
-        " idle.poll_timeouts=0 idle.poll_cost_ns=100000"
-    } else {
-        ""
+        args.push_str(" idle.poll_timeouts=0 idle.poll_cost_ns=100000");
     }
+    args
 }
 
 pub fn num_cpus() -> u32 {
@@ -452,6 +465,20 @@ pub fn within(path: &str, base: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_idle_poll_rests_at_its_window_whatever_the_cap_becomes() {
+        for cpus in [1, num_cpus()] {
+            let args = idle_poll_cmdline(cpus);
+            let window = idle_poll_ns(cpus);
+            assert!(args.contains(&format!(" idle.poll_ns={window} ")), "{args}");
+            assert!(
+                args.contains(&format!(" idle.poll_local_ns={window}")),
+                "{args}"
+            );
+        }
+        assert!(idle_poll_cmdline(num_cpus()).contains("idle.poll_timeouts=0"));
+    }
 
     /// The home folder alone, as every install before 0.11.6 wrote it, reads
     /// as the defaults; a drive listed beside it is inside `/Volumes`.

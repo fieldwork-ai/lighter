@@ -45,4 +45,14 @@ if len(sys.argv) > 4 and sys.argv[2] == "paced":
         t = time.perf_counter(); s.run(None, {inp.name: x}); spent += time.perf_counter() - t
         runs += 1; time.sleep(max(0.0, 1.0 / hz - (time.perf_counter() - t)))
     print(f"PACED runs={runs} ms_per_run={spent / runs * 1000:.2f}", flush=True)
+# `loop <seconds>`: requests back to back, as a model's token loop sends them,
+# then nothing; the gate reads when the VMM holds the vCPUs.
+if len(sys.argv) > 3 and sys.argv[2] == "loop":
+    seconds = float(sys.argv[3])
+    print("LOOPING", flush=True)
+    end = time.perf_counter() + seconds; runs = 0
+    while time.perf_counter() < end:
+        s.run(None, {inp.name: x}); runs += 1
+    print(f"LOOPED runs={runs}", flush=True)
+    time.sleep(4)
 sys.exit(0 if diff < 1e-2 else 2)

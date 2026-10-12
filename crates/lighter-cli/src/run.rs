@@ -136,11 +136,7 @@ pub fn machine() -> anyhow::Result<()> {
     let mut cmdline = String::from(
         "console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/lighter-init reboot=t cgroup_disable=pressure swiotlb=noforce",
     );
-    cmdline.push_str(&format!(
-        " idle.poll_ns={}",
-        crate::config::idle_poll_ns(config.vcpus())
-    ));
-    cmdline.push_str(crate::config::idle_poll_args(config.vcpus()));
+    cmdline.push_str(&crate::config::idle_poll_cmdline(config.vcpus()));
     cmdline.push_str(&format!(
         " lighter.time={}",
         std::time::SystemTime::now()

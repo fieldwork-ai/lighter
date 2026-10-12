@@ -59,7 +59,11 @@ trap 'exit 143' INT TERM
 
 echo
 echo "==> Booting the Docker guest with the Neural Engine service"
-"$BIN" \
+# The idle poll as the CLI sets it where the vCPUs fill the Mac's cores
+# (`config::idle_poll_cmdline`): a 50 µs window, given as the resting one too,
+# which the paced stage below checks survives the agent widening the cap.
+# qos at debug: the paced and loop stages read when the vCPUs are held.
+LIGHTER_LOG="${LIGHTER_LOG:-info,lighter_vmm::qos=debug}" "$BIN" \
 	--kernel "$KERNEL" \
 	--disk "$ROOTFS" \
 	--disk "$DATA" --disk-size-gib 16 \
@@ -67,7 +71,7 @@ echo "==> Booting the Docker guest with the Neural Engine service"
 	--vsock "$SOCKET:2375" \
 	--docker-ports "$SOCKET" \
 	--no-tty --cpus 4 --memory-mib 4096 --ane \
-	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s)" \
+	--cmdline "console=ttyAMA0 earlycon=pl011,0xc000000 panic=-1 root=/dev/vda rw init=/sbin/lighter-init lighter.time=$(date +%s) idle.poll_ns=50000 idle.poll_local_ns=50000 idle.poll_timeouts=0 idle.poll_cost_ns=100000" \
 	>"$LOG" 2>&1 &
 VMM_PID=$!
 
@@ -143,7 +147,19 @@ until docker logs "$container" 2>&1 | grep -q '^PACING'; do
 	sleep 1; waited=$((waited + 1))
 done
 if docker logs "$container" 2>&1 | grep -q '^PACING'; then
+	# From here on the client is paced; its agreement check before it runs
+	# back to back, a loop, and is held until a moment after.
 	sleep 3
+	mark="$(wc -l < "$LOG")"
+	# The stream holds the cap at 5 ms; the windows must stay at the resting
+	# 50 µs, or every idle vCPU spins four times as long for a detector.
+	idle="$(docker run --rm --privileged alpine sh -c 'cat /sys/module/idle/parameters/poll_ns; cat /sys/module/idle/parameters/limits' 2>/dev/null)"
+	cap="$(echo "$idle" | head -1)"; widest="$(echo "$idle" | tail -1 | tr ' ' '\n' | grep . | sort -n | tail -1)"
+	if [ "$cap" = 5000000 ] && [ -n "$widest" ] && [ "$widest" -le 50000 ]; then
+		pass "with the stream open the cap is 5 ms and every window rests at 50 µs or less (widest $widest ns)"
+	else
+		fail "with the stream open: cap ${cap:-?}, widest window ${widest:-?} ns (want 5000000 and at most 50000)"
+	fi
 	# top's first sample is since the process began; the mean of the next six.
 	cpu="$(top -l 7 -s 2 -pid "$VMM_PID" -stats cpu 2>/dev/null | awk '/^[0-9.]+ *$/{n++; if (n>1) {s+=$1; c++}} END{if (c) printf "%.1f", s/c}')"
 	docker wait "$container" >/dev/null 2>&1 || true
@@ -156,6 +172,46 @@ if docker logs "$container" 2>&1 | grep -q '^PACING'; then
 	fi
 else
 	fail "the paced client never started"; docker logs "$container" 2>&1 | tail -8 | sed 's/^/    /'
+fi
+docker rm -f "$container" >/dev/null 2>&1 || true
+# A trickle of wakeups like this one is what the poll must back off from, by
+# idle entries (patch 0053); a backoff counted in time ran out between them.
+started="$( (docker run --rm --privileged alpine sh -c 'cat /sys/module/idle/parameters/backoffs 2>/dev/null' || true) | tr ' ' '\n' | awk -F/ 'NF==3 {s+=$1} END {print s+0}')"
+if [ "${started:-0}" -gt 0 ]; then
+	pass "the idle poll backed off $started times under the paced client"
+else
+	fail "the idle poll never backed off under the paced client (idle.backoffs: ${started:-unreadable})"
+fi
+# Only the paced part's lines: the runs before it are request loops, and
+# hold the vCPUs as they should.
+if tail -n +"$((${mark:-0} + 1))" "$LOG" | grep -q "vCPUs at the interactive class"; then
+	fail "a client at 5 Hz held the vCPUs at the interactive class"
+else
+	pass "a client at 5 Hz left the vCPUs at the default class"
+fi
+
+echo
+echo "==> A request loop holds the vCPUs, and lets go when it stops"
+# A model's token loop answers every few milliseconds and is woken late on a
+# busy Mac unless the vCPUs are at the interactive class; anything slower is
+# left at the default class, and the hold ends two seconds after the loop.
+mark="$(wc -l < "$LOG")"
+container="$(docker create --device lighter.sh/ane=all "$IMAGE" sh -c \
+	'pip install -q onnxruntime numpy >/dev/null 2>&1 || exit 97; python /fixtures/ane-client.py /fixtures/tinycnn-init.onnx loop 3 2>&1')"
+docker cp "$ROOT/scripts/gates/fixtures" "$container:/fixtures" >/dev/null
+docker start "$container" >/dev/null
+docker wait "$container" >/dev/null 2>&1 || true
+looped="$(docker logs "$container" 2>&1 | grep '^LOOPED' | tail -1)"
+# The client's own stream stays open after the loop, so the hold has to end
+# by the VMM letting go, the last word this stage logs about the vCPUs.
+stage="$(tail -n +"$((mark + 1))" "$LOG" | grep -E "vCPUs (at the interactive class|back to the default class)")"
+held="$(echo "$stage" | grep -c "interactive class")"
+released="$(echo "$stage" | tail -1 | grep -c "back to the default class")"
+if [ -n "$looped" ] && [ "$held" -ge 1 ] && [ "$released" = 1 ]; then
+	pass "the loop held the vCPUs and the VMM let go after it ($looped)"
+else
+	fail "request loop: ${looped:-no LOOPED line}, held $held times, released at the end: $released"
+	docker logs "$container" 2>&1 | tail -5 | sed 's/^/    /'
 fi
 docker rm -f "$container" >/dev/null 2>&1 || true
 

@@ -111,9 +111,9 @@ struct Stream {
     writing: bool,
     /// For a DNS stream: bytes of a frame not yet whole.
     partial: Vec<u8>,
-    /// For a stream to an accelerator server: the vCPUs held at the
-    /// interactive class for its life.
-    boost: Option<crate::qos::Boost>,
+    /// For a stream to an accelerator server: whether it runs a request
+    /// loop, and the vCPUs held at the interactive class while it does.
+    pace: Option<crate::qos::Pace>,
 }
 
 /// Counters for `LIGHTER_STREAM_TRACE`.
@@ -591,6 +591,10 @@ struct Loop {
     udp_inbound_flows: HashMap<u32, (Published, SocketAddr)>,
     udp_inbound_next: u32,
     udp_inbound_swept: Instant,
+    /// Accelerator streams holding the vCPUs, and when their holds were last
+    /// looked at.
+    boosted: std::collections::HashSet<ConnKey>,
+    settled: Instant,
 }
 
 fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
@@ -620,6 +624,8 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         udp_inbound_flows: HashMap::new(),
         udp_inbound_next: 0,
         udp_inbound_swept: Instant::now(),
+        boosted: std::collections::HashSet::new(),
+        settled: Instant::now(),
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
     // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
@@ -629,6 +635,10 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
     let tick = libc::timespec {
         tv_sec: 0,
         tv_nsec: 10_000_000,
+    };
+    let settle_tick = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: crate::qos::WINDOW.as_nanos() as libc::c_long,
     };
     let mut last_trace = std::time::Instant::now();
     // Spinning before parking: after any activity the loop polls kqueue and
@@ -655,6 +665,8 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             &zero
         } else if trace {
             &tick
+        } else if !l.boosted.is_empty() {
+            &settle_tick
         } else {
             std::ptr::null()
         };
@@ -740,6 +752,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
                 l.progress(key);
             }
         }
+        l.settle();
         if spin.is_zero() {
             continue;
         }
@@ -776,6 +789,23 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
 }
 
 impl Loop {
+    /// Lets go of the vCPUs for every accelerator stream whose request loop
+    /// has gone quiet, at most once a window.
+    fn settle(&mut self) {
+        if self.boosted.is_empty() || self.settled.elapsed() < crate::qos::WINDOW {
+            return;
+        }
+        let now = Instant::now();
+        self.settled = now;
+        let streams = &mut self.streams;
+        self.boosted.retain(|key| {
+            streams
+                .get_mut(key)
+                .and_then(|s| s.pace.as_mut())
+                .is_some_and(|pace| pace.settle(now))
+        });
+    }
+
     fn trace(&self) {
         let t = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -835,7 +865,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
-                        boost: None,
+                        pace: None,
                     },
                 );
             }
@@ -854,7 +884,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
-                        boost: None,
+                        pace: None,
                     },
                 );
             }
@@ -876,7 +906,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
-                        boost: None,
+                        pace: None,
                     },
                 );
                 self.udp_flows.insert(key, HashMap::new());
@@ -901,7 +931,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
-                        boost: None,
+                        pace: None,
                     },
                 );
                 self.udp_inbound = Some(key);
@@ -951,7 +981,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
-                        boost: None,
+                        pace: None,
                     },
                 );
             }
@@ -979,7 +1009,7 @@ impl Loop {
                         reading: false,
                         writing: false,
                         partial: Vec::new(),
-                        boost: None,
+                        pace: None,
                     },
                 );
             }
@@ -1381,7 +1411,7 @@ impl Loop {
                             let stream = self.streams.get_mut(&key).expect("present");
                             stream.tcp = Some(tcp);
                             if crate::qos::is_accelerator(addr) {
-                                stream.boost = Some(crate::qos::Boost::vcpus());
+                                stream.pace = Some(crate::qos::Pace::new(Instant::now()));
                             }
                             stream.phase = Phase::Connecting;
                             stream.writing = true;
@@ -1655,6 +1685,11 @@ impl Loop {
         let fd = tcp.as_raw_fd();
         if !matches!(stream.phase, Phase::Open) {
             return;
+        }
+        if let Some(pace) = stream.pace.as_mut()
+            && pace.reply(Instant::now())
+        {
+            self.boosted.insert(key);
         }
         loop {
             // Into a payload-sized buffer the packet will own: a read and a
