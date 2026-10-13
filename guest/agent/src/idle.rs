@@ -19,7 +19,7 @@
 //! reaches untouched since the pass before: idle for at least the horizon and
 //! at most twice it, decided per page from the kernel's own access bits.
 //! DAMON's region sampling, which estimates hot and cold ranges, plays no
-//! part in the decision; it is set slow (ten pages a minute) and ignored.
+//! part in the decision; it is set slow (ten pages every 72 s) and ignored.
 //!
 //! Not the multi-generational LRU: its generations place a newly cached
 //! read() page in the oldest one and never promote it on access, so they
@@ -43,10 +43,18 @@ pub const IDLE_HORIZON_SECS: u64 = 3600;
 
 const ADMIN: &str = "/sys/kernel/mm/damon/admin";
 
-/// DAMON's sampling interval, which must not exceed its aggregation
-/// interval (the horizon): a minute, or a quarter of a short horizon.
-pub fn sample_secs(horizon_secs: u64) -> u64 {
-    (horizon_secs / 4).clamp(1, 60)
+/// DAMON's sampling interval, in microseconds: a fiftieth of the horizon
+/// (72 s of an hour), or a quarter of a short one.
+///
+/// The number of samples per aggregation has to divide 10,000. DAMON keeps
+/// each region's access count twice, as a count and as a moving sum in
+/// basis points that sheds `count × 10000 / samples` a sample; with sixty
+/// samples that division truncates, the sum drifts from the count, and the
+/// next reset warns `invalid nr_accesses_bp` with a stack trace in the
+/// guest's log (every user's, about two hours after boot) and corrects it.
+pub fn sample_us(horizon_secs: u64) -> u64 {
+    let samples = if horizon_secs >= 200 { 50 } else { 4 };
+    horizon_secs * 1_000_000 / samples
 }
 
 /// The span of guest physical memory to pass over: from the lowest
@@ -87,7 +95,7 @@ pub fn configuration(root: &str, horizon_secs: u64, iomem: &str) -> Option<Vec<(
         (format!("{ctx}/operations"), "paddr".into()),
         (
             format!("{ctx}/monitoring_attrs/intervals/sample_us"),
-            (sample_secs(horizon_secs) * 1_000_000).to_string(),
+            sample_us(horizon_secs).to_string(),
         ),
         (format!("{ctx}/monitoring_attrs/intervals/aggr_us"), horizon_us.to_string()),
         (format!("{ctx}/monitoring_attrs/intervals/update_us"), horizon_us.to_string()),
@@ -197,7 +205,7 @@ impl Idle {
         }
         idle.running = true;
         let (root, pending) = (root.to_string(), idle.pending.clone());
-        let cadence = Duration::from_secs(sample_secs(horizon_secs));
+        let cadence = Duration::from_micros(sample_us(horizon_secs));
         std::thread::spawn(move || {
             let mut applied = 0;
             loop {
@@ -253,9 +261,14 @@ c0000000-c000ffff : virtio-mmio
 
     #[test]
     fn the_sampling_interval_stays_under_the_horizon() {
-        assert_eq!(sample_secs(3600), 60);
-        assert_eq!(sample_secs(40), 10);
-        assert_eq!(sample_secs(3), 1);
+        assert_eq!(sample_us(3600), 72_000_000);
+        assert_eq!(sample_us(40), 10_000_000);
+        assert_eq!(sample_us(3), 750_000);
+        for horizon in [3, 40, 199, 200, 3600, 7200, 86_400] {
+            let samples = horizon * 1_000_000 / sample_us(horizon);
+            assert_eq!(horizon * 1_000_000 % sample_us(horizon), 0, "{horizon}: whole samples");
+            assert_eq!(10_000 % samples, 0, "{horizon}: {samples} samples divide DAMON's basis points");
+        }
     }
 
     #[test]
@@ -263,7 +276,7 @@ c0000000-c000ffff : virtio-mmio
         let writes = configuration("/d", 3600, IOMEM).unwrap();
         let get = |p: &str| writes.iter().find(|(k, _)| k == &format!("/d/{p}")).map(|(_, v)| v.as_str());
         assert_eq!(get("kdamonds/0/contexts/0/operations"), Some("paddr"));
-        assert_eq!(get("kdamonds/0/contexts/0/monitoring_attrs/intervals/sample_us"), Some("60000000"));
+        assert_eq!(get("kdamonds/0/contexts/0/monitoring_attrs/intervals/sample_us"), Some("72000000"));
         assert_eq!(get("kdamonds/0/contexts/0/monitoring_attrs/intervals/aggr_us"), Some("3600000000"));
         assert_eq!(get("kdamonds/0/contexts/0/targets/0/regions/0/start"), Some("1073741824"));
         assert_eq!(get("kdamonds/0/contexts/0/targets/0/regions/0/end"), Some("21474836480"));

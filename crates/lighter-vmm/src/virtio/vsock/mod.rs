@@ -24,6 +24,23 @@
 //! two under one lock deadlocks the machine the first time a container writes
 //! to the Docker socket while the guest is also writing back, which is to say
 //! immediately and only under load.
+//!
+//! # Sharing
+//!
+//! **Nothing shared is held on behalf of a party whose progress the host does
+//! not control.** Every connection shares the transmit ring, the outbox and
+//! the credit budget, and every connection's host peer can stop reading,
+//! reset, or never be heard from again; so does the guest. A connection
+//! holds at most its share of the ring (`TX_SHARE_DIVISOR`) and the ring's
+//! reserve is never held (`TX_RESERVE_DIVISOR`); a window is drawn from the
+//! budget and cut when its peer stops ([`credit::Budget`]); a closed
+//! connection gives everything back at once and is removed whether or not the
+//! guest answers ([`VsockShared::sweep`]); the control plane has its own lane
+//! (`Outbox`). Before these rules one published port written in 16 KiB
+//! pieces to a client that had stopped reading held all 256 chains, and
+//! Docker, every port and the memory reports went dark until a restart
+//! (#84). A change that adds anything shared here says who holds it, what
+//! bounds it, and what gives it back when the holder never does.
 
 pub mod credit;
 pub mod packet;

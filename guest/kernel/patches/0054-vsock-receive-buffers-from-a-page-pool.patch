@@ -1,0 +1,271 @@
+# vsock/virtio: receive buffers from a page pool. A 256 KiB receive buffer is an order-6 allocation,
+# and a guest that has run for a day has fragmented memory the compactor cannot repair: filesystem
+# metadata (a media server scanning its library over a share holds gigabytes of it) is unmovable, and
+# skwiz0d's guest (#84), with 3.1 GB available, had no free block of 256 KiB or more in its main zone
+# and refused the large buffer 25,000 times, every one a 32 KiB buffer instead (patch 0021). The large
+# buffers now come from a page pool and return to it when the socket layer frees them
+# (skb_mark_for_recycle), so the allocator is asked for 256 KiB blocks at boot and rarely after. The
+# pool's ring holds up to 128 recycled buffers beyond the 128 the receive ring has posted, and after
+# ten seconds with nothing received a fresh pool replaces it, so its cache goes back to the Mac rather
+# than sitting resident (kept, it held 43 MiB more of a 4 GiB guest than 0.13.4 after a transfer).
+# 0021's 32 KiB fallback remains for a pool that is empty while the allocator refuses. Its counters,
+# and those of the two fallbacks, are /sys/module/vmw_vsock_virtio_transport/parameters/rx_pool.
+diff --git a/net/vmw_vsock/virtio_transport.c b/net/vmw_vsock/virtio_transport.c
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -20,6 +20,7 @@
+ #include <net/sock.h>
+ #include <linux/mutex.h>
+ #include <net/af_vsock.h>
++#include <net/page_pool/helpers.h>
+ 
+ static struct workqueue_struct *virtio_vsock_workqueue;
+ static struct virtio_vsock __rcu *the_virtio_vsock;
+@@ -55,6 +56,11 @@
+ 	bool rx_run;
+ 	int rx_buf_nr;
+ 	int rx_buf_max_nr;
++	/* lighter: where the large receive buffers come from and go back to,
++	 * and the work that gives the pool's cache back once traffic stops.
++	 */
++	struct page_pool *rx_pool;
++	struct delayed_work rx_pool_trim_work;
+ 
+ 	/* The following fields are protected by event_lock.
+ 	 * vqs[VSOCK_VQ_EVENT] must be accessed with event_lock held.
+@@ -322,6 +328,141 @@
+  * work rather than forgotten, and says so once.
+  */
+ #define VIRTIO_VSOCK_SMALL_RX_BUF_SIZE	SKB_WITH_OVERHEAD(1024 * 32)
++
++/* lighter: the large buffers come from a page pool and go back to it when
++ * the socket layer frees them, so a long-running guest asks the page
++ * allocator for 256 KiB blocks once, at boot, rather than on every refill:
++ * fragmentation that builds with uptime (filesystem metadata compaction
++ * cannot move) no longer shrinks what the host can send. The ring is the
++ * floor of what the pool holds; it keeps up to RX_POOL_CACHE more
++ * recycled, 32 MiB, and frees past that. Fewer is not enough: a refill
++ * posts half the ring at once, and with a cache of 64 the buffers freed
++ * between two refills overflowed it, so a fifth of the refills under a
++ * transfer were new 256 KiB allocations. Only when the pool is empty and
++ * the allocator refuses a new block does the 32 KiB fallback below apply.
++ */
++#define VIRTIO_VSOCK_RX_POOL_ORDER	get_order(1024 * 256)
++#define VIRTIO_VSOCK_RX_POOL_CACHE	128
++
++/* The pool's cache is for traffic. page_pool cannot shrink in place, so
++ * after this long with nothing received a fresh pool replaces it and the old
++ * one is destroyed: its cache is freed at once, and the buffers still posted
++ * or on sockets are released as they come back. Kept, the cache held 43 MiB
++ * more of a 4 GiB guest on the Mac than 0.13.4 after a transfer.
++ */
++#define VIRTIO_VSOCK_RX_POOL_IDLE	(10 * HZ)
++
++/* Large buffers the pool could not supply but the allocator could, and the
++ * small ones posted when it could not either; and the counters of pools
++ * already replaced, under rx_lock.
++ */
++static atomic64_t virtio_vsock_rx_unpooled = ATOMIC64_INIT(0);
++static atomic64_t virtio_vsock_rx_small = ATOMIC64_INIT(0);
++#ifdef CONFIG_PAGE_POOL_STATS
++static struct page_pool_stats virtio_vsock_rx_pool_retired;
++#endif
++
++static struct sk_buff *virtio_vsock_rx_pool_skb(struct virtio_vsock *vsock)
++{
++	struct sk_buff *skb;
++	struct page *page;
++
++	if (!vsock->rx_pool)
++		return NULL;
++	page = page_pool_alloc_pages(vsock->rx_pool, GFP_KERNEL | __GFP_NOWARN);
++	if (!page)
++		return NULL;
++	skb = build_skb(page_address(page), PAGE_SIZE << VIRTIO_VSOCK_RX_POOL_ORDER);
++	if (!skb) {
++		page_pool_put_full_page(vsock->rx_pool, page, false);
++		return NULL;
++	}
++	skb_mark_for_recycle(skb);
++	skb_reserve(skb, VIRTIO_VSOCK_SKB_HEADROOM);
++	return skb;
++}
++
++/* /sys/module/vmw_vsock_virtio_transport/parameters/rx_pool: the pool's own
++ * counters, for `lighter doctor` and the gate that fragments a guest.
++ */
++static int virtio_vsock_rx_pool_get(char *buf, const struct kernel_param *kp)
++{
++	struct page_pool_stats stats = {};
++	struct virtio_vsock *vsock;
++	bool have = false;
++
++	/* The pool can be replaced and freed under a reader that only held
++	 * RCU, so the counters are read under the locks that replace it.
++	 */
++	mutex_lock(&the_virtio_vsock_mutex);
++	vsock = rcu_dereference_protected(the_virtio_vsock,
++					  lockdep_is_held(&the_virtio_vsock_mutex));
++	if (vsock) {
++		mutex_lock(&vsock->rx_lock);
++#ifdef CONFIG_PAGE_POOL_STATS
++		stats = virtio_vsock_rx_pool_retired;
++		if (vsock->rx_pool)
++			have = page_pool_get_stats(vsock->rx_pool, &stats);
++#endif
++		mutex_unlock(&vsock->rx_lock);
++	}
++	mutex_unlock(&the_virtio_vsock_mutex);
++	return sysfs_emit(buf,
++			  "pool=%d fast=%llu slow=%llu recycled=%llu ring_full=%llu released=%llu unpooled=%lld small=%lld\n",
++			  have, stats.alloc_stats.fast, stats.alloc_stats.slow_high_order,
++			  stats.recycle_stats.cached + stats.recycle_stats.ring,
++			  stats.recycle_stats.ring_full, stats.recycle_stats.released_refcnt,
++			  atomic64_read(&virtio_vsock_rx_unpooled),
++			  atomic64_read(&virtio_vsock_rx_small));
++}
++
++static const struct kernel_param_ops virtio_vsock_rx_pool_ops = {
++	.get = virtio_vsock_rx_pool_get,
++};
++module_param_cb(rx_pool, &virtio_vsock_rx_pool_ops, NULL, 0444);
++
++static void virtio_vsock_rx_pool_create(struct virtio_vsock *vsock)
++{
++	struct page_pool_params pp = {
++		.order = VIRTIO_VSOCK_RX_POOL_ORDER,
++		.pool_size = VIRTIO_VSOCK_RX_POOL_CACHE,
++		.nid = NUMA_NO_NODE,
++	};
++	struct page_pool *pool = page_pool_create(&pp);
++
++	if (IS_ERR(pool)) {
++		pr_warn("virtio_vsock: no receive buffer pool (%ld); allocating each buffer\n",
++			PTR_ERR(pool));
++		pool = NULL;
++	}
++	vsock->rx_pool = pool;
++}
++
++static void virtio_vsock_rx_pool_trim_work(struct work_struct *work)
++{
++	struct virtio_vsock *vsock =
++		container_of(work, struct virtio_vsock, rx_pool_trim_work.work);
++	struct page_pool *old;
++
++	mutex_lock(&vsock->rx_lock);
++	old = vsock->rx_pool;
++	if (!old || !vsock->rx_run) {
++		mutex_unlock(&vsock->rx_lock);
++		return;
++	}
++	virtio_vsock_rx_pool_create(vsock);
++	if (!vsock->rx_pool) {
++		/* No new pool: keep the old one, cache and all. */
++		vsock->rx_pool = old;
++		mutex_unlock(&vsock->rx_lock);
++		return;
++	}
++#ifdef CONFIG_PAGE_POOL_STATS
++	page_pool_get_stats(old, &virtio_vsock_rx_pool_retired);
++#endif
++	mutex_unlock(&vsock->rx_lock);
++	page_pool_destroy(old);
++}
+ 
+ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
+ {
+@@ -338,12 +479,19 @@
+ 	do {
+ 		int len = total_len;
+ 
+-		skb = virtio_vsock_alloc_linear_skb(len, GFP_KERNEL | __GFP_NOWARN);
++		skb = virtio_vsock_rx_pool_skb(vsock);
+ 		if (!skb) {
++			skb = virtio_vsock_alloc_linear_skb(len, GFP_KERNEL | __GFP_NOWARN);
++			if (skb)
++				atomic64_inc(&virtio_vsock_rx_unpooled);
++		}
++		if (!skb) {
+ 			len = VIRTIO_VSOCK_SMALL_RX_BUF_SIZE;
+ 			skb = virtio_vsock_alloc_linear_skb(len, GFP_KERNEL);
+-			if (skb)
++			if (skb) {
++				atomic64_inc(&virtio_vsock_rx_small);
+ 				pr_info_ratelimited("virtio_vsock: the large receive buffer was refused; posting a small one\n");
++			}
+ 		}
+ 		if (!skb)
+ 			break;
+@@ -660,6 +808,7 @@
+ 	struct virtio_vsock *vsock =
+ 		container_of(work, struct virtio_vsock, rx_work);
+ 	struct virtqueue *vq;
++	bool received = false;
+ 
+ 	mutex_lock(&vsock->rx_lock);
+ 
+@@ -688,6 +837,7 @@
+ 				break;
+ 
+ 			vsock->rx_buf_nr--;
++			received = true;
+ 
+ 			/* Drop short/long packets */
+ 			if (unlikely(len < sizeof(*hdr) ||
+@@ -723,6 +873,9 @@
+ 				    vq->num_free);
+ 	if (vsock->rx_buf_nr < vsock->rx_buf_max_nr / 2)
+ 		virtio_vsock_rx_fill(vsock);
++	if (received && vsock->rx_pool)
++		mod_delayed_work(virtio_vsock_workqueue, &vsock->rx_pool_trim_work,
++				 VIRTIO_VSOCK_RX_POOL_IDLE);
+ out_nofill:
+ 	mutex_unlock(&vsock->rx_lock);
+ }
+@@ -860,6 +1013,7 @@
+ 	skb_queue_head_init(&vsock->send_pkt_queue);
+ 	INIT_WORK(&vsock->rx_work, virtio_transport_rx_work);
+ 	INIT_DELAYED_WORK(&vsock->rx_refill_work, virtio_vsock_rx_refill_work);
++	INIT_DELAYED_WORK(&vsock->rx_pool_trim_work, virtio_vsock_rx_pool_trim_work);
+ 	INIT_WORK(&vsock->tx_work, virtio_transport_tx_work);
+ 	INIT_WORK(&vsock->event_work, virtio_transport_event_work);
+ 	INIT_WORK(&vsock->send_pkt_work, virtio_transport_send_pkt_work);
+@@ -867,6 +1021,8 @@
+ 	if (virtio_has_feature(vdev, VIRTIO_VSOCK_F_SEQPACKET))
+ 		vsock->seqpacket_allow = true;
+ 
++	virtio_vsock_rx_pool_create(vsock);
++
+ 	vdev->priv = vsock;
+ 
+ 	ret = virtio_vsock_vqs_init(vsock);
+@@ -884,6 +1040,8 @@
+ 	return 0;
+ 
+ out:
++	if (vsock && vsock->rx_pool)
++		page_pool_destroy(vsock->rx_pool);
+ 	kfree(vsock);
+ 	mutex_unlock(&the_virtio_vsock_mutex);
+ 	return ret;
+@@ -905,6 +1063,7 @@
+ 	 * all works before to free the vsock object to avoid use after free.
+ 	 */
+ 	cancel_delayed_work_sync(&vsock->rx_refill_work);
++	cancel_delayed_work_sync(&vsock->rx_pool_trim_work);
+ 	flush_work(&vsock->tx_work);
+ 	flush_work(&vsock->event_work);
+ 	flush_work(&vsock->send_pkt_work);
+@@ -912,6 +1071,11 @@
+ 
+ 	mutex_unlock(&the_virtio_vsock_mutex);
+ 
++	/* Buffers still queued on sockets come back to the pool as they are
++	 * freed; destroy waits for them.
++	 */
++	if (vsock->rx_pool)
++		page_pool_destroy(vsock->rx_pool);
+ 	kfree(vsock);
+ }
+ 
