@@ -113,14 +113,26 @@ struct Conn {
     /// The host end, kept for shutdown. The writer thread holds its own
     /// clone. None until a pump attaches one.
     socket: Option<Box<dyn Closable>>,
-    /// Threads blocked in `wait_progress` on this connection. The transport
-    /// broadcasts the condvar only when a packet touched a connection that
-    /// has one: the memory policy's reader sits in a 100 ms wait on its own
-    /// port for the machine's whole life, and with one count for everyone
-    /// its presence made every batch of somebody else's stream a broadcast
-    /// and a context switch — a fifth of the poller's time at 53 Gbit/s on
-    /// an M1.
+    /// Threads blocked in `wait_progress` on this connection. An event on the
+    /// connection notifies `wake` only while this is non-zero. The memory
+    /// policy's reader sits in a 100 ms wait on its own port for the machine's
+    /// whole life; with one device-wide condvar its wake-ups were a broadcast
+    /// and a context switch for every batch of somebody else's stream — a
+    /// fifth of the poller's time at 53 Gbit/s on an M1.
     waiters: u32,
+    /// What this connection's waiters sleep on. Only events on this
+    /// connection wake them.
+    wake: Arc<Condvar>,
+}
+
+impl Conn {
+    /// Wakes this connection's own waiters, if it has any. Called with the
+    /// state lock held, after the change it reports.
+    fn wake_waiters(&self) {
+        if self.waiters > 0 {
+            self.wake.notify_all();
+        }
+    }
 }
 
 /// What the host end of a connection has to be: readable, writable,
@@ -275,16 +287,16 @@ pub struct VsockShared {
     /// Guest memory, for a writer reading a payload where the guest left
     /// it. Set when the driver activates the device.
     memory: std::sync::OnceLock<Arc<GuestMemory>>,
-    /// Signalled when credit frees up or a connection changes state, so a
-    /// blocked writer wakes without polling.
+    /// Signalled when outbox room frees up, for a sender blocked on a full
+    /// outbox: the one condition every connection's sender shares. Waiters on
+    /// a connection's own state sleep on that connection's `Conn::wake`.
     progress: Condvar,
-    /// How many threads are waiting on `progress` at all, for the rare
-    /// events that are not about one connection (a reset, a shutdown). The
-    /// packet paths look at the connection's own count instead.
-    waiters: std::sync::atomic::AtomicUsize,
-    /// How many of them are senders out of outbox room, which is the one
-    /// condition that delivery into the guest changes for everybody.
+    /// How many threads are blocked on outbox room.
     room_waiters: std::sync::atomic::AtomicUsize,
+    /// Waiters woken by a notification (not by their timeout), for tests of
+    /// who an event wakes.
+    #[cfg(test)]
+    wakeups: std::sync::atomic::AtomicUsize,
     /// Pokes the transport to drain the outbox into the guest.
     ///
     /// Set after construction because the transport does not exist yet when the
@@ -338,17 +350,22 @@ impl VsockShared {
                 listeners: HashMap::new(),
             }),
             progress: Condvar::new(),
-            waiters: std::sync::atomic::AtomicUsize::new(0),
             room_waiters: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            wakeups: std::sync::atomic::AtomicUsize::new(0),
             waker: Mutex::new(None),
         }
     }
 
-    /// Waits on `progress` with the lock held, counted so that `progressed`
-    /// can skip the broadcast when nobody waits. The count goes up under the
-    /// lock, and every state change a waiter checks is made under the same
-    /// lock, so a notifier that changes state after the waiter's check sees
-    /// the count before it decides whether to broadcast.
+    /// Waits for a change with the lock held, counted so that a notifier can
+    /// skip the wake-up when nobody waits. Room waiters block on the
+    /// device-wide condvar: outbox room is the one thing every connection's
+    /// sender shares. Anyone waiting on a connection's own state blocks on
+    /// that connection's condvar, which only an event on that connection
+    /// wakes. The counts go up under the lock, and every state change a
+    /// waiter checks is made under the same lock, so a notifier that changes
+    /// state after the waiter's check sees the count before it decides
+    /// whether to notify.
     fn wait_progress<'a>(
         &self,
         key: ConnKey,
@@ -356,30 +373,50 @@ impl VsockShared {
         mut inner: std::sync::MutexGuard<'a, Inner>,
         timeout: std::time::Duration,
     ) -> std::sync::MutexGuard<'a, Inner> {
-        if let Some(conn) = inner.conns.get_mut(&key) {
-            conn.waiters += 1;
-        }
-        self.waiters
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if want_room {
             self.room_waiters
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        let (mut guard, _) = self
-            .progress
-            .wait_timeout(inner, timeout)
-            .expect("vsock state poisoned");
-        if want_room {
+            let (guard, outcome) = self
+                .progress
+                .wait_timeout(inner, timeout)
+                .expect("vsock state poisoned");
             self.room_waiters
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.count_wakeup(&outcome);
+            return guard;
         }
-        self.waiters
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(conn) = guard.conns.get_mut(&key) {
+        let Some(conn) = inner.conns.get_mut(&key) else {
+            return inner;
+        };
+        conn.waiters += 1;
+        let wake = conn.wake.clone();
+        let (mut guard, outcome) = wake
+            .wait_timeout(inner, timeout)
+            .expect("vsock state poisoned");
+        self.count_wakeup(&outcome);
+        // The entry may have gone while this thread slept, and a newer
+        // connection may now sit under the same key. Only the entry this
+        // thread registered with is its to decrement.
+        if let Some(conn) = guard.conns.get_mut(&key)
+            && Arc::ptr_eq(&conn.wake, &wake)
+        {
             conn.waiters = conn.waiters.saturating_sub(1);
         }
         guard
     }
+
+    /// Counts a waiter that a notification woke, for tests. A timeout is not
+    /// a wake-up.
+    #[cfg(test)]
+    fn count_wakeup(&self, outcome: &std::sync::WaitTimeoutResult) {
+        if !outcome.timed_out() {
+            self.wakeups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn count_wakeup(&self, _outcome: &std::sync::WaitTimeoutResult) {}
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("vsock state poisoned")
@@ -414,20 +451,19 @@ impl VsockShared {
         *self.stream_waker.lock().expect("stream waker poisoned") = Some(Arc::new(waker));
     }
 
-    /// Something a waiter may care about changed: blocking waiters are
-    /// woken through the condvar, the reactor through its waker. For
-    /// events that name no connection; the packet paths know whose
-    /// connections they touched and use `progressed_if`.
+    /// Something changed that a room waiter or the reactor may need. The
+    /// device-wide condvar is only for room, so it is skipped unless a sender
+    /// is blocked on a full outbox. Events on one connection use
+    /// `Conn::wake_waiters`.
     fn progressed(&self) {
-        self.progressed_if(self.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0);
-    }
-
-    /// As `progressed`, broadcasting to blocked threads only if `blocked`
-    /// says a touched connection has one.
-    fn progressed_if(&self, blocked: bool) {
-        if blocked {
+        if self.room_waiters.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             self.progress.notify_all();
         }
+        self.signal_reactor();
+    }
+
+    /// Tells the reactor that a stream changed, through its waker.
+    fn signal_reactor(&self) {
         self.stream_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if self
@@ -528,6 +564,7 @@ impl VsockShared {
                 received: 0,
                 socket: Some(Box::new(socket)),
                 waiters: 0,
+                wake: Arc::new(Condvar::new()),
             },
         );
         let mut request = Packet::control(Op::Request, host_port, guest_port);
@@ -973,6 +1010,9 @@ impl VsockShared {
         packet.flags = shutdown::SEND;
         packet.buf_alloc = credit::BUF_ALLOC;
         inner.outbox.push_back(packet);
+        if let Some(conn) = inner.conns.get(&key) {
+            conn.wake_waiters();
+        }
         drop(inner);
 
         self.progressed();
@@ -995,6 +1035,7 @@ impl VsockShared {
             if let Some(socket) = &conn.socket {
                 socket.close();
             }
+            conn.wake_waiters();
         }
         drop(inner);
         self.progressed();
@@ -1017,7 +1058,9 @@ impl VsockShared {
             if conn.state == State::Closed || conn.guest_done {
                 return None;
             }
-            inner = self.wait_progress(key, false, inner, std::time::Duration::from_millis(100));
+            // Woken by this connection's own events. The timeout is only a
+            // safety net against a missed notification.
+            inner = self.wait_progress(key, false, inner, std::time::Duration::from_secs(1));
         }
     }
 
@@ -1084,6 +1127,7 @@ impl VsockShared {
             return;
         };
         conn.credit.consumed(bytes);
+        conn.wake_waiters();
         if conn.guest_done && conn.guest_receive_closed && conn.received == conn.credit.fwd_cnt() {
             Vsock::finish_shutdown(&mut inner, key);
             drop(inner);
@@ -1188,6 +1232,12 @@ impl Vsock {
         // together they name the connection.
         let host_port = packet.dst_port;
         let key: ConnKey = (packet.dst_port, packet.src_port);
+
+        // Whatever this packet changes, the connection's own waiters re-check
+        // it: they cannot see the change until this lock is released.
+        if let Some(conn) = inner.conns.get(&key) {
+            conn.wake_waiters();
+        }
 
         // Credit rides on every packet, including ones we otherwise ignore.
         if let Some(conn) = inner.conns.get_mut(&key) {
@@ -1301,6 +1351,7 @@ impl Vsock {
                             received: 0,
                             socket: None,
                             waiters: 0,
+                            wake: Arc::new(Condvar::new()),
                         };
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
                         inner.conns.insert(key, conn);
@@ -1345,6 +1396,7 @@ impl Vsock {
     /// Returns queued chains on teardown. In-flight chains remain owned by
     /// their writer and are completed there, including after a reset.
     fn retire(inner: &mut Inner, conn: Conn) {
+        conn.wake_waiters();
         if let Some(socket) = &conn.socket {
             socket.close();
         }
@@ -1372,6 +1424,9 @@ impl Vsock {
                 let len: usize = spans.iter().map(|s| s.1).sum();
                 conn.received = conn.received.wrapping_add(len as u32);
                 conn.outbound.push_back(Chunk::Guest { head, spans });
+                // This path does not go through `handle`, and the writer
+                // parked on this connection takes the chain from here.
+                conn.wake_waiters();
                 inner.held += 1;
                 true
             }
@@ -1492,13 +1547,7 @@ impl Vsock {
         }
 
         let mut inner = self.shared.lock();
-        // Whether any packet landed on a connection with a thread blocked
-        // on it, looked up before the packet is handled: a reset removes
-        // the connection, and its waiter is exactly who must hear.
-        let mut blocked = false;
         for (packet, guest) in packets {
-            let key = (packet.dst_port, packet.src_port);
-            blocked |= inner.conns.get(&key).is_some_and(|conn| conn.waiters > 0);
             match guest {
                 Some((head, spans)) => {
                     if !Vsock::handle_guest_rw(&mut inner, &packet, head, spans) {
@@ -1515,9 +1564,10 @@ impl Vsock {
         }
         drop(inner);
         // Credit may have freed up, and a connection may have been
-        // established or torn down; whoever waits on those connections
-        // is woken, and nobody else.
-        self.shared.progressed_if(blocked);
+        // established or torn down. Each packet woke its own connection's
+        // waiters as it was handled (`handle` or `handle_guest_rw`); this
+        // reaches the reactor and room waiters.
+        self.shared.progressed();
 
         used_any
     }
@@ -1613,14 +1663,9 @@ impl Vsock {
 
         drop(inner);
         if used_any {
-            // Delivery frees outbox room, which is the one thing a blocked
-            // sender may be waiting on that is not its own connection's.
-            let room = self
-                .shared
-                .room_waiters
-                .load(std::sync::atomic::Ordering::SeqCst)
-                > 0;
-            self.shared.progressed_if(room);
+            // Delivery frees outbox room, which a blocked sender may be
+            // waiting for whatever the state of its own connection.
+            self.shared.progressed();
         }
         used_any
     }
@@ -1725,6 +1770,9 @@ impl VirtioDevice for Vsock {
 
     fn reset(&mut self) {
         let mut inner = self.shared.lock();
+        for conn in inner.conns.values() {
+            conn.wake_waiters();
+        }
         inner.conns.clear();
         inner.outbox.clear();
         drop(inner);
@@ -2467,5 +2515,83 @@ mod tests {
 
         assert_eq!(delivered.len(), 10_000, "no bytes may be lost in the split");
         assert!(delivered.iter().all(|&b| b == 0xab));
+    }
+
+    /// An event on one connection wakes that connection's writer and no other.
+    /// A single condvar for the whole device woke every parked writer on every
+    /// event, which is work per guest packet that grows with the connections.
+    #[test]
+    fn an_event_on_one_connection_wakes_only_its_writer() {
+        const PARKED: usize = 20;
+        let shared = Arc::new(VsockShared::new());
+        let mut keys = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..PARKED {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let key = shared.open(2375, ours);
+            shared.lock().conns.get_mut(&key).unwrap().state = State::Established;
+            let worker = shared.clone();
+            std::thread::spawn(move || while worker.take_outbound(key).is_some() {});
+            keys.push(key);
+            peers.push(theirs);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !keys.iter().all(|key| shared.lock().conns[key].waiters == 1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writers never parked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let before = shared.wakeups.load(std::sync::atomic::Ordering::SeqCst);
+        shared.shutdown_write(keys[0]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let woken = shared.wakeups.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert_eq!(
+            woken, 1,
+            "one event on one connection woke {woken} of {PARKED} parked writers"
+        );
+        for key in keys {
+            shared.shutdown(key);
+        }
+        drop(peers);
+    }
+
+    /// A guest write takes the RW path, which does not go through `handle`.
+    /// The writer parked on that connection must be woken by it, not left to
+    /// its own timeout.
+    #[test]
+    fn a_guest_write_wakes_its_parked_writer() {
+        let shared = Arc::new(VsockShared::new());
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let key = shared.open(2375, socket);
+        shared.lock().conns.get_mut(&key).unwrap().state = State::Established;
+        let worker = shared.clone();
+        let (taken, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = taken.send(worker.take_outbound(key).map(|chunks| chunks.len()));
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shared.lock().conns[&key].waiters == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never parked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let write = Packet::control(Op::Rw, key.1, key.0);
+        assert!(Vsock::handle_guest_rw(
+            &mut shared.lock(),
+            &write,
+            7,
+            vec![(0x1000, 5)]
+        ));
+        let woken = received
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("the guest write did not wake its writer within 500 ms");
+        assert_eq!(woken, Some(1), "the writer took the guest's chain");
+        shared.shutdown(key);
     }
 }
