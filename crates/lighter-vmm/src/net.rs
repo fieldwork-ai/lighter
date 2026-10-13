@@ -1289,6 +1289,13 @@ pub(crate) fn write_all_vectored(fd: libc::c_int, iovs: &mut [libc::iovec]) -> i
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            // The Mac's network stack out of buffers is not this socket
+            // failing: wait for them, as the reactor does (`STARVED_RETRY`).
+            // A socket shut meanwhile answers EPIPE and ends this.
+            if e.raw_os_error() == Some(libc::ENOBUFS) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
             return Err(e);
         }
         let mut n = n as usize;

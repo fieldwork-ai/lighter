@@ -246,6 +246,10 @@ dump
 ring="$(ring_held)"
 alive "2,000 clients not reading"
 [ "${ring:-999}" -le 192 ] && pass "2,000 clients: the ring holds ${ring} chains of its limit of 192" || fail "2,000 clients: the ring holds ${ring:-?}"
+# And the Mac's own network buffers: lighter leaves TCP sockets to macOS's
+# autotuning, so clients that do not read do not hold them (sockbuf.rs).
+nobufs="$(sed 's/\x1b\[[0-9;]*m//g' "$LIGHTER_HOME/machine.log" | grep -c "out of network buffers")"
+[ "$nobufs" = 0 ] && pass "2,000 clients: the Mac never ran out of network buffers" || fail "2,000 clients: the Mac ran out of network buffers (ENOBUFS)"
 wait "$many"
 sleep 12
 dump

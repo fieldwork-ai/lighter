@@ -449,7 +449,14 @@ ts = [threading.Thread(target=tick, args=(c,)) for c in range(n)]
 print("%.2f" % max(worst))' >/dev/null
 		sleep 5
 		docker pause lighter-gate-smb >/dev/null
-		sleep 20
+		sleep 10
+		# And Docker itself, which shares nothing with the share but the
+		# machine: it answers while the server is hung (#84's rule, that no
+		# party lighter does not control silences the machine).
+		ps_start=$(python3 -c 'import time; print(time.monotonic())')
+		docker ps -q >/dev/null 2>&1 && ps_ok=1 || ps_ok=0
+		ps_secs=$(python3 -c "import time; print('%.2f' % (time.monotonic() - $ps_start))")
+		sleep 10
 		# Measured only if the share lasted the hang: macOS sometimes gives
 		# up on a server that stops answering and drops the share, and the
 		# requests then fail at once, which proves nothing either way.
@@ -468,6 +475,9 @@ print("%.2f" % max(worst))' >/dev/null
 			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
 				&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
 				|| fail "SMB: with the server hung, a local file in the same share waited ${slowest:-?} s"
+			[ "$ps_ok" = 1 ] && awk -v g="$ps_secs" 'BEGIN { exit !(g + 0 < 2) }' \
+				&& pass "SMB: and Docker answered in ${ps_secs} s" \
+				|| fail "SMB: with the server hung, Docker took ${ps_secs} s (ok=$ps_ok)"
 		else
 			note "SMB: macOS dropped the share while its server was hung, so the hang was not measured (gap ${gap:-?} s, slowest local ${slowest:-?} s)"
 		fi
