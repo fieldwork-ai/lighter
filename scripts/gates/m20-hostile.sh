@@ -293,7 +293,9 @@ docker run -d --name m20-frag --privileged -v "$ROOT/scripts/gates/fixtures:/f:r
 for i in $(seq 1 120); do docker logs m20-frag 2>&1 | grep -q fragmented && break; sleep 2; done
 read -r _ free256 slab <<<"$(docker logs m20-frag 2>&1 | grep fragmented | tail -1)"
 memory="$("$LIGHTER" status 2>/dev/null | grep "guest mem" | sed 's/^ *guest mem *//')"
-[ "${free256:-999}" -lt 32 ] \
+# Fewer free blocks than one ring of receive buffers: refills cannot come
+# from the allocator, which is what the pool is for.
+[ "${free256:-999}" -lt 128 ] \
 	&& pass "fragmented: ${free256} free blocks of 256 KiB with ${slab} MiB of pinned metadata; ${memory}" \
 	|| fail "the guest was not fragmented: ${free256:-?} free blocks of 256 KiB ($(docker logs m20-frag 2>&1 | tail -1))"
 p0="$(pool)"

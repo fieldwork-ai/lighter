@@ -9,12 +9,14 @@ or so still holding a file are scattered through memory, each pinning its
 256 KiB block. Second, whatever free memory the slab never reached is
 pinned the same way, one page of every physical 64-page block (from
 /proc/self/pagemap), mlocked where compaction may not move it, the rest
-freed. Memory is then available but in pieces, and is kept so: any whole
-block the guest frees later is pinned in its turn. Prints `fragmented
-<free 256 KiB blocks> <slab MiB>` and holds it all until killed.
+freed. Memory is then available but in pieces. Prints `fragmented <free
+256 KiB blocks> <slab MiB>` and holds it all until killed. Pinning again
+whenever the guest freed a block kept the guest short enough that the OOM
+killer took the containers a gate was watching.
 """
 
 import ctypes
+import errno
 import mmap
 import os
 import random
@@ -63,14 +65,19 @@ def slab():
     directory = 0
     # Free, not available: dentries are reclaimable slab, which available
     # counts, and a loop on it grew the slab until the OOM killer came.
-    while meminfo("MemFree:") > total // 6:
-        path = f"{ROOT}/{directory}"
-        os.mkdir(path)
-        for i in range(20000):
-            name = f"{path}/{i:05d}-{'x' * 40}"
-            os.close(os.open(name, os.O_CREAT | os.O_WRONLY, 0o644))
-            names.append(name)
-        directory += 1
+    # Memory running out first is the same answer, sooner.
+    try:
+        while meminfo("MemFree:") > total // 6:
+            path = f"{ROOT}/{directory}"
+            os.mkdir(path)
+            for i in range(20000):
+                name = f"{path}/{i:05d}-{'x' * 40}"
+                os.close(os.open(name, os.O_CREAT | os.O_WRONLY, 0o644))
+                names.append(name)
+            directory += 1
+    except OSError as e:
+        if e.errno != errno.ENOMEM:
+            raise
     random.seed(84)
     random.shuffle(names)
     for name in names[len(names) // KEEP :]:
@@ -85,18 +92,31 @@ def release(base, first, count):
         libc.madvise(address, count * PAGE, 4)
 
 
-def pins(held):
+def pins(held, margin, lower_reserve):
+    """One page of every physical block of nearly all free memory, pinned.
+    `margin` is left free for everything else in the guest; the kernel's
+    reserve is halved for the first pass only. Taking all but 24 MiB with
+    the reserve at 4 MiB, a pass ran the guest out of memory and the OOM
+    killer took another container's server."""
     sysctl("compact_unevictable_allowed", 0)
-    reserve = sysctl("min_free_kbytes", 4096)
+    reserve = sysctl("min_free_kbytes")
+    if lower_reserve:
+        sysctl("min_free_kbytes", max(int(reserve) // 2, 8192))
     try:
         for _ in range(4):
-            size = (meminfo("MemFree:") - (24 << 20)) // PAGE * PAGE
+            size = (meminfo("MemFree:") - margin) // PAGE * PAGE
             if size < (16 << 20) or free_blocks() < 16:
                 break
-            region = mmap.mmap(-1, size, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x8000)
+            try:
+                region = mmap.mmap(-1, size, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x8000)
+            except OSError as e:
+                if e.errno != errno.ENOMEM:
+                    raise
+                break
             base = ctypes.addressof(ctypes.c_char.from_buffer(region))
             if libc.mlock(base, size) != 0:
-                raise OSError(ctypes.get_errno(), "mlock")
+                region.close()
+                break
             pages = size // PAGE
             with open("/proc/self/pagemap", "rb") as pagemap:
                 pagemap.seek(base // PAGE * 8)
@@ -118,15 +138,14 @@ def pins(held):
         sysctl("min_free_kbytes", reserve)
 
 
+# If the guest runs out regardless, this is what goes, never a container
+# the gate is watching.
+open("/proc/self/oom_score_adj", "w").write("1000")
 held = []
 slab()
-pins(held)
+pins(held, 64 << 20, True)
 time.sleep(1)
-pins(held)
+pins(held, 64 << 20, True)
 print("fragmented", free_blocks(), meminfo("Slab:") >> 20, flush=True)
-# And kept so: whatever the guest frees in whole blocks from here on (a
-# cache dropped, a buffer given back) is pinned in its turn.
 while True:
-    time.sleep(1)
-    if free_blocks() >= 8:
-        pins(held)
+    time.sleep(3600)
