@@ -965,6 +965,8 @@ impl Loop {
                 }
                 let Ok(clone) = mac.try_clone() else { return };
                 let key = self.shared.open(INBOUND_PORT, clone);
+                self.shared
+                    .label(key, format!("a client of port {}", dst.port()));
                 let fd = mac.as_raw_fd();
                 self.by_fd.insert(fd, key);
                 self.streams.insert(
@@ -1403,6 +1405,7 @@ impl Loop {
                         self.close(key);
                         return;
                     };
+                    self.shared.label(key, format!("a stream to {addr}"));
                     match connect_nonblocking(addr) {
                         Ok(tcp) => {
                             let fd = tcp.as_raw_fd();
