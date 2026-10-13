@@ -407,10 +407,12 @@ fn carry_inbound(shared: Arc<VsockShared>, dst: SocketAddr, mac: TcpStream) {
     let key = shared.open(INBOUND_PORT, clone);
     if !shared.await_established(key, Duration::from_secs(4)) {
         tracing::debug!(%dst, "the agent did not accept an inbound stream");
+        shared.reap(key);
         return;
     }
     let client = mac.peer_addr().ok().and_then(crate::reactor::lan_client);
     if !shared.send(key, &crate::reactor::inbound_header(dst, client)) {
+        shared.reap(key);
         return;
     }
     pump(shared, key, mac, None);

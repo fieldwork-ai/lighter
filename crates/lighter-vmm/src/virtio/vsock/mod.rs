@@ -1159,9 +1159,34 @@ impl VsockShared {
         }
     }
 
+    /// Forgets a connection whose host side is finished: the entry, its host
+    /// fd (a dup the table holds) and any queued guest chains go now, and the
+    /// guest is told with an RST rather than left to its own linger timeout.
+    /// A no-op for a connection that has already gone.
+    pub fn reap(&self, key: ConnKey) {
+        let mut inner = self.lock();
+        let Some(conn) = inner.conns.remove(&key) else {
+            return;
+        };
+        let mut rst = Packet::control(Op::Rst, key.0, key.1);
+        rst.buf_alloc = credit::BUF_ALLOC;
+        rst.fwd_cnt = conn.credit.fwd_cnt();
+        inner.outbox.push_back(rst);
+        Vsock::retire(&mut inner, conn);
+        drop(inner);
+        self.progressed();
+        self.wake();
+    }
+
     /// Whether anything is waiting to go to the guest.
     pub fn has_pending(&self) -> bool {
         !self.lock().outbox.is_empty()
+    }
+
+    /// Connections the table holds, for tests of teardown.
+    #[cfg(test)]
+    pub(crate) fn connection_count(&self) -> usize {
+        self.lock().conns.len()
     }
 }
 
@@ -1878,13 +1903,45 @@ pub fn pump<S: Socket>(
     // a full close here takes that output with it.
     if host_closed {
         shared.shutdown_write(key);
-        let _ = writer_done.recv();
+        // A client that half-closed and is still reading keeps the writer
+        // alive for as long as the guest talks. A client that has closed
+        // fully while the guest stays silent never ends that wait, so every
+        // so often ask the socket whether anyone is still there.
+        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            writer_done.recv_timeout(PEER_PROBE_EVERY)
+        {
+            if peer_fully_closed(&socket) {
+                break;
+            }
+        }
         shared.shutdown(key);
+        let _ = writer_done.recv();
+        shared.reap(key);
         return;
     }
 
     shared.shutdown(key);
     let _ = writer_done.recv();
+    shared.reap(key);
+}
+
+/// How often a pump whose client has half-closed checks that the client is
+/// still there at all. Costs one syscall per such connection per interval.
+#[cfg(not(test))]
+const PEER_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Short, so the tests that wait on it finish in a fraction of a second.
+#[cfg(test)]
+const PEER_PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether the client has closed both ways. On a Unix-domain socket on Darwin
+/// a zero-length send fails with EPIPE only then; a half-closed client
+/// returns 0. The poll flags cannot tell a half-close from a full one, and
+/// this can. A TCP peer that has fully closed still returns 0, so this does
+/// not detect it (see `a_fully_closed_tcp_peer_is_not_detected_by_the_probe`).
+fn peer_fully_closed(socket: &impl Socket) -> bool {
+    // SAFETY: a zero-length send reads no memory; the fd is live for the call.
+    let n = unsafe { libc::send(socket.as_raw_fd(), std::ptr::null(), 0, libc::MSG_NOSIGNAL) };
+    n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
 }
 
 /// One vectored write per batch, completed across partial writes. Guest
@@ -2017,8 +2074,9 @@ mod tests {
         assert!(woken.try_recv().is_ok());
     }
 
-    #[test]
-    fn a_failed_pump_write_returns_the_guest_buffers() {
+    /// Runs a pump whose first guest batch cannot be written, because the
+    /// peer is already gone, and waits for the pump to return.
+    fn pump_after_a_failed_write() -> (Arc<VsockShared>, ConnKey) {
         let shared = Arc::new(VsockShared::new());
         let (socket, peer) = UnixStream::pair().unwrap();
         let key = shared.open(2375, socket.try_clone().unwrap());
@@ -2045,9 +2103,107 @@ mod tests {
         finished
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
+        (shared, key)
+    }
+
+    /// The probe does not see a TCP client that has fully closed: a zero-length
+    /// send still returns 0 there. This pins the claim in `peer_fully_closed`.
+    #[test]
+    fn a_fully_closed_tcp_peer_is_not_detected_by_the_probe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop(client);
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // The end-of-stream has arrived once a peek reads it as zero bytes.
+        assert_eq!(server.peek(&mut [0u8; 1]).unwrap(), 0);
+        assert!(
+            !peer_fully_closed(&server),
+            "a fully closed TCP peer was detected; update the doc on peer_fully_closed"
+        );
+    }
+
+    /// A write that fails because the client is gone returns the guest's
+    /// buffers, and the connection is then closed. Nothing else closes it,
+    /// since the guest is never acknowledged: the entry and its host fd are
+    /// released when the pump returns, and the guest is reset.
+    #[test]
+    fn a_failed_pump_write_returns_the_guest_buffers() {
+        let (shared, key) = pump_after_a_failed_write();
         let inner = shared.lock();
         assert_eq!(inner.done.iter().copied().collect::<Vec<_>>(), [7]);
-        assert_eq!(inner.conns[&key].credit.fwd_cnt(), 0);
+        assert!(
+            !inner.conns.contains_key(&key),
+            "the entry and its host fd are released"
+        );
+        assert!(
+            inner
+                .outbox
+                .iter()
+                .any(|p| p.op == Op::Rst && p.dst_port == key.1),
+            "the guest is reset rather than left to its own timeout"
+        );
+    }
+
+    /// The client closed while the guest never answers. The pump and its
+    /// writer must not wait forever for an end-of-stream the guest will not
+    /// send.
+    #[test]
+    fn a_client_closed_while_the_guest_is_silent_releases_its_pump() {
+        let shared = Arc::new(VsockShared::new());
+        let (socket, client) = UnixStream::pair().unwrap();
+        let key = shared.open(2375, socket.try_clone().unwrap());
+        drop(client);
+        let worker_shared = shared.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            pump(worker_shared, key, socket, None);
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .expect("the pump is still blocked 8 s after the client closed, guest silent");
+        assert_eq!(shared.connection_count(), 0, "the connection is forgotten");
+    }
+
+    /// A client that half-closes and keeps reading is alive. The pump must
+    /// outlast the peer probe and still deliver what the guest sends last.
+    #[test]
+    fn a_half_closed_client_still_receives_the_guest_reply() {
+        use std::io::Read;
+        let shared = Arc::new(VsockShared::new());
+        let (socket, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let key = shared.open(2375, socket.try_clone().unwrap());
+        shared.lock().conns.get_mut(&key).unwrap().state = State::Established;
+        let worker_shared = shared.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            pump(worker_shared, key, socket, None);
+            let _ = done.send(());
+        });
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        // Several times the test probe interval, with nothing from the guest yet.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        {
+            let mut inner = shared.lock();
+            let mut reply = Packet::control(Op::Rw, 2375, key.0);
+            reply.payload = b"reply".to_vec();
+            Vsock::handle(&mut inner, reply);
+            let mut last = Packet::control(Op::Shutdown, 2375, key.0);
+            last.flags = shutdown::SEND;
+            Vsock::handle(&mut inner, last);
+        }
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"reply");
+        finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the pump returns once the reply is written");
     }
 
     #[test]
@@ -2078,7 +2234,10 @@ mod tests {
         // request, and teardown must wake the peer and the writer thread.
         peer.set_nonblocking(true).unwrap();
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-        assert_eq!(shared.lock().conns[&key].credit.counters().2, 0);
+        assert!(
+            !shared.lock().conns.contains_key(&key),
+            "reaped when the pump returns"
+        );
     }
 
     fn flat(chunks: Option<Vec<Chunk>>) -> Option<Vec<u8>> {

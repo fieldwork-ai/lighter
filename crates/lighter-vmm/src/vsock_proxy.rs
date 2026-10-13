@@ -164,8 +164,45 @@ fn serve(
             guest_port,
             "the guest did not accept; is the agent running?"
         );
+        // The table holds a dup of the client's fd: without this the client
+        // never sees EOF, and a late RESPONSE would mark the leftover entry
+        // established, with no pump to serve it.
+        shared.reap(host_port);
         return;
     }
 
     pump(shared, host_port, stream, inspect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// A guest that never accepts: `serve` gives up after its accept timeout.
+    /// The table must forget the connection, and the client must see it end
+    /// rather than hang on an entry that still holds its socket.
+    #[test]
+    fn a_guest_that_never_answers_gives_the_client_eof() {
+        let shared = Arc::new(VsockShared::new());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        let worker = shared.clone();
+        std::thread::spawn(move || serve(server, 2375, worker, None))
+            .join()
+            .unwrap();
+        assert_eq!(
+            shared.connection_count(),
+            0,
+            "the timed-out connection is forgotten"
+        );
+        let mut byte = [0u8; 1];
+        let got = client.read(&mut byte);
+        assert!(
+            matches!(got, Ok(0)),
+            "the client still sees an open socket after the guest gave up: {got:?}"
+        );
+    }
 }
