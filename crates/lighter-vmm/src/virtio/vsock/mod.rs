@@ -470,6 +470,23 @@ impl Inner {
         }
     }
 
+    /// The chains writers have finished with, counted back against the
+    /// ring and their connections, for the transport to return.
+    fn finish_done(&mut self) -> Vec<u16> {
+        let heads: Vec<u16> = self.done.drain(..).collect();
+        for &head in &heads {
+            self.held = self.held.saturating_sub(1);
+            self.last_return = std::time::Instant::now();
+            if let Some((key, id)) = self.holders.remove(&head)
+                && let Some(conn) = self.conns.get_mut(&key)
+                && conn.id == id
+            {
+                conn.held = conn.held.saturating_sub(1);
+            }
+        }
+        heads
+    }
+
     fn insert(&mut self, key: ConnKey, guest_port: u32, state: State) -> &mut Conn {
         let window = self.budget.open();
         self.next_id += 1;
@@ -1862,20 +1879,11 @@ impl Vsock {
 
     /// Returns the chains a writer has finished with to the guest.
     fn complete_done(inner: &mut Inner, queue: &mut Virtqueue, mem: &GuestMemory) -> bool {
-        let mut any = false;
-        while let Some(head) = inner.done.pop_front() {
+        let heads = inner.finish_done();
+        for &head in &heads {
             queue.push_used(mem, head, 0);
-            inner.held = inner.held.saturating_sub(1);
-            inner.last_return = std::time::Instant::now();
-            if let Some((key, id)) = inner.holders.remove(&head)
-                && let Some(conn) = inner.conns.get_mut(&key)
-                && conn.id == id
-            {
-                conn.held = conn.held.saturating_sub(1);
-            }
-            any = true;
         }
-        any
+        !heads.is_empty()
     }
 
     /// Reads packets the guest has queued for us.
@@ -3078,30 +3086,25 @@ mod tests {
         #[test]
         fn chains_count_back_against_their_connection_as_they_return() {
             let (shared, key, mem, _peer) = setup();
-            for i in 0..32u16 {
+            let share = shared.lock().tx_limits().1 as u16;
+            for i in 0..share {
                 assert!(send(&shared, key, &mem, i, u64::from(i)));
             }
-            assert!(!send(&shared, key, &mem, 32, 32), "at its share");
+            assert!(
+                !send(&shared, key, &mem, share, u64::from(share)),
+                "at its share"
+            );
             let taken = shared.take_outbound(key).unwrap();
             shared.complete(taken.iter().filter_map(|c| match c {
                 Chunk::Guest { head, .. } => Some(*head),
                 Chunk::Owned(_) => None,
             }));
             let mut inner = shared.lock();
-            let done: Vec<u16> = inner.done.drain(..).collect();
-            for head in done {
-                inner.held -= 1;
-                if let Some((k, id)) = inner.holders.remove(&head)
-                    && let Some(conn) = inner.conns.get_mut(&k)
-                    && conn.id == id
-                {
-                    conn.held -= 1;
-                }
-            }
+            assert_eq!(inner.finish_done().len(), usize::from(share));
             assert_eq!(inner.conns[&key].held, 0);
             drop(inner);
             assert!(
-                send(&shared, key, &mem, 33, 33),
+                send(&shared, key, &mem, share + 1, 0),
                 "held again once its chains are back"
             );
         }
@@ -3300,6 +3303,295 @@ mod tests {
                 "the connection holding the ring is reset"
             );
             assert_eq!(inner.warden.resets, 1);
+        }
+    }
+
+    /// A guest and its host peers, played at random against the device's own
+    /// code (#84). The guest sends what its credit allows, in pieces of every
+    /// size, on a real 256-entry ring; each Mac-side peer is fast, slow,
+    /// stalled or one that resets; the warden is swept with its clock pushed
+    /// ahead, so windows are cut far more often than they would be. What
+    /// must hold at every step, for every seed: no connection holds more
+    /// than its share and the ring never more than its limit; the Docker
+    /// connection can always send and is always served; every byte a
+    /// surviving connection sent arrives once, in order; and once everything
+    /// is closed, every chain, window and table entry is back.
+    mod simulation {
+        use super::*;
+
+        const BASE: u64 = 0x2000_0000;
+        const SLOT: usize = 256 * 1024;
+        const RING: usize = 256;
+        const SIZES: [usize; 6] = [4096, 8192, 16384, 16413, 65536, 262144];
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Peer {
+            Fast,
+            Slow,
+            Stalled,
+            Resets,
+        }
+
+        struct Stream {
+            key: ConnKey,
+            peer: Peer,
+            /// The guest's side: bytes sent, and the host's window and
+            /// consumed count as the guest last heard them.
+            sent: u32,
+            peer_fwd: u32,
+            peer_buf: u32,
+            /// The guest has heard the host close it.
+            heard_close: bool,
+            /// The host's side: bytes taken from the device, in order.
+            delivered: u32,
+            closed_by_host: bool,
+            reset_at: usize,
+        }
+
+        /// The bytes a stream carries from `offset`: each its offset modulo
+        /// 251, so a byte out of place or repeated shows.
+        fn pattern(offset: u32, len: usize) -> &'static [u8] {
+            static PATTERN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+            let all = PATTERN.get_or_init(|| (0..SLOT + 251).map(|i| (i % 251) as u8).collect());
+            &all[(offset % 251) as usize..][..len]
+        }
+
+        /// What the guest hears: every packet the host queued, in order.
+        fn guest_hears(shared: &VsockShared, streams: &mut [Stream]) {
+            let mut inner = shared.lock();
+            while let Some(p) = inner.outbox.pop_front() {
+                if let Some(s) = streams
+                    .iter_mut()
+                    .find(|s| (s.key.0, s.key.1) == (p.src_port, p.dst_port))
+                {
+                    s.peer_fwd = p.fwd_cnt;
+                    s.peer_buf = p.buf_alloc;
+                    if matches!(p.op, Op::Shutdown | Op::Rst) {
+                        s.heard_close = true;
+                    }
+                }
+            }
+        }
+
+        /// The host's side of one stream: takes what the device holds for
+        /// it, checks every byte, and gives the chains and the credit back.
+        fn host_takes(shared: &VsockShared, mem: &GuestMemory, s: &mut Stream) {
+            let Outbound::Chunks(chunks) = shared.try_take_outbound(s.key) else {
+                return;
+            };
+            let mut bytes = 0u32;
+            let mut read = Vec::with_capacity(SLOT);
+            for chunk in &chunks {
+                let data: &[u8] = match chunk {
+                    Chunk::Owned(v) => v,
+                    Chunk::Guest { spans, .. } => {
+                        read.clear();
+                        for (gpa, n) in spans {
+                            let at = read.len();
+                            read.resize(at + n, 0);
+                            mem.read(*gpa, &mut read[at..]).unwrap();
+                        }
+                        &read
+                    }
+                };
+                assert!(
+                    data == pattern(s.delivered, data.len()),
+                    "{:?}: the bytes from {} are out of order or corrupt",
+                    s.key,
+                    s.delivered
+                );
+                s.delivered = s.delivered.wrapping_add(data.len() as u32);
+                bytes += data.len() as u32;
+            }
+            shared.complete(chunks.iter().filter_map(|c| match c {
+                Chunk::Guest { head, .. } => Some(*head),
+                Chunk::Owned(_) => None,
+            }));
+            shared.recycle(chunks);
+            shared.acknowledge(s.key, bytes);
+        }
+
+        fn run(seed: u64, steps: usize) {
+            let mut rng = Rng(seed);
+            let shared = Arc::new(VsockShared::new());
+            let mem = GuestMemory::test_region(BASE, RING * SLOT);
+            let mut sockets = Vec::new();
+            let mut streams = Vec::new();
+            let peers = [Peer::Fast, Peer::Slow, Peer::Stalled, Peer::Resets];
+            for i in 0..8 {
+                let (ours, theirs) = UnixStream::pair().unwrap();
+                sockets.push(theirs);
+                let key = shared.open(if i == 0 { 2375 } else { 2378 }, ours);
+                shared.establish_for_test(key, 8 << 20);
+                let peer = if i == 0 {
+                    Peer::Fast
+                } else {
+                    peers[rng.below(4) as usize]
+                };
+                streams.push(Stream {
+                    key,
+                    peer,
+                    sent: 0,
+                    peer_fwd: 0,
+                    peer_buf: 0,
+                    heard_close: false,
+                    delivered: 0,
+                    closed_by_host: false,
+                    reset_at: 200 + rng.below(steps as u64) as usize,
+                });
+            }
+            shared.lock().tx_ring = RING;
+            guest_hears(&shared, &mut streams);
+            let mut free: Vec<u16> = (0..RING as u16).collect();
+            let (limit, share) = shared.lock().tx_limits();
+            let mut warden_clock = std::time::Instant::now();
+
+            for step in 0..steps {
+                // The guest sends a few packets on streams with credit.
+                for _ in 0..4 {
+                    let i = rng.below(streams.len() as u64) as usize;
+                    let docker = i == 0 && step % 16 == 0;
+                    let s = &mut streams[i];
+                    if s.heard_close {
+                        continue;
+                    }
+                    let in_flight = s.sent.wrapping_sub(s.peer_fwd);
+                    let credit = s.peer_buf.saturating_sub(in_flight) as usize;
+                    let want = SIZES[rng.below(SIZES.len() as u64) as usize];
+                    let len = want.min(credit);
+                    if len == 0 {
+                        continue;
+                    }
+                    let Some(head) = free.pop() else {
+                        panic!("seed {seed} step {step}: the guest found the whole ring held");
+                    };
+                    let at = BASE + u64::from(head) * SLOT as u64;
+                    mem.write(at, pattern(s.sent, len)).unwrap();
+                    let mut packet = Packet::control(Op::Rw, s.key.1, s.key.0);
+                    packet.buf_alloc = 8 << 20;
+                    let held = Vsock::handle_guest_rw(
+                        &mut shared.lock(),
+                        &packet,
+                        head,
+                        vec![(at, len)],
+                        &mem,
+                    );
+                    if !held {
+                        free.push(head);
+                    }
+                    s.sent = s.sent.wrapping_add(len as u32);
+                    let _ = docker;
+                }
+
+                // Each host peer, as it behaves.
+                for s in streams.iter_mut() {
+                    if s.closed_by_host {
+                        continue;
+                    }
+                    if s.peer == Peer::Resets && step >= s.reset_at {
+                        shared.shutdown(s.key);
+                        s.closed_by_host = true;
+                        continue;
+                    }
+                    let takes = match s.peer {
+                        Peer::Fast | Peer::Resets => true,
+                        Peer::Slow => rng.below(8) == 0,
+                        Peer::Stalled => false,
+                    };
+                    if takes {
+                        host_takes(&shared, &mem, s);
+                    }
+                }
+
+                // The transport returns finished chains; the guest hears.
+                free.extend(shared.lock().finish_done());
+                guest_hears(&shared, &mut streams);
+                if step % 50 == 49 {
+                    warden_clock += STALL_AFTER;
+                    shared.sweep(warden_clock);
+                    free.extend(shared.lock().finish_done());
+                    guest_hears(&shared, &mut streams);
+                }
+
+                // What must hold.
+                let inner = shared.lock();
+                assert!(
+                    inner.held <= limit,
+                    "seed {seed} step {step}: {} held, limit {limit}",
+                    inner.held
+                );
+                for (key, conn) in &inner.conns {
+                    assert!(
+                        conn.held <= share,
+                        "seed {seed} step {step}: {key:?} holds {}",
+                        conn.held
+                    );
+                }
+                assert_eq!(
+                    free.len() + inner.held,
+                    RING,
+                    "seed {seed} step {step}: chains lost"
+                );
+                assert!(
+                    free.len() >= RING - limit,
+                    "seed {seed} step {step}: the reserve was taken"
+                );
+                drop(inner);
+                let docker = &streams[0];
+                assert_eq!(
+                    docker.delivered, docker.sent,
+                    "seed {seed} step {step}: the Docker connection is waiting"
+                );
+            }
+
+            // Everything closes: the host the rest, the guest resetting only
+            // some, the warden ending the others after its timeout.
+            for s in streams.iter_mut().filter(|s| !s.closed_by_host) {
+                shared.shutdown(s.key);
+                s.closed_by_host = true;
+            }
+            for s in &streams {
+                if rng.below(2) == 0 {
+                    Vsock::handle(
+                        &mut shared.lock(),
+                        Packet::control(Op::Rst, s.key.1, s.key.0),
+                    );
+                }
+            }
+            shared.sweep(
+                std::time::Instant::now() + CLOSE_TIMEOUT + std::time::Duration::from_secs(1),
+            );
+            free.extend(shared.lock().finish_done());
+            let inner = shared.lock();
+            assert!(
+                inner.conns.is_empty(),
+                "seed {seed}: {} connections left",
+                inner.conns.len()
+            );
+            assert_eq!(inner.held, 0, "seed {seed}");
+            assert_eq!(free.len(), RING, "seed {seed}: every chain back");
+            assert_eq!(inner.budget.granted(), 0, "seed {seed}: every window back");
+            assert!(inner.holders.is_empty(), "seed {seed}");
+        }
+
+        #[test]
+        fn random_peers_never_take_the_ring_or_lose_a_byte() {
+            for seed in 1..=10u64 {
+                run(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, 3000);
+            }
         }
     }
 }
