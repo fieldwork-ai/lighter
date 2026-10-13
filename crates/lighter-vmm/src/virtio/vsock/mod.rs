@@ -68,7 +68,7 @@ const OUTBOX_LIMIT: usize = 1024;
 /// writes, which is how a TLS proxy writes, is exactly the 256-entry ring —
 /// and one stream whose client had stopped reading held every chain, which
 /// silenced Docker and every port until a restart (#84).
-const TX_SHARE_DIVISOR: usize = 8;
+const TX_SHARE_DIVISOR: usize = 4;
 const TX_RESERVE_DIVISOR: usize = 4;
 
 /// How long a connection we closed may wait for the guest's reset before we
@@ -297,9 +297,100 @@ impl Chunk {
 /// dialed and differ in theirs, which is why one port was never enough.
 pub type ConnKey = (u32, u32);
 
+/// The vsock ports whose connections are the machine's control plane:
+/// the Docker socket and the agent's control socket (guest ports the host
+/// dials), and DNS, the memory reports and the time (host ports the guest
+/// dials). Their packets go to the guest ahead of every stream's.
+const CONTROL_PORTS: [u32; 5] = [2375, 2376, 2379, 2381, 2382];
+
+/// What waits to go to the guest, in two lanes: the control plane's
+/// connections first, then everything else. A connection's packets all
+/// travel in one lane, so its own order is kept — the guest takes
+/// `fwd_cnt` from every packet as it comes, and a credit update overtaking
+/// a connection's older data would move it backwards. Between lanes the
+/// order is free, and that freedom is the point: a guest slow to post
+/// receive buffers (memory short, a stream flooding it) delivered Docker's
+/// replies and the credit that unblocks its own sends behind every stream
+/// queued before them.
+#[derive(Default)]
+struct Outbox {
+    control: VecDeque<Packet>,
+    bulk: VecDeque<Packet>,
+}
+
+impl Outbox {
+    fn is_control(packet: &Packet) -> bool {
+        CONTROL_PORTS.contains(&packet.dst_port) || CONTROL_PORTS.contains(&packet.src_port)
+    }
+
+    fn lane(&mut self, packet: &Packet) -> &mut VecDeque<Packet> {
+        if Self::is_control(packet) {
+            &mut self.control
+        } else {
+            &mut self.bulk
+        }
+    }
+
+    fn push_back(&mut self, packet: Packet) {
+        self.lane(&packet).push_back(packet);
+    }
+
+    /// Back at the head of its lane: the rest of a packet that did not fit.
+    fn push_front(&mut self, packet: Packet) {
+        self.lane(&packet).push_front(packet);
+    }
+
+    fn pop_front(&mut self) -> Option<Packet> {
+        self.control.pop_front().or_else(|| self.bulk.pop_front())
+    }
+
+    fn len(&self) -> usize {
+        self.control.len() + self.bulk.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.control.is_empty() && self.bulk.is_empty()
+    }
+
+    /// Room for another packet in `key`'s lane.
+    fn room(&self, key: ConnKey) -> usize {
+        let probe = Packet::control(Op::Rw, key.0, key.1);
+        let used = if Self::is_control(&probe) {
+            self.control.len()
+        } else {
+            self.bulk.len()
+        };
+        OUTBOX_LIMIT.saturating_sub(used)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Packet) -> bool) {
+        self.control.retain(&mut keep);
+        self.bulk.retain(keep);
+    }
+
+    fn clear(&mut self) {
+        self.control.clear();
+        self.bulk.clear();
+    }
+
+    /// In delivery order.
+    #[cfg(test)]
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Packet> {
+        self.control.iter().chain(self.bulk.iter())
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<usize> for Outbox {
+    type Output = Packet;
+    fn index(&self, i: usize) -> &Packet {
+        self.iter().nth(i).expect("outbox index out of range")
+    }
+}
+
 struct Inner {
     conns: HashMap<ConnKey, Conn>,
-    outbox: VecDeque<Packet>,
+    outbox: Outbox,
     next_port: u32,
     /// Payload buffers the writers have finished with, for the ring reader
     /// to fill again. A fresh 256 KiB Vec per packet is a page-faulted,
@@ -336,7 +427,7 @@ struct Inner {
 }
 
 /// What [`VsockShared::sweep`] has done since boot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WardenCounts {
     /// Connections we closed that the guest never reset, removed at
     /// `CLOSE_TIMEOUT`.
@@ -347,6 +438,18 @@ pub struct WardenCounts {
     pub stalled: u64,
     /// Connections reset because a shared resource stayed exhausted.
     pub resets: u64,
+    /// The last few of those cuts and resets, newest last, as what the
+    /// connection's host side was: "reset a client of port 8096".
+    pub recent: Vec<String>,
+}
+
+impl WardenCounts {
+    fn note(&mut self, what: String) {
+        if self.recent.len() == 8 {
+            self.recent.remove(0);
+        }
+        self.recent.push(what);
+    }
 }
 
 impl Inner {
@@ -452,7 +555,7 @@ impl VsockShared {
             deferred_waker: Mutex::new(None),
             inner: Mutex::new(Inner {
                 conns: HashMap::new(),
-                outbox: VecDeque::new(),
+                outbox: Outbox::default(),
                 next_port: FIRST_EPHEMERAL_PORT,
                 spare: Vec::new(),
                 done: VecDeque::new(),
@@ -714,7 +817,7 @@ impl VsockShared {
             };
         }
         let mut allowed = conn.credit.available() as usize;
-        let mut room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+        let mut room = inner.outbox.room(key);
         let (host_port, guest_port) = key;
         let fwd_cnt = conn.credit.fwd_cnt();
         let window = conn.window;
@@ -783,7 +886,7 @@ impl VsockShared {
             };
         }
         let allowed = conn.credit.available() as usize;
-        let room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+        let room = inner.outbox.room(key);
         if room == 0 || allowed == 0 {
             return Ok(Some(data));
         }
@@ -1025,7 +1128,7 @@ impl VsockShared {
             let allowed = conn.credit.available() as usize;
             // Also bounded by the outbox, or a fast host writer against a slow
             // guest would grow it without limit.
-            let room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+            let room = inner.outbox.room(key);
 
             if allowed == 0 || room == 0 {
                 // Out of credit. What frees it is the guest receiving what is
@@ -1342,7 +1445,7 @@ impl VsockShared {
 
     /// What the warden has done since boot.
     pub fn warden_counts(&self) -> WardenCounts {
-        self.lock().warden
+        self.lock().warden.clone()
     }
 
     /// Starts the thread that runs [`VsockShared::sweep`] four times a second.
@@ -1410,6 +1513,10 @@ impl VsockShared {
             if *stalled {
                 let label = conn.label.clone();
                 inner.warden.stalled += 1;
+                inner.warden.note(format!(
+                    "cut the window of {}, which had stopped taking bytes",
+                    label.as_deref().unwrap_or("a connection")
+                ));
                 tracing::debug!(
                     ?key,
                     label = label.as_deref(),
@@ -1447,6 +1554,10 @@ impl VsockShared {
                     }
                     inner.remove(key);
                     inner.warden.resets += 1;
+                    inner.warden.note(format!(
+                        "reset {}",
+                        label.as_deref().unwrap_or("a connection")
+                    ));
                     inner.ring_full_since = None;
                     lines.push(format!(
                         "vsock: {} held {held} of the transmit ring's {} chains for {}s with none returned; reset it",
@@ -1716,7 +1827,12 @@ impl Vsock {
             // It had nothing waiting: whatever happens next is timed from here.
             conn.drained = std::time::Instant::now();
         }
-        if conn.held < share && ring_held < ring_limit {
+        // `LIGHTER_VSOCK_COPY=1` copies every payload, for measuring what
+        // holding them in place is worth.
+        static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let copy_all =
+            *COPY.get_or_init(|| std::env::var("LIGHTER_VSOCK_COPY").is_ok_and(|v| v == "1"));
+        if !copy_all && conn.held < share && ring_held < ring_limit {
             conn.outbound.push_back(Chunk::Guest { head, spans });
             conn.held += 1;
             inner.held += 1;
@@ -3115,6 +3231,49 @@ mod tests {
             assert_eq!(inner.conns[&key].window, credit::MIN_WINDOW);
             assert_eq!(inner.budget.granted(), u64::from(credit::MIN_WINDOW));
             assert_eq!(inner.warden.stalled, 0, "idle is not stalled");
+        }
+
+        /// A full stream lane neither delays nor refuses the control plane,
+        /// and each connection's packets keep their order.
+        #[test]
+        fn the_control_plane_overtakes_a_full_stream_lane_in_order() {
+            let mut outbox = Outbox::default();
+            let stream: ConnKey = (FIRST_EPHEMERAL_PORT, 2378);
+            let docker: ConnKey = (FIRST_EPHEMERAL_PORT + 1, 2375);
+            for i in 0..OUTBOX_LIMIT {
+                let mut p = Packet::control(Op::Rw, stream.0, stream.1);
+                p.fwd_cnt = i as u32;
+                outbox.push_back(p);
+            }
+            assert_eq!(outbox.room(stream), 0);
+            assert_eq!(
+                outbox.room(docker),
+                OUTBOX_LIMIT,
+                "the stream's backlog is not the control plane's"
+            );
+            for i in 0..3 {
+                let mut p = Packet::control(Op::Rw, docker.0, docker.1);
+                p.fwd_cnt = i;
+                outbox.push_back(p);
+            }
+            let mut dns = Packet::control(Op::Rw, 2379, 1_994_936_000);
+            dns.fwd_cnt = 99;
+            outbox.push_back(dns);
+            let first: Vec<(u32, u32)> = (0..4)
+                .map(|_| outbox.pop_front().map(|p| (p.dst_port, p.fwd_cnt)).unwrap())
+                .collect();
+            assert_eq!(
+                first,
+                [(2375, 0), (2375, 1), (2375, 2), (1_994_936_000, 99)]
+            );
+            let rest: Vec<u32> = std::iter::from_fn(|| outbox.pop_front())
+                .map(|p| p.fwd_cnt)
+                .collect();
+            assert_eq!(
+                rest,
+                (0..OUTBOX_LIMIT as u32).collect::<Vec<_>>(),
+                "the stream's own order is kept"
+            );
         }
 
         /// Unreachable through the device's own rules, and so a bug if it

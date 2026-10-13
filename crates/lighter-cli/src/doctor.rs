@@ -424,6 +424,29 @@ pub fn run() -> Vec<Finding> {
         findings.push(finding);
     }
 
+    // The guest's memory: how much is available, whether it stalls for it,
+    // and whether it is in pieces. Fragmented alone is not a fault — the
+    // receive buffers come from a pool (guest patch 0054) — so it is said in
+    // the detail and only shortage warns.
+    if matches!(crate::machine::running_pid(), Ok(Some(_)))
+        && let Some(memory) = crate::machine::control("memory")
+            .ok()
+            .and_then(|reply| crate::machine::GuestMemory::parse(&reply))
+    {
+        findings.push(memory_finding(&memory));
+    }
+
+    // The vsock link's warden. A reset means a shared resource sat exhausted
+    // for seconds, which the link's own rules should make impossible: it is
+    // a bug, and the row asks for the report (#84).
+    if let Ok(Some(pid)) = crate::machine::running_pid()
+        && let Ok(home) = paths::home()
+        && let Ok(report) = crate::storage_status::query(&home, pid)
+        && let Some(link) = &report.link
+    {
+        findings.push(link_finding(link));
+    }
+
     // A custom home never owns the global context; its machine is reached
     // by DOCKER_HOST, and telling someone to `docker context use lighter`
     // would point them at a machine this doctor is not examining.
@@ -484,6 +507,53 @@ fn warm_finding(line: &str) -> Option<Finding> {
         ),
         _ => Finding::good("idle cache", "kept while containers run (`lighter.warm=0`)"),
     })
+}
+
+fn memory_finding(memory: &crate::machine::GuestMemory) -> Finding {
+    if memory.short() {
+        Finding::warn(
+            "guest memory",
+            format!("short: {}", memory.line()),
+            "give the machine more with `lighter config --memory`, or stop what it does not need",
+        )
+    } else {
+        Finding::good("guest memory", memory.line())
+    }
+}
+
+fn link_finding(link: &crate::storage_status::Link) -> Finding {
+    let ended = link.closed_expired + link.connect_expired;
+    if link.resets > 0 {
+        let resets: Vec<&str> = link
+            .recent
+            .iter()
+            .filter(|r| r.starts_with("reset "))
+            .map(String::as_str)
+            .collect();
+        return Finding::warn(
+            "vsock link",
+            format!(
+                "the watchdog reset {} connection{} holding the transmit ring: {}",
+                link.resets,
+                if link.resets == 1 { "" } else { "s" },
+                if resets.is_empty() {
+                    "see `lighter logs`".to_string()
+                } else {
+                    resets.join("; ")
+                }
+            ),
+            "this is a lighter bug: please report it at https://github.com/fieldwork-ai/lighter/issues with `lighter logs`",
+        );
+    }
+    Finding::good(
+        "vsock link",
+        format!(
+            "no resets; {ended} abandoned connection{} removed, {} stalled peer{} slowed",
+            if ended == 1 { "" } else { "s" },
+            link.stalled,
+            if link.stalled == 1 { "" } else { "s" },
+        ),
+    )
 }
 
 /// Formats the findings the way `lighter doctor` prints them.
@@ -549,6 +619,56 @@ fn free_space_gib() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_guests_memory_warns_only_when_it_is_short() {
+        let reply =
+            "memory total_mib=12004 available_mib=3124 free_mib=596 stall_some=12 blocks_256k=0";
+        let memory = crate::machine::GuestMemory::parse(reply).unwrap();
+        let row = memory_finding(&memory);
+        assert!(row.ok && !row.warn, "fragmented is said, not warned");
+        assert!(row.detail.contains("3124 of 12004 MiB available"));
+        assert!(row.detail.contains("fragmented"));
+        let short = crate::machine::GuestMemory::parse(
+            "memory total_mib=12004 available_mib=400 free_mib=90 stall_some=2500 blocks_256k=3",
+        )
+        .unwrap();
+        let row = memory_finding(&short);
+        assert!(row.warn);
+        assert!(row.detail.contains("stalling 25.00%"), "{}", row.detail);
+        assert!(crate::machine::GuestMemory::parse("error unknown command").is_none());
+    }
+
+    #[test]
+    fn a_watchdog_reset_asks_for_a_report_and_names_the_connection() {
+        let quiet = crate::storage_status::Link {
+            closed_expired: 3,
+            stalled: 1,
+            ..Default::default()
+        };
+        let row = link_finding(&quiet);
+        assert!(!row.warn);
+        assert_eq!(
+            row.detail,
+            "no resets; 3 abandoned connections removed, 1 stalled peer slowed"
+        );
+        let reset = crate::storage_status::Link {
+            resets: 1,
+            recent: vec![
+                "cut the window of a client of port 8096, which had stopped taking bytes".into(),
+                "reset a client of port 8096".into(),
+            ],
+            ..Default::default()
+        };
+        let row = link_finding(&reset);
+        assert!(row.warn);
+        assert!(
+            row.detail.ends_with("reset a client of port 8096"),
+            "{}",
+            row.detail
+        );
+        assert!(row.remedy.unwrap().contains("issues"));
+    }
 
     #[test]
     fn the_agents_warm_line_becomes_a_row() {

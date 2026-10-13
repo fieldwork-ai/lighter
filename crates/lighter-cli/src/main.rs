@@ -545,6 +545,16 @@ fn status() -> anyhow::Result<std::process::ExitCode> {
             memory.base_mib + memory.range_mib
         );
     }
+    if let Some(memory) = &status.guest_memory {
+        outln!("  guest mem  {}", memory.line());
+    }
+    if let Some(link) = status.link.as_ref().filter(|l| l.resets > 0) {
+        outln!(
+            "  link       the watchdog reset {} connection{} (see `lighter doctor`)",
+            link.resets,
+            if link.resets == 1 { "" } else { "s" }
+        );
+    }
     if let Some(entries) = usb::status() {
         for e in entries {
             let detail = if e.detail.is_empty() {

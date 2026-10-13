@@ -44,6 +44,19 @@ pub struct Unforwarded {
     pub reason: String,
 }
 
+/// What the vsock link's warden has done since the machine started: the
+/// connections it ended that nobody else would, the windows it cut for
+/// peers that had stopped reading, and its resets, which mean a shared
+/// resource stayed exhausted and are a bug to report (#84).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Link {
+    pub closed_expired: u64,
+    pub connect_expired: u64,
+    pub stalled: u64,
+    pub resets: u64,
+    pub recent: Vec<String>,
+}
+
 /// What the machine reports on demand.
 #[derive(Debug, Default)]
 pub struct Report {
@@ -53,6 +66,8 @@ pub struct Report {
     /// The folders the machine shares: those configured that were there
     /// when it started. `None` from a machine before 0.11.6.
     pub shares: Option<Vec<String>>,
+    /// `None` from a machine before 0.13.5.
+    pub link: Option<Link>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -65,6 +80,8 @@ struct Reply {
     unforwarded: Vec<Unforwarded>,
     #[serde(default)]
     shares: Option<Vec<String>>,
+    #[serde(default)]
+    link: Option<Link>,
 }
 
 pub struct Server {
@@ -81,6 +98,7 @@ impl Server {
         mem: Option<lighter_vmm::virtio::mem::MemControl>,
         ports: Option<lighter_docker::PortHealth>,
         shares: Vec<String>,
+        vsock: Option<Arc<lighter_vmm::virtio::vsock::VsockShared>>,
     ) -> io::Result<Self> {
         let path = home.join(SOCKET);
         match std::fs::remove_file(&path) {
@@ -108,6 +126,14 @@ impl Server {
                     {
                         continue;
                     }
+                    // The client checks who we are on the open socket, then
+                    // asks; replying first and closing let a client that
+                    // looked a moment later find no peer (ENOTCONN), which
+                    // under load was the report missing from `lighter
+                    // status`. A client from before the request byte gets
+                    // its reply when the wait runs out.
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                    let _ = stream.read(&mut [0u8; 1]);
                     let waiting = disks
                         .iter()
                         .filter_map(|(path, disk)| {
@@ -145,12 +171,23 @@ impl Server {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let link = vsock.as_ref().map(|vsock| {
+                        let w = vsock.warden_counts();
+                        Link {
+                            closed_expired: w.closed_expired,
+                            connect_expired: w.connect_expired,
+                            stalled: w.stalled,
+                            resets: w.resets,
+                            recent: w.recent,
+                        }
+                    });
                     let reply = Reply {
                         version: 1,
                         waiting,
                         memory,
                         unforwarded,
                         shares: Some(shares.clone()),
+                        link,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&reply) {
                         let _ = stream.write_all(&bytes);
@@ -185,6 +222,10 @@ pub fn query(home: &Path, pid: u32) -> io::Result<Report> {
             "storage status belongs to a different daemon",
         ));
     }
+    // The request: the server waits for it, so the socket is still open
+    // when its owner is checked above. A machine from before 0.13.5 has
+    // replied and closed without waiting, so a failed write is no failure.
+    let _ = stream.write_all(b"?");
     let mut bytes = Vec::new();
     (&mut stream).take(65537).read_to_end(&mut bytes)?;
     if bytes.len() > 65536 {
@@ -199,6 +240,7 @@ pub fn query(home: &Path, pid: u32) -> io::Result<Report> {
         memory: reply.memory,
         unforwarded: reply.unforwarded,
         shares: reply.shares,
+        link: reply.link,
     })
 }
 
@@ -211,7 +253,8 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("lighter-storage-status-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        let server = Server::start(&home, Vec::new(), None, None, vec!["/Users".into()]).unwrap();
+        let server =
+            Server::start(&home, Vec::new(), None, None, vec!["/Users".into()], None).unwrap();
         let report = query(&home, std::process::id()).unwrap();
         assert!(report.waiting.is_empty());
         assert!(report.memory.is_none(), "no range, no memory report");
