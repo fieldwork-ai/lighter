@@ -79,12 +79,15 @@ const OUTBOX_LIMIT: usize = 1024;
 
 /// The transmit ring is shared by every connection, and a chain held for a
 /// payload is held until that connection's host peer takes the bytes. So no
-/// connection holds more than an eighth of the ring, and the last quarter is
+/// connection holds more than a quarter of the ring, and the last quarter is
 /// never held at all: a payload beyond either is copied out and its chain
 /// returned at once. Credit bounds bytes, not chains — 4 MiB in 16 KiB
 /// writes, which is how a TLS proxy writes, is exactly the 256-entry ring —
 /// and one stream whose client had stopped reading held every chain, which
-/// silenced Docker and every port until a restart (#84).
+/// silenced Docker and every port until a restart (#84). A quarter, not an
+/// eighth: one fast stream's window in 64 KiB packets spans 64 chains, and
+/// an eighth copied half of it, 9% of container-to-Mac throughput; always
+/// copying cost 5 to 9% (`LIGHTER_VSOCK_COPY=1` measures it).
 const TX_SHARE_DIVISOR: usize = 4;
 const TX_RESERVE_DIVISOR: usize = 4;
 
@@ -1657,7 +1660,12 @@ impl Vsock {
 
         match packet.op {
             Op::Response => {
-                if let Some(conn) = inner.conns.get_mut(&key) {
+                // Only a connection still waiting for it: one we closed in
+                // the meantime stays closed, or it would be Established for
+                // good with nothing left to end it.
+                if let Some(conn) = inner.conns.get_mut(&key)
+                    && conn.state == State::Connecting
+                {
                     conn.state = State::Established;
                     tracing::debug!(host_port, guest_port = conn.guest_port, "vsock established");
                 }
@@ -3205,6 +3213,24 @@ mod tests {
                 0,
                 "both windows back in the budget"
             );
+        }
+
+        /// An opener that closes before the guest answers: the answer does not
+        /// bring it back, and the warden removes it.
+        #[test]
+        fn a_late_answer_does_not_reopen_a_closed_connection() {
+            let shared = Arc::new(VsockShared::new());
+            let (ours, _theirs) = UnixStream::pair().unwrap();
+            let key = shared.open(2378, ours);
+            shared.shutdown(key);
+            Vsock::handle(
+                &mut shared.lock(),
+                Packet::control(Op::Response, key.1, key.0),
+            );
+            assert_eq!(shared.status(key), Status::Gone);
+            let closed = shared.lock().conns[&key].since;
+            shared.sweep(closed + CLOSE_TIMEOUT);
+            assert!(!shared.lock().conns.contains_key(&key));
         }
 
         /// A peer that has stopped reading loses its window, so the guest
