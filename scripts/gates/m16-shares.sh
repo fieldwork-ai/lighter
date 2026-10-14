@@ -78,6 +78,16 @@ SMB_F="$HOME/.lighter-gate-smb-f-$$"
 # had gone, and the next look at it waited out the Mac's SMB timeout.
 # A share Disk Arbitration could not unmount is named in REFUSED.
 REFUSED=""
+# Seconds `docker ps` takes, timed in one process: two processes' clocks
+# subtracted read -0.00 s. Fails if it does.
+docker_ps_secs() {
+	python3 -c 'import subprocess, sys, time
+t = time.monotonic()
+r = subprocess.run(["docker", "ps", "-q"], capture_output=True)
+print("%.2f" % (time.monotonic() - t))
+sys.exit(r.returncode)'
+}
+
 smb_unmount() {
 	grep -q "on $1 (smbfs" <<<"$(mount)" || return 0
 	diskutil unmount "$1" >/dev/null 2>&1 && return 0
@@ -434,7 +444,11 @@ else
 import os, time
 stop = time.time() + 35; worst = 0.0
 while time.time() < stop:
-    t = time.monotonic(); os.stat("/h/probe"); os.listdir("/h"); worst = max(worst, time.monotonic() - t)
+    t = time.monotonic()
+    # A new file each time: a stat of one the guest has seen is answered
+    # from its own cache, and never reaches the Mac to wait.
+    name = "/h/p%d" % int(t * 1e6); open(name, "w").close(); os.unlink(name)
+    worst = max(worst, time.monotonic() - t)
     time.sleep(0.05)
 print("%.2f" % worst)' >/dev/null
 		docker run -d --name lighter-gate-ticker "$PYTHON" python3 -c '
@@ -453,9 +467,7 @@ print("%.2f" % max(worst))' >/dev/null
 		# And Docker itself, which shares nothing with the share but the
 		# machine: it answers while the server is hung (#84's rule, that no
 		# party lighter does not control silences the machine).
-		ps_start=$(python3 -c 'import time; print(time.monotonic())')
-		docker ps -q >/dev/null 2>&1 && ps_ok=1 || ps_ok=0
-		ps_secs=$(python3 -c "import time; print('%.2f' % (time.monotonic() - $ps_start))")
+		ps_secs="$(docker_ps_secs)" && ps_ok=1 || ps_ok=0
 		sleep 10
 		# Measured only if the share lasted the hang: macOS sometimes gives
 		# up on a server that stops answering and drops the share, and the
@@ -481,6 +493,61 @@ print("%.2f" % max(worst))' >/dev/null
 		else
 			note "SMB: macOS dropped the share while its server was hung, so the hang was not measured (gap ${gap:-?} s, slowest local ${slowest:-?} s)"
 		fi
+
+		# A thousand requests to the hung server, more than the share's four
+		# rings of 256 hold: each waits holding its descriptors, and a file on
+		# the Mac's own disk in the same share used to wait with them. Now
+		# the ones never started are answered with EIO once the lane is stuck
+		# and the rings three quarters held (lighter-vmm `virtio::fs`, Queue).
+		LOCAL_PROBE="$HOME/.lighter-gate-local-$$"
+		mkdir -p "$LOCAL_PROBE" && touch "$LOCAL_PROBE/probe"
+		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
+import os, time
+stop = time.time() + 50; worst = 0.0
+while time.time() < stop:
+    t = time.monotonic()
+    # A new file each time: a stat of one the guest has seen is answered
+    # from its own cache, and never reaches the Mac to wait.
+    name = "/h/p%d" % int(t * 1e6); open(name, "w").close(); os.unlink(name)
+    worst = max(worst, time.monotonic() - t)
+    time.sleep(0.05)
+print("%.2f" % worst)' >/dev/null
+		sleep 2
+		docker pause lighter-gate-smb >/dev/null
+		docker run -d --name lighter-gate-smb-reader -v "$SMB_D:/m" "$IMAGE" sh -c \
+			'for i in $(seq 1 1200); do stat /m/many-$i >/dev/null 2>&1 & done; wait; echo done' >/dev/null
+		sleep 30
+		ps_secs="$(docker_ps_secs)" && ps_ok=1 || ps_ok=0
+		kept=0
+		grep -q "on $SMB_D (smbfs" <<<"$(mount)" && kept=1
+		# Bounded: on 0.13.5 the probe waited behind the hung requests until
+		# the server came back, which here is only after it.
+		if perl -e 'alarm 40; exec @ARGV' docker wait lighter-gate-local >/dev/null 2>&1; then
+			slowest="$(docker logs lighter-gate-local 2>&1 | tail -1)"
+		else
+			slowest="over 40"
+		fi
+		docker unpause lighter-gate-smb >/dev/null
+		reader="$(perl -e 'alarm 60; exec @ARGV' docker wait lighter-gate-smb-reader 2>/dev/null || echo stuck)"
+		after="$(perl -e 'alarm 30; exec @ARGV' docker run --rm -v "$SMB_D:/m" "$IMAGE" sh -c 'touch /m/after && ls /m/after' 2>&1 || true)"
+		said="$(sed 's/\x1b\[[0-9;]*m//g' "$LIGHTER_HOME/machine.log" | grep -c 'has not answered for' || true)"
+		docker rm -f lighter-gate-smb-reader lighter-gate-local >/dev/null
+		rm -rf "$LOCAL_PROBE"
+		if [ "$kept" = 1 ]; then
+			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 8 && g != "") }' \
+				&& pass "SMB: with 1,200 requests to the hung server, a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
+				|| fail "SMB: with 1,200 requests to the hung server, a local file in the same share waited ${slowest:-?} s"
+			[ "$said" -gt 0 ] && pass "SMB: and the machine's log says the volume stopped answering" \
+				|| fail "SMB: the machine's log does not say the volume stopped answering"
+		else
+			note "SMB: macOS dropped the share while its server was hung, so the thousand requests were not measured (slowest local ${slowest:-?} s)"
+		fi
+		[ "$ps_ok" = 1 ] && awk -v g="$ps_secs" 'BEGIN { exit !(g + 0 < 2) }' \
+			&& pass "SMB: and Docker answered in ${ps_secs} s" \
+			|| fail "SMB: with 1,200 requests hung, Docker took ${ps_secs} s (ok=$ps_ok)"
+		[ "$reader" != stuck ] && [ "$after" = /m/after ] \
+			&& pass "SMB: once the server answers, every request has ended and the share works" \
+			|| fail "SMB: once the server answered, the requests ${reader} and the share gave '${after}'"
 		smb_unmount "$SMB_D"
 		smb_unmount "$SMB_T"
 		[ -z "$REFUSED" ] \

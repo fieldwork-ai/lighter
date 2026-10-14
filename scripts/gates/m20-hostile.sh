@@ -21,6 +21,9 @@
 #   6. a guest whose memory is in pieces (no free block of 256 KiB): bytes
 #      into the machine keep their speed and their receive buffers come
 #      from the pool, and (1) holds there too
+#   7. a client that closes while its server says nothing is let go, over a
+#      published port (TCP, found by keepalive) and over the Docker socket,
+#      and one that only half-closed still gets a reply that comes late (#87)
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -40,7 +43,7 @@ export DOCKER_HOST="unix://$LIGHTER_HOME/docker.sock"
 SCRATCH="$HOME/.lighter-gate-m20-$$"
 mkdir -p "$SCRATCH"
 cleanup() {
-	docker rm -f m20-push m20-ok m20-tls m20-sink m20-frag >/dev/null 2>&1 || true
+	docker rm -f m20-push m20-ok m20-tls m20-sink m20-frag m20-silent >/dev/null 2>&1 || true
 	docker network rm m20-net >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	[ "$FAILED" = 0 ] || { mkdir -p "$ROOT/.logs"; cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m20-machine-$(date +%H%M%S).log" 2>/dev/null; } || true
@@ -54,6 +57,7 @@ PUSH=18096
 OK=18097
 TLS=18443
 SINK=18098
+SILENT=18099
 
 # Seconds a command takes, or "timeout" past its limit.
 timed() {
@@ -138,6 +142,31 @@ while True:
 EOF
 docker run -d --name m20-push --oom-score-adj=-1000 --network m20-net -p "$PUSH:8096" -v "$SCRATCH:/g:ro" "$PYTHON" python3 /g/push.py >/dev/null
 docker run -d --name m20-ok --oom-score-adj=-1000 -p "$OK:8000" "$PYTHON" python3 -m http.server 8000 >/dev/null
+# A server that says nothing: it reads a request to its end, then for
+# `hold` keeps the connection open and silent for good, and for `late`
+# answers 20 s later.
+cat >"$SCRATCH/silent.py" <<'EOF'
+import socket, threading, time
+def serve(c):
+    request = b""
+    while True:
+        data = c.recv(4096)
+        if not data:
+            break
+        request += data
+    if request.startswith(b"late"):
+        time.sleep(20)
+        c.sendall(b"late")
+        c.close()
+        return
+    time.sleep(10 ** 6)
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 8099)); s.listen(64)
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+EOF
+docker run -d --name m20-silent --oom-score-adj=-1000 -p "$SILENT:8099" -v "$SCRATCH:/g:ro" "$PYTHON" python3 /g/silent.py >/dev/null
 /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=m20 -days 1 -keyout "$SCRATCH/key.pem" -out "$SCRATCH/cert.pem" >/dev/null 2>&1
 cat >"$SCRATCH/nginx.conf" <<'EOF'
 events {}
@@ -243,18 +272,69 @@ after="$("$LIGHTER" doctor 2>/dev/null | grep "vsock link")"
 [ "$got" = "4194304 intact" ] && pass "slow reader: 4 MiB at 200 KB/s, every byte intact" || fail "slow reader: got '$got'"
 grep -q "no resets" <<<"$after" && pass "slow reader: slowed, never reset" || fail "slow reader: $after"
 
+echo "==> A client that closes while its server says nothing"
+# Over a published port the client is TCP, which looks the same half-closed
+# and closed once its FIN is read: keepalive tells, once the client's
+# kernel lets go of the connection (FIN_WAIT_2, 60 s on macOS).
+python3 -c 'import socket, sys
+c = socket.create_connection(("127.0.0.1", int(sys.argv[1]))); c.sendall(b"hold"); c.close()' "$SILENT"
+sleep 2
+dump
+[ "$(port_conns $SILENT)" = 1 ] || note "published port: the silent connection was not in the table to begin with ($(port_conns $SILENT))"
+gone=""
+for t in $(seq 10 10 120); do
+	sleep 8
+	dump
+	[ "$(port_conns $SILENT)" = 0 ] && { gone=$t; break; }
+done
+[ -n "$gone" ] && pass "published port: a client that closed is let go within ${gone} s, its server silent" \
+	|| fail "published port: a client that closed is still held after 120 s, its server silent"
+# A half-closed one is still there, and gets the reply that comes late.
+got="$(timed 45 python3 -c 'import socket, sys
+c = socket.create_connection(("127.0.0.1", int(sys.argv[1]))); c.sendall(b"late"); c.shutdown(socket.SHUT_WR)
+got = b""
+while True:
+    d = c.recv(64)
+    if not d:
+        break
+    got += d
+assert got == b"late", got' "$SILENT")"
+fast "$got" 45 && pass "published port: a client that half-closed still got a reply 20 s late" \
+	|| fail "published port: a client that half-closed lost its late reply ($got)"
+# Over the Docker socket, a Unix socket: a client killed while its exec's
+# process says nothing held its connection until the process exited.
+dump
+before="$(grep -c "a client of the Docker socket" "$SCRATCH/dump")"
+docker exec -i m20-silent sleep 600 </dev/null &
+exec_cli=$!
+sleep 3
+dump
+during="$(grep -c "a client of the Docker socket" "$SCRATCH/dump")"
+kill -9 "$exec_cli" 2>/dev/null
+wait "$exec_cli" 2>/dev/null
+sleep 12
+dump
+after="$(grep -c "a client of the Docker socket" "$SCRATCH/dump")"
+[ "$during" -gt "$before" ] && [ "$after" -le "$before" ] \
+	&& pass "Docker socket: a client killed during a silent exec is let go ($before, $during while it ran, $after 12 s after)" \
+	|| fail "Docker socket: connections $before before, $during during, $after after a client killed during a silent exec"
+
 # As many clients as half the Mac's own network buffers hold at a default
 # 128 KiB socket buffer each, up to two thousand: an 8 GB Mac has 128 MiB
 # of clusters, and two thousand idle clients outran it whatever lighter did.
 MANY=$(( $(sysctl -n kern.ipc.nmbclusters) * 2048 / 2 / 131072 ))
 [ "$MANY" -gt 2000 ] && MANY=2000
-# And as many as half the guest holds: a client that stops reading costs
-# the guest about 5 MiB, 0.7 in TCP's queues and the rest held on the vsock
-# side of the agent's join (worklog, 2026-10-14), so two thousand ran a 4 GiB
-# guest out of memory.
-GUEST_MANY=$(( 4096 / 2 / 6 ))
+# And as many as half the guest holds at 2 MiB each: what a client that
+# stops reading costs it, about 1 MiB of TCP's queues, a quarter of the
+# vsock backlog's least (guest patch 0056) and the push server's thread for
+# it. Before 0056 it was 5.6 MiB, and two thousand ran a 4 GiB guest out of
+# memory.
+GUEST_MANY=$(( 4096 / 2 / 2 ))
 [ "$MANY" -gt "$GUEST_MANY" ] && MANY=$GUEST_MANY
+# What the guest has available, from `lighter status`, in MiB.
+available() { "$LIGHTER" status 2>/dev/null | sed -n 's/.*guest mem *\([0-9]*\) of.*/\1/p'; }
 echo "==> $MANY clients that stop reading, then reset"
+avail_before="$(available)"
 cat >"$SCRATCH/many.py" <<'EOF'
 import socket, struct, sys, time
 port, n, hold = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
@@ -271,6 +351,15 @@ python3 "$SCRATCH/many.py" "$PUSH" "$MANY" 20 >"$SCRATCH/many.out" &
 many=$!
 sleep 16
 dump
+avail_during="$(available)"
+if [ -n "$avail_before" ] && [ -n "$avail_during" ]; then
+	each=$(( (avail_before - avail_during) * 1024 / MANY ))
+	[ "$each" -le 3072 ] \
+		&& pass "$MANY clients: each costs the guest ${each} KiB (${avail_before} MiB available before, ${avail_during} with them)" \
+		|| fail "$MANY clients: each costs the guest ${each} KiB, more than 3 MiB (${avail_before} MiB available before, ${avail_during} with them)"
+else
+	fail "$MANY clients: lighter status gave no guest memory ('$avail_before', '$avail_during')"
+fi
 ring="$(ring_held)"
 alive "$MANY clients not reading"
 [ "${ring:-999}" -le 192 ] && pass "$MANY clients: the ring holds ${ring} chains of its limit of 192" || fail "$MANY clients: the ring holds ${ring:-?}"
