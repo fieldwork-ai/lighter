@@ -24,6 +24,7 @@
 #   7. a client that closes while its server says nothing is let go, over a
 #      published port (TCP, found by keepalive) and over the Docker socket,
 #      and one that only half-closed still gets a reply that comes late (#87)
+#   8. a thousand idle connections cost a busy stream little of its speed
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -43,7 +44,7 @@ export DOCKER_HOST="unix://$LIGHTER_HOME/docker.sock"
 SCRATCH="$HOME/.lighter-gate-m20-$$"
 mkdir -p "$SCRATCH"
 cleanup() {
-	docker rm -f m20-push m20-ok m20-tls m20-sink m20-frag m20-silent >/dev/null 2>&1 || true
+	docker rm -f m20-push m20-ok m20-tls m20-sink m20-frag m20-silent m20-iperf >/dev/null 2>&1 || true
 	docker network rm m20-net >/dev/null 2>&1 || true
 	"$LIGHTER" stop >/dev/null 2>&1 || true
 	[ "$FAILED" = 0 ] || { mkdir -p "$ROOT/.logs"; cp "$LIGHTER_HOME/machine.log" "$ROOT/.logs/m20-machine-$(date +%H%M%S).log" 2>/dev/null; } || true
@@ -58,6 +59,7 @@ OK=18097
 TLS=18443
 SINK=18098
 SILENT=18099
+IPERF=18201
 
 # Seconds a command takes, or "timeout" past its limit.
 timed() {
@@ -98,7 +100,7 @@ alive() {
 echo "==> Booting"
 "$LIGHTER" config --cpus 4 --memory 4096 >/dev/null 2>&1
 "$LIGHTER" start >/dev/null 2>&1 || { fail "the machine did not start"; exit 1; }
-docker pull -q "$PYTHON" >/dev/null && docker pull -q "$NGINX" >/dev/null || { fail "could not pull the images"; exit 1; }
+docker pull -q "$PYTHON" >/dev/null && docker pull -q "$NGINX" >/dev/null && docker pull -q networkstatic/iperf3 >/dev/null || { fail "could not pull the images"; exit 1; }
 docker network create m20-net >/dev/null
 
 # The gate's own servers are never the OOM killer's choice: fragmenting the
@@ -333,6 +335,27 @@ GUEST_MANY=$(( 4096 / 2 / 2 ))
 [ "$MANY" -gt "$GUEST_MANY" ] && MANY=$GUEST_MANY
 # What the guest has available, from `lighter status`, in MiB.
 available() { "$LIGHTER" status 2>/dev/null | sed -n 's/.*guest mem *\([0-9]*\) of.*/\1/p'; }
+echo "==> A busy stream beside a thousand idle connections"
+# Each wake walked every stream and the first 32 connections took the whole
+# window budget whether or not they sent: on 0.13.5 a stream beside a
+# thousand idle connections ran at a quarter of its speed, and at a
+# twenty-fifth once they had closed.
+docker run -d --name m20-iperf --oom-score-adj=-1000 -p "$IPERF:5201" networkstatic/iperf3 -s >/dev/null
+sleep 2
+gbits() { iperf3 -c 127.0.0.1 -p "$IPERF" -t 5 -R 2>&1 | awk '/receiver/ { print $7 }'; }
+alone="$(gbits)"
+python3 -c 'import socket, sys, time
+socks = [socket.create_connection(("127.0.0.1", int(sys.argv[1]))) for _ in range(1000)]
+time.sleep(12)' "$SILENT" &
+idle=$!
+sleep 4
+beside="$(gbits)"
+wait "$idle"
+awk -v a="$alone" -v b="$beside" 'BEGIN { exit !(a > 0 && b >= 0.6 * a) }' \
+	&& pass "a thousand idle connections: a busy stream ran at ${beside} Gbit/s beside them, ${alone} alone" \
+	|| fail "a thousand idle connections: a busy stream ran at ${beside:-?} Gbit/s beside them, ${alone:-?} alone"
+docker rm -f m20-iperf >/dev/null
+
 echo "==> $MANY clients that stop reading, then reset"
 avail_before="$(available)"
 cat >"$SCRATCH/many.py" <<'EOF'
