@@ -606,7 +606,20 @@ struct Loop {
     /// gone for good; and when they last were.
     half_open: std::collections::HashSet<ConnKey>,
     probed: Instant,
+    /// Streams with bytes for the guest that it had no room or credit for,
+    /// or a header not yet sent: served on every wake, since room in the
+    /// outbox frees for all of them at once. Every other stream is served
+    /// only when the vsock side says it changed (`take_touched`).
+    waiting: std::collections::HashSet<ConnKey>,
+    /// Streams commands made or spoke to since the last wake.
+    fresh: Vec<ConnKey>,
+    /// When every stream was last served, whatever it was told: a bound on
+    /// what a change nobody recorded could cost.
+    swept: Instant,
 }
+
+/// How often a wake serves every stream rather than the changed ones.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long a stream refused for want of the Mac's network buffers waits
 /// before writing again. The refusal is the Mac's whole network stack out
@@ -648,6 +661,9 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         starved_said: None,
         half_open: std::collections::HashSet::new(),
         probed: Instant::now(),
+        waiting: std::collections::HashSet::new(),
+        fresh: Vec::new(),
+        swept: Instant::now(),
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
     // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
@@ -739,10 +755,14 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             }
             if let Some(&published) = l.udp_published_by_fd.get(&fd) {
                 l.udp_published_readable(published);
+                if let Some(key) = l.udp_inbound {
+                    l.recheck(key);
+                }
                 continue;
             }
             if let Some(&(key, flow)) = l.udp_by_fd.get(&fd) {
                 l.udp_readable(key, flow);
+                l.recheck(key);
                 continue;
             }
             let Some(&key) = l.by_fd.get(&fd) else {
@@ -750,6 +770,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             };
             if ev.filter == libc::EVFILT_READ {
                 l.readable(key);
+                l.recheck(key);
             } else if ev.filter == libc::EVFILT_WRITE {
                 l.writable(key);
             }
@@ -766,8 +787,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         }
         if woken || pending {
             l.counters.wakes += 1;
-            // Take the commands, then look at every stream: the waker says
-            // nothing about which one changed.
+            // Take the commands, then serve the streams that changed.
             let commands: Vec<Command> = std::mem::take(
                 &mut *l
                     .reactor
@@ -781,9 +801,24 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             if l.memory.is_none() {
                 l.memory = l.shared.memory();
             }
-            let keys: Vec<ConnKey> = l.streams.keys().copied().collect();
+            let keys: Vec<ConnKey> = match l.shared.take_touched() {
+                Some(touched) if l.swept.elapsed() < SWEEP_EVERY => {
+                    let mut keys = touched;
+                    keys.append(&mut l.fresh);
+                    keys.extend(l.waiting.iter().copied());
+                    keys.sort_unstable();
+                    keys.dedup();
+                    keys
+                }
+                _ => {
+                    l.fresh.clear();
+                    l.swept = Instant::now();
+                    l.streams.keys().copied().collect()
+                }
+            };
             for key in keys {
                 l.progress(key);
+                l.recheck(key);
             }
         }
         l.retry_starved();
@@ -906,6 +941,7 @@ impl Loop {
                         pace: None,
                     },
                 );
+                self.fresh.push(key);
             }
             Command::Dns(key) => {
                 self.streams.insert(
@@ -925,9 +961,11 @@ impl Loop {
                         pace: None,
                     },
                 );
+                self.fresh.push(key);
             }
             Command::DnsReply(key, id, reply) => {
                 self.dns_send(key, id, &reply);
+                self.fresh.push(key);
             }
             Command::Udp(key) => {
                 self.streams.insert(
@@ -947,6 +985,7 @@ impl Loop {
                         pace: None,
                     },
                 );
+                self.fresh.push(key);
                 self.udp_flows.insert(key, HashMap::new());
             }
             Command::UdpInbound(key) => {
@@ -972,6 +1011,7 @@ impl Loop {
                         pace: None,
                     },
                 );
+                self.fresh.push(key);
                 self.udp_inbound = Some(key);
             }
             Command::PublishUdp(published, socket, dst) => {
@@ -1024,6 +1064,7 @@ impl Loop {
                         pace: None,
                     },
                 );
+                self.fresh.push(key);
             }
             Command::Carry(guest_port, socket, header) => {
                 crate::sockbuf::widen(&socket);
@@ -1052,6 +1093,7 @@ impl Loop {
                         pace: None,
                     },
                 );
+                self.fresh.push(key);
             }
         }
     }
@@ -1902,9 +1944,24 @@ impl Loop {
         }
     }
 
+    /// Whether `key`'s stream waits on the guest for room, kept in
+    /// `waiting` so that every wake serves it.
+    fn recheck(&mut self, key: ConnKey) {
+        let waits = self.streams.get(&key).is_some_and(|stream| {
+            stream.to_guest_at < stream.to_guest.len()
+                || matches!(stream.phase, Phase::AwaitEstablished(_))
+        });
+        if waits {
+            self.waiting.insert(key);
+        } else {
+            self.waiting.remove(&key);
+        }
+    }
+
     fn close(&mut self, key: ConnKey) {
         self.starved.remove(&key);
         self.half_open.remove(&key);
+        self.waiting.remove(&key);
         if self.udp_inbound == Some(key) {
             // The agent's stream is gone, and every inbound flow with it;
             // the published sockets stay, for the stream that replaces it.

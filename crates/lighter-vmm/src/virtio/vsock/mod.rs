@@ -439,6 +439,13 @@ struct Inner {
     /// counted against its connection's share.
     holders: HashMap<u16, (ConnKey, u64)>,
     next_id: u64,
+    /// Connections something changed for since the reactor last looked,
+    /// or `touched_all` for a change to every one. The reactor serves
+    /// these rather than every stream it has: a wake that walked them all
+    /// took this lock per stream, and beside a thousand idle connections a
+    /// published port's stream ran at 28 Gbit/s where it ran at 105 alone.
+    touched: std::collections::HashSet<ConnKey>,
+    touched_all: bool,
     /// The transmit ring's size, as the driver set it; the shares and the
     /// reserve are fractions of it.
     tx_ring: usize,
@@ -489,8 +496,24 @@ impl Inner {
         (ring - ring / TX_RESERVE_DIVISOR, ring / TX_SHARE_DIVISOR)
     }
 
+    /// Records that `key`'s connection changed, for the reactor. Bounded:
+    /// a pile nobody takes, of connections that are not the reactor's, is
+    /// folded into one look at every stream.
+    fn touch(&mut self, key: ConnKey) {
+        if self.touched_all {
+            return;
+        }
+        if self.touched.len() >= TOUCHED_MAX {
+            self.touched.clear();
+            self.touched_all = true;
+            return;
+        }
+        self.touched.insert(key);
+    }
+
     /// Removes a connection, returning its chains and its window.
     fn remove(&mut self, key: ConnKey) -> bool {
+        self.touch(key);
         match self.conns.remove(&key) {
             Some(conn) => {
                 Vsock::retire(self, conn);
@@ -522,6 +545,7 @@ impl Inner {
         self.next_id += 1;
         let conn = Conn::new(guest_port, state, window, self.next_id);
         if let Some(old) = self.conns.insert(key, conn) {
+            self.touch(key);
             Vsock::retire(self, old);
         }
         self.conns.get_mut(&key).expect("just inserted")
@@ -609,6 +633,8 @@ impl VsockShared {
                 held: 0,
                 holders: HashMap::new(),
                 next_id: 0,
+                touched: std::collections::HashSet::new(),
+                touched_all: false,
                 tx_ring: 256,
                 budget: credit::Budget::default(),
                 listeners: HashMap::new(),
@@ -1293,6 +1319,7 @@ impl VsockShared {
         }
         let dropped = std::mem::take(&mut conn.outbound);
         conn.wake_waiters();
+        inner.touch(key);
         inner.outbox.push_back(packet);
         Vsock::discard(&mut inner, dropped);
         drop(inner);
@@ -1345,7 +1372,7 @@ impl VsockShared {
         };
         let (ring_limit, share) = inner.tx_limits();
         let mut lines = vec![format!(
-            "vsock queues held={} of {} (limit {ring_limit}, share {share}) completed={:?} outbox={} windows={} KiB of {} warden={:?}",
+            "vsock queues held={} of {} (limit {ring_limit}, share {share}) completed={:?} outbox={} windows={} KiB beyond the least, of {} warden={:?}",
             inner.held,
             inner.tx_ring,
             inner.done,
@@ -1476,6 +1503,17 @@ impl VsockShared {
                 inner.spare.push(buf);
             }
         }
+    }
+
+    /// The connections something changed for since the last call, or
+    /// `None` for every one: what the reactor serves on a wake.
+    pub fn take_touched(&self) -> Option<Vec<ConnKey>> {
+        let mut inner = self.lock();
+        if std::mem::take(&mut inner.touched_all) {
+            inner.touched.clear();
+            return None;
+        }
+        Some(inner.touched.drain().collect())
     }
 
     /// Connections in the table, for tests of teardown elsewhere.
@@ -1649,6 +1687,10 @@ impl VsockShared {
     }
 }
 
+/// How many touched connections are kept for the reactor before they are
+/// folded into one look at every stream.
+const TOUCHED_MAX: usize = 4096;
+
 /// A connection with bytes buffered whose host side took none for this
 /// long has a peer that has stopped reading: its window is cut to the
 /// least, so the guest stops sending what nobody is taking. A slow peer
@@ -1691,6 +1733,7 @@ impl Vsock {
         if let Some(conn) = inner.conns.get_mut(&key) {
             conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
             conn.wake_waiters();
+            inner.touch(key);
         }
 
         match packet.op {
@@ -1899,6 +1942,7 @@ impl Vsock {
         // As in `handle`, which this path does not go through.
         conn.wake_waiters();
         if conn.state == State::Closed {
+            inner.touch(key);
             return false;
         }
         let len: usize = spans.iter().map(|s| s.1).sum();
@@ -1918,6 +1962,7 @@ impl Vsock {
             inner.held += 1;
             let id = conn.id;
             inner.holders.insert(head, (key, id));
+            inner.touch(key);
             return true;
         }
         let mut copy = match inner.spare.pop() {
@@ -1937,6 +1982,7 @@ impl Vsock {
         if let Some(conn) = inner.conns.get_mut(&key) {
             conn.outbound.push_back(Chunk::Owned(copy));
         }
+        inner.touch(key);
         false
     }
 
@@ -2271,6 +2317,8 @@ impl VirtioDevice for Vsock {
         for conn in inner.conns.values() {
             conn.wake_waiters();
         }
+        inner.touched.clear();
+        inner.touched_all = true;
         inner.conns.clear();
         inner.outbox.clear();
         drop(inner);
@@ -2884,9 +2932,9 @@ mod tests {
         assert_eq!(request.dst_port, 2375);
         assert_eq!(
             request.buf_alloc,
-            credit::BUF_ALLOC,
+            credit::MIN_WINDOW,
             "the guest must be told our buffer size in the opening packet, or it \
-             cannot send us anything"
+             cannot send us anything: the least, which grows as it drains"
         );
     }
 
@@ -3142,7 +3190,11 @@ mod tests {
             .find(|p| p.op == Op::CreditUpdate)
             .expect("delivery of a quarter window should produce a credit update");
         assert_eq!(update.fwd_cnt, 5 + credit::BUF_ALLOC / 4);
-        assert_eq!(update.buf_alloc, credit::BUF_ALLOC);
+        assert_eq!(
+            update.buf_alloc,
+            2 * credit::MIN_WINDOW,
+            "a connection that drains is given more"
+        );
     }
 
     #[test]
@@ -3490,12 +3542,23 @@ mod tests {
             assert!(!shared.lock().conns.contains_key(&key));
         }
 
+        /// A connection grown to a full window, as one that drained would be.
+        fn full_window(shared: &VsockShared, key: ConnKey) {
+            let mut inner = shared.lock();
+            let mut window = inner.conns[&key].window;
+            while window < credit::BUF_ALLOC {
+                window = inner.budget.grow(window);
+            }
+            inner.conns.get_mut(&key).unwrap().window = window;
+        }
+
         /// A peer that has stopped reading loses its window, so the guest
         /// stops sending into memory nobody empties; once it reads again the
         /// window grows back by doubling.
         #[test]
         fn a_stalled_peers_window_is_cut_and_grows_back_when_it_reads() {
             let (shared, key, mem, _peer) = setup();
+            full_window(&shared, key);
             send(&shared, key, &mem, 0, 0);
             let start = shared.lock().conns[&key].drained;
             shared.sweep(start + STALL_AFTER - std::time::Duration::from_millis(1));
@@ -3528,11 +3591,16 @@ mod tests {
         #[test]
         fn an_idle_connection_gives_its_window_back() {
             let (shared, key, _mem, _peer) = setup();
+            full_window(&shared, key);
             let start = shared.lock().conns[&key].drained;
             shared.sweep(start + IDLE_AFTER);
             let inner = shared.lock();
             assert_eq!(inner.conns[&key].window, credit::MIN_WINDOW);
-            assert_eq!(inner.budget.granted(), u64::from(credit::MIN_WINDOW));
+            assert_eq!(
+                inner.budget.granted(),
+                0,
+                "all it had beyond the least is back"
+            );
             assert_eq!(inner.warden.stalled, 0, "idle is not stalled");
         }
 
