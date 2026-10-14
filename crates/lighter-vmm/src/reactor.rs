@@ -601,6 +601,11 @@ struct Loop {
     /// and when to try again; and when that was last said in the log.
     starved: HashMap<ConnKey, Instant>,
     starved_said: Option<Instant>,
+    /// Streams whose Mac client has sent its end-of-stream while the guest
+    /// has not, looked at every `peer::PROBE_EVERY` for a client that has
+    /// gone for good; and when they last were.
+    half_open: std::collections::HashSet<ConnKey>,
+    probed: Instant,
 }
 
 /// How long a stream refused for want of the Mac's network buffers waits
@@ -641,6 +646,8 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         settled: Instant::now(),
         starved: HashMap::new(),
         starved_said: None,
+        half_open: std::collections::HashSet::new(),
+        probed: Instant::now(),
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
     // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
@@ -673,6 +680,10 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    let probe_tick = libc::timespec {
+        tv_sec: crate::peer::PROBE_EVERY.as_secs() as libc::time_t,
+        tv_nsec: crate::peer::PROBE_EVERY.subsec_nanos() as libc::c_long,
+    };
     let mut spinning = false;
     let mut last_activity = std::time::Instant::now();
     loop {
@@ -688,6 +699,8 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
             &starved_tick
         } else if !l.boosted.is_empty() {
             &settle_tick
+        } else if !l.half_open.is_empty() {
+            &probe_tick
         } else {
             std::ptr::null()
         };
@@ -775,6 +788,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         }
         l.retry_starved();
         l.settle();
+        l.probe_half_open();
         if spin.is_zero() {
             continue;
         }
@@ -1760,6 +1774,9 @@ impl Loop {
                 self.shared.shutdown_write(key);
                 if stream.guest_eof && stream.from_guest.is_empty() {
                     self.close(key);
+                } else if !stream.guest_eof {
+                    crate::peer::watch(fd);
+                    self.half_open.insert(key);
                 }
                 return;
             }
@@ -1854,8 +1871,40 @@ impl Loop {
         }
     }
 
+    /// Ends the half-open streams whose client has gone for good: a client
+    /// that closed while the guest stayed silent was kept forever (#87).
+    /// One that is only half-closed is still reading, and stays.
+    fn probe_half_open(&mut self) {
+        if self.half_open.is_empty() || self.probed.elapsed() < crate::peer::PROBE_EVERY {
+            return;
+        }
+        self.probed = Instant::now();
+        let mut gone = Vec::new();
+        self.half_open.retain(|key| {
+            let Some(stream) = self.streams.get(key) else {
+                return false;
+            };
+            if stream.guest_eof {
+                return false;
+            }
+            if stream
+                .tcp
+                .as_ref()
+                .is_some_and(|tcp| crate::peer::gone(tcp.as_raw_fd()))
+            {
+                gone.push(*key);
+            }
+            true
+        });
+        for key in gone {
+            tracing::debug!(?key, "the client of a half-open stream has gone");
+            self.close(key);
+        }
+    }
+
     fn close(&mut self, key: ConnKey) {
         self.starved.remove(&key);
+        self.half_open.remove(&key);
         if self.udp_inbound == Some(key) {
             // The agent's stream is gone, and every inbound flow with it;
             // the published sockets stay, for the stream that replaces it.
