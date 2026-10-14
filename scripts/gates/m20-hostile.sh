@@ -15,8 +15,8 @@
 #   2. the same through a TLS reverse proxy, which writes 16 KiB records
 #   3. a client that half-closes and reads to the end gets every byte
 #   4. a client reading slowly is slowed, never reset, and gets every byte
-#   5. two thousand clients that stop reading, then reset: the same, and
-#      the connection table empties
+#   5. up to two thousand clients that stop reading, then reset (as many as
+#      half the Mac's network buffers hold): the same, and the table empties
 #   6. a guest whose memory is in pieces (no free block of 256 KiB): bytes
 #      into the machine keep their speed and their receive buffers come
 #      from the pool, and (1) holds there too
@@ -32,7 +32,7 @@ pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
 note() { printf '  \033[33m··\033[0m   %s\n' "$*"; }
 
-ulimit -n 32768 || { echo "m20 needs a 32768-file limit: 2,000 clients are held at once" >&2; exit 1; }
+ulimit -n 32768 || { echo "m20 needs a 32768-file limit: $MANY clients are held at once" >&2; exit 1; }
 
 export LIGHTER_HOME="$(mktemp -d -t lighter-m20-home)"
 export DOCKER_HOST="unix://$LIGHTER_HOME/docker.sock"
@@ -226,7 +226,12 @@ after="$("$LIGHTER" doctor 2>/dev/null | grep "vsock link")"
 [ "$got" = "4194304 intact" ] && pass "slow reader: 4 MiB at 200 KB/s, every byte intact" || fail "slow reader: got '$got'"
 grep -q "no resets" <<<"$after" && pass "slow reader: slowed, never reset" || fail "slow reader: $after"
 
-echo "==> Two thousand clients that stop reading, then reset"
+# As many clients as half the Mac's own network buffers hold at a default
+# 128 KiB socket buffer each, up to two thousand: an 8 GB Mac has 128 MiB
+# of clusters, and two thousand idle clients outran it whatever lighter did.
+MANY=$(( $(sysctl -n kern.ipc.nmbclusters) * 2048 / 2 / 131072 ))
+[ "$MANY" -gt 2000 ] && MANY=2000
+echo "==> $MANY clients that stop reading, then reset"
 cat >"$SCRATCH/many.py" <<'EOF'
 import socket, struct, sys, time
 port, n, hold = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
@@ -239,23 +244,23 @@ for s in socks:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)); s.close()
 print(len(socks))
 EOF
-python3 "$SCRATCH/many.py" "$PUSH" 2000 20 >"$SCRATCH/many.out" &
+python3 "$SCRATCH/many.py" "$PUSH" "$MANY" 20 >"$SCRATCH/many.out" &
 many=$!
 sleep 16
 dump
 ring="$(ring_held)"
-alive "2,000 clients not reading"
-[ "${ring:-999}" -le 192 ] && pass "2,000 clients: the ring holds ${ring} chains of its limit of 192" || fail "2,000 clients: the ring holds ${ring:-?}"
+alive "$MANY clients not reading"
+[ "${ring:-999}" -le 192 ] && pass "$MANY clients: the ring holds ${ring} chains of its limit of 192" || fail "$MANY clients: the ring holds ${ring:-?}"
 # And the Mac's own network buffers: lighter leaves TCP sockets to macOS's
 # autotuning, so clients that do not read do not hold them (sockbuf.rs).
 nobufs="$(sed 's/\x1b\[[0-9;]*m//g' "$LIGHTER_HOME/machine.log" | grep -c "out of network buffers")"
-[ "$nobufs" = 0 ] && pass "2,000 clients: the Mac never ran out of network buffers" || fail "2,000 clients: the Mac ran out of network buffers (ENOBUFS)"
+[ "$nobufs" = 0 ] && pass "$MANY clients: the Mac never ran out of network buffers" || fail "$MANY clients: the Mac ran out of network buffers (ENOBUFS)"
 wait "$many"
 sleep 12
 dump
 [ "$(port_conns $PUSH)" = 0 ] && [ "$(ring_held)" = 0 ] \
-	&& pass "2,000 clients: reset, the table is empty and every chain is back" \
-	|| fail "2,000 clients: $(port_conns $PUSH) connections remain, the ring holds $(ring_held)"
+	&& pass "$MANY clients: reset, the table is empty and every chain is back" \
+	|| fail "$MANY clients: $(port_conns $PUSH) connections remain, the ring holds $(ring_held)"
 
 fi
 
