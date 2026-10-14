@@ -32,7 +32,7 @@ pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
 note() { printf '  \033[33m··\033[0m   %s\n' "$*"; }
 
-ulimit -n 32768 || { echo "m20 needs a 32768-file limit: $MANY clients are held at once" >&2; exit 1; }
+ulimit -n 32768 || { echo "m20 needs a 32768-file limit: up to 2,000 clients are held at once" >&2; exit 1; }
 
 export LIGHTER_HOME="$(mktemp -d -t lighter-m20-home)"
 export DOCKER_HOST="unix://$LIGHTER_HOME/docker.sock"
