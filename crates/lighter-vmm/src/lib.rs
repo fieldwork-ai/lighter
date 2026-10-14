@@ -47,6 +47,7 @@ pub mod memory_policy;
 pub mod mempressure;
 pub mod metal;
 pub mod net;
+pub mod peer;
 pub mod psci;
 pub mod qos;
 pub mod reactor;

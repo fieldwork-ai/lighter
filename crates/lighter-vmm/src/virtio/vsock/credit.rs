@@ -22,17 +22,21 @@ pub const BUF_ALLOC: u32 = 4 * 1024 * 1024;
 /// always make progress. A quarter of it is the credit-update threshold.
 pub const MIN_WINDOW: u32 = 64 * 1024;
 
-/// What every window together may promise. A window is what the guest may
-/// send us ahead of the host peer taking it, and a payload beyond a
-/// connection's share of the transmit ring is copied out to be held here,
-/// so the sum of the windows is what bounds the host's memory: 32 streams at
-/// a full window, or two thousand at the least.
+/// What every window together may promise beyond the least each keeps. A
+/// window is what the guest may send us ahead of the host peer taking it,
+/// and a payload beyond a connection's share of the transmit ring is copied
+/// out to be held here, so the windows are what bound the host's memory:
+/// the least for every connection, and this for those that grow, 32 streams
+/// at a full window. The least is the connection's own, as a socket's
+/// smallest buffer is: counted in the budget, three thousand connections at
+/// it left nothing for a stream to grow into, and beside them one ran at 21
+/// Gbit/s where it ran at 105 alone.
 pub const BUDGET: u64 = 128 * 1024 * 1024;
 
 /// The windows every connection advertises, drawn from one budget.
 ///
-/// A window is granted in full while the budget allows, grows back by
-/// doubling as its connection drains, and is cut to the least when its host
+/// A window opens at the least and grows by doubling as its connection
+/// drains, as far as the budget allows, and is cut to the least when its host
 /// peer stops reading or it sits idle, so that windows follow traffic and a
 /// stalled peer cannot keep the guest sending into memory nobody will
 /// empty. The guest's own kernel bounds what it has in flight by the
@@ -54,19 +58,20 @@ impl Budget {
         Budget { total, granted: 0 }
     }
 
+    /// What windows hold beyond their least.
     fn free(&self) -> u64 {
         self.total.saturating_sub(self.granted)
     }
 
-    /// A new connection's window: as much of a full one as is free, and
-    /// never less than the least.
+    /// A new connection's window: the least, which doubles as it drains.
+    /// Granting a full one while the budget lasted handed it to whoever
+    /// connected first, whether or not they ever sent: beside a thousand
+    /// idle connections a stream opened after them was held to the least
+    /// until the warden took theirs back, and ran at 40 Gbit/s where it ran
+    /// at 103 alone. Growing costs a stream about a megabyte of credit
+    /// updates to reach a full window.
     pub fn open(&mut self) -> u32 {
-        let window = self
-            .free()
-            .min(u64::from(BUF_ALLOC))
-            .max(u64::from(MIN_WINDOW)) as u32;
-        self.granted += u64::from(window);
-        window
+        MIN_WINDOW
     }
 
     /// The window after a connection has drained a quarter of `window`:
@@ -80,20 +85,23 @@ impl Budget {
         grown as u32
     }
 
+    fn beyond_least(window: u32) -> u64 {
+        u64::from(window.saturating_sub(MIN_WINDOW))
+    }
+
     /// The least window, for a connection whose peer has stopped or that
     /// has gone idle.
     pub fn shrink(&mut self, window: u32) -> u32 {
-        let least = window.min(MIN_WINDOW);
-        self.granted = self.granted.saturating_sub(u64::from(window - least));
-        least
+        self.granted = self.granted.saturating_sub(Budget::beyond_least(window));
+        window.min(MIN_WINDOW)
     }
 
     /// A connection is gone and its window with it.
     pub fn close(&mut self, window: u32) {
-        self.granted = self.granted.saturating_sub(u64::from(window));
+        self.granted = self.granted.saturating_sub(Budget::beyond_least(window));
     }
 
-    /// What every window together promises now.
+    /// What every window together promises beyond its least now.
     pub const fn granted(&self) -> u64 {
         self.granted
     }
@@ -253,24 +261,26 @@ mod tests {
     }
 
     #[test]
-    fn windows_are_full_while_the_budget_lasts_and_least_after() {
+    fn windows_open_at_the_least_however_much_is_free() {
         let mut budget = Budget::new(u64::from(BUF_ALLOC) * 2);
-        assert_eq!(budget.open(), BUF_ALLOC);
-        assert_eq!(budget.open(), BUF_ALLOC);
-        assert_eq!(budget.open(), MIN_WINDOW, "the least, however tight");
-        assert_eq!(
-            budget.granted(),
-            u64::from(BUF_ALLOC) * 2 + u64::from(MIN_WINDOW)
-        );
+        assert_eq!(budget.open(), MIN_WINDOW);
+        assert_eq!(budget.open(), MIN_WINDOW);
+        assert_eq!(budget.granted(), 0, "the least is each connection's own");
+        let mut tight = Budget::new(0);
+        assert_eq!(tight.open(), MIN_WINDOW, "and the least however tight");
+        assert_eq!(tight.grow(MIN_WINDOW), MIN_WINDOW, "but no more");
     }
 
     #[test]
     fn a_window_cut_to_the_least_grows_back_by_doubling_into_what_is_free() {
         let mut budget = Budget::new(u64::from(BUF_ALLOC));
-        let full = budget.open();
+        let mut full = budget.open();
+        while full < BUF_ALLOC {
+            full = budget.grow(full);
+        }
         let least = budget.shrink(full);
         assert_eq!(least, MIN_WINDOW);
-        assert_eq!(budget.granted(), u64::from(MIN_WINDOW));
+        assert_eq!(budget.granted(), 0);
         let mut window = least;
         let mut steps = 0;
         while window < BUF_ALLOC {
@@ -281,15 +291,20 @@ mod tests {
         }
         assert_eq!(steps, 6, "64 KiB to 4 MiB");
         assert_eq!(budget.grow(window), BUF_ALLOC, "never past a full window");
-        assert_eq!(budget.granted(), u64::from(BUF_ALLOC));
+        assert_eq!(budget.granted(), u64::from(BUF_ALLOC - MIN_WINDOW));
     }
 
     #[test]
     fn growth_takes_only_what_the_budget_has_free() {
-        let mut budget = Budget::new(u64::from(BUF_ALLOC) + 3 * u64::from(MIN_WINDOW));
-        let _hog = budget.open();
-        let small = budget.open();
-        assert_eq!(small, 3 * MIN_WINDOW);
+        let mut budget = Budget::new(u64::from(BUF_ALLOC - MIN_WINDOW) + 2 * u64::from(MIN_WINDOW));
+        let mut hog = budget.open();
+        while hog < BUF_ALLOC {
+            hog = budget.grow(hog);
+        }
+        let mut small = budget.open();
+        small = budget.grow(small);
+        small = budget.grow(small);
+        assert_eq!(small, 3 * MIN_WINDOW, "64 KiB, 128, then the 192 left");
         assert_eq!(
             budget.grow(small),
             3 * MIN_WINDOW,

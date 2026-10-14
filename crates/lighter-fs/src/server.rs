@@ -1261,6 +1261,20 @@ impl Server {
         })
     }
 
+    /// Answers a request without serving it: `EIO`, in place of a wait on a
+    /// network volume that has stopped answering. Nothing it asked for has
+    /// happened. A FORGET has no reply and is dropped, its inode left
+    /// referenced: forgetting may close a descriptor on that very volume.
+    pub fn refuse(&self, request: &[u8], sink: &mut dyn Sink) -> usize {
+        let Some(header) = InHeader::parse(request) else {
+            return 0;
+        };
+        match header.opcode {
+            op::FORGET | op::BATCH_FORGET => 0,
+            _ => write_error(sink, header.unique, linux::EIO),
+        }
+    }
+
     /// Handles one request, writing the reply into `sink`.
     ///
     /// Returns how many bytes were written, which is zero for the operations

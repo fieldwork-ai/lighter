@@ -1,0 +1,146 @@
+sockmap: a backlog into vsock is as deep as the host's window
+
+Patch 0017 pauses a source while its redirect target's backlog is over 4
+MiB and reads it again below 1 MiB. A redirect takes the bytes out of the
+source's accounting as the verdict runs, so nothing else bounds them: a
+stream whose host client stops reading parks a whole high mark in its
+vsock end's backlog for as long as the client lives, which with TCP's
+queues was 5.6 MiB of guest memory per such client, and two thousand of
+them ran a 4 GiB guest out of memory. A shallower mark is no answer on its
+own: at 1 MiB a container's stream to the Mac ran at 47 Gbit/s where 4 MiB
+gave 100.
+
+The host already decides how much each stream may have in flight, from
+one budget: windows are full while it lasts, and 64 KiB beyond it or once
+a peer stops reading. A backlog into vsock is now as deep as its window,
+between 256 KiB and the high mark, and resumes at a quarter of that. The
+marks are module parameters of skmsg (backlog_high, backlog_low,
+backlog_tight).
+
+And the pass to a socket's own ingress queued skbs on the backlog without
+counting them, while the worker subtracted every skb it took off: the
+count wrapped, and the sources paused on that socket stayed paused. Every
+skb in is counted now, and none is taken out twice.
+
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -9,6 +9,8 @@
+ #include <net/tcp.h>
+ #include <net/tls.h>
+ #include <linux/virtio_vsock.h>
++#include <linux/moduleparam.h>
++#include <net/af_vsock.h>
+ #include <linux/sched/idle.h>
+ #include <trace/events/sock.h>
+ 
+@@ -17,7 +19,80 @@
+  * each side's cleanup from racing the other's.
+  */
+ static DEFINE_SPINLOCK(sk_psock_pause_lock);
++
++/* lighter: how deep a redirect target's backlog may grow.
++ *
++ * A redirect takes bytes out of the source's accounting as its verdict
++ * runs: TCP's window stays open and tcp_mem no longer counts them, so the
++ * marks of patch 0017 are all that bound them. A stream at full speed needs
++ * its backlog deep: at 1 MiB a container's stream to the Mac ran at 47
++ * Gbit/s where 4 MiB gave 100, and at 512 KiB a published port's reverse
++ * ran at 12. But a stream whose host client stops reading parks a whole high
++ * mark here for as long as the client lives: with TCP's queues, 5.6 MiB of
++ * guest memory per such client, and two thousand of them ran a 4 GiB guest
++ * out of memory.
++ *
++ * The host already decides how much each stream may have in flight: its
++ * windows come from one budget, full while it lasts and 64 KiB beyond it or
++ * once a peer stops reading (crates/lighter-vmm/src/virtio/vsock/credit.rs).
++ * So a backlog into vsock is as deep as its window, between the tight mark
++ * and the high one, and resumes at a quarter of that. A machine moving a few
++ * streams keeps them at full depth; a flood of clients that never read gets
++ * the host's least for every one past its budget.
++ *
++ * Module parameters of skmsg: backlog_high and backlog_low for everything,
++ * backlog_tight for the least a vsock backlog is given.
++ */
++static unsigned int backlog_high = SK_PSOCK_BACKLOG_HIGH;
++module_param(backlog_high, uint, 0644);
++static unsigned int backlog_low = SK_PSOCK_BACKLOG_LOW;
++module_param(backlog_low, uint, 0644);
++static unsigned int backlog_tight = 256U << 10;
++module_param(backlog_tight, uint, 0644);
++
++/* The window the vsock peer gave, or 0 for a socket that is not vsock. */
++static u32 sk_psock_peer_window(const struct sock *sk)
++{
++	const struct virtio_vsock_sock *vvs;
++
++	if (!sk_is_vsock(sk))
++		return 0;
++	vvs = vsock_sk(sk)->trans;
++	return vvs ? READ_ONCE(vvs->peer_buf_alloc) : 0;
++}
+ 
++static u32 sk_psock_backlog_high(const struct sk_psock *psock)
++{
++	u32 high = READ_ONCE(backlog_high);
++	u32 window = sk_psock_peer_window(psock->sk);
++
++	if (!window)
++		return high;
++	return clamp(window, min(READ_ONCE(backlog_tight), high), high);
++}
++
++static u32 sk_psock_backlog_low(const struct sk_psock *psock)
++{
++	if (!sk_psock_peer_window(psock->sk))
++		return READ_ONCE(backlog_low);
++	return sk_psock_backlog_high(psock) / 4;
++}
++
++/* Every skb into a backlog is counted, under the psock's ingress lock, and
++ * every one out: the pass to a socket's own ingress queued skbs for the
++ * worker without counting them, the worker subtracted every skb it took,
++ * and a count that wraps holds the sources paused on it for good.
++ */
++static void sk_psock_backlog_add(struct sk_psock *psock, u32 len)
++{
++	psock->ingress_skb_bytes += len;
++}
++
++static void sk_psock_backlog_drop(struct sk_psock *psock, u32 len)
++{
++	psock->ingress_skb_bytes -= min(len, psock->ingress_skb_bytes);
++}
++
+ static void sk_psock_pause(struct sk_psock *from, struct sk_psock *on)
+ {
+ 	spin_lock_bh(&sk_psock_pause_lock);
+@@ -827,8 +902,8 @@
+ 		sk_psock_skb_state(psock, state, 0, 0);
+ 		spin_lock_bh(&psock->ingress_lock);
+ 		skb = __skb_dequeue(&psock->ingress_skb);
+-		psock->ingress_skb_bytes -= skb_len;
+-		low = psock->ingress_skb_bytes < SK_PSOCK_BACKLOG_LOW;
++		sk_psock_backlog_drop(psock, skb_len);
++		low = psock->ingress_skb_bytes < sk_psock_backlog_low(psock);
+ 		spin_unlock_bh(&psock->ingress_lock);
+ 		kfree_skb(skb);
+ 		if (low && !list_empty(&psock->paused))
+@@ -1093,8 +1168,8 @@
+ 	}
+ 
+ 	skb_queue_tail(&psock_other->ingress_skb, skb);
+-	psock_other->ingress_skb_bytes += skb->len;
+-	deep = psock_other->ingress_skb_bytes > SK_PSOCK_BACKLOG_HIGH;
++	sk_psock_backlog_add(psock_other, skb->len);
++	deep = psock_other->ingress_skb_bytes > sk_psock_backlog_high(psock_other);
+ 	schedule_delayed_work(&psock_other->work, 0);
+ 	spin_unlock_bh(&psock_other->ingress_lock);
+ 	if (deep)
+@@ -1175,6 +1250,7 @@
+ 			spin_lock_bh(&psock->ingress_lock);
+ 			if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+ 				skb_queue_tail(&psock->ingress_skb, skb);
++				sk_psock_backlog_add(psock, skb->len);
+ 				schedule_delayed_work(&psock->work, 0);
+ 				err = 0;
+ 			}

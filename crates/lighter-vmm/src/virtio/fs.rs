@@ -323,6 +323,10 @@ struct Job {
     /// Whether it may wait on a volume not known to be this Mac's
     /// (`Server::may_block`): its lane, below.
     remote: bool,
+    /// To be answered without being served: its lane is stuck.
+    refuse: bool,
+    /// The size of the ring it came from.
+    ring: u16,
 }
 
 /// A finished request, waiting to go back on the used ring.
@@ -349,26 +353,96 @@ struct Completion {
 /// then waited 38.7 seconds behind them. Only `remote_cap` workers take a
 /// remote job at once; the rest of that lane waits here, holding no thread,
 /// and the local lane is always served first.
+///
+/// Waiting holds no thread, but it holds the request's descriptors: a
+/// virtqueue takes a chain back only with its reply. So a lane whose every
+/// worker has been stuck for `STUCK_AFTER`, with nothing started or finished
+/// meanwhile, answers what waits in it with `EIO` rather than keep it
+/// (`Server::refuse`): a thousand requests to one hung server filled the
+/// share's four rings of 256, and a file on the Mac's own disk in the same
+/// share then waited with them. Sooner, `PRESSED_AFTER`, once a ring is three
+/// quarters held by them, because then the local files are about to wait.
+/// Only requests never started are answered so, and nothing they asked for
+/// has happened; the first that finishes ends it. A server that is only
+/// slow keeps finishing, and is never answered for.
 struct Queue {
     jobs: Mutex<Option<Lanes>>,
     arrived: Condvar,
     remote_cap: usize,
+    stuck_after: std::time::Duration,
+    pressed_after: std::time::Duration,
+    tag: String,
 }
 
-#[derive(Default)]
+/// How long a remote lane with every worker busy may go without a request
+/// starting or finishing before what waits in it is answered. Longer than
+/// anything a working server takes (macOS's own SMB client gives up on a
+/// server after about 30 s).
+const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// The same once their requests hold three quarters of a ring: a disk on a
+/// NAS spinning up takes about this long.
+const PRESSED_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct Lanes {
     local: VecDeque<Job>,
     remote: VecDeque<Job>,
     /// Remote jobs a worker is serving now.
     remote_busy: usize,
+    /// When a remote job last started or finished.
+    remote_moved: std::time::Instant,
+    /// Remote jobs answered unserved since the lane last moved, for the log.
+    refused: u64,
+    /// Remote jobs holding a chain of each ring, queued or being served,
+    /// and the ring's size.
+    held: std::collections::HashMap<u16, (usize, u16)>,
+}
+
+impl Lanes {
+    fn release(&mut self, ring: u16) {
+        if let Some((held, _)) = self.held.get_mut(&ring) {
+            *held = held.saturating_sub(1);
+        }
+    }
+
+    /// Whether remote jobs hold three quarters of any ring.
+    fn pressed(&self) -> bool {
+        self.held
+            .values()
+            .any(|&(held, size)| held * 4 >= usize::from(size) * 3)
+    }
+}
+
+impl Default for Lanes {
+    fn default() -> Lanes {
+        Lanes {
+            local: VecDeque::new(),
+            remote: VecDeque::new(),
+            remote_busy: 0,
+            remote_moved: std::time::Instant::now(),
+            refused: 0,
+            held: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl Queue {
-    fn new(remote_cap: usize) -> Queue {
+    fn new(remote_cap: usize, tag: &str) -> Queue {
+        Queue::with_patience(remote_cap, tag, STUCK_AFTER, PRESSED_AFTER)
+    }
+
+    fn with_patience(
+        remote_cap: usize,
+        tag: &str,
+        stuck_after: std::time::Duration,
+        pressed_after: std::time::Duration,
+    ) -> Queue {
         Queue {
             jobs: Mutex::new(Some(Lanes::default())),
             arrived: Condvar::new(),
             remote_cap: remote_cap.max(1),
+            stuck_after,
+            pressed_after,
+            tag: tag.to_string(),
         }
     }
 
@@ -379,6 +453,9 @@ impl Queue {
             return false;
         };
         if job.remote {
+            let held = lanes.held.entry(job.queue).or_insert((0, job.ring));
+            held.0 += 1;
+            held.1 = job.ring;
             lanes.remote.push_back(job);
         } else {
             lanes.local.push_back(job);
@@ -389,7 +466,8 @@ impl Queue {
     }
 
     /// Blocks until there is a job this worker may take, or until the queue
-    /// is closed. A remote job taken must be given back with [`Queue::done`].
+    /// is closed. A remote job taken to serve must be given back with
+    /// [`Queue::done`]; one marked `refuse` is only to be answered.
     fn pop(&self) -> Option<Job> {
         let mut guard = self.jobs.lock().expect("fs job queue poisoned");
         loop {
@@ -397,23 +475,65 @@ impl Queue {
             if let Some(job) = lanes.local.pop_front() {
                 return Some(job);
             }
-            if lanes.remote_busy < self.remote_cap
-                && let Some(job) = lanes.remote.pop_front()
-            {
-                lanes.remote_busy += 1;
-                return Some(job);
+            if lanes.remote_busy < self.remote_cap {
+                if let Some(job) = lanes.remote.pop_front() {
+                    lanes.remote_busy += 1;
+                    lanes.remote_moved = std::time::Instant::now();
+                    return Some(job);
+                }
+            } else if !lanes.remote.is_empty() {
+                let still = lanes.remote_moved.elapsed();
+                let patience = if lanes.pressed() {
+                    self.pressed_after.min(self.stuck_after)
+                } else {
+                    self.stuck_after
+                };
+                if still >= patience {
+                    let mut job = lanes.remote.pop_front().expect("not empty");
+                    job.refuse = true;
+                    lanes.release(job.queue);
+                    if lanes.refused == 0 {
+                        tracing::warn!(
+                            share = %self.tag,
+                            "a network volume in this share has not answered for {}s; requests waiting on it fail with EIO until it does",
+                            still.as_secs()
+                        );
+                    }
+                    lanes.refused += 1;
+                    return Some(job);
+                }
+                // Not stuck yet: look again when it would be, or sooner if
+                // the rings fill meanwhile.
+                let left = (patience - still).min(self.pressed_after);
+                guard = self
+                    .arrived
+                    .wait_timeout(guard, left)
+                    .expect("fs job queue poisoned")
+                    .0;
+                continue;
             }
             guard = self.arrived.wait(guard).expect("fs job queue poisoned");
         }
     }
 
-    /// A remote job is finished: its place is free for the next.
-    fn done(&self, job_was_remote: bool) {
+    /// A remote job is finished: its place is free for the next, and the
+    /// lane has moved.
+    fn done(&self, job_was_remote: bool, ring: u16) {
         if !job_was_remote {
             return;
         }
         if let Some(lanes) = self.jobs.lock().expect("fs job queue poisoned").as_mut() {
             lanes.remote_busy -= 1;
+            lanes.release(ring);
+            lanes.remote_moved = std::time::Instant::now();
+            if lanes.refused > 0 {
+                tracing::info!(
+                    share = %self.tag,
+                    refused = lanes.refused,
+                    "the network volume answers again"
+                );
+                lanes.refused = 0;
+            }
         }
         self.arrived.notify_one();
     }
@@ -467,7 +587,7 @@ impl Pool {
         // A quarter of the workers for requests that may wait on a network
         // volume: enough for a NAS in use, few enough that one that hangs
         // leaves the rest to the Mac's own disks.
-        let queue = Arc::new(Queue::new(count / 4));
+        let queue = Arc::new(Queue::new(count / 4, &tag));
         let mut threads = Vec::with_capacity(count);
         for index in 0..count {
             let queue = queue.clone();
@@ -481,10 +601,14 @@ impl Pool {
                 .spawn(move || {
                     raise_server_qos();
                     while let Some(job) = queue.pop() {
-                        let remote = job.remote;
                         let mut sink = ChainSink::new(memory.clone(), job.reply);
-                        let written = server.dispatch(&job.request, &mut sink);
-                        queue.done(remote);
+                        let written = if job.refuse {
+                            server.refuse(&job.request, &mut sink)
+                        } else {
+                            let written = server.dispatch(&job.request, &mut sink);
+                            queue.done(job.remote, job.queue);
+                            written
+                        };
                         done.lock()
                             .expect("fs completions poisoned")
                             .push_back(Completion {
@@ -836,6 +960,8 @@ impl VirtioDevice for Fs {
                             reply,
                             queue: HIPRIO_QUEUE,
                             remote: true,
+                            refuse: false,
+                            ring: hiprio.size(),
                         };
                         if pool.push(job) {
                             continue;
@@ -905,6 +1031,8 @@ impl VirtioDevice for Fs {
                         reply,
                         queue: index,
                         remote,
+                        refuse: false,
+                        ring: requests.size(),
                     }) {
                         // Every worker is gone. Return the chain rather than
                         // leaking it, so the guest sees an error instead of a
@@ -938,6 +1066,8 @@ mod tests {
             reply: Vec::new(),
             queue: 0,
             remote,
+            refuse: false,
+            ring: 256,
         }
     }
 
@@ -946,7 +1076,7 @@ mod tests {
     /// and a local file in the same share waited 38.7 s behind it.
     #[test]
     fn remote_jobs_take_at_most_their_share_of_the_workers() {
-        let queue = Arc::new(Queue::new(2));
+        let queue = Arc::new(Queue::new(2, "test"));
         for head in 0..3 {
             assert!(queue.push(job(true, head)));
         }
@@ -985,13 +1115,71 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_millis(100))
                 .is_err()
         );
-        queue.done(true);
+        queue.done(true, 0);
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
             Some(2),
             "a finished remote job frees its place"
         );
         waiting.join().unwrap();
+    }
+
+    /// A lane whose every worker is stuck answers what waits in it rather
+    /// than keep its descriptors, sooner once they fill a ring, and a lane
+    /// that moves does not.
+    #[test]
+    fn a_stuck_remote_lane_answers_what_waits_in_it() {
+        let ms = std::time::Duration::from_millis;
+        let queue = Arc::new(Queue::with_patience(1, "test", ms(400), ms(100)));
+        let remote = |head, ring| Job {
+            ring,
+            ..job(true, head)
+        };
+        queue.push(remote(0, 256));
+        assert!(!queue.pop().unwrap().refuse, "the first is served");
+        queue.push(remote(1, 256));
+        queue.push(remote(2, 256));
+
+        // Stuck, and the rings nearly empty: the full patience.
+        let started = std::time::Instant::now();
+        let next = queue.pop().unwrap();
+        assert!(
+            next.refuse && next.head == 1,
+            "answered once the lane is stuck"
+        );
+        assert!(
+            started.elapsed() >= ms(300),
+            "and not before ({:?})",
+            started.elapsed()
+        );
+        let next = queue.pop().unwrap();
+        assert!(next.refuse && next.head == 2, "every waiting one, at once");
+
+        // It finishes: the lane moves, and the next is served.
+        queue.done(true, 0);
+        queue.push(remote(3, 4));
+        let served = queue.pop().unwrap();
+        assert!(
+            !served.refuse && served.head == 3,
+            "served again once it moves"
+        );
+
+        // Three of a ring of four held: answered after the shorter wait.
+        queue.push(remote(4, 4));
+        queue.push(remote(5, 4));
+        let started = std::time::Instant::now();
+        let next = queue.pop().unwrap();
+        assert!(next.refuse && next.head == 4);
+        assert!(
+            started.elapsed() < ms(300),
+            "a ring nearly full waits less ({:?})",
+            started.elapsed()
+        );
+        assert!(queue.pop().unwrap().refuse);
+
+        // A local job is never answered unserved.
+        queue.push(job(false, 6));
+        assert!(!queue.pop().unwrap().refuse);
     }
 
     #[test]

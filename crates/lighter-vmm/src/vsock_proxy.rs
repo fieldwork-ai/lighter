@@ -180,3 +180,30 @@ fn path_label(guest_port: u32) -> &'static str {
         _ => "a proxied socket",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// A guest that never accepts: `serve` gives up after its accept
+    /// timeout, the table forgets the connection, and the client sees it end
+    /// rather than hang on an entry holding its socket (#87, test by
+    /// @petrfilip).
+    #[test]
+    fn a_guest_that_never_answers_gives_the_client_eof() {
+        let shared = Arc::new(VsockShared::new());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(ACCEPT_TIMEOUT * 2)).unwrap();
+        let worker = shared.clone();
+        std::thread::spawn(move || serve(server, 2375, worker, None))
+            .join()
+            .unwrap();
+        assert_eq!(shared.connection_count(), 0, "the connection is forgotten");
+        let got = client.read(&mut [0u8; 1]);
+        assert!(
+            matches!(got, Ok(0)),
+            "the client still sees an open socket after the guest gave up: {got:?}"
+        );
+    }
+}

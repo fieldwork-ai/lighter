@@ -56,7 +56,7 @@ pub fn widen(socket: &impl AsRawFd) {
 
 /// A TCP socket: a stream socket of either internet family. Darwin has no
 /// `SO_PROTOCOL` to ask directly.
-fn is_tcp(fd: libc::c_int) -> bool {
+pub(crate) fn is_tcp(fd: libc::c_int) -> bool {
     let mut kind: libc::c_int = 0;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: an int lives at the pointer for the call's duration and the
