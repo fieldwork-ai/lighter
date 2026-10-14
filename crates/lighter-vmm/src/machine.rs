@@ -410,6 +410,7 @@ impl Machine {
         // and everything host-to-guest above the network — the Docker socket,
         // the control channel — rides on it.
         let vsock_state = Arc::new(VsockShared::new());
+        vsock_state.start_warden();
         let vsock_slot = virtio.len();
         virtio.push(Box::new(Vsock::new(vsock_state.clone())));
 

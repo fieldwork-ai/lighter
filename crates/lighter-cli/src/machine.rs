@@ -43,6 +43,64 @@ pub struct Status {
     /// Direct access: the link's subnet and Docker's networks outside it,
     /// or why the machine started without it. None when it is off.
     pub direct: Option<Result<(std::net::Ipv4Addr, Vec<String>), String>>,
+    /// The guest's memory as the agent sees it; `None` when it cannot say.
+    pub guest_memory: Option<GuestMemory>,
+    /// What the vsock link's warden has done; `None` before 0.13.5.
+    pub link: Option<crate::storage_status::Link>,
+}
+
+/// The agent's `memory` reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestMemory {
+    pub total_mib: u64,
+    pub available_mib: u64,
+    pub free_mib: u64,
+    /// Memory stall over the last ten seconds, in hundredths of a percent.
+    pub stall_some: u64,
+    /// Free blocks of 256 KiB or more: none means the guest's memory is
+    /// in pieces too small for a full-size receive buffer.
+    pub blocks_256k: u64,
+}
+
+impl GuestMemory {
+    pub fn parse(reply: &str) -> Option<GuestMemory> {
+        let rest = reply.trim().strip_prefix("memory ")?;
+        let field = |name: &str| -> Option<u64> {
+            rest.split_whitespace()
+                .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))?
+                .parse()
+                .ok()
+        };
+        Some(GuestMemory {
+            total_mib: field("total_mib")?,
+            available_mib: field("available_mib")?,
+            free_mib: field("free_mib")?,
+            stall_some: field("stall_some")?,
+            blocks_256k: field("blocks_256k")?,
+        })
+    }
+
+    /// Short of memory: under a twentieth available, or stalling a tenth
+    /// of the time.
+    pub fn short(&self) -> bool {
+        self.available_mib * 20 < self.total_mib || self.stall_some >= 1000
+    }
+
+    /// What `lighter status` says of it.
+    pub fn line(&self) -> String {
+        let mut line = format!("{} of {} MiB available", self.available_mib, self.total_mib);
+        if self.stall_some >= 100 {
+            line.push_str(&format!(
+                ", stalling {}.{:02}% of the time",
+                self.stall_some / 100,
+                self.stall_some % 100
+            ));
+        }
+        if self.blocks_256k == 0 {
+            line.push_str(", fragmented (no free block of 256 KiB)");
+        }
+        line
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +418,9 @@ pub fn status() -> anyhow::Result<Status> {
         .and_then(|_| control("restarts").ok())
         .and_then(|reply| reply.strip_prefix("restarts ").map(str::to_owned))
         .filter(|r| r != "none");
+    let guest_memory = pid
+        .and_then(|_| control("memory").ok())
+        .and_then(|reply| GuestMemory::parse(&reply));
     Ok(Status {
         running: pid.is_some(),
         pid,
@@ -372,6 +433,8 @@ pub fn status() -> anyhow::Result<Status> {
         unshared,
         lan,
         direct,
+        guest_memory,
+        link: report.link,
     })
 }
 

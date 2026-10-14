@@ -754,6 +754,49 @@ fn offer_memory(
 /// Pressure stall information for memory, in hundredths of a percent of
 /// the last ten seconds: `some` (any task stalled) and `full` (every task
 /// stalled). Zero when the kernel does not account it.
+/// One line, `memory total_mib=12004 available_mib=3124 free_mib=596
+/// stall_some=12 blocks_256k=0`: the stall in hundredths of a percent of
+/// the last ten seconds, and how many free blocks of 256 KiB or more the
+/// page allocator holds — none is a fragmented guest, whose memory is
+/// there but not in pieces large enough for a full-size receive buffer.
+fn memory_report() -> String {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let field = |name: &str| -> u64 {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .unwrap_or(0)
+            >> 10
+    };
+    let buddyinfo = std::fs::read_to_string("/proc/buddyinfo").unwrap_or_default();
+    format!(
+        "memory total_mib={} available_mib={} free_mib={} stall_some={} blocks_256k={}\n",
+        field("MemTotal:"),
+        field("MemAvailable:"),
+        field("MemFree:"),
+        memory_stall().0,
+        free_blocks(&buddyinfo, 6),
+    )
+}
+
+/// Free blocks of at least `2^order` pages across every zone, from
+/// `/proc/buddyinfo`: a block of a higher order is that many of this one.
+fn free_blocks(buddyinfo: &str, order: usize) -> u64 {
+    buddyinfo
+        .lines()
+        .filter_map(|line| line.split_once("zone").map(|(_, rest)| rest))
+        .flat_map(|rest| {
+            rest.split_whitespace()
+                .skip(1)
+                .enumerate()
+                .filter(move |(o, _)| *o >= order)
+                .filter_map(move |(o, n)| Some(n.parse::<u64>().ok()? << (o - order)))
+        })
+        .sum()
+}
+
 fn memory_stall() -> (u32, u32) {
     let text = std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default();
     (psi_avg10(&text, "some"), psi_avg10(&text, "full"))
@@ -1299,6 +1342,10 @@ fn handle_control(line: &str) -> String {
             Err(_) => "error bad gain\n".into(),
         },
         (Some("warm"), _) => warm::SHARED.report(),
+        // Memory as `lighter status` and `doctor` show it: how much is
+        // available, whether the guest is stalling for it, and whether it
+        // is in pieces (`memory_report`).
+        (Some("memory"), _) => memory_report(),
         // The host is compressing our pages: give back that much page cache,
         // coldest first, from the cgroup every container lives in. The
         // kernel frees it in bulk and free page reporting returns it to the
@@ -1598,6 +1645,17 @@ impl Write for Fd {
 
 #[cfg(test)]
 mod tests {
+    /// skwiz0d's guest at the stall (#84): 3.1 GB available and not one
+    /// free block of 256 KiB in the main zone; the DMA zone held 37.
+    #[test]
+    fn free_blocks_count_every_zone_and_split_the_larger_orders() {
+        let buddyinfo = "Node 0, zone      DMA  15395   6792   8025   4054    918    144     25      9      1      1      0 \n\
+                         Node 0, zone   Normal   3291   1399   2220    679    649     67      0      0      0      0      0 \n";
+        assert_eq!(super::free_blocks(buddyinfo, 6), 25 + 9 * 2 + 4 + 8);
+        assert_eq!(super::free_blocks("Node 0, zone   Normal 0 0 0 0 0 0 0 0 0 0 0\n", 6), 0);
+        assert_eq!(super::free_blocks("", 6), 0);
+    }
+
     #[test]
     fn restarts_are_counted_by_agent() {
         assert_eq!(super::agent_restarts(""), "none");

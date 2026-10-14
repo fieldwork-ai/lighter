@@ -127,6 +127,8 @@ struct Counters {
     writev: u64,
     eagain: u64,
     writable: u64,
+    /// Writes the Mac refused for want of network buffers (ENOBUFS).
+    nobufs: u64,
 }
 
 enum Command {
@@ -595,7 +597,18 @@ struct Loop {
     /// looked at.
     boosted: std::collections::HashSet<ConnKey>,
     settled: Instant,
+    /// Streams whose last write the Mac refused for want of network buffers,
+    /// and when to try again; and when that was last said in the log.
+    starved: HashMap<ConnKey, Instant>,
+    starved_said: Option<Instant>,
 }
+
+/// How long a stream refused for want of the Mac's network buffers waits
+/// before writing again. The refusal is the Mac's whole network stack out
+/// of buffers (`kern.ipc.nmbclusters`), not this connection failing; the
+/// socket may well report writable meanwhile, so it is a timer, not a
+/// filter.
+const STARVED_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
 fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
     crate::qos::raise_interactive();
@@ -626,6 +639,8 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
         udp_inbound_swept: Instant::now(),
         boosted: std::collections::HashSet::new(),
         settled: Instant::now(),
+        starved: HashMap::new(),
+        starved_said: None,
     };
     let mut events: Vec<libc::kevent> = Vec::with_capacity(64);
     // `LIGHTER_STREAM_TRACE=1`: every stream's state every 100 ms, to the log.
@@ -661,10 +676,16 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
     let mut spinning = false;
     let mut last_activity = std::time::Instant::now();
     loop {
+        let starved_tick = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: STARVED_RETRY.as_nanos() as libc::c_long,
+        };
         let timeout: *const libc::timespec = if spinning {
             &zero
         } else if trace {
             &tick
+        } else if !l.starved.is_empty() {
+            &starved_tick
         } else if !l.boosted.is_empty() {
             &settle_tick
         } else {
@@ -752,6 +773,7 @@ fn run(reactor: Arc<Reactor>, wake_read: RawFd) {
                 l.progress(key);
             }
         }
+        l.retry_starved();
         l.settle();
         if spin.is_zero() {
             continue;
@@ -830,7 +852,7 @@ impl Loop {
         }
         let c = &self.counters;
         eprintln!(
-            "TRACE t={t} reactor iters={} wakes={} events={} takes_chunks={} takes_empty={} writev={} eagain={} writable={}",
+            "TRACE t={t} reactor iters={} wakes={} events={} takes_chunks={} takes_empty={} writev={} eagain={} writable={} nobufs={} starved={}",
             c.iters,
             c.wakes,
             c.events,
@@ -838,7 +860,9 @@ impl Loop {
             c.takes_empty,
             c.writev,
             c.eagain,
-            c.writable
+            c.writable,
+            c.nobufs,
+            self.starved.len()
         );
         for line in self.shared.trace_lines() {
             if line.contains("outbound=0/0") && line.contains("guest_inflight=0 ") {
@@ -965,6 +989,8 @@ impl Loop {
                 }
                 let Ok(clone) = mac.try_clone() else { return };
                 let key = self.shared.open(INBOUND_PORT, clone);
+                self.shared
+                    .label(key, format!("a client of port {}", dst.port()));
                 let fd = mac.as_raw_fd();
                 self.by_fd.insert(fd, key);
                 self.streams.insert(
@@ -1403,6 +1429,7 @@ impl Loop {
                         self.close(key);
                         return;
                     };
+                    self.shared.label(key, format!("a stream to {addr}"));
                     match connect_nonblocking(addr) {
                         Ok(tcp) => {
                             let fd = tcp.as_raw_fd();
@@ -1552,6 +1579,13 @@ impl Loop {
     /// Writes what is pending from the guest; arms the write filter if the
     /// socket would not take it all.
     fn flush(&mut self, key: ConnKey) {
+        if self
+            .starved
+            .get(&key)
+            .is_some_and(|at| *at > Instant::now())
+        {
+            return;
+        }
         let Some(stream) = self.streams.get_mut(&key) else {
             return;
         };
@@ -1615,6 +1649,11 @@ impl Loop {
                 }
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
+                }
+                if e.raw_os_error() == Some(libc::ENOBUFS) {
+                    self.counters.nobufs += 1;
+                    self.starve(key);
+                    return;
                 }
                 self.close(key);
                 return;
@@ -1779,7 +1818,44 @@ impl Loop {
         self.pull_from_guest(key);
     }
 
+    /// A write the Mac refused for want of network buffers: the bytes stay
+    /// queued and the stream writes again after `STARVED_RETRY`. Closing it
+    /// instead, as a failed write, reset every stream that wrote while a
+    /// flood of clients that had stopped reading held the Mac's buffers:
+    /// requests to an unrelated port came back empty.
+    fn starve(&mut self, key: ConnKey) {
+        let now = Instant::now();
+        self.starved.insert(key, now + STARVED_RETRY);
+        if self
+            .starved_said
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(60))
+        {
+            self.starved_said = Some(now);
+            tracing::warn!(
+                "the Mac is out of network buffers (ENOBUFS); streams wait for them rather than failing"
+            );
+        }
+    }
+
+    fn retry_starved(&mut self) {
+        if self.starved.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<ConnKey> = self
+            .starved
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in due {
+            self.starved.remove(&key);
+            self.pull_from_guest(key);
+        }
+    }
+
     fn close(&mut self, key: ConnKey) {
+        self.starved.remove(&key);
         if self.udp_inbound == Some(key) {
             // The agent's stream is gone, and every inbound flow with it;
             // the published sockets stay, for the stream that replaces it.

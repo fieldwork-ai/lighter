@@ -355,6 +355,7 @@ pub fn machine() -> anyhow::Result<()> {
         machine.mem().cloned(),
         Some(port_health.clone()),
         shared,
+        Some(machine.vsock()),
     )?;
     for (path, port) in machine::sockets()? {
         machine.proxy_socket(&path, port)?;

@@ -24,6 +24,23 @@
 //! two under one lock deadlocks the machine the first time a container writes
 //! to the Docker socket while the guest is also writing back, which is to say
 //! immediately and only under load.
+//!
+//! # Sharing
+//!
+//! **Nothing shared is held on behalf of a party whose progress the host does
+//! not control.** Every connection shares the transmit ring, the outbox and
+//! the credit budget, and every connection's host peer can stop reading,
+//! reset, or never be heard from again; so does the guest. A connection
+//! holds at most its share of the ring (`TX_SHARE_DIVISOR`) and the ring's
+//! reserve is never held (`TX_RESERVE_DIVISOR`); a window is drawn from the
+//! budget and cut when its peer stops ([`credit::Budget`]); a closed
+//! connection gives everything back at once and is removed whether or not the
+//! guest answers ([`VsockShared::sweep`]); the control plane has its own lane
+//! (`Outbox`). Before these rules one published port written in 16 KiB
+//! pieces to a client that had stopped reading held all 256 chains, and
+//! Docker, every port and the memory reports went dark until a restart
+//! (#84). A change that adds anything shared here says who holds it, what
+//! bounds it, and what gives it back when the holder never does.
 
 pub mod credit;
 pub mod packet;
@@ -59,6 +76,28 @@ const FIRST_EPHEMERAL_PORT: u32 = 1 << 30;
 /// Bounded for the same reason the network's backlog is: the producers are host
 /// threads and the consumer is a guest that may be busy.
 const OUTBOX_LIMIT: usize = 1024;
+
+/// The transmit ring is shared by every connection, and a chain held for a
+/// payload is held until that connection's host peer takes the bytes. So no
+/// connection holds more than a quarter of the ring, and the last quarter is
+/// never held at all: a payload beyond either is copied out and its chain
+/// returned at once. Credit bounds bytes, not chains — 4 MiB in 16 KiB
+/// writes, which is how a TLS proxy writes, is exactly the 256-entry ring —
+/// and one stream whose client had stopped reading held every chain, which
+/// silenced Docker and every port until a restart (#84). A quarter, not an
+/// eighth: one fast stream's window in 64 KiB packets spans 64 chains, and
+/// an eighth copied half of it, 9% of container-to-Mac throughput; always
+/// copying cost 5 to 9% (`LIGHTER_VSOCK_COPY=1` measures it).
+const TX_SHARE_DIVISOR: usize = 4;
+const TX_RESERVE_DIVISOR: usize = 4;
+
+/// How long a connection we closed may wait for the guest's reset before we
+/// remove it ourselves, as Linux does on its side (`VSOCK_CLOSE_TIMEOUT`).
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long a connection we opened may wait for the guest's answer. Every
+/// opener gives up well before this; the entry it leaves is removed here.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A connection's half of the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +160,51 @@ struct Conn {
     /// and a context switch — a fifth of the poller's time at 53 Gbit/s on
     /// an M1.
     waiters: u32,
+    /// Transmit chains this connection holds: queued here or in a writer's
+    /// hands. Bounded by the ring's share; see `TX_SHARE_DIVISOR`.
+    held: usize,
+    /// Unique for the device's life: a guest reuses its ports, and a chain
+    /// returned after its connection was replaced is not the new one's.
+    id: u64,
+    /// The window we advertise, from the shared budget (`credit::Budget`).
+    window: u32,
+    /// When the state last changed: opened, or closed by us. What the
+    /// warden times a connection that never finishes from.
+    since: std::time::Instant,
+    /// When the host side last took bytes, or the connection last had none
+    /// buffered: what tells a stalled peer from a slow one.
+    drained: std::time::Instant,
+    /// What the host side is, for the warden's log lines.
+    label: Option<Arc<str>>,
+}
+
+impl Conn {
+    fn new(guest_port: u32, state: State, window: u32, id: u64) -> Conn {
+        let now = std::time::Instant::now();
+        Conn {
+            id,
+            guest_port,
+            state,
+            credit: Credit::new(),
+            outbound: VecDeque::new(),
+            guest_done: false,
+            guest_receive_closed: false,
+            unreported: 0,
+            received: 0,
+            socket: None,
+            waiters: 0,
+            held: 0,
+            window,
+            since: now,
+            drained: now,
+            label: None,
+        }
+    }
+
+    /// Bytes taken from the guest and not yet on the host socket.
+    fn buffered(&self) -> u32 {
+        self.received.wrapping_sub(self.credit.fwd_cnt())
+    }
 }
 
 /// What the host end of a connection has to be: readable, writable,
@@ -233,9 +317,100 @@ impl Chunk {
 /// dialed and differ in theirs, which is why one port was never enough.
 pub type ConnKey = (u32, u32);
 
+/// The vsock ports whose connections are the machine's control plane:
+/// the Docker socket and the agent's control socket (guest ports the host
+/// dials), and DNS, the memory reports and the time (host ports the guest
+/// dials). Their packets go to the guest ahead of every stream's.
+const CONTROL_PORTS: [u32; 5] = [2375, 2376, 2379, 2381, 2382];
+
+/// What waits to go to the guest, in two lanes: the control plane's
+/// connections first, then everything else. A connection's packets all
+/// travel in one lane, so its own order is kept — the guest takes
+/// `fwd_cnt` from every packet as it comes, and a credit update overtaking
+/// a connection's older data would move it backwards. Between lanes the
+/// order is free, and that freedom is the point: a guest slow to post
+/// receive buffers (memory short, a stream flooding it) delivered Docker's
+/// replies and the credit that unblocks its own sends behind every stream
+/// queued before them.
+#[derive(Default)]
+struct Outbox {
+    control: VecDeque<Packet>,
+    bulk: VecDeque<Packet>,
+}
+
+impl Outbox {
+    fn is_control(packet: &Packet) -> bool {
+        CONTROL_PORTS.contains(&packet.dst_port) || CONTROL_PORTS.contains(&packet.src_port)
+    }
+
+    fn lane(&mut self, packet: &Packet) -> &mut VecDeque<Packet> {
+        if Self::is_control(packet) {
+            &mut self.control
+        } else {
+            &mut self.bulk
+        }
+    }
+
+    fn push_back(&mut self, packet: Packet) {
+        self.lane(&packet).push_back(packet);
+    }
+
+    /// Back at the head of its lane: the rest of a packet that did not fit.
+    fn push_front(&mut self, packet: Packet) {
+        self.lane(&packet).push_front(packet);
+    }
+
+    fn pop_front(&mut self) -> Option<Packet> {
+        self.control.pop_front().or_else(|| self.bulk.pop_front())
+    }
+
+    fn len(&self) -> usize {
+        self.control.len() + self.bulk.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.control.is_empty() && self.bulk.is_empty()
+    }
+
+    /// Room for another packet in `key`'s lane.
+    fn room(&self, key: ConnKey) -> usize {
+        let probe = Packet::control(Op::Rw, key.0, key.1);
+        let used = if Self::is_control(&probe) {
+            self.control.len()
+        } else {
+            self.bulk.len()
+        };
+        OUTBOX_LIMIT.saturating_sub(used)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Packet) -> bool) {
+        self.control.retain(&mut keep);
+        self.bulk.retain(keep);
+    }
+
+    fn clear(&mut self) {
+        self.control.clear();
+        self.bulk.clear();
+    }
+
+    /// In delivery order.
+    #[cfg(test)]
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Packet> {
+        self.control.iter().chain(self.bulk.iter())
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<usize> for Outbox {
+    type Output = Packet;
+    fn index(&self, i: usize) -> &Packet {
+        self.iter().nth(i).expect("outbox index out of range")
+    }
+}
+
 struct Inner {
     conns: HashMap<ConnKey, Conn>,
-    outbox: VecDeque<Packet>,
+    outbox: Outbox,
     next_port: u32,
     /// Payload buffers the writers have finished with, for the ring reader
     /// to fill again. A fresh 256 KiB Vec per packet is a page-faulted,
@@ -250,10 +425,97 @@ struct Inner {
     /// The guest's ring is finite: when every held chain is done, nothing
     /// else will bring the next look at the ring, so `complete` does.
     held: usize,
+    /// Which connection holds each held chain, so a chain's return is
+    /// counted against its connection's share.
+    holders: HashMap<u16, (ConnKey, u64)>,
+    next_id: u64,
+    /// The transmit ring's size, as the driver set it; the shares and the
+    /// reserve are fractions of it.
+    tx_ring: usize,
+    /// Every connection's window comes from here.
+    budget: credit::Budget,
     /// Ports the host answers: a REQUEST to one is accepted and the new
     /// connection handed to the listener, one end of a socket pair for the
     /// device's pump and the other for whoever listens.
     listeners: HashMap<u32, std::sync::mpsc::Sender<Accepted>>,
+    /// What the warden has done since boot, for `lighter doctor`.
+    warden: WardenCounts,
+    /// When a held chain last went back, and since when the ring has been
+    /// at its limit: the watchdog's two clocks.
+    last_return: std::time::Instant,
+    ring_full_since: Option<std::time::Instant>,
+}
+
+/// What [`VsockShared::sweep`] has done since boot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WardenCounts {
+    /// Connections we closed that the guest never reset, removed at
+    /// `CLOSE_TIMEOUT`.
+    pub closed_expired: u64,
+    /// Connections we opened that the guest never answered.
+    pub connect_expired: u64,
+    /// Windows cut because a host peer stopped taking bytes.
+    pub stalled: u64,
+    /// Connections reset because a shared resource stayed exhausted.
+    pub resets: u64,
+    /// The last few of those cuts and resets, newest last, as what the
+    /// connection's host side was: "reset a client of port 8096".
+    pub recent: Vec<String>,
+}
+
+impl WardenCounts {
+    fn note(&mut self, what: String) {
+        if self.recent.len() == 8 {
+            self.recent.remove(0);
+        }
+        self.recent.push(what);
+    }
+}
+
+impl Inner {
+    /// The most chains held at once, and the most for any one connection.
+    fn tx_limits(&self) -> (usize, usize) {
+        let ring = self.tx_ring.max(TX_SHARE_DIVISOR);
+        (ring - ring / TX_RESERVE_DIVISOR, ring / TX_SHARE_DIVISOR)
+    }
+
+    /// Removes a connection, returning its chains and its window.
+    fn remove(&mut self, key: ConnKey) -> bool {
+        match self.conns.remove(&key) {
+            Some(conn) => {
+                Vsock::retire(self, conn);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The chains writers have finished with, counted back against the
+    /// ring and their connections, for the transport to return.
+    fn finish_done(&mut self) -> Vec<u16> {
+        let heads: Vec<u16> = self.done.drain(..).collect();
+        for &head in &heads {
+            self.held = self.held.saturating_sub(1);
+            self.last_return = std::time::Instant::now();
+            if let Some((key, id)) = self.holders.remove(&head)
+                && let Some(conn) = self.conns.get_mut(&key)
+                && conn.id == id
+            {
+                conn.held = conn.held.saturating_sub(1);
+            }
+        }
+        heads
+    }
+
+    fn insert(&mut self, key: ConnKey, guest_port: u32, state: State) -> &mut Conn {
+        let window = self.budget.open();
+        self.next_id += 1;
+        let conn = Conn::new(guest_port, state, window, self.next_id);
+        if let Some(old) = self.conns.insert(key, conn) {
+            Vsock::retire(self, old);
+        }
+        self.conns.get_mut(&key).expect("just inserted")
+    }
 }
 
 /// A connection the guest opened, as handed to its listener: established,
@@ -330,12 +592,19 @@ impl VsockShared {
             deferred_waker: Mutex::new(None),
             inner: Mutex::new(Inner {
                 conns: HashMap::new(),
-                outbox: VecDeque::new(),
+                outbox: Outbox::default(),
                 next_port: FIRST_EPHEMERAL_PORT,
                 spare: Vec::new(),
                 done: VecDeque::new(),
                 held: 0,
+                holders: HashMap::new(),
+                next_id: 0,
+                tx_ring: 256,
+                budget: credit::Budget::default(),
                 listeners: HashMap::new(),
+                warden: WardenCounts::default(),
+                last_return: std::time::Instant::now(),
+                ring_full_since: None,
             }),
             progress: Condvar::new(),
             waiters: std::sync::atomic::AtomicUsize::new(0),
@@ -515,23 +784,11 @@ impl VsockShared {
         let host_port = inner.next_port;
         inner.next_port = inner.next_port.wrapping_add(1).max(FIRST_EPHEMERAL_PORT);
 
-        inner.conns.insert(
-            (host_port, guest_port),
-            Conn {
-                guest_port,
-                state: State::Connecting,
-                credit: Credit::new(),
-                outbound: VecDeque::new(),
-                guest_done: false,
-                guest_receive_closed: false,
-                unreported: 0,
-                received: 0,
-                socket: Some(Box::new(socket)),
-                waiters: 0,
-            },
-        );
+        let conn = inner.insert((host_port, guest_port), guest_port, State::Connecting);
+        conn.socket = Some(Box::new(socket));
+        let window = conn.window;
         let mut request = Packet::control(Op::Request, host_port, guest_port);
-        request.buf_alloc = credit::BUF_ALLOC;
+        request.buf_alloc = window;
         inner.outbox.push_back(request);
         drop(inner);
 
@@ -597,9 +854,10 @@ impl VsockShared {
             };
         }
         let mut allowed = conn.credit.available() as usize;
-        let mut room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+        let mut room = inner.outbox.room(key);
         let (host_port, guest_port) = key;
         let fwd_cnt = conn.credit.fwd_cnt();
+        let window = conn.window;
         let mut offset = 0;
         while allowed > 0 && room > 0 && offset < data.len() {
             let take = allowed.min(MAX_PAYLOAD).min(data.len() - offset);
@@ -613,7 +871,7 @@ impl VsockShared {
             };
             payload.extend_from_slice(&data[offset..offset + take]);
             packet.payload = payload;
-            packet.buf_alloc = credit::BUF_ALLOC;
+            packet.buf_alloc = window;
             packet.fwd_cnt = fwd_cnt;
             inner.outbox.push_back(packet);
             if let Some(conn) = inner.conns.get_mut(&key) {
@@ -665,12 +923,13 @@ impl VsockShared {
             };
         }
         let allowed = conn.credit.available() as usize;
-        let room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+        let room = inner.outbox.room(key);
         if room == 0 || allowed == 0 {
             return Ok(Some(data));
         }
         let (host_port, guest_port) = key;
         let fwd_cnt = conn.credit.fwd_cnt();
+        let window = conn.window;
         let rest = if data.len() > allowed {
             Some(data.split_off(allowed))
         } else {
@@ -679,7 +938,7 @@ impl VsockShared {
         let take = data.len();
         let mut packet = Packet::control(Op::Rw, host_port, guest_port);
         packet.payload = data;
-        packet.buf_alloc = credit::BUF_ALLOC;
+        packet.buf_alloc = window;
         packet.fwd_cnt = fwd_cnt;
         inner.outbox.push_back(packet);
         if let Some(conn) = inner.conns.get_mut(&key) {
@@ -906,7 +1165,7 @@ impl VsockShared {
             let allowed = conn.credit.available() as usize;
             // Also bounded by the outbox, or a fast host writer against a slow
             // guest would grow it without limit.
-            let room = OUTBOX_LIMIT.saturating_sub(inner.outbox.len());
+            let room = inner.outbox.room(key);
 
             if allowed == 0 || room == 0 {
                 // Out of credit. What frees it is the guest receiving what is
@@ -927,6 +1186,7 @@ impl VsockShared {
             // most of what a packet cost.
             let (host_port, guest_port) = key;
             let fwd_cnt = conn.credit.fwd_cnt();
+            let window = conn.window;
             let mut allowed = allowed;
             let mut room = room;
             while allowed > 0 && room > 0 && offset < data.len() {
@@ -941,7 +1201,7 @@ impl VsockShared {
                 };
                 payload.extend_from_slice(&data[offset..offset + take]);
                 packet.payload = payload;
-                packet.buf_alloc = credit::BUF_ALLOC;
+                packet.buf_alloc = window;
                 packet.fwd_cnt = fwd_cnt;
                 inner.outbox.push_back(packet);
                 if let Some(conn) = inner.conns.get_mut(&key) {
@@ -965,13 +1225,18 @@ impl VsockShared {
     /// matters. Sending a full close here instead loses the reply.
     pub fn shutdown_write(&self, key: ConnKey) {
         let mut inner = self.lock();
-        if inner.conns.get(&key).is_none_or(|c| c.guest_receive_closed) {
+        let Some(window) = inner
+            .conns
+            .get(&key)
+            .filter(|c| !c.guest_receive_closed)
+            .map(|c| c.window)
+        else {
             return;
-        }
+        };
         let (host_port, guest_port) = key;
         let mut packet = Packet::control(Op::Shutdown, host_port, guest_port);
         packet.flags = shutdown::SEND;
-        packet.buf_alloc = credit::BUF_ALLOC;
+        packet.buf_alloc = window;
         inner.outbox.push_back(packet);
         drop(inner);
 
@@ -980,22 +1245,32 @@ impl VsockShared {
     }
 
     /// Closes our end, telling the guest we will write no more.
+    ///
+    /// The host socket is shut both ways, so nothing the guest has sent and
+    /// we have not written can be delivered any more: it is dropped here,
+    /// and whatever the guest sends until it hears is dropped on arrival.
+    /// Queued chains go back to the guest now — a writer's batch in flight is
+    /// returned by the writer — rather than when the guest's reset arrives,
+    /// because that reset needs a free chain of its own (#84).
     pub fn shutdown(&self, key: ConnKey) {
         let mut inner = self.lock();
-        if !inner.conns.contains_key(&key) {
+        let Some(conn) = inner.conns.get_mut(&key) else {
             return;
-        }
-        let (host_port, guest_port) = key;
-        let mut packet = Packet::control(Op::Shutdown, host_port, guest_port);
+        };
+        let mut packet = Packet::control(Op::Shutdown, key.0, key.1);
         packet.flags = shutdown::BOTH;
-        packet.buf_alloc = credit::BUF_ALLOC;
-        inner.outbox.push_back(packet);
-        if let Some(conn) = inner.conns.get_mut(&key) {
+        packet.buf_alloc = conn.window;
+        packet.fwd_cnt = conn.credit.fwd_cnt();
+        if conn.state != State::Closed {
             conn.state = State::Closed;
-            if let Some(socket) = &conn.socket {
-                socket.close();
-            }
+            conn.since = std::time::Instant::now();
         }
+        if let Some(socket) = &conn.socket {
+            socket.close();
+        }
+        let dropped = std::mem::take(&mut conn.outbound);
+        inner.outbox.push_back(packet);
+        Vsock::discard(&mut inner, dropped);
         drop(inner);
         self.progressed();
         self.wake();
@@ -1042,11 +1317,16 @@ impl VsockShared {
                 }
             }
         };
+        let (ring_limit, share) = inner.tx_limits();
         let mut lines = vec![format!(
-            "vsock queues held={} completed={:?} outbox={}",
+            "vsock queues held={} of {} (limit {ring_limit}, share {share}) completed={:?} outbox={} windows={} KiB of {} warden={:?}",
             inner.held,
+            inner.tx_ring,
             inner.done,
-            inner.outbox.len()
+            inner.outbox.len(),
+            inner.budget.granted() >> 10,
+            credit::BUDGET >> 10,
+            inner.warden,
         )];
         lines.extend(inner
             .conns
@@ -1055,9 +1335,12 @@ impl VsockShared {
                 let (pba, pfwd, tx, fwd) = conn.credit.counters();
                 let outbound: usize = conn.outbound.iter().map(|c| c.len()).sum();
                 format!(
-                    "vsock {:?} state={:?} received={} fwd={} unreported={} guest_inflight={} outbound={}/{} to_guest_avail={} tx={} peer_fwd={} peer_buf={} outbox={} done={}",
+                    "vsock {:?} {} state={:?} held={} window={} received={} fwd={} unreported={} guest_inflight={} outbound={}/{} to_guest_avail={} tx={} peer_fwd={} peer_buf={} outbox={} done={}",
                     key,
+                    conn.label.as_deref().unwrap_or("-"),
                     conn.state,
+                    conn.held,
+                    conn.window,
                     conn.received,
                     fwd,
                     conn.unreported,
@@ -1084,6 +1367,9 @@ impl VsockShared {
             return;
         };
         conn.credit.consumed(bytes);
+        if bytes > 0 {
+            conn.drained = std::time::Instant::now();
+        }
         if conn.guest_done && conn.guest_receive_closed && conn.received == conn.credit.fwd_cnt() {
             Vsock::finish_shutdown(&mut inner, key);
             drop(inner);
@@ -1110,16 +1396,23 @@ impl VsockShared {
         static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let eager =
             *EAGER.get_or_init(|| std::env::var("LIGHTER_CREDIT_EAGER").is_ok_and(|v| v == "1"));
-        let window = credit::BUF_ALLOC.min(conn.credit.peer_buf_alloc().max(64 << 10));
-        if !eager && conn.unreported < window / 4 {
+        let threshold = conn.window.min(conn.credit.peer_buf_alloc().max(64 << 10));
+        if !eager && conn.unreported < threshold / 4 {
             return;
         }
         conn.unreported = 0;
         let fwd_cnt = conn.credit.fwd_cnt();
+        // A connection draining a quarter of its window at a time is one
+        // whose peer takes what it is given: its window grows back toward a
+        // full one, as far as the budget allows.
+        let window = conn.window;
+        let grown = inner.budget.grow(window);
+        let conn = inner.conns.get_mut(&key).expect("looked up above");
+        conn.window = grown;
 
         let (host_port, guest_port) = key;
         let mut update = Packet::control(Op::CreditUpdate, host_port, guest_port);
-        update.buf_alloc = credit::BUF_ALLOC;
+        update.buf_alloc = grown;
         update.fwd_cnt = fwd_cnt;
         inner.outbox.push_back(update);
         drop(inner);
@@ -1163,7 +1456,178 @@ impl VsockShared {
     pub fn has_pending(&self) -> bool {
         !self.lock().outbox.is_empty()
     }
+
+    /// Gives up on a connection the guest never answered: it is removed and
+    /// the guest told, so an opener that stops waiting leaves nothing behind.
+    pub fn abandon(&self, key: ConnKey) {
+        let mut inner = self.lock();
+        if !inner.remove(key) {
+            return;
+        }
+        let mut rst = Packet::control(Op::Rst, key.0, key.1);
+        rst.buf_alloc = credit::MIN_WINDOW;
+        inner.outbox.push_back(rst);
+        drop(inner);
+        self.progressed();
+        self.wake();
+    }
+
+    /// Names a connection for the warden's log lines: what its host side
+    /// is, in the words a user would recognise ("port 8096").
+    pub fn label(&self, key: ConnKey, label: impl Into<Arc<str>>) {
+        if let Some(conn) = self.lock().conns.get_mut(&key) {
+            conn.label = Some(label.into());
+        }
+    }
+
+    /// What the warden has done since boot.
+    pub fn warden_counts(&self) -> WardenCounts {
+        self.lock().warden.clone()
+    }
+
+    /// Starts the thread that runs [`VsockShared::sweep`] four times a second.
+    pub fn start_warden(self: &Arc<Self>) {
+        let shared = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("vsock-warden".into())
+            .spawn(move || {
+                while let Some(shared) = shared.upgrade() {
+                    shared.sweep(std::time::Instant::now());
+                    drop(shared);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            });
+    }
+
+    /// Ends what nobody else will end, and takes back what nobody uses.
+    ///
+    /// Every rule here is about something shared — the table, the budget,
+    /// the transmit ring — held on behalf of a party whose progress the host
+    /// does not control: a guest that never resets a connection we closed or
+    /// never answers one we opened, a host peer that has stopped reading.
+    /// None of it waits on a packet from the guest to fire, because the
+    /// failure it repairs may be the guest being unable to send one.
+    pub fn sweep(&self, now: std::time::Instant) {
+        let mut inner = self.lock();
+        let mut ended: Vec<(ConnKey, &'static str)> = Vec::new();
+        let mut cut: Vec<(ConnKey, bool)> = Vec::new();
+        for (key, conn) in &inner.conns {
+            let age = now.saturating_duration_since(conn.since);
+            match conn.state {
+                State::Closed if age >= CLOSE_TIMEOUT => ended.push((*key, "closed")),
+                State::Connecting if age >= CONNECT_TIMEOUT => ended.push((*key, "connect")),
+                State::Established if conn.window > credit::MIN_WINDOW => {
+                    let quiet = now.saturating_duration_since(conn.drained);
+                    let buffered = conn.buffered() > 0;
+                    if (buffered && quiet >= STALL_AFTER) || (!buffered && quiet >= IDLE_AFTER) {
+                        cut.push((*key, buffered));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for (key, why) in &ended {
+            let mut rst = Packet::control(Op::Rst, key.0, key.1);
+            rst.buf_alloc = credit::MIN_WINDOW;
+            inner.outbox.push_back(rst);
+            inner.remove(*key);
+            match *why {
+                "closed" => inner.warden.closed_expired += 1,
+                _ => inner.warden.connect_expired += 1,
+            }
+        }
+        for (key, stalled) in &cut {
+            let Some(window) = inner.conns.get(key).map(|c| c.window) else {
+                continue;
+            };
+            let least = inner.budget.shrink(window);
+            let conn = inner.conns.get_mut(key).expect("looked up above");
+            conn.window = least;
+            let mut update = Packet::control(Op::CreditUpdate, key.0, key.1);
+            update.buf_alloc = least;
+            update.fwd_cnt = conn.credit.fwd_cnt();
+            if *stalled {
+                let label = conn.label.clone();
+                inner.warden.stalled += 1;
+                inner.warden.note(format!(
+                    "cut the window of {}, which had stopped taking bytes",
+                    label.as_deref().unwrap_or("a connection")
+                ));
+                tracing::debug!(
+                    ?key,
+                    label = label.as_deref(),
+                    "vsock peer stopped reading; window cut"
+                );
+            }
+            inner.outbox.push_back(update);
+        }
+        // The watchdog. The shares make this unreachable — a chain is held
+        // only below the ring's limit and its connection's share — so a ring
+        // at its limit with nothing returned for seconds is a bug somewhere,
+        // and the machine is not left to it: the connection holding the most
+        // is reset, and says so.
+        let (ring_limit, _) = inner.tx_limits();
+        if inner.held < ring_limit {
+            inner.ring_full_since = None;
+        } else {
+            let since = *inner.ring_full_since.get_or_insert(now);
+            let returned = inner.last_return.max(since);
+            if now.saturating_duration_since(returned) >= WATCHDOG {
+                let worst = inner
+                    .conns
+                    .iter()
+                    .filter(|(_, c)| c.held > 0)
+                    .max_by_key(|(_, c)| (c.held, std::cmp::Reverse(c.drained)))
+                    .map(|(k, c)| (*k, c.held, c.label.clone()));
+                if let Some((key, held, label)) = worst {
+                    let mut rst = Packet::control(Op::Rst, key.0, key.1);
+                    rst.buf_alloc = credit::MIN_WINDOW;
+                    inner.outbox.push_back(rst);
+                    if let Some(conn) = inner.conns.get(&key)
+                        && let Some(socket) = &conn.socket
+                    {
+                        socket.close();
+                    }
+                    inner.remove(key);
+                    inner.warden.resets += 1;
+                    inner.warden.note(format!(
+                        "reset {}",
+                        label.as_deref().unwrap_or("a connection")
+                    ));
+                    inner.ring_full_since = None;
+                    lines.push(format!(
+                        "vsock: {} held {held} of the transmit ring's {} chains for {}s with none returned; reset it",
+                        label.as_deref().unwrap_or("a connection"),
+                        inner.tx_ring,
+                        WATCHDOG.as_secs()
+                    ));
+                }
+            }
+        }
+        let changed = !ended.is_empty() || !cut.is_empty() || !lines.is_empty();
+        drop(inner);
+        for line in lines {
+            tracing::warn!("{line}");
+        }
+        if changed {
+            self.progressed();
+            self.wake();
+        }
+    }
 }
+
+/// A connection with bytes buffered whose host side took none for this
+/// long has a peer that has stopped reading: its window is cut to the
+/// least, so the guest stops sending what nobody is taking. A slow peer
+/// keeps taking something and keeps its window.
+const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+/// And one with nothing buffered and nothing arriving gives its window
+/// back to the budget; it grows again as soon as it carries anything.
+const IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the transmit ring may sit at its limit with no chain returned
+/// before the warden resets the connection holding the most.
+const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The device model.
 pub struct Vsock {
@@ -1196,7 +1660,12 @@ impl Vsock {
 
         match packet.op {
             Op::Response => {
-                if let Some(conn) = inner.conns.get_mut(&key) {
+                // Only a connection still waiting for it: one we closed in
+                // the meantime stays closed, or it would be Established for
+                // good with nothing left to end it.
+                if let Some(conn) = inner.conns.get_mut(&key)
+                    && conn.state == State::Connecting
+                {
                     conn.state = State::Established;
                     tracing::debug!(host_port, guest_port = conn.guest_port, "vsock established");
                 }
@@ -1206,8 +1675,7 @@ impl Vsock {
                 // Refused, or torn down. Either way the connection is over, and
                 // dropping the entry closes the host socket with it. Chains it
                 // still held go back to the guest.
-                if let Some(conn) = inner.conns.remove(&key) {
-                    Vsock::retire(inner, conn);
+                if inner.remove(key) {
                     tracing::debug!(host_port, "vsock reset by guest");
                 }
                 // Running under the transport lock already: the retired
@@ -1254,6 +1722,10 @@ impl Vsock {
                     return;
                 };
 
+                // Closed by us: nothing will write it. See `shutdown`.
+                if conn.state == State::Closed {
+                    return;
+                }
                 // Queued, not written: see `Conn::outbound`. Credit is NOT
                 // advanced here — the bytes are not with the host application
                 // yet, and claiming they are would invite the guest to send
@@ -1268,7 +1740,7 @@ impl Vsock {
                     let guest_port = conn.guest_port;
                     let fwd_cnt = conn.credit.fwd_cnt();
                     let mut update = Packet::control(Op::CreditUpdate, host_port, guest_port);
-                    update.buf_alloc = credit::BUF_ALLOC;
+                    update.buf_alloc = conn.window;
                     update.fwd_cnt = fwd_cnt;
                     inner.outbox.push_back(update);
                 }
@@ -1290,23 +1762,12 @@ impl Vsock {
                     .is_some_and(|listener| listener.send(Accepted { key }).is_ok());
                 match accepted {
                     true => {
-                        let mut conn = Conn {
-                            guest_port: packet.src_port,
-                            state: State::Established,
-                            credit: Credit::new(),
-                            outbound: VecDeque::new(),
-                            guest_done: false,
-                            guest_receive_closed: false,
-                            unreported: 0,
-                            received: 0,
-                            socket: None,
-                            waiters: 0,
-                        };
+                        let conn = inner.insert(key, packet.src_port, State::Established);
                         conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
-                        inner.conns.insert(key, conn);
+                        let window = conn.window;
                         let mut response =
                             Packet::control(Op::Response, host_port, packet.src_port);
-                        response.buf_alloc = credit::BUF_ALLOC;
+                        response.buf_alloc = window;
                         inner.outbox.push_back(response);
                     }
                     false => {
@@ -1325,74 +1786,129 @@ impl Vsock {
 
     /// A graceful close is acknowledged only after writers have delivered all
     /// bytes. An empty queue alone is insufficient: a batch may be in flight.
+    ///
+    /// A connection we closed has nothing left to deliver — its socket is
+    /// shut and its bytes were dropped — so the guest's shutdown ends it
+    /// whatever was acknowledged: waiting for bytes that can no longer be
+    /// written kept every closed stream in the table until its reset.
     fn finish_shutdown(inner: &mut Inner, key: ConnKey) {
         let Some(conn) = inner.conns.get(&key) else {
             return;
         };
-        if !conn.guest_done || !conn.guest_receive_closed || conn.received != conn.credit.fwd_cnt()
-        {
+        let ours_closed = conn.state == State::Closed;
+        let theirs_closed = conn.guest_done && conn.guest_receive_closed;
+        let delivered = conn.received == conn.credit.fwd_cnt();
+        if !ours_closed && !(theirs_closed && delivered) {
             return;
         }
         let mut rst = Packet::control(Op::Rst, key.0, key.1);
-        rst.buf_alloc = credit::BUF_ALLOC;
+        rst.buf_alloc = conn.window;
         rst.fwd_cnt = conn.credit.fwd_cnt();
         inner.outbox.push_back(rst);
-        if let Some(conn) = inner.conns.remove(&key) {
-            Self::retire(inner, conn);
-        }
+        inner.remove(key);
     }
 
-    /// Returns queued chains on teardown. In-flight chains remain owned by
-    /// their writer and are completed there, including after a reset.
-    fn retire(inner: &mut Inner, conn: Conn) {
+    /// Returns queued chains and the window on teardown. In-flight chains
+    /// remain owned by their writer and are completed there, including after
+    /// a reset.
+    fn retire(inner: &mut Inner, mut conn: Conn) {
         if let Some(socket) = &conn.socket {
             socket.close();
         }
-        for chunk in conn.outbound {
-            if let Chunk::Guest { head, .. } = chunk {
-                inner.done.push_back(head);
+        inner.budget.close(conn.window);
+        let queued = std::mem::take(&mut conn.outbound);
+        Vsock::discard(inner, queued);
+    }
+
+    /// Chunks nobody will write: chains back to the guest, buffers back to
+    /// the spares.
+    fn discard(inner: &mut Inner, chunks: VecDeque<Chunk>) {
+        for chunk in chunks {
+            match chunk {
+                Chunk::Guest { head, .. } => inner.done.push_back(head),
+                Chunk::Owned(buf) => {
+                    if buf.capacity() >= MAX_PAYLOAD / 4 && inner.spare.len() < 64 {
+                        inner.spare.push(buf);
+                    }
+                }
             }
         }
     }
 
-    /// An RW packet whose payload stays in the guest: queued as a
-    /// [`Chunk::Guest`] if the connection is there to take it, in which
-    /// case the chain is held until the writer is done with it. Returns
-    /// whether the chain was held.
+    /// An RW packet whose payload is in the guest's transmit buffers.
+    ///
+    /// Held in place as a [`Chunk::Guest`] — the writer reads it where it
+    /// is — while the connection is under its share of the ring and the ring
+    /// under its reserve; copied out otherwise, so the chain goes back at
+    /// once (`TX_SHARE_DIVISOR`). A connection we closed gets nothing: the
+    /// bytes are dropped and the chain returned. Returns whether the chain
+    /// was held.
     fn handle_guest_rw(
         inner: &mut Inner,
         packet: &Packet,
         head: u16,
         spans: Vec<(u64, usize)>,
+        mem: &GuestMemory,
     ) -> bool {
         let key: ConnKey = (packet.dst_port, packet.src_port);
-        match inner.conns.get_mut(&key) {
-            Some(conn) => {
-                conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
-                let len: usize = spans.iter().map(|s| s.1).sum();
-                conn.received = conn.received.wrapping_add(len as u32);
-                conn.outbound.push_back(Chunk::Guest { head, spans });
-                inner.held += 1;
-                true
+        let (ring_limit, share) = inner.tx_limits();
+        let ring_held = inner.held;
+        let Some(conn) = inner.conns.get_mut(&key) else {
+            let mut rst = Packet::control(Op::Rst, packet.dst_port, packet.src_port);
+            rst.buf_alloc = credit::BUF_ALLOC;
+            inner.outbox.push_back(rst);
+            return false;
+        };
+        conn.credit.observe(packet.buf_alloc, packet.fwd_cnt);
+        if conn.state == State::Closed {
+            return false;
+        }
+        let len: usize = spans.iter().map(|s| s.1).sum();
+        conn.received = conn.received.wrapping_add(len as u32);
+        if conn.buffered() as usize == len {
+            // It had nothing waiting: whatever happens next is timed from here.
+            conn.drained = std::time::Instant::now();
+        }
+        // `LIGHTER_VSOCK_COPY=1` copies every payload, for measuring what
+        // holding them in place is worth.
+        static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let copy_all =
+            *COPY.get_or_init(|| std::env::var("LIGHTER_VSOCK_COPY").is_ok_and(|v| v == "1"));
+        if !copy_all && conn.held < share && ring_held < ring_limit {
+            conn.outbound.push_back(Chunk::Guest { head, spans });
+            conn.held += 1;
+            inner.held += 1;
+            let id = conn.id;
+            inner.holders.insert(head, (key, id));
+            return true;
+        }
+        let mut copy = match inner.spare.pop() {
+            Some(mut buf) => {
+                buf.clear();
+                buf
             }
-            None => {
-                let mut rst = Packet::control(Op::Rst, packet.dst_port, packet.src_port);
-                rst.buf_alloc = credit::BUF_ALLOC;
-                inner.outbox.push_back(rst);
-                false
+            None => Vec::with_capacity(MAX_PAYLOAD),
+        };
+        for (gpa, n) in &spans {
+            let start = copy.len();
+            copy.resize(start + n, 0);
+            if mem.read(*gpa, &mut copy[start..]).is_err() {
+                copy.truncate(start);
             }
         }
+        if let Some(conn) = inner.conns.get_mut(&key) {
+            conn.outbound.push_back(Chunk::Owned(copy));
+        }
+        false
     }
 
     /// Returns the chains a writer has finished with to the guest.
     fn complete_done(inner: &mut Inner, queue: &mut Virtqueue, mem: &GuestMemory) -> bool {
-        let mut any = false;
-        while let Some(head) = inner.done.pop_front() {
+        let heads = inner.finish_done();
+        for &head in &heads {
             queue.push_used(mem, head, 0);
-            inner.held = inner.held.saturating_sub(1);
-            any = true;
         }
-        any
+        !heads.is_empty()
     }
 
     /// Reads packets the guest has queued for us.
@@ -1492,6 +2008,7 @@ impl Vsock {
         }
 
         let mut inner = self.shared.lock();
+        inner.tx_ring = usize::from(queue.size());
         // Whether any packet landed on a connection with a thread blocked
         // on it, looked up before the packet is handled: a reset removes
         // the connection, and its waiter is exactly who must hear.
@@ -1501,7 +2018,7 @@ impl Vsock {
             blocked |= inner.conns.get(&key).is_some_and(|conn| conn.waiters > 0);
             match guest {
                 Some((head, spans)) => {
-                    if !Vsock::handle_guest_rw(&mut inner, &packet, head, spans) {
+                    if !Vsock::handle_guest_rw(&mut inner, &packet, head, spans, mem) {
                         queue.push_used(mem, head, 0);
                         used_any = true;
                     }
@@ -2243,9 +2760,21 @@ mod tests {
         let (shared, key, _peer) = shared_with_connection();
         shared.establish_for_test(key, 4096);
         let packet = Packet::control(Op::Rw, key.1, key.0);
-        Vsock::handle_guest_rw(&mut shared.lock(), &packet, 11, vec![(0x4000, 4)]);
+        Vsock::handle_guest_rw(
+            &mut shared.lock(),
+            &packet,
+            11,
+            vec![(0x4000, 4)],
+            &GuestMemory::detached(),
+        );
         let in_flight = shared.take_outbound(key).unwrap();
-        Vsock::handle_guest_rw(&mut shared.lock(), &packet, 12, vec![(0x5000, 4)]);
+        Vsock::handle_guest_rw(
+            &mut shared.lock(),
+            &packet,
+            12,
+            vec![(0x5000, 4)],
+            &GuestMemory::detached(),
+        );
         Vsock::handle(&mut shared.lock(), Packet::control(Op::Rst, key.1, key.0));
         assert_eq!(shared.lock().done.iter().copied().collect::<Vec<_>>(), [12]);
         shared.complete(in_flight.into_iter().filter_map(|chunk| match chunk {
@@ -2467,5 +2996,645 @@ mod tests {
 
         assert_eq!(delivered.len(), 10_000, "no bytes may be lost in the split");
         assert!(delivered.iter().all(|&b| b == 0xab));
+    }
+
+    /// The rules that keep one connection from holding what every
+    /// connection shares (#84). Guest memory here is real anonymous memory,
+    /// so a copied-out payload is checked byte for byte.
+    mod shares {
+        use super::*;
+
+        const BASE: u64 = 0x1000_0000;
+        const SLOT: usize = 16 * 1024;
+
+        /// A device state with one established connection and a ring of 256,
+        /// and memory holding 512 TLS-sized payloads, each byte its slot.
+        fn setup() -> (Arc<VsockShared>, ConnKey, GuestMemory, UnixStream) {
+            let (shared, key, peer) = shared_with_connection();
+            let mem = GuestMemory::test_region(BASE, 512 * SLOT);
+            for i in 0..512u64 {
+                mem.write(BASE + i * SLOT as u64, &vec![i as u8; SLOT])
+                    .unwrap();
+            }
+            let mut inner = shared.lock();
+            Vsock::handle(&mut inner, Packet::control(Op::Response, key.1, key.0));
+            inner.tx_ring = 256;
+            inner.outbox.clear();
+            drop(inner);
+            (shared, key, mem, peer)
+        }
+
+        /// The guest sends payload `i` of `key` on chain `head`.
+        fn send(shared: &VsockShared, key: ConnKey, mem: &GuestMemory, head: u16, i: u64) -> bool {
+            let packet = Packet::control(Op::Rw, key.1, key.0);
+            let spans = vec![(BASE + i * SLOT as u64, SLOT)];
+            Vsock::handle_guest_rw(&mut shared.lock(), &packet, head, spans, mem)
+        }
+
+        fn bytes(chunk: &Chunk, mem: &GuestMemory) -> Vec<u8> {
+            match chunk {
+                Chunk::Owned(v) => v.clone(),
+                Chunk::Guest { spans, .. } => {
+                    let mut v = Vec::new();
+                    for (gpa, n) in spans {
+                        let start = v.len();
+                        v.resize(start + n, 0);
+                        mem.read(*gpa, &mut v[start..]).unwrap();
+                    }
+                    v
+                }
+            }
+        }
+
+        /// The recreation, at the device: 4 MiB of credit in 16 KiB writes is
+        /// the whole ring, and a peer that never reads held all of it. Now the
+        /// connection holds its share and the rest is copied, intact and in
+        /// order, with every other chain back with the guest at once.
+        #[test]
+        fn a_stream_whose_peer_never_reads_holds_only_its_share() {
+            let (shared, key, mem, _peer) = setup();
+            let held: usize = (0..256u16)
+                .filter(|&i| send(&shared, key, &mem, i, u64::from(i)))
+                .count();
+            let inner = shared.lock();
+            assert_eq!(
+                held,
+                256 / TX_SHARE_DIVISOR,
+                "the share, and not one chain more"
+            );
+            assert_eq!(inner.held, held);
+            assert_eq!(inner.conns[&key].held, held);
+            let queued: Vec<Vec<u8>> = inner.conns[&key]
+                .outbound
+                .iter()
+                .map(|c| bytes(c, &mem))
+                .collect();
+            assert_eq!(queued.len(), 256);
+            for (i, payload) in queued.iter().enumerate() {
+                assert_eq!(
+                    payload,
+                    &vec![i as u8; SLOT],
+                    "payload {i} intact and in order"
+                );
+            }
+        }
+
+        #[test]
+        fn the_last_quarter_of_the_ring_is_never_held_whatever_the_connections() {
+            let (shared, first, mem, _peer) = setup();
+            let mut keys = vec![first];
+            for _ in 0..15 {
+                let (ours, _theirs) = UnixStream::pair().unwrap();
+                let key = shared.open(2377, ours);
+                Vsock::handle(
+                    &mut shared.lock(),
+                    Packet::control(Op::Response, key.1, key.0),
+                );
+                keys.push(key);
+            }
+            let mut head = 0u16;
+            for round in 0..32u64 {
+                for key in &keys {
+                    send(&shared, *key, &mem, head, round);
+                    head += 1;
+                }
+            }
+            let inner = shared.lock();
+            let (limit, _) = inner.tx_limits();
+            assert_eq!(limit, 192);
+            assert_eq!(
+                inner.held, limit,
+                "sixteen connections, each under its share, stop at the reserve"
+            );
+        }
+
+        #[test]
+        fn chains_count_back_against_their_connection_as_they_return() {
+            let (shared, key, mem, _peer) = setup();
+            let share = shared.lock().tx_limits().1 as u16;
+            for i in 0..share {
+                assert!(send(&shared, key, &mem, i, u64::from(i)));
+            }
+            assert!(
+                !send(&shared, key, &mem, share, u64::from(share)),
+                "at its share"
+            );
+            let taken = shared.take_outbound(key).unwrap();
+            shared.complete(taken.iter().filter_map(|c| match c {
+                Chunk::Guest { head, .. } => Some(*head),
+                Chunk::Owned(_) => None,
+            }));
+            let mut inner = shared.lock();
+            assert_eq!(inner.finish_done().len(), usize::from(share));
+            assert_eq!(inner.conns[&key].held, 0);
+            drop(inner);
+            assert!(
+                send(&shared, key, &mem, share + 1, 0),
+                "held again once its chains are back"
+            );
+        }
+
+        /// What a closed stream sent before it was closed, and what it sends
+        /// until the guest hears, is nobody's: its chains go back at once.
+        #[test]
+        fn closing_returns_every_queued_chain_and_drops_what_arrives_after() {
+            let (shared, key, mem, _peer) = setup();
+            for i in 0..32u16 {
+                assert!(send(&shared, key, &mem, i, u64::from(i)));
+            }
+            shared.shutdown(key);
+            {
+                let inner = shared.lock();
+                assert_eq!(
+                    inner.done.len(),
+                    32,
+                    "every queued chain is on its way back"
+                );
+                assert!(inner.conns[&key].outbound.is_empty());
+                assert!(inner.outbox.iter().any(|p| p.op == Op::Shutdown));
+            }
+            assert!(
+                !send(&shared, key, &mem, 40, 40),
+                "data after the close is not held"
+            );
+            assert!(shared.lock().conns[&key].outbound.is_empty(), "nor queued");
+        }
+
+        #[test]
+        fn the_guests_shutdown_ends_a_connection_we_closed_whatever_was_acknowledged() {
+            let (shared, key, mem, _peer) = setup();
+            send(&shared, key, &mem, 0, 0);
+            shared.shutdown(key);
+            let mut reply = Packet::control(Op::Shutdown, key.1, key.0);
+            reply.flags = shutdown::BOTH;
+            Vsock::handle(&mut shared.lock(), reply);
+            let inner = shared.lock();
+            assert!(!inner.conns.contains_key(&key));
+            assert!(
+                inner.outbox.iter().any(|p| p.op == Op::Rst),
+                "and the guest is told"
+            );
+        }
+
+        #[test]
+        fn a_closed_connection_the_guest_never_resets_is_removed_after_the_timeout() {
+            let (shared, key, _mem, _peer) = setup();
+            shared.shutdown(key);
+            let closed = shared.lock().conns[&key].since;
+            shared.sweep(closed + CLOSE_TIMEOUT - std::time::Duration::from_millis(1));
+            assert!(shared.lock().conns.contains_key(&key));
+            shared.sweep(closed + CLOSE_TIMEOUT);
+            let inner = shared.lock();
+            assert!(!inner.conns.contains_key(&key));
+            assert!(
+                inner
+                    .outbox
+                    .iter()
+                    .any(|p| p.op == Op::Rst && p.src_port == key.0)
+            );
+            assert_eq!(inner.warden.closed_expired, 1);
+        }
+
+        #[test]
+        fn an_unanswered_open_is_removed_by_its_opener_or_by_the_warden() {
+            let shared = Arc::new(VsockShared::new());
+            let (a, _ta) = UnixStream::pair().unwrap();
+            let (b, _tb) = UnixStream::pair().unwrap();
+            let abandoned = shared.open(2378, a);
+            let forgotten = shared.open(2378, b);
+            shared.abandon(abandoned);
+            assert!(!shared.lock().conns.contains_key(&abandoned));
+            let opened = shared.lock().conns[&forgotten].since;
+            shared.sweep(opened + CONNECT_TIMEOUT);
+            assert!(!shared.lock().conns.contains_key(&forgotten));
+            assert_eq!(shared.warden_counts().connect_expired, 1);
+            assert_eq!(
+                shared.lock().budget.granted(),
+                0,
+                "both windows back in the budget"
+            );
+        }
+
+        /// An opener that closes before the guest answers: the answer does not
+        /// bring it back, and the warden removes it.
+        #[test]
+        fn a_late_answer_does_not_reopen_a_closed_connection() {
+            let shared = Arc::new(VsockShared::new());
+            let (ours, _theirs) = UnixStream::pair().unwrap();
+            let key = shared.open(2378, ours);
+            shared.shutdown(key);
+            Vsock::handle(
+                &mut shared.lock(),
+                Packet::control(Op::Response, key.1, key.0),
+            );
+            assert_eq!(shared.status(key), Status::Gone);
+            let closed = shared.lock().conns[&key].since;
+            shared.sweep(closed + CLOSE_TIMEOUT);
+            assert!(!shared.lock().conns.contains_key(&key));
+        }
+
+        /// A peer that has stopped reading loses its window, so the guest
+        /// stops sending into memory nobody empties; once it reads again the
+        /// window grows back by doubling.
+        #[test]
+        fn a_stalled_peers_window_is_cut_and_grows_back_when_it_reads() {
+            let (shared, key, mem, _peer) = setup();
+            send(&shared, key, &mem, 0, 0);
+            let start = shared.lock().conns[&key].drained;
+            shared.sweep(start + STALL_AFTER - std::time::Duration::from_millis(1));
+            assert_eq!(
+                shared.lock().conns[&key].window,
+                credit::BUF_ALLOC,
+                "slow is not stalled"
+            );
+            shared.sweep(start + STALL_AFTER);
+            {
+                let inner = shared.lock();
+                assert_eq!(inner.conns[&key].window, credit::MIN_WINDOW);
+                let update = inner
+                    .outbox
+                    .iter()
+                    .rev()
+                    .find(|p| p.op == Op::CreditUpdate)
+                    .unwrap();
+                assert_eq!(
+                    update.buf_alloc,
+                    credit::MIN_WINDOW,
+                    "and the guest is told"
+                );
+                assert_eq!(inner.warden.stalled, 1);
+            }
+            shared.acknowledge(key, SLOT as u32);
+            assert_eq!(shared.lock().conns[&key].window, 2 * credit::MIN_WINDOW);
+        }
+
+        #[test]
+        fn an_idle_connection_gives_its_window_back() {
+            let (shared, key, _mem, _peer) = setup();
+            let start = shared.lock().conns[&key].drained;
+            shared.sweep(start + IDLE_AFTER);
+            let inner = shared.lock();
+            assert_eq!(inner.conns[&key].window, credit::MIN_WINDOW);
+            assert_eq!(inner.budget.granted(), u64::from(credit::MIN_WINDOW));
+            assert_eq!(inner.warden.stalled, 0, "idle is not stalled");
+        }
+
+        /// A full stream lane neither delays nor refuses the control plane,
+        /// and each connection's packets keep their order.
+        #[test]
+        fn the_control_plane_overtakes_a_full_stream_lane_in_order() {
+            let mut outbox = Outbox::default();
+            let stream: ConnKey = (FIRST_EPHEMERAL_PORT, 2378);
+            let docker: ConnKey = (FIRST_EPHEMERAL_PORT + 1, 2375);
+            for i in 0..OUTBOX_LIMIT {
+                let mut p = Packet::control(Op::Rw, stream.0, stream.1);
+                p.fwd_cnt = i as u32;
+                outbox.push_back(p);
+            }
+            assert_eq!(outbox.room(stream), 0);
+            assert_eq!(
+                outbox.room(docker),
+                OUTBOX_LIMIT,
+                "the stream's backlog is not the control plane's"
+            );
+            for i in 0..3 {
+                let mut p = Packet::control(Op::Rw, docker.0, docker.1);
+                p.fwd_cnt = i;
+                outbox.push_back(p);
+            }
+            let mut dns = Packet::control(Op::Rw, 2379, 1_994_936_000);
+            dns.fwd_cnt = 99;
+            outbox.push_back(dns);
+            let first: Vec<(u32, u32)> = (0..4)
+                .map(|_| outbox.pop_front().map(|p| (p.dst_port, p.fwd_cnt)).unwrap())
+                .collect();
+            assert_eq!(
+                first,
+                [(2375, 0), (2375, 1), (2375, 2), (1_994_936_000, 99)]
+            );
+            let rest: Vec<u32> = std::iter::from_fn(|| outbox.pop_front())
+                .map(|p| p.fwd_cnt)
+                .collect();
+            assert_eq!(
+                rest,
+                (0..OUTBOX_LIMIT as u32).collect::<Vec<_>>(),
+                "the stream's own order is kept"
+            );
+        }
+
+        /// Unreachable through the device's own rules, and so a bug if it
+        /// happens: the warden does not leave the machine to it.
+        #[test]
+        fn a_ring_at_its_limit_with_nothing_returned_is_unblocked_by_the_watchdog() {
+            let (shared, key, _mem, _peer) = setup();
+            shared.label(key, "a client of port 8096");
+            let now = std::time::Instant::now();
+            {
+                let mut inner = shared.lock();
+                let (limit, _) = inner.tx_limits();
+                inner.held = limit;
+                inner.conns.get_mut(&key).unwrap().held = limit;
+                inner.last_return = now;
+            }
+            shared.sweep(now);
+            shared.sweep(now + WATCHDOG - std::time::Duration::from_millis(1));
+            assert!(shared.lock().conns.contains_key(&key));
+            shared.sweep(now + WATCHDOG);
+            let inner = shared.lock();
+            assert!(
+                !inner.conns.contains_key(&key),
+                "the connection holding the ring is reset"
+            );
+            assert_eq!(inner.warden.resets, 1);
+        }
+    }
+
+    /// A guest and its host peers, played at random against the device's own
+    /// code (#84). The guest sends what its credit allows, in pieces of every
+    /// size, on a real 256-entry ring; each Mac-side peer is fast, slow,
+    /// stalled or one that resets; the warden is swept with its clock pushed
+    /// ahead, so windows are cut far more often than they would be. What
+    /// must hold at every step, for every seed: no connection holds more
+    /// than its share and the ring never more than its limit; the Docker
+    /// connection can always send and is always served; every byte a
+    /// surviving connection sent arrives once, in order; and once everything
+    /// is closed, every chain, window and table entry is back.
+    mod simulation {
+        use super::*;
+
+        const BASE: u64 = 0x2000_0000;
+        const SLOT: usize = 256 * 1024;
+        const RING: usize = 256;
+        const SIZES: [usize; 6] = [4096, 8192, 16384, 16413, 65536, 262144];
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Peer {
+            Fast,
+            Slow,
+            Stalled,
+            Resets,
+        }
+
+        struct Stream {
+            key: ConnKey,
+            peer: Peer,
+            /// The guest's side: bytes sent, and the host's window and
+            /// consumed count as the guest last heard them.
+            sent: u32,
+            peer_fwd: u32,
+            peer_buf: u32,
+            /// The guest has heard the host close it.
+            heard_close: bool,
+            /// The host's side: bytes taken from the device, in order.
+            delivered: u32,
+            closed_by_host: bool,
+            reset_at: usize,
+        }
+
+        /// The bytes a stream carries from `offset`: each its offset modulo
+        /// 251, so a byte out of place or repeated shows.
+        fn pattern(offset: u32, len: usize) -> &'static [u8] {
+            static PATTERN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+            let all = PATTERN.get_or_init(|| (0..SLOT + 251).map(|i| (i % 251) as u8).collect());
+            &all[(offset % 251) as usize..][..len]
+        }
+
+        /// What the guest hears: every packet the host queued, in order.
+        fn guest_hears(shared: &VsockShared, streams: &mut [Stream]) {
+            let mut inner = shared.lock();
+            while let Some(p) = inner.outbox.pop_front() {
+                if let Some(s) = streams
+                    .iter_mut()
+                    .find(|s| (s.key.0, s.key.1) == (p.src_port, p.dst_port))
+                {
+                    s.peer_fwd = p.fwd_cnt;
+                    s.peer_buf = p.buf_alloc;
+                    if matches!(p.op, Op::Shutdown | Op::Rst) {
+                        s.heard_close = true;
+                    }
+                }
+            }
+        }
+
+        /// The host's side of one stream: takes what the device holds for
+        /// it, checks every byte, and gives the chains and the credit back.
+        fn host_takes(shared: &VsockShared, mem: &GuestMemory, s: &mut Stream) {
+            let Outbound::Chunks(chunks) = shared.try_take_outbound(s.key) else {
+                return;
+            };
+            let mut bytes = 0u32;
+            let mut read = Vec::with_capacity(SLOT);
+            for chunk in &chunks {
+                let data: &[u8] = match chunk {
+                    Chunk::Owned(v) => v,
+                    Chunk::Guest { spans, .. } => {
+                        read.clear();
+                        for (gpa, n) in spans {
+                            let at = read.len();
+                            read.resize(at + n, 0);
+                            mem.read(*gpa, &mut read[at..]).unwrap();
+                        }
+                        &read
+                    }
+                };
+                assert!(
+                    data == pattern(s.delivered, data.len()),
+                    "{:?}: the bytes from {} are out of order or corrupt",
+                    s.key,
+                    s.delivered
+                );
+                s.delivered = s.delivered.wrapping_add(data.len() as u32);
+                bytes += data.len() as u32;
+            }
+            shared.complete(chunks.iter().filter_map(|c| match c {
+                Chunk::Guest { head, .. } => Some(*head),
+                Chunk::Owned(_) => None,
+            }));
+            shared.recycle(chunks);
+            shared.acknowledge(s.key, bytes);
+        }
+
+        fn run(seed: u64, steps: usize) {
+            let mut rng = Rng(seed);
+            let shared = Arc::new(VsockShared::new());
+            let mem = GuestMemory::test_region(BASE, RING * SLOT);
+            let mut sockets = Vec::new();
+            let mut streams = Vec::new();
+            let peers = [Peer::Fast, Peer::Slow, Peer::Stalled, Peer::Resets];
+            for i in 0..8 {
+                let (ours, theirs) = UnixStream::pair().unwrap();
+                sockets.push(theirs);
+                let key = shared.open(if i == 0 { 2375 } else { 2378 }, ours);
+                shared.establish_for_test(key, 8 << 20);
+                let peer = if i == 0 {
+                    Peer::Fast
+                } else {
+                    peers[rng.below(4) as usize]
+                };
+                streams.push(Stream {
+                    key,
+                    peer,
+                    sent: 0,
+                    peer_fwd: 0,
+                    peer_buf: 0,
+                    heard_close: false,
+                    delivered: 0,
+                    closed_by_host: false,
+                    reset_at: 200 + rng.below(steps as u64) as usize,
+                });
+            }
+            shared.lock().tx_ring = RING;
+            guest_hears(&shared, &mut streams);
+            let mut free: Vec<u16> = (0..RING as u16).collect();
+            let (limit, share) = shared.lock().tx_limits();
+            let mut warden_clock = std::time::Instant::now();
+
+            for step in 0..steps {
+                // The guest sends a few packets on streams with credit.
+                for _ in 0..4 {
+                    let i = rng.below(streams.len() as u64) as usize;
+                    let docker = i == 0 && step % 16 == 0;
+                    let s = &mut streams[i];
+                    if s.heard_close {
+                        continue;
+                    }
+                    let in_flight = s.sent.wrapping_sub(s.peer_fwd);
+                    let credit = s.peer_buf.saturating_sub(in_flight) as usize;
+                    let want = SIZES[rng.below(SIZES.len() as u64) as usize];
+                    let len = want.min(credit);
+                    if len == 0 {
+                        continue;
+                    }
+                    let Some(head) = free.pop() else {
+                        panic!("seed {seed} step {step}: the guest found the whole ring held");
+                    };
+                    let at = BASE + u64::from(head) * SLOT as u64;
+                    mem.write(at, pattern(s.sent, len)).unwrap();
+                    let mut packet = Packet::control(Op::Rw, s.key.1, s.key.0);
+                    packet.buf_alloc = 8 << 20;
+                    let held = Vsock::handle_guest_rw(
+                        &mut shared.lock(),
+                        &packet,
+                        head,
+                        vec![(at, len)],
+                        &mem,
+                    );
+                    if !held {
+                        free.push(head);
+                    }
+                    s.sent = s.sent.wrapping_add(len as u32);
+                    let _ = docker;
+                }
+
+                // Each host peer, as it behaves.
+                for s in streams.iter_mut() {
+                    if s.closed_by_host {
+                        continue;
+                    }
+                    if s.peer == Peer::Resets && step >= s.reset_at {
+                        shared.shutdown(s.key);
+                        s.closed_by_host = true;
+                        continue;
+                    }
+                    let takes = match s.peer {
+                        Peer::Fast | Peer::Resets => true,
+                        Peer::Slow => rng.below(8) == 0,
+                        Peer::Stalled => false,
+                    };
+                    if takes {
+                        host_takes(&shared, &mem, s);
+                    }
+                }
+
+                // The transport returns finished chains; the guest hears.
+                free.extend(shared.lock().finish_done());
+                guest_hears(&shared, &mut streams);
+                if step % 50 == 49 {
+                    warden_clock += STALL_AFTER;
+                    shared.sweep(warden_clock);
+                    free.extend(shared.lock().finish_done());
+                    guest_hears(&shared, &mut streams);
+                }
+
+                // What must hold.
+                let inner = shared.lock();
+                assert!(
+                    inner.held <= limit,
+                    "seed {seed} step {step}: {} held, limit {limit}",
+                    inner.held
+                );
+                for (key, conn) in &inner.conns {
+                    assert!(
+                        conn.held <= share,
+                        "seed {seed} step {step}: {key:?} holds {}",
+                        conn.held
+                    );
+                }
+                assert_eq!(
+                    free.len() + inner.held,
+                    RING,
+                    "seed {seed} step {step}: chains lost"
+                );
+                assert!(
+                    free.len() >= RING - limit,
+                    "seed {seed} step {step}: the reserve was taken"
+                );
+                drop(inner);
+                let docker = &streams[0];
+                assert_eq!(
+                    docker.delivered, docker.sent,
+                    "seed {seed} step {step}: the Docker connection is waiting"
+                );
+            }
+
+            // Everything closes: the host the rest, the guest resetting only
+            // some, the warden ending the others after its timeout.
+            for s in streams.iter_mut().filter(|s| !s.closed_by_host) {
+                shared.shutdown(s.key);
+                s.closed_by_host = true;
+            }
+            for s in &streams {
+                if rng.below(2) == 0 {
+                    Vsock::handle(
+                        &mut shared.lock(),
+                        Packet::control(Op::Rst, s.key.1, s.key.0),
+                    );
+                }
+            }
+            shared.sweep(
+                std::time::Instant::now() + CLOSE_TIMEOUT + std::time::Duration::from_secs(1),
+            );
+            free.extend(shared.lock().finish_done());
+            let inner = shared.lock();
+            assert!(
+                inner.conns.is_empty(),
+                "seed {seed}: {} connections left",
+                inner.conns.len()
+            );
+            assert_eq!(inner.held, 0, "seed {seed}");
+            assert_eq!(free.len(), RING, "seed {seed}: every chain back");
+            assert_eq!(inner.budget.granted(), 0, "seed {seed}: every window back");
+            assert!(inner.holders.is_empty(), "seed {seed}");
+        }
+
+        #[test]
+        fn random_peers_never_take_the_ring_or_lose_a_byte() {
+            for seed in 1..=10u64 {
+                run(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, 3000);
+            }
+        }
     }
 }

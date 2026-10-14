@@ -159,13 +159,24 @@ fn serve(
 
     crate::sockbuf::widen(&stream);
     let host_port = shared.open(guest_port, device_side);
+    shared.label(host_port, format!("a client of {}", path_label(guest_port)));
     if !shared.await_established(host_port, ACCEPT_TIMEOUT) {
         tracing::debug!(
             guest_port,
             "the guest did not accept; is the agent running?"
         );
+        shared.abandon(host_port);
         return;
     }
 
     pump(shared, host_port, stream, inspect);
+}
+
+/// What a proxied socket is, for the vsock warden's log lines.
+fn path_label(guest_port: u32) -> &'static str {
+    match guest_port {
+        2375 => "the Docker socket",
+        2376 => "the control socket",
+        _ => "a proxied socket",
+    }
 }
