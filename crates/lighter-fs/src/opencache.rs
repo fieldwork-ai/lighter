@@ -24,12 +24,17 @@
 //! arbitrary slice of it goes. A perfect LRU would cost a lock ordering and a
 //! list write on every read, to make slightly better decisions about which
 //! descriptor to re-open.
+//!
+//! A file on a network volume is an open handle on its server as well, and
+//! the server has only so many, so the cache keeps only that volume's
+//! allowance of them ([`crate::remote`]), whatever room the cache has.
 
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use crate::inode::{OpenDir, OpenFile};
+use crate::remote::Remote;
 
 /// How many of each kind to keep. Sized to be comfortably under the descriptor
 /// limit while still covering the working set of a build: a compiler with a
@@ -39,8 +44,33 @@ const DIR_LIMIT: usize = 512;
 
 #[derive(Default)]
 pub struct OpenCache {
-    files: Mutex<HashMap<u64, Arc<OpenFile>>>,
+    files: Mutex<HashMap<u64, Cached>>,
     dirs: Mutex<HashMap<u64, Arc<OpenDir>>>,
+}
+
+/// A cached file, counted on its network volume while it is in the cache.
+/// The count is kept by construction and drop, so every way an entry
+/// leaves the map, eviction, trimming and replacement alike, uncounts it.
+struct Cached {
+    file: Arc<OpenFile>,
+    remote: Option<Arc<Remote>>,
+}
+
+impl Cached {
+    fn new(file: Arc<OpenFile>, remote: Option<Arc<Remote>>) -> Cached {
+        if let Some(remote) = &remote {
+            remote.cached_file();
+        }
+        Cached { file, remote }
+    }
+}
+
+impl Drop for Cached {
+    fn drop(&mut self) {
+        if let Some(remote) = &self.remote {
+            remote.uncached_file();
+        }
+    }
 }
 
 impl OpenCache {
@@ -52,7 +82,7 @@ impl OpenCache {
     /// enough for what the caller intends.
     pub fn file(&self, nodeid: u64, need_write: bool) -> Option<Arc<OpenFile>> {
         let files = self.files.lock().expect("open cache poisoned");
-        let file = files.get(&nodeid)?;
+        let file = &files.get(&nodeid)?.file;
         // A read-only descriptor cannot serve a write, nor a write-only one a
         // read; the caller replaces it. Reporting a miss is how it finds out.
         let fits = if need_write {
@@ -63,9 +93,34 @@ impl OpenCache {
         fits.then(|| file.clone())
     }
 
-    pub fn put_file(&self, nodeid: u64, file: Arc<OpenFile>) {
+    /// Caches the file `nodeid` has open. `remote` is the network volume
+    /// it is on, if it is on one, whose allowance it is kept to.
+    pub fn put_file(&self, nodeid: u64, file: Arc<OpenFile>, remote: Option<Arc<Remote>>) {
         let mut files = self.files.lock().expect("open cache poisoned");
-        files.insert(nodeid, file);
+        let over = remote.clone();
+        files.insert(nodeid, Cached::new(file, remote));
+        if let Some(remote) = over
+            && remote.files_over() > 0
+        {
+            // A quarter of the allowance besides, so a volume at its
+            // allowance does not pay an eviction on every open.
+            let excess = remote.files_over() + remote.file_allowance() / 4;
+            let doomed: Vec<u64> = files
+                .iter()
+                .filter(|(key, cached)| {
+                    **key != nodeid
+                        && cached
+                            .remote
+                            .as_ref()
+                            .is_some_and(|other| Arc::ptr_eq(other, &remote))
+                })
+                .map(|(key, _)| *key)
+                .take(excess)
+                .collect();
+            for key in doomed {
+                files.remove(&key);
+            }
+        }
         trim(&mut files, FILE_LIMIT);
     }
 
@@ -120,8 +175,25 @@ impl OpenCache {
     pub fn evict_device(&self, dev: i64) -> usize {
         let mut files = self.files.lock().expect("open cache poisoned");
         let before = files.len();
-        files.retain(|_, file| {
-            crate::sys::stat_fd(file.fd.as_raw_fd()).map_or(true, |st| st.st_dev as i64 != dev)
+        files.retain(|_, cached| {
+            crate::sys::stat_fd(cached.file.fd.as_raw_fd())
+                .map_or(true, |st| st.st_dev as i64 != dev)
+        });
+        before - files.len()
+    }
+
+    /// Drops every file cached on the network volume `dev`, returning how
+    /// many. Unlike [`OpenCache::evict_device`] it asks no descriptor
+    /// anything: the volume's server is out of handles, and each entry says
+    /// which volume it is on.
+    pub fn evict_remote(&self, dev: i64) -> usize {
+        let mut files = self.files.lock().expect("open cache poisoned");
+        let before = files.len();
+        files.retain(|_, cached| {
+            cached
+                .remote
+                .as_ref()
+                .is_none_or(|remote| remote.dev() != dev)
         });
         before - files.len()
     }
@@ -171,7 +243,7 @@ mod tests {
     #[test]
     fn a_cached_descriptor_comes_back() {
         let cache = OpenCache::new();
-        cache.put_file(7, file(true));
+        cache.put_file(7, file(true), None);
         assert!(cache.file(7, false).is_some());
         assert!(cache.file(8, false).is_none());
     }
@@ -182,7 +254,7 @@ mod tests {
     #[test]
     fn a_read_only_descriptor_is_a_miss_for_a_write() {
         let cache = OpenCache::new();
-        cache.put_file(7, file(false));
+        cache.put_file(7, file(false), None);
         assert!(cache.file(7, false).is_some());
         assert!(cache.file(7, true).is_none());
     }
@@ -190,7 +262,7 @@ mod tests {
     #[test]
     fn eviction_removes_what_it_is_asked_to() {
         let cache = OpenCache::new();
-        cache.put_file(7, file(true));
+        cache.put_file(7, file(true), None);
         cache.evict(7);
         assert!(cache.file(7, false).is_none());
         assert!(cache.is_empty());
@@ -202,7 +274,7 @@ mod tests {
     fn the_cache_stays_under_its_limit() {
         let cache = OpenCache::new();
         for nodeid in 0..(FILE_LIMIT as u64 * 2) {
-            cache.put_file(nodeid, file(true));
+            cache.put_file(nodeid, file(true), None);
         }
         assert!(
             cache.len() <= FILE_LIMIT,
@@ -211,11 +283,38 @@ mod tests {
         );
     }
 
+    /// A network volume's files are kept to its allowance however much room
+    /// the cache has, and counted out however they leave.
+    #[test]
+    fn a_network_volume_keeps_only_its_allowance_of_files() {
+        let remotes = crate::remote::Remotes::default();
+        remotes.set(7, true);
+        let remote = remotes.get(7).unwrap();
+        let allowance = remote.allowance().1;
+        let cache = OpenCache::new();
+        for nodeid in 0..(allowance as u64 * 4) {
+            cache.put_file(nodeid, file(false), Some(remote.clone()));
+            assert!(
+                remote.holding().1 <= allowance,
+                "{} files cached on the volume against an allowance of {allowance}",
+                remote.holding().1
+            );
+        }
+        // The newest is always kept: the read that opened it is about to use it.
+        assert!(cache.file(allowance as u64 * 4 - 1, false).is_some());
+        // Files elsewhere are not the volume's to evict.
+        cache.put_file(1_000_000, file(false), None);
+        let on_volume = remote.holding().1;
+        assert_eq!(cache.evict_remote(7), on_volume);
+        assert_eq!(remote.holding().1, 0);
+        assert!(cache.file(1_000_000, false).is_some());
+    }
+
     /// Eviction must not close a descriptor another thread is mid-read on.
     #[test]
     fn an_evicted_descriptor_stays_alive_for_its_current_user() {
         let cache = OpenCache::new();
-        cache.put_file(7, file(true));
+        cache.put_file(7, file(true), None);
         let borrowed = cache.file(7, false).unwrap();
         cache.evict(7);
         // Still a live descriptor: `fstat` on a closed one would fail.

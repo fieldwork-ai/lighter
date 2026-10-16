@@ -2977,6 +2977,53 @@ fn on_a_network_share(name: &str) -> Guest {
     guest
 }
 
+/// A network volume's descriptors are handles on its server, which has only
+/// so many: Samba's limit is its process's, shared by every client of the
+/// share. A container walking a photo library through one held a handle per
+/// photo until the guest forgot it, which a guest with memory to spare never
+/// does, and once the NAS was out Immich saw EMFILE and folders listed empty
+/// in Finder too (#93). A walk now holds the volume's allowance, whatever
+/// the size of the library, and every file is still there to read after.
+#[test]
+fn a_walk_of_a_network_share_holds_its_allowance_not_a_handle_a_file() {
+    let mut guest = on_a_network_share("network-walk");
+    const DIRS: usize = 200;
+    const FILES: usize = 20;
+    for d in 0..DIRS {
+        let dir = guest.host(&format!("{}", 2000 + d));
+        std::fs::create_dir(&dir).unwrap();
+        for f in 0..FILES {
+            std::fs::write(dir.join(format!("IMG_{f}.jpg")), format!("photo {d} {f}")).unwrap();
+        }
+    }
+    let mut first = None;
+    for d in 0..DIRS {
+        let dir = guest.lookup(1, &format!("{}", 2000 + d)).unwrap();
+        assert_eq!(guest.list(dir, 4096, true).len(), FILES + 2);
+        for f in 0..FILES {
+            let file = guest.lookup(dir, &format!("IMG_{f}.jpg")).unwrap();
+            guest.call(op::GETATTR, file, &[0u8; 16]).unwrap();
+            let fh = guest.open(file, 0).unwrap();
+            let read = guest.read(file, fh, 0, 4096).unwrap();
+            assert_eq!(read, format!("photo {d} {f}").as_bytes());
+            first.get_or_insert(file);
+        }
+    }
+    let held = descriptors_under(&guest.root);
+    // The volume's allowances (128 directories, 64 open files) and the
+    // share's root, against 4,200 had every file kept its own.
+    assert!(
+        held <= 128 + 64 + 8,
+        "{held} descriptors held on the network share after a walk of {} files",
+        DIRS * FILES
+    );
+    // The first file of the walk, long since let go, is read through its
+    // directory and its name.
+    let file = first.unwrap();
+    guest.call(op::GETATTR, file, &[0u8; 16]).unwrap();
+    assert_eq!(guest.read(file, 0, 0, 4096).unwrap(), b"photo 0 0");
+}
+
 /// The same share served again, as after a restart.
 fn restarted_on_a_network_share(guest: &Guest) -> Guest {
     let restarted = guest.another();

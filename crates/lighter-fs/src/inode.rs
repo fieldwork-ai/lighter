@@ -122,6 +122,10 @@ pub struct Inode {
     /// increment, and the tally drifted down until it stopped triggering a
     /// reclaim while the real descriptor count climbed to the kernel's ceiling.
     census: Arc<Census>,
+    /// The network volume this inode is on, if it is on one, as known when
+    /// it was made: what it may hold there ([`crate::remote`]). Fixed for
+    /// the inode's life, so every edge that counts it in counts it out.
+    remote: Option<Arc<crate::remote::Remote>>,
     /// Host identity, which is what makes two paths to one file share a
     /// `nodeid` — as hard links must. Atomics because an inode born pending
     /// (acknowledged before its create has been applied) binds its real
@@ -281,6 +285,9 @@ pub struct Pool {
     descriptors: Arc<AtomicUsize>,
     resident_dirs: Arc<AtomicUsize>,
     holders: Arc<Holders>,
+    /// The network volumes the shares have learned, each with what it may
+    /// hold of its server's handles ([`crate::remote`]).
+    remotes: Arc<crate::remote::Remotes>,
 }
 
 /// A share's hold on the Mac's files, which it can let go of a device at a
@@ -288,6 +295,11 @@ pub struct Pool {
 pub trait Release: Send + Sync {
     /// Closes every descriptor held on `dev`, returning how many it closed.
     fn release_device(&self, dev: i64) -> usize;
+    /// Closes every descriptor held idle on `dev`, a network volume whose
+    /// server has refused an open, returning how many it closed. What is in
+    /// use stays open until its operation finishes, and the volume stays
+    /// known.
+    fn relieve_device(&self, dev: i64) -> usize;
 }
 
 #[derive(Default)]
@@ -321,6 +333,32 @@ impl Pool {
         holders.iter().map(|h| h.release_device(dev)).sum()
     }
 
+    /// Has every share in the pool let go of what it holds idle on `dev`,
+    /// a network volume whose server refused an open with `errno`, and
+    /// lowers the volume's allowance to half of what it held. Returns how
+    /// many descriptors that closed.
+    pub fn relieve_device(&self, dev: i64, errno: i32) -> usize {
+        let Some(remote) = self.remotes.get(dev) else {
+            return 0;
+        };
+        remote.relieve(errno, || {
+            let holders: Vec<_> = self
+                .holders
+                .0
+                .lock()
+                .expect("pool holders poisoned")
+                .iter()
+                .filter_map(|h| h.upgrade())
+                .collect();
+            holders.iter().map(|h| h.relieve_device(dev)).sum()
+        })
+    }
+
+    /// The network volume `dev` is, if it is one.
+    pub fn remote(&self, dev: i64) -> Option<Arc<crate::remote::Remote>> {
+        self.remotes.get(dev)
+    }
+
     /// Descriptors held across the pool.
     pub fn descriptors(&self) -> usize {
         self.descriptors.load(Ordering::Relaxed)
@@ -344,6 +382,9 @@ pub struct Census {
     /// itself can ask whether there is room without a pointer back to the
     /// registry. Zero until the registry sets it.
     budget: AtomicUsize,
+    /// The pool's network volumes, so an inode can find its own as it is
+    /// made.
+    remotes: Arc<crate::remote::Remotes>,
 }
 
 impl Census {
@@ -360,10 +401,7 @@ impl Drop for Inode {
     fn drop(&mut self) {
         self.census.inodes.fetch_sub(1, Ordering::Relaxed);
         if self.fd.get_mut().expect("inode slot poisoned").is_some() {
-            self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
-            if self.is_dir {
-                self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
-            }
+            self.uncount_resident();
         }
     }
 }
@@ -391,12 +429,9 @@ impl Inode {
         lookups: u64,
         census: Arc<Census>,
     ) -> Inode {
-        census.descriptors.fetch_add(1, Ordering::Relaxed);
         census.inodes.fetch_add(1, Ordering::Relaxed);
-        if is_dir {
-            census.resident_dirs.fetch_add(1, Ordering::Relaxed);
-        }
-        Inode {
+        let remote = census.remotes.get(dev);
+        let inode = Inode {
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
             born: Mutex::new(None),
@@ -404,6 +439,7 @@ impl Inode {
             used: AtomicBool::new(true),
             held: AtomicBool::new(true),
             census,
+            remote,
             dev: std::sync::atomic::AtomicI64::new(dev),
             ino: AtomicU64::new(ino),
             is_dir,
@@ -432,7 +468,49 @@ impl Inode {
             attr_override: Mutex::new(AttrOverride::default()),
             attr_batch: Mutex::new(None),
             last_write_seq: AtomicU64::new(0),
+        };
+        inode.count_resident();
+        inode
+    }
+
+    /// Counts a descriptor the slot has just come to hold: in the pool,
+    /// and on the inode's network volume if it is on one. Every edge that
+    /// fills the slot calls it, and [`Inode::uncount_resident`] every edge
+    /// that empties it; split across callers, the tallies drift.
+    fn count_resident(&self) {
+        self.census.descriptors.fetch_add(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(remote) = &self.remote {
+            remote.held();
+        }
+    }
+
+    fn uncount_resident(&self) {
+        self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(remote) = &self.remote {
+            remote.released();
+        }
+    }
+
+    /// Whether this inode may keep a descriptor of its own between
+    /// operations. On a network volume only a directory may, while the
+    /// volume has room ([`crate::remote`]): a file there is reached through
+    /// its directory and its name, and every descriptor held is a handle on
+    /// a server that has only so many.
+    fn may_hold(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_none_or(|remote| self.is_dir && remote.room())
+    }
+
+    /// The network volume this inode is on, if it is on one.
+    pub fn remote(&self) -> Option<&Arc<crate::remote::Remote>> {
+        self.remote.as_ref()
     }
 
     /// An inode acknowledged before it exists: no descriptor, provisional
@@ -445,6 +523,7 @@ impl Inode {
         census: Arc<Census>,
     ) -> Inode {
         census.inodes.fetch_add(1, Ordering::Relaxed);
+        let remote = census.remotes.get(dev);
         Inode {
             fd: RwLock::new(None),
             parked_at: Mutex::new(None),
@@ -453,6 +532,7 @@ impl Inode {
             used: AtomicBool::new(true),
             held: AtomicBool::new(false),
             census,
+            remote,
             dev: std::sync::atomic::AtomicI64::new(dev),
             ino: AtomicU64::new(ino),
             is_dir: matches!(kind, PendingKind::Directory),
@@ -539,10 +619,7 @@ impl Inode {
         self.dev.store(dev, Ordering::Relaxed);
         self.ino.store(ino, Ordering::Relaxed);
         *self.fd.write().expect("inode slot poisoned") = Some(Arc::new(fd));
-        self.census.descriptors.fetch_add(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
-        }
+        self.count_resident();
         self.held.store(true, Ordering::Relaxed);
         *self.pending_meta.lock().expect("pending meta poisoned") = None;
         self.pending.store(false, Ordering::Relaxed);
@@ -1177,15 +1254,19 @@ impl Inode {
         // was most of what the server did. Installed, it stays until the
         // sweep finds it cold, and the chain above a working directory is
         // resident the next time.
+        //
+        // On a network volume a directory too is installed only while the
+        // volume has room, and a file never: it would be a handle held on
+        // the server until the sweep happened by ([`crate::remote`]).
         let budget = self.census.budget.load(Ordering::Relaxed);
         if budget > 0 && !self.is_dir && self.census.descriptors.load(Ordering::Relaxed) >= budget {
             return Ok(Reference(fd));
         }
-        self.held.store(true, Ordering::Relaxed);
-        self.census.descriptors.fetch_add(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
+        if !self.may_hold() {
+            return Ok(Reference(fd));
         }
+        self.held.store(true, Ordering::Relaxed);
+        self.count_resident();
         *slot = Some(fd.clone());
         Ok(Reference(fd))
     }
@@ -1227,21 +1308,38 @@ impl Inode {
         // keeps resident, against a walk of the whole absolute path. A
         // directory revived this way revives its own parent the same way,
         // so a cold subtree costs one open per level and no more.
-        if let Some((ancestor, path)) = self.nearest_resident()
-            && let Ok(fd) = crate::sys::open_reference(ancestor.raw_fd(), &path, self.is_symlink)
-            && let Ok(st) = crate::sys::stat_fd(fd.as_raw_fd())
-            && st.st_ino == self.ino()
-            && st.st_dev as i64 == self.dev()
-        {
-            return Ok(fd);
+        //
+        // A server refusing the open is said as it is, not as ESTALE: the
+        // file is there, its server is out of handles, and the share lets
+        // go of its own and asks again ([`crate::remote`]). The other doors
+        // lead to the same server.
+        if let Some((ancestor, path)) = self.nearest_resident() {
+            match crate::sys::open_reference(ancestor.raw_fd(), &path, self.is_symlink) {
+                Ok(fd) => {
+                    if let Ok(st) = crate::sys::stat_fd(fd.as_raw_fd())
+                        && st.st_ino == self.ino()
+                        && st.st_dev as i64 == self.dev()
+                    {
+                        return Ok(fd);
+                    }
+                }
+                Err(errno) if self.remote.is_some() && crate::remote::is_refusal(errno) => {
+                    return Err(errno);
+                }
+                Err(_) => {}
+            }
         }
-        if let Ok(fd) = crate::sys::open_reference_path(&parked.path, self.is_symlink) {
-            match crate::sys::stat_fd(fd.as_raw_fd()) {
+        match crate::sys::open_reference_path(&parked.path, self.is_symlink) {
+            Ok(fd) => match crate::sys::stat_fd(fd.as_raw_fd()) {
                 Ok(st) if st.st_ino == self.ino() && st.st_dev as i64 == self.dev() => {
                     return Ok(fd);
                 }
                 _ => {}
+            },
+            Err(errno) if self.remote.is_some() && crate::remote::is_refusal(errno) => {
+                return Err(errno);
             }
+            Err(_) => {}
         }
         let vol = PathBuf::from(format!("/.vol/{}/{}", self.dev(), self.ino()));
         let fd = crate::sys::open_reference_path(&vol, self.is_symlink)
@@ -1263,6 +1361,9 @@ impl Inode {
     /// spends it on something the guest has touched since the hand last
     /// came round.
     fn promote(&self) -> bool {
+        if !self.may_hold() {
+            return false;
+        }
         let mut slot = self.fd.write().expect("inode slot poisoned");
         if slot.is_some() {
             return false;
@@ -1274,10 +1375,7 @@ impl Inode {
             return false;
         };
         self.held.store(true, Ordering::Relaxed);
-        self.census.descriptors.fetch_add(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
-        }
+        self.count_resident();
         *slot = Some(Arc::new(fd));
         true
     }
@@ -1306,10 +1404,7 @@ impl Inode {
         *self.parked_at.lock().expect("parked path poisoned") = Some(Parked { path, birthtime });
         *slot = None;
         self.held.store(false, Ordering::Relaxed);
-        self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.uncount_resident();
         true
     }
 
@@ -1603,6 +1698,7 @@ impl Registry {
         let census = Arc::new(Census {
             descriptors: pool.descriptors.clone(),
             resident_dirs: pool.resident_dirs.clone(),
+            remotes: pool.remotes.clone(),
             ..Census::default()
         });
         census.budget.store(descriptor_budget(), Ordering::Relaxed);
@@ -1708,6 +1804,30 @@ impl Registry {
         } else {
             devs.remove(&dev);
         }
+    }
+
+    /// Records whether `dev` is a network volume, whose descriptors are
+    /// handles on its server ([`crate::remote`]). Inodes made from here on
+    /// hold descriptors there as its allowance says.
+    pub fn remote_volume(&self, dev: i64, remote: bool) {
+        self.census.remotes.set(dev, remote);
+    }
+
+    /// The network volume `dev` is, if it is one.
+    pub fn remote(&self, dev: i64) -> Option<Arc<crate::remote::Remote>> {
+        self.census.remotes.get(dev)
+    }
+
+    /// Whether a new inode on `dev` would be parked the moment it was
+    /// bound: the share is at its budget, or `dev` is a network volume
+    /// that keeps no descriptor for it.
+    pub fn parks_new(&self, dev: i64, is_dir: bool) -> bool {
+        self.at_budget()
+            || self
+                .census
+                .remotes
+                .get(dev)
+                .is_some_and(|remote| !is_dir || !remote.room())
     }
 
     /// Whether files on `dev` are told apart by birth time as well.
@@ -1931,7 +2051,7 @@ impl Registry {
         // longer push the count past the budget at all; the paced sweep is
         // left with only its real job, keeping the RESIDENT set the
         // recently-used one.
-        if self.census.descriptors() > self.budget && inode.parkable() {
+        if (self.census.descriptors() > self.budget && inode.parkable()) || !inode.may_hold() {
             let _ = inode.park();
         }
         self.by_id[shard(id)]
@@ -2042,7 +2162,7 @@ impl Registry {
         // descriptor count past the budget, or a create storm larger than the
         // budget outruns the sweep and climbs to the kernel's ceiling. A
         // directory keeps its residency privilege (`parkable`).
-        if self.census.descriptors() > self.budget && inode.parkable() {
+        if (self.census.descriptors() > self.budget && inode.parkable()) || !inode.may_hold() {
             let _ = inode.park();
         }
         self.claim_identity(id, dev, ino);

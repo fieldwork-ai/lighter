@@ -36,6 +36,7 @@ pub mod mounts;
 pub mod notify;
 pub mod opencache;
 pub mod ownership;
+pub mod remote;
 pub mod server;
 pub mod stats;
 pub mod sys;
