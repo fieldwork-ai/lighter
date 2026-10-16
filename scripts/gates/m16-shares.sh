@@ -389,15 +389,17 @@ smb_library() {
 	got="$(docker run --rm -v "$SMB_D:/m:ro" "$IMAGE" sh -c '
 		echo "$(find /m/library -type f -exec stat -c %s {} + 2>&1 >/dev/null | wc -l)" \
 			"$(find /m/library -type f -exec cat {} + 2>&1 >/dev/null | wc -l)" \
-			"$(ls /m/library/60 | wc -l)"' 2>&1 | tail -1)"
+			"$(ls /m/library/60 | wc -l)"' 2>&1 | tail -1 || true)"
 	# What the server holds once the walk is over, the guest having
 	# forgotten none of it: the share's allowance, not a handle a photo.
-	held="$(docker exec lighter-gate-smb sh -c 'for p in $(pidof smbd); do ls /proc/$p/fd | wc -l; done' | sort -n | tail -1)"
-	listed="$(ls "$SMB_D/library/60" 2>&1 | wc -l | tr -d ' ')"
+	held="$(docker exec lighter-gate-smb sh -c 'for p in $(pidof smbd); do ls /proc/$p/fd | wc -l; done' | sort -n | tail -1 || true)"
+	# Out of handles, the server refuses the Mac too: that is the failure,
+	# and under `set -e` a listing that fails must say so, not end the gate.
+	listed="$( (ls "$SMB_D/library/60" 2>/dev/null || true) | wc -l | tr -d ' ')"
 	[ "$got" = "0 0 100" ] && [ "${held:-9999}" -lt 512 ] && [ "$listed" = 100 ] \
 		&& pass "SMB: a library of 6,000 photos on a server with 4,096 handles is walked and read in full, and the server holds ${held} handles after" \
 		|| fail "SMB library: errors (stat, read, listed) '$got', the server holds ${held:-?} handles, the Mac lists ${listed} of 100"
-	docker exec lighter-gate-smb rm -rf /srv/d/library
+	docker exec lighter-gate-smb rm -rf /srv/d/library || true
 }
 
 # A file renamed over another, or made again under its name, reads back as the
