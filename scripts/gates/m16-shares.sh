@@ -355,6 +355,25 @@ smb_file_ids() {
 	docker rm -f lighter-gate-smb-fid >/dev/null
 }
 
+# What the local probe said: "<slowest> <errors> <first error>". It kept
+# answering if every create and unlink succeeded and the slowest took under
+# $2 seconds; anything else, a probe that never finished or one that saw an
+# error, is a failure, however its first word reads as a number.
+local_answered() {
+	set -- $1 "$2"
+	[ "$#" -eq 4 ] && [ "$2" = 0 ] && [[ "$1" =~ ^[0-9]+\.[0-9]+$ ]] \
+		&& awk -v g="$1" -v b="$4" 'BEGIN { exit !(g < b) }'
+}
+
+local_said() {
+	set -- $1
+	if [ "$#" -eq 3 ] && [[ "$1" =~ ^[0-9]+\.[0-9]+$ ]]; then
+		echo "slowest $1 s, $2 errors (first: ${3//_/ })"
+	else
+		echo "the probe said '${*:-nothing}'"
+	fi
+}
+
 # A library with more files than its server has handles (#93). Samba's limit
 # is its process's descriptor limit, shared by every client of the share, and
 # a QNAP's is lower than a photo library: Immich walked one, the share held a
@@ -472,15 +491,19 @@ else
 			"while true; do ls -a /h >/dev/null 2>&1; stat /h/$(basename "$SMB_D") >/dev/null 2>&1; done" >/dev/null
 		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
 import os, time
-stop = time.time() + 35; worst = 0.0
+stop = time.time() + 35; worst = 0.0; errors = 0; first = None
 while time.time() < stop:
     t = time.monotonic()
     # A new file each time: a stat of one the guest has seen is answered
     # from its own cache, and never reaches the Mac to wait.
-    name = "/h/p%d" % int(t * 1e6); open(name, "w").close(); os.unlink(name)
+    name = "/h/p%d" % int(t * 1e6)
+    try:
+        open(name, "w").close(); os.unlink(name)
+    except OSError as e:
+        errors += 1; first = first or "%s on %s" % (e.strerror, e.filename)
     worst = max(worst, time.monotonic() - t)
     time.sleep(0.05)
-print("%.2f" % worst)' >/dev/null
+print("%.2f %d %s" % (worst, errors, (first or "-").replace(" ", "_")))' >/dev/null
 		docker run -d --name lighter-gate-ticker "$PYTHON" python3 -c '
 import os, threading, time
 n = os.cpu_count(); worst = [0.0] * n; stop = time.time() + 35
@@ -514,9 +537,9 @@ print("%.2f" % max(worst))' >/dev/null
 			awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
 				&& pass "SMB: the server hung for 20 s, and no guest CPU stopped (longest gap ${gap} s)" \
 				|| fail "SMB: with the server hung, a guest CPU stopped for ${gap:-?} s"
-			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
-				&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
-				|| fail "SMB: with the server hung, a local file in the same share waited ${slowest:-?} s"
+			local_answered "$slowest" 2 \
+				&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest%% *} s)" \
+				|| fail "SMB: with the server hung, a local file in the same share: $(local_said "$slowest")"
 			[ "$ps_ok" = 1 ] && awk -v g="$ps_secs" 'BEGIN { exit !(g + 0 < 2) }' \
 				&& pass "SMB: and Docker answered in ${ps_secs} s" \
 				|| fail "SMB: with the server hung, Docker took ${ps_secs} s (ok=$ps_ok)"
@@ -529,19 +552,26 @@ print("%.2f" % max(worst))' >/dev/null
 		# the Mac's own disk in the same share used to wait with them. Now
 		# the ones never started are answered with EIO once the lane is stuck
 		# and the rings three quarters held (lighter-vmm `virtio::fs`, Queue).
-		LOCAL_PROBE="$HOME/.lighter-gate-local-$$"
+		# A directory of its own: the first one was removed on the Mac a moment
+		# ago, and the guest can still have its entry cached when a container
+		# binds the same path again.
+		LOCAL_PROBE="$HOME/.lighter-gate-local-many-$$"
 		mkdir -p "$LOCAL_PROBE" && touch "$LOCAL_PROBE/probe"
 		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
 import os, time
-stop = time.time() + 50; worst = 0.0
+stop = time.time() + 50; worst = 0.0; errors = 0; first = None
 while time.time() < stop:
     t = time.monotonic()
     # A new file each time: a stat of one the guest has seen is answered
     # from its own cache, and never reaches the Mac to wait.
-    name = "/h/p%d" % int(t * 1e6); open(name, "w").close(); os.unlink(name)
+    name = "/h/p%d" % int(t * 1e6)
+    try:
+        open(name, "w").close(); os.unlink(name)
+    except OSError as e:
+        errors += 1; first = first or "%s on %s" % (e.strerror, e.filename)
     worst = max(worst, time.monotonic() - t)
     time.sleep(0.05)
-print("%.2f" % worst)' >/dev/null
+print("%.2f %d %s" % (worst, errors, (first or "-").replace(" ", "_")))' >/dev/null
 		sleep 2
 		docker pause lighter-gate-smb >/dev/null
 		docker run -d --name lighter-gate-smb-reader -v "$SMB_D:/m" "$IMAGE" sh -c \
@@ -552,21 +582,21 @@ print("%.2f" % worst)' >/dev/null
 		grep -q "on $SMB_D (smbfs" <<<"$(mount)" && kept=1
 		# Bounded: on 0.13.5 the probe waited behind the hung requests until
 		# the server came back, which here is only after it.
-		if perl -e 'alarm 40; exec @ARGV' docker wait lighter-gate-local >/dev/null 2>&1; then
+		if scripts/capped.sh 40 docker wait lighter-gate-local >/dev/null 2>&1; then
 			slowest="$(docker logs lighter-gate-local 2>&1 | tail -1)"
 		else
 			slowest="over 40"
 		fi
 		docker unpause lighter-gate-smb >/dev/null
-		reader="$(perl -e 'alarm 60; exec @ARGV' docker wait lighter-gate-smb-reader 2>/dev/null || echo stuck)"
-		after="$(perl -e 'alarm 30; exec @ARGV' docker run --rm -v "$SMB_D:/m" "$IMAGE" sh -c 'touch /m/after && ls /m/after' 2>&1 || true)"
+		reader="$(scripts/capped.sh 60 docker wait lighter-gate-smb-reader 2>/dev/null || echo stuck)"
+		after="$(scripts/capped.sh 30 docker run --rm -v "$SMB_D:/m" "$IMAGE" sh -c 'touch /m/after && ls /m/after' 2>&1 || true)"
 		said="$(sed 's/\x1b\[[0-9;]*m//g' "$LIGHTER_HOME/machine.log" | grep -c 'has not answered for' || true)"
 		docker rm -f lighter-gate-smb-reader lighter-gate-local >/dev/null
 		rm -rf "$LOCAL_PROBE"
 		if [ "$kept" = 1 ]; then
-			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 8 && g != "") }' \
-				&& pass "SMB: with 1,200 requests to the hung server, a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
-				|| fail "SMB: with 1,200 requests to the hung server, a local file in the same share waited ${slowest:-?} s"
+			local_answered "$slowest" 8 \
+				&& pass "SMB: with 1,200 requests to the hung server, a file on the Mac's own disk in the same share kept answering (slowest ${slowest%% *} s)" \
+				|| fail "SMB: with 1,200 requests to the hung server, a local file in the same share: $(local_said "$slowest")"
 			[ "$said" -gt 0 ] && pass "SMB: and the machine's log says the volume stopped answering" \
 				|| fail "SMB: the machine's log does not say the volume stopped answering"
 		else
