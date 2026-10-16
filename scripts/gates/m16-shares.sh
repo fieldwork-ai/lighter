@@ -16,6 +16,8 @@
 #   6. sharing all of it costs nothing while idle: /var/folders is where every
 #      app on the Mac keeps its temporary files, and each change there is an
 #      event the machine is told about
+#   7. a network share works however many files a container walks on it: a
+#      NAS has only so many handles, and lighter holds only its share (#93)
 #
 # Drives are disk images: they mount under /Volumes like any drive, and need
 # neither hardware nor root.
@@ -353,6 +355,32 @@ smb_file_ids() {
 	docker rm -f lighter-gate-smb-fid >/dev/null
 }
 
+# A library with more files than its server has handles (#93). Samba's limit
+# is its process's descriptor limit, shared by every client of the share, and
+# a QNAP's is lower than a photo library: Immich walked one, the share held a
+# handle on the NAS for every photo it had looked up and read, and once the
+# NAS was out every open failed, Immich's with EMFILE and the Mac's own too,
+# so folders listed empty in containers and Finder alike. Now a network
+# volume holds an allowance of a few hundred handles, whatever its size.
+smb_library() {
+	local got held listed
+	docker exec lighter-gate-smb sh -c 'mkdir /srv/d/library && cd /srv/d/library &&
+		for y in $(seq 1 60); do mkdir $y; for i in $(seq 1 100); do echo "$y/$i" > $y/IMG_$i.jpg; done; done' \
+		|| { fail "SMB library: could not make the library"; return; }
+	got="$(docker run --rm -v "$SMB_D:/m:ro" "$IMAGE" sh -c '
+		echo "$(find /m/library -type f -exec stat -c %s {} + 2>&1 >/dev/null | wc -l)" \
+			"$(find /m/library -type f -exec cat {} + 2>&1 >/dev/null | wc -l)" \
+			"$(ls /m/library/60 | wc -l)"' 2>&1 | tail -1)"
+	# What the server holds once the walk is over, the guest having
+	# forgotten none of it: the share's allowance, not a handle a photo.
+	held="$(docker exec lighter-gate-smb sh -c 'for p in $(pidof smbd); do ls /proc/$p/fd | wc -l; done' | sort -n | tail -1)"
+	listed="$(ls "$SMB_D/library/60" 2>&1 | wc -l | tr -d ' ')"
+	[ "$got" = "0 0 100" ] && [ "${held:-9999}" -lt 512 ] && [ "$listed" = 100 ] \
+		&& pass "SMB: a library of 6,000 photos on a server with 4,096 handles is walked and read in full, and the server holds ${held} handles after" \
+		|| fail "SMB library: errors (stat, read, listed) '$got', the server holds ${held:-?} handles, the Mac lists ${listed} of 100"
+	docker exec lighter-gate-smb rm -rf /srv/d/library
+}
+
 # A file renamed over another, or made again under its name, reads back as the
 # new one. Samba with fruit offers no file ids, so macOS numbers each file by
 # its name and a replacement has the numbers of the file it replaced: Postgres
@@ -412,7 +440,8 @@ if lsof -nP -iTCP:445 -sTCP:LISTEN >/dev/null 2>&1; then
 	fail "port 445 is taken on this Mac (File Sharing?); the SMB checks need it"
 else
 	docker build -q -t lighter-gate-smb scripts/gates/fixtures/smb >/dev/null
-	docker run -d --name lighter-gate-smb -p 445:445 lighter-gate-smb >/dev/null
+	# Fewer handles than a library has files, as a NAS has (smb_library).
+	docker run -d --name lighter-gate-smb --ulimit nofile=4096:4096 -p 445:445 lighter-gate-smb >/dev/null
 	mkdir -p "$SMB_D" "$SMB_T"
 	# By name rather than address: the Mac's SMB client keeps a session to
 	# a server it has just used, and refuses a second mount of the same
@@ -421,6 +450,7 @@ else
 		metadata "$SMB_D" "$SMB_T" | judge "SMB"
 		smb_permissions
 		smb_file_ids
+		smb_library
 		# A network volume that stops answering stops only what touches
 		# it. Served on the vCPU that asked, a request on it stopped that
 		# CPU for as long: a NAS that hung for 48 s froze three of the
