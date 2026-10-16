@@ -230,7 +230,9 @@ impl Remotes {
 /// Whether an open failed because the server behind a network volume has no
 /// handle left to give, in Linux numbers. The Mac's SMB client reports
 /// Samba's `NT_STATUS_TOO_MANY_OPENED_FILES` as EAGAIN, and passes the
-/// descriptor errors through as they are.
+/// descriptor errors through as they are. EAGAIN means nothing else here:
+/// the guest keeps its own locks, so no request the server answers is
+/// refused for a contested one.
 pub fn is_refusal(errno: i32) -> bool {
     use crate::errno::linux;
     errno == linux::EMFILE || errno == linux::ENFILE || errno == linux::EAGAIN
