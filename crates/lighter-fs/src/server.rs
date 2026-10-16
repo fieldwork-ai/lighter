@@ -360,7 +360,12 @@ fn create_job(
                 // query and a close for nothing, fifty thousand times an
                 // install — so there it is bound parked, the open file still
                 // cached for the writes that follow.
-                let meta = if park_creates && registry.at_budget() {
+                let remote = inode.remote().cloned();
+                let meta = if (park_creates && registry.at_budget())
+                    || remote
+                        .as_ref()
+                        .is_some_and(|remote| !inode.is_dir || !remote.room())
+                {
                     None
                 } else {
                     sys::dup(&fd).ok()
@@ -375,6 +380,7 @@ fn create_job(
                         readable: true,
                         writable: flags & 0o3 != 0,
                     }),
+                    remote,
                 );
                 match meta {
                     Some(meta) => registry.bind_pending(
@@ -640,6 +646,7 @@ impl Volumes {
                 permissions: sys::keeps_permissions(fd).unwrap_or(true),
             };
             registry.identify_by_birth(dev, !volume.local);
+            registry.remote_volume(dev, !volume.local);
             self.0
                 .write()
                 .expect("volumes poisoned")
@@ -651,6 +658,27 @@ impl Volumes {
     fn forget(&self, dev: i64) {
         self.0.write().expect("volumes poisoned").remove(&dev);
     }
+}
+
+/// Whether a request may be served again after a network volume's server
+/// refused it an open: those that only read, whose first attempt changed
+/// nothing.
+fn retries_on_refusal(opcode: u32) -> bool {
+    matches!(
+        opcode,
+        op::LOOKUP
+            | op::GETATTR
+            | op::STATX
+            | op::READLINK
+            | op::READ
+            | op::STATFS
+            | op::GETXATTR
+            | op::LISTXATTR
+            | op::ACCESS
+            | op::READDIR
+            | op::READDIRPLUS
+            | op::LSEEK
+    )
 }
 
 /// Whether a chmod failed because the server would not take it, rather than
@@ -777,6 +805,7 @@ impl crate::inode::Release for Hold {
         self.volfs.forget(dev);
         self.volumes.forget(dev);
         self.registry.identify_by_birth(dev, false);
+        self.registry.remote_volume(dev, false);
         let inodes = self
             .registry
             .release_device(dev, |id| self.open_cache.evict(id));
@@ -785,6 +814,13 @@ impl crate::inode::Release for Hold {
             tracing::info!(dev, inodes, open_files, "let go of a volume being ejected");
         }
         inodes + open_files
+    }
+
+    fn relieve_device(&self, dev: i64) -> usize {
+        let inodes = self
+            .registry
+            .release_device(dev, |id| self.open_cache.evict(id));
+        inodes + self.open_cache.evict_remote(dev)
     }
 }
 
@@ -814,6 +850,9 @@ pub struct Server {
     /// What the pool asks to let go of a volume being ejected; enrolled
     /// there weakly, so it lives exactly as long as the share.
     _hold: Arc<Hold>,
+    /// The machine's shares, which a network volume's server refusing an
+    /// open asks to let go of what they hold there ([`crate::remote`]).
+    pool: crate::inode::Pool,
     /// Opcode counters, off unless asked for.
     stats: Stats,
     /// Set on the share that carries Rosetta. See [`Server::serve_rosetta`].
@@ -976,18 +1015,38 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
         Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
         Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0),
         Located::At(parent, name) => {
-            let opened =
+            // A file on a network volume is opened by its whole path, as one
+            // with a descriptor of its own always was (`sys::reopen`). Opened
+            // by name under its directory instead, the first read of each
+            // photo took 43 ms in a machine launchd had started from an ad-hoc
+            // build, where 0.13.6, opening by path, took 0.2 ms; from Terminal
+            // both took under a millisecond. macOS asks whether the process
+            // may read a network volume as each file is opened, and the time
+            // the answer takes depends on who asks and how the file is named.
+            let opened = if inode.remote().is_some() {
+                sys::path_of(parent.raw_fd()).and_then(|dir| {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = dir.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+                    sys::open_path(&path, linux_flags | LINUX_O_NOFOLLOW, 0)
+                })
+            } else {
                 sys::openat_path(parent.raw_fd(), &name, linux_flags | LINUX_O_NOFOLLOW, 0)
-                    .and_then(|fd| {
-                        let st = sys::stat_fd(fd.as_raw_fd())?;
-                        if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
-                            Ok(fd)
-                        } else {
-                            Err(linux::ESTALE)
-                        }
-                    });
+            };
+            let opened = opened.and_then(|fd| {
+                let st = sys::stat_fd(fd.as_raw_fd())?;
+                if st.st_ino == inode.ino() && st.st_dev as i64 == inode.dev() {
+                    Ok(fd)
+                } else {
+                    Err(linux::ESTALE)
+                }
+            });
             match opened {
                 Ok(fd) => Ok(fd),
+                // Its server is out of handles, which asking by another door
+                // would only ask again ([`crate::remote`]).
+                Err(errno) if inode.remote().is_some() && crate::remote::is_refusal(errno) => {
+                    Err(errno)
+                }
                 // The name has moved on; the file may not have.
                 Err(_) => sys::reopen(inode.reference()?.raw_fd(), linux_flags, 0),
             }
@@ -1169,6 +1228,7 @@ impl Server {
             notifications: sink,
             open_cache,
             _hold: hold,
+            pool: pool.clone(),
             stats: Stats::new(),
             rosetta: None,
             apply,
@@ -1199,6 +1259,7 @@ impl Server {
     #[doc(hidden)]
     pub fn assume_network_share(&self) {
         self.registry.identify_by_birth(self.root_dev, true);
+        self.registry.remote_volume(self.root_dev, true);
         self.volumes.0.write().expect("volumes poisoned").insert(
             self.root_dev,
             Volume {
@@ -1342,7 +1403,30 @@ impl Server {
             self.stats.enter();
             std::time::Instant::now()
         });
-        let outcome = self.handle(&header, body, sink.capacity());
+        let mut outcome = self.handle(&header, body, sink.capacity());
+        if let Err(errno) = outcome
+            && crate::remote::is_refusal(errno)
+            && let Some(dev) = self.remote_dev(header.nodeid)
+        {
+            // The server is out of handles: whatever this request needed
+            // opened was refused, and every share lets go of what it holds
+            // idle on the volume. A request that only reads is then served
+            // again, once, against a server with room. One that changes
+            // something is answered as it was: it may have done part of
+            // its work, and the guest's retry is the one that knows.
+            let closed = self.pool.relieve_device(dev, errno);
+            if retries_on_refusal(header.opcode) {
+                outcome = self.handle(&header, body, sink.capacity());
+            }
+            tracing::debug!(
+                dev,
+                errno,
+                closed,
+                op = crate::stats::name(header.opcode),
+                again = ?outcome.as_ref().err(),
+                "an open refused on a network volume"
+            );
+        }
         if traced {
             self.trace(&header, body, &outcome);
         }
@@ -1430,6 +1514,15 @@ impl Server {
             self.stats.exit();
         }
         written
+    }
+
+    /// The network volume a request's inode is on, if it is on one. Asked
+    /// by device rather than of the inode, which records only what was known
+    /// when it was made: a mount point's own directory is made before its
+    /// volume is learned.
+    fn remote_dev(&self, nodeid: u64) -> Option<i64> {
+        let dev = self.registry.get(self.resolve(nodeid))?.dev();
+        self.registry.remote(dev).map(|_| dev)
     }
 
     /// Everything with a reply.
@@ -2054,14 +2147,16 @@ impl Server {
         }
         let entry = self.entry_with_reference(parent, st, mark, || {
             let is_symlink = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
-            // A regular file the guest names into a full share is registered
-            // parked, with no descriptor at all: it is operated on through
-            // this parent's descriptor from here on (`Inode::locate`), and
-            // opening one only to have the sweep close it again was an
-            // `open` and a `close` per file of a package tree.
+            // A regular file the guest names into a full share, or on a
+            // network volume, is registered parked, with no descriptor at
+            // all: it is operated on through this parent's descriptor from
+            // here on (`Inode::locate`), and opening one only to have the
+            // sweep close it again was an `open` and a `close` per file of a
+            // package tree. On a network volume it was a handle on the
+            // server, held until the guest forgot the file (#93).
             if !is_symlink
                 && st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFREG as u32
-                && self.registry.at_budget()
+                && self.registry.parks_new(st.st_dev as i64, false)
             {
                 return Err(PARK_ON_ENTRY);
             }
@@ -4019,7 +4114,8 @@ impl Server {
             readable: true,
             writable: need_write,
         });
-        self.open_cache.put_file(nodeid, file.clone());
+        self.open_cache
+            .put_file(nodeid, file.clone(), inode.remote().cloned());
         Ok(file)
     }
 
@@ -4839,6 +4935,7 @@ impl Server {
         // held until the share closed — one per create, until the process
         // ran out (issue #46).
         let access = if created { creating } else { flags } & 0o3;
+        let remote = self.registry.remote(parent.dev());
         self.open_cache.put_file(
             entry.nodeid,
             Arc::new(OpenFile {
@@ -4846,6 +4943,7 @@ impl Server {
                 readable: access != 1,
                 writable: access != 0,
             }),
+            remote,
         );
         let mut out = self.entry_reply(&entry);
         let mut open_flags = self.created_file_flags();

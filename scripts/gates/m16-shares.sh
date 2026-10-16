@@ -16,6 +16,8 @@
 #   6. sharing all of it costs nothing while idle: /var/folders is where every
 #      app on the Mac keeps its temporary files, and each change there is an
 #      event the machine is told about
+#   7. a network share works however many files a container walks on it: a
+#      NAS has only so many handles, and lighter holds only its share (#93)
 #
 # Drives are disk images: they mount under /Volumes like any drive, and need
 # neither hardware nor root.
@@ -353,6 +355,53 @@ smb_file_ids() {
 	docker rm -f lighter-gate-smb-fid >/dev/null
 }
 
+# What the local probe said: "<slowest> <errors> <first error>". It kept
+# answering if every create and unlink succeeded and the slowest took under
+# $2 seconds; anything else, a probe that never finished or one that saw an
+# error, is a failure, however its first word reads as a number.
+local_answered() {
+	set -- $1 "$2"
+	[ "$#" -eq 4 ] && [ "$2" = 0 ] && [[ "$1" =~ ^[0-9]+\.[0-9]+$ ]] \
+		&& awk -v g="$1" -v b="$4" 'BEGIN { exit !(g < b) }'
+}
+
+local_said() {
+	set -- $1
+	if [ "$#" -eq 3 ] && [[ "$1" =~ ^[0-9]+\.[0-9]+$ ]]; then
+		echo "slowest $1 s, $2 errors (first: ${3//_/ })"
+	else
+		echo "the probe said '${*:-nothing}'"
+	fi
+}
+
+# A library with more files than its server has handles (#93). Samba's limit
+# is its process's descriptor limit, shared by every client of the share, and
+# a QNAP's is lower than a photo library: Immich walked one, the share held a
+# handle on the NAS for every photo it had looked up and read, and once the
+# NAS was out every open failed, Immich's with EMFILE and the Mac's own too,
+# so folders listed empty in containers and Finder alike. Now a network
+# volume holds an allowance of a few hundred handles, whatever its size.
+smb_library() {
+	local got held listed
+	docker exec lighter-gate-smb sh -c 'mkdir /srv/d/library && cd /srv/d/library &&
+		for y in $(seq 1 60); do mkdir $y; for i in $(seq 1 100); do echo "$y/$i" > $y/IMG_$i.jpg; done; done' \
+		|| { fail "SMB library: could not make the library"; return; }
+	got="$(docker run --rm -v "$SMB_D:/m:ro" "$IMAGE" sh -c '
+		echo "$(find /m/library -type f -exec stat -c %s {} + 2>&1 >/dev/null | wc -l)" \
+			"$(find /m/library -type f -exec cat {} + 2>&1 >/dev/null | wc -l)" \
+			"$(ls /m/library/60 | wc -l)"' 2>&1 | tail -1 || true)"
+	# What the server holds once the walk is over, the guest having
+	# forgotten none of it: the share's allowance, not a handle a photo.
+	held="$(docker exec lighter-gate-smb sh -c 'for p in $(pidof smbd); do ls /proc/$p/fd | wc -l; done' | sort -n | tail -1 || true)"
+	# Out of handles, the server refuses the Mac too: that is the failure,
+	# and under `set -e` a listing that fails must say so, not end the gate.
+	listed="$( (ls "$SMB_D/library/60" 2>/dev/null || true) | wc -l | tr -d ' ')"
+	[ "$got" = "0 0 100" ] && [ "${held:-9999}" -lt 512 ] && [ "$listed" = 100 ] \
+		&& pass "SMB: a library of 6,000 photos on a server with 4,096 handles is walked and read in full, and the server holds ${held} handles after" \
+		|| fail "SMB library: errors (stat, read, listed) '$got', the server holds ${held:-?} handles, the Mac lists ${listed} of 100"
+	docker exec lighter-gate-smb rm -rf /srv/d/library || true
+}
+
 # A file renamed over another, or made again under its name, reads back as the
 # new one. Samba with fruit offers no file ids, so macOS numbers each file by
 # its name and a replacement has the numbers of the file it replaced: Postgres
@@ -412,7 +461,8 @@ if lsof -nP -iTCP:445 -sTCP:LISTEN >/dev/null 2>&1; then
 	fail "port 445 is taken on this Mac (File Sharing?); the SMB checks need it"
 else
 	docker build -q -t lighter-gate-smb scripts/gates/fixtures/smb >/dev/null
-	docker run -d --name lighter-gate-smb -p 445:445 lighter-gate-smb >/dev/null
+	# Fewer handles than a library has files, as a NAS has (smb_library).
+	docker run -d --name lighter-gate-smb --ulimit nofile=4096:4096 -p 445:445 lighter-gate-smb >/dev/null
 	mkdir -p "$SMB_D" "$SMB_T"
 	# By name rather than address: the Mac's SMB client keeps a session to
 	# a server it has just used, and refuses a second mount of the same
@@ -421,6 +471,7 @@ else
 		metadata "$SMB_D" "$SMB_T" | judge "SMB"
 		smb_permissions
 		smb_file_ids
+		smb_library
 		# A network volume that stops answering stops only what touches
 		# it. Served on the vCPU that asked, a request on it stopped that
 		# CPU for as long: a NAS that hung for 48 s froze three of the
@@ -442,15 +493,19 @@ else
 			"while true; do ls -a /h >/dev/null 2>&1; stat /h/$(basename "$SMB_D") >/dev/null 2>&1; done" >/dev/null
 		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
 import os, time
-stop = time.time() + 35; worst = 0.0
+stop = time.time() + 35; worst = 0.0; errors = 0; first = None
 while time.time() < stop:
     t = time.monotonic()
     # A new file each time: a stat of one the guest has seen is answered
     # from its own cache, and never reaches the Mac to wait.
-    name = "/h/p%d" % int(t * 1e6); open(name, "w").close(); os.unlink(name)
+    name = "/h/p%d" % int(t * 1e6)
+    try:
+        open(name, "w").close(); os.unlink(name)
+    except OSError as e:
+        errors += 1; first = first or "%s on %s" % (e.strerror, e.filename)
     worst = max(worst, time.monotonic() - t)
     time.sleep(0.05)
-print("%.2f" % worst)' >/dev/null
+print("%.2f %d %s" % (worst, errors, (first or "-").replace(" ", "_")))' >/dev/null
 		docker run -d --name lighter-gate-ticker "$PYTHON" python3 -c '
 import os, threading, time
 n = os.cpu_count(); worst = [0.0] * n; stop = time.time() + 35
@@ -484,9 +539,9 @@ print("%.2f" % max(worst))' >/dev/null
 			awk -v g="$gap" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
 				&& pass "SMB: the server hung for 20 s, and no guest CPU stopped (longest gap ${gap} s)" \
 				|| fail "SMB: with the server hung, a guest CPU stopped for ${gap:-?} s"
-			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 2 && g != "") }' \
-				&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
-				|| fail "SMB: with the server hung, a local file in the same share waited ${slowest:-?} s"
+			local_answered "$slowest" 2 \
+				&& pass "SMB: and a file on the Mac's own disk in the same share kept answering (slowest ${slowest%% *} s)" \
+				|| fail "SMB: with the server hung, a local file in the same share: $(local_said "$slowest")"
 			[ "$ps_ok" = 1 ] && awk -v g="$ps_secs" 'BEGIN { exit !(g + 0 < 2) }' \
 				&& pass "SMB: and Docker answered in ${ps_secs} s" \
 				|| fail "SMB: with the server hung, Docker took ${ps_secs} s (ok=$ps_ok)"
@@ -499,19 +554,26 @@ print("%.2f" % max(worst))' >/dev/null
 		# the Mac's own disk in the same share used to wait with them. Now
 		# the ones never started are answered with EIO once the lane is stuck
 		# and the rings three quarters held (lighter-vmm `virtio::fs`, Queue).
-		LOCAL_PROBE="$HOME/.lighter-gate-local-$$"
+		# A directory of its own: the first one was removed on the Mac a moment
+		# ago, and the guest can still have its entry cached when a container
+		# binds the same path again.
+		LOCAL_PROBE="$HOME/.lighter-gate-local-many-$$"
 		mkdir -p "$LOCAL_PROBE" && touch "$LOCAL_PROBE/probe"
 		docker run -d --name lighter-gate-local -v "$LOCAL_PROBE:/h" "$PYTHON" python3 -c '
 import os, time
-stop = time.time() + 50; worst = 0.0
+stop = time.time() + 50; worst = 0.0; errors = 0; first = None
 while time.time() < stop:
     t = time.monotonic()
     # A new file each time: a stat of one the guest has seen is answered
     # from its own cache, and never reaches the Mac to wait.
-    name = "/h/p%d" % int(t * 1e6); open(name, "w").close(); os.unlink(name)
+    name = "/h/p%d" % int(t * 1e6)
+    try:
+        open(name, "w").close(); os.unlink(name)
+    except OSError as e:
+        errors += 1; first = first or "%s on %s" % (e.strerror, e.filename)
     worst = max(worst, time.monotonic() - t)
     time.sleep(0.05)
-print("%.2f" % worst)' >/dev/null
+print("%.2f %d %s" % (worst, errors, (first or "-").replace(" ", "_")))' >/dev/null
 		sleep 2
 		docker pause lighter-gate-smb >/dev/null
 		docker run -d --name lighter-gate-smb-reader -v "$SMB_D:/m" "$IMAGE" sh -c \
@@ -522,21 +584,21 @@ print("%.2f" % worst)' >/dev/null
 		grep -q "on $SMB_D (smbfs" <<<"$(mount)" && kept=1
 		# Bounded: on 0.13.5 the probe waited behind the hung requests until
 		# the server came back, which here is only after it.
-		if perl -e 'alarm 40; exec @ARGV' docker wait lighter-gate-local >/dev/null 2>&1; then
+		if scripts/capped.sh 40 docker wait lighter-gate-local >/dev/null 2>&1; then
 			slowest="$(docker logs lighter-gate-local 2>&1 | tail -1)"
 		else
 			slowest="over 40"
 		fi
 		docker unpause lighter-gate-smb >/dev/null
-		reader="$(perl -e 'alarm 60; exec @ARGV' docker wait lighter-gate-smb-reader 2>/dev/null || echo stuck)"
-		after="$(perl -e 'alarm 30; exec @ARGV' docker run --rm -v "$SMB_D:/m" "$IMAGE" sh -c 'touch /m/after && ls /m/after' 2>&1 || true)"
+		reader="$(scripts/capped.sh 60 docker wait lighter-gate-smb-reader 2>/dev/null || echo stuck)"
+		after="$(scripts/capped.sh 30 docker run --rm -v "$SMB_D:/m" "$IMAGE" sh -c 'touch /m/after && ls /m/after' 2>&1 || true)"
 		said="$(sed 's/\x1b\[[0-9;]*m//g' "$LIGHTER_HOME/machine.log" | grep -c 'has not answered for' || true)"
 		docker rm -f lighter-gate-smb-reader lighter-gate-local >/dev/null
 		rm -rf "$LOCAL_PROBE"
 		if [ "$kept" = 1 ]; then
-			awk -v g="$slowest" 'BEGIN { exit !(g + 0 < 8 && g != "") }' \
-				&& pass "SMB: with 1,200 requests to the hung server, a file on the Mac's own disk in the same share kept answering (slowest ${slowest} s)" \
-				|| fail "SMB: with 1,200 requests to the hung server, a local file in the same share waited ${slowest:-?} s"
+			local_answered "$slowest" 8 \
+				&& pass "SMB: with 1,200 requests to the hung server, a file on the Mac's own disk in the same share kept answering (slowest ${slowest%% *} s)" \
+				|| fail "SMB: with 1,200 requests to the hung server, a local file in the same share: $(local_said "$slowest")"
 			[ "$said" -gt 0 ] && pass "SMB: and the machine's log says the volume stopped answering" \
 				|| fail "SMB: the machine's log does not say the volume stopped answering"
 		else

@@ -227,10 +227,10 @@ docker run -d --name m6-short --tmpfs /ballast:rw,size=$((SHORT_MIB + 128))m alp
 	sh -c "dd if=/dev/zero of=/ballast/x bs=1M count=$SHORT_MIB 2>/dev/null; i=0; while :; do i=\$((i+1)); [ \$((i % 100000)) -eq 0 ] && echo \$i; done" \
 	>/dev/null 2>&1 || fail "could not make the guest short of memory"
 sleep 20
-answers() { perl -e 'alarm shift; exec @ARGV' "$1" docker ps -q >/dev/null 2>&1; }
+answers() { scripts/capped.sh "$1" docker ps -q >/dev/null 2>&1; }
 # Read through dockerd's log of the container, not an exec into it: starting
 # a process in a guest this short can take longer than the check.
-count() { perl -e 'alarm 10; exec @ARGV' docker logs --tail 1 m6-short 2>/dev/null | tail -1; }
+count() { scripts/capped.sh 10 docker logs --tail 1 m6-short 2>/dev/null | tail -1; }
 answers 10 || fail "Docker stopped answering while the guest was merely short"
 before_floor="$(field ballooned_mib)"
 puffs_before="$(grep -ac 'Out of puff' "$LOG" || true)"
@@ -422,11 +422,11 @@ start m6-cold alpine:3.21 sh -c 'dd if=/dev/zero of=/cold bs=1M count=2048 2>/de
 start m6-mapped node:24-alpine node -e 'setInterval(() => {}, 1000000)'
 sleep 20
 # A container's own view of its cgroup, in MiB.
-cgstat() { perl -e 'alarm 10; exec @ARGV' docker exec "$1" grep -E "^$2 " /sys/fs/cgroup/memory.stat 2>/dev/null | awk '{ print int($2 / 1048576) }'; }
+cgstat() { scripts/capped.sh 10 docker exec "$1" grep -E "^$2 " /sys/fs/cgroup/memory.stat 2>/dev/null | awk '{ print int($2 / 1048576) }'; }
 # The sleeping process's resident mapped file pages (its executable and
 # libraries), from its own view: image layers are charged to the engine's
 # cgroup, not the container's, so the cgroup's `file_mapped` says nothing.
-rssfile() { perl -e 'alarm 10; exec @ARGV' docker exec "$1" grep RssFile /proc/1/status 2>/dev/null | awk '{ print int($2 / 1024) }'; }
+rssfile() { scripts/capped.sh 10 docker exec "$1" grep RssFile /proc/1/status 2>/dev/null | awk '{ print int($2 / 1024) }'; }
 cold0="$(cgstat m6-cold file)"
 warm0="$(cgstat m6-warm file)"
 mapped0="$(rssfile m6-mapped)"
