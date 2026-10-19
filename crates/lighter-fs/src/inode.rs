@@ -288,6 +288,9 @@ pub struct Pool {
     /// The network volumes the shares have learned, each with what it may
     /// hold of its server's handles ([`crate::remote`]).
     remotes: Arc<crate::remote::Remotes>,
+    /// When the shares last let go because the Mac's file table was full; see
+    /// [`Pool::relieve_system`].
+    relieved: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// A share's hold on the Mac's files, which it can let go of a device at a
@@ -300,6 +303,13 @@ pub trait Release: Send + Sync {
     /// use stays open until its operation finishes, and the volume stays
     /// known.
     fn relieve_device(&self, dev: i64) -> usize;
+    /// Lets go of what this share holds, and lowers its budget, because the
+    /// Mac's file table is full. What is in use stays open until its
+    /// operation finishes. Returns how many descriptors it closed. See
+    /// [`Registry::relieve_system`].
+    fn relieve_system(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Default)]
@@ -357,6 +367,40 @@ impl Pool {
     /// The network volume `dev` is, if it is one.
     pub fn remote(&self, dev: i64) -> Option<Arc<crate::remote::Remote>> {
         self.remotes.get(dev)
+    }
+
+    /// Has every share of the machine let go of what it holds, because the
+    /// Mac's file table is full (`ENFILE`, `errno`), and holds less from now
+    /// on: each share halves its budget and parks what it holds. Returns how
+    /// many descriptors that closed.
+    ///
+    /// The table is the Mac's, not a volume's, so this is not per volume the
+    /// way [`Pool::relieve_device`] is. It is also not repeated: a shortage is
+    /// one event, and every worker that meets it at once must not each halve
+    /// the budget again. So it runs at most once a second per machine, and the
+    /// workers that arrive while it runs wait for it, then retry against a
+    /// table with room in it.
+    pub fn relieve_system(&self, errno: i32) -> usize {
+        let mut relieved = self.relieved.lock().expect("pool relief poisoned");
+        if relieved.is_some_and(|at| at.elapsed() < crate::remote::RELIEF_EVERY) {
+            return 0;
+        }
+        let holders: Vec<_> = self
+            .holders
+            .0
+            .lock()
+            .expect("pool holders poisoned")
+            .iter()
+            .filter_map(|h| h.upgrade())
+            .collect();
+        let closed: usize = holders.iter().map(|h| h.relieve_system()).sum();
+        *relieved = Some(std::time::Instant::now());
+        tracing::warn!(
+            errno,
+            closed,
+            "the Mac's file table is full; lighter let go of what it held and holds less from now on"
+        );
+        closed
     }
 
     /// Descriptors held across the pool.
@@ -1271,6 +1315,18 @@ impl Inode {
         Ok(Reference(fd))
     }
 
+    /// Whether an open of this inode that failed with `errno` is passed on as
+    /// it is, rather than read as the file having gone. That is so when the
+    /// server behind a network volume has no handle left, or the Mac's file
+    /// table is full: the file is there in both cases, and the share lets go
+    /// of what it holds and asks again ([`crate::remote`],
+    /// [`Pool::relieve_system`]). Asking by another door would be refused by
+    /// the same thing.
+    pub(crate) fn refuses(&self, errno: i32) -> bool {
+        (self.remote.is_some() && crate::remote::is_refusal(errno))
+            || crate::remote::is_full_table(errno)
+    }
+
     /// Reopens a parked inode: by its remembered path, and failing that by
     /// its identity.
     ///
@@ -1323,7 +1379,7 @@ impl Inode {
                         return Ok(fd);
                     }
                 }
-                Err(errno) if self.remote.is_some() && crate::remote::is_refusal(errno) => {
+                Err(errno) if self.refuses(errno) => {
                     return Err(errno);
                 }
                 Err(_) => {}
@@ -1336,14 +1392,19 @@ impl Inode {
                 }
                 _ => {}
             },
-            Err(errno) if self.remote.is_some() && crate::remote::is_refusal(errno) => {
+            Err(errno) if self.refuses(errno) => {
                 return Err(errno);
             }
             Err(_) => {}
         }
         let vol = PathBuf::from(format!("/.vol/{}/{}", self.dev(), self.ino()));
-        let fd = crate::sys::open_reference_path(&vol, self.is_symlink)
-            .map_err(|_| crate::errno::linux::ESTALE)?;
+        let fd = crate::sys::open_reference_path(&vol, self.is_symlink).map_err(|errno| {
+            if crate::remote::is_full_table(errno) {
+                errno
+            } else {
+                crate::errno::linux::ESTALE
+            }
+        })?;
         match crate::sys::stat_fd(fd.as_raw_fd()) {
             Ok(st)
                 if st.st_ino == self.ino()
@@ -1631,8 +1692,9 @@ pub struct Registry {
     /// honest: each of the four edges that moves it — construction, parking,
     /// reviving, dropping — belongs to an inode and adjusts it there.
     census: Arc<Census>,
-    /// The most it may hold before parking the cold ones.
-    budget: usize,
+    /// The pool this share counts into. An apply job that finds the Mac's
+    /// file table full reaches every share through it, not only this one.
+    pool: Pool,
     /// Which shard the hand is on, so successive sweeps cover all of them.
     sweep: AtomicUsize,
     /// When the descriptor pressure was last reported.
@@ -1666,14 +1728,9 @@ pub struct Registry {
     born: std::time::Instant,
     /// Elapsed millis at the last over-budget sweep.
     last_sweep: AtomicUsize,
-    /// The count above which a sweep may no longer be deferred.
-    ///
-    /// Between the budget and this line, sweeps are rate-limited and the count
-    /// breathes: a working set genuinely hotter and larger than the budget is
-    /// a fact, and holding the line by sweeping on every request turns a
-    /// ten-second install into ten minutes of parking the same inodes. Past
-    /// the line, the ceiling is near and EMFILE is worse than any stall.
-    red_line: usize,
+    /// How far above the budget the red line sits. Fixed when the share is
+    /// built; [`Registry::red_line`] moves with a relief's lower budget.
+    red_headroom: usize,
     /// See [`Registry::on_forget`].
     forgotten: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
 }
@@ -1730,7 +1787,7 @@ impl Registry {
             by_birth: RwLock::new(std::collections::HashSet::new()),
             next_id: AtomicU64::new(ROOT_ID + 1),
             census,
-            budget: descriptor_budget(),
+            pool: pool.clone(),
             sweep: AtomicUsize::new(0),
             reported: Mutex::new(std::time::Instant::now()),
             hands: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
@@ -1738,7 +1795,7 @@ impl Registry {
             forcing: AtomicBool::new(false),
             born: std::time::Instant::now(),
             last_sweep: AtomicUsize::new(0),
-            red_line: descriptor_budget() + descriptor_red_headroom(),
+            red_headroom: descriptor_red_headroom(),
             forgotten: std::sync::OnceLock::new(),
         }
     }
@@ -1769,14 +1826,44 @@ impl Registry {
     /// one's id first so that whatever else holds it open can let go too.
     /// Returns how many descriptors it closed. An unlinked file the guest
     /// still has open cannot be parked, having no path to come back by.
-    pub fn release_device(&self, dev: i64, mut evicted: impl FnMut(u64)) -> usize {
+    pub fn release_device(&self, dev: i64, evicted: impl FnMut(u64)) -> usize {
+        self.release_where(|inode| inode.dev() == dev, evicted)
+    }
+
+    /// The share's part of a relief when the Mac's file table is full: the
+    /// budget halves, to no less than [`LOWEST_BUDGET`], and every descriptor
+    /// it holds is parked, as [`Registry::release_device`] parks a volume's.
+    /// Returns how many descriptors that closed.
+    ///
+    /// Parking everything is the blunt answer, and the right one for a table
+    /// that is full now: a parked file costs one reopen when it is next used,
+    /// and an `ENFILE` costs the workload its open. The lower budget is what
+    /// stops the share filling the table again as soon as the pressure eases.
+    /// Like the budget itself, the lower one stays.
+    pub fn relieve_system(&self, evicted: impl FnMut(u64)) -> usize {
+        let budget = self.budget();
+        // Halved, but never below the floor, and never raised: a share whose
+        // budget a test or an operator set below the floor keeps it.
+        let lowered = (budget / 2).max(LOWEST_BUDGET).min(budget);
+        self.census.budget.store(lowered, Ordering::Relaxed);
+        self.quiet_until.store(0, Ordering::Relaxed);
+        self.release_where(|_| true, evicted)
+    }
+
+    /// Parks every inode but the root that `wanted` picks, calling `evicted`
+    /// with each one's id first. Returns how many descriptors it closed.
+    fn release_where(
+        &self,
+        wanted: impl Fn(&Inode) -> bool,
+        mut evicted: impl FnMut(u64),
+    ) -> usize {
         let mut closed = 0;
         for shard in &self.by_id {
             let inodes: Vec<Arc<Inode>> = shard
                 .lock()
                 .expect("inode table poisoned")
                 .iter()
-                .filter(|(id, inode)| **id != ROOT_ID && inode.dev() == dev)
+                .filter(|(id, inode)| **id != ROOT_ID && wanted(inode))
                 .map(|(_, inode)| inode.clone())
                 .collect();
             for inode in inodes {
@@ -1787,6 +1874,24 @@ impl Registry {
             }
         }
         closed
+    }
+
+    /// How many descriptors the share may hold before parking the cold ones.
+    /// Held in the census, where an inode reviving itself can read it, and
+    /// lowered there by [`Registry::relieve_system`].
+    fn budget(&self) -> usize {
+        self.census.budget.load(Ordering::Relaxed)
+    }
+
+    /// The count above which a sweep may no longer be deferred.
+    ///
+    /// Between the budget and this line, sweeps are rate-limited and the count
+    /// breathes: a working set genuinely hotter and larger than the budget is
+    /// a fact, and holding the line by sweeping on every request turns a
+    /// ten-second install into ten minutes of parking the same inodes. Past
+    /// the line, the ceiling is near and EMFILE is worse than any stall.
+    fn red_line(&self) -> usize {
+        self.budget() + self.red_headroom
     }
 
     /// Counts a lookup of an inode we already hold, if we hold it.
@@ -2051,7 +2156,7 @@ impl Registry {
         // longer push the count past the budget at all; the paced sweep is
         // left with only its real job, keeping the RESIDENT set the
         // recently-used one.
-        if (self.census.descriptors() > self.budget && inode.parkable()) || !inode.may_hold() {
+        if (self.census.descriptors() > self.budget() && inode.parkable()) || !inode.may_hold() {
             let _ = inode.park();
         }
         self.by_id[shard(id)]
@@ -2162,7 +2267,7 @@ impl Registry {
         // descriptor count past the budget, or a create storm larger than the
         // budget outruns the sweep and climbs to the kernel's ceiling. A
         // directory keeps its residency privilege (`parkable`).
-        if (self.census.descriptors() > self.budget && inode.parkable()) || !inode.may_hold() {
+        if (self.census.descriptors() > self.budget() && inode.parkable()) || !inode.may_hold() {
             let _ = inode.park();
         }
         self.claim_identity(id, dev, ino);
@@ -2361,7 +2466,7 @@ impl Registry {
         // moment the budget fills, so a busy share sits exactly AT budget —
         // and that is when the paced sweep has its real work, rotating
         // residency toward what is actually being touched.
-        if open < self.budget {
+        if open < self.budget() {
             return;
         }
         // Between the budget and the red line, sweeps are paced, not
@@ -2371,7 +2476,7 @@ impl Registry {
         // count breathing inside the headroom for a fraction of a percent of
         // the machine; at the red line every request sweeps, because the next
         // stop after the headroom is the kernel's ceiling.
-        if open < self.red_line {
+        if open < self.red_line() {
             let now = self.born.elapsed().as_millis() as usize;
             let last = self.last_sweep.load(Ordering::Relaxed);
             if now.saturating_sub(last) < SWEEP_EVERY_MS
@@ -2383,11 +2488,11 @@ impl Registry {
                 return;
             }
         }
-        let slack = (self.budget / SWEEP_SLACK_DIVISOR).max(64);
-        if open <= self.budget + slack && open < self.quiet_until.load(Ordering::Relaxed) {
+        let slack = (self.budget() / SWEEP_SLACK_DIVISOR).max(64);
+        if open <= self.budget() + slack && open < self.quiet_until.load(Ordering::Relaxed) {
             return;
         }
-        let target = self.budget - self.budget / 8;
+        let target = self.budget() - self.budget() / 8;
         let mut examined = 0usize;
         let mut parked_total = 0usize;
         let mut promoted_total = 0usize;
@@ -2447,7 +2552,7 @@ impl Registry {
                         // through, and resident it saves the walk from its
                         // nearest resident ancestor, and the check that the
                         // walk arrived, on every operation inside it.
-                        let room = self.budget.saturating_sub(self.census.descriptors());
+                        let room = self.budget().saturating_sub(self.census.descriptors());
                         if inode.is_dir && promoted_total < room && inode.promote() {
                             promoted_total += 1;
                         }
@@ -2484,7 +2589,7 @@ impl Registry {
         // thread keeps the hand turning and parks whatever is held, reference
         // bit or no, until the count is back under target or it has been all
         // the way around. The others skip past and go back to work.
-        if self.census.descriptors() > self.budget + slack
+        if self.census.descriptors() > self.budget() + slack
             && self
                 .forcing
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -2532,7 +2637,7 @@ impl Registry {
         }
 
         let open = self.census.descriptors();
-        if open > self.budget {
+        if open > self.budget() {
             self.quiet_until
                 .store(open.saturating_add(slack), Ordering::Relaxed);
         }
@@ -2541,10 +2646,10 @@ impl Registry {
         // slack is the other thing, and the next event after it is `EMFILE`
         // inside the guest on a file that is plainly there — which is a
         // miserable thing to diagnose from that end, so it is said here.
-        if open > self.budget + slack && self.should_report() {
+        if open > self.budget() + slack && self.should_report() {
             tracing::warn!(
                 open,
-                budget = self.budget,
+                budget = self.budget(),
                 inodes = self.inode_count(),
                 live = self.census.inodes(),
                 examined,
@@ -2579,11 +2684,16 @@ impl Registry {
     /// Whether a new descriptor would be over the budget — and so parked
     /// the moment it was bound.
     pub fn at_budget(&self) -> bool {
-        self.budget > 0 && self.census.descriptors() >= self.budget
+        self.budget() > 0 && self.census.descriptors() >= self.budget()
     }
 
     pub fn descriptor_usage(&self) -> (usize, usize) {
-        (self.census.descriptors(), self.budget)
+        (self.census.descriptors(), self.budget())
+    }
+
+    /// The pool this share counts into.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
     }
 
     /// How many inodes are live. Diagnostics only.
@@ -2637,6 +2747,12 @@ fn descriptor_red_headroom() -> usize {
     let ceiling = crate::sys::descriptor_ceiling() as usize;
     (ceiling / 32).min(descriptor_budget() / 4).max(64)
 }
+
+/// The fewest descriptors a share's budget is ever lowered to, by a relief
+/// for a full file table ([`Registry::relieve_system`]). Low enough that the
+/// share stops taking the table, and high enough that a share which has been
+/// relieved does not thrash on every open.
+const LOWEST_BUDGET: usize = 1024;
 
 /// How many metadata descriptors one share may hold open.
 ///
@@ -2728,6 +2844,12 @@ mod tests {
             let fd = crate::sys::open_root(&self.0).unwrap();
             let st = crate::sys::stat_fd(fd.as_raw_fd()).unwrap();
             Registry::new(fd, st.st_dev as i64, st.st_ino)
+        }
+
+        fn registry_in(&self, pool: &Pool) -> Registry {
+            let fd = crate::sys::open_root(&self.0).unwrap();
+            let st = crate::sys::stat_fd(fd.as_raw_fd()).unwrap();
+            Registry::in_pool(fd, st.st_dev as i64, st.st_ino, pool)
         }
 
         /// A real file, and the numbers the filesystem gave it.
@@ -3178,6 +3300,96 @@ mod tests {
             worst <= budget * 3,
             "descriptors reached {worst} against a budget of {budget} with everything hot"
         );
+    }
+
+    /// A share as a pool asks it for relief: its registry, enrolled.
+    struct Share(Arc<Registry>);
+
+    impl Release for Share {
+        fn release_device(&self, dev: i64) -> usize {
+            self.0.release_device(dev, |_| {})
+        }
+
+        fn relieve_device(&self, _dev: i64) -> usize {
+            0
+        }
+
+        fn relieve_system(&self) -> usize {
+            self.0.relieve_system(|_| {})
+        }
+    }
+
+    /// A full file table is the whole machine's, so every share in the pool
+    /// lets go of what it holds, and holds a lower budget from then on.
+    #[test]
+    fn a_full_file_table_halves_the_budget_and_parks_what_is_held() {
+        let scratch = Scratch::new("system-full");
+        let pool = Pool::default();
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(&pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        let reg = share.0.clone();
+        reg.census.budget.store(4096, Ordering::Relaxed);
+        for n in 0..300 {
+            let (fd, dev, ino) = scratch.file(&format!("s{n}"));
+            reg.insert(fd, dev, ino, false, false, None);
+        }
+        assert!(reg.descriptor_usage().0 >= 300);
+
+        let closed = pool.relieve_system(crate::errno::linux::ENFILE);
+
+        let (open, budget) = reg.descriptor_usage();
+        assert_eq!(budget, 2048);
+        assert!(closed >= 300, "closed only {closed}");
+        assert!(open < 300, "still holding {open} descriptors");
+        assert_eq!(pool.descriptors(), open);
+    }
+
+    /// Workers refused by one shortage are one event: the first lets go and
+    /// halves the budget, the rest inside the window do not halve it again.
+    /// Once the window has passed, the next shortage halves it again, and it
+    /// stops at the floor.
+    #[test]
+    fn a_relief_inside_its_window_is_not_repeated_and_the_floor_holds() {
+        let scratch = Scratch::new("system-window");
+        let pool = Pool::default();
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(&pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        let reg = share.0.clone();
+        reg.census.budget.store(4096, Ordering::Relaxed);
+        let enfile = crate::errno::linux::ENFILE;
+
+        pool.relieve_system(enfile);
+        assert_eq!(reg.descriptor_usage().1, 2048);
+        assert_eq!(pool.relieve_system(enfile), 0, "inside the window");
+        assert_eq!(reg.descriptor_usage().1, 2048);
+
+        // As if a second had passed since the last relief.
+        let window_passed = || {
+            *pool.relieved.lock().unwrap() =
+                Some(std::time::Instant::now() - crate::remote::RELIEF_EVERY);
+        };
+        window_passed();
+        pool.relieve_system(enfile);
+        assert_eq!(reg.descriptor_usage().1, 1024);
+        window_passed();
+        pool.relieve_system(enfile);
+        assert_eq!(reg.descriptor_usage().1, 1024, "never below the floor");
+    }
+
+    /// A budget already under the floor is a deliberate small one (a test's,
+    /// or an operator's), and a relief does not raise it.
+    #[test]
+    fn a_relief_never_raises_a_budget_already_under_the_floor() {
+        let scratch = Scratch::new("system-small");
+        let pool = Pool::default();
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(&pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        let reg = share.0.clone();
+        reg.census.budget.store(512, Ordering::Relaxed);
+
+        pool.relieve_system(crate::errno::linux::ENFILE);
+
+        assert_eq!(reg.descriptor_usage().1, 512);
     }
 
     /// The budget has to be under what the kernel will actually allow, or it

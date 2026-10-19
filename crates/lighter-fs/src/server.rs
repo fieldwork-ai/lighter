@@ -436,6 +436,14 @@ fn create_job(
                 for _ in &writes {
                     inode.write_applied(Err(errno));
                 }
+                // The create was acknowledged already, so no request is
+                // left to see the refusal and relieve the table: the job
+                // has to. Without it, a create storm into a full table
+                // fails job after job and nothing lets go. A network
+                // volume's refusal is its server's, as in the dispatch.
+                if crate::remote::is_full_table(errno) && inode.remote().is_none() {
+                    registry.pool().relieve_system(errno);
+                }
             }
         }
         // Settled either way: the host directory answers for this name now
@@ -822,6 +830,10 @@ impl crate::inode::Release for Hold {
             .release_device(dev, |id| self.open_cache.evict(id));
         inodes + self.open_cache.evict_remote(dev)
     }
+
+    fn relieve_system(&self) -> usize {
+        self.registry.relieve_system(|id| self.open_cache.evict(id))
+    }
 }
 
 pub struct Server {
@@ -1042,11 +1054,10 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
             });
             match opened {
                 Ok(fd) => Ok(fd),
-                // Its server is out of handles, which asking by another door
-                // would only ask again ([`crate::remote`]).
-                Err(errno) if inode.remote().is_some() && crate::remote::is_refusal(errno) => {
-                    Err(errno)
-                }
+                // Its server is out of handles, or the Mac's file table is
+                // full: asking by another door would only ask again
+                // ([`crate::remote`], [`crate::inode::Inode::refuses`]).
+                Err(errno) if inode.refuses(errno) => Err(errno),
                 // The name has moved on; the file may not have.
                 Err(_) => sys::reopen(inode.reference()?.raw_fd(), linux_flags, 0),
             }
@@ -1425,6 +1436,27 @@ impl Server {
                 op = crate::stats::name(header.opcode),
                 again = ?outcome.as_ref().err(),
                 "an open refused on a network volume"
+            );
+        } else if let Err(errno) = outcome
+            && crate::remote::is_full_table(errno)
+            && self.remote_dev(header.nodeid).is_none()
+        {
+            // The Mac's own file table is full, so no open on this share can
+            // succeed until something lets go. Every share of the machine
+            // does, and holds less from now on ([`Pool::relieve_system`]).
+            // Then the same rule as a refused network open: a request that
+            // only reads is served again once; one that changes something
+            // is answered as it was.
+            let closed = self.pool.relieve_system(errno);
+            if retries_on_refusal(header.opcode) {
+                outcome = self.handle(&header, body, sink.capacity());
+            }
+            tracing::debug!(
+                errno,
+                closed,
+                op = crate::stats::name(header.opcode),
+                again = ?outcome.as_ref().err(),
+                "an open refused while the Mac's file table was full"
             );
         }
         if traced {

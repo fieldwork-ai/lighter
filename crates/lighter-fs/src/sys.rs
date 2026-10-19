@@ -91,6 +91,32 @@ fn check_size(rc: libc::ssize_t) -> Result<usize> {
     }
 }
 
+static REFUSED_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REFUSED_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Test seam: the next `count` opens made here fail with `errno` before they
+/// reach the kernel, as an open does when the Mac's file table is full.
+///
+/// The table belongs to the whole machine, so a test cannot fill it without
+/// breaking everything else on it. This makes a share see the refusal
+/// instead. Nothing calls it outside the tests.
+#[doc(hidden)]
+pub fn refuse_next_opens(errno: i32, count: usize) {
+    REFUSED_ERRNO.store(errno, std::sync::atomic::Ordering::Relaxed);
+    REFUSED_OPENS.store(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The seam's check, first in every open: `Err` while refusals remain.
+///
+/// A single relaxed read when none are pending, which every open pays.
+fn refused_open() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    match REFUSED_OPENS.try_update(Relaxed, Relaxed, |n| n.checked_sub(1)) {
+        Ok(_) => Err(REFUSED_ERRNO.load(Relaxed)),
+        Err(_) => Ok(()),
+    }
+}
+
 /// A guest-supplied name, validated before it can reach a syscall.
 ///
 /// The three rules are not stylistic. An empty name resolves to the directory
@@ -131,6 +157,7 @@ pub fn path_of(fd: RawFd) -> Result<PathBuf> {
 /// Never follows a final symlink, and never blocks: a FIFO opened for reading
 /// waits for a writer, and a server thread that did so would be gone for good.
 pub fn open_reference(parent: RawFd, name: &CStr, is_symlink: bool) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = if is_symlink {
         // O_EVTONLY cannot be combined with O_SYMLINK; the latter already
         // refuses to follow.
@@ -152,6 +179,7 @@ pub fn open_reference(parent: RawFd, name: &CStr, is_symlink: bool) -> Result<Ow
 /// Whether that path still names the same file is the caller's question to ask,
 /// not this function's to answer.
 pub fn open_reference_path(path: &Path, is_symlink: bool) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = if is_symlink {
         O_SYMLINK | libc::O_CLOEXEC | libc::O_NONBLOCK
     } else {
@@ -319,6 +347,7 @@ pub fn reopen(reference: RawFd, linux_flags: u32, mode: u32) -> Result<OwnedFd> 
 
 /// Opens a host path with flags expressed in the *guest's* numbering.
 pub fn open_path(path: &Path, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+    refused_open()?;
     let c = cpath(path)?;
     let flags = translate_open_flags(linux_flags) | libc::O_CLOEXEC;
     // SAFETY: a valid NUL-terminated path; `mode` is only consulted when the
@@ -341,6 +370,7 @@ pub fn open_path(path: &Path, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
 /// `list`), and this costs one name lookup where a reopen by path walked the
 /// whole path from the root.
 pub fn open_directory_self(dir: RawFd) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: a live directory descriptor and a constant path.
     let raw = check(unsafe { libc::openat(dir, c".".as_ptr(), flags) })?;
@@ -350,6 +380,7 @@ pub fn open_directory_self(dir: RawFd) -> Result<OwnedFd> {
 
 /// Opens a name under a directory for real I/O.
 pub fn openat_path(parent: RawFd, name: &CStr, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = translate_open_flags(linux_flags) | libc::O_CLOEXEC;
     // SAFETY: valid name, live directory descriptor.
     let raw = check(unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::c_uint) })?;
