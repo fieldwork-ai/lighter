@@ -1666,6 +1666,17 @@ impl Server {
         self.registry.descriptor_usage()
     }
 
+    /// How many parked inodes this server's pool has revived because a
+    /// request needed one ([`crate::inode::Pool::revived_on_demand`]).
+    pub fn revived_on_demand(&self) -> u64 {
+        self.registry.revived_on_demand()
+    }
+
+    /// Of [`Server::revived_on_demand`], the directories.
+    pub fn dirs_revived_on_demand(&self) -> u64 {
+        self.registry.dirs_revived_on_demand()
+    }
+
     pub fn stats_enabled(&self) -> bool {
         self.stats.enabled()
     }

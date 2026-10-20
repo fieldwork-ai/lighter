@@ -288,6 +288,13 @@ pub struct Pool {
     /// The network volumes the shares have learned, each with what it may
     /// hold of its server's handles ([`crate::remote`]).
     remotes: Arc<crate::remote::Remotes>,
+    /// Revivals of parked inodes across the pool, and of those, the ones a
+    /// sweep tried, promoting a directory into room under the budget. What
+    /// is left is what requests revived ([`Pool::revived_on_demand`]).
+    reopens: Arc<AtomicU64>,
+    promotions: Arc<AtomicU64>,
+    /// Of the revivals, directories'. A sweep promotes only directories.
+    dir_reopens: Arc<AtomicU64>,
 }
 
 /// A share's hold on the Mac's files, which it can let go of a device at a
@@ -359,6 +366,22 @@ impl Pool {
         self.remotes.get(dev)
     }
 
+    /// How many parked inodes the pool's shares have revived because a
+    /// request needed one, leaving out the directories a sweep promoted.
+    ///
+    /// The sweep's promotions follow the clock (a share over budget is swept
+    /// every [`SWEEP_EVERY_MS`]), so a slower run promotes more; what a
+    /// request revives does not depend on how long the run took. [`REOPENS`]
+    /// counts both, and every share's in the process.
+    pub fn revived_on_demand(&self) -> u64 {
+        self.reopens.load(Ordering::Relaxed) - self.promotions.load(Ordering::Relaxed)
+    }
+
+    /// Of [`Pool::revived_on_demand`], the directories.
+    pub fn dirs_revived_on_demand(&self) -> u64 {
+        self.dir_reopens.load(Ordering::Relaxed) - self.promotions.load(Ordering::Relaxed)
+    }
+
     /// Descriptors held across the pool.
     pub fn descriptors(&self) -> usize {
         self.descriptors.load(Ordering::Relaxed)
@@ -385,6 +408,10 @@ pub struct Census {
     /// The pool's network volumes, so an inode can find its own as it is
     /// made.
     remotes: Arc<crate::remote::Remotes>,
+    /// The pool's revivals ([`Pool::revived_on_demand`]).
+    reopens: Arc<AtomicU64>,
+    promotions: Arc<AtomicU64>,
+    dir_reopens: Arc<AtomicU64>,
 }
 
 impl Census {
@@ -1288,6 +1315,10 @@ impl Inode {
         // Every twenty-thousandth revival says where it came from, when the
         // stats are on: the counter alone says how many, not why.
         let nth = REOPENS.fetch_add(1, Ordering::Relaxed);
+        self.census.reopens.fetch_add(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.dir_reopens.fetch_add(1, Ordering::Relaxed);
+        }
         if std::env::var_os("LIGHTER_FS_REOPEN_TRACE").is_some() {
             eprintln!(
                 "REOPEN-TRACE id={} dir={} {}",
@@ -1371,6 +1402,9 @@ impl Inode {
         let Some(parked) = self.parked_at.lock().expect("parked path poisoned").clone() else {
             return false;
         };
+        // Counted as tried, so that a promotion whose directory has gone
+        // is not read as a request's revival.
+        self.census.promotions.fetch_add(1, Ordering::Relaxed);
         let Ok(fd) = self.reopen(&parked) else {
             return false;
         };
@@ -1699,6 +1733,9 @@ impl Registry {
             descriptors: pool.descriptors.clone(),
             resident_dirs: pool.resident_dirs.clone(),
             remotes: pool.remotes.clone(),
+            reopens: pool.reopens.clone(),
+            promotions: pool.promotions.clone(),
+            dir_reopens: pool.dir_reopens.clone(),
             ..Census::default()
         });
         census.budget.store(descriptor_budget(), Ordering::Relaxed);
@@ -2584,6 +2621,18 @@ impl Registry {
 
     pub fn descriptor_usage(&self) -> (usize, usize) {
         (self.census.descriptors(), self.budget)
+    }
+
+    /// How many parked inodes this share's pool has revived because a
+    /// request needed one ([`Pool::revived_on_demand`]).
+    pub fn revived_on_demand(&self) -> u64 {
+        self.census.reopens.load(Ordering::Relaxed) - self.census.promotions.load(Ordering::Relaxed)
+    }
+
+    /// Of [`Registry::revived_on_demand`], the directories.
+    pub fn dirs_revived_on_demand(&self) -> u64 {
+        self.census.dir_reopens.load(Ordering::Relaxed)
+            - self.census.promotions.load(Ordering::Relaxed)
     }
 
     /// How many inodes are live. Diagnostics only.

@@ -66,12 +66,15 @@ impl Sink for Buffer {
     }
 }
 
-/// Held by every test that lowers the fd budget or counts revivals. The
-/// budget is a process-wide variable read when a server is built, and
-/// `REOPENS` a process-wide counter, and cargo runs tests on parallel threads:
-/// without this, one test's reclaim lands inside another's window. CI once
-/// counted 17 revivals against a bound of 16 on a commit that touched only
-/// the worklog.
+/// Held by every test that lowers the fd budget. The budget is a
+/// process-wide variable read when a server is built, and cargo runs tests on
+/// parallel threads: without this, one test's server is built with another's
+/// budget. Revivals are counted per server and without the sweep's promotions
+/// (`Server::revived_on_demand`), not by the process-wide `REOPENS`: every
+/// other test's revivals landed in that, and the promotions follow the clock,
+/// so a loaded machine counted more. CI once counted 17 against a bound of 16
+/// on a commit that touched only the worklog, and a fresh checkout being
+/// indexed counted up to 54.
 static RECLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn reclaim_alone() -> std::sync::MutexGuard<'static, ()> {
@@ -2245,14 +2248,14 @@ fn listing_parked_clones_revives_none_of_them() {
         guest.call(op::LIGHTER_CLONE, dest, &body).expect("clone");
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
-    let before = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed);
+    let before = guest.server.revived_on_demand();
     let mut body = vec![0u8; 40];
     body[16..20].copy_from_slice(&65536u32.to_le_bytes());
     let listing = guest
         .call(op::READDIRPLUS, pkg, &body)
         .expect("readdirplus");
     assert!(listing.len() > 40 * 32, "every entry listed");
-    let revived = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let revived = guest.server.revived_on_demand() - before;
     assert_eq!(revived, 0, "a listing revives nothing");
 }
 
@@ -2279,7 +2282,7 @@ fn a_parked_directory_is_not_revived_by_creating_inside_it() {
     // A create, a lookup, a stat of the name, a mkdir, an unlink and a
     // rename in each parked directory, none of which opens the directory:
     // its nearest resident ancestor and a relative path do the work.
-    let before = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed);
+    let before = guest.server.dirs_revived_on_demand();
     for (n, dir) in dirs.iter().enumerate() {
         let (file, fh) = guest.create(*dir, "made", 0x8241).expect("create");
         guest.write(file, fh, 0, b"x").unwrap();
@@ -2308,12 +2311,12 @@ fn a_parked_directory_is_not_revived_by_creating_inside_it() {
             .expect("rmdir inside");
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
-    let revived = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
-    // The sweep promotes a few directories into headroom as it goes; the
-    // operations themselves revive nothing.
-    assert!(
-        revived <= 16,
-        "working inside parked directories revived {revived} inodes"
+    let revived = guest.server.dirs_revived_on_demand() - before;
+    // The sweep promotes a few directories into headroom as it goes, as many
+    // as the clock gives it sweeps; the operations themselves open none.
+    assert_eq!(
+        revived, 0,
+        "working inside parked directories revived {revived} of them"
     );
     for n in 0..DIRS {
         let left: Vec<_> = std::fs::read_dir(guest.host(&format!("d{n}")))
