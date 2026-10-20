@@ -298,6 +298,11 @@ pub struct Pool {
     /// When the shares last let go because the Mac's file table was full; see
     /// [`Pool::relieve_system`].
     relieved: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// How far the shares' budgets are lowered while the Mac's file table is
+    /// short of room ([`Squeeze`]).
+    squeeze: Arc<Squeeze>,
+    /// Set while one share has the others sweep ([`Pool::reclaim_others`]).
+    reclaiming_others: Arc<AtomicBool>,
 }
 
 /// A share's hold on the Mac's files, which it can let go of a device at a
@@ -316,6 +321,111 @@ pub trait Release: Send + Sync {
     /// [`Registry::relieve_system`].
     fn relieve_system(&self) -> usize {
         0
+    }
+    /// Sweeps this share's cold descriptors, as a request to it would, unless
+    /// it is `asking`: the pool's count is over its budget and the share
+    /// that found it so holds little of it ([`Pool::reclaim_others`]).
+    fn reclaim_unless(&self, _asking: &Registry) {}
+}
+
+/// What an open was refused for want of, when it was room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortage {
+    /// The Mac's file table is full: every share of the machine lets go.
+    Table,
+    /// The server behind this network volume is out of handles: the shares
+    /// let go of what they hold on it ([`crate::remote`]).
+    Volume(i64),
+}
+
+impl Shortage {
+    /// What an open refused with `errno` was short of, on `remote`, the
+    /// device if it is a network volume.
+    ///
+    /// `ENFILE` is the Mac's table on the Mac's own disks. On a network volume
+    /// it may be the server's (a client passes on what the server said), so
+    /// there it is the table only if the table is nearly full when asked.
+    pub fn of(errno: i32, remote: Option<i64>) -> Option<Shortage> {
+        let table_full =
+            || crate::sys::file_table().is_some_and(|(open, most)| open * 16 >= most * 15);
+        if crate::remote::is_full_table(errno) && (remote.is_none() || table_full()) {
+            return Some(Shortage::Table);
+        }
+        match remote {
+            Some(dev) if crate::remote::is_refusal(errno) => Some(Shortage::Volume(dev)),
+            _ => None,
+        }
+    }
+}
+
+/// How far a pool's budgets are lowered because the Mac's file table ran
+/// out of room: each refusal halves them, to no less than [`LOWEST_BUDGET`],
+/// and each [`RECOVER_EVERY`] in which the table has had room since doubles
+/// them back, to where they were.
+///
+/// The table is the whole Mac's, and whatever filled it is usually another
+/// program, so a lowered budget is a loan, not a lesson. A network volume's
+/// allowance is learned, because the server's limit cannot be known; the
+/// table's size can be (`kern.maxfiles`), and how full it is.
+#[derive(Debug, Default)]
+struct Squeeze {
+    halvings: AtomicU32,
+    /// When the budgets last moved, either way.
+    moved: Mutex<Option<std::time::Instant>>,
+}
+
+/// How long a lowered budget is held before it is raised again, a step at a
+/// time, if the Mac's table has room by then.
+const RECOVER_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most a pool's budgets are halved, by refusal after refusal.
+const MOST_HALVINGS: u32 = 8;
+
+impl Squeeze {
+    /// `budget` as it is while the table is short of room.
+    fn apply(&self, budget: usize) -> usize {
+        if self.halvings.load(Ordering::Relaxed) == 0 {
+            return budget;
+        }
+        self.recover();
+        let halvings = self.halvings.load(Ordering::Relaxed);
+        if halvings == 0 {
+            return budget;
+        }
+        // Never below the floor, and never raised: a budget a test or an
+        // operator set below the floor keeps it.
+        (budget >> halvings).max(LOWEST_BUDGET).min(budget)
+    }
+
+    /// Lowers the budgets a step, for a refusal.
+    fn tighten(&self) -> u32 {
+        let mut moved = self.moved.lock().expect("squeeze poisoned");
+        let halvings = (self.halvings.load(Ordering::Relaxed) + 1).min(MOST_HALVINGS);
+        self.halvings.store(halvings, Ordering::Relaxed);
+        *moved = Some(std::time::Instant::now());
+        halvings
+    }
+
+    /// Raises the budgets a step once [`RECOVER_EVERY`] has passed with the
+    /// Mac's table no more than three quarters full. Checked as budgets are
+    /// read, and only while they are lowered.
+    fn recover(&self) {
+        let Ok(mut moved) = self.moved.try_lock() else {
+            return;
+        };
+        if moved.is_some_and(|at| at.elapsed() < RECOVER_EVERY) {
+            return;
+        }
+        *moved = Some(std::time::Instant::now());
+        if !crate::sys::file_table().is_some_and(|(open, most)| open * 4 <= most * 3) {
+            return;
+        }
+        let halvings = self.halvings.load(Ordering::Relaxed).saturating_sub(1);
+        self.halvings.store(halvings, Ordering::Relaxed);
+        tracing::info!(
+            halvings,
+            "the Mac's file table has room again; lighter's shares hold more"
+        );
     }
 }
 
@@ -393,9 +503,9 @@ impl Pool {
     }
 
     /// Has every share of the machine let go of what it holds, because the
-    /// Mac's file table is full (`ENFILE`, `errno`), and holds less from now
-    /// on: each share halves its budget and parks what it holds. Returns how
-    /// many descriptors that closed.
+    /// Mac's file table is full (`ENFILE`, `errno`), and hold less until the
+    /// table has room again: every share parks what it holds idle, and the
+    /// budgets halve ([`Squeeze`]). Returns how many descriptors that closed.
     ///
     /// The table is the Mac's, not a volume's, so this is not per volume the
     /// way [`Pool::relieve_device`] is. It is also not repeated: a shortage is
@@ -416,14 +526,55 @@ impl Pool {
             .iter()
             .filter_map(|h| h.upgrade())
             .collect();
+        let halvings = self.squeeze.tighten();
         let closed: usize = holders.iter().map(|h| h.relieve_system()).sum();
         *relieved = Some(std::time::Instant::now());
         tracing::warn!(
             errno,
             closed,
-            "the Mac's file table is full; lighter let go of what it held and holds less from now on"
+            halvings,
+            "the Mac's file table is full; lighter let go of what it held, and holds less until the table has room again"
         );
         closed
+    }
+
+    /// Lets go of what `shortage` asks, for an open refused with `errno`.
+    /// Returns how many descriptors that closed.
+    pub fn relieve(&self, shortage: Shortage, errno: i32) -> usize {
+        match shortage {
+            Shortage::Table => self.relieve_system(errno),
+            Shortage::Volume(dev) => self.relieve_device(dev, errno),
+        }
+    }
+
+    /// Has every share but `asking` sweep its cold descriptors.
+    ///
+    /// The budget is the pool's, and each share sweeps only its own, so a
+    /// share that had filled the budget and then gone quiet kept it: nothing
+    /// asked it to sweep, and a busy share beside it found the pool over
+    /// budget, parked every descriptor it opened the moment it was bound,
+    /// and had nothing of its own to sweep. One share asks at a time, and a
+    /// share asked does not ask again in turn.
+    fn reclaim_others(&self, asking: &Registry) {
+        if self
+            .reclaiming_others
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let holders: Vec<_> = self
+            .holders
+            .0
+            .lock()
+            .expect("pool holders poisoned")
+            .iter()
+            .filter_map(|h| h.upgrade())
+            .collect();
+        for holder in holders {
+            holder.reclaim_unless(asking);
+        }
+        self.reclaiming_others.store(false, Ordering::Release);
     }
 
     /// Descriptors held across the pool.
@@ -447,8 +598,13 @@ pub struct Census {
     inodes: AtomicUsize,
     /// The registry's descriptor budget, mirrored here so an inode reviving
     /// itself can ask whether there is room without a pointer back to the
-    /// registry. Zero until the registry sets it.
+    /// registry. Zero until the registry sets it. Read through
+    /// [`Census::budget`], which lowers it while the Mac's table is short.
     budget: AtomicUsize,
+    /// The pool's [`Squeeze`].
+    squeeze: Arc<Squeeze>,
+    /// Of the pool's descriptors, the ones this share holds.
+    held: AtomicUsize,
     /// The pool's network volumes, so an inode can find its own as it is
     /// made.
     remotes: Arc<crate::remote::Remotes>,
@@ -461,6 +617,10 @@ pub struct Census {
 impl Census {
     fn descriptors(&self) -> usize {
         self.descriptors.load(Ordering::Relaxed)
+    }
+
+    fn budget(&self) -> usize {
+        self.squeeze.apply(self.budget.load(Ordering::Relaxed))
     }
 
     fn inodes(&self) -> usize {
@@ -550,6 +710,7 @@ impl Inode {
     /// that empties it; split across callers, the tallies drift.
     fn count_resident(&self) {
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
+        self.census.held.fetch_add(1, Ordering::Relaxed);
         if self.is_dir {
             self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
         }
@@ -560,6 +721,7 @@ impl Inode {
 
     fn uncount_resident(&self) {
         self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
+        self.census.held.fetch_sub(1, Ordering::Relaxed);
         if self.is_dir {
             self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
         }
@@ -1329,7 +1491,7 @@ impl Inode {
         // On a network volume a directory too is installed only while the
         // volume has room, and a file never: it would be a handle held on
         // the server until the sweep happened by ([`crate::remote`]).
-        let budget = self.census.budget.load(Ordering::Relaxed);
+        let budget = self.census.budget();
         if budget > 0 && !self.is_dir && self.census.descriptors.load(Ordering::Relaxed) >= budget {
             return Ok(Reference(fd));
         }
@@ -1519,7 +1681,7 @@ impl Inode {
         if !self.is_dir {
             return true;
         }
-        let budget = self.census.budget.load(Ordering::Relaxed);
+        let budget = self.census.budget();
         // The privilege is for the common case, not a right. Past the slack
         // the sweep is already in the regime where it would otherwise force,
         // and a privilege that holds there starves it: pnpm's tree is
@@ -1793,6 +1955,7 @@ impl Registry {
             reopens: pool.reopens.clone(),
             promotions: pool.promotions.clone(),
             dir_reopens: pool.dir_reopens.clone(),
+            squeeze: pool.squeeze.clone(),
             ..Census::default()
         });
         census.budget.store(descriptor_budget(), Ordering::Relaxed);
@@ -1867,22 +2030,17 @@ impl Registry {
         self.release_where(|inode| inode.dev() == dev, evicted)
     }
 
-    /// The share's part of a relief when the Mac's file table is full: the
-    /// budget halves, to no less than [`LOWEST_BUDGET`], and every descriptor
-    /// it holds is parked, as [`Registry::release_device`] parks a volume's.
-    /// Returns how many descriptors that closed.
+    /// The share's part of a relief when the Mac's file table is full:
+    /// every descriptor it holds idle is parked, as
+    /// [`Registry::release_device`] parks a volume's, under the budget the
+    /// pool has just lowered ([`Squeeze`]). Returns how many descriptors that
+    /// closed.
     ///
     /// Parking everything is the blunt answer, and the right one for a table
     /// that is full now: a parked file costs one reopen when it is next used,
     /// and an `ENFILE` costs the workload its open. The lower budget is what
-    /// stops the share filling the table again as soon as the pressure eases.
-    /// Like the budget itself, the lower one stays.
+    /// stops the share filling the table again before it has room.
     pub fn relieve_system(&self, evicted: impl FnMut(u64)) -> usize {
-        let budget = self.budget();
-        // Halved, but never below the floor, and never raised: a share whose
-        // budget a test or an operator set below the floor keeps it.
-        let lowered = (budget / 2).max(LOWEST_BUDGET).min(budget);
-        self.census.budget.store(lowered, Ordering::Relaxed);
         self.quiet_until.store(0, Ordering::Relaxed);
         self.release_where(|_| true, evicted)
     }
@@ -1915,9 +2073,9 @@ impl Registry {
 
     /// How many descriptors the share may hold before parking the cold ones.
     /// Held in the census, where an inode reviving itself can read it, and
-    /// lowered there by [`Registry::relieve_system`].
+    /// lowered while the Mac's file table is short of room ([`Squeeze`]).
     fn budget(&self) -> usize {
-        self.census.budget.load(Ordering::Relaxed)
+        self.census.budget()
     }
 
     /// The count above which a sweep may no longer be deferred.
@@ -2678,6 +2836,12 @@ impl Registry {
             self.quiet_until
                 .store(open.saturating_add(slack), Ordering::Relaxed);
         }
+        // At the pool's budget with most of it held by other shares: this
+        // share has swept what it can, and parks what it opens the moment it
+        // is bound, so the rest is theirs to let go.
+        if open >= self.budget() && self.census.held.load(Ordering::Relaxed) * 2 < open {
+            self.pool.reclaim_others(self);
+        }
         // Sitting at the budget with nothing to park is the reclaim working,
         // not failing: everything it can reach is in use. Drifting past the
         // slack is the other thing, and the next event after it is `EMFILE`
@@ -2849,7 +3013,15 @@ fn descriptor_budget() -> usize {
     // either machine.
     let ceiling = crate::sys::descriptor_ceiling();
     let reserve = (ceiling / 8).max(2048);
-    ((ceiling.saturating_sub(reserve) / 4) * 3).max(1024) as usize
+    let own = (ceiling.saturating_sub(reserve) / 4) * 3;
+    // A fifth of the Mac's file table at most. The process's ceiling is a
+    // third to a half of the table, and every program on the Mac opens from
+    // the table, so three quarters of the ceiling let a cache take a third
+    // of the machine's files (#95: 160,000 of 491,520, the table then filled
+    // by another program, and the user logged out). On a stock Mac the
+    // ceiling is the smaller bound and nothing changes: 6,144 either way.
+    let table = crate::sys::file_table().map_or(u64::MAX, |(_, most)| most / 5);
+    own.min(table).max(1024) as usize
 }
 
 /// `prefix/name`, or `name` alone under a resident directory.
@@ -3366,6 +3538,107 @@ mod tests {
         fn relieve_system(&self) -> usize {
             self.0.relieve_system(|_| {})
         }
+
+        fn reclaim_unless(&self, asking: &Registry) {
+            if !std::ptr::eq(Arc::as_ptr(&self.0), asking) {
+                self.0.reclaim_if_over_budget();
+            }
+        }
+    }
+
+    /// A share enrolled in `pool`, over a scratch directory of its own.
+    fn enrolled(scratch: &Scratch, pool: &Pool, budget: usize) -> Arc<Share> {
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        share.0.census.budget.store(budget, Ordering::Relaxed);
+        share
+    }
+
+    /// A lowered budget is a loan: once the window has passed with the Mac's
+    /// table no more than three quarters full, as it is on a machine running
+    /// tests, it doubles back a step at a time, to where it was.
+    #[test]
+    fn a_lowered_budget_is_raised_again_once_the_table_has_room() {
+        let scratch = Scratch::new("system-recover");
+        let pool = Pool::default();
+        let share = enrolled(&scratch, &pool, 4096);
+        let enfile = crate::errno::linux::ENFILE;
+        pool.relieve_system(enfile);
+        *pool.relieved.lock().unwrap() =
+            Some(std::time::Instant::now() - crate::remote::RELIEF_EVERY);
+        pool.relieve_system(enfile);
+        assert_eq!(share.0.descriptor_usage().1, 1024);
+
+        // Inside the window, nothing moves.
+        assert_eq!(share.0.descriptor_usage().1, 1024);
+        let window_passed = || {
+            *pool.squeeze.moved.lock().unwrap() = Some(std::time::Instant::now() - RECOVER_EVERY);
+        };
+        window_passed();
+        assert_eq!(share.0.descriptor_usage().1, 2048, "not raised a step");
+        window_passed();
+        assert_eq!(share.0.descriptor_usage().1, 4096, "not raised back");
+        window_passed();
+        assert_eq!(
+            share.0.descriptor_usage().1,
+            4096,
+            "raised past where it was"
+        );
+    }
+
+    /// The budget is the pool's and each share sweeps only its own, so a
+    /// share that filled the budget and went quiet used to keep it, while a
+    /// busy share beside it parked everything it opened. The busy share now
+    /// has the quiet one sweep.
+    #[test]
+    fn a_quiet_share_holding_the_pools_budget_is_swept_by_a_busy_one() {
+        let quiet_dir = Scratch::new("pool-quiet");
+        let busy_dir = Scratch::new("pool-busy");
+        let pool = Pool::default();
+        let quiet = enrolled(&quiet_dir, &pool, 256);
+        let busy = enrolled(&busy_dir, &pool, 256);
+        for n in 0..256 {
+            let (fd, dev, ino) = quiet_dir.file(&format!("q{n}"));
+            quiet.0.insert(fd, dev, ino, false, false, None);
+        }
+        let held_quiet = quiet.0.census.held.load(Ordering::Relaxed);
+        assert!(held_quiet >= 250, "the quiet share held only {held_quiet}");
+        for n in 0..64 {
+            let (fd, dev, ino) = busy_dir.file(&format!("b{n}"));
+            busy.0.insert(fd, dev, ino, false, false, None);
+        }
+        assert!(
+            busy.0.census.held.load(Ordering::Relaxed) < 8,
+            "the busy share held its files with the pool at its budget"
+        );
+
+        // The busy share's requests sweep, paced, as they would.
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(SWEEP_EVERY_MS as u64 + 10));
+            busy.0.reclaim_if_over_budget();
+        }
+
+        let held_quiet_after = quiet.0.census.held.load(Ordering::Relaxed);
+        assert!(
+            held_quiet_after <= 224,
+            "the quiet share still holds {held_quiet_after} of the pool's 256"
+        );
+        assert!(pool.descriptors() <= 256);
+    }
+
+    /// `ENFILE` is the Mac's table on its own disks. On a network volume it
+    /// may be the server's, and is the table's only when the table is nearly
+    /// full, which it is not on a machine running tests.
+    #[test]
+    fn enfile_is_the_macs_table_on_its_own_disks_and_the_servers_otherwise() {
+        use crate::errno::linux::{EAGAIN, EMFILE, ENFILE, ENOENT};
+        assert_eq!(Shortage::of(ENFILE, None), Some(Shortage::Table));
+        assert_eq!(Shortage::of(EMFILE, None), None, "EMFILE is the process's");
+        assert_eq!(Shortage::of(ENOENT, None), None);
+        assert_eq!(Shortage::of(EAGAIN, Some(7)), Some(Shortage::Volume(7)));
+        assert_eq!(Shortage::of(EMFILE, Some(7)), Some(Shortage::Volume(7)));
+        assert_eq!(Shortage::of(ENFILE, Some(7)), Some(Shortage::Volume(7)));
+        assert_eq!(Shortage::of(ENOENT, Some(7)), None);
     }
 
     /// A full file table is the whole machine's, so every share in the pool
@@ -3451,6 +3724,12 @@ mod tests {
         assert!(
             budget < ceiling,
             "budget {budget} must be under the ceiling {ceiling}"
+        );
+        // And the Mac's table, which every program opens from (#95).
+        let (_, table) = crate::sys::file_table().unwrap();
+        assert!(
+            budget <= (table / 5).max(1024),
+            "budget {budget} takes more than a fifth of the Mac's table of {table}"
         );
     }
 }

@@ -299,10 +299,11 @@ fn a_per_process_limit_is_not_the_full_table_and_relieves_nothing() {
 /// The create is acknowledged before it is made, so the refusal of its open
 /// reaches no request: it is found in the apply queue, the way the incident
 /// log found it ("an acknowledged create failed to apply", errno 23). The
-/// queue's job has to let the table go, or a storm of creates fails job after
-/// job with nothing relieving it.
+/// guest was told the file exists, so the queue's job lets the table go, as
+/// a request would, and makes the file again; without that, the file a
+/// container had written was never made.
 #[test]
-fn an_acknowledged_create_refused_by_a_full_table_relieves_it_from_the_queue() {
+fn an_acknowledged_create_refused_by_a_full_table_is_made_once_the_table_is_let_go() {
     let _turn = turn();
     // Straight into the queue: a create held back for its grace period would
     // be answered from the held entry, and its job would not have run.
@@ -313,19 +314,19 @@ fn an_acknowledged_create_refused_by_a_full_table_relieves_it_from_the_queue() {
     lighter_fs::sys::refuse_next_opens(ENFILE, 1);
     let acknowledged = guest.create(1, "queued");
     // The job runs on the queue's worker after the request was answered, so
-    // wait for the relief it should make, with a deadline for when it does not.
+    // wait for the file it should make, with a deadline for when it does not.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while guest.server.descriptor_usage().1 == 4096 && std::time::Instant::now() < deadline {
+    while !root.join("queued").exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let budget = guest.server.descriptor_usage().1;
     let made = root.join("queued").exists();
+    let budget = guest.server.descriptor_usage().1;
     finish(&root);
 
     assert!(
         acknowledged.is_ok(),
         "the create was not acknowledged: {acknowledged:?}"
     );
+    assert!(made, "the acknowledged create was never made");
     assert_eq!(budget, 2048, "the queue's refusal did not let the table go");
-    assert!(!made, "the refused create made the file anyway");
 }

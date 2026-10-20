@@ -298,7 +298,7 @@ fn create_job(
         } else {
             flags
         };
-        let result = (|| {
+        let create = || {
             let fd = parent.under_name(&name, |dir, at| {
                 sys::openat_path(
                     dir,
@@ -309,7 +309,21 @@ fn create_job(
             })?;
             let st = sys::stat_fd(fd.as_raw_fd())?;
             Ok((fd, st))
-        })();
+        };
+        let mut result = create();
+        // The guest was told this file exists, so an open refused for want
+        // of room is not the end of it: the job lets go of what the shortage
+        // asks, as a request would, and makes the file again. Nothing was
+        // made by the refused open (the table, or the server, refused it
+        // before the name was), so the second try cannot find a file of its
+        // own in the way.
+        if let Err(errno) = result
+            && let Some(shortage) =
+                crate::inode::Shortage::of(errno, inode.remote().map(|remote| remote.dev()))
+        {
+            registry.pool().relieve(shortage, errno);
+            result = create();
+        }
         match result {
             Ok((fd, mut st)) => {
                 // The bytes promised while the create was held back are the
@@ -435,14 +449,6 @@ fn create_job(
                 registry.release_if_unwanted(inode.id());
                 for _ in &writes {
                     inode.write_applied(Err(errno));
-                }
-                // The create was acknowledged already, so no request is
-                // left to see the refusal and relieve the table: the job
-                // has to. Without it, a create storm into a full table
-                // fails job after job and nothing lets go. A network
-                // volume's refusal is its server's, as in the dispatch.
-                if crate::remote::is_full_table(errno) && inode.remote().is_none() {
-                    registry.pool().relieve_system(errno);
                 }
             }
         }
@@ -833,6 +839,12 @@ impl crate::inode::Release for Hold {
 
     fn relieve_system(&self) -> usize {
         self.registry.relieve_system(|id| self.open_cache.evict(id))
+    }
+
+    fn reclaim_unless(&self, asking: &Registry) {
+        if !std::ptr::eq(Arc::as_ptr(&self.registry), asking) {
+            self.registry.reclaim_if_over_budget();
+        }
     }
 }
 
@@ -1416,47 +1428,27 @@ impl Server {
         });
         let mut outcome = self.handle(&header, body, sink.capacity());
         if let Err(errno) = outcome
-            && crate::remote::is_refusal(errno)
-            && let Some(dev) = self.remote_dev(header.nodeid)
+            && let Some(shortage) =
+                crate::inode::Shortage::of(errno, self.remote_dev(header.nodeid))
         {
-            // The server is out of handles: whatever this request needed
-            // opened was refused, and every share lets go of what it holds
-            // idle on the volume. A request that only reads is then served
-            // again, once, against a server with room. One that changes
-            // something is answered as it was: it may have done part of
-            // its work, and the guest's retry is the one that knows.
-            let closed = self.pool.relieve_device(dev, errno);
+            // Whatever this request needed opened was refused for want of
+            // room: on a network volume's server, whose handles every share
+            // then lets go of, or in the Mac's own file table, which every
+            // share of the machine then lets go of. A request that only reads
+            // is served again, once, against the room that made. One that
+            // changes something is answered as it was: it may have done part
+            // of its work, and the guest's retry is the one that knows.
+            let closed = self.pool.relieve(shortage, errno);
             if retries_on_refusal(header.opcode) {
                 outcome = self.handle(&header, body, sink.capacity());
             }
             tracing::debug!(
-                dev,
+                ?shortage,
                 errno,
                 closed,
                 op = crate::stats::name(header.opcode),
                 again = ?outcome.as_ref().err(),
-                "an open refused on a network volume"
-            );
-        } else if let Err(errno) = outcome
-            && crate::remote::is_full_table(errno)
-            && self.remote_dev(header.nodeid).is_none()
-        {
-            // The Mac's own file table is full, so no open on this share can
-            // succeed until something lets go. Every share of the machine
-            // does, and holds less from now on ([`Pool::relieve_system`]).
-            // Then the same rule as a refused network open: a request that
-            // only reads is served again once; one that changes something
-            // is answered as it was.
-            let closed = self.pool.relieve_system(errno);
-            if retries_on_refusal(header.opcode) {
-                outcome = self.handle(&header, body, sink.capacity());
-            }
-            tracing::debug!(
-                errno,
-                closed,
-                op = crate::stats::name(header.opcode),
-                again = ?outcome.as_ref().err(),
-                "an open refused while the Mac's file table was full"
+                "an open refused for want of room"
             );
         }
         if traced {

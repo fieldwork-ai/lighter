@@ -212,6 +212,20 @@ pub fn descriptor_ceiling() -> u64 {
     soft.min(sysctl_u64(c"kern.maxfilesperproc").unwrap_or(10_240))
 }
 
+/// The Mac's file table: how many files are open across the whole machine,
+/// and the most that may be (`kern.num_files`, `kern.maxfiles`).
+///
+/// Every process's descriptors come out of the one table, and a full table
+/// fails opens everywhere with `ENFILE`, which is how a Mac logs its user
+/// out; a process's own ceiling ([`descriptor_ceiling`]) is a third to a half
+/// of it.
+pub fn file_table() -> Option<(u64, u64)> {
+    Some((
+        sysctl_u64(c"kern.num_files")?,
+        sysctl_u64(c"kern.maxfiles")?,
+    ))
+}
+
 /// Raises this process's descriptor limit as far as the system allows.
 ///
 /// Not housekeeping. A share holds one descriptor per inode the guest is
