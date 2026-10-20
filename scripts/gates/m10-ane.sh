@@ -153,12 +153,18 @@ if docker logs "$container" 2>&1 | grep -q '^PACING'; then
 	mark="$(wc -l < "$LOG")"
 	# The stream holds the cap at 5 ms; the windows must stay at the resting
 	# 50 µs, or every idle vCPU spins four times as long for a detector.
-	idle="$(docker run --rm --privileged alpine sh -c 'cat /sys/module/idle/parameters/poll_ns; cat /sys/module/idle/parameters/limits' 2>/dev/null)"
-	cap="$(echo "$idle" | head -1)"; widest="$(echo "$idle" | tail -1 | tr ' ' '\n' | grep . | sort -n | tail -1)"
-	if [ "$cap" = 5000000 ] && [ -n "$widest" ] && [ "$widest" -le 50000 ]; then
-		pass "with the stream open the cap is 5 ms and every window rests at 50 µs or less (widest $widest ns)"
+	# Read five times, half a second apart, by one container: a window widens
+	# for a moment when a wakeup lands inside it, and a single reading once
+	# caught one at the cap on a busy Mac (2026-10-20). Windows that do not
+	# rest stay wide in every reading; three of five at rest is resting.
+	readings="$(docker run --rm --privileged alpine sh -c 'for i in 1 2 3 4 5; do echo "$(cat /sys/module/idle/parameters/poll_ns) $(cat /sys/module/idle/parameters/limits | tr " " "\n" | grep . | sort -n | tail -1)"; sleep 0.5; done' 2>/dev/null)"
+	cap="$(echo "$readings" | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+	widest="$(echo "$readings" | awk '{print $2}' | sort -n | tail -1)"
+	resting="$(echo "$readings" | awk '$2 != "" && $2 <= 50000' | wc -l | tr -d ' ')"
+	if [ "$cap" = 5000000 ] && [ "${resting:-0}" -ge 3 ]; then
+		pass "with the stream open the cap is 5 ms and every window rests at 50 µs or less (${resting} of 5 readings; widest seen $widest ns)"
 	else
-		fail "with the stream open: cap ${cap:-?}, widest window ${widest:-?} ns (want 5000000 and at most 50000)"
+		fail "with the stream open: cap ${cap:-?}, every window at 50 µs or less in ${resting:-0} of 5 readings (widest ${widest:-?} ns; want 5000000 and three)"
 	fi
 	# top's first sample is since the process began; the mean of the next six.
 	cpu="$(top -l 7 -s 2 -pid "$VMM_PID" -stats cpu 2>/dev/null | awk '/^[0-9.]+ *$/{n++; if (n>1) {s+=$1; c++}} END{if (c) printf "%.1f", s/c}')"

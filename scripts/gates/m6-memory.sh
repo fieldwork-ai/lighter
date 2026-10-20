@@ -235,6 +235,7 @@ answers 10 || fail "Docker stopped answering while the guest was merely short"
 before_floor="$(field ballooned_mib)"
 puffs_before="$(grep -ac 'Out of puff' "$LOG" || true)"
 count_before="$(count)"
+floor_mark="$(wc -l < "$LOG")"
 echo warn > "$PRESSURE_FILE"
 sleep 20
 if answers 10; then pass "Docker answers 20s into a Warn floor on a short guest"; else fail "Docker stopped answering under the floor"; fi
@@ -249,8 +250,26 @@ if grep -aq "balloon ramp held" "$LOG"; then
 else
 	fail "the ramp was not held; the policy took the quarter from a short guest"
 fi
-grew=$(( $(field ballooned_mib) - ${before_floor:-0} ))
-[ "$grew" -le 256 ] && pass "the balloon grew ${grew} MiB under the held ramp" || fail "the balloon grew ${grew} MiB under a ramp that should have been held"
+now_ballooned="$(field ballooned_mib)"
+grew=$(( ${now_ballooned:-0} - ${before_floor:-0} ))
+# On an overcommitted Mac the policy is already ramping for the Mac's own
+# pressure when the floor goes in, and a short guest that the balloon comes
+# down for is fine again a few seconds later, so the ramp resumes and is held
+# again: the balloon goes round a cycle, and where two samples fall on it is
+# chance (768 then 1280 MiB on 2026-10-20, held at 1280 each time). What a hold
+# promises is that the balloon stays at what it had when it was held, so
+# there it is judged by that: no higher than the most a hold since the floor
+# held it at.
+held_at="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | tail -n +"$((floor_mark + 1))" \
+	| grep -a "balloon ramp held" | grep -oE 'held_mib=[0-9]+' | cut -d= -f2 | sort -n | tail -1)"
+overcommitted_now="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a "host overcommitment changed" | tail -1 || true)"
+if [[ "$overcommitted_now" == *"overcommitted=true"* ]] && [ -n "$held_at" ]; then
+	[ "${now_ballooned:-0}" -le $((held_at + 256)) ] \
+		&& pass "the balloon stayed at what the held ramp had: ${now_ballooned:-0} MiB, held at ${held_at} (the Mac is overcommitted, so the ramp was already moving)" \
+		|| fail "the balloon grew to ${now_ballooned:-0} MiB past the ${held_at} MiB the ramp was held at"
+else
+	[ "$grew" -le 256 ] && pass "the balloon grew ${grew} MiB under the held ramp" || fail "the balloon grew ${grew} MiB under a ramp that should have been held"
+fi
 puffs=$(( $(grep -ac 'Out of puff' "$LOG" || true) - puffs_before ))
 [ "$puffs" -le 10 ] && pass "${puffs} failed inflations while held" || fail "${puffs} failed inflations: the driver is retrying against a guest with nothing to give"
 docker rm -f m6-short >/dev/null 2>&1
