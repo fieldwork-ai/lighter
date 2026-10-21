@@ -1193,9 +1193,17 @@ impl Server {
         let watcher = if polled.caching() || pushed.caching() {
             match Watcher::start(
                 root,
-                // Short enough that the guest's staleness is dominated by the
-                // channel rather than by FSEvents' own coalescing window.
-                std::time::Duration::from_millis(10),
+                // How long FSEvents may hold a change back to coalesce it.
+                // The guest finds a file the Mac just made by looking it up,
+                // which is answered from the disk at once, while a change to
+                // a file it has cached reaches it only through this stream:
+                // a Mac program that wrote a file and then a marker beside
+                // it had a container, waiting for the marker, read the old
+                // contents for as long as the change was held back. At 10 ms
+                // a probe of exactly that saw them one boot in five; at 1 ms,
+                // none in five, and the Mac touching 20,000 watched files cost
+                // the VM no more.
+                std::time::Duration::from_millis(1),
                 Box::new(Invalidator::new(
                     root,
                     policy.clone(),
