@@ -578,12 +578,39 @@ pub fn readlink_at(parent: RawFd, name: &CStr) -> Result<Vec<u8>> {
 /// between reading the path and using it is the same window every other
 /// path-based syscall has, and the alternative is not supporting device nodes
 /// and FIFOs at all.
+/// A FIFO, or a regular file, under a directory. Relative to the directory's
+/// descriptor, like every other call here: rebuilt as a whole path, a FIFO
+/// deeper than macOS's 1,024 characters failed with the ENOSPC of the
+/// F_GETPATH that would not fit it, where a file at the same depth was made
+/// (pjdfstest mkfifo/03). A regular file is created rather than mknod'd,
+/// which Linux allows and macOS does not.
 pub fn mknod_at(parent: RawFd, name: &CStr, mode: u32, rdev: u32) -> Result<()> {
-    let mut path = path_of(parent)?;
-    path.push(OsStr::from_bytes(name.to_bytes()));
-    let c = cpath(&path)?;
-    // SAFETY: a valid NUL-terminated path.
-    check(unsafe { libc::mknod(c.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t) }).map(|_| ())
+    if mode & libc::S_IFMT as u32 == libc::S_IFREG as u32 || mode & libc::S_IFMT as u32 == 0 {
+        let flags =
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: valid name, live directory descriptor.
+        let fd = check(unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                flags,
+                (mode & 0o7777) as libc::c_uint,
+            )
+        })?;
+        // SAFETY: the descriptor just opened.
+        unsafe { libc::close(fd) };
+        return Ok(());
+    }
+    // SAFETY: valid name, live directory descriptor.
+    check(unsafe {
+        libc::mknodat(
+            parent,
+            name.as_ptr(),
+            mode as libc::mode_t,
+            rdev as libc::dev_t,
+        )
+    })
+    .map(|_| ())
 }
 
 pub fn chmod_at(parent: RawFd, name: &CStr, mode: u32) -> Result<()> {

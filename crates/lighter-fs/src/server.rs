@@ -3232,7 +3232,23 @@ impl Server {
             let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
             let wanted = self.requested_owner(valid, body, owner)?;
             if wanted != owner {
-                let mode = self.permissions_of(&inode)?;
+                let mut mode = self.permissions_of(&inode)?;
+                // A chown drops what would let the new owner run the file
+                // as the old one: setuid, and setgid where the group may
+                // execute it, as Linux does for root too and as macOS would
+                // were the file chowned there. The server claims that duty
+                // (FUSE_HANDLE_KILLPRIV) and it is the record, not the file,
+                // that changes owner, so nothing else does it.
+                if !inode.is_dir {
+                    let setgid = if mode & 0o010 != 0 { 0o2000 } else { 0 };
+                    let dropped = mode & !(0o4000 | setgid);
+                    if dropped != mode {
+                        if self.volumes.keeps_permissions(inode.dev()) {
+                            sys::chmod_at(libc::AT_FDCWD, &path, servable(dropped, false))?;
+                        }
+                        mode = dropped;
+                    }
+                }
                 self.record_owner(&inode, None, &path, wanted, mode)?;
             }
         }

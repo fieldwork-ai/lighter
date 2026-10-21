@@ -1588,6 +1588,53 @@ fn a_socket_and_a_device_node_are_made_and_seen_as_what_they_are() {
     assert_eq!(entry_kind(&reply).0 & libc::S_IFMT as u32, sock);
 }
 
+/// A chown drops setuid, and setgid where the group may execute, so the new
+/// owner cannot run the file as the old one (pjdfstest chown/00).
+#[test]
+fn a_chown_drops_setuid_and_setgid() {
+    let mut guest = Guest::new("chown-setid");
+    let (nodeid, _) = guest
+        .create_mode(1, "tool", 0o1 | 0o100, 0o755)
+        .expect("create");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&fuse::fattr::MODE.to_le_bytes());
+    body[68..72].copy_from_slice(&0o6755u32.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).expect("chmod");
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&(fuse::fattr::UID | fuse::fattr::GID).to_le_bytes());
+    body[76..80].copy_from_slice(&65534u32.to_le_bytes());
+    body[80..84].copy_from_slice(&65534u32.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).expect("chown");
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o755);
+    assert_eq!(host_mode(&guest.host("tool")), 0o755);
+}
+
+/// A FIFO deeper than macOS's 1,024-character paths is made like a file at
+/// the same depth: relative to its directory, never by its whole path.
+#[test]
+fn a_fifo_is_made_deeper_than_a_mac_path_can_be() {
+    let mut guest = Guest::new("deep-fifo");
+    let name = "d".repeat(200);
+    let mut dir = 1;
+    for _ in 0..6 {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(&name));
+        let reply = guest.call(op::MKDIR, dir, &body).expect("mkdir");
+        dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let fifo = libc::S_IFIFO as u32;
+    let reply = guest
+        .call(op::MKNOD, dir, &mknod_body(fifo | 0o644, 0, "f"))
+        .expect("mknod fifo");
+    assert_eq!(entry_kind(&reply).0, fifo | 0o644);
+}
+
 #[test]
 fn a_file_the_guest_has_open_survives_its_deletion_on_the_host() {
     let mut guest = Guest::new("notice-host-delete");
