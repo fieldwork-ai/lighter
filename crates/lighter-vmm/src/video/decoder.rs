@@ -574,11 +574,13 @@ impl Session {
                     );
                 }
                 Some(Ok(desc)) => {
-                    if let Some(old) = self.vt.take() {
+                    let replaced = self.vt.take().inspect(|old| {
                         old.flush();
+                    });
+                    if replaced.is_some() {
                         self.collect(true);
                     }
-                    self.start_session(desc);
+                    self.start_session(desc, replaced.is_some());
                 }
                 Some(Err(st)) => {
                     tracing::warn!(st, codec = ?self.codec, "VideoToolbox refused the stream's parameter sets");
@@ -621,8 +623,10 @@ impl Session {
     }
 
     /// A VideoToolbox session for the stream as the parser now describes
-    /// it, and what that changes for the guest.
-    fn start_session(&mut self, desc: FormatDescription) {
+    /// it, and what that changes for the guest. `replacing` is whether a
+    /// session decoded this stream before it: only then is there an old
+    /// format whose frames a LAST buffer ends.
+    fn start_session(&mut self, desc: FormatDescription, replacing: bool) {
         self.take_depth(true);
         let ten_bit = self.parser.ten_bit();
         tracing::debug!(
@@ -657,6 +661,23 @@ impl Session {
         // asks nothing of it, and ffmpeg, finding the format it asks after
         // the event unchanged, keeps the buffers it has and stops at the
         // LAST buffer as at the end of the stream.
+        // The first session, for a stream the guest already set CAPTURE up
+        // for and turned on: the size it asked for, not a change of it.
+        // ffmpeg does this when the container or an RTSP session
+        // description gave it the size, and a live stream joined between
+        // keyframes then reaches its first parameter sets with CAPTURE
+        // running. Answered as a change, the LAST buffer that ended a format
+        // nothing was decoded in ended the stream for ffmpeg after one
+        // frame (#98).
+        if !replacing
+            && self.capture_streaming
+            && dims == self.coded_size
+            && self.capture_fourcc == fourcc
+        {
+            self.stream.coded_size = dims;
+            self.stream.visible_rect = Rect::new(0, 0, dims.0, dims.1);
+            return;
+        }
         if dims != self.stream.coded_size || self.capture_fourcc != fourcc {
             tracing::info!(
                 from = format_args!("{}x{}", self.stream.coded_size.0, self.stream.coded_size.1),
@@ -666,7 +687,7 @@ impl Session {
             );
             // Mid-stream, the old format's frames (all flushed) end with a
             // LAST buffer before any of the new one.
-            if self.capture_streaming {
+            if self.capture_streaming && replacing {
                 self.ready.push_back(Ready::Last(self.generation));
             }
             self.generation += 1;
@@ -1543,6 +1564,55 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
         );
+    }
+
+    #[test]
+    fn capture_set_up_before_the_first_parameter_sets_is_the_stream_not_a_change() {
+        use crate::video::h264::tests::REOLINK_PPS;
+        let annexb = |nals: &[&[u8]]| -> Vec<u8> {
+            nals.iter()
+                .flat_map(|nal| [&[0u8, 0, 0, 1][..], nal].concat())
+                .collect()
+        };
+        let stamp = bindings::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let sps: &[u8] = &[
+            0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00,
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58,
+        ];
+        // ffmpeg reading a live RTSP stream: the session description gave
+        // it the size, so CAPTURE is set up and on before the first
+        // keyframe's parameter sets arrive.
+        let mut s = Session::new(Codec::H264);
+        s.coded_size = (1920, 1080);
+        s.capture_streaming = true;
+        let before = s.generation;
+        s.feed(annexb(&[sps, REOLINK_PPS]), 0, stamp).unwrap();
+        assert_eq!(s.generation, before);
+        assert!(!s.ready.iter().any(|r| matches!(r, Ready::Last(_))));
+        assert!(
+            !s.events
+                .iter()
+                .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
+        );
+        assert_eq!(s.stream.coded_size, (1920, 1080));
+
+        // Set up for another size, it is told of the stream's, but no
+        // LAST buffer ends a format nothing was decoded in.
+        let mut s = Session::new(Codec::H264);
+        s.coded_size = (1280, 720);
+        s.capture_streaming = true;
+        s.feed(annexb(&[sps, REOLINK_PPS]), 0, stamp).unwrap();
+        assert!(!s.ready.iter().any(|r| matches!(r, Ready::Last(_))));
+        assert!(
+            s.events
+                .iter()
+                .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
+        );
+        let f = s.capture_format();
+        assert_eq!((f.width, f.height), (1920, 1080));
     }
 
     #[test]
