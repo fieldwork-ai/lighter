@@ -283,7 +283,6 @@ pub struct AttrOverride {
 #[derive(Debug, Clone, Default)]
 pub struct Pool {
     descriptors: Arc<AtomicUsize>,
-    resident_dirs: Arc<AtomicUsize>,
     holders: Arc<Holders>,
     /// The network volumes the shares have learned, each with what it may
     /// hold of its server's handles ([`crate::remote`]).
@@ -322,6 +321,7 @@ pub trait Release: Send + Sync {
     fn relieve_system(&self) -> usize {
         0
     }
+
     /// Sweeps this share's cold descriptors, as a request to it would, unless
     /// it is `asking`: the pool's count is over its budget and the share
     /// that found it so holds little of it ([`Pool::reclaim_others`]).
@@ -589,8 +589,6 @@ pub struct Census {
     /// Open metadata descriptors, across the share's [`Pool`]. The number
     /// the budget is about.
     descriptors: Arc<AtomicUsize>,
-    /// Of those, directories. See [`Inode::parkable`].
-    resident_dirs: Arc<AtomicUsize>,
     /// Live `Inode` values, as against how many the table lists. The two
     /// disagreeing means something is holding `Arc`s the table has already
     /// forgotten, which from the outside looks exactly like a descriptor leak
@@ -711,9 +709,6 @@ impl Inode {
     fn count_resident(&self) {
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
         self.census.held.fetch_add(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
-        }
         if let Some(remote) = &self.remote {
             remote.held();
         }
@@ -722,23 +717,22 @@ impl Inode {
     fn uncount_resident(&self) {
         self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
         self.census.held.fetch_sub(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
-        }
         if let Some(remote) = &self.remote {
             remote.released();
         }
     }
 
     /// Whether this inode may keep a descriptor of its own between
-    /// operations. On a network volume only a directory may, while the
-    /// volume has room ([`crate::remote`]): a file there is reached through
-    /// its directory and its name, and every descriptor held is a handle on
-    /// a server that has only so many.
+    /// operations: a directory, which every name inside it is reached
+    /// through, and on a network volume only while the volume has room
+    /// ([`crate::remote`]). A file never does. It is reached through its
+    /// directory and its name, or its identity, when it is needed; held, one
+    /// per file the guest remembered came to a hundred thousand descriptors
+    /// on a large tree and bought nothing, because a metadata-only descriptor
+    /// does not keep an open file's contents either. What does is the guest
+    /// saying which files it has open ([`crate::server`], guest patch 0057).
     fn may_hold(&self) -> bool {
-        self.remote
-            .as_ref()
-            .is_none_or(|remote| self.is_dir && remote.room())
+        self.is_dir && self.remote.as_ref().is_none_or(|remote| remote.room())
     }
 
     /// The network volume this inode is on, if it is on one.
@@ -1475,26 +1469,14 @@ impl Inode {
             .clone()
             .ok_or(crate::errno::linux::ESTALE)?;
         let fd = Arc::new(self.reopen(&parked)?);
-        // A file revived into a full share serves this one operation and is
-        // dropped with it: it needs no descriptor of its own — its parent's
-        // and its name do everything (`locate`) — and installing one only
-        // makes the sweep park something else, which the next operation
-        // revives in turn. A directory is the opposite case and is always
-        // installed. It is what every name inside it is reached through, and
-        // reviving it transiently meant reviving its parent transiently too,
-        // and that one's parent: profiled at the stock budget, one `openat`
-        // per level of the tree on every lookup and every queued job, which
-        // was most of what the server did. Installed, it stays until the
-        // sweep finds it cold, and the chain above a working directory is
-        // resident the next time.
-        //
-        // On a network volume a directory too is installed only while the
-        // volume has room, and a file never: it would be a handle held on
-        // the server until the sweep happened by ([`crate::remote`]).
-        let budget = self.census.budget();
-        if budget > 0 && !self.is_dir && self.census.descriptors.load(Ordering::Relaxed) >= budget {
-            return Ok(Reference(fd));
-        }
+        // A file's descriptor serves this one operation and is dropped with
+        // it (`may_hold`). A directory's is installed. It is what every name
+        // inside it is reached through, and reviving it transiently meant
+        // reviving its parent transiently too, and that one's parent:
+        // profiled at the stock budget, one `openat` per level of the tree on
+        // every lookup and every queued job, which was most of what the
+        // server did. Installed, it stays until the sweep finds it cold, and
+        // the chain above a working directory is resident the next time.
         if !self.may_hold() {
             return Ok(Reference(fd));
         }
@@ -1663,34 +1645,6 @@ impl Inode {
         self.held.store(false, Ordering::Relaxed);
         self.uncount_resident();
         true
-    }
-
-    /// Whether the polite sweep may park this inode.
-    ///
-    /// A parked file costs nothing until that file is touched again. A parked
-    /// directory taxes every name inside it: each lookup revives it by path —
-    /// an `open` against the host, at a full share transiently, so every
-    /// lookup — and a package install is nothing but lookups into the
-    /// directories it just made. Profiled mid-install, that revival was the
-    /// single hottest frame on the request thread. So directories stay
-    /// resident while they are less than half the budget, which on a stock
-    /// Mac is three thousand of them; only past that do they compete with
-    /// files, and the forced phase, which exists for the case where nothing
-    /// else works, ignores this entirely.
-    fn parkable(&self) -> bool {
-        if !self.is_dir {
-            return true;
-        }
-        let budget = self.census.budget();
-        // The privilege is for the common case, not a right. Past the slack
-        // the sweep is already in the regime where it would otherwise force,
-        // and a privilege that holds there starves it: pnpm's tree is
-        // directories most of the way down, and with them exempt a pass
-        // examined eight thousand inodes and parked none while every request
-        // swept. Under pressure a directory is an ordinary candidate.
-        let slack = (budget / SWEEP_SLACK_DIVISOR).max(64);
-        self.census.descriptors.load(Ordering::Relaxed) > budget + slack
-            || self.census.resident_dirs.load(Ordering::Relaxed) > budget / 2
     }
 
     /// Whether this inode is still the file those numbers name.
@@ -1950,7 +1904,6 @@ impl Registry {
         // take the whole mount with it.
         let census = Arc::new(Census {
             descriptors: pool.descriptors.clone(),
-            resident_dirs: pool.resident_dirs.clone(),
             remotes: pool.remotes.clone(),
             reopens: pool.reopens.clone(),
             promotions: pool.promotions.clone(),
@@ -2119,15 +2072,17 @@ impl Registry {
     }
 
     /// Whether a new inode on `dev` would be parked the moment it was
-    /// bound: the share is at its budget, or `dev` is a network volume
-    /// that keeps no descriptor for it.
+    /// bound: always for a file, which holds no descriptor (`may_hold`); for
+    /// a directory when the share is at its budget, or `dev` is a network
+    /// volume without room for another.
     pub fn parks_new(&self, dev: i64, is_dir: bool) -> bool {
-        self.at_budget()
+        !is_dir
+            || self.at_budget()
             || self
                 .census
                 .remotes
                 .get(dev)
-                .is_some_and(|remote| !is_dir || !remote.room())
+                .is_some_and(|remote| !remote.room())
     }
 
     /// Whether files on `dev` are told apart by birth time as well.
@@ -2351,7 +2306,7 @@ impl Registry {
         // longer push the count past the budget at all; the paced sweep is
         // left with only its real job, keeping the RESIDENT set the
         // recently-used one.
-        if (self.census.descriptors() > self.budget() && inode.parkable()) || !inode.may_hold() {
+        if self.census.descriptors() > self.budget() || !inode.may_hold() {
             let _ = inode.park();
         }
         self.by_id[shard(id)]
@@ -2418,6 +2373,9 @@ impl Registry {
             self.census.clone(),
         ));
         inode.id.store(id, Ordering::Relaxed);
+        // Born with the one lookup a create's reply owes; this one is owed
+        // none until a reply names it.
+        *inode.lookups.lock().expect("lookup count poisoned") = 0;
         inode.bind_parked(dev, ino, birthtime);
         inode.set_born(self.born_on(dev, Some(birthtime)));
         self.by_id[shard(id)]
@@ -2460,9 +2418,9 @@ impl Registry {
         inode.set_born(self.born_on(dev, birthtime));
         // The same admission control as `insert`: a bind must not push the
         // descriptor count past the budget, or a create storm larger than the
-        // budget outruns the sweep and climbs to the kernel's ceiling. A
-        // directory keeps its residency privilege (`parkable`).
-        if (self.census.descriptors() > self.budget() && inode.parkable()) || !inode.may_hold() {
+        // budget outruns the sweep and climbs to the kernel's ceiling. A file
+        // holds nothing at all (`may_hold`).
+        if self.census.descriptors() > self.budget() || !inode.may_hold() {
             let _ = inode.park();
         }
         self.claim_identity(id, dev, ino);
@@ -2692,10 +2650,9 @@ impl Registry {
         let mut parked_total = 0usize;
         let mut promoted_total = 0usize;
         // Why the pass skipped what it saw: the numbers that say whether a
-        // sweep that frees nothing is looking at a hot set, a parked set, a
-        // privileged set, or files it cannot park (unlinked, nlink zero).
-        let (mut skip_unheld, mut skip_used, mut skip_privileged, mut skip_unparkable) =
-            (0usize, 0usize, 0usize, 0usize);
+        // sweep that frees nothing is looking at a hot set, a parked set, or
+        // directories it cannot park (removed, or no path to come back by).
+        let (mut skip_unheld, mut skip_used, mut skip_unparkable) = (0usize, 0usize, 0usize);
 
         while examined < SWEEP_STEPS && parked_total < SWEEP_TAKE {
             if self.census.descriptors() <= target {
@@ -2760,10 +2717,6 @@ impl Registry {
                     skip_used += 1;
                     continue;
                 }
-                if !inode.parkable() {
-                    skip_privileged += 1;
-                    continue;
-                }
                 // Parked outside the shard lock: parking stats and closes a
                 // descriptor, and holding the lock across those would stall
                 // every worker whose path runs through that shard.
@@ -2813,16 +2766,6 @@ impl Registry {
                     if !inode.held.load(Ordering::Relaxed) {
                         continue;
                     }
-                    // Files first, here too. Parking a hot directory by force
-                    // was measured as a hundred milliseconds per directory on
-                    // a tree walk: the walk revived it, revival re-admitted
-                    // it, the count crossed the slack, and this pass swept
-                    // the whole hand again — per readdir, for sixteen minutes.
-                    // `parkable` still lets directories go once they alone
-                    // exceed half the budget, so this always terminates.
-                    if !inode.parkable() {
-                        continue;
-                    }
                     if inode.park() {
                         parked_total += 1;
                     }
@@ -2857,7 +2800,6 @@ impl Registry {
                 parked = parked_total,
                 unheld = skip_unheld,
                 used = skip_used,
-                privileged = skip_privileged,
                 unparkable = skip_unparkable,
                 "the share is holding more descriptors than it may"
             );
@@ -3086,6 +3028,15 @@ mod tests {
             (fd, meta.dev() as i64, meta.ino())
         }
 
+        /// A real directory, and the numbers the filesystem gave it.
+        fn dir(&self, name: &str) -> (OwnedFd, i64, u64) {
+            let path = self.0.join(name);
+            std::fs::create_dir(&path).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            let fd = crate::sys::open_path(&path, 0, 0).unwrap();
+            (fd, meta.dev() as i64, meta.ino())
+        }
+
         fn link(&self, from: &str, to: &str) -> OwnedFd {
             std::fs::hard_link(self.0.join(from), self.0.join(to)).unwrap();
             crate::sys::open_path(&self.0.join(to), 0, 0).unwrap()
@@ -3272,14 +3223,33 @@ mod tests {
     /// answering to the same nodeid and the same numbers, and the next use
     /// reopens it.
     #[test]
+    fn a_file_holds_no_descriptor() {
+        // A file is reached by its parent and name, or its identity, each
+        // time it is needed; only a directory, which every name inside it is
+        // reached through, keeps one.
+        let scratch = Scratch::new("file-unheld");
+        let reg = scratch.registry();
+        let root_held = reg.descriptor_usage().0;
+        let (fd, dev, ino) = scratch.file("plain");
+        let id = reg.insert(fd, dev, ino, false, false, None);
+        assert_eq!(reg.descriptor_usage().0, root_held);
+        let inode = reg.get(id).unwrap();
+        let reference = inode.reference().expect("a file reopens when needed");
+        let st = crate::sys::stat_fd(reference.raw_fd()).unwrap();
+        assert_eq!((st.st_dev as i64, st.st_ino), (dev, ino));
+        drop(reference);
+        assert_eq!(reg.descriptor_usage().0, root_held);
+    }
+
+    #[test]
     fn a_parked_inode_comes_back() {
         let scratch = Scratch::new("park-revive");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("parked");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("parked");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
 
-        assert!(inode.park(), "an ordinary file must be parkable");
+        assert!(inode.park(), "a directory must be parkable");
         assert!(
             inode.fd.read().unwrap().is_none(),
             "parking must actually let the descriptor go"
@@ -3298,41 +3268,25 @@ mod tests {
     fn a_parked_inode_whose_name_was_taken_is_stale() {
         let scratch = Scratch::new("park-stolen");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("victim");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("victim");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
 
         let path = scratch.0.join("victim");
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"someone else").unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
 
         assert_eq!(
             inode.reference().err(),
             Some(crate::errno::linux::ESTALE),
-            "a reopen that lands on another file must not be handed out"
+            "a reopen that lands on another directory must not be handed out"
         );
     }
 
     /// An unlinked file has no path to be reopened by, and its descriptor is
     /// the only thing keeping the guest's open handle working. Parking it
     /// would lose the file.
-    #[test]
-    fn an_unlinked_inode_is_never_parked() {
-        let scratch = Scratch::new("park-unlinked");
-        let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("doomed");
-        let id = reg.insert(fd, dev, ino, false, false, None);
-        std::fs::remove_file(scratch.0.join("doomed")).unwrap();
-
-        let inode = reg.get(id).unwrap();
-        assert!(
-            !inode.park(),
-            "a file with no links must keep its descriptor"
-        );
-        assert!(inode.reference().is_ok());
-    }
-
     /// A parked inode revives across a rename.
     ///
     /// The remembered path is stale the moment anything moves the file, and
@@ -3344,14 +3298,14 @@ mod tests {
     fn a_parked_inode_survives_being_renamed() {
         let scratch = Scratch::new("volfs");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("original");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("original");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
         std::fs::rename(scratch.0.join("original"), scratch.0.join("moved")).unwrap();
         let reference = inode
             .reference()
-            .expect("a renamed file is still the same file");
+            .expect("a renamed directory is still the same directory");
         let st = crate::sys::stat_fd(reference.raw_fd()).unwrap();
         assert_eq!(
             st.st_ino, ino,
@@ -3364,14 +3318,14 @@ mod tests {
     fn a_parked_inode_does_not_survive_deletion() {
         let scratch = Scratch::new("volfs-gone");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("doomed");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("doomed");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
-        std::fs::remove_file(scratch.0.join("doomed")).unwrap();
+        std::fs::remove_dir(scratch.0.join("doomed")).unwrap();
         assert!(
             inode.reference().is_err(),
-            "a deleted file must not revive as anything"
+            "a deleted directory must not revive as anything"
         );
     }
 
@@ -3388,8 +3342,8 @@ mod tests {
         let reg = scratch.registry();
         let root_held = reg.descriptor_usage().0;
 
-        let (fd, dev, ino) = scratch.file("counted");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("counted");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         assert_eq!(reg.descriptor_usage().0, root_held + 1);
 
         let inode = reg.get(id).unwrap();
@@ -3598,18 +3552,18 @@ mod tests {
         let quiet = enrolled(&quiet_dir, &pool, 256);
         let busy = enrolled(&busy_dir, &pool, 256);
         for n in 0..256 {
-            let (fd, dev, ino) = quiet_dir.file(&format!("q{n}"));
-            quiet.0.insert(fd, dev, ino, false, false, None);
+            let (fd, dev, ino) = quiet_dir.dir(&format!("q{n}"));
+            quiet.0.insert(fd, dev, ino, true, false, None);
         }
         let held_quiet = quiet.0.census.held.load(Ordering::Relaxed);
         assert!(held_quiet >= 250, "the quiet share held only {held_quiet}");
         for n in 0..64 {
-            let (fd, dev, ino) = busy_dir.file(&format!("b{n}"));
-            busy.0.insert(fd, dev, ino, false, false, None);
+            let (fd, dev, ino) = busy_dir.dir(&format!("b{n}"));
+            busy.0.insert(fd, dev, ino, true, false, None);
         }
         assert!(
             busy.0.census.held.load(Ordering::Relaxed) < 8,
-            "the busy share held its files with the pool at its budget"
+            "the busy share held its directories with the pool at its budget"
         );
 
         // The busy share's requests sweep, paced, as they would.
@@ -3652,8 +3606,8 @@ mod tests {
         let reg = share.0.clone();
         reg.census.budget.store(4096, Ordering::Relaxed);
         for n in 0..300 {
-            let (fd, dev, ino) = scratch.file(&format!("s{n}"));
-            reg.insert(fd, dev, ino, false, false, None);
+            let (fd, dev, ino) = scratch.dir(&format!("s{n}"));
+            reg.insert(fd, dev, ino, true, false, None);
         }
         assert!(reg.descriptor_usage().0 >= 300);
 

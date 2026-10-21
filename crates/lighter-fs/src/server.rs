@@ -365,20 +365,17 @@ fn create_job(
                         }
                     }
                 }
-                // Two descriptors, as the synchronous path keeps two: a
-                // metadata reference for the inode, and the open file itself
-                // in the open cache — which is what lets the guest keep
-                // reading and writing after an unlink, exactly as a real
-                // file handle would. At a full share the reference would be
-                // parked the instant it was bound — a dup, a stat, a path
-                // query and a close for nothing, fifty thousand times an
-                // install — so there it is bound parked, the open file still
-                // cached for the writes that follow.
+                // The open file goes in the open cache, which is what lets the
+                // guest keep reading and writing after an unlink, as a real
+                // file handle would. A file holds no metadata reference of
+                // its own (`Inode::may_hold`), so it is bound parked; so is a
+                // directory at a full share, or on a network volume without
+                // room, where the reference would be parked the instant it
+                // was bound.
                 let remote = inode.remote().cloned();
-                let meta = if (park_creates && registry.at_budget())
-                    || remote
-                        .as_ref()
-                        .is_some_and(|remote| !inode.is_dir || !remote.room())
+                let meta = if !inode.is_dir
+                    || (park_creates && registry.at_budget())
+                    || remote.as_ref().is_some_and(|remote| !remote.room())
                 {
                     None
                 } else {
@@ -2199,20 +2196,21 @@ impl Server {
         });
         let entry = match entry {
             Err(PARK_ON_ENTRY) => {
+                // Registered here and counted once, below: the reply names it
+                // once, so the guest forgets it once.
                 let (dev, ino) = (st.st_dev as i64, st.st_ino);
-                let nodeid = match self.registry.relookup(dev, ino, birth(&st)) {
-                    Some(existing) => existing,
+                let inode = match self.registry.identified(dev, ino, birth(&st)) {
+                    Some(existing) => Some(existing),
                     None => {
                         let id = self.registry.insert_parked(
                             dev,
                             ino,
                             (st.st_birthtime, st.st_birthtime_nsec),
                         );
-                        self.registry.count_lookup(id);
-                        id
+                        self.registry.get(id)
                     }
                 };
-                if let Some(inode) = self.registry.get(nodeid) {
+                if let Some(inode) = inode {
                     inode.set_place(parent, name);
                 }
                 return self.entry_with_reference(parent, st, mark, || Err(linux::EIO));

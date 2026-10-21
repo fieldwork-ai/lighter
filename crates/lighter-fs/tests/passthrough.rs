@@ -1406,6 +1406,31 @@ fn fsync_settles_the_apply_queue_before_replying() {
 /// in the table forever — holding its descriptor — and the sweep starves.
 /// Measured: 150,000 forgets across an install cycle and a table that never
 /// shrank.
+/// A file the server registers without a descriptor (every file, and every
+/// directory at a full share or on a full network volume) is counted once
+/// for the one reply that names it. It was counted three times — once by
+/// registering it, once in the branch that registered it, once again as the
+/// entry was answered — so the guest's forget left it in the table for good:
+/// 49 of 64 such files, looked up and forgotten, stayed live.
+#[test]
+fn a_file_looked_up_and_forgotten_leaves_the_registry() {
+    let mut guest = Guest::new("forget-lookup");
+    let before = guest.server.live_inodes();
+    let names: Vec<String> = (0..64).map(|n| format!("f{n}")).collect();
+    for name in &names {
+        std::fs::write(guest.host(name), name.as_bytes()).unwrap();
+    }
+    for name in &names {
+        let nodeid = guest.lookup(1, name).expect("lookup");
+        guest.call(op::FORGET, nodeid, &1u64.to_le_bytes()).ok();
+    }
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "a lookup and its forget must leave nothing behind"
+    );
+}
+
 #[test]
 fn a_forgotten_async_file_leaves_the_registry() {
     let mut guest = Guest::new("forget-async");
