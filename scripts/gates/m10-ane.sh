@@ -153,18 +153,21 @@ if docker logs "$container" 2>&1 | grep -q '^PACING'; then
 	mark="$(wc -l < "$LOG")"
 	# The stream holds the cap at 5 ms; the windows must stay at the resting
 	# 50 µs, or every idle vCPU spins four times as long for a detector.
-	# Read five times, half a second apart, by one container: a window widens
-	# for a moment when a wakeup lands inside it, and a single reading once
-	# caught one at the cap on a busy Mac (2026-10-20). Windows that do not
-	# rest stay wide in every reading; three of five at rest is resting.
-	readings="$(docker run --rm --privileged alpine sh -c 'for i in 1 2 3 4 5; do echo "$(cat /sys/module/idle/parameters/poll_ns) $(cat /sys/module/idle/parameters/limits | tr " " "\n" | grep . | sort -n | tail -1)"; sleep 0.5; done' 2>/dev/null)"
-	cap="$(echo "$readings" | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+	# Read twenty times, a tenth of a second apart, by one container. A
+	# poll that catches its wakeup widens its window, and while the stream
+	# has moved a message in the last millisecond a timeout does not narrow
+	# it (patch 0039), so a reading just after a frame, or the reading's own
+	# wakeups, can find one wide: a single reading once caught one at the cap
+	# on a busy Mac (2026-10-20), and five readings caught three. Windows that
+	# do not rest are wide in nearly every reading; resting is most of them.
+	readings="$(docker run --rm --privileged alpine sh -c 'for i in $(seq 20); do echo "$(cat /sys/module/idle/parameters/poll_ns) $(cat /sys/module/idle/parameters/limits | tr " " "\n" | grep . | sort -n | tail -1)"; sleep 0.1; done' 2>/dev/null)"
+	cap="$(echo "$readings" | awk 'NF {print $1}' | sort | uniq -c | sort -rn | awk 'NR == 1 {print $2}')"
 	widest="$(echo "$readings" | awk '{print $2}' | sort -n | tail -1)"
 	resting="$(echo "$readings" | awk '$2 != "" && $2 <= 50000' | wc -l | tr -d ' ')"
-	if [ "$cap" = 5000000 ] && [ "${resting:-0}" -ge 3 ]; then
-		pass "with the stream open the cap is 5 ms and every window rests at 50 µs or less (${resting} of 5 readings; widest seen $widest ns)"
+	if [ "$cap" = 5000000 ] && [ "${resting:-0}" -ge 11 ]; then
+		pass "with the stream open the cap is 5 ms and every window rests at 50 µs or less (${resting} of 20 readings; widest seen $widest ns)"
 	else
-		fail "with the stream open: cap ${cap:-?}, every window at 50 µs or less in ${resting:-0} of 5 readings (widest ${widest:-?} ns; want 5000000 and three)"
+		fail "with the stream open: cap ${cap:-?}, every window at 50 µs or less in ${resting:-0} of 20 readings (widest ${widest:-?} ns; want 5000000 and most)"
 	fi
 	# top's first sample is since the process began; the mean of the next six.
 	cpu="$(top -l 7 -s 2 -pid "$VMM_PID" -stats cpu 2>/dev/null | awk '/^[0-9.]+ *$/{n++; if (n>1) {s+=$1; c++}} END{if (c) printf "%.1f", s/c}')"
