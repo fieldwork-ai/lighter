@@ -3369,10 +3369,10 @@ impl Server {
     /// A socket or a device node, which the Mac user cannot make
     /// ([`crate::ownership::Special`]): an empty regular file in its place,
     /// and what it is in its record. A container binding a socket in a
-    /// shared folder (Postgres with its data there, an app server on
-    /// `unix:/app/app.sock`) failed with EPERM, and so did every mknod of a
-    /// device; the guest's kernel does all a socket or a node is for, so the
-    /// name and the kind are all it needs of the server.
+    /// shared folder (an app server on `unix:/app/app.sock`) failed with
+    /// EPERM, and so did every mknod of a device; the guest's kernel does all
+    /// a socket or a node is for, so the name and the kind are all it needs
+    /// of the server.
     fn make_special(
         &self,
         parent: &Arc<Inode>,

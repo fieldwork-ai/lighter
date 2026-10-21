@@ -1543,8 +1543,7 @@ fn entry_kind(reply: &[u8]) -> (u32, u32) {
 /// A socket bound in a shared folder, and a device node made in one: the Mac
 /// user can make neither, so the Mac has an empty file in each one's place
 /// and the guest, whose kernel does all a socket or a node is for, sees what
-/// it made. Both were EPERM: Postgres with its data in a shared folder puts
-/// its socket there.
+/// it made. Both were EPERM.
 #[test]
 fn a_socket_and_a_device_node_are_made_and_seen_as_what_they_are() {
     let mut guest = Guest::new("special-files");

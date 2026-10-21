@@ -16,6 +16,12 @@
 //! The price is that `READ` and `WRITE` then arrive with no file handle, only
 //! an inode — so somebody has to hold the descriptor. That is this module.
 //!
+//! It is a cache, so what it holds is no promise: an evicted file is opened
+//! again by its identity, and one the Mac has deleted or saved over since is
+//! gone. A file the guest has open is held apart from it, from the batch
+//! that says so to the one that says it closed (guest patch 0057,
+//! `Inode::open`), so that one stays what the guest opened.
+//!
 //! # Bounded, and why eviction is safe
 //!
 //! Entries are handed out as `Arc`s, so evicting one does not close anything:
