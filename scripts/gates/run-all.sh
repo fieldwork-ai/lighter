@@ -32,6 +32,7 @@ GATES=(
 	"m7  x86-64:m7-amd64.sh"
 	"m8  daily driver:m8-daily.sh"
 	"m16 shared folders and drives:m16-shares.sh"
+	"m21 a shared folder is a local disk:m21-posix.sh"
 	"m17 the machine on the network:m17-lan.sh"
 	"m18 the Mac reaches containers:m18-direct.sh"
 	"m19 network changes (opt-in):m19-network-change.sh"
