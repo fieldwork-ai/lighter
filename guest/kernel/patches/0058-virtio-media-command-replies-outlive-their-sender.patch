@@ -1,0 +1,221 @@
+# virtio-media: a reply is recorded before its sender is woken, and never written to a sender that has gone.
+# The callback set the waiter's `done`, then its `resp_len`, then woke it through a pointer in the
+# waiter's stack frame. A waiter that saw `done` in the meantime (a host that answers in microseconds:
+# lighter's asynchronous decoder) read a length of 0 ("received response header is too short") and
+# returned, and the callback went on writing into a frame the next command now used, which surfaced as
+# "command:id 0 is not a head!" and a broken command queue: every later open or ioctl EIO, /dev/video0
+# dead until reboot. A reply after a timeout did the same without any race. The reply is now kept in
+# the device and the ring carries a sequence number, so a reply for a sender that timed out is dropped;
+# and the ring is serialized against its callback, as virtio_ring requires.
+--- a/drivers/media/virtio/virtio_media.h
++++ b/drivers/media/virtio/virtio_media.h
+@@ -37,6 +37,12 @@
+  *        other responses are handled by &struct virtio_media_session
+  * @vlock: serializes access to the command queue.
+  * @wq: waitqueue for host responses on the command queue.
++ * @cmd_lock: protects the command queue against its callback, and the four
++ *            fields below.
++ * @cmd_seq: number of the last command sent; its tokens are made from it.
++ * @cmd_token: token of the command being waited for, or %NULL.
++ * @cmd_done: whether the command being waited for has its reply.
++ * @cmd_resp_len: length of that reply.
+  */
+ struct virtio_media {
+ 	struct v4l2_device v4l2_dev;
+@@ -70,6 +76,12 @@
+ 
+ 	struct mutex vlock; /* serializes command queue access */
+ 	wait_queue_head_t wq;
++
++	spinlock_t cmd_lock; /* see @cmd_lock */
++	unsigned long cmd_seq;
++	void *cmd_token;
++	bool cmd_done;
++	size_t cmd_resp_len;
+ };
+ 
+ static inline struct virtio_media *
+--- a/drivers/media/virtio/virtio_media_driver.c
++++ b/drivers/media/virtio/virtio_media_driver.c
+@@ -183,43 +183,58 @@
+ }
+ 
+ /**
+- * struct virtio_media_cmd_callback_param - Callback parameters to the virtio
+- *                                          command queue.
+- * @vv: virtio-media device in use.
+- * @done: flag to be switched once the command is completed.
+- * @resp_len: length of the received response from the command. Only valid
+- *            after @done flag has switched to %true.
+- */
+-struct virtio_media_cmd_callback_param {
+-	struct virtio_media *vv;
+-	bool done;
+-	size_t resp_len;
+-};
+-
+-/**
+  * commandq_callback() - Callback for the command queue.
+  * @queue: command virtqueue.
+  *
+- * This just wakes up the thread that was waiting on the command to complete.
++ * Records the reply to the command being waited for and wakes its sender.
++ * The sender's state lives in &struct virtio_media rather than on its stack,
++ * and the token on the ring is a sequence number, never a pointer: a reply
++ * that arrives after its sender timed out names a command nobody is waiting
++ * for any more, and is dropped instead of written into a stack frame that
++ * now belongs to someone else.
+  */
+ static void commandq_callback(struct virtqueue *queue)
+ {
++	struct virtio_media *vv = queue->vdev->priv;
++	unsigned long flags;
+ 	unsigned int len;
+-	struct virtio_media_cmd_callback_param *param;
++	bool woke = false;
++	void *token;
+ 
++	spin_lock_irqsave(&vv->cmd_lock, flags);
+ process_bufs:
+-	while ((param = virtqueue_get_buf(queue, &len))) {
+-		param->done = true;
+-		param->resp_len = len;
+-		wake_up(&param->vv->wq);
++	while ((token = virtqueue_get_buf(queue, &len))) {
++		if (token == vv->cmd_token) {
++			vv->cmd_resp_len = len;
++			vv->cmd_done = true;
++			woke = true;
++		}
+ 	}
+ 
+ 	if (!virtqueue_enable_cb(queue)) {
+ 		virtqueue_disable_cb(queue);
+ 		goto process_bufs;
+ 	}
++	spin_unlock_irqrestore(&vv->cmd_lock, flags);
++
++	if (woke)
++		wake_up(&vv->wq);
+ }
+ 
++/* Whether the command being waited for has its reply, and its length. */
++static bool virtio_media_cmd_done(struct virtio_media *vv, size_t *resp_len)
++{
++	unsigned long flags;
++	bool done;
++
++	spin_lock_irqsave(&vv->cmd_lock, flags);
++	done = vv->cmd_done;
++	*resp_len = vv->cmd_resp_len;
++	spin_unlock_irqrestore(&vv->cmd_lock, flags);
++
++	return done;
++}
++
+ /**
+  * virtio_media_kick_command() - send a command to the commandq.
+  * @vv: virtio-media device in use.
+@@ -228,48 +243,66 @@
+  * @in_sgs: number of device-writable descriptors in @sgs.
+  * @resp_len: output parameter. Upon success, contains the size of the response
+  *            in bytes.
++ *
++ * Called with &virtio_media.vlock held, so one command is outstanding at a
++ * time. &virtio_media.cmd_lock serializes the ring itself against the
++ * callback, which virtio_ring requires of its callers: a reply can come back
++ * before the sender has returned from the kick.
+  */
+ static int virtio_media_kick_command(struct virtio_media *vv,
+ 				     struct scatterlist **sgs,
+ 				     const size_t out_sgs, const size_t in_sgs,
+ 				     size_t *resp_len)
+ {
+-	struct virtio_media_cmd_callback_param cb_param = {
+-		.vv = vv,
+-		.done = false,
+-		.resp_len = 0,
+-	};
+ 	struct virtio_media_resp_header *resp_header;
+-	int ret = virtqueue_add_sgs(vv->commandq, sgs, out_sgs, in_sgs,
+-		  &cb_param, GFP_ATOMIC);
++	unsigned long flags;
++	size_t len = 0;
++	void *token;
++	bool notify = false;
++	int ret;
++
++	spin_lock_irqsave(&vv->cmd_lock, flags);
++	/* Odd, so never NULL, and only ever compared. */
++	token = (void *)((++vv->cmd_seq << 1) | 1);
++	ret = virtqueue_add_sgs(vv->commandq, sgs, out_sgs, in_sgs, token,
++				GFP_ATOMIC);
++	if (!ret) {
++		vv->cmd_token = token;
++		vv->cmd_done = false;
++		vv->cmd_resp_len = 0;
++		notify = virtqueue_kick_prepare(vv->commandq);
++	}
++	spin_unlock_irqrestore(&vv->cmd_lock, flags);
+ 	if (ret) {
+ 		v4l2_err(&vv->v4l2_dev,
+ 			 "failed to add sgs to command virtqueue\n");
+ 		return ret;
+ 	}
+ 
+-	if (!virtqueue_kick(vv->commandq)) {
++	if (notify && !virtqueue_notify(vv->commandq)) {
+ 		v4l2_err(&vv->v4l2_dev, "failed to kick command virtqueue\n");
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto forget;
+ 	}
+ 
+ 	/* Wait for the response. */
+-	ret = wait_event_timeout(vv->wq, cb_param.done, 5 * HZ);
+-	if (ret == 0) {
++	if (!wait_event_timeout(vv->wq, virtio_media_cmd_done(vv, &len),
++				5 * HZ)) {
+ 		v4l2_err(&vv->v4l2_dev,
+ 			 "timed out waiting for response to command\n");
+-		return -ETIMEDOUT;
++		ret = -ETIMEDOUT;
++		goto forget;
+ 	}
+ 
+ 	if (resp_len)
+-		*resp_len = cb_param.resp_len;
++		*resp_len = len;
+ 
+ 	if (in_sgs > 0) {
+ 		/*
+ 		 * If we expect a response, make sure we have at least a
+ 		 * response header - anything shorter is invalid.
+ 		 */
+-		if (cb_param.resp_len < sizeof(*resp_header)) {
++		if (len < sizeof(*resp_header)) {
+ 			v4l2_err(&vv->v4l2_dev,
+ 				 "received response header is too short\n");
+ 			return -EINVAL;
+@@ -282,6 +315,13 @@
+ 	}
+ 
+ 	return 0;
++
++forget:
++	/* A reply that still comes is for nobody; the callback drops it. */
++	spin_lock_irqsave(&vv->cmd_lock, flags);
++	vv->cmd_token = NULL;
++	spin_unlock_irqrestore(&vv->cmd_lock, flags);
++	return ret;
+ }
+ 
+ /**
+@@ -981,6 +1021,7 @@
+ 	mutex_init(&vv->sessions_lock);
+ 	mutex_init(&vv->events_lock);
+ 	mutex_init(&vv->vlock);
++	spin_lock_init(&vv->cmd_lock);
+ 
+ 	vv->virtio_dev = virtio_dev;
+ 	virtio_dev->priv = vv;
