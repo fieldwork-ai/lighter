@@ -1101,7 +1101,7 @@ fn set_ours(
 fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i32> {
     match inode.locate()? {
         Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
-        Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0),
+        Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0, inode.born().is_none()),
         Located::At(parent, name) => {
             // A file on a network volume is opened by its whole path, as one
             // with a descriptor of its own always was (`sys::reopen`). Opened
@@ -1135,7 +1135,12 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
                 // ([`crate::remote`], [`crate::inode::Inode::refuses`]).
                 Err(errno) if inode.refuses(errno) => Err(errno),
                 // The name has moved on; the file may not have.
-                Err(_) => sys::reopen(inode.reference()?.raw_fd(), linux_flags, 0),
+                Err(_) => sys::reopen(
+                    inode.reference()?.raw_fd(),
+                    linux_flags,
+                    0,
+                    inode.born().is_none(),
+                ),
             }
         }
     }
@@ -4666,11 +4671,21 @@ impl Server {
                             opened.as_raw_fd()
                         }
                         Source::Held(reference) => {
-                            opened = sys::reopen(reference.raw_fd(), 0, 0)?;
+                            opened = sys::reopen(
+                                reference.raw_fd(),
+                                0,
+                                0,
+                                !registry.identifies_by_birth(parent.dev()),
+                            )?;
                             opened.as_raw_fd()
                         }
                         Source::Cached(file) => {
-                            opened = sys::reopen(file.fd.as_raw_fd(), 0, 0)?;
+                            opened = sys::reopen(
+                                file.fd.as_raw_fd(),
+                                0,
+                                0,
+                                !registry.identifies_by_birth(parent.dev()),
+                            )?;
                             opened.as_raw_fd()
                         }
                     };

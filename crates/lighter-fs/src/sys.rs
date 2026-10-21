@@ -357,15 +357,31 @@ pub fn identity_path(fd: RawFd) -> Result<PathBuf> {
 /// and renaming it into place) leaves the name naming the new file, and the
 /// guest read the new file's bytes through the old one's nodeid. So what
 /// the path opens is handed back only if it is the same file, and is
-/// `ESTALE` otherwise.
-pub fn reopen(reference: RawFd, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+/// `ESTALE` otherwise. The same file is the same numbers where the volume's
+/// numbers identify a file (`numbers_identify`), and the same birth time
+/// where they do not: Samba without file ids numbers a file by its name, so
+/// a file moved there has new numbers and is still itself, and the numbers
+/// alone read every file renamed into place as gone (m16).
+pub fn reopen(
+    reference: RawFd,
+    linux_flags: u32,
+    mode: u32,
+    numbers_identify: bool,
+) -> Result<OwnedFd> {
     if let Ok(fd) = identity_path(reference).and_then(|p| open_path(&p, linux_flags, mode)) {
         return Ok(fd);
     }
     let path = path_of(reference)?;
     let fd = open_path(&path, linux_flags, mode)?;
     let (was, now) = (stat_fd(reference)?, stat_fd(fd.as_raw_fd())?);
-    if (was.st_dev, was.st_ino) == (now.st_dev, now.st_ino) {
+    let same = if numbers_identify {
+        (was.st_dev, was.st_ino) == (now.st_dev, now.st_ino)
+    } else {
+        was.st_dev == now.st_dev
+            && (was.st_birthtime, was.st_birthtime_nsec)
+                == (now.st_birthtime, now.st_birthtime_nsec)
+    };
+    if same {
         Ok(fd)
     } else {
         Err(crate::errno::linux::ESTALE)
@@ -1247,7 +1263,7 @@ mod tests {
         let reference = open_path(&path, 0, 0).unwrap();
         std::fs::write(dir.join("f.tmp"), b"new").unwrap();
         std::fs::rename(dir.join("f.tmp"), &path).unwrap();
-        match reopen(reference.as_raw_fd(), 0, 0) {
+        match reopen(reference.as_raw_fd(), 0, 0, true) {
             Ok(fd) => {
                 let mut buf = [0u8; 8];
                 let n =
