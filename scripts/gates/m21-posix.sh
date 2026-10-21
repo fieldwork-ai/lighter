@@ -75,29 +75,7 @@ fi
 if [ -e "$P/result.json" ]; then
 	while read -r verdict line; do
 		if [ "$verdict" = ok ]; then pass "$line"; else fail "$line"; fi
-	done < <(python3 - "$P/result.json" <<'EOF'
-import json, sys
-r = json.load(open(sys.argv[1]))
-want = {
-    "host-delete-unread": ("old", "deleted on the Mac, open and unread"),
-    "host-delete-read": ("old", "deleted on the Mac, open and read"),
-    "host-replace-unread": ("old", "saved over on the Mac, open and unread"),
-    "host-replace-read": ("old", "saved over on the Mac, open and read"),
-    "host-rename-unread": ("old", "moved on the Mac, open"),
-    "host-inplace-read": ("new", "edited in place on the Mac, open: the edit is read at once"),
-    "guest-delete-unread": ("old", "deleted in the container, open"),
-    "guest-replace-unread": ("old", "replaced in the container, open"),
-    "guest-tmpfile": ("same", "opened, unlinked and used as scratch in the container"),
-}
-show = lambda v: {"old-contents": "old", "new-contents": "new"}.get(v.strip(), v.strip())
-for case, (w, what) in want.items():
-    got = r[case]
-    now, later = show(got["now"]), show(got.get("later", got["now"]))
-    verdict = "ok" if now == w and later == w else "bad"
-    detail = "" if verdict == "ok" else f" (read {now}, then {later})"
-    print(verdict, what + detail)
-EOF
-)
+	done < <(python3 "$FIXTURES/verdict.py" "$P/result.json")
 else
 	fail "the probe container never reported"
 	docker logs m21-probe 2>&1 | tail -5
