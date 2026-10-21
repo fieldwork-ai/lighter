@@ -351,12 +351,25 @@ pub fn identity_path(fd: RawFd) -> Result<PathBuf> {
 /// [`identity_path`]). The path is the fallback for a filesystem with no
 /// `/.vol`, and the error reported is the fallback's, which is what this
 /// function has always returned.
+///
+/// The path is only where the file last was, and another file may have
+/// taken it since: a Mac program saving over a file (writing a temporary
+/// and renaming it into place) leaves the name naming the new file, and the
+/// guest read the new file's bytes through the old one's nodeid. So what
+/// the path opens is handed back only if it is the same file, and is
+/// `ESTALE` otherwise.
 pub fn reopen(reference: RawFd, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
     if let Ok(fd) = identity_path(reference).and_then(|p| open_path(&p, linux_flags, mode)) {
         return Ok(fd);
     }
     let path = path_of(reference)?;
-    open_path(&path, linux_flags, mode)
+    let fd = open_path(&path, linux_flags, mode)?;
+    let (was, now) = (stat_fd(reference)?, stat_fd(fd.as_raw_fd())?);
+    if (was.st_dev, was.st_ino) == (now.st_dev, now.st_ino) {
+        Ok(fd)
+    } else {
+        Err(crate::errno::linux::ESTALE)
+    }
 }
 
 /// Opens a host path with flags expressed in the *guest's* numbering.
@@ -1195,6 +1208,34 @@ pub fn raise_server_qos() {
 
 #[cfg(test)]
 mod tests {
+    /// A Mac program saving over a file renames another file onto its name.
+    /// A reopen of the old one must never come back as the new one.
+    #[test]
+    fn a_reopen_never_hands_back_the_file_that_took_the_name() {
+        let dir = std::env::temp_dir().join(format!("lighter-sys-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"old").unwrap();
+        let reference = open_path(&path, 0, 0).unwrap();
+        std::fs::write(dir.join("f.tmp"), b"new").unwrap();
+        std::fs::rename(dir.join("f.tmp"), &path).unwrap();
+        match reopen(reference.as_raw_fd(), 0, 0) {
+            Ok(fd) => {
+                let mut buf = [0u8; 8];
+                let n =
+                    unsafe { libc::pread(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+                assert_eq!(
+                    &buf[..n as usize],
+                    b"old",
+                    "a reopen handed back another file"
+                );
+            }
+            Err(errno) => assert_eq!(errno, crate::errno::linux::ESTALE),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// The bug this test exists for: Linux O_APPEND is bit 0o2000, which on
