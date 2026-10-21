@@ -407,7 +407,10 @@ impl VtSession {
 
 impl Drop for VtSession {
     fn drop(&mut self) {
+        // The callback's refcon is freed with this session, and a frame still
+        // in flight would land on it.
         unsafe {
+            vt::VTDecompressionSessionWaitForAsynchronousFrames(self.session);
             vt::VTDecompressionSessionInvalidate(self.session);
             vt::CFRelease(self.session);
         }
