@@ -93,6 +93,8 @@ pub struct OpenPin {
 pub struct Inode {
     /// See [`OpenPin`].
     pub open: Mutex<OpenPin>,
+    /// See [`Inode::link_gate`].
+    link_gate: RwLock<()>,
     /// A metadata-only descriptor, or nothing if it has been parked.
     ///
     /// Shared rather than owned so that parking is never a race: a reclaimer
@@ -677,6 +679,7 @@ impl Inode {
         let remote = census.remotes.get(dev);
         let inode = Inode {
             open: Mutex::new(OpenPin::default()),
+            link_gate: RwLock::new(()),
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
             born: Mutex::new(None),
@@ -769,6 +772,7 @@ impl Inode {
         let remote = census.remotes.get(dev);
         Inode {
             open: Mutex::new(OpenPin::default()),
+            link_gate: RwLock::new(()),
             fd: RwLock::new(None),
             parked_at: Mutex::new(None),
             born: Mutex::new(None),
@@ -1188,6 +1192,18 @@ impl Inode {
 
     pub fn extra_links(&self) -> u32 {
         self.extra_links.load(Ordering::Relaxed)
+    }
+
+    /// Held by a reader of this file's link count across its two reads (the
+    /// promise, then the host), and exclusively by a queued link across
+    /// landing on the host and withdrawing its promise, so no reader sees
+    /// both the landed link and its promise.
+    pub fn link_gate(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.link_gate.read().expect("link gate poisoned")
+    }
+
+    pub fn link_gate_exclusive(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.link_gate.write().expect("link gate poisoned")
     }
 
     /// The nodeid the registry issued for this inode; see [`Registry`].

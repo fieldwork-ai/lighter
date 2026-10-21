@@ -2351,7 +2351,15 @@ impl Server {
         // while the stat was in flight and the stat be of the moment before:
         // the file is stat'd again, with nothing left to race.
         if !is_dir && let Some(inode) = self.registry.get(nodeid) {
+            // The stat above was made before the inode was known, so not
+            // under its link gate (`attr_of`): with a link outstanding, made
+            // again under it.
+            let gate = inode.link_gate();
+            if inode.extra_links() > 0 {
+                attr = self.attr(&self.stat_inode(nodeid, &inode)?);
+            }
             let overlay = inode.overlay();
+            drop(gate);
             if !overlay.is_empty() {
                 self.overlay_attr(&overlay, &mut attr);
             } else if inode.settle_seq() > mark {
@@ -4281,6 +4289,8 @@ impl Server {
             let target = target.clone();
             let name = name.clone();
             move || {
+                // Landed and withdrawn as one, as a stat sees it (`attr_of`).
+                let gate = target.link_gate_exclusive();
                 let result = (|| {
                     // Bound by now, or its create failed — and a provisional
                     // number names nothing on the volume.
@@ -4296,6 +4306,8 @@ impl Server {
                         sys::link_at(libc::AT_FDCWD, &source, dir, at)
                     })
                 })();
+                target.link_applied();
+                drop(gate);
                 if let Err(errno) = result {
                     tracing::warn!(
                         errno,
@@ -4303,7 +4315,6 @@ impl Server {
                         "an acknowledged link failed to apply"
                     );
                 }
-                target.link_applied();
                 parent.remove_pending_child(name.to_bytes(), nodeid);
                 registry.release_if_unwanted(parent.id());
                 if target.unpromise() {
@@ -5044,8 +5055,15 @@ impl Server {
     /// empty, once in a dozen boots. Read first, the promise is either still
     /// there and laid over, or already kept and the stat shows it.
     fn attr_of(&self, nodeid: u64, inode: &Inode) -> Result<Attr, i32> {
+        // A link's promise is added to the host's count, not laid over it as
+        // a size is, so a link landing between the two reads was counted
+        // twice (pjdfstest link/00 and link/03: three names, nlink 4). The
+        // job lands it and withdraws its promise under the inode's link
+        // gate, and the two reads are made under it too.
+        let gate = inode.link_gate();
         let overlay = inode.overlay();
         let mut attr = self.attr(&self.stat_inode(nodeid, inode)?);
+        drop(gate);
         self.overlay_attr(&overlay, &mut attr);
         self.own(inode, None, &mut attr);
         Ok(attr)
