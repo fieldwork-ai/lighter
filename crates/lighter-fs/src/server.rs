@@ -574,18 +574,22 @@ impl Volfs {
     fn path_of(&self, fd: RawFd) -> Result<PathBuf, i32> {
         let st = sys::stat_fd(fd)?;
         let dev = st.st_dev as i64;
-        let identity = PathBuf::from(format!("/.vol/{}/{}", st.st_dev, st.st_ino));
+        match self.identity(fd, dev, st.st_ino) {
+            Some(identity) => Ok(identity),
+            None => sys::path_of(fd),
+        }
+    }
+
+    /// `/.vol/<dev>/<ino>`, if the volume `fd` is open on serves identity
+    /// paths.
+    fn identity(&self, fd: RawFd, dev: i64, ino: u64) -> Option<PathBuf> {
         let known = self.0.read().expect("volfs poisoned").get(&dev).copied();
         let serves = known.unwrap_or_else(|| {
             let serves = Volfs::probe(fd);
             self.0.write().expect("volfs poisoned").insert(dev, serves);
             serves
         });
-        if serves {
-            Ok(identity)
-        } else {
-            sys::path_of(fd)
-        }
+        serves.then(|| PathBuf::from(format!("/.vol/{dev}/{ino}")))
     }
 
     /// Asked of the volume's root, which is always there: the file at hand
@@ -2189,16 +2193,23 @@ impl Server {
         // Path-based operations (access, xattr, link, setattr) need a file
         // that exists; settle it once, here, for all of them.
         self.settle_while(inode, |inode| inode.is_pending());
-        // A parked file's path is its parent's path and its name — no
-        // descriptor of its own is opened for it. The parent's identity path
-        // takes child components, so this stays immune to the stale-name
-        // problem below; what the name resolves to is checked against the
-        // inode's own identity, since the Mac may have moved it since.
+        // A file without a descriptor of its own is found by its parent and
+        // its name, and what the name resolves to is checked against the
+        // inode's own identity, since the Mac may have moved it since. Then
+        // it is named by that identity where the volume serves one, not as
+        // the parent's identity path and the name: macOS 26 resolves
+        // `/.vol/<dev>/<dir>/<name>` through the directory's whole path, so a
+        // file more than 1,024 bytes deep was ENAMETOOLONG to every xattr,
+        // and a chown failed (pjdfstest chown/03 on the M1; macOS 27 does
+        // not). Where it serves none, the parent's path and the name.
         if let Ok(Located::At(parent, name)) = inode.locate()
             && let Ok(st) = sys::stat_at(parent.raw_fd(), &name)
             && st.st_ino == inode.ino()
             && st.st_dev as i64 == inode.dev()
         {
+            if let Some(identity) = self.volfs.identity(parent.raw_fd(), inode.dev(), st.st_ino) {
+                return sys::c_path(&identity);
+            }
             let base = self.volfs.path_of(parent.raw_fd())?;
             return sys::c_path(&base.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
         }

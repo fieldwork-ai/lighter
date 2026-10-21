@@ -1634,6 +1634,28 @@ fn a_fifo_is_made_deeper_than_a_mac_path_can_be() {
     assert_eq!(entry_kind(&reply).0, fifo | 0o644);
 }
 
+/// A file deeper than macOS's 1,024-character paths takes a chown, which is
+/// an xattr on the Mac, as one at the top does. Named as its directory's
+/// identity path and its name, it was ENAMETOOLONG on macOS 26, which
+/// resolves that through the directory's whole path (pjdfstest chown/03).
+#[test]
+fn a_file_deeper_than_a_mac_path_can_be_is_chowned() {
+    let mut guest = Guest::new("deep-chown");
+    let name = "d".repeat(200);
+    let mut dir = 1;
+    for _ in 0..6 {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(&name));
+        let reply = guest.call(op::MKDIR, dir, &body).expect("mkdir");
+        dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    }
+    let (f, _) = guest.create(dir, "f", 0x8241).expect("create f");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    chown(&mut guest, f, 65534, 65534).expect("a chown 1,200 characters deep");
+    assert_eq!(owner_of(&mut guest, f), (65534, 65534));
+}
+
 /// A file renamed over one a container has just created, whose create is
 /// still held: the holder is queued first and the rename lands on it, as on
 /// any filesystem. Queued after, the create met the renamed file and failed,
