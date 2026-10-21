@@ -193,7 +193,10 @@ pub struct Inode {
     pending_count: AtomicUsize,
     /// Names removed from this directory by acknowledged unlinks that have
     /// not applied yet: the host still lists them, the guest must not.
-    pending_gone: Mutex<std::collections::HashSet<Vec<u8>>>,
+    /// Counted: one name can be promised away by two operations at once (an
+    /// unlink, a create of the name, an unlink again), and the first to
+    /// apply must not take the second's promise with it.
+    pending_gone: Mutex<std::collections::HashMap<Vec<u8>, usize>>,
     /// Mirror of `pending_gone.len()`, same reason as `pending_count`.
     gone_count: AtomicUsize,
     /// Names promised to this inode by queued renames and links, which
@@ -696,7 +699,7 @@ impl Inode {
             pending_meta: Mutex::new(None),
             pending_children: Mutex::new(std::collections::HashMap::new()),
             pending_count: AtomicUsize::new(0),
-            pending_gone: Mutex::new(std::collections::HashSet::new()),
+            pending_gone: Mutex::new(std::collections::HashMap::new()),
             gone_count: AtomicUsize::new(0),
             promised: AtomicUsize::new(0),
             forget_deferred: AtomicBool::new(false),
@@ -788,7 +791,7 @@ impl Inode {
             pending_meta: Mutex::new(Some(meta)),
             pending_children: Mutex::new(std::collections::HashMap::new()),
             pending_count: AtomicUsize::new(0),
-            pending_gone: Mutex::new(std::collections::HashSet::new()),
+            pending_gone: Mutex::new(std::collections::HashMap::new()),
             gone_count: AtomicUsize::new(0),
             promised: AtomicUsize::new(0),
             forget_deferred: AtomicBool::new(false),
@@ -977,14 +980,19 @@ impl Inode {
     /// Promises that `name` is gone from this directory.
     pub fn add_pending_gone(&self, name: &[u8]) {
         let mut gone = self.pending_gone.lock().expect("pending gone poisoned");
-        gone.insert(name.to_vec());
+        *gone.entry(name.to_vec()).or_insert(0) += 1;
         self.gone_count.store(gone.len(), Ordering::Relaxed);
     }
 
     /// The unlink applied (or failed, loudly); the host answers again.
     pub fn remove_pending_gone(&self, name: &[u8]) {
         let mut gone = self.pending_gone.lock().expect("pending gone poisoned");
-        gone.remove(name);
+        if let Some(promises) = gone.get_mut(name) {
+            *promises -= 1;
+            if *promises == 0 {
+                gone.remove(name);
+            }
+        }
         self.gone_count.store(gone.len(), Ordering::Relaxed);
     }
 
@@ -996,7 +1004,7 @@ impl Inode {
         self.pending_gone
             .lock()
             .expect("pending gone poisoned")
-            .contains(name)
+            .contains_key(name)
     }
 
     /// A write job with this sequence number was queued: any setattr batch
@@ -1241,7 +1249,9 @@ impl Inode {
         self.pending_gone
             .lock()
             .expect("pending gone poisoned")
-            .clone()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Whether any queued operation still shadows this directory's listing.
@@ -3236,6 +3246,28 @@ mod tests {
     /// Parking is a descriptor decision, not an identity one: the inode keeps
     /// answering to the same nodeid and the same numbers, and the next use
     /// reopens it.
+    #[test]
+    fn a_name_promised_away_twice_stays_gone_until_both_apply() {
+        // An unlink, a create of the name and an unlink again, all queued:
+        // the first unlink applying must not take the second's promise.
+        let scratch = Scratch::new("gone-twice");
+        let reg = scratch.registry();
+        let (fd, dev, ino) = scratch.dir("d");
+        let dir = reg
+            .get(reg.insert(fd, dev, ino, true, false, None))
+            .unwrap();
+        dir.add_pending_gone(b"f");
+        dir.add_pending_gone(b"f");
+        dir.remove_pending_gone(b"f");
+        assert!(
+            dir.name_pending_gone(b"f"),
+            "the second promise went with the first"
+        );
+        dir.remove_pending_gone(b"f");
+        assert!(!dir.name_pending_gone(b"f"));
+        assert!(!dir.has_promises());
+    }
+
     #[test]
     fn a_file_holds_no_descriptor() {
         // A file is reached by its parent and name, or its identity, each

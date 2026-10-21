@@ -1634,6 +1634,65 @@ fn a_fifo_is_made_deeper_than_a_mac_path_can_be() {
     assert_eq!(entry_kind(&reply).0, fifo | 0o644);
 }
 
+/// A file renamed over one a container has just created, whose create is
+/// still held: the holder is queued first and the rename lands on it, as on
+/// any filesystem. Queued after, the create met the renamed file and failed,
+/// "an acknowledged create failed to apply", and what was written to it was
+/// lost (pjdfstest rename/10, where the renamed-away name then read as
+/// still there).
+#[test]
+fn a_rename_over_a_file_just_created_lands_after_the_create() {
+    let mut guest = Guest::new("rename-over-held");
+    std::fs::write(guest.host("g"), b"from g").unwrap();
+    let g = guest.lookup(1, "g").expect("lookup g");
+    let (f, fh) = guest.create(1, "f", 0x8241).expect("create f");
+    guest.write(f, fh, 0, b"written to f").expect("write f");
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("g"));
+    body.extend_from_slice(&name_body("f"));
+    guest.call(op::RENAME, 1, &body).expect("rename g over f");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(guest.lookup(1, "f").expect("lookup f"), g);
+    assert_eq!(std::fs::read(guest.host("f")).unwrap(), b"from g");
+    assert!(
+        matches!(guest.lookup(1, "g"), Err(_) | Ok(0)),
+        "g is still there after its rename"
+    );
+    // The file the rename displaced is still the guest's to read.
+    assert_eq!(guest.read(f, fh, 0, 64), Ok(b"written to f".to_vec()));
+}
+
+/// A directory renamed over one that holds only a create still held: the
+/// rename is ENOTEMPTY, as the guest's view of the directory says, and the
+/// file is made. It succeeded on the host's empty directory, and the create
+/// then failed for want of its own (pjdfstest rename/20).
+#[test]
+fn a_rename_over_a_directory_with_a_file_just_made_in_it_is_enotempty() {
+    let mut guest = Guest::new("rename-over-nonempty");
+    let mut dirs = Vec::new();
+    for name in ["a", "b"] {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(name));
+        let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+        dirs.push(u64::from_le_bytes(reply[0..8].try_into().unwrap()));
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let (f, fh) = guest.create(dirs[1], "f", 0x8241).expect("create b/f");
+    guest.write(f, fh, 0, b"in b").expect("write");
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("a"));
+    body.extend_from_slice(&name_body("b"));
+    let renamed = guest.call(op::RENAME, 1, &body);
+    assert_eq!(
+        renamed.err(),
+        Some(39),
+        "a rename over a non-empty directory"
+    );
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::read(guest.host("b/f")).unwrap(), b"in b");
+}
+
 #[test]
 fn a_file_the_guest_has_open_survives_its_deletion_on_the_host() {
     let mut guest = Guest::new("notice-host-delete");

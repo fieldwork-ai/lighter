@@ -3325,6 +3325,21 @@ impl Server {
         sys::readlink_at(libc::AT_FDCWD, &path)
     }
 
+    /// Waits until `name` under `parent` is the host's to make: the parent
+    /// exists, and nothing queued still creates or removes the name. A
+    /// removal is acknowledged before it is applied, so a name made at once
+    /// on the host after one (an unlink, then a mknod of the same name)
+    /// found the old file still there: a FIFO, socket or device node made
+    /// where one had just been unlinked failed with EEXIST, one time in
+    /// six (pjdfstest rename/10).
+    fn settle_name(&self, parent: &Arc<Inode>, name: &CStr) {
+        self.settle_while(parent, |parent| {
+            parent.is_pending()
+                || parent.pending_child(name.to_bytes()).is_some()
+                || parent.name_pending_gone(name.to_bytes())
+        });
+    }
+
     fn symlink(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let (name, rest) = get_name(body).ok_or(linux::EINVAL)?;
@@ -3340,7 +3355,7 @@ impl Server {
         )? {
             return Ok(reply);
         }
-        self.settle_while(&parent, |parent| parent.is_pending());
+        self.settle_name(&parent, &name);
         sys::symlink_at(&target, parent.reference()?.raw_fd(), &name)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
@@ -3348,12 +3363,12 @@ impl Server {
 
     fn mknod(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
-        self.settle_while(&parent, |parent| parent.is_pending());
         let mode = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let rdev = get_u32(body, 4).ok_or(linux::EINVAL)?;
         let umask = get_u32(body, 8).unwrap_or(0);
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
+        self.settle_name(&parent, &name);
         let kind = mode & libc::S_IFMT as u32;
         if crate::ownership::Special::applies(kind) {
             return self.make_special(&parent, &name, mode & !umask & 0o7777, kind, rdev);
@@ -3423,7 +3438,7 @@ impl Server {
         )? {
             return Ok(reply);
         }
-        self.settle_while(&parent, |parent| parent.is_pending());
+        self.settle_name(&parent, &name);
         parent.under_name(&name, |dir, at| {
             sys::mkdir_at(dir, at, servable(mode, true))
         })?;
@@ -3774,18 +3789,6 @@ impl Server {
                     }
                     return Ok(Some(Vec::new()));
                 }
-                // Not free: this rename replaces whatever holds the new
-                // name, and the queue orders that — but only among jobs it
-                // holds. A held create of the new name is not in the queue
-                // yet, and materialized later it would land on the file
-                // this rename put there: "an acknowledged create failed to
-                // apply", from two pnpm threads writing the same content
-                // to the same content-hash name. So the holder goes into
-                // the queue first, and the replacement lands after it, as
-                // on any filesystem.
-                if let Some(holder) = new_parent.pending_child(new.to_bytes()) {
-                    self.materialize_why(holder, 7);
-                }
                 self.materialize_why(nodeid, 5);
                 nodeid
             }
@@ -3817,6 +3820,21 @@ impl Server {
                 }
             }
         };
+        // This rename replaces whatever holds the new name, and the queue
+        // orders that, but only among jobs it holds. A held create of the
+        // new name is not in the queue yet, and materialized later it would
+        // land on the file this rename put there: "an acknowledged create
+        // failed to apply", from two pnpm threads writing the same content
+        // to the same content-hash name, and from a file renamed over one a
+        // container had just created (pjdfstest rename/10, whose create was
+        // lost and whose renamed-away name then read as still there). So
+        // the holder goes into the queue first, whichever the source is,
+        // and the replacement lands after it, as on any filesystem.
+        if let Some(holder) = new_parent.pending_child(new.to_bytes())
+            && holder != nodeid
+        {
+            self.materialize_why(holder, 7);
+        }
         let Some(inode) = self.registry.get(nodeid) else {
             {
                 self.stats.count("rename-none=4");
@@ -3996,6 +4014,21 @@ impl Server {
             parent.pending_child(new.to_bytes()).is_some()
                 || parent.name_pending_gone(new.to_bytes())
         });
+        // A directory the rename would replace must be empty, and what the
+        // guest has made in it may not be on the host yet: renamed over a
+        // directory holding only a create that was still held, the rename
+        // succeeded where Linux says ENOTEMPTY, and the create then failed
+        // for want of its directory, its file lost (pjdfstest rename/20).
+        // Its children go to the host first, and the host answers.
+        if let Ok(st) = new_parent.under_name(&new, sys::stat_at)
+            && st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && let Some(target) = self
+                .registry
+                .identified(st.st_dev as i64, st.st_ino, birth(&st))
+        {
+            self.materialize_children(&target);
+            self.settle_while(&target, |dir| dir.has_promises());
+        }
         phase("rename-us-3-settle-names", t2);
         let t3 = std::time::Instant::now();
         // Renumbered after, where its volume numbers files by name.
