@@ -193,8 +193,10 @@ struct Held {
     writes: Vec<(u64, Vec<u8>)>,
     bytes: usize,
     since: std::time::Instant,
-    /// On a network share: where the file's bits are kept once it exists.
-    keep: Option<Arc<Modes>>,
+    /// Where the file's bits are kept once it exists, if they need to be:
+    /// on a network share, or bits the host file cannot have ([`lifted`]).
+    keep: Arc<Modes>,
+    network: bool,
 }
 
 /// Bytes one held file may accumulate before its create is queued, and all
@@ -269,6 +271,7 @@ fn create_job(
         mode,
         writes,
         keep,
+        network,
         ..
     } = held;
     let keys = crate::apply::Keys::of(&[parent.id(), nodeid]);
@@ -304,7 +307,7 @@ fn create_job(
                     dir,
                     at,
                     host_flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
-                    mode,
+                    servable(mode, false),
                 )
             })?;
             let st = sys::stat_fd(fd.as_raw_fd())?;
@@ -341,13 +344,13 @@ fn create_job(
                     .iter()
                     .map(|(offset, data)| write_fully(fd.as_raw_fd(), data, *offset))
                     .collect();
-                if let Some(modes) = &keep {
-                    let mode = inode.pending_meta().map_or(mode, |meta| meta.mode);
-                    modes.keep(&inode, Some(&parent), fd.as_raw_fd(), mode & 0o7777);
+                let kept = inode.pending_meta().map_or(mode, |meta| meta.mode);
+                if network || lifted(kept, false) {
+                    keep.keep(&inode, Some(&parent), fd.as_raw_fd(), kept & 0o7777);
                 }
                 if let Some(meta) = inode.pending_meta() {
                     if meta.mode & 0o7777 != mode & 0o7777 {
-                        let _ = sys::chmod_fd(fd.as_raw_fd(), meta.mode & 0o7777);
+                        let _ = sys::chmod_fd(fd.as_raw_fd(), servable(meta.mode & 0o7777, false));
                     }
                     if meta.atime != meta.born || meta.mtime != meta.born {
                         let _ = sys::utimes_fd(
@@ -770,14 +773,19 @@ impl Modes {
             && parent.mark() != Mark::Marked
         {
             // Before the record, as [`Server::record_owner`] marks it.
-            sys::set_xattr_fd(parent.reference()?.raw_fd(), MARKER, b"1")?;
+            let dir = parent.reference()?;
+            with_owner_write_fd(dir.raw_fd(), || {
+                sys::set_xattr_fd(dir.raw_fd(), MARKER, b"1")
+            })?;
             parent.set_mark(Mark::Marked);
         }
         let record = encode(uid, gid, mode, true);
-        set_ours(
-            || sys::set_xattr_fd(fd, RECORD, &record),
-            || sys::remove_xattr_fd(fd, RECORD),
-        )?;
+        with_owner_write_fd(fd, || {
+            set_ours(
+                || sys::set_xattr_fd(fd, RECORD, &record),
+                || sys::remove_xattr_fd(fd, RECORD),
+            )
+        })?;
         inode.set_owner(Owner::Set {
             uid,
             gid,
@@ -974,6 +982,44 @@ fn with_owner_write<T>(path: &CStr, op: impl Fn() -> Result<T, i32>) -> Result<T
     let done = op();
     sys::chmod_at(libc::AT_FDCWD, path, mode)?;
     done
+}
+
+/// [`with_owner_write`] through a descriptor, for the keeping of bits on a
+/// file the server holds open: a directory made 0151 has its read and search
+/// bits on the Mac ([`servable`]) and not its write bit.
+fn with_owner_write_fd<T>(fd: RawFd, op: impl Fn() -> Result<T, i32>) -> Result<T, i32> {
+    match op() {
+        Err(errno) if errno == linux::EACCES => {}
+        done => return done,
+    }
+    let mode = sys::stat_fd(fd)?.st_mode as u32 & 0o7777;
+    if mode & 0o200 != 0 {
+        return Err(linux::EACCES);
+    }
+    sys::chmod_fd(fd, mode | 0o200)?;
+    let done = op();
+    sys::chmod_fd(fd, mode)?;
+    done
+}
+
+/// The bits a host file is given for `mode`, the bits the guest asked for:
+/// the owner read and search on a directory, read on a file, added where the
+/// guest left them out. The server works as the Mac user and needs them to
+/// serve the file at all: a directory it cannot read or search cannot be
+/// registered, listed or reached through, and a container's root, which a
+/// local disk lets do anything, met EACCES making `mkdir -m 0151` (pjdfstest
+/// had 26 such failures in mkdir alone). The guest's bits are kept in the
+/// ownership record instead ([`lifted`]), and only these: a read-only file or
+/// directory (0444, 0555) is read-only on the Mac too, as git's objects and
+/// Go's module cache are meant to be.
+fn servable(mode: u32, is_dir: bool) -> u32 {
+    mode | if is_dir { 0o500 } else { 0o400 }
+}
+
+/// Whether `mode` is not one the host file can have ([`servable`]), so the
+/// guest's bits are kept in the record and read from it.
+fn lifted(mode: u32, is_dir: bool) -> bool {
+    servable(mode & 0o7777, is_dir) != mode & 0o7777
 }
 
 /// A stat's birth time, for the registry to tell files apart by where their
@@ -2401,15 +2447,13 @@ impl Server {
 
     /// The bits a record holds in place of the file's own: any it has on a
     /// volume that keeps none, and those it keeps ([`Modes`]) on a network
-    /// share. On the Mac's own disks the file's are the truth, a chmod
-    /// there being one the file takes.
+    /// share or where the host file could not have them ([`lifted`]).
+    /// Otherwise the file's are the truth, a chmod being one the file takes.
     fn recorded_mode(&self, inode: &Inode, record: crate::ownership::Owner) -> Option<u32> {
         if !self.volumes.keeps_permissions(inode.dev()) {
             record.mode()
-        } else if self.volumes.network(inode.dev()) {
-            record.kept_mode()
         } else {
-            None
+            record.kept_mode()
         }
     }
 
@@ -2480,7 +2524,7 @@ impl Server {
         mode: u32,
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode};
-        let kept = self.volumes.network(inode.dev());
+        let kept = self.volumes.network(inode.dev()) || lifted(mode, inode.is_dir);
         if (uid, gid) == (0, 0) && self.volumes.keeps_permissions(inode.dev()) && !kept {
             match with_owner_write(path, || sys::remove_xattr(path, RECORD)) {
                 Err(errno) if errno != linux::ENODATA => return Err(errno),
@@ -2523,11 +2567,12 @@ impl Server {
         Ok(())
     }
 
-    /// On a network share, keeps the bits a file was just made with
-    /// ([`Modes`]), and answers with them: the entry was read from the
-    /// server, which may have given the file bits of its own.
+    /// Keeps the bits a file was just made with ([`Modes`]) on a network
+    /// share, whose server may have given it bits of its own, and where the
+    /// host file could not have them ([`lifted`]); and answers with them.
     fn keep_made(&self, parent: &Inode, entry: &mut EntryOut, mode: u32) {
-        if !self.volumes.network(parent.dev()) {
+        let is_dir = entry.attr.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
+        if !self.volumes.network(parent.dev()) && !lifted(mode, is_dir) {
             return;
         }
         let Some(inode) = self.registry.get(entry.nodeid) else {
@@ -2849,7 +2894,10 @@ impl Server {
             || inode.is_dir
             || inode.is_symlink
             // Kept in the record, which needs the file.
-            || (valid & fuse::fattr::MODE != 0 && !self.volumes.keeps_permissions(inode.dev()))
+            || (valid & fuse::fattr::MODE != 0
+                && (!self.volumes.keeps_permissions(inode.dev())
+                    || get_u32(body, 68).is_some_and(|mode| lifted(mode, inode.is_dir))
+                    || self.record_of(inode, None).kept_mode().is_some()))
         {
             return Ok(None);
         }
@@ -3097,14 +3145,20 @@ impl Server {
             let network = self.volumes.network(inode.dev());
             let mut refusal = None;
             if self.volumes.keeps_permissions(inode.dev()) {
-                match sys::chmod_at(libc::AT_FDCWD, &path, mode) {
+                match sys::chmod_at(libc::AT_FDCWD, &path, servable(mode, inode.is_dir)) {
                     Ok(()) => {}
                     // The server's call; the record keeps the container's.
                     Err(errno) if network && refused(errno) => refusal = Some(errno),
                     Err(errno) => return Err(errno),
                 }
             }
-            if network || !self.volumes.keeps_permissions(inode.dev()) {
+            // Recorded where the bits are kept, and rewritten where they were
+            // and are not any more, so the file's own are read again.
+            if network
+                || !self.volumes.keeps_permissions(inode.dev())
+                || lifted(mode, inode.is_dir)
+                || self.record_of(&inode, None).kept_mode().is_some()
+            {
                 let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
                 match self.record_owner(&inode, None, &path, owner, mode) {
                     Ok(()) => {}
@@ -3222,7 +3276,9 @@ impl Server {
         let umask = get_u32(body, 8).unwrap_or(0);
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        parent.under_name(&name, |dir, at| sys::mknod_at(dir, at, mode & !umask, rdev))?;
+        parent.under_name(&name, |dir, at| {
+            sys::mknod_at(dir, at, servable(mode & !umask, false), rdev)
+        })?;
         let mut entry = self.entry(&parent, &name)?;
         self.keep_made(&parent, &mut entry, mode & !umask & 0o7777);
         Ok(self.entry_reply(&entry))
@@ -3245,7 +3301,9 @@ impl Server {
             return Ok(reply);
         }
         self.settle_while(&parent, |parent| parent.is_pending());
-        parent.under_name(&name, |dir, at| sys::mkdir_at(dir, at, mode))?;
+        parent.under_name(&name, |dir, at| {
+            sys::mkdir_at(dir, at, servable(mode, true))
+        })?;
         let mut entry = self.entry(&parent, &name)?;
         self.keep_made(&parent, &mut entry, mode);
         Ok(self.entry_reply(&entry))
@@ -3946,8 +4004,8 @@ impl Server {
             let inode = inode.clone();
             let name = name.clone();
             let is_symlink = matches!(kind, crate::inode::PendingKind::Symlink);
-            let keep =
-                (!is_symlink && self.volumes.network(parent.dev())).then(|| self.modes.clone());
+            let keep = (!is_symlink).then(|| self.modes.clone());
+            let network = self.volumes.network(parent.dev());
             move || {
                 let result = (|| {
                     let fd = parent.under_name(&name, |dir, at| {
@@ -3955,7 +4013,7 @@ impl Server {
                             Some(target) => sys::symlink_at(target, dir, at)?,
                             None => {
                                 let mode = inode.pending_meta().map(|m| m.mode).unwrap_or(mode);
-                                sys::mkdir_at(dir, at, mode & 0o7777)?;
+                                sys::mkdir_at(dir, at, servable(mode & 0o7777, true))?;
                             }
                         }
                         sys::open_reference(dir, at, is_symlink)
@@ -3972,9 +4030,11 @@ impl Server {
                                 "NAME-DEBUG mkdir job applied, binding"
                             );
                         }
-                        if let Some(modes) = &keep {
-                            let mode = inode.pending_meta().map_or(mode, |meta| meta.mode);
-                            modes.keep(&inode, Some(&parent), fd.as_raw_fd(), mode & 0o7777);
+                        let kept = inode.pending_meta().map_or(mode, |meta| meta.mode);
+                        if let Some(modes) = &keep
+                            && (network || lifted(kept, true))
+                        {
+                            modes.keep(&inode, Some(&parent), fd.as_raw_fd(), kept & 0o7777);
                         }
                         registry.bind_pending(
                             nodeid,
@@ -4701,10 +4761,8 @@ impl Server {
             writes: Vec::new(),
             bytes: 0,
             since: std::time::Instant::now(),
-            keep: self
-                .volumes
-                .network(parent.dev())
-                .then(|| self.modes.clone()),
+            keep: self.modes.clone(),
+            network: self.volumes.network(parent.dev()),
         };
         if self.defer_creates {
             self.deferred
@@ -4982,7 +5040,7 @@ impl Server {
                     dir,
                     at,
                     creating | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
-                    mode & 0o7777 & !umask,
+                    servable(mode & 0o7777 & !umask, false),
                 ) {
                     Ok(fd) => break fd,
                     Err(e) if e == linux::EEXIST && flags & LINUX_O_EXCL == 0 => {}

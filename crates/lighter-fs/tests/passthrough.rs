@@ -1426,6 +1426,102 @@ fn fsync_settles_the_apply_queue_before_replying() {
 /// yet. A Mac program deleting it, or saving over it, must leave the guest
 /// reading what it opened, as a local file would; OrbStack, Docker Desktop
 /// and Apple's virtiofs all do.
+fn mode_from_attr(reply: &[u8]) -> u32 {
+    u32::from_le_bytes(reply[16 + 60..16 + 64].try_into().unwrap()) & 0o7777
+}
+
+fn host_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn host_record(path: &std::path::Path) -> bool {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = c"com.docker.grpcfuse.ownership";
+    // SAFETY: valid NUL-terminated strings and no buffer, which asks for the size.
+    unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        ) >= 0
+    }
+}
+
+/// A container's root makes a directory it cannot read or search, as
+/// pjdfstest does: Linux lets root use it anyway, and the server, which
+/// works as the Mac user, needs to read and search it to serve it at all.
+/// The Mac directory gets the owner bits the server needs; the guest sees
+/// what it asked for, kept in the record.
+#[test]
+fn a_directory_made_unreadable_is_made_and_shows_its_mode() {
+    let mut guest = Guest::new("mode-dir-unreadable");
+    let mut body = 0o151u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("d"));
+    let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+    let nodeid = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(host_mode(&guest.host("d")), 0o551);
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o151);
+    // A chmod to bits the Mac can hold gives them back to the file, and the
+    // record lets go.
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&fuse::fattr::MODE.to_le_bytes());
+    body[68..72].copy_from_slice(&0o755u32.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).expect("setattr");
+    assert_eq!(host_mode(&guest.host("d")), 0o755);
+    assert!(
+        !host_record(&guest.host("d")),
+        "the record outlived the bits it kept"
+    );
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o755);
+}
+
+/// A file made with no read bit is still read by the server for the
+/// container's root, and shows the bits it was made with; a read-only file,
+/// which the server can read, is left exactly as asked, with no record.
+#[test]
+fn a_file_made_unreadable_is_kept_and_a_read_only_one_is_left_alone() {
+    let mut guest = Guest::new("mode-file-unreadable");
+    let (nodeid, fh) = guest
+        .create_mode(1, "secret", 0o1 | 0o100, 0o000)
+        .expect("create");
+    guest.write(nodeid, fh, 0, b"content").expect("write");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(host_mode(&guest.host("secret")), 0o400);
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o000);
+    assert_eq!(guest.read(nodeid, 0, 0, 64), Ok(b"content".to_vec()));
+
+    let (plain, _) = guest
+        .create_mode(1, "readonly", 0o1 | 0o100, 0o444)
+        .expect("create");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(host_mode(&guest.host("readonly")), 0o444);
+    assert!(
+        !host_record(&guest.host("readonly")),
+        "a read-only file was given a record"
+    );
+    let ga = guest.call(op::GETATTR, plain, &[0u8; 16]).expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o444);
+}
+
 #[test]
 fn a_file_the_guest_has_open_survives_its_deletion_on_the_host() {
     let mut guest = Guest::new("notice-host-delete");
