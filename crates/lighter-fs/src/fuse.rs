@@ -37,6 +37,9 @@ pub mod op {
     /// Ours (guest patch 0005): a whole-file clone of one inode over another
     /// name. Numbered far above anything mainline assigns.
     pub const LIGHTER_CLONE: u32 = 62000;
+    /// Ours (guest patch 0057): which files the guest has opened and closed
+    /// since the last batch, as `{u64 nodeid, i64 delta}` entries.
+    pub const LIGHTER_NOTICES: u32 = 62003;
     pub const LOOKUP: u32 = 1;
     pub const FORGET: u32 = 2;
     pub const GETATTR: u32 = 3;
@@ -150,6 +153,9 @@ pub mod init2 {
     /// [`attr::LIGHTER_CALLER_UID`] or `_GID` belongs to whoever asks.
     /// Overall bit 56.
     pub const LIGHTER_CALLER_OWNS: u32 = 1 << 24;
+    /// Ours, matched by guest patch 0057: [`super::op::LIGHTER_NOTICES`]
+    /// are sent. Overall bit 55.
+    pub const LIGHTER_OPEN_NOTICE: u32 = 1 << 23;
 }
 
 /// `fuse_attr.flags`.

@@ -255,6 +255,16 @@ impl Guest {
         }
     }
 
+    /// What guest patch 0057 sends: these files' opens and closes.
+    fn notices(&mut self, changes: &[(u64, i64)]) {
+        let mut body = Vec::new();
+        for (nodeid, delta) in changes {
+            body.extend_from_slice(&nodeid.to_le_bytes());
+            body.extend_from_slice(&delta.to_le_bytes());
+        }
+        self.call(op::LIGHTER_NOTICES, 1, &body).expect("notices");
+    }
+
     fn write(&mut self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
         let mut body = Vec::new();
         body.extend_from_slice(&fh.to_le_bytes());
@@ -1412,6 +1422,53 @@ fn fsync_settles_the_apply_queue_before_replying() {
 /// registering it, once in the branch that registered it, once again as the
 /// entry was answered — so the guest's forget left it in the table for good:
 /// 49 of 64 such files, looked up and forgotten, stayed live.
+/// The guest says a file is open (guest patch 0057), and has not read it
+/// yet. A Mac program deleting it, or saving over it, must leave the guest
+/// reading what it opened, as a local file would; OrbStack, Docker Desktop
+/// and Apple's virtiofs all do.
+#[test]
+fn a_file_the_guest_has_open_survives_its_deletion_on_the_host() {
+    let mut guest = Guest::new("notice-host-delete");
+    std::fs::write(guest.host("f"), b"original").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    let fh = guest.open(nodeid, 0).unwrap();
+    guest.notices(&[(nodeid, 1)]);
+    std::fs::remove_file(guest.host("f")).unwrap();
+    assert_eq!(guest.read(nodeid, fh, 0, 64), Ok(b"original".to_vec()));
+}
+
+#[test]
+fn a_file_the_guest_has_open_survives_a_save_over_it_on_the_host() {
+    let mut guest = Guest::new("notice-host-replace");
+    std::fs::write(guest.host("f"), b"original").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    let fh = guest.open(nodeid, 0).unwrap();
+    guest.notices(&[(nodeid, 1)]);
+    std::fs::write(guest.host("f.tmp"), b"replacement").unwrap();
+    std::fs::rename(guest.host("f.tmp"), guest.host("f")).unwrap();
+    assert_eq!(guest.read(nodeid, fh, 0, 64), Ok(b"original".to_vec()));
+}
+
+/// Without a notice, or after the close, nothing is held: the guest gets
+/// ESTALE, never the file that took the name.
+#[test]
+fn a_file_closed_again_is_not_held() {
+    let mut guest = Guest::new("notice-closed");
+    std::fs::write(guest.host("f"), b"original").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    guest.notices(&[(nodeid, 1)]);
+    guest.notices(&[(nodeid, -1)]);
+    std::fs::write(guest.host("f.tmp"), b"replacement").unwrap();
+    std::fs::rename(guest.host("f.tmp"), guest.host("f")).unwrap();
+    // Out of the open cache too, as it would be after its eviction.
+    let read = guest.read(nodeid, 0, 0, 64);
+    assert_ne!(
+        read,
+        Ok(b"replacement".to_vec()),
+        "read another file's bytes"
+    );
+}
+
 #[test]
 fn a_file_looked_up_and_forgotten_leaves_the_registry() {
     let mut guest = Guest::new("forget-lookup");

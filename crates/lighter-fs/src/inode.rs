@@ -80,7 +80,19 @@ pub enum Located {
 /// enough that no filesystem's real numbers reach it.
 pub const PROVISIONAL_INO: u64 = 1 << 62;
 
+/// Whether the guest has this file open, as its notices say (guest patch
+/// 0057), and the descriptor held for it while it does.
+#[derive(Default)]
+pub struct OpenPin {
+    /// Opens minus closes. A batch can carry a close the server sees before
+    /// the open it ends; the count is right once both have arrived.
+    pub count: i64,
+    pub file: Option<Arc<OpenFile>>,
+}
+
 pub struct Inode {
+    /// See [`OpenPin`].
+    pub open: Mutex<OpenPin>,
     /// A metadata-only descriptor, or nothing if it has been parked.
     ///
     /// Shared rather than owned so that parking is never a race: a reclaimer
@@ -661,6 +673,7 @@ impl Inode {
         census.inodes.fetch_add(1, Ordering::Relaxed);
         let remote = census.remotes.get(dev);
         let inode = Inode {
+            open: Mutex::new(OpenPin::default()),
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
             born: Mutex::new(None),
@@ -752,6 +765,7 @@ impl Inode {
         census.inodes.fetch_add(1, Ordering::Relaxed);
         let remote = census.remotes.get(dev);
         Inode {
+            open: Mutex::new(OpenPin::default()),
             fd: RwLock::new(None),
             parked_at: Mutex::new(None),
             born: Mutex::new(None),

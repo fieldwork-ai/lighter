@@ -1604,6 +1604,7 @@ impl Server {
 
             op::CREATE => self.create(nodeid, body),
             op::LIGHTER_CLONE => self.clone_over(header.nodeid, body),
+            op::LIGHTER_NOTICES => self.notices(body),
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
             // Never sent once OPEN has answered ENOSYS; nothing holds an `fh`.
@@ -1880,6 +1881,7 @@ impl Server {
         };
         let flags2 = if flags & fuse::init::INIT_EXT != 0 {
             (fuse::init2::LIGHTER_CREATE
+                | fuse::init2::LIGHTER_OPEN_NOTICE
                 | clone
                 | no_security
                 | fuse::init2::LIGHTER_NOOP_SETATTR
@@ -4124,6 +4126,43 @@ impl Server {
     /// The guest stopped reporting opens, so every `fh` it sends is zero and
     /// the inode is the only thing identifying the file: the descriptor is
     /// ours to find or make.
+    /// Which files the guest has open (guest patch 0057). Each is held from
+    /// the batch that says it opened until the one that says it closed, so a
+    /// Mac program deleting it or saving over it leaves the guest reading
+    /// what it opened, as a local file would. A file whose create is still
+    /// queued has no host file to hold yet: it is counted now, and held by
+    /// the first descriptor opened for it (`file_for`).
+    fn notices(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+        for entry in body.as_chunks::<16>().0 {
+            let (nodeid, delta) = entry.split_at(8);
+            let nodeid = u64::from_le_bytes(nodeid.try_into().expect("eight bytes"));
+            let delta = i64::from_le_bytes(delta.try_into().expect("eight bytes"));
+            let Ok(inode) = self.inode(nodeid) else {
+                continue;
+            };
+            if inode.is_dir {
+                continue;
+            }
+            let opened = {
+                let mut pin = inode.open.lock().expect("open pin poisoned");
+                let was = pin.count;
+                pin.count += delta;
+                if pin.count <= 0 {
+                    pin.file = None;
+                }
+                was <= 0 && pin.count > 0 && pin.file.is_none()
+            };
+            if opened && !inode.is_promised() {
+                // Read-write where it can be, so the guest's writes through
+                // it after a deletion land in the file it has open.
+                let _ = self
+                    .file_for(nodeid, true)
+                    .or_else(|_| self.file_for(nodeid, false));
+            }
+        }
+        Ok(Vec::new())
+    }
+
     fn file_for(&self, nodeid: u64, need_write: bool) -> Result<Arc<OpenFile>, i32> {
         if let Some(cached) = self.open_cache.file(nodeid, need_write) {
             return Ok(cached);
@@ -4131,6 +4170,12 @@ impl Server {
         let inode = self.inode(nodeid)?;
         if inode.is_dir {
             return Err(linux::EISDIR);
+        }
+        let held = inode.open.lock().expect("open pin poisoned").file.clone();
+        if let Some(file) = held.filter(|file| file.writable || !need_write) {
+            self.open_cache
+                .put_file(nodeid, file.clone(), inode.remote().cloned());
+            return Ok(file);
         }
         // A name the guest was given by a queued rename or link is one the
         // host does not have yet, and a file whose descriptor was parked is
@@ -4147,6 +4192,17 @@ impl Server {
             readable: true,
             writable: need_write,
         });
+        {
+            let mut pin = inode.open.lock().expect("open pin poisoned");
+            if pin.count > 0
+                && pin
+                    .file
+                    .as_ref()
+                    .is_none_or(|held| !held.writable && need_write)
+            {
+                pin.file = Some(file.clone());
+            }
+        }
         self.open_cache
             .put_file(nodeid, file.clone(), inode.remote().cloned());
         Ok(file)
