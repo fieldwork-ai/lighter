@@ -731,7 +731,7 @@ impl Modes {
     /// owner it has recorded, if any. On failure the file shows the server's
     /// bits, as it did before, and the failure is said once.
     fn keep(&self, inode: &Inode, parent: Option<&Inode>, fd: RawFd, mode: u32) {
-        if let Err(errno) = self.try_keep(inode, parent, fd, mode)
+        if let Err(errno) = self.try_keep(inode, parent, fd, mode, None)
             && !self.warned.swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
@@ -741,28 +741,48 @@ impl Modes {
         }
     }
 
+    /// Records `mode` as the bits of a special file just made in the
+    /// regular file standing in for it, and what it is.
+    fn keep_special(
+        &self,
+        inode: &Inode,
+        parent: &Inode,
+        fd: RawFd,
+        mode: u32,
+        special: crate::ownership::Special,
+    ) -> Result<(), i32> {
+        self.try_keep(inode, Some(parent), fd, mode, Some(special))
+    }
+
+    /// `special` says what the file is; `None` keeps what the record says.
     fn try_keep(
         &self,
         inode: &Inode,
         parent: Option<&Inode>,
         fd: RawFd,
         mode: u32,
+        special: Option<crate::ownership::Special>,
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode, parse};
-        let (uid, gid) = match inode.owner() {
-            Owner::Set { uid, gid, .. } => (uid, gid),
-            Owner::Mac => (0, 0),
+        let ((uid, gid), recorded) = match inode.owner() {
+            Owner::Set {
+                uid, gid, special, ..
+            } => ((uid, gid), special),
+            Owner::Mac => ((0, 0), None),
             Owner::Unknown => {
                 let mut record = [0u8; 128];
                 match sys::get_xattr_fd(fd, RECORD, &mut record) {
-                    Ok(len) => parse(&record[..len])
-                        .and_then(|owner| owner.recorded())
-                        .unwrap_or((0, 0)),
-                    Err(errno) if errno == linux::ENODATA || errno == linux::ERANGE => (0, 0),
+                    Ok(len) => parse(&record[..len]).map_or(((0, 0), None), |owner| {
+                        (owner.recorded().unwrap_or((0, 0)), owner.special())
+                    }),
+                    Err(errno) if errno == linux::ENODATA || errno == linux::ERANGE => {
+                        ((0, 0), None)
+                    }
                     Err(errno) => return Err(errno),
                 }
             }
         };
+        let special = special.or(recorded);
         self.mark_root();
         let place = if parent.is_none() {
             inode.place()
@@ -779,7 +799,7 @@ impl Modes {
             })?;
             parent.set_mark(Mark::Marked);
         }
-        let record = encode(uid, gid, mode, true);
+        let record = encode(uid, gid, mode, true, special);
         with_owner_write_fd(fd, || {
             set_ours(
                 || sys::set_xattr_fd(fd, RECORD, &record),
@@ -791,6 +811,7 @@ impl Modes {
             gid,
             mode: Some(mode & 0o7777),
             kept: true,
+            special,
         });
         Ok(())
     }
@@ -2484,6 +2505,29 @@ impl Server {
         mark == Mark::Marked
     }
 
+    /// Marks `to` when `from` is marked ([`crate::ownership::MARKER`]): a
+    /// file with a record that moves there must still be looked for there.
+    /// A container's chown, a kept mode, a socket: each read as the Mac
+    /// user's plain file once moved into a directory nothing marked, and
+    /// stayed that way. A rename out of a directory nothing in which has a
+    /// record, which is every rename a package install makes, costs nothing.
+    fn carry_mark(&self, from: &Inode, to: &Inode) {
+        use crate::ownership::{MARKER, Mark};
+        if from.id() == to.id()
+            || to.mark() == Mark::Marked
+            || !self.ownership.load(Ordering::Relaxed)
+            || !self.may_hold_owned(from)
+        {
+            return;
+        }
+        let Ok(path) = self.path(to) else {
+            return;
+        };
+        if with_owner_write(&path, || sys::set_xattr(&path, MARKER, b"1", 0)).is_ok() {
+            to.set_mark(Mark::Marked);
+        }
+    }
+
     /// `None` if the file cannot be reached right now, which is not the
     /// same as having no record and so is not remembered.
     fn read_owner(&self, inode: &Inode) -> Option<crate::ownership::Owner> {
@@ -2508,6 +2552,11 @@ impl Server {
         if let Some(mode) = self.recorded_mode(inode, record) {
             attr.mode = (attr.mode & !0o7777) | mode;
         }
+        if let Some(special) = record.special() {
+            attr.mode = special.kind | (attr.mode & 0o7777);
+            attr.rdev = special.rdev;
+            attr.size = 0;
+        }
     }
 
     /// Records a container's owner and the file's permission bits, or clears
@@ -2524,7 +2573,11 @@ impl Server {
         mode: u32,
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode};
-        let kept = self.volumes.network(inode.dev()) || lifted(mode, inode.is_dir);
+        let special = inode.owner().special();
+        // A special file is a regular file on the Mac: its record is what it
+        // is, and its bits are the record's.
+        let kept =
+            self.volumes.network(inode.dev()) || lifted(mode, inode.is_dir) || special.is_some();
         if (uid, gid) == (0, 0) && self.volumes.keeps_permissions(inode.dev()) && !kept {
             match with_owner_write(path, || sys::remove_xattr(path, RECORD)) {
                 Err(errno) if errno != linux::ENODATA => return Err(errno),
@@ -2551,7 +2604,7 @@ impl Server {
             })?;
             parent.set_mark(Mark::Marked);
         }
-        let record = encode(uid, gid, mode, kept);
+        let record = encode(uid, gid, mode, kept, special);
         with_owner_write(path, || {
             set_ours(
                 || sys::set_xattr(path, RECORD, &record, 0),
@@ -2563,6 +2616,7 @@ impl Server {
             gid,
             mode: Some(mode & 0o7777),
             kept,
+            special,
         });
         Ok(())
     }
@@ -3276,12 +3330,57 @@ impl Server {
         let umask = get_u32(body, 8).unwrap_or(0);
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
+        let kind = mode & libc::S_IFMT as u32;
+        if crate::ownership::Special::applies(kind) {
+            return self.make_special(&parent, &name, mode & !umask & 0o7777, kind, rdev);
+        }
         parent.under_name(&name, |dir, at| {
             sys::mknod_at(dir, at, servable(mode & !umask, false), rdev)
         })?;
         let mut entry = self.entry(&parent, &name)?;
         self.keep_made(&parent, &mut entry, mode & !umask & 0o7777);
         Ok(self.entry_reply(&entry))
+    }
+
+    /// A socket or a device node, which the Mac user cannot make
+    /// ([`crate::ownership::Special`]): an empty regular file in its place,
+    /// and what it is in its record. A container binding a socket in a
+    /// shared folder (Postgres with its data there, an app server on
+    /// `unix:/app/app.sock`) failed with EPERM, and so did every mknod of a
+    /// device; the guest's kernel does all a socket or a node is for, so the
+    /// name and the kind are all it needs of the server.
+    fn make_special(
+        &self,
+        parent: &Arc<Inode>,
+        name: &CString,
+        mode: u32,
+        kind: u32,
+        rdev: u32,
+    ) -> Result<Vec<u8>, i32> {
+        let fd = parent.under_name(name, |dir, at| {
+            sys::openat_path(
+                dir,
+                at,
+                LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW | 1,
+                servable(mode, false),
+            )
+        })?;
+        let made = self.entry(parent, name).and_then(|mut entry| {
+            let inode = self.registry.get(entry.nodeid).ok_or(linux::EIO)?;
+            let special = crate::ownership::Special { kind, rdev };
+            self.modes
+                .keep_special(&inode, parent, fd.as_raw_fd(), mode, special)?;
+            self.own(&inode, Some(parent), &mut entry.attr);
+            Ok(entry)
+        });
+        match made {
+            Ok(entry) => Ok(self.entry_reply(&entry)),
+            Err(errno) => {
+                // Not a special file without its record: no file at all.
+                let _ = parent.under_name(name, |dir, at| sys::unlink_at(dir, at, false));
+                Err(errno)
+            }
+        }
     }
 
     fn mkdir(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
@@ -3851,6 +3950,7 @@ impl Server {
         let new = self.checked_name(new)?;
         self.settle_while(&old_parent, |parent| parent.is_pending());
         self.settle_while(&new_parent, |parent| parent.is_pending());
+        self.carry_mark(&old_parent, &new_parent);
         phase("rename-us-1-parents", t0);
         let t1 = std::time::Instant::now();
         if flags == 0

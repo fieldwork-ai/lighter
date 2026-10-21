@@ -1522,6 +1522,72 @@ fn a_file_made_unreadable_is_kept_and_a_read_only_one_is_left_alone() {
     assert_eq!(mode_from_attr(&ga), 0o444);
 }
 
+fn mknod_body(mode: u32, rdev: u32, name: &str) -> Vec<u8> {
+    let mut body = mode.to_le_bytes().to_vec();
+    body.extend_from_slice(&rdev.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // umask
+    body.extend_from_slice(&0u32.to_le_bytes()); // padding
+    body.extend_from_slice(&name_body(name));
+    body
+}
+
+/// (mode, rdev) from an entry reply.
+fn entry_kind(reply: &[u8]) -> (u32, u32) {
+    let attr = 40;
+    (
+        u32::from_le_bytes(reply[attr + 60..attr + 64].try_into().unwrap()),
+        u32::from_le_bytes(reply[attr + 76..attr + 80].try_into().unwrap()),
+    )
+}
+
+/// A socket bound in a shared folder, and a device node made in one: the Mac
+/// user can make neither, so the Mac has an empty file in each one's place
+/// and the guest, whose kernel does all a socket or a node is for, sees what
+/// it made. Both were EPERM: Postgres with its data in a shared folder puts
+/// its socket there.
+#[test]
+fn a_socket_and_a_device_node_are_made_and_seen_as_what_they_are() {
+    let mut guest = Guest::new("special-files");
+    let sock = libc::S_IFSOCK as u32;
+    let reply = guest
+        .call(op::MKNOD, 1, &mknod_body(sock | 0o755, 0, "s"))
+        .expect("mknod socket");
+    assert_eq!(entry_kind(&reply), (sock | 0o755, 0));
+    let host = std::fs::symlink_metadata(guest.host("s")).unwrap();
+    assert!(
+        host.file_type().is_file() && host.len() == 0,
+        "the Mac has a plain empty file"
+    );
+
+    let chr = libc::S_IFCHR as u32;
+    let reply = guest
+        .call(op::MKNOD, 1, &mknod_body(chr | 0o644, 0x0102, "c"))
+        .expect("mknod char");
+    assert_eq!(entry_kind(&reply), (chr | 0o644, 0x0102));
+
+    // Moved into a directory of its own, and read by a server that starts
+    // afresh, it is still a socket: the directory it went to is looked in.
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("sub"));
+    let sub = u64::from_le_bytes(
+        guest.call(op::MKDIR, 1, &body).expect("mkdir")[0..8]
+            .try_into()
+            .unwrap(),
+    );
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let mut body = sub.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("s"));
+    body.extend_from_slice(&name_body("s"));
+    guest.call(op::RENAME, 1, &body).expect("rename");
+    let mut fresh = guest.another();
+    let sub = fresh.lookup(1, "sub").expect("lookup sub");
+    let reply = fresh
+        .call(op::LOOKUP, sub, &name_body("s"))
+        .expect("lookup s");
+    assert_eq!(entry_kind(&reply).0 & libc::S_IFMT as u32, sock);
+}
+
 #[test]
 fn a_file_the_guest_has_open_survives_its_deletion_on_the_host() {
     let mut guest = Guest::new("notice-host-delete");
