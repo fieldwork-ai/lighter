@@ -261,7 +261,7 @@ grew=$(( ${now_ballooned:-0} - ${before_floor:-0} ))
 # there it is judged by that: no higher than the most a hold since the floor
 # held it at.
 held_at="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | tail -n +"$((floor_mark + 1))" \
-	| grep -a "balloon ramp held" | grep -oE 'held_mib=[0-9]+' | cut -d= -f2 | sort -n | tail -1)"
+	| grep -a "balloon ramp held" | grep -oE 'held_mib=[0-9]+' | cut -d= -f2 | sort -n | tail -1 || true)"
 overcommitted_now="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a "host overcommitment changed" | tail -1 || true)"
 if [[ "$overcommitted_now" == *"overcommitted=true"* ]] && [ -n "$held_at" ]; then
 	[ "${now_ballooned:-0}" -le $((held_at + 256)) ] \
