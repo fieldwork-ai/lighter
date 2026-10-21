@@ -312,8 +312,8 @@ for run in 1 2 3 4 5; do
 done
 ")"
 		echo "$sizes" | sed 's/^/    /'
-		runs="$(grep -c '^SIZE_RUN 0 \(exact\|dropped [0-9]*\)$' <<<"$sizes")"
-		exact="$(grep -c '^SIZE_RUN 0 exact$' <<<"$sizes")"
+		runs="$(grep -c '^SIZE_RUN 0 \(exact\|dropped [0-9]*\)$' <<<"$sizes" || true)"
+		exact="$(grep -c '^SIZE_RUN 0 exact$' <<<"$sizes" || true)"
 		if grep -q '^SIZE_SW 0$' <<<"$sizes" && [ "$runs" = 5 ]; then
 			pass "H.264 $change mid-stream: 5 runs, every frame at both sizes matches software decode in $exact; the rest lack only frames ffmpeg drops at the change"
 		else

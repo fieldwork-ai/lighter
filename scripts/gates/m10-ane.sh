@@ -213,9 +213,9 @@ docker wait "$container" >/dev/null 2>&1 || true
 looped="$(docker logs "$container" 2>&1 | grep '^LOOPED' | tail -1)"
 # The client's own stream stays open after the loop, so the hold has to end
 # by the VMM letting go, the last word this stage logs about the vCPUs.
-stage="$(tail -n +"$((mark + 1))" "$LOG" | grep -E "vCPUs (at the interactive class|back to the default class)")"
-held="$(echo "$stage" | grep -c "interactive class")"
-released="$(echo "$stage" | tail -1 | grep -c "back to the default class")"
+stage="$(tail -n +"$((mark + 1))" "$LOG" | grep -E "vCPUs (at the interactive class|back to the default class)" || true)"
+held="$(echo "$stage" | grep -c "interactive class" || true)"
+released="$(echo "$stage" | tail -1 | grep -c "back to the default class" || true)"
 if [ -n "$looped" ] && [ "$held" -ge 1 ] && [ "$released" = 1 ]; then
 	pass "the loop held the vCPUs and the VMM let go after it ($looped)"
 else
