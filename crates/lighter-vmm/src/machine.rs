@@ -484,15 +484,18 @@ impl Machine {
 
         // The decoder first, so it is /dev/video0 as it always was, then
         // the encoder, each with half the aperture.
-        let encoder = layout.video.map(|aperture| {
+        let video = layout.video.map(|aperture| {
             let half = aperture.size / 2;
-            virtio.push(Box::new(crate::virtio::media::Media::decoder(
+            let decoder = crate::virtio::media::Media::decoder(
                 crate::layout::Window {
                     base: aperture.base,
                     size: half,
                 },
                 memory.clone(),
-            )));
+            );
+            let decoded = decoder.doorbell().expect("the decoder has a doorbell");
+            let decoder_slot = virtio.len();
+            virtio.push(Box::new(decoder));
             let encoder = crate::virtio::media::Media::encoder(
                 crate::layout::Window {
                     base: aperture.base + half,
@@ -500,10 +503,13 @@ impl Machine {
                 },
                 memory.clone(),
             );
-            let doorbell = encoder.doorbell().expect("the encoder has a doorbell");
-            let slot = virtio.len();
+            let encoded = encoder.doorbell().expect("the encoder has a doorbell");
+            let encoder_slot = virtio.len();
             virtio.push(Box::new(encoder));
-            (slot, doorbell)
+            [
+                ("video-decode", decoder_slot, decoded),
+                ("video-encode", encoder_slot, encoded),
+            ]
         });
 
         let wired: Vec<_> = [&config.lan, &config.link]
@@ -552,23 +558,24 @@ impl Machine {
                 .map_err(|e| MachineError::Thread("gpu-fences", e))?;
         }
 
-        // VideoToolbox hands encoded frames back on its own threads and rings
-        // the encoder's doorbell; this thread takes the transport lock and
-        // services the event queue, which delivers them.
-        if let Some((slot, doorbell)) = encoder {
+        // VideoToolbox hands decoded and encoded frames back on its own
+        // threads and rings the device's doorbell; a thread per device takes
+        // the transport lock and services the event queue, which delivers
+        // them.
+        for (name, slot, doorbell) in video.into_iter().flatten() {
             let transport = virtio_devices[slot].clone();
             std::thread::Builder::new()
-                .name("video-encode".into())
+                .name(name.into())
                 .spawn(move || {
                     loop {
                         doorbell.wait();
                         transport
                             .lock()
-                            .expect("video encoder transport poisoned")
+                            .expect("video transport poisoned")
                             .service_queue(crate::virtio::media::EVENT_QUEUE);
                     }
                 })
-                .map_err(|e| MachineError::Thread("video-encode", e))?;
+                .map_err(|e| MachineError::Thread(name, e))?;
         }
 
         // vsock queues packets from host threads and must be able to deliver
