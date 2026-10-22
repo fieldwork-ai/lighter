@@ -1412,6 +1412,26 @@ impl Server {
                     .map_while(|index| get_u64(body, 8 + index * 16))
                     .any(|nodeid| !self.surely_local(nodeid))
             }
+            // Its header names the root; what it opens are the files in its
+            // body. Each one the guest has kept open is opened to be held,
+            // and one on a network volume opened on the vCPU stopped it on
+            // the server: where that server was Samba in the guest itself,
+            // reached through a published port, the Mac's client waited for
+            // it, gave up and dropped the session, and m16's library walk
+            // read 4,000 photos as "Socket not connected".
+            op::LIGHTER_NOTICES => {
+                let end = (header.len as usize)
+                    .min(request.len())
+                    .max(fuse::IN_HEADER_LEN);
+                request[fuse::IN_HEADER_LEN..end]
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .any(|entry| {
+                        let nodeid = u64::from_le_bytes(entry[..8].try_into().expect("eight"));
+                        !self.surely_local(nodeid)
+                    })
+            }
             _ => !self.surely_local(header.nodeid),
         }
     }
@@ -6005,6 +6025,32 @@ mod volfs_tests {
             "one inode not known to be local sends the batch to a worker"
         );
         assert!(!server.may_block(&request(op::INTERRUPT, 0, &[0u8; 8])));
+    }
+
+    /// A batch of open notices names the root in its header and opens the
+    /// files in its body: it is served inline only when all of them are
+    /// local.
+    #[test]
+    fn open_notices_are_served_inline_only_when_all_they_name_is_local() {
+        let dir = tempfile_dir();
+        let server = Server::new(&dir).unwrap();
+        let notices = |nodeids: &[u64]| {
+            let mut r = vec![0u8; crate::fuse::IN_HEADER_LEN];
+            for nodeid in nodeids {
+                r.extend_from_slice(&nodeid.to_le_bytes());
+                r.extend_from_slice(&1i64.to_le_bytes());
+            }
+            let len = r.len() as u32;
+            r[0..4].copy_from_slice(&len.to_le_bytes());
+            r[4..8].copy_from_slice(&op::LIGHTER_NOTICES.to_le_bytes());
+            r[16..24].copy_from_slice(&1u64.to_le_bytes());
+            r
+        };
+        assert!(!server.may_block(&notices(&[1])));
+        assert!(
+            server.may_block(&notices(&[1, 424_242])),
+            "a file not known to be local sends the batch to a worker"
+        );
     }
 
     /// A record the server will not overwrite is removed and made again; any
