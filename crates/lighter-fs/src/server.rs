@@ -1138,7 +1138,19 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
                 // full: asking by another door would only ask again
                 // ([`crate::remote`], [`crate::inode::Inode::refuses`]).
                 Err(errno) if inode.refuses(errno) => Err(errno),
-                // The name has moved on; the file may not have.
+                // The name has moved on; the file may not have. Anything else
+                // (EACCES, EROFS) is the file's own answer, and asking it by
+                // identity would only hear it again: a read-write open of a
+                // read-only file, which an open notice tries first, cost a
+                // second open, a round trip each on a network volume.
+                Err(errno)
+                    if errno != linux::ENOENT
+                        && errno != linux::ESTALE
+                        && errno != linux::ENOTDIR
+                        && errno != linux::ELOOP =>
+                {
+                    Err(errno)
+                }
                 Err(_) => sys::reopen(
                     inode.reference()?.raw_fd(),
                     linux_flags,
