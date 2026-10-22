@@ -193,8 +193,10 @@ struct Held {
     writes: Vec<(u64, Vec<u8>)>,
     bytes: usize,
     since: std::time::Instant,
-    /// On a network share: where the file's bits are kept once it exists.
-    keep: Option<Arc<Modes>>,
+    /// Where the file's bits are kept once it exists, if they need to be:
+    /// on a network share, or bits the host file cannot have ([`lifted`]).
+    keep: Arc<Modes>,
+    network: bool,
 }
 
 /// Bytes one held file may accumulate before its create is queued, and all
@@ -269,6 +271,7 @@ fn create_job(
         mode,
         writes,
         keep,
+        network,
         ..
     } = held;
     let keys = crate::apply::Keys::of(&[parent.id(), nodeid]);
@@ -298,18 +301,32 @@ fn create_job(
         } else {
             flags
         };
-        let result = (|| {
+        let create = || {
             let fd = parent.under_name(&name, |dir, at| {
                 sys::openat_path(
                     dir,
                     at,
                     host_flags | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
-                    mode,
+                    servable(mode, false),
                 )
             })?;
             let st = sys::stat_fd(fd.as_raw_fd())?;
             Ok((fd, st))
-        })();
+        };
+        let mut result = create();
+        // The guest was told this file exists, so an open refused for want
+        // of room is not the end of it: the job lets go of what the shortage
+        // asks, as a request would, and makes the file again. Nothing was
+        // made by the refused open (the table, or the server, refused it
+        // before the name was), so the second try cannot find a file of its
+        // own in the way.
+        if let Err(errno) = result
+            && let Some(shortage) =
+                crate::inode::Shortage::of(errno, inode.remote().map(|remote| remote.dev()))
+        {
+            registry.pool().relieve(shortage, errno);
+            result = create();
+        }
         match result {
             Ok((fd, mut st)) => {
                 // The bytes promised while the create was held back are the
@@ -327,13 +344,13 @@ fn create_job(
                     .iter()
                     .map(|(offset, data)| write_fully(fd.as_raw_fd(), data, *offset))
                     .collect();
-                if let Some(modes) = &keep {
-                    let mode = inode.pending_meta().map_or(mode, |meta| meta.mode);
-                    modes.keep(&inode, Some(&parent), fd.as_raw_fd(), mode & 0o7777);
+                let kept = inode.pending_meta().map_or(mode, |meta| meta.mode);
+                if network || lifted(kept, false) {
+                    keep.keep(&inode, Some(&parent), fd.as_raw_fd(), kept & 0o7777);
                 }
                 if let Some(meta) = inode.pending_meta() {
                     if meta.mode & 0o7777 != mode & 0o7777 {
-                        let _ = sys::chmod_fd(fd.as_raw_fd(), meta.mode & 0o7777);
+                        let _ = sys::chmod_fd(fd.as_raw_fd(), servable(meta.mode & 0o7777, false));
                     }
                     if meta.atime != meta.born || meta.mtime != meta.born {
                         let _ = sys::utimes_fd(
@@ -351,20 +368,17 @@ fn create_job(
                         }
                     }
                 }
-                // Two descriptors, as the synchronous path keeps two: a
-                // metadata reference for the inode, and the open file itself
-                // in the open cache — which is what lets the guest keep
-                // reading and writing after an unlink, exactly as a real
-                // file handle would. At a full share the reference would be
-                // parked the instant it was bound — a dup, a stat, a path
-                // query and a close for nothing, fifty thousand times an
-                // install — so there it is bound parked, the open file still
-                // cached for the writes that follow.
+                // The open file goes in the open cache, which is what lets the
+                // guest keep reading and writing after an unlink, as a real
+                // file handle would. A file holds no metadata reference of
+                // its own (`Inode::may_hold`), so it is bound parked; so is a
+                // directory at a full share, or on a network volume without
+                // room, where the reference would be parked the instant it
+                // was bound.
                 let remote = inode.remote().cloned();
-                let meta = if (park_creates && registry.at_budget())
-                    || remote
-                        .as_ref()
-                        .is_some_and(|remote| !inode.is_dir || !remote.room())
+                let meta = if !inode.is_dir
+                    || (park_creates && registry.at_budget())
+                    || remote.as_ref().is_some_and(|remote| !remote.room())
                 {
                     None
                 } else {
@@ -560,18 +574,22 @@ impl Volfs {
     fn path_of(&self, fd: RawFd) -> Result<PathBuf, i32> {
         let st = sys::stat_fd(fd)?;
         let dev = st.st_dev as i64;
-        let identity = PathBuf::from(format!("/.vol/{}/{}", st.st_dev, st.st_ino));
+        match self.identity(fd, dev, st.st_ino) {
+            Some(identity) => Ok(identity),
+            None => sys::path_of(fd),
+        }
+    }
+
+    /// `/.vol/<dev>/<ino>`, if the volume `fd` is open on serves identity
+    /// paths.
+    fn identity(&self, fd: RawFd, dev: i64, ino: u64) -> Option<PathBuf> {
         let known = self.0.read().expect("volfs poisoned").get(&dev).copied();
         let serves = known.unwrap_or_else(|| {
             let serves = Volfs::probe(fd);
             self.0.write().expect("volfs poisoned").insert(dev, serves);
             serves
         });
-        if serves {
-            Ok(identity)
-        } else {
-            sys::path_of(fd)
-        }
+        serves.then(|| PathBuf::from(format!("/.vol/{dev}/{ino}")))
     }
 
     /// Asked of the volume's root, which is always there: the file at hand
@@ -717,7 +735,7 @@ impl Modes {
     /// owner it has recorded, if any. On failure the file shows the server's
     /// bits, as it did before, and the failure is said once.
     fn keep(&self, inode: &Inode, parent: Option<&Inode>, fd: RawFd, mode: u32) {
-        if let Err(errno) = self.try_keep(inode, parent, fd, mode)
+        if let Err(errno) = self.try_keep(inode, parent, fd, mode, None)
             && !self.warned.swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
@@ -727,28 +745,48 @@ impl Modes {
         }
     }
 
+    /// Records `mode` as the bits of a special file just made in the
+    /// regular file standing in for it, and what it is.
+    fn keep_special(
+        &self,
+        inode: &Inode,
+        parent: &Inode,
+        fd: RawFd,
+        mode: u32,
+        special: crate::ownership::Special,
+    ) -> Result<(), i32> {
+        self.try_keep(inode, Some(parent), fd, mode, Some(special))
+    }
+
+    /// `special` says what the file is; `None` keeps what the record says.
     fn try_keep(
         &self,
         inode: &Inode,
         parent: Option<&Inode>,
         fd: RawFd,
         mode: u32,
+        special: Option<crate::ownership::Special>,
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode, parse};
-        let (uid, gid) = match inode.owner() {
-            Owner::Set { uid, gid, .. } => (uid, gid),
-            Owner::Mac => (0, 0),
+        let ((uid, gid), recorded) = match inode.owner() {
+            Owner::Set {
+                uid, gid, special, ..
+            } => ((uid, gid), special),
+            Owner::Mac => ((0, 0), None),
             Owner::Unknown => {
                 let mut record = [0u8; 128];
                 match sys::get_xattr_fd(fd, RECORD, &mut record) {
-                    Ok(len) => parse(&record[..len])
-                        .and_then(|owner| owner.recorded())
-                        .unwrap_or((0, 0)),
-                    Err(errno) if errno == linux::ENODATA || errno == linux::ERANGE => (0, 0),
+                    Ok(len) => parse(&record[..len]).map_or(((0, 0), None), |owner| {
+                        (owner.recorded().unwrap_or((0, 0)), owner.special())
+                    }),
+                    Err(errno) if errno == linux::ENODATA || errno == linux::ERANGE => {
+                        ((0, 0), None)
+                    }
                     Err(errno) => return Err(errno),
                 }
             }
         };
+        let special = special.or(recorded);
         self.mark_root();
         let place = if parent.is_none() {
             inode.place()
@@ -759,19 +797,25 @@ impl Modes {
             && parent.mark() != Mark::Marked
         {
             // Before the record, as [`Server::record_owner`] marks it.
-            sys::set_xattr_fd(parent.reference()?.raw_fd(), MARKER, b"1")?;
+            let dir = parent.reference()?;
+            with_owner_write_fd(dir.raw_fd(), || {
+                sys::set_xattr_fd(dir.raw_fd(), MARKER, b"1")
+            })?;
             parent.set_mark(Mark::Marked);
         }
-        let record = encode(uid, gid, mode, true);
-        set_ours(
-            || sys::set_xattr_fd(fd, RECORD, &record),
-            || sys::remove_xattr_fd(fd, RECORD),
-        )?;
+        let record = encode(uid, gid, mode, true, special);
+        with_owner_write_fd(fd, || {
+            set_ours(
+                || sys::set_xattr_fd(fd, RECORD, &record),
+                || sys::remove_xattr_fd(fd, RECORD),
+            )
+        })?;
         inode.set_owner(Owner::Set {
             uid,
             gid,
             mode: Some(mode & 0o7777),
             kept: true,
+            special,
         });
         Ok(())
     }
@@ -821,6 +865,16 @@ impl crate::inode::Release for Hold {
             .registry
             .release_device(dev, |id| self.open_cache.evict(id));
         inodes + self.open_cache.evict_remote(dev)
+    }
+
+    fn relieve_system(&self) -> usize {
+        self.registry.relieve_system(|id| self.open_cache.evict(id))
+    }
+
+    fn reclaim_unless(&self, asking: &Registry) {
+        if !std::ptr::eq(Arc::as_ptr(&self.registry), asking) {
+            self.registry.reclaim_if_over_budget();
+        }
     }
 }
 
@@ -955,6 +1009,44 @@ fn with_owner_write<T>(path: &CStr, op: impl Fn() -> Result<T, i32>) -> Result<T
     done
 }
 
+/// [`with_owner_write`] through a descriptor, for the keeping of bits on a
+/// file the server holds open: a directory made 0151 has its read and search
+/// bits on the Mac ([`servable`]) and not its write bit.
+fn with_owner_write_fd<T>(fd: RawFd, op: impl Fn() -> Result<T, i32>) -> Result<T, i32> {
+    match op() {
+        Err(errno) if errno == linux::EACCES => {}
+        done => return done,
+    }
+    let mode = sys::stat_fd(fd)?.st_mode as u32 & 0o7777;
+    if mode & 0o200 != 0 {
+        return Err(linux::EACCES);
+    }
+    sys::chmod_fd(fd, mode | 0o200)?;
+    let done = op();
+    sys::chmod_fd(fd, mode)?;
+    done
+}
+
+/// The bits a host file is given for `mode`, the bits the guest asked for:
+/// the owner read and search on a directory, read on a file, added where the
+/// guest left them out. The server works as the Mac user and needs them to
+/// serve the file at all: a directory it cannot read or search cannot be
+/// registered, listed or reached through, and a container's root, which a
+/// local disk lets do anything, met EACCES making `mkdir -m 0151` (pjdfstest
+/// had 26 such failures in mkdir alone). The guest's bits are kept in the
+/// ownership record instead ([`lifted`]), and only these: a read-only file or
+/// directory (0444, 0555) is read-only on the Mac too, as git's objects and
+/// Go's module cache are meant to be.
+fn servable(mode: u32, is_dir: bool) -> u32 {
+    mode | if is_dir { 0o500 } else { 0o400 }
+}
+
+/// Whether `mode` is not one the host file can have ([`servable`]), so the
+/// guest's bits are kept in the record and read from it.
+fn lifted(mode: u32, is_dir: bool) -> bool {
+    servable(mode & 0o7777, is_dir) != mode & 0o7777
+}
+
 /// A stat's birth time, for the registry to tell files apart by where their
 /// numbers alone cannot ([`Registry::identified`]).
 fn birth(st: &libc::stat) -> Option<(i64, i64)> {
@@ -1013,7 +1105,7 @@ fn set_ours(
 fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i32> {
     match inode.locate()? {
         Located::Fd(fd) if inode.is_dir => sys::open_directory_self(fd.raw_fd()),
-        Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0),
+        Located::Fd(fd) => sys::reopen(fd.raw_fd(), linux_flags, 0, inode.born().is_none()),
         Located::At(parent, name) => {
             // A file on a network volume is opened by its whole path, as one
             // with a descriptor of its own always was (`sys::reopen`). Opened
@@ -1042,13 +1134,29 @@ fn open_inode(inode: &Inode, linux_flags: u32) -> Result<std::os::fd::OwnedFd, i
             });
             match opened {
                 Ok(fd) => Ok(fd),
-                // Its server is out of handles, which asking by another door
-                // would only ask again ([`crate::remote`]).
-                Err(errno) if inode.remote().is_some() && crate::remote::is_refusal(errno) => {
+                // Its server is out of handles, or the Mac's file table is
+                // full: asking by another door would only ask again
+                // ([`crate::remote`], [`crate::inode::Inode::refuses`]).
+                Err(errno) if inode.refuses(errno) => Err(errno),
+                // The name has moved on; the file may not have. Anything else
+                // (EACCES, EROFS) is the file's own answer, and asking it by
+                // identity would only hear it again: a read-write open of a
+                // read-only file, which an open notice tries first, cost a
+                // second open, a round trip each on a network volume.
+                Err(errno)
+                    if errno != linux::ENOENT
+                        && errno != linux::ESTALE
+                        && errno != linux::ENOTDIR
+                        && errno != linux::ELOOP =>
+                {
                     Err(errno)
                 }
-                // The name has moved on; the file may not have.
-                Err(_) => sys::reopen(inode.reference()?.raw_fd(), linux_flags, 0),
+                Err(_) => sys::reopen(
+                    inode.reference()?.raw_fd(),
+                    linux_flags,
+                    0,
+                    inode.born().is_none(),
+                ),
             }
         }
     }
@@ -1106,9 +1214,17 @@ impl Server {
         let watcher = if polled.caching() || pushed.caching() {
             match Watcher::start(
                 root,
-                // Short enough that the guest's staleness is dominated by the
-                // channel rather than by FSEvents' own coalescing window.
-                std::time::Duration::from_millis(10),
+                // How long FSEvents may hold a change back to coalesce it.
+                // The guest finds a file the Mac just made by looking it up,
+                // which is answered from the disk at once, while a change to
+                // a file it has cached reaches it only through this stream:
+                // a Mac program that wrote a file and then a marker beside
+                // it had a container, waiting for the marker, read the old
+                // contents for as long as the change was held back. At 10 ms
+                // a probe of exactly that saw them one boot in five; at 1 ms,
+                // none in five, and the Mac touching 20,000 watched files cost
+                // the VM no more.
+                std::time::Duration::from_millis(1),
                 Box::new(Invalidator::new(
                     root,
                     policy.clone(),
@@ -1308,6 +1424,26 @@ impl Server {
                     .map_while(|index| get_u64(body, 8 + index * 16))
                     .any(|nodeid| !self.surely_local(nodeid))
             }
+            // Its header names the root; what it opens are the files in its
+            // body. Each one the guest has kept open is opened to be held,
+            // and one on a network volume opened on the vCPU stopped it on
+            // the server: where that server was Samba in the guest itself,
+            // reached through a published port, the Mac's client waited for
+            // it, gave up and dropped the session, and m16's library walk
+            // read 4,000 photos as "Socket not connected".
+            op::LIGHTER_NOTICES => {
+                let end = (header.len as usize)
+                    .min(request.len())
+                    .max(fuse::IN_HEADER_LEN);
+                request[fuse::IN_HEADER_LEN..end]
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .any(|entry| {
+                        let nodeid = u64::from_le_bytes(entry[..8].try_into().expect("eight"));
+                        !self.surely_local(nodeid)
+                    })
+            }
             _ => !self.surely_local(header.nodeid),
         }
     }
@@ -1405,26 +1541,27 @@ impl Server {
         });
         let mut outcome = self.handle(&header, body, sink.capacity());
         if let Err(errno) = outcome
-            && crate::remote::is_refusal(errno)
-            && let Some(dev) = self.remote_dev(header.nodeid)
+            && let Some(shortage) =
+                crate::inode::Shortage::of(errno, self.remote_dev(header.nodeid))
         {
-            // The server is out of handles: whatever this request needed
-            // opened was refused, and every share lets go of what it holds
-            // idle on the volume. A request that only reads is then served
-            // again, once, against a server with room. One that changes
-            // something is answered as it was: it may have done part of
-            // its work, and the guest's retry is the one that knows.
-            let closed = self.pool.relieve_device(dev, errno);
+            // Whatever this request needed opened was refused for want of
+            // room: on a network volume's server, whose handles every share
+            // then lets go of, or in the Mac's own file table, which every
+            // share of the machine then lets go of. A request that only reads
+            // is served again, once, against the room that made. One that
+            // changes something is answered as it was: it may have done part
+            // of its work, and the guest's retry is the one that knows.
+            let closed = self.pool.relieve(shortage, errno);
             if retries_on_refusal(header.opcode) {
                 outcome = self.handle(&header, body, sink.capacity());
             }
             tracing::debug!(
-                dev,
+                ?shortage,
                 errno,
                 closed,
                 op = crate::stats::name(header.opcode),
                 again = ?outcome.as_ref().err(),
-                "an open refused on a network volume"
+                "an open refused for want of room"
             );
         }
         if traced {
@@ -1583,6 +1720,7 @@ impl Server {
 
             op::CREATE => self.create(nodeid, body),
             op::LIGHTER_CLONE => self.clone_over(header.nodeid, body),
+            op::LIGHTER_NOTICES => self.notices(body),
             op::WRITE => self.write(nodeid, body),
             op::STATFS => self.statfs(),
             // Never sent once OPEN has answered ENOSYS; nothing holds an `fh`.
@@ -1664,6 +1802,17 @@ impl Server {
     /// silently frees nothing looks exactly like one that was never needed.
     pub fn descriptor_usage(&self) -> (usize, usize) {
         self.registry.descriptor_usage()
+    }
+
+    /// How many parked inodes this server's pool has revived because a
+    /// request needed one ([`crate::inode::Pool::revived_on_demand`]).
+    pub fn revived_on_demand(&self) -> u64 {
+        self.registry.revived_on_demand()
+    }
+
+    /// Of [`Server::revived_on_demand`], the directories.
+    pub fn dirs_revived_on_demand(&self) -> u64 {
+        self.registry.dirs_revived_on_demand()
     }
 
     pub fn stats_enabled(&self) -> bool {
@@ -1848,6 +1997,7 @@ impl Server {
         };
         let flags2 = if flags & fuse::init::INIT_EXT != 0 {
             (fuse::init2::LIGHTER_CREATE
+                | fuse::init2::LIGHTER_OPEN_NOTICE
                 | clone
                 | no_security
                 | fuse::init2::LIGHTER_NOOP_SETATTR
@@ -2075,16 +2225,23 @@ impl Server {
         // Path-based operations (access, xattr, link, setattr) need a file
         // that exists; settle it once, here, for all of them.
         self.settle_while(inode, |inode| inode.is_pending());
-        // A parked file's path is its parent's path and its name — no
-        // descriptor of its own is opened for it. The parent's identity path
-        // takes child components, so this stays immune to the stale-name
-        // problem below; what the name resolves to is checked against the
-        // inode's own identity, since the Mac may have moved it since.
+        // A file without a descriptor of its own is found by its parent and
+        // its name, and what the name resolves to is checked against the
+        // inode's own identity, since the Mac may have moved it since. Then
+        // it is named by that identity where the volume serves one, not as
+        // the parent's identity path and the name: macOS 26 resolves
+        // `/.vol/<dev>/<dir>/<name>` through the directory's whole path, so a
+        // file more than 1,024 bytes deep was ENAMETOOLONG to every xattr,
+        // and a chown failed (pjdfstest chown/03 on the M1; macOS 27 does
+        // not). Where it serves none, the parent's path and the name.
         if let Ok(Located::At(parent, name)) = inode.locate()
             && let Ok(st) = sys::stat_at(parent.raw_fd(), &name)
             && st.st_ino == inode.ino()
             && st.st_dev as i64 == inode.dev()
         {
+            if let Some(identity) = self.volfs.identity(parent.raw_fd(), inode.dev(), st.st_ino) {
+                return sys::c_path(&identity);
+            }
             let base = self.volfs.path_of(parent.raw_fd())?;
             return sys::c_path(&base.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
         }
@@ -2137,13 +2294,9 @@ impl Server {
         // failed ENOTEMPTY on an M1 in every run.
         if let Some(nodeid) = parent.pending_child(name.to_bytes())
             && let Some(inode) = self.registry.get(nodeid)
+            && let Some(entry) = self.answer_promise(parent, &inode, nodeid)?
         {
-            self.registry.count_lookup(nodeid);
-            return Ok(if inode.is_pending() {
-                self.pending_entry(parent, &inode, nodeid)
-            } else {
-                self.promised_entry(parent, &inode, nodeid)?
-            });
+            return Ok(entry);
         }
         let entry = self.entry_with_reference(parent, st, mark, || {
             let is_symlink = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
@@ -2164,20 +2317,21 @@ impl Server {
         });
         let entry = match entry {
             Err(PARK_ON_ENTRY) => {
+                // Registered here and counted once, below: the reply names it
+                // once, so the guest forgets it once.
                 let (dev, ino) = (st.st_dev as i64, st.st_ino);
-                let nodeid = match self.registry.relookup(dev, ino, birth(&st)) {
-                    Some(existing) => existing,
+                let inode = match self.registry.identified(dev, ino, birth(&st)) {
+                    Some(existing) => Some(existing),
                     None => {
                         let id = self.registry.insert_parked(
                             dev,
                             ino,
                             (st.st_birthtime, st.st_birthtime_nsec),
                         );
-                        self.registry.count_lookup(id);
-                        id
+                        self.registry.get(id)
                     }
                 };
-                if let Some(inode) = self.registry.get(nodeid) {
+                if let Some(inode) = inode {
                     inode.set_place(parent, name);
                 }
                 return self.entry_with_reference(parent, st, mark, || Err(linux::EIO));
@@ -2236,7 +2390,15 @@ impl Server {
         // while the stat was in flight and the stat be of the moment before:
         // the file is stat'd again, with nothing left to race.
         if !is_dir && let Some(inode) = self.registry.get(nodeid) {
+            // The stat above was made before the inode was known, so not
+            // under its link gate (`attr_of`): with a link outstanding, made
+            // again under it.
+            let gate = inode.link_gate();
+            if inode.extra_links() > 0 {
+                attr = self.attr(&self.stat_inode(nodeid, &inode)?);
+            }
             let overlay = inode.overlay();
+            drop(gate);
             if !overlay.is_empty() {
                 self.overlay_attr(&overlay, &mut attr);
             } else if inode.settle_seq() > mark {
@@ -2366,15 +2528,13 @@ impl Server {
 
     /// The bits a record holds in place of the file's own: any it has on a
     /// volume that keeps none, and those it keeps ([`Modes`]) on a network
-    /// share. On the Mac's own disks the file's are the truth, a chmod
-    /// there being one the file takes.
+    /// share or where the host file could not have them ([`lifted`]).
+    /// Otherwise the file's are the truth, a chmod being one the file takes.
     fn recorded_mode(&self, inode: &Inode, record: crate::ownership::Owner) -> Option<u32> {
         if !self.volumes.keeps_permissions(inode.dev()) {
             record.mode()
-        } else if self.volumes.network(inode.dev()) {
-            record.kept_mode()
         } else {
-            None
+            record.kept_mode()
         }
     }
 
@@ -2405,6 +2565,29 @@ impl Server {
         mark == Mark::Marked
     }
 
+    /// Marks `to` when `from` is marked ([`crate::ownership::MARKER`]): a
+    /// file with a record that moves there must still be looked for there.
+    /// A container's chown, a kept mode, a socket: each read as the Mac
+    /// user's plain file once moved into a directory nothing marked, and
+    /// stayed that way. A rename out of a directory nothing in which has a
+    /// record, which is every rename a package install makes, costs nothing.
+    fn carry_mark(&self, from: &Inode, to: &Inode) {
+        use crate::ownership::{MARKER, Mark};
+        if from.id() == to.id()
+            || to.mark() == Mark::Marked
+            || !self.ownership.load(Ordering::Relaxed)
+            || !self.may_hold_owned(from)
+        {
+            return;
+        }
+        let Ok(path) = self.path(to) else {
+            return;
+        };
+        if with_owner_write(&path, || sys::set_xattr(&path, MARKER, b"1", 0)).is_ok() {
+            to.set_mark(Mark::Marked);
+        }
+    }
+
     /// `None` if the file cannot be reached right now, which is not the
     /// same as having no record and so is not remembered.
     fn read_owner(&self, inode: &Inode) -> Option<crate::ownership::Owner> {
@@ -2429,6 +2612,11 @@ impl Server {
         if let Some(mode) = self.recorded_mode(inode, record) {
             attr.mode = (attr.mode & !0o7777) | mode;
         }
+        if let Some(special) = record.special() {
+            attr.mode = special.kind | (attr.mode & 0o7777);
+            attr.rdev = special.rdev;
+            attr.size = 0;
+        }
     }
 
     /// Records a container's owner and the file's permission bits, or clears
@@ -2445,7 +2633,11 @@ impl Server {
         mode: u32,
     ) -> Result<(), i32> {
         use crate::ownership::{MARKER, Mark, Owner, RECORD, encode};
-        let kept = self.volumes.network(inode.dev());
+        let special = inode.owner().special();
+        // A special file is a regular file on the Mac: its record is what it
+        // is, and its bits are the record's.
+        let kept =
+            self.volumes.network(inode.dev()) || lifted(mode, inode.is_dir) || special.is_some();
         if (uid, gid) == (0, 0) && self.volumes.keeps_permissions(inode.dev()) && !kept {
             match with_owner_write(path, || sys::remove_xattr(path, RECORD)) {
                 Err(errno) if errno != linux::ENODATA => return Err(errno),
@@ -2472,7 +2664,7 @@ impl Server {
             })?;
             parent.set_mark(Mark::Marked);
         }
-        let record = encode(uid, gid, mode, kept);
+        let record = encode(uid, gid, mode, kept, special);
         with_owner_write(path, || {
             set_ours(
                 || sys::set_xattr(path, RECORD, &record, 0),
@@ -2484,15 +2676,17 @@ impl Server {
             gid,
             mode: Some(mode & 0o7777),
             kept,
+            special,
         });
         Ok(())
     }
 
-    /// On a network share, keeps the bits a file was just made with
-    /// ([`Modes`]), and answers with them: the entry was read from the
-    /// server, which may have given the file bits of its own.
+    /// Keeps the bits a file was just made with ([`Modes`]) on a network
+    /// share, whose server may have given it bits of its own, and where the
+    /// host file could not have them ([`lifted`]); and answers with them.
     fn keep_made(&self, parent: &Inode, entry: &mut EntryOut, mode: u32) {
-        if !self.volumes.network(parent.dev()) {
+        let is_dir = entry.attr.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
+        if !self.volumes.network(parent.dev()) && !lifted(mode, is_dir) {
             return;
         }
         let Some(inode) = self.registry.get(entry.nodeid) else {
@@ -2604,17 +2798,11 @@ impl Server {
                 "NAME-DEBUG lookup"
             );
         }
+        // Released as its promise was kept, it is the host's to answer for.
         if let Some(nodeid) = parent.pending_child(name.to_bytes())
             && let Some(inode) = self.registry.get(nodeid)
+            && let Some(entry) = self.answer_promise(&parent, &inode, nodeid)?
         {
-            let entry = if inode.is_pending() {
-                self.registry.count_lookup(nodeid);
-                self.pending_entry(&parent, &inode, nodeid)
-            } else {
-                // Promised here by a queued rename: a real file, answering
-                // under a name the host does not have yet.
-                self.promised_entry(&parent, &inode, nodeid)?
-            };
             return Ok(self.entry_reply(&entry));
         }
         if parent.name_pending_gone(name.to_bytes()) {
@@ -2814,7 +3002,10 @@ impl Server {
             || inode.is_dir
             || inode.is_symlink
             // Kept in the record, which needs the file.
-            || (valid & fuse::fattr::MODE != 0 && !self.volumes.keeps_permissions(inode.dev()))
+            || (valid & fuse::fattr::MODE != 0
+                && (!self.volumes.keeps_permissions(inode.dev())
+                    || get_u32(body, 68).is_some_and(|mode| lifted(mode, inode.is_dir))
+                    || self.record_of(inode, None).kept_mode().is_some()))
         {
             return Ok(None);
         }
@@ -3062,14 +3253,20 @@ impl Server {
             let network = self.volumes.network(inode.dev());
             let mut refusal = None;
             if self.volumes.keeps_permissions(inode.dev()) {
-                match sys::chmod_at(libc::AT_FDCWD, &path, mode) {
+                match sys::chmod_at(libc::AT_FDCWD, &path, servable(mode, inode.is_dir)) {
                     Ok(()) => {}
                     // The server's call; the record keeps the container's.
                     Err(errno) if network && refused(errno) => refusal = Some(errno),
                     Err(errno) => return Err(errno),
                 }
             }
-            if network || !self.volumes.keeps_permissions(inode.dev()) {
+            // Recorded where the bits are kept, and rewritten where they were
+            // and are not any more, so the file's own are read again.
+            if network
+                || !self.volumes.keeps_permissions(inode.dev())
+                || lifted(mode, inode.is_dir)
+                || self.record_of(&inode, None).kept_mode().is_some()
+            {
                 let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
                 match self.record_owner(&inode, None, &path, owner, mode) {
                     Ok(()) => {}
@@ -3089,7 +3286,23 @@ impl Server {
             let owner = self.recorded_owner(&inode, None).unwrap_or((0, 0));
             let wanted = self.requested_owner(valid, body, owner)?;
             if wanted != owner {
-                let mode = self.permissions_of(&inode)?;
+                let mut mode = self.permissions_of(&inode)?;
+                // A chown drops what would let the new owner run the file
+                // as the old one: setuid, and setgid where the group may
+                // execute it, as Linux does for root too and as macOS would
+                // were the file chowned there. The server claims that duty
+                // (FUSE_HANDLE_KILLPRIV) and it is the record, not the file,
+                // that changes owner, so nothing else does it.
+                if !inode.is_dir {
+                    let setgid = if mode & 0o010 != 0 { 0o2000 } else { 0 };
+                    let dropped = mode & !(0o4000 | setgid);
+                    if dropped != mode {
+                        if self.volumes.keeps_permissions(inode.dev()) {
+                            sys::chmod_at(libc::AT_FDCWD, &path, servable(dropped, false))?;
+                        }
+                        mode = dropped;
+                    }
+                }
                 self.record_owner(&inode, None, &path, wanted, mode)?;
             }
         }
@@ -3158,6 +3371,21 @@ impl Server {
         sys::readlink_at(libc::AT_FDCWD, &path)
     }
 
+    /// Waits until `name` under `parent` is the host's to make: the parent
+    /// exists, and nothing queued still creates or removes the name. A
+    /// removal is acknowledged before it is applied, so a name made at once
+    /// on the host after one (an unlink, then a mknod of the same name)
+    /// found the old file still there: a FIFO, socket or device node made
+    /// where one had just been unlinked failed with EEXIST, one time in
+    /// six (pjdfstest rename/10).
+    fn settle_name(&self, parent: &Arc<Inode>, name: &CStr) {
+        self.settle_while(parent, |parent| {
+            parent.is_pending()
+                || parent.pending_child(name.to_bytes()).is_some()
+                || parent.name_pending_gone(name.to_bytes())
+        });
+    }
+
     fn symlink(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
         let (name, rest) = get_name(body).ok_or(linux::EINVAL)?;
@@ -3173,7 +3401,7 @@ impl Server {
         )? {
             return Ok(reply);
         }
-        self.settle_while(&parent, |parent| parent.is_pending());
+        self.settle_name(&parent, &name);
         sys::symlink_at(&target, parent.reference()?.raw_fd(), &name)?;
         let entry = self.entry(&parent, &name)?;
         Ok(self.entry_reply(&entry))
@@ -3181,16 +3409,63 @@ impl Server {
 
     fn mknod(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
         let parent = self.directory(parent)?;
-        self.settle_while(&parent, |parent| parent.is_pending());
         let mode = get_u32(body, 0).ok_or(linux::EINVAL)?;
         let rdev = get_u32(body, 4).ok_or(linux::EINVAL)?;
         let umask = get_u32(body, 8).unwrap_or(0);
         let (name, _) = get_name(body.get(16..).ok_or(linux::EINVAL)?).ok_or(linux::EINVAL)?;
         let name = self.checked_name(name)?;
-        parent.under_name(&name, |dir, at| sys::mknod_at(dir, at, mode & !umask, rdev))?;
+        self.settle_name(&parent, &name);
+        let kind = mode & libc::S_IFMT as u32;
+        if crate::ownership::Special::applies(kind) {
+            return self.make_special(&parent, &name, mode & !umask & 0o7777, kind, rdev);
+        }
+        parent.under_name(&name, |dir, at| {
+            sys::mknod_at(dir, at, servable(mode & !umask, false), rdev)
+        })?;
         let mut entry = self.entry(&parent, &name)?;
         self.keep_made(&parent, &mut entry, mode & !umask & 0o7777);
         Ok(self.entry_reply(&entry))
+    }
+
+    /// A socket or a device node, which the Mac user cannot make
+    /// ([`crate::ownership::Special`]): an empty regular file in its place,
+    /// and what it is in its record. A container binding a socket in a
+    /// shared folder (an app server on `unix:/app/app.sock`) failed with
+    /// EPERM, and so did every mknod of a device; the guest's kernel does all
+    /// a socket or a node is for, so the name and the kind are all it needs
+    /// of the server.
+    fn make_special(
+        &self,
+        parent: &Arc<Inode>,
+        name: &CString,
+        mode: u32,
+        kind: u32,
+        rdev: u32,
+    ) -> Result<Vec<u8>, i32> {
+        let fd = parent.under_name(name, |dir, at| {
+            sys::openat_path(
+                dir,
+                at,
+                LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW | 1,
+                servable(mode, false),
+            )
+        })?;
+        let made = self.entry(parent, name).and_then(|mut entry| {
+            let inode = self.registry.get(entry.nodeid).ok_or(linux::EIO)?;
+            let special = crate::ownership::Special { kind, rdev };
+            self.modes
+                .keep_special(&inode, parent, fd.as_raw_fd(), mode, special)?;
+            self.own(&inode, Some(parent), &mut entry.attr);
+            Ok(entry)
+        });
+        match made {
+            Ok(entry) => Ok(self.entry_reply(&entry)),
+            Err(errno) => {
+                // Not a special file without its record: no file at all.
+                let _ = parent.under_name(name, |dir, at| sys::unlink_at(dir, at, false));
+                Err(errno)
+            }
+        }
     }
 
     fn mkdir(&self, parent: u64, body: &[u8]) -> Result<Vec<u8>, i32> {
@@ -3209,8 +3484,10 @@ impl Server {
         )? {
             return Ok(reply);
         }
-        self.settle_while(&parent, |parent| parent.is_pending());
-        parent.under_name(&name, |dir, at| sys::mkdir_at(dir, at, mode))?;
+        self.settle_name(&parent, &name);
+        parent.under_name(&name, |dir, at| {
+            sys::mkdir_at(dir, at, servable(mode, true))
+        })?;
         let mut entry = self.entry(&parent, &name)?;
         self.keep_made(&parent, &mut entry, mode);
         Ok(self.entry_reply(&entry))
@@ -3558,18 +3835,6 @@ impl Server {
                     }
                     return Ok(Some(Vec::new()));
                 }
-                // Not free: this rename replaces whatever holds the new
-                // name, and the queue orders that — but only among jobs it
-                // holds. A held create of the new name is not in the queue
-                // yet, and materialized later it would land on the file
-                // this rename put there: "an acknowledged create failed to
-                // apply", from two pnpm threads writing the same content
-                // to the same content-hash name. So the holder goes into
-                // the queue first, and the replacement lands after it, as
-                // on any filesystem.
-                if let Some(holder) = new_parent.pending_child(new.to_bytes()) {
-                    self.materialize_why(holder, 7);
-                }
                 self.materialize_why(nodeid, 5);
                 nodeid
             }
@@ -3601,6 +3866,21 @@ impl Server {
                 }
             }
         };
+        // This rename replaces whatever holds the new name, and the queue
+        // orders that, but only among jobs it holds. A held create of the
+        // new name is not in the queue yet, and materialized later it would
+        // land on the file this rename put there: "an acknowledged create
+        // failed to apply", from two pnpm threads writing the same content
+        // to the same content-hash name, and from a file renamed over one a
+        // container had just created (pjdfstest rename/10, whose create was
+        // lost and whose renamed-away name then read as still there). So
+        // the holder goes into the queue first, whichever the source is,
+        // and the replacement lands after it, as on any filesystem.
+        if let Some(holder) = new_parent.pending_child(new.to_bytes())
+            && holder != nodeid
+        {
+            self.materialize_why(holder, 7);
+        }
         let Some(inode) = self.registry.get(nodeid) else {
             {
                 self.stats.count("rename-none=4");
@@ -3758,6 +4038,7 @@ impl Server {
         let new = self.checked_name(new)?;
         self.settle_while(&old_parent, |parent| parent.is_pending());
         self.settle_while(&new_parent, |parent| parent.is_pending());
+        self.carry_mark(&old_parent, &new_parent);
         phase("rename-us-1-parents", t0);
         let t1 = std::time::Instant::now();
         if flags == 0
@@ -3779,31 +4060,56 @@ impl Server {
             parent.pending_child(new.to_bytes()).is_some()
                 || parent.name_pending_gone(new.to_bytes())
         });
+        // A directory the rename would replace must be empty, and what the
+        // guest has made in it may not be on the host yet: renamed over a
+        // directory holding only a create that was still held, the rename
+        // succeeded where Linux says ENOTEMPTY, and the create then failed
+        // for want of its directory, its file lost (pjdfstest rename/20).
+        // Its children go to the host first, and the host answers.
+        if let Ok(st) = new_parent.under_name(&new, sys::stat_at)
+            && st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && let Some(target) = self
+                .registry
+                .identified(st.st_dev as i64, st.st_ino, birth(&st))
+        {
+            self.materialize_children(&target);
+            self.settle_while(&target, |dir| dir.has_promises());
+        }
         phase("rename-us-3-settle-names", t2);
         let t3 = std::time::Instant::now();
-        // Renumbered after, where its volume numbers files by name.
-        let moved = if self.registry.identifies_by_birth(old_parent.dev()) {
-            old_parent
-                .under_name(&old, sys::stat_at)
-                .ok()
-                .and_then(|st| {
-                    self.registry
-                        .identified(st.st_dev as i64, st.st_ino, birth(&st))
-                })
-        } else {
-            None
+        // What the rename moves is found before it and placed after it,
+        // on every volume. A file holds no descriptor, so its place is how
+        // the next request on it is served, and the guest, whose own rename
+        // moved its name, never looks it up again to correct it. Placed only
+        // where it had to be renumbered (Samba without file ids), a file
+        // renamed into place on any other volume was opened by its old name:
+        // `ENOENT`, or the next file made there (`ESTALE`), and on SMB with
+        // file ids 30 of 100 WAL segments failed m16. An exchange moves both.
+        let identify = |dir: &Arc<Inode>, name: &CStr| {
+            dir.under_name(name, sys::stat_at).ok().and_then(|st| {
+                self.registry
+                    .identified(st.st_dev as i64, st.st_ino, birth(&st))
+            })
         };
+        let moved = identify(&old_parent, &old);
+        let swapped = (flags & crate::fuse::rename::EXCHANGE != 0)
+            .then(|| identify(&new_parent, &new))
+            .flatten();
         old_parent.under_name(&old, |old_dir, old_at| {
             new_parent.under_name(&new, |new_dir, new_at| {
                 sys::rename_at(old_dir, old_at, new_dir, new_at, flags)
             })
         })?;
-        if let Some(moved) = moved
-            && let Ok(st) = new_parent.under_name(&new, sys::stat_at)
-        {
-            moved.set_place(&new_parent, &new);
-            self.registry
-                .renumber(moved.id(), st.st_dev as i64, st.st_ino, birth(&st));
+        for (inode, parent, name) in [(moved, &new_parent, &new), (swapped, &old_parent, &old)] {
+            let Some(inode) = inode else { continue };
+            inode.set_place(parent, name);
+            // Renumbered too, where its volume numbers files by name.
+            if self.registry.identifies_by_birth(parent.dev())
+                && let Ok(st) = parent.under_name(name, sys::stat_at)
+            {
+                self.registry
+                    .renumber(inode.id(), st.st_dev as i64, st.st_ino, birth(&st));
+            }
         }
         phase("rename-us-4-host", t3);
         phase("rename-us-total", t0);
@@ -3911,8 +4217,8 @@ impl Server {
             let inode = inode.clone();
             let name = name.clone();
             let is_symlink = matches!(kind, crate::inode::PendingKind::Symlink);
-            let keep =
-                (!is_symlink && self.volumes.network(parent.dev())).then(|| self.modes.clone());
+            let keep = (!is_symlink).then(|| self.modes.clone());
+            let network = self.volumes.network(parent.dev());
             move || {
                 let result = (|| {
                     let fd = parent.under_name(&name, |dir, at| {
@@ -3920,7 +4226,7 @@ impl Server {
                             Some(target) => sys::symlink_at(target, dir, at)?,
                             None => {
                                 let mode = inode.pending_meta().map(|m| m.mode).unwrap_or(mode);
-                                sys::mkdir_at(dir, at, mode & 0o7777)?;
+                                sys::mkdir_at(dir, at, servable(mode & 0o7777, true))?;
                             }
                         }
                         sys::open_reference(dir, at, is_symlink)
@@ -3937,9 +4243,11 @@ impl Server {
                                 "NAME-DEBUG mkdir job applied, binding"
                             );
                         }
-                        if let Some(modes) = &keep {
-                            let mode = inode.pending_meta().map_or(mode, |meta| meta.mode);
-                            modes.keep(&inode, Some(&parent), fd.as_raw_fd(), mode & 0o7777);
+                        let kept = inode.pending_meta().map_or(mode, |meta| meta.mode);
+                        if let Some(modes) = &keep
+                            && (network || lifted(kept, true))
+                        {
+                            modes.keep(&inode, Some(&parent), fd.as_raw_fd(), kept & 0o7777);
                         }
                         registry.bind_pending(
                             nodeid,
@@ -4024,6 +4332,8 @@ impl Server {
             let target = target.clone();
             let name = name.clone();
             move || {
+                // Landed and withdrawn as one, as a stat sees it (`attr_of`).
+                let gate = target.link_gate_exclusive();
                 let result = (|| {
                     // Bound by now, or its create failed — and a provisional
                     // number names nothing on the volume.
@@ -4039,6 +4349,8 @@ impl Server {
                         sys::link_at(libc::AT_FDCWD, &source, dir, at)
                     })
                 })();
+                target.link_applied();
+                drop(gate);
                 if let Err(errno) = result {
                     tracing::warn!(
                         errno,
@@ -4046,7 +4358,6 @@ impl Server {
                         "an acknowledged link failed to apply"
                     );
                 }
-                target.link_applied();
                 parent.remove_pending_child(name.to_bytes(), nodeid);
                 registry.release_if_unwanted(parent.id());
                 if target.unpromise() {
@@ -4062,12 +4373,10 @@ impl Server {
         ));
         parent.settled_by(seq);
         target.settled_by(seq);
-        let entry = if target.is_pending() {
-            self.registry.count_lookup(nodeid);
-            self.pending_entry(parent, target, nodeid)
-        } else {
-            self.promised_entry(parent, target, nodeid)?
-        };
+        // Held by the link's own promise, it cannot have been released.
+        let entry = self
+            .answer_promise(parent, target, nodeid)?
+            .ok_or(linux::ESTALE)?;
         Ok(Some(self.entry_reply(&entry)))
     }
 
@@ -4091,6 +4400,43 @@ impl Server {
     /// The guest stopped reporting opens, so every `fh` it sends is zero and
     /// the inode is the only thing identifying the file: the descriptor is
     /// ours to find or make.
+    /// Which files the guest has open (guest patch 0057). Each is held from
+    /// the batch that says it opened until the one that says it closed, so a
+    /// Mac program deleting it or saving over it leaves the guest reading
+    /// what it opened, as a local file would. A file whose create is still
+    /// queued has no host file to hold yet: it is counted now, and held by
+    /// the first descriptor opened for it (`file_for`).
+    fn notices(&self, body: &[u8]) -> Result<Vec<u8>, i32> {
+        for entry in body.as_chunks::<16>().0 {
+            let (nodeid, delta) = entry.split_at(8);
+            let nodeid = u64::from_le_bytes(nodeid.try_into().expect("eight bytes"));
+            let delta = i64::from_le_bytes(delta.try_into().expect("eight bytes"));
+            let Ok(inode) = self.inode(nodeid) else {
+                continue;
+            };
+            if inode.is_dir {
+                continue;
+            }
+            let opened = {
+                let mut pin = inode.open.lock().expect("open pin poisoned");
+                let was = pin.count;
+                pin.count += delta;
+                if pin.count <= 0 {
+                    pin.file = None;
+                }
+                was <= 0 && pin.count > 0 && pin.file.is_none()
+            };
+            if opened && !inode.is_promised() {
+                // Read-write where it can be, so the guest's writes through
+                // it after a deletion land in the file it has open.
+                let _ = self
+                    .file_for(nodeid, true)
+                    .or_else(|_| self.file_for(nodeid, false));
+            }
+        }
+        Ok(Vec::new())
+    }
+
     fn file_for(&self, nodeid: u64, need_write: bool) -> Result<Arc<OpenFile>, i32> {
         if let Some(cached) = self.open_cache.file(nodeid, need_write) {
             return Ok(cached);
@@ -4098,6 +4444,12 @@ impl Server {
         let inode = self.inode(nodeid)?;
         if inode.is_dir {
             return Err(linux::EISDIR);
+        }
+        let held = inode.open.lock().expect("open pin poisoned").file.clone();
+        if let Some(file) = held.filter(|file| file.writable || !need_write) {
+            self.open_cache
+                .put_file(nodeid, file.clone(), inode.remote().cloned());
+            return Ok(file);
         }
         // A name the guest was given by a queued rename or link is one the
         // host does not have yet, and a file whose descriptor was parked is
@@ -4114,6 +4466,17 @@ impl Server {
             readable: true,
             writable: need_write,
         });
+        {
+            let mut pin = inode.open.lock().expect("open pin poisoned");
+            if pin.count > 0
+                && pin
+                    .file
+                    .as_ref()
+                    .is_none_or(|held| !held.writable && need_write)
+            {
+                pin.file = Some(file.clone());
+            }
+        }
         self.open_cache
             .put_file(nodeid, file.clone(), inode.remote().cloned());
         Ok(file)
@@ -4360,11 +4723,21 @@ impl Server {
                             opened.as_raw_fd()
                         }
                         Source::Held(reference) => {
-                            opened = sys::reopen(reference.raw_fd(), 0, 0)?;
+                            opened = sys::reopen(
+                                reference.raw_fd(),
+                                0,
+                                0,
+                                !registry.identifies_by_birth(parent.dev()),
+                            )?;
                             opened.as_raw_fd()
                         }
                         Source::Cached(file) => {
-                            opened = sys::reopen(file.fd.as_raw_fd(), 0, 0)?;
+                            opened = sys::reopen(
+                                file.fd.as_raw_fd(),
+                                0,
+                                0,
+                                !registry.identifies_by_birth(parent.dev()),
+                            )?;
                             opened.as_raw_fd()
                         }
                     };
@@ -4612,10 +4985,8 @@ impl Server {
             writes: Vec::new(),
             bytes: 0,
             since: std::time::Instant::now(),
-            keep: self
-                .volumes
-                .network(parent.dev())
-                .then(|| self.modes.clone()),
+            keep: self.modes.clone(),
+            network: self.volumes.network(parent.dev()),
         };
         if self.defer_creates {
             self.deferred
@@ -4725,8 +5096,15 @@ impl Server {
     /// empty, once in a dozen boots. Read first, the promise is either still
     /// there and laid over, or already kept and the stat shows it.
     fn attr_of(&self, nodeid: u64, inode: &Inode) -> Result<Attr, i32> {
+        // A link's promise is added to the host's count, not laid over it as
+        // a size is, so a link landing between the two reads was counted
+        // twice (pjdfstest link/00 and link/03: three names, nlink 4). The
+        // job lands it and withdraws its promise under the inode's link
+        // gate, and the two reads are made under it too.
+        let gate = inode.link_gate();
         let overlay = inode.overlay();
         let mut attr = self.attr(&self.stat_inode(nodeid, inode)?);
+        drop(gate);
         self.overlay_attr(&overlay, &mut attr);
         self.own(inode, None, &mut attr);
         Ok(attr)
@@ -4756,6 +5134,35 @@ impl Server {
     /// The entry for a bound inode reached through the overlay — a file a
     /// queued rename has promised to this name. It counts as a lookup, as
     /// any reply naming a nodeid does.
+    /// The entry for an inode the guest is promised under a name, pending
+    /// or promised by a queued rename or link, counted as the one lookup the
+    /// reply is; `None` if it was released before it could be.
+    ///
+    /// Counted first. A promise kept meanwhile finishes a forget it had put
+    /// off and releases an inode no lookup holds, and the stat a promised
+    /// file is answered with takes a round trip on a network volume: counted
+    /// after it, a lookup of a WAL segment whose rename landed in between
+    /// named a nodeid the server had just forgotten, and the guest's writes
+    /// to it failed ENOENT (m16, SMB with file ids, 5 to 30 of 100).
+    fn answer_promise(
+        &self,
+        parent: &Inode,
+        inode: &std::sync::Arc<Inode>,
+        nodeid: u64,
+    ) -> Result<Option<EntryOut>, i32> {
+        if !self.registry.count_lookup(nodeid) {
+            return Ok(None);
+        }
+        if inode.is_pending() {
+            return Ok(Some(self.pending_entry(parent, inode, nodeid)));
+        }
+        self.promised_entry(parent, inode, nodeid)
+            .map(Some)
+            .inspect_err(|_| self.registry.forget(nodeid, 1))
+    }
+
+    /// The entry a file promised under a name by a queued rename or link
+    /// answers with, from the host. Counted by [`Server::answer_promise`].
     fn promised_entry(
         &self,
         parent: &Inode,
@@ -4763,7 +5170,6 @@ impl Server {
         nodeid: u64,
     ) -> Result<EntryOut, i32> {
         let attr = self.attr_of(nodeid, inode)?;
-        self.registry.count_lookup(nodeid);
         let entry_valid = self
             .policy
             .validity(parent.dev(), parent.ino(), Answer::File);
@@ -4893,7 +5299,7 @@ impl Server {
                     dir,
                     at,
                     creating | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOFOLLOW,
-                    mode & 0o7777 & !umask,
+                    servable(mode & 0o7777 & !umask, false),
                 ) {
                     Ok(fd) => break fd,
                     Err(e) if e == linux::EEXIST && flags & LINUX_O_EXCL == 0 => {}
@@ -5277,15 +5683,11 @@ impl Server {
                     None
                 } else if let Some(id) = parent.pending_child(&entry.name)
                     && let Some(inode) = self.registry.get(id)
+                    && let Ok(Some(found)) = self.answer_promise(&parent, &inode, id)
                 {
                     // Promised here: answered from the promise, and counted
                     // as the lookup the kernel takes it for.
-                    if inode.is_pending() {
-                        self.registry.count_lookup(id);
-                        Some(self.pending_entry(&parent, &inode, id))
-                    } else {
-                        self.promised_entry(&parent, &inode, id).ok()
-                    }
+                    Some(found)
                 } else {
                     self.checked_name(&entry.name)
                         .and_then(|name| self.entry(&parent, &name))
@@ -5657,6 +6059,32 @@ mod volfs_tests {
             "one inode not known to be local sends the batch to a worker"
         );
         assert!(!server.may_block(&request(op::INTERRUPT, 0, &[0u8; 8])));
+    }
+
+    /// A batch of open notices names the root in its header and opens the
+    /// files in its body: it is served inline only when all of them are
+    /// local.
+    #[test]
+    fn open_notices_are_served_inline_only_when_all_they_name_is_local() {
+        let dir = tempfile_dir();
+        let server = Server::new(&dir).unwrap();
+        let notices = |nodeids: &[u64]| {
+            let mut r = vec![0u8; crate::fuse::IN_HEADER_LEN];
+            for nodeid in nodeids {
+                r.extend_from_slice(&nodeid.to_le_bytes());
+                r.extend_from_slice(&1i64.to_le_bytes());
+            }
+            let len = r.len() as u32;
+            r[0..4].copy_from_slice(&len.to_le_bytes());
+            r[4..8].copy_from_slice(&op::LIGHTER_NOTICES.to_le_bytes());
+            r[16..24].copy_from_slice(&1u64.to_le_bytes());
+            r
+        };
+        assert!(!server.may_block(&notices(&[1])));
+        assert!(
+            server.may_block(&notices(&[1, 424_242])),
+            "a file not known to be local sends the batch to a worker"
+        );
     }
 
     /// A record the server will not overwrite is removed and made again; any

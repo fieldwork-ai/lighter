@@ -68,6 +68,8 @@ pub const kCMVideoCodecType_VP9: CMVideoCodecType = 0x7670_3039;
 pub const kCVPixelBufferLock_ReadOnly: u64 = 1;
 
 pub const kVTDecodeFrame_EnableAsynchronousDecompression: VTDecodeFrameFlags = 1 << 0;
+/// `CMBlockBufferCreateWithMemoryBlock`: allocate the block now, not on first use.
+pub const kCMBlockBufferAssureMemoryNowFlag: u32 = 1 << 0;
 pub const kVTDecodeFrame_DoNotOutputFrame: VTDecodeFrameFlags = 1 << 1;
 pub const kVTDecodeFrame_1xRealTimePlayback: VTDecodeFrameFlags = 1 << 2;
 pub const kVTDecodeFrame_EnableTemporalProcessing: VTDecodeFrameFlags = 1 << 3;
@@ -237,6 +239,12 @@ unsafe extern "C" {
         create: Boolean,
     ) -> CFArrayRef;
     pub fn CMBlockBufferGetDataLength(buffer: CMBlockBufferRef) -> usize;
+    pub fn CMBlockBufferReplaceDataBytes(
+        source: *const c_void,
+        destination: CMBlockBufferRef,
+        offset: usize,
+        length: usize,
+    ) -> OSStatus;
     pub fn CMBlockBufferCopyDataBytes(
         buffer: CMBlockBufferRef,
         offset: usize,

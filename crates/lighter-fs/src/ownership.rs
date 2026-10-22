@@ -60,7 +60,31 @@ pub enum Owner {
         gid: u32,
         mode: Option<u32>,
         kept: bool,
+        special: Option<Special>,
     },
+}
+
+/// What a special file is, kept where the Mac cannot make one: a device
+/// node takes root to make, and a socket exists on a Mac disk only while
+/// something is bound to it. The host has an empty regular file in its
+/// place; the guest, whose kernel does everything a socket or a device
+/// node is for, sees the kind and the device number. A FIFO needs none of
+/// this: the Mac user can make one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Special {
+    /// `S_IFSOCK`, `S_IFCHR` or `S_IFBLK`, which Linux and macOS number alike.
+    pub kind: u32,
+    /// The device number as the guest gave it.
+    pub rdev: u32,
+}
+
+impl Special {
+    /// The kinds kept this way.
+    pub fn applies(kind: u32) -> bool {
+        [libc::S_IFSOCK, libc::S_IFCHR, libc::S_IFBLK]
+            .iter()
+            .any(|k| *k as u32 == kind)
+    }
 }
 
 impl Owner {
@@ -83,6 +107,14 @@ impl Owner {
         }
     }
 
+    /// What the file is, if it is a special file kept in the record.
+    pub fn special(self) -> Option<Special> {
+        match self {
+            Owner::Set { special, .. } => special,
+            Owner::Unknown | Owner::Mac => None,
+        }
+    }
+
     /// The permission bits recorded as the file's in containers on any
     /// volume, if the record says so.
     pub fn kept_mode(self) -> Option<u32> {
@@ -101,11 +133,15 @@ pub fn is_ours(name: &[u8]) -> bool {
 }
 
 /// The record for an owner and the file's permission bits, `kept` if the
-/// bits are the file's in containers whatever the file itself says.
-pub fn encode(uid: u32, gid: u32, mode: u32, kept: bool) -> Vec<u8> {
+/// bits are the file's in containers whatever the file itself says, and
+/// what it is if it is a [`Special`] file.
+pub fn encode(uid: u32, gid: u32, mode: u32, kept: bool, special: Option<Special>) -> Vec<u8> {
     let kept = if kept { r#","kept":1"# } else { "" };
+    let special = special.map_or(String::new(), |special| {
+        format!(r#","kind":{:o},"rdev":{}"#, special.kind, special.rdev)
+    });
     format!(
-        r#"{{"UID":{uid},"GID":{gid},"mode":{:o}{kept}}}"#,
+        r#"{{"UID":{uid},"GID":{gid},"mode":{:o}{kept}{special}}}"#,
         mode & 0o7777
     )
     .into_bytes()
@@ -118,11 +154,19 @@ pub fn parse(record: &[u8]) -> Option<Owner> {
     let mode = digits(text, "mode")
         .and_then(|digits| u32::from_str_radix(digits, 8).ok())
         .map(|mode| mode & 0o7777);
+    let special = digits(text, "kind")
+        .and_then(|digits| u32::from_str_radix(digits, 8).ok())
+        .filter(|kind| Special::applies(*kind))
+        .map(|kind| Special {
+            kind,
+            rdev: field(text, "rdev").unwrap_or(0),
+        });
     Some(Owner::Set {
         uid: field(text, "UID")?,
         gid: field(text, "GID")?,
         kept: mode.is_some() && field(text, "kept") == Some(1),
         mode,
+        special,
     })
 }
 
@@ -153,21 +197,49 @@ mod tests {
             gid,
             mode,
             kept,
+            special: None,
         }
     }
 
     #[test]
     fn a_record_round_trips() {
-        let record = encode(1000, 82, 0o100755, false);
+        let record = encode(1000, 82, 0o100755, false, None);
         assert_eq!(record, br#"{"UID":1000,"GID":82,"mode":755}"#);
         assert_eq!(parse(&record), Some(set(1000, 82, Some(0o755), false)));
-        let record = encode(0, 0, 0o700, true);
+        let record = encode(0, 0, 0o700, true, None);
         assert_eq!(record, br#"{"UID":0,"GID":0,"mode":700,"kept":1}"#);
         let kept = parse(&record).unwrap();
         assert_eq!(kept, set(0, 0, Some(0o700), true));
         assert_eq!(kept.kept_mode(), Some(0o700));
         assert_eq!(kept.recorded(), None, "a kept mode alone names no owner");
         assert_eq!(set(1000, 82, Some(0o755), false).kept_mode(), None);
+    }
+
+    #[test]
+    fn a_special_file_round_trips() {
+        let socket = Special {
+            kind: libc::S_IFSOCK as u32,
+            rdev: 0,
+        };
+        let record = encode(0, 0, 0o755, true, Some(socket));
+        assert_eq!(
+            record,
+            br#"{"UID":0,"GID":0,"mode":755,"kept":1,"kind":140000,"rdev":0}"#
+        );
+        assert_eq!(parse(&record).unwrap().special(), Some(socket));
+        let device = Special {
+            kind: libc::S_IFCHR as u32,
+            rdev: 0x0102,
+        };
+        let record = encode(1000, 1000, 0o644, true, Some(device));
+        assert_eq!(parse(&record).unwrap().special(), Some(device));
+        // Nothing else is a special file, whatever a record says.
+        assert_eq!(
+            parse(br#"{"UID":0,"GID":0,"kind":100000}"#)
+                .unwrap()
+                .special(),
+            None
+        );
     }
 
     #[test]

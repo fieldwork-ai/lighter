@@ -66,12 +66,15 @@ impl Sink for Buffer {
     }
 }
 
-/// Held by every test that lowers the fd budget or counts revivals. The
-/// budget is a process-wide variable read when a server is built, and
-/// `REOPENS` a process-wide counter, and cargo runs tests on parallel threads:
-/// without this, one test's reclaim lands inside another's window. CI once
-/// counted 17 revivals against a bound of 16 on a commit that touched only
-/// the worklog.
+/// Held by every test that lowers the fd budget. The budget is a
+/// process-wide variable read when a server is built, and cargo runs tests on
+/// parallel threads: without this, one test's server is built with another's
+/// budget. Revivals are counted per server and without the sweep's promotions
+/// (`Server::revived_on_demand`), not by the process-wide `REOPENS`: every
+/// other test's revivals landed in that, and the promotions follow the clock,
+/// so a loaded machine counted more. CI once counted 17 against a bound of 16
+/// on a commit that touched only the worklog, and a fresh checkout being
+/// indexed counted up to 54.
 static RECLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn reclaim_alone() -> std::sync::MutexGuard<'static, ()> {
@@ -250,6 +253,16 @@ impl Guest {
             Err(other) => Err(other),
             Ok(reply) => Ok(u64::from_le_bytes(reply[0..8].try_into().unwrap())),
         }
+    }
+
+    /// What guest patch 0057 sends: these files' opens and closes.
+    fn notices(&mut self, changes: &[(u64, i64)]) {
+        let mut body = Vec::new();
+        for (nodeid, delta) in changes {
+            body.extend_from_slice(&nodeid.to_le_bytes());
+            body.extend_from_slice(&delta.to_le_bytes());
+        }
+        self.call(op::LIGHTER_NOTICES, 1, &body).expect("notices");
     }
 
     fn write(&mut self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
@@ -1403,6 +1416,367 @@ fn fsync_settles_the_apply_queue_before_replying() {
 /// in the table forever — holding its descriptor — and the sweep starves.
 /// Measured: 150,000 forgets across an install cycle and a table that never
 /// shrank.
+/// A file the server registers without a descriptor (every file, and every
+/// directory at a full share or on a full network volume) is counted once
+/// for the one reply that names it. It was counted three times — once by
+/// registering it, once in the branch that registered it, once again as the
+/// entry was answered — so the guest's forget left it in the table for good:
+/// 49 of 64 such files, looked up and forgotten, stayed live.
+/// The guest says a file is open (guest patch 0057), and has not read it
+/// yet. A Mac program deleting it, or saving over it, must leave the guest
+/// reading what it opened, as a local file would; OrbStack, Docker Desktop
+/// and Apple's virtiofs all do.
+fn mode_from_attr(reply: &[u8]) -> u32 {
+    u32::from_le_bytes(reply[16 + 60..16 + 64].try_into().unwrap()) & 0o7777
+}
+
+fn host_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn host_record(path: &std::path::Path) -> bool {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = c"com.docker.grpcfuse.ownership";
+    // SAFETY: valid NUL-terminated strings and no buffer, which asks for the size.
+    unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        ) >= 0
+    }
+}
+
+/// A container's root makes a directory it cannot read or search, as
+/// pjdfstest does: Linux lets root use it anyway, and the server, which
+/// works as the Mac user, needs to read and search it to serve it at all.
+/// The Mac directory gets the owner bits the server needs; the guest sees
+/// what it asked for, kept in the record.
+#[test]
+fn a_directory_made_unreadable_is_made_and_shows_its_mode() {
+    let mut guest = Guest::new("mode-dir-unreadable");
+    let mut body = 0o151u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("d"));
+    let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+    let nodeid = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(host_mode(&guest.host("d")), 0o551);
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o151);
+    // A chmod to bits the Mac can hold gives them back to the file, and the
+    // record lets go.
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&fuse::fattr::MODE.to_le_bytes());
+    body[68..72].copy_from_slice(&0o755u32.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).expect("setattr");
+    assert_eq!(host_mode(&guest.host("d")), 0o755);
+    assert!(
+        !host_record(&guest.host("d")),
+        "the record outlived the bits it kept"
+    );
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o755);
+}
+
+/// A file made with no read bit is still read by the server for the
+/// container's root, and shows the bits it was made with; a read-only file,
+/// which the server can read, is left exactly as asked, with no record.
+#[test]
+fn a_file_made_unreadable_is_kept_and_a_read_only_one_is_left_alone() {
+    let mut guest = Guest::new("mode-file-unreadable");
+    let (nodeid, fh) = guest
+        .create_mode(1, "secret", 0o1 | 0o100, 0o000)
+        .expect("create");
+    guest.write(nodeid, fh, 0, b"content").expect("write");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(host_mode(&guest.host("secret")), 0o400);
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o000);
+    assert_eq!(guest.read(nodeid, 0, 0, 64), Ok(b"content".to_vec()));
+
+    let (plain, _) = guest
+        .create_mode(1, "readonly", 0o1 | 0o100, 0o444)
+        .expect("create");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(host_mode(&guest.host("readonly")), 0o444);
+    assert!(
+        !host_record(&guest.host("readonly")),
+        "a read-only file was given a record"
+    );
+    let ga = guest.call(op::GETATTR, plain, &[0u8; 16]).expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o444);
+}
+
+fn mknod_body(mode: u32, rdev: u32, name: &str) -> Vec<u8> {
+    let mut body = mode.to_le_bytes().to_vec();
+    body.extend_from_slice(&rdev.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // umask
+    body.extend_from_slice(&0u32.to_le_bytes()); // padding
+    body.extend_from_slice(&name_body(name));
+    body
+}
+
+/// (mode, rdev) from an entry reply.
+fn entry_kind(reply: &[u8]) -> (u32, u32) {
+    let attr = 40;
+    (
+        u32::from_le_bytes(reply[attr + 60..attr + 64].try_into().unwrap()),
+        u32::from_le_bytes(reply[attr + 76..attr + 80].try_into().unwrap()),
+    )
+}
+
+/// A socket bound in a shared folder, and a device node made in one: the Mac
+/// user can make neither, so the Mac has an empty file in each one's place
+/// and the guest, whose kernel does all a socket or a node is for, sees what
+/// it made. Both were EPERM.
+#[test]
+fn a_socket_and_a_device_node_are_made_and_seen_as_what_they_are() {
+    let mut guest = Guest::new("special-files");
+    let sock = libc::S_IFSOCK as u32;
+    let reply = guest
+        .call(op::MKNOD, 1, &mknod_body(sock | 0o755, 0, "s"))
+        .expect("mknod socket");
+    assert_eq!(entry_kind(&reply), (sock | 0o755, 0));
+    let host = std::fs::symlink_metadata(guest.host("s")).unwrap();
+    assert!(
+        host.file_type().is_file() && host.len() == 0,
+        "the Mac has a plain empty file"
+    );
+
+    let chr = libc::S_IFCHR as u32;
+    let reply = guest
+        .call(op::MKNOD, 1, &mknod_body(chr | 0o644, 0x0102, "c"))
+        .expect("mknod char");
+    assert_eq!(entry_kind(&reply), (chr | 0o644, 0x0102));
+
+    // Moved into a directory of its own, and read by a server that starts
+    // afresh, it is still a socket: the directory it went to is looked in.
+    let mut body = 0o755u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&name_body("sub"));
+    let sub = u64::from_le_bytes(
+        guest.call(op::MKDIR, 1, &body).expect("mkdir")[0..8]
+            .try_into()
+            .unwrap(),
+    );
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let mut body = sub.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("s"));
+    body.extend_from_slice(&name_body("s"));
+    guest.call(op::RENAME, 1, &body).expect("rename");
+    let mut fresh = guest.another();
+    let sub = fresh.lookup(1, "sub").expect("lookup sub");
+    let reply = fresh
+        .call(op::LOOKUP, sub, &name_body("s"))
+        .expect("lookup s");
+    assert_eq!(entry_kind(&reply).0 & libc::S_IFMT as u32, sock);
+}
+
+/// A chown drops setuid, and setgid where the group may execute, so the new
+/// owner cannot run the file as the old one (pjdfstest chown/00).
+#[test]
+fn a_chown_drops_setuid_and_setgid() {
+    let mut guest = Guest::new("chown-setid");
+    let (nodeid, _) = guest
+        .create_mode(1, "tool", 0o1 | 0o100, 0o755)
+        .expect("create");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&fuse::fattr::MODE.to_le_bytes());
+    body[68..72].copy_from_slice(&0o6755u32.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).expect("chmod");
+    let mut body = vec![0u8; 88];
+    body[0..4].copy_from_slice(&(fuse::fattr::UID | fuse::fattr::GID).to_le_bytes());
+    body[76..80].copy_from_slice(&65534u32.to_le_bytes());
+    body[80..84].copy_from_slice(&65534u32.to_le_bytes());
+    guest.call(op::SETATTR, nodeid, &body).expect("chown");
+    let ga = guest
+        .call(op::GETATTR, nodeid, &[0u8; 16])
+        .expect("getattr");
+    assert_eq!(mode_from_attr(&ga), 0o755);
+    assert_eq!(host_mode(&guest.host("tool")), 0o755);
+}
+
+/// A FIFO deeper than macOS's 1,024-character paths is made like a file at
+/// the same depth: relative to its directory, never by its whole path.
+#[test]
+fn a_fifo_is_made_deeper_than_a_mac_path_can_be() {
+    let mut guest = Guest::new("deep-fifo");
+    let name = "d".repeat(200);
+    let mut dir = 1;
+    for _ in 0..6 {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(&name));
+        let reply = guest.call(op::MKDIR, dir, &body).expect("mkdir");
+        dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let fifo = libc::S_IFIFO as u32;
+    let reply = guest
+        .call(op::MKNOD, dir, &mknod_body(fifo | 0o644, 0, "f"))
+        .expect("mknod fifo");
+    assert_eq!(entry_kind(&reply).0, fifo | 0o644);
+}
+
+/// A file deeper than macOS's 1,024-character paths takes a chown, which is
+/// an xattr on the Mac, as one at the top does. Named as its directory's
+/// identity path and its name, it was ENAMETOOLONG on macOS 26, which
+/// resolves that through the directory's whole path (pjdfstest chown/03).
+#[test]
+fn a_file_deeper_than_a_mac_path_can_be_is_chowned() {
+    let mut guest = Guest::new("deep-chown");
+    let name = "d".repeat(200);
+    let mut dir = 1;
+    for _ in 0..6 {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(&name));
+        let reply = guest.call(op::MKDIR, dir, &body).expect("mkdir");
+        dir = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+    }
+    let (f, _) = guest.create(dir, "f", 0x8241).expect("create f");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    chown(&mut guest, f, 65534, 65534).expect("a chown 1,200 characters deep");
+    assert_eq!(owner_of(&mut guest, f), (65534, 65534));
+}
+
+/// A file renamed over one a container has just created, whose create is
+/// still held: the holder is queued first and the rename lands on it, as on
+/// any filesystem. Queued after, the create met the renamed file and failed,
+/// "an acknowledged create failed to apply", and what was written to it was
+/// lost (pjdfstest rename/10, where the renamed-away name then read as
+/// still there).
+#[test]
+fn a_rename_over_a_file_just_created_lands_after_the_create() {
+    let mut guest = Guest::new("rename-over-held");
+    std::fs::write(guest.host("g"), b"from g").unwrap();
+    let g = guest.lookup(1, "g").expect("lookup g");
+    let (f, fh) = guest.create(1, "f", 0x8241).expect("create f");
+    guest.write(f, fh, 0, b"written to f").expect("write f");
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("g"));
+    body.extend_from_slice(&name_body("f"));
+    guest.call(op::RENAME, 1, &body).expect("rename g over f");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(guest.lookup(1, "f").expect("lookup f"), g);
+    assert_eq!(std::fs::read(guest.host("f")).unwrap(), b"from g");
+    assert!(
+        matches!(guest.lookup(1, "g"), Err(_) | Ok(0)),
+        "g is still there after its rename"
+    );
+    // The file the rename displaced is still the guest's to read.
+    assert_eq!(guest.read(f, fh, 0, 64), Ok(b"written to f".to_vec()));
+}
+
+/// A directory renamed over one that holds only a create still held: the
+/// rename is ENOTEMPTY, as the guest's view of the directory says, and the
+/// file is made. It succeeded on the host's empty directory, and the create
+/// then failed for want of its own (pjdfstest rename/20).
+#[test]
+fn a_rename_over_a_directory_with_a_file_just_made_in_it_is_enotempty() {
+    let mut guest = Guest::new("rename-over-nonempty");
+    let mut dirs = Vec::new();
+    for name in ["a", "b"] {
+        let mut body = 0o755u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&name_body(name));
+        let reply = guest.call(op::MKDIR, 1, &body).expect("mkdir");
+        dirs.push(u64::from_le_bytes(reply[0..8].try_into().unwrap()));
+    }
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    let (f, fh) = guest.create(dirs[1], "f", 0x8241).expect("create b/f");
+    guest.write(f, fh, 0, b"in b").expect("write");
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("a"));
+    body.extend_from_slice(&name_body("b"));
+    let renamed = guest.call(op::RENAME, 1, &body);
+    assert_eq!(
+        renamed.err(),
+        Some(39),
+        "a rename over a non-empty directory"
+    );
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::read(guest.host("b/f")).unwrap(), b"in b");
+}
+
+#[test]
+fn a_file_the_guest_has_open_survives_its_deletion_on_the_host() {
+    let mut guest = Guest::new("notice-host-delete");
+    std::fs::write(guest.host("f"), b"original").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    let fh = guest.open(nodeid, 0).unwrap();
+    guest.notices(&[(nodeid, 1)]);
+    std::fs::remove_file(guest.host("f")).unwrap();
+    assert_eq!(guest.read(nodeid, fh, 0, 64), Ok(b"original".to_vec()));
+}
+
+#[test]
+fn a_file_the_guest_has_open_survives_a_save_over_it_on_the_host() {
+    let mut guest = Guest::new("notice-host-replace");
+    std::fs::write(guest.host("f"), b"original").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    let fh = guest.open(nodeid, 0).unwrap();
+    guest.notices(&[(nodeid, 1)]);
+    std::fs::write(guest.host("f.tmp"), b"replacement").unwrap();
+    std::fs::rename(guest.host("f.tmp"), guest.host("f")).unwrap();
+    assert_eq!(guest.read(nodeid, fh, 0, 64), Ok(b"original".to_vec()));
+}
+
+/// Without a notice, or after the close, nothing is held: the guest gets
+/// ESTALE, never the file that took the name.
+#[test]
+fn a_file_closed_again_is_not_held() {
+    let mut guest = Guest::new("notice-closed");
+    std::fs::write(guest.host("f"), b"original").unwrap();
+    let nodeid = guest.lookup(1, "f").unwrap();
+    guest.notices(&[(nodeid, 1)]);
+    guest.notices(&[(nodeid, -1)]);
+    std::fs::write(guest.host("f.tmp"), b"replacement").unwrap();
+    std::fs::rename(guest.host("f.tmp"), guest.host("f")).unwrap();
+    // Out of the open cache too, as it would be after its eviction.
+    let read = guest.read(nodeid, 0, 0, 64);
+    assert_ne!(
+        read,
+        Ok(b"replacement".to_vec()),
+        "read another file's bytes"
+    );
+}
+
+#[test]
+fn a_file_looked_up_and_forgotten_leaves_the_registry() {
+    let mut guest = Guest::new("forget-lookup");
+    let before = guest.server.live_inodes();
+    let names: Vec<String> = (0..64).map(|n| format!("f{n}")).collect();
+    for name in &names {
+        std::fs::write(guest.host(name), name.as_bytes()).unwrap();
+    }
+    for name in &names {
+        let nodeid = guest.lookup(1, name).expect("lookup");
+        guest.call(op::FORGET, nodeid, &1u64.to_le_bytes()).ok();
+    }
+    assert_eq!(
+        guest.server.live_inodes(),
+        before,
+        "a lookup and its forget must leave nothing behind"
+    );
+}
+
 #[test]
 fn a_forgotten_async_file_leaves_the_registry() {
     let mut guest = Guest::new("forget-async");
@@ -2245,14 +2619,14 @@ fn listing_parked_clones_revives_none_of_them() {
         guest.call(op::LIGHTER_CLONE, dest, &body).expect("clone");
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
-    let before = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed);
+    let before = guest.server.revived_on_demand();
     let mut body = vec![0u8; 40];
     body[16..20].copy_from_slice(&65536u32.to_le_bytes());
     let listing = guest
         .call(op::READDIRPLUS, pkg, &body)
         .expect("readdirplus");
     assert!(listing.len() > 40 * 32, "every entry listed");
-    let revived = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let revived = guest.server.revived_on_demand() - before;
     assert_eq!(revived, 0, "a listing revives nothing");
 }
 
@@ -2279,7 +2653,7 @@ fn a_parked_directory_is_not_revived_by_creating_inside_it() {
     // A create, a lookup, a stat of the name, a mkdir, an unlink and a
     // rename in each parked directory, none of which opens the directory:
     // its nearest resident ancestor and a relative path do the work.
-    let before = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed);
+    let before = guest.server.dirs_revived_on_demand();
     for (n, dir) in dirs.iter().enumerate() {
         let (file, fh) = guest.create(*dir, "made", 0x8241).expect("create");
         guest.write(file, fh, 0, b"x").unwrap();
@@ -2308,12 +2682,12 @@ fn a_parked_directory_is_not_revived_by_creating_inside_it() {
             .expect("rmdir inside");
     }
     guest.call(op::SYNCFS, 1, &[0u8; 8]).unwrap();
-    let revived = lighter_fs::inode::REOPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
-    // The sweep promotes a few directories into headroom as it goes; the
-    // operations themselves revive nothing.
-    assert!(
-        revived <= 16,
-        "working inside parked directories revived {revived} inodes"
+    let revived = guest.server.dirs_revived_on_demand() - before;
+    // The sweep promotes a few directories into headroom as it goes, as many
+    // as the clock gives it sweeps; the operations themselves open none.
+    assert_eq!(
+        revived, 0,
+        "working inside parked directories revived {revived} of them"
     );
     for n in 0..DIRS {
         let left: Vec<_> = std::fs::read_dir(guest.host(&format!("d{n}")))
@@ -3161,6 +3535,37 @@ fn a_rename_that_must_not_replace_works_on_a_drive_that_cannot_refuse() {
         "EEXIST, not a replace"
     );
     assert_eq!(std::fs::read(drive.mount.join("taken")).unwrap(), b"kept");
+}
+
+/// A file the host renames at once (a rename with flags, and every rename
+/// on a network volume) is reached afterwards by its new name. The guest's
+/// own rename moved its name, so it never looks the file up again; placed at
+/// its old name, the file was found only by reviving it by identity, which a
+/// network volume has none of: a WAL segment renamed into place on SMB with
+/// file ids read `ENOENT`, or the next file made under the old name.
+#[test]
+fn a_file_renamed_at_once_is_reached_by_its_new_name() {
+    let mut guest = Guest::new("renamed-at-once");
+    std::fs::write(guest.host("f"), b"moved").unwrap();
+    let f = guest.lookup(1, "f").unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(&fuse::rename::NOREPLACE.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(b"f\0g\0");
+    guest.call(op::RENAME2, 1, &body).expect("rename f to g");
+    std::fs::write(guest.host("f"), b"another file").unwrap();
+
+    let before = guest.server.revived_on_demand();
+    let reply = guest.call(op::GETATTR, f, &[0u8; 16]).expect("getattr");
+    let size = u64::from_le_bytes(reply[24..32].try_into().unwrap());
+    assert_eq!(size, 5, "the moved file's size");
+    assert_eq!(guest.read(f, 0, 0, 64).expect("read"), b"moved");
+    assert_eq!(
+        guest.server.revived_on_demand(),
+        before,
+        "reached by its old name and revived"
+    );
 }
 
 /// `/Users` and `/Volumes` are root's, so the marker that says a share holds

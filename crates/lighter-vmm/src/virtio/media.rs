@@ -31,12 +31,12 @@
 //! Everything happens in `notify`, under the transport lock, as the GPU
 //! does it: a command is read from the chain, dispatched, its response
 //! scattered back, and any events the device produced are written into
-//! the descriptors the driver keeps posted on the event queue. Decoding is
-//! synchronous inside the command that queued the bitstream, a few
-//! milliseconds for a 1080p frame. Encoding is not: VideoToolbox returns
-//! frames on its own thread and rings the device's doorbell, and a thread
-//! of the device's takes the transport lock and services the event queue,
-//! which collects them.
+//! the descriptors the driver keeps posted on the event queue. Neither
+//! codec works inside a command: VideoToolbox decodes and encodes on its
+//! own threads and rings the device's doorbell, and a thread of the
+//! device's takes the transport lock and services the event queue, which
+//! collects the frames. A decode inside the command held the guest's vCPU
+//! for the whole of it, a few milliseconds a frame (#98).
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -95,8 +95,9 @@ pub struct Media<D: VirtioMediaDevice<Reader, Writer>> {
 impl Decoder {
     pub fn decoder(aperture: Window, memory: Arc<GuestMemory>) -> Decoder {
         let pending = PendingEvents::default();
+        let doorbell = Arc::new(Doorbell::default());
         let device = VideoDecoder::new(
-            VideoToolboxDecoder::new(),
+            VideoToolboxDecoder::with_doorbell(doorbell.clone()),
             Events(pending.clone()),
             Aperture::new(aperture, memory),
         );
@@ -105,7 +106,7 @@ impl Decoder {
             aperture,
             card: b"lighter VideoToolbox decoder",
             pending,
-            doorbell: None,
+            doorbell: Some(doorbell),
         }
     }
 }
@@ -209,9 +210,9 @@ impl<D: VirtioMediaDevice<Reader, Writer>> Media<D> {
             let mut reader = std::io::Cursor::new(request);
             let mut writer = Vec::new();
             self.runner.handle_command(&mut reader, &mut writer);
-            // The decoder answers synchronously, so whatever it produced
-            // (a frame back, an input buffer released, a resolution change)
-            // is ready the moment the command is.
+            // Whatever the command produced (an input buffer released, a
+            // resolution change, frames that came back meanwhile) goes out
+            // with its answer; later frames ring the doorbell.
             self.pump();
             let len = Self::scatter(mem, &reply, &writer);
             queue.push_used(mem, head, len);
@@ -368,8 +369,8 @@ impl VirtioMediaEventQueue for Events {
     }
 }
 
-/// The decoder has no file descriptor to poll: it answers within the
-/// command, and its events are collected right after it.
+/// Neither codec has a file descriptor to poll: their frames arrive on
+/// VideoToolbox's threads, which ring the device's doorbell instead.
 #[derive(Clone)]
 pub struct NoPoller;
 

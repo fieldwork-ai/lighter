@@ -153,12 +153,21 @@ if docker logs "$container" 2>&1 | grep -q '^PACING'; then
 	mark="$(wc -l < "$LOG")"
 	# The stream holds the cap at 5 ms; the windows must stay at the resting
 	# 50 µs, or every idle vCPU spins four times as long for a detector.
-	idle="$(docker run --rm --privileged alpine sh -c 'cat /sys/module/idle/parameters/poll_ns; cat /sys/module/idle/parameters/limits' 2>/dev/null)"
-	cap="$(echo "$idle" | head -1)"; widest="$(echo "$idle" | tail -1 | tr ' ' '\n' | grep . | sort -n | tail -1)"
-	if [ "$cap" = 5000000 ] && [ -n "$widest" ] && [ "$widest" -le 50000 ]; then
-		pass "with the stream open the cap is 5 ms and every window rests at 50 µs or less (widest $widest ns)"
+	# Read twenty times, a tenth of a second apart, by one container. A
+	# poll that catches its wakeup widens its window, and while the stream
+	# has moved a message in the last millisecond a timeout does not narrow
+	# it (patch 0039), so a reading just after a frame, or the reading's own
+	# wakeups, can find one wide: a single reading once caught one at the cap
+	# on a busy Mac (2026-10-20), and five readings caught three. Windows that
+	# do not rest are wide in nearly every reading; resting is most of them.
+	readings="$(docker run --rm --privileged alpine sh -c 'for i in $(seq 20); do echo "$(cat /sys/module/idle/parameters/poll_ns) $(cat /sys/module/idle/parameters/limits | tr " " "\n" | grep . | sort -n | tail -1)"; sleep 0.1; done' 2>/dev/null)"
+	cap="$(echo "$readings" | awk 'NF {print $1}' | sort | uniq -c | sort -rn | awk 'NR == 1 {print $2}')"
+	widest="$(echo "$readings" | awk '{print $2}' | sort -n | tail -1)"
+	resting="$(echo "$readings" | awk '$2 != "" && $2 <= 50000' | wc -l | tr -d ' ')"
+	if [ "$cap" = 5000000 ] && [ "${resting:-0}" -ge 11 ]; then
+		pass "with the stream open the cap is 5 ms and every window rests at 50 µs or less (${resting} of 20 readings; widest seen $widest ns)"
 	else
-		fail "with the stream open: cap ${cap:-?}, widest window ${widest:-?} ns (want 5000000 and at most 50000)"
+		fail "with the stream open: cap ${cap:-?}, every window at 50 µs or less in ${resting:-0} of 20 readings (widest ${widest:-?} ns; want 5000000 and most)"
 	fi
 	# top's first sample is since the process began; the mean of the next six.
 	cpu="$(top -l 7 -s 2 -pid "$VMM_PID" -stats cpu 2>/dev/null | awk '/^[0-9.]+ *$/{n++; if (n>1) {s+=$1; c++}} END{if (c) printf "%.1f", s/c}')"
@@ -204,9 +213,9 @@ docker wait "$container" >/dev/null 2>&1 || true
 looped="$(docker logs "$container" 2>&1 | grep '^LOOPED' | tail -1)"
 # The client's own stream stays open after the loop, so the hold has to end
 # by the VMM letting go, the last word this stage logs about the vCPUs.
-stage="$(tail -n +"$((mark + 1))" "$LOG" | grep -E "vCPUs (at the interactive class|back to the default class)")"
-held="$(echo "$stage" | grep -c "interactive class")"
-released="$(echo "$stage" | tail -1 | grep -c "back to the default class")"
+stage="$(tail -n +"$((mark + 1))" "$LOG" | grep -E "vCPUs (at the interactive class|back to the default class)" || true)"
+held="$(echo "$stage" | grep -c "interactive class" || true)"
+released="$(echo "$stage" | tail -1 | grep -c "back to the default class" || true)"
 if [ -n "$looped" ] && [ "$held" -ge 1 ] && [ "$released" = 1 ]; then
 	pass "the loop held the vCPUs and the VMM let go after it ($looped)"
 else

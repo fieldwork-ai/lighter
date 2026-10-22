@@ -21,6 +21,7 @@
 //! What this mirrors is `extras/ffmpeg-decoder` in the virtio-media tree,
 //! the reference backend, with VideoToolbox where it has libavcodec.
 
+use super::encoder::Doorbell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -184,9 +185,15 @@ impl Drop for Decoded {
     }
 }
 
-/// Where the output callback puts frames. Boxed and leaked to the session
-/// as its refcon; freed with the session.
+/// Where the output callback puts frames.
 type Sink = Mutex<VecDeque<Decoded>>;
+
+/// The output callback's refcon: where frames go, and the doorbell that
+/// says some have, so the device's thread hands them to the guest.
+struct Callback {
+    sink: Arc<Sink>,
+    doorbell: Option<Arc<Doorbell>>,
+}
 
 unsafe extern "C" fn on_frame(
     refcon: *mut c_void,
@@ -202,11 +209,13 @@ unsafe extern "C" fn on_frame(
         return;
     }
     tracing::trace!(seq = pts.value, "VideoToolbox frame out");
-    // SAFETY: `refcon` is the `Arc<Sink>` pointer the session registered and
-    // keeps alive until it is invalidated and drained.
-    let sink = unsafe { &*(refcon as *const Sink) };
+    // SAFETY: `refcon` is the `Callback` the session registered and keeps
+    // alive until it is invalidated and drained.
+    let callback = unsafe { &*(refcon as *const Callback) };
     unsafe { vt::CVPixelBufferRetain(image) };
-    sink.lock()
+    callback
+        .sink
+        .lock()
         .expect("decoder sink poisoned")
         .push_back(Decoded {
             pixels: image,
@@ -217,6 +226,9 @@ unsafe extern "C" fn on_frame(
                 tv_usec: 0,
             },
         });
+    if let Some(doorbell) = &callback.doorbell {
+        doorbell.ring();
+    }
 }
 
 /// One decompression session for one set of parameter sets.
@@ -224,7 +236,7 @@ struct VtSession {
     session: vt::VTDecompressionSessionRef,
     desc: FormatDescription,
     /// Kept alive for the callback's sake: its address is the refcon.
-    _sink: Arc<Sink>,
+    _callback: Box<Callback>,
     /// The coded picture size the SPS declares.
     dims: (u32, u32),
 }
@@ -238,7 +250,9 @@ impl VtSession {
         desc: FormatDescription,
         ten_bit: bool,
         sink: Arc<Sink>,
+        doorbell: Option<Arc<Doorbell>>,
     ) -> Result<VtSession, vt::OSStatus> {
+        let callback = Box::new(Callback { sink, doorbell });
         let dims = desc.dimensions();
         let format = if ten_bit {
             vt::kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
@@ -265,7 +279,7 @@ impl VtSession {
         };
         let record = vt::VTDecompressionOutputCallbackRecord {
             callback: Some(on_frame),
-            refcon: Arc::as_ptr(&sink) as *mut c_void,
+            refcon: &*callback as *const Callback as *mut c_void,
         };
         let mut session: vt::VTDecompressionSessionRef = std::ptr::null();
         let st = unsafe {
@@ -288,7 +302,7 @@ impl VtSession {
         Ok(VtSession {
             session,
             desc,
-            _sink: sink,
+            _callback: callback,
             dims,
         })
     }
@@ -304,22 +318,32 @@ impl VtSession {
 
     /// Decodes one access unit, its NALs length-prefixed in `avcc`; `seq`
     /// comes back with the frame.
-    fn decode(&self, avcc: &mut [u8], seq: i64) -> Result<(), vt::OSStatus> {
+    fn decode(&self, avcc: &[u8], seq: i64) -> Result<(), vt::OSStatus> {
+        // A block CoreMedia owns, with the unit copied in: the decode is
+        // asynchronous, so VideoToolbox may still be reading it after this
+        // returns and the unit's own buffer is gone.
         let mut block: vt::CMBlockBufferRef = std::ptr::null();
         let st = unsafe {
             vt::CMBlockBufferCreateWithMemoryBlock(
                 vt::kCFAllocatorDefault,
-                avcc.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
                 avcc.len(),
-                vt::kCFAllocatorNull,
+                vt::kCFAllocatorDefault,
                 std::ptr::null(),
                 0,
                 avcc.len(),
-                0,
+                vt::kCMBlockBufferAssureMemoryNowFlag,
                 &mut block,
             )
         };
         if st != 0 || block.is_null() {
+            return Err(st);
+        }
+        let st = unsafe {
+            vt::CMBlockBufferReplaceDataBytes(avcc.as_ptr().cast(), block, 0, avcc.len())
+        };
+        if st != 0 {
+            unsafe { vt::CFRelease(block) };
             return Err(st);
         }
         let timing = vt::CMSampleTimingInfo {
@@ -346,16 +370,21 @@ impl VtSession {
             unsafe { vt::CFRelease(block) };
             return Err(st);
         }
-        // Synchronous: the callback runs on this thread before the call
-        // returns, in decode order whatever the flags ask for (asynchronous
-        // decompression with temporal processing was measured to change
-        // nothing), hence the session's own reordering.
+        // Asynchronous: the call returns once VideoToolbox has the unit, and
+        // the frame arrives later on VideoToolbox's thread, which rings the
+        // device's doorbell. Decoded here instead, the guest's vCPU stood in
+        // the command for the whole decode and the copy after it, a few
+        // milliseconds a frame that the guest counted as its decoder
+        // thread's kernel time: a tenth of a core per 2688x1512 camera, the
+        // cost of decoding in software (#98). Frames come back in decode
+        // order (no temporal processing), hence the session's own
+        // reordering.
         let mut info = 0u32;
         let st = unsafe {
             vt::VTDecompressionSessionDecodeFrame(
                 self.session,
                 sample,
-                vt::kVTDecodeFrame_EnableTemporalProcessing,
+                vt::kVTDecodeFrame_EnableAsynchronousDecompression,
                 std::ptr::null_mut(),
                 &mut info,
             )
@@ -378,7 +407,10 @@ impl VtSession {
 
 impl Drop for VtSession {
     fn drop(&mut self) {
+        // The callback's refcon is freed with this session, and a frame still
+        // in flight would land on it.
         unsafe {
+            vt::VTDecompressionSessionWaitForAsynchronousFrames(self.session);
             vt::VTDecompressionSessionInvalidate(self.session);
             vt::CFRelease(self.session);
         }
@@ -472,6 +504,8 @@ pub struct Session {
     ten_bit: bool,
     capture_fourcc: u32,
     sink: Arc<Sink>,
+    /// Rung by VideoToolbox's thread when frames arrive; `None` in tests.
+    doorbell: Option<Arc<Doorbell>>,
     /// What the CAPTURE queue is formatted for: the stream's size, or a
     /// larger one the guest set since the stream last changed it.
     coded_size: (u32, u32),
@@ -524,6 +558,7 @@ impl Session {
             ten_bit: false,
             capture_fourcc: NV12,
             sink: Arc::new(Mutex::new(VecDeque::new())),
+            doorbell: None,
             coded_size: DEFAULT_CODED_SIZE,
             input_size: INPUT_SIZE,
             stream: StreamParams {
@@ -574,11 +609,13 @@ impl Session {
                     );
                 }
                 Some(Ok(desc)) => {
-                    if let Some(old) = self.vt.take() {
+                    let replaced = self.vt.take().inspect(|old| {
                         old.flush();
+                    });
+                    if replaced.is_some() {
                         self.collect(true);
                     }
-                    self.start_session(desc);
+                    self.start_session(desc, replaced.is_some());
                 }
                 Some(Err(st)) => {
                     tracing::warn!(st, codec = ?self.codec, "VideoToolbox refused the stream's parameter sets");
@@ -595,7 +632,7 @@ impl Session {
             && !unit.sample.is_empty()
         {
             self.seq += 1;
-            let mut sample = unit.sample;
+            let sample = unit.sample;
             tracing::trace!(
                 index,
                 seq,
@@ -604,7 +641,7 @@ impl Session {
                 "video decode in"
             );
             self.in_flight.insert(seq, (unit.order, timestamp));
-            if let Err(st) = vt.decode(&mut sample, seq) {
+            if let Err(st) = vt.decode(&sample, seq) {
                 // A bad unit in a live stream is skipped, not fatal.
                 tracing::debug!(st, "VideoToolbox rejected a frame");
                 self.in_flight.remove(&seq);
@@ -621,8 +658,10 @@ impl Session {
     }
 
     /// A VideoToolbox session for the stream as the parser now describes
-    /// it, and what that changes for the guest.
-    fn start_session(&mut self, desc: FormatDescription) {
+    /// it, and what that changes for the guest. `replacing` is whether a
+    /// session decoded this stream before it: only then is there an old
+    /// format whose frames a LAST buffer ends.
+    fn start_session(&mut self, desc: FormatDescription, replacing: bool) {
         self.take_depth(true);
         let ten_bit = self.parser.ten_bit();
         tracing::debug!(
@@ -632,7 +671,7 @@ impl Session {
             ten_bit,
             "video stream"
         );
-        let vt = match VtSession::new(desc, ten_bit, self.sink.clone()) {
+        let vt = match VtSession::new(desc, ten_bit, self.sink.clone(), self.doorbell.clone()) {
             Ok(vt) => vt,
             Err(st) => {
                 tracing::warn!(st, codec = ?self.codec, "VideoToolbox could not decode the stream");
@@ -657,6 +696,23 @@ impl Session {
         // asks nothing of it, and ffmpeg, finding the format it asks after
         // the event unchanged, keeps the buffers it has and stops at the
         // LAST buffer as at the end of the stream.
+        // The first session, for a stream the guest already set CAPTURE up
+        // for and turned on: the size it asked for, not a change of it.
+        // ffmpeg does this when the container or an RTSP session
+        // description gave it the size, and a live stream joined between
+        // keyframes then reaches its first parameter sets with CAPTURE
+        // running. Answered as a change, the LAST buffer that ended a format
+        // nothing was decoded in ended the stream for ffmpeg after one
+        // frame (#98).
+        if !replacing
+            && self.capture_streaming
+            && dims == self.coded_size
+            && self.capture_fourcc == fourcc
+        {
+            self.stream.coded_size = dims;
+            self.stream.visible_rect = Rect::new(0, 0, dims.0, dims.1);
+            return;
+        }
         if dims != self.stream.coded_size || self.capture_fourcc != fourcc {
             tracing::info!(
                 from = format_args!("{}x{}", self.stream.coded_size.0, self.stream.coded_size.1),
@@ -666,7 +722,7 @@ impl Session {
             );
             // Mid-stream, the old format's frames (all flushed) end with a
             // LAST buffer before any of the new one.
-            if self.capture_streaming {
+            if self.capture_streaming && replacing {
                 self.ready.push_back(Ready::Last(self.generation));
             }
             self.generation += 1;
@@ -1013,6 +1069,12 @@ impl VideoDecoderBackendSession for Session {
     }
 
     fn next_event(&mut self) -> Option<VideoDecoderBackendEvent> {
+        // Frames VideoToolbox finished since the last command, which the
+        // doorbell's thread comes to collect.
+        if self.events.is_empty() {
+            self.collect_decoded();
+            self.emit_frames();
+        }
         self.events.pop_front()
     }
 
@@ -1070,11 +1132,20 @@ impl VideoDecoderBackendSession for Session {
 // ------------------------------------------------------------- backend ---
 
 /// The decoder device: one per machine, a session per open of the node.
-pub struct VideoToolboxDecoder;
+pub struct VideoToolboxDecoder {
+    doorbell: Option<Arc<Doorbell>>,
+}
 
 impl VideoToolboxDecoder {
     pub fn new() -> VideoToolboxDecoder {
-        VideoToolboxDecoder
+        VideoToolboxDecoder { doorbell: None }
+    }
+
+    /// A decoder whose frames ring `doorbell` as they arrive.
+    pub fn with_doorbell(doorbell: Arc<Doorbell>) -> VideoToolboxDecoder {
+        VideoToolboxDecoder {
+            doorbell: Some(doorbell),
+        }
     }
 }
 
@@ -1088,7 +1159,9 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
     type Session = Session;
 
     fn new_session(&mut self, _id: u32) -> IoctlResult<Session> {
-        Ok(Session::new(Codec::H264))
+        let mut session = Session::new(Codec::H264);
+        session.doorbell = self.doorbell.clone();
+        Ok(session)
     }
 
     fn close_session(&mut self, _session: Session) {}
@@ -1194,7 +1267,9 @@ impl VideoDecoderBackend for VideoToolboxDecoder {
                     && codec != session.codec
                 {
                     tracing::debug!(?codec, "video session codec");
+                    let doorbell = session.doorbell.take();
                     *session = Session::new(codec);
+                    session.doorbell = doorbell;
                 }
                 session.input_size = input_size(pix_mp.plane_fmt[0].sizeimage);
             }
@@ -1379,7 +1454,7 @@ mod tests {
             .expect("both sets")
             .expect("accepted without the VUI");
         let sink = Arc::new(Mutex::new(VecDeque::new()));
-        let vt = VtSession::new(desc, false, sink).expect("a session");
+        let vt = VtSession::new(desc, false, sink, None).expect("a session");
         assert_eq!(vt.dims, (896, 512));
     }
 
@@ -1543,6 +1618,55 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
         );
+    }
+
+    #[test]
+    fn capture_set_up_before_the_first_parameter_sets_is_the_stream_not_a_change() {
+        use crate::video::h264::tests::REOLINK_PPS;
+        let annexb = |nals: &[&[u8]]| -> Vec<u8> {
+            nals.iter()
+                .flat_map(|nal| [&[0u8, 0, 0, 1][..], nal].concat())
+                .collect()
+        };
+        let stamp = bindings::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let sps: &[u8] = &[
+            0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00,
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58,
+        ];
+        // ffmpeg reading a live RTSP stream: the session description gave
+        // it the size, so CAPTURE is set up and on before the first
+        // keyframe's parameter sets arrive.
+        let mut s = Session::new(Codec::H264);
+        s.coded_size = (1920, 1080);
+        s.capture_streaming = true;
+        let before = s.generation;
+        s.feed(annexb(&[sps, REOLINK_PPS]), 0, stamp).unwrap();
+        assert_eq!(s.generation, before);
+        assert!(!s.ready.iter().any(|r| matches!(r, Ready::Last(_))));
+        assert!(
+            !s.events
+                .iter()
+                .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
+        );
+        assert_eq!(s.stream.coded_size, (1920, 1080));
+
+        // Set up for another size, it is told of the stream's, but no
+        // LAST buffer ends a format nothing was decoded in.
+        let mut s = Session::new(Codec::H264);
+        s.coded_size = (1280, 720);
+        s.capture_streaming = true;
+        s.feed(annexb(&[sps, REOLINK_PPS]), 0, stamp).unwrap();
+        assert!(!s.ready.iter().any(|r| matches!(r, Ready::Last(_))));
+        assert!(
+            s.events
+                .iter()
+                .any(|e| matches!(e, VideoDecoderBackendEvent::StreamFormatChanged))
+        );
+        let f = s.capture_format();
+        assert_eq!((f.width, f.height), (1920, 1080));
     }
 
     #[test]

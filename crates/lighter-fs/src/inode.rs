@@ -80,7 +80,21 @@ pub enum Located {
 /// enough that no filesystem's real numbers reach it.
 pub const PROVISIONAL_INO: u64 = 1 << 62;
 
+/// Whether the guest has this file open, as its notices say (guest patch
+/// 0057), and the descriptor held for it while it does.
+#[derive(Default)]
+pub struct OpenPin {
+    /// Opens minus closes. A batch can carry a close the server sees before
+    /// the open it ends; the count is right once both have arrived.
+    pub count: i64,
+    pub file: Option<Arc<OpenFile>>,
+}
+
 pub struct Inode {
+    /// See [`OpenPin`].
+    pub open: Mutex<OpenPin>,
+    /// See [`Inode::link_gate`].
+    link_gate: RwLock<()>,
     /// A metadata-only descriptor, or nothing if it has been parked.
     ///
     /// Shared rather than owned so that parking is never a race: a reclaimer
@@ -181,7 +195,10 @@ pub struct Inode {
     pending_count: AtomicUsize,
     /// Names removed from this directory by acknowledged unlinks that have
     /// not applied yet: the host still lists them, the guest must not.
-    pending_gone: Mutex<std::collections::HashSet<Vec<u8>>>,
+    /// Counted: one name can be promised away by two operations at once (an
+    /// unlink, a create of the name, an unlink again), and the first to
+    /// apply must not take the second's promise with it.
+    pending_gone: Mutex<std::collections::HashMap<Vec<u8>, usize>>,
     /// Mirror of `pending_gone.len()`, same reason as `pending_count`.
     gone_count: AtomicUsize,
     /// Names promised to this inode by queued renames and links, which
@@ -283,11 +300,25 @@ pub struct AttrOverride {
 #[derive(Debug, Clone, Default)]
 pub struct Pool {
     descriptors: Arc<AtomicUsize>,
-    resident_dirs: Arc<AtomicUsize>,
     holders: Arc<Holders>,
     /// The network volumes the shares have learned, each with what it may
     /// hold of its server's handles ([`crate::remote`]).
     remotes: Arc<crate::remote::Remotes>,
+    /// Revivals of parked inodes across the pool, and of those, the ones a
+    /// sweep tried, promoting a directory into room under the budget. What
+    /// is left is what requests revived ([`Pool::revived_on_demand`]).
+    reopens: Arc<AtomicU64>,
+    promotions: Arc<AtomicU64>,
+    /// Of the revivals, directories'. A sweep promotes only directories.
+    dir_reopens: Arc<AtomicU64>,
+    /// When the shares last let go because the Mac's file table was full; see
+    /// [`Pool::relieve_system`].
+    relieved: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// How far the shares' budgets are lowered while the Mac's file table is
+    /// short of room ([`Squeeze`]).
+    squeeze: Arc<Squeeze>,
+    /// Set while one share has the others sweep ([`Pool::reclaim_others`]).
+    reclaiming_others: Arc<AtomicBool>,
 }
 
 /// A share's hold on the Mac's files, which it can let go of a device at a
@@ -300,6 +331,119 @@ pub trait Release: Send + Sync {
     /// use stays open until its operation finishes, and the volume stays
     /// known.
     fn relieve_device(&self, dev: i64) -> usize;
+    /// Lets go of what this share holds, and lowers its budget, because the
+    /// Mac's file table is full. What is in use stays open until its
+    /// operation finishes. Returns how many descriptors it closed. See
+    /// [`Registry::relieve_system`].
+    fn relieve_system(&self) -> usize {
+        0
+    }
+
+    /// Sweeps this share's cold descriptors, as a request to it would, unless
+    /// it is `asking`: the pool's count is over its budget and the share
+    /// that found it so holds little of it ([`Pool::reclaim_others`]).
+    fn reclaim_unless(&self, _asking: &Registry) {}
+}
+
+/// What an open was refused for want of, when it was room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortage {
+    /// The Mac's file table is full: every share of the machine lets go.
+    Table,
+    /// The server behind this network volume is out of handles: the shares
+    /// let go of what they hold on it ([`crate::remote`]).
+    Volume(i64),
+}
+
+impl Shortage {
+    /// What an open refused with `errno` was short of, on `remote`, the
+    /// device if it is a network volume.
+    ///
+    /// `ENFILE` is the Mac's table on the Mac's own disks. On a network volume
+    /// it may be the server's (a client passes on what the server said), so
+    /// there it is the table only if the table is nearly full when asked.
+    pub fn of(errno: i32, remote: Option<i64>) -> Option<Shortage> {
+        let table_full =
+            || crate::sys::file_table().is_some_and(|(open, most)| open * 16 >= most * 15);
+        if crate::remote::is_full_table(errno) && (remote.is_none() || table_full()) {
+            return Some(Shortage::Table);
+        }
+        match remote {
+            Some(dev) if crate::remote::is_refusal(errno) => Some(Shortage::Volume(dev)),
+            _ => None,
+        }
+    }
+}
+
+/// How far a pool's budgets are lowered because the Mac's file table ran
+/// out of room: each refusal halves them, to no less than [`LOWEST_BUDGET`],
+/// and each [`RECOVER_EVERY`] in which the table has had room since doubles
+/// them back, to where they were.
+///
+/// The table is the whole Mac's, and whatever filled it is usually another
+/// program, so a lowered budget is a loan, not a lesson. A network volume's
+/// allowance is learned, because the server's limit cannot be known; the
+/// table's size can be (`kern.maxfiles`), and how full it is.
+#[derive(Debug, Default)]
+struct Squeeze {
+    halvings: AtomicU32,
+    /// When the budgets last moved, either way.
+    moved: Mutex<Option<std::time::Instant>>,
+}
+
+/// How long a lowered budget is held before it is raised again, a step at a
+/// time, if the Mac's table has room by then.
+const RECOVER_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most a pool's budgets are halved, by refusal after refusal.
+const MOST_HALVINGS: u32 = 8;
+
+impl Squeeze {
+    /// `budget` as it is while the table is short of room.
+    fn apply(&self, budget: usize) -> usize {
+        if self.halvings.load(Ordering::Relaxed) == 0 {
+            return budget;
+        }
+        self.recover();
+        let halvings = self.halvings.load(Ordering::Relaxed);
+        if halvings == 0 {
+            return budget;
+        }
+        // Never below the floor, and never raised: a budget a test or an
+        // operator set below the floor keeps it.
+        (budget >> halvings).max(LOWEST_BUDGET).min(budget)
+    }
+
+    /// Lowers the budgets a step, for a refusal.
+    fn tighten(&self) -> u32 {
+        let mut moved = self.moved.lock().expect("squeeze poisoned");
+        let halvings = (self.halvings.load(Ordering::Relaxed) + 1).min(MOST_HALVINGS);
+        self.halvings.store(halvings, Ordering::Relaxed);
+        *moved = Some(std::time::Instant::now());
+        halvings
+    }
+
+    /// Raises the budgets a step once [`RECOVER_EVERY`] has passed with the
+    /// Mac's table no more than three quarters full. Checked as budgets are
+    /// read, and only while they are lowered.
+    fn recover(&self) {
+        let Ok(mut moved) = self.moved.try_lock() else {
+            return;
+        };
+        if moved.is_some_and(|at| at.elapsed() < RECOVER_EVERY) {
+            return;
+        }
+        *moved = Some(std::time::Instant::now());
+        if !crate::sys::file_table().is_some_and(|(open, most)| open * 4 <= most * 3) {
+            return;
+        }
+        let halvings = self.halvings.load(Ordering::Relaxed).saturating_sub(1);
+        self.halvings.store(halvings, Ordering::Relaxed);
+        tracing::info!(
+            halvings,
+            "the Mac's file table has room again; lighter's shares hold more"
+        );
+    }
 }
 
 #[derive(Default)]
@@ -359,6 +503,97 @@ impl Pool {
         self.remotes.get(dev)
     }
 
+    /// How many parked inodes the pool's shares have revived because a
+    /// request needed one, leaving out the directories a sweep promoted.
+    ///
+    /// The sweep's promotions follow the clock (a share over budget is swept
+    /// every [`SWEEP_EVERY_MS`]), so a slower run promotes more; what a
+    /// request revives does not depend on how long the run took. [`REOPENS`]
+    /// counts both, and every share's in the process.
+    pub fn revived_on_demand(&self) -> u64 {
+        self.reopens.load(Ordering::Relaxed) - self.promotions.load(Ordering::Relaxed)
+    }
+
+    /// Of [`Pool::revived_on_demand`], the directories.
+    pub fn dirs_revived_on_demand(&self) -> u64 {
+        self.dir_reopens.load(Ordering::Relaxed) - self.promotions.load(Ordering::Relaxed)
+    }
+
+    /// Has every share of the machine let go of what it holds, because the
+    /// Mac's file table is full (`ENFILE`, `errno`), and hold less until the
+    /// table has room again: every share parks what it holds idle, and the
+    /// budgets halve ([`Squeeze`]). Returns how many descriptors that closed.
+    ///
+    /// The table is the Mac's, not a volume's, so this is not per volume the
+    /// way [`Pool::relieve_device`] is. It is also not repeated: a shortage is
+    /// one event, and every worker that meets it at once must not each halve
+    /// the budget again. So it runs at most once a second per machine, and the
+    /// workers that arrive while it runs wait for it, then retry against a
+    /// table with room in it.
+    pub fn relieve_system(&self, errno: i32) -> usize {
+        let mut relieved = self.relieved.lock().expect("pool relief poisoned");
+        if relieved.is_some_and(|at| at.elapsed() < crate::remote::RELIEF_EVERY) {
+            return 0;
+        }
+        let holders: Vec<_> = self
+            .holders
+            .0
+            .lock()
+            .expect("pool holders poisoned")
+            .iter()
+            .filter_map(|h| h.upgrade())
+            .collect();
+        let halvings = self.squeeze.tighten();
+        let closed: usize = holders.iter().map(|h| h.relieve_system()).sum();
+        *relieved = Some(std::time::Instant::now());
+        tracing::warn!(
+            errno,
+            closed,
+            halvings,
+            "the Mac's file table is full; lighter let go of what it held, and holds less until the table has room again"
+        );
+        closed
+    }
+
+    /// Lets go of what `shortage` asks, for an open refused with `errno`.
+    /// Returns how many descriptors that closed.
+    pub fn relieve(&self, shortage: Shortage, errno: i32) -> usize {
+        match shortage {
+            Shortage::Table => self.relieve_system(errno),
+            Shortage::Volume(dev) => self.relieve_device(dev, errno),
+        }
+    }
+
+    /// Has every share but `asking` sweep its cold descriptors.
+    ///
+    /// The budget is the pool's, and each share sweeps only its own, so a
+    /// share that had filled the budget and then gone quiet kept it: nothing
+    /// asked it to sweep, and a busy share beside it found the pool over
+    /// budget, parked every descriptor it opened the moment it was bound,
+    /// and had nothing of its own to sweep. One share asks at a time, and a
+    /// share asked does not ask again in turn.
+    fn reclaim_others(&self, asking: &Registry) {
+        if self
+            .reclaiming_others
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let holders: Vec<_> = self
+            .holders
+            .0
+            .lock()
+            .expect("pool holders poisoned")
+            .iter()
+            .filter_map(|h| h.upgrade())
+            .collect();
+        for holder in holders {
+            holder.reclaim_unless(asking);
+        }
+        self.reclaiming_others.store(false, Ordering::Release);
+    }
+
     /// Descriptors held across the pool.
     pub fn descriptors(&self) -> usize {
         self.descriptors.load(Ordering::Relaxed)
@@ -371,8 +606,6 @@ pub struct Census {
     /// Open metadata descriptors, across the share's [`Pool`]. The number
     /// the budget is about.
     descriptors: Arc<AtomicUsize>,
-    /// Of those, directories. See [`Inode::parkable`].
-    resident_dirs: Arc<AtomicUsize>,
     /// Live `Inode` values, as against how many the table lists. The two
     /// disagreeing means something is holding `Arc`s the table has already
     /// forgotten, which from the outside looks exactly like a descriptor leak
@@ -380,16 +613,29 @@ pub struct Census {
     inodes: AtomicUsize,
     /// The registry's descriptor budget, mirrored here so an inode reviving
     /// itself can ask whether there is room without a pointer back to the
-    /// registry. Zero until the registry sets it.
+    /// registry. Zero until the registry sets it. Read through
+    /// [`Census::budget`], which lowers it while the Mac's table is short.
     budget: AtomicUsize,
+    /// The pool's [`Squeeze`].
+    squeeze: Arc<Squeeze>,
+    /// Of the pool's descriptors, the ones this share holds.
+    held: AtomicUsize,
     /// The pool's network volumes, so an inode can find its own as it is
     /// made.
     remotes: Arc<crate::remote::Remotes>,
+    /// The pool's revivals ([`Pool::revived_on_demand`]).
+    reopens: Arc<AtomicU64>,
+    promotions: Arc<AtomicU64>,
+    dir_reopens: Arc<AtomicU64>,
 }
 
 impl Census {
     fn descriptors(&self) -> usize {
         self.descriptors.load(Ordering::Relaxed)
+    }
+
+    fn budget(&self) -> usize {
+        self.squeeze.apply(self.budget.load(Ordering::Relaxed))
     }
 
     fn inodes(&self) -> usize {
@@ -432,6 +678,8 @@ impl Inode {
         census.inodes.fetch_add(1, Ordering::Relaxed);
         let remote = census.remotes.get(dev);
         let inode = Inode {
+            open: Mutex::new(OpenPin::default()),
+            link_gate: RwLock::new(()),
             fd: RwLock::new(Some(Arc::new(fd))),
             parked_at: Mutex::new(None),
             born: Mutex::new(None),
@@ -454,7 +702,7 @@ impl Inode {
             pending_meta: Mutex::new(None),
             pending_children: Mutex::new(std::collections::HashMap::new()),
             pending_count: AtomicUsize::new(0),
-            pending_gone: Mutex::new(std::collections::HashSet::new()),
+            pending_gone: Mutex::new(std::collections::HashMap::new()),
             gone_count: AtomicUsize::new(0),
             promised: AtomicUsize::new(0),
             forget_deferred: AtomicBool::new(false),
@@ -479,9 +727,7 @@ impl Inode {
     /// that empties it; split across callers, the tallies drift.
     fn count_resident(&self) {
         self.census.descriptors.fetch_add(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_add(1, Ordering::Relaxed);
-        }
+        self.census.held.fetch_add(1, Ordering::Relaxed);
         if let Some(remote) = &self.remote {
             remote.held();
         }
@@ -489,23 +735,23 @@ impl Inode {
 
     fn uncount_resident(&self) {
         self.census.descriptors.fetch_sub(1, Ordering::Relaxed);
-        if self.is_dir {
-            self.census.resident_dirs.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.census.held.fetch_sub(1, Ordering::Relaxed);
         if let Some(remote) = &self.remote {
             remote.released();
         }
     }
 
     /// Whether this inode may keep a descriptor of its own between
-    /// operations. On a network volume only a directory may, while the
-    /// volume has room ([`crate::remote`]): a file there is reached through
-    /// its directory and its name, and every descriptor held is a handle on
-    /// a server that has only so many.
+    /// operations: a directory, which every name inside it is reached
+    /// through, and on a network volume only while the volume has room
+    /// ([`crate::remote`]). A file never does. It is reached through its
+    /// directory and its name, or its identity, when it is needed; held, one
+    /// per file the guest remembered came to a hundred thousand descriptors
+    /// on a large tree and bought nothing, because a metadata-only descriptor
+    /// does not keep an open file's contents either. What does is the guest
+    /// saying which files it has open ([`crate::server`], guest patch 0057).
     fn may_hold(&self) -> bool {
-        self.remote
-            .as_ref()
-            .is_none_or(|remote| self.is_dir && remote.room())
+        self.is_dir && self.remote.as_ref().is_none_or(|remote| remote.room())
     }
 
     /// The network volume this inode is on, if it is on one.
@@ -525,6 +771,8 @@ impl Inode {
         census.inodes.fetch_add(1, Ordering::Relaxed);
         let remote = census.remotes.get(dev);
         Inode {
+            open: Mutex::new(OpenPin::default()),
+            link_gate: RwLock::new(()),
             fd: RwLock::new(None),
             parked_at: Mutex::new(None),
             born: Mutex::new(None),
@@ -547,7 +795,7 @@ impl Inode {
             pending_meta: Mutex::new(Some(meta)),
             pending_children: Mutex::new(std::collections::HashMap::new()),
             pending_count: AtomicUsize::new(0),
-            pending_gone: Mutex::new(std::collections::HashSet::new()),
+            pending_gone: Mutex::new(std::collections::HashMap::new()),
             gone_count: AtomicUsize::new(0),
             promised: AtomicUsize::new(0),
             forget_deferred: AtomicBool::new(false),
@@ -736,14 +984,19 @@ impl Inode {
     /// Promises that `name` is gone from this directory.
     pub fn add_pending_gone(&self, name: &[u8]) {
         let mut gone = self.pending_gone.lock().expect("pending gone poisoned");
-        gone.insert(name.to_vec());
+        *gone.entry(name.to_vec()).or_insert(0) += 1;
         self.gone_count.store(gone.len(), Ordering::Relaxed);
     }
 
     /// The unlink applied (or failed, loudly); the host answers again.
     pub fn remove_pending_gone(&self, name: &[u8]) {
         let mut gone = self.pending_gone.lock().expect("pending gone poisoned");
-        gone.remove(name);
+        if let Some(promises) = gone.get_mut(name) {
+            *promises -= 1;
+            if *promises == 0 {
+                gone.remove(name);
+            }
+        }
         self.gone_count.store(gone.len(), Ordering::Relaxed);
     }
 
@@ -755,7 +1008,7 @@ impl Inode {
         self.pending_gone
             .lock()
             .expect("pending gone poisoned")
-            .contains(name)
+            .contains_key(name)
     }
 
     /// A write job with this sequence number was queued: any setattr batch
@@ -941,6 +1194,18 @@ impl Inode {
         self.extra_links.load(Ordering::Relaxed)
     }
 
+    /// Held by a reader of this file's link count across its two reads (the
+    /// promise, then the host), and exclusively by a queued link across
+    /// landing on the host and withdrawing its promise, so no reader sees
+    /// both the landed link and its promise.
+    pub fn link_gate(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.link_gate.read().expect("link gate poisoned")
+    }
+
+    pub fn link_gate_exclusive(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.link_gate.write().expect("link gate poisoned")
+    }
+
     /// The nodeid the registry issued for this inode; see [`Registry`].
     pub fn id(&self) -> u64 {
         self.id.load(Ordering::Relaxed)
@@ -1000,7 +1265,9 @@ impl Inode {
         self.pending_gone
             .lock()
             .expect("pending gone poisoned")
-            .clone()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Whether any queued operation still shadows this directory's listing.
@@ -1242,26 +1509,14 @@ impl Inode {
             .clone()
             .ok_or(crate::errno::linux::ESTALE)?;
         let fd = Arc::new(self.reopen(&parked)?);
-        // A file revived into a full share serves this one operation and is
-        // dropped with it: it needs no descriptor of its own — its parent's
-        // and its name do everything (`locate`) — and installing one only
-        // makes the sweep park something else, which the next operation
-        // revives in turn. A directory is the opposite case and is always
-        // installed. It is what every name inside it is reached through, and
-        // reviving it transiently meant reviving its parent transiently too,
-        // and that one's parent: profiled at the stock budget, one `openat`
-        // per level of the tree on every lookup and every queued job, which
-        // was most of what the server did. Installed, it stays until the
-        // sweep finds it cold, and the chain above a working directory is
-        // resident the next time.
-        //
-        // On a network volume a directory too is installed only while the
-        // volume has room, and a file never: it would be a handle held on
-        // the server until the sweep happened by ([`crate::remote`]).
-        let budget = self.census.budget.load(Ordering::Relaxed);
-        if budget > 0 && !self.is_dir && self.census.descriptors.load(Ordering::Relaxed) >= budget {
-            return Ok(Reference(fd));
-        }
+        // A file's descriptor serves this one operation and is dropped with
+        // it (`may_hold`). A directory's is installed. It is what every name
+        // inside it is reached through, and reviving it transiently meant
+        // reviving its parent transiently too, and that one's parent:
+        // profiled at the stock budget, one `openat` per level of the tree on
+        // every lookup and every queued job, which was most of what the
+        // server did. Installed, it stays until the sweep finds it cold, and
+        // the chain above a working directory is resident the next time.
         if !self.may_hold() {
             return Ok(Reference(fd));
         }
@@ -1269,6 +1524,18 @@ impl Inode {
         self.count_resident();
         *slot = Some(fd.clone());
         Ok(Reference(fd))
+    }
+
+    /// Whether an open of this inode that failed with `errno` is passed on as
+    /// it is, rather than read as the file having gone. That is so when the
+    /// server behind a network volume has no handle left, or the Mac's file
+    /// table is full: the file is there in both cases, and the share lets go
+    /// of what it holds and asks again ([`crate::remote`],
+    /// [`Pool::relieve_system`]). Asking by another door would be refused by
+    /// the same thing.
+    pub(crate) fn refuses(&self, errno: i32) -> bool {
+        (self.remote.is_some() && crate::remote::is_refusal(errno))
+            || crate::remote::is_full_table(errno)
     }
 
     /// Reopens a parked inode: by its remembered path, and failing that by
@@ -1288,6 +1555,10 @@ impl Inode {
         // Every twenty-thousandth revival says where it came from, when the
         // stats are on: the counter alone says how many, not why.
         let nth = REOPENS.fetch_add(1, Ordering::Relaxed);
+        self.census.reopens.fetch_add(1, Ordering::Relaxed);
+        if self.is_dir {
+            self.census.dir_reopens.fetch_add(1, Ordering::Relaxed);
+        }
         if std::env::var_os("LIGHTER_FS_REOPEN_TRACE").is_some() {
             eprintln!(
                 "REOPEN-TRACE id={} dir={} {}",
@@ -1323,7 +1594,7 @@ impl Inode {
                         return Ok(fd);
                     }
                 }
-                Err(errno) if self.remote.is_some() && crate::remote::is_refusal(errno) => {
+                Err(errno) if self.refuses(errno) => {
                     return Err(errno);
                 }
                 Err(_) => {}
@@ -1336,14 +1607,19 @@ impl Inode {
                 }
                 _ => {}
             },
-            Err(errno) if self.remote.is_some() && crate::remote::is_refusal(errno) => {
+            Err(errno) if self.refuses(errno) => {
                 return Err(errno);
             }
             Err(_) => {}
         }
         let vol = PathBuf::from(format!("/.vol/{}/{}", self.dev(), self.ino()));
-        let fd = crate::sys::open_reference_path(&vol, self.is_symlink)
-            .map_err(|_| crate::errno::linux::ESTALE)?;
+        let fd = crate::sys::open_reference_path(&vol, self.is_symlink).map_err(|errno| {
+            if crate::remote::is_full_table(errno) {
+                errno
+            } else {
+                crate::errno::linux::ESTALE
+            }
+        })?;
         match crate::sys::stat_fd(fd.as_raw_fd()) {
             Ok(st)
                 if st.st_ino == self.ino()
@@ -1371,6 +1647,9 @@ impl Inode {
         let Some(parked) = self.parked_at.lock().expect("parked path poisoned").clone() else {
             return false;
         };
+        // Counted as tried, so that a promotion whose directory has gone
+        // is not read as a request's revival.
+        self.census.promotions.fetch_add(1, Ordering::Relaxed);
         let Ok(fd) = self.reopen(&parked) else {
             return false;
         };
@@ -1406,34 +1685,6 @@ impl Inode {
         self.held.store(false, Ordering::Relaxed);
         self.uncount_resident();
         true
-    }
-
-    /// Whether the polite sweep may park this inode.
-    ///
-    /// A parked file costs nothing until that file is touched again. A parked
-    /// directory taxes every name inside it: each lookup revives it by path —
-    /// an `open` against the host, at a full share transiently, so every
-    /// lookup — and a package install is nothing but lookups into the
-    /// directories it just made. Profiled mid-install, that revival was the
-    /// single hottest frame on the request thread. So directories stay
-    /// resident while they are less than half the budget, which on a stock
-    /// Mac is three thousand of them; only past that do they compete with
-    /// files, and the forced phase, which exists for the case where nothing
-    /// else works, ignores this entirely.
-    fn parkable(&self) -> bool {
-        if !self.is_dir {
-            return true;
-        }
-        let budget = self.census.budget.load(Ordering::Relaxed);
-        // The privilege is for the common case, not a right. Past the slack
-        // the sweep is already in the regime where it would otherwise force,
-        // and a privilege that holds there starves it: pnpm's tree is
-        // directories most of the way down, and with them exempt a pass
-        // examined eight thousand inodes and parked none while every request
-        // swept. Under pressure a directory is an ordinary candidate.
-        let slack = (budget / SWEEP_SLACK_DIVISOR).max(64);
-        self.census.descriptors.load(Ordering::Relaxed) > budget + slack
-            || self.census.resident_dirs.load(Ordering::Relaxed) > budget / 2
     }
 
     /// Whether this inode is still the file those numbers name.
@@ -1631,8 +1882,9 @@ pub struct Registry {
     /// honest: each of the four edges that moves it — construction, parking,
     /// reviving, dropping — belongs to an inode and adjusts it there.
     census: Arc<Census>,
-    /// The most it may hold before parking the cold ones.
-    budget: usize,
+    /// The pool this share counts into. An apply job that finds the Mac's
+    /// file table full reaches every share through it, not only this one.
+    pool: Pool,
     /// Which shard the hand is on, so successive sweeps cover all of them.
     sweep: AtomicUsize,
     /// When the descriptor pressure was last reported.
@@ -1666,14 +1918,9 @@ pub struct Registry {
     born: std::time::Instant,
     /// Elapsed millis at the last over-budget sweep.
     last_sweep: AtomicUsize,
-    /// The count above which a sweep may no longer be deferred.
-    ///
-    /// Between the budget and this line, sweeps are rate-limited and the count
-    /// breathes: a working set genuinely hotter and larger than the budget is
-    /// a fact, and holding the line by sweeping on every request turns a
-    /// ten-second install into ten minutes of parking the same inodes. Past
-    /// the line, the ceiling is near and EMFILE is worse than any stall.
-    red_line: usize,
+    /// How far above the budget the red line sits. Fixed when the share is
+    /// built; [`Registry::red_line`] moves with a relief's lower budget.
+    red_headroom: usize,
     /// See [`Registry::on_forget`].
     forgotten: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
 }
@@ -1697,8 +1944,11 @@ impl Registry {
         // take the whole mount with it.
         let census = Arc::new(Census {
             descriptors: pool.descriptors.clone(),
-            resident_dirs: pool.resident_dirs.clone(),
             remotes: pool.remotes.clone(),
+            reopens: pool.reopens.clone(),
+            promotions: pool.promotions.clone(),
+            dir_reopens: pool.dir_reopens.clone(),
+            squeeze: pool.squeeze.clone(),
             ..Census::default()
         });
         census.budget.store(descriptor_budget(), Ordering::Relaxed);
@@ -1730,7 +1980,7 @@ impl Registry {
             by_birth: RwLock::new(std::collections::HashSet::new()),
             next_id: AtomicU64::new(ROOT_ID + 1),
             census,
-            budget: descriptor_budget(),
+            pool: pool.clone(),
             sweep: AtomicUsize::new(0),
             reported: Mutex::new(std::time::Instant::now()),
             hands: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
@@ -1738,7 +1988,7 @@ impl Registry {
             forcing: AtomicBool::new(false),
             born: std::time::Instant::now(),
             last_sweep: AtomicUsize::new(0),
-            red_line: descriptor_budget() + descriptor_red_headroom(),
+            red_headroom: descriptor_red_headroom(),
             forgotten: std::sync::OnceLock::new(),
         }
     }
@@ -1769,14 +2019,39 @@ impl Registry {
     /// one's id first so that whatever else holds it open can let go too.
     /// Returns how many descriptors it closed. An unlinked file the guest
     /// still has open cannot be parked, having no path to come back by.
-    pub fn release_device(&self, dev: i64, mut evicted: impl FnMut(u64)) -> usize {
+    pub fn release_device(&self, dev: i64, evicted: impl FnMut(u64)) -> usize {
+        self.release_where(|inode| inode.dev() == dev, evicted)
+    }
+
+    /// The share's part of a relief when the Mac's file table is full:
+    /// every descriptor it holds idle is parked, as
+    /// [`Registry::release_device`] parks a volume's, under the budget the
+    /// pool has just lowered ([`Squeeze`]). Returns how many descriptors that
+    /// closed.
+    ///
+    /// Parking everything is the blunt answer, and the right one for a table
+    /// that is full now: a parked file costs one reopen when it is next used,
+    /// and an `ENFILE` costs the workload its open. The lower budget is what
+    /// stops the share filling the table again before it has room.
+    pub fn relieve_system(&self, evicted: impl FnMut(u64)) -> usize {
+        self.quiet_until.store(0, Ordering::Relaxed);
+        self.release_where(|_| true, evicted)
+    }
+
+    /// Parks every inode but the root that `wanted` picks, calling `evicted`
+    /// with each one's id first. Returns how many descriptors it closed.
+    fn release_where(
+        &self,
+        wanted: impl Fn(&Inode) -> bool,
+        mut evicted: impl FnMut(u64),
+    ) -> usize {
         let mut closed = 0;
         for shard in &self.by_id {
             let inodes: Vec<Arc<Inode>> = shard
                 .lock()
                 .expect("inode table poisoned")
                 .iter()
-                .filter(|(id, inode)| **id != ROOT_ID && inode.dev() == dev)
+                .filter(|(id, inode)| **id != ROOT_ID && wanted(inode))
                 .map(|(_, inode)| inode.clone())
                 .collect();
             for inode in inodes {
@@ -1787,6 +2062,24 @@ impl Registry {
             }
         }
         closed
+    }
+
+    /// How many descriptors the share may hold before parking the cold ones.
+    /// Held in the census, where an inode reviving itself can read it, and
+    /// lowered while the Mac's file table is short of room ([`Squeeze`]).
+    fn budget(&self) -> usize {
+        self.census.budget()
+    }
+
+    /// The count above which a sweep may no longer be deferred.
+    ///
+    /// Between the budget and this line, sweeps are rate-limited and the count
+    /// breathes: a working set genuinely hotter and larger than the budget is
+    /// a fact, and holding the line by sweeping on every request turns a
+    /// ten-second install into ten minutes of parking the same inodes. Past
+    /// the line, the ceiling is near and EMFILE is worse than any stall.
+    fn red_line(&self) -> usize {
+        self.budget() + self.red_headroom
     }
 
     /// Counts a lookup of an inode we already hold, if we hold it.
@@ -1819,15 +2112,17 @@ impl Registry {
     }
 
     /// Whether a new inode on `dev` would be parked the moment it was
-    /// bound: the share is at its budget, or `dev` is a network volume
-    /// that keeps no descriptor for it.
+    /// bound: always for a file, which holds no descriptor (`may_hold`); for
+    /// a directory when the share is at its budget, or `dev` is a network
+    /// volume without room for another.
     pub fn parks_new(&self, dev: i64, is_dir: bool) -> bool {
-        self.at_budget()
+        !is_dir
+            || self.at_budget()
             || self
                 .census
                 .remotes
                 .get(dev)
-                .is_some_and(|remote| !is_dir || !remote.room())
+                .is_some_and(|remote| !remote.room())
     }
 
     /// Whether files on `dev` are told apart by birth time as well.
@@ -1947,15 +2242,17 @@ impl Registry {
 
     /// A reply named this nodeid outside the usual paths: count it, so the
     /// kernel's FORGET total and ours agree.
-    pub fn count_lookup(&self, id: u64) {
-        if let Some(inode) = self.by_id[shard(id)]
-            .lock()
-            .expect("inode table poisoned")
-            .get(&id)
-        {
-            let mut lookups = inode.lookups.lock().expect("lookup count poisoned");
-            *lookups = lookups.saturating_add(1);
-        }
+    ///
+    /// Whether it was: an inode already released is not brought back by it,
+    /// and a reply must not name it.
+    pub fn count_lookup(&self, id: u64) -> bool {
+        let table = self.by_id[shard(id)].lock().expect("inode table poisoned");
+        let Some(inode) = table.get(&id) else {
+            return false;
+        };
+        let mut lookups = inode.lookups.lock().expect("lookup count poisoned");
+        *lookups = lookups.saturating_add(1);
+        true
     }
 
     /// The nodeid for a host identity, without counting it as a lookup.
@@ -2051,7 +2348,7 @@ impl Registry {
         // longer push the count past the budget at all; the paced sweep is
         // left with only its real job, keeping the RESIDENT set the
         // recently-used one.
-        if (self.census.descriptors() > self.budget && inode.parkable()) || !inode.may_hold() {
+        if self.census.descriptors() > self.budget() || !inode.may_hold() {
             let _ = inode.park();
         }
         self.by_id[shard(id)]
@@ -2118,6 +2415,9 @@ impl Registry {
             self.census.clone(),
         ));
         inode.id.store(id, Ordering::Relaxed);
+        // Born with the one lookup a create's reply owes; this one is owed
+        // none until a reply names it.
+        *inode.lookups.lock().expect("lookup count poisoned") = 0;
         inode.bind_parked(dev, ino, birthtime);
         inode.set_born(self.born_on(dev, Some(birthtime)));
         self.by_id[shard(id)]
@@ -2160,9 +2460,9 @@ impl Registry {
         inode.set_born(self.born_on(dev, birthtime));
         // The same admission control as `insert`: a bind must not push the
         // descriptor count past the budget, or a create storm larger than the
-        // budget outruns the sweep and climbs to the kernel's ceiling. A
-        // directory keeps its residency privilege (`parkable`).
-        if (self.census.descriptors() > self.budget && inode.parkable()) || !inode.may_hold() {
+        // budget outruns the sweep and climbs to the kernel's ceiling. A file
+        // holds nothing at all (`may_hold`).
+        if self.census.descriptors() > self.budget() || !inode.may_hold() {
             let _ = inode.park();
         }
         self.claim_identity(id, dev, ino);
@@ -2361,7 +2661,7 @@ impl Registry {
         // moment the budget fills, so a busy share sits exactly AT budget —
         // and that is when the paced sweep has its real work, rotating
         // residency toward what is actually being touched.
-        if open < self.budget {
+        if open < self.budget() {
             return;
         }
         // Between the budget and the red line, sweeps are paced, not
@@ -2371,7 +2671,7 @@ impl Registry {
         // count breathing inside the headroom for a fraction of a percent of
         // the machine; at the red line every request sweeps, because the next
         // stop after the headroom is the kernel's ceiling.
-        if open < self.red_line {
+        if open < self.red_line() {
             let now = self.born.elapsed().as_millis() as usize;
             let last = self.last_sweep.load(Ordering::Relaxed);
             if now.saturating_sub(last) < SWEEP_EVERY_MS
@@ -2383,19 +2683,18 @@ impl Registry {
                 return;
             }
         }
-        let slack = (self.budget / SWEEP_SLACK_DIVISOR).max(64);
-        if open <= self.budget + slack && open < self.quiet_until.load(Ordering::Relaxed) {
+        let slack = (self.budget() / SWEEP_SLACK_DIVISOR).max(64);
+        if open <= self.budget() + slack && open < self.quiet_until.load(Ordering::Relaxed) {
             return;
         }
-        let target = self.budget - self.budget / 8;
+        let target = self.budget() - self.budget() / 8;
         let mut examined = 0usize;
         let mut parked_total = 0usize;
         let mut promoted_total = 0usize;
         // Why the pass skipped what it saw: the numbers that say whether a
-        // sweep that frees nothing is looking at a hot set, a parked set, a
-        // privileged set, or files it cannot park (unlinked, nlink zero).
-        let (mut skip_unheld, mut skip_used, mut skip_privileged, mut skip_unparkable) =
-            (0usize, 0usize, 0usize, 0usize);
+        // sweep that frees nothing is looking at a hot set, a parked set, or
+        // directories it cannot park (removed, or no path to come back by).
+        let (mut skip_unheld, mut skip_used, mut skip_unparkable) = (0usize, 0usize, 0usize);
 
         while examined < SWEEP_STEPS && parked_total < SWEEP_TAKE {
             if self.census.descriptors() <= target {
@@ -2447,7 +2746,7 @@ impl Registry {
                         // through, and resident it saves the walk from its
                         // nearest resident ancestor, and the check that the
                         // walk arrived, on every operation inside it.
-                        let room = self.budget.saturating_sub(self.census.descriptors());
+                        let room = self.budget().saturating_sub(self.census.descriptors());
                         if inode.is_dir && promoted_total < room && inode.promote() {
                             promoted_total += 1;
                         }
@@ -2458,10 +2757,6 @@ impl Registry {
                 // round survives this pass and is a candidate on the next.
                 if inode.used.swap(false, Ordering::Relaxed) {
                     skip_used += 1;
-                    continue;
-                }
-                if !inode.parkable() {
-                    skip_privileged += 1;
                     continue;
                 }
                 // Parked outside the shard lock: parking stats and closes a
@@ -2484,7 +2779,7 @@ impl Registry {
         // thread keeps the hand turning and parks whatever is held, reference
         // bit or no, until the count is back under target or it has been all
         // the way around. The others skip past and go back to work.
-        if self.census.descriptors() > self.budget + slack
+        if self.census.descriptors() > self.budget() + slack
             && self
                 .forcing
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -2513,16 +2808,6 @@ impl Registry {
                     if !inode.held.load(Ordering::Relaxed) {
                         continue;
                     }
-                    // Files first, here too. Parking a hot directory by force
-                    // was measured as a hundred milliseconds per directory on
-                    // a tree walk: the walk revived it, revival re-admitted
-                    // it, the count crossed the slack, and this pass swept
-                    // the whole hand again — per readdir, for sixteen minutes.
-                    // `parkable` still lets directories go once they alone
-                    // exceed half the budget, so this always terminates.
-                    if !inode.parkable() {
-                        continue;
-                    }
                     if inode.park() {
                         parked_total += 1;
                     }
@@ -2532,26 +2817,31 @@ impl Registry {
         }
 
         let open = self.census.descriptors();
-        if open > self.budget {
+        if open > self.budget() {
             self.quiet_until
                 .store(open.saturating_add(slack), Ordering::Relaxed);
+        }
+        // At the pool's budget with most of it held by other shares: this
+        // share has swept what it can, and parks what it opens the moment it
+        // is bound, so the rest is theirs to let go.
+        if open >= self.budget() && self.census.held.load(Ordering::Relaxed) * 2 < open {
+            self.pool.reclaim_others(self);
         }
         // Sitting at the budget with nothing to park is the reclaim working,
         // not failing: everything it can reach is in use. Drifting past the
         // slack is the other thing, and the next event after it is `EMFILE`
         // inside the guest on a file that is plainly there — which is a
         // miserable thing to diagnose from that end, so it is said here.
-        if open > self.budget + slack && self.should_report() {
+        if open > self.budget() + slack && self.should_report() {
             tracing::warn!(
                 open,
-                budget = self.budget,
+                budget = self.budget(),
                 inodes = self.inode_count(),
                 live = self.census.inodes(),
                 examined,
                 parked = parked_total,
                 unheld = skip_unheld,
                 used = skip_used,
-                privileged = skip_privileged,
                 unparkable = skip_unparkable,
                 "the share is holding more descriptors than it may"
             );
@@ -2579,11 +2869,28 @@ impl Registry {
     /// Whether a new descriptor would be over the budget — and so parked
     /// the moment it was bound.
     pub fn at_budget(&self) -> bool {
-        self.budget > 0 && self.census.descriptors() >= self.budget
+        self.budget() > 0 && self.census.descriptors() >= self.budget()
     }
 
     pub fn descriptor_usage(&self) -> (usize, usize) {
-        (self.census.descriptors(), self.budget)
+        (self.census.descriptors(), self.budget())
+    }
+
+    /// The pool this share counts into.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// How many parked inodes this share's pool has revived because a
+    /// request needed one ([`Pool::revived_on_demand`]).
+    pub fn revived_on_demand(&self) -> u64 {
+        self.census.reopens.load(Ordering::Relaxed) - self.census.promotions.load(Ordering::Relaxed)
+    }
+
+    /// Of [`Registry::revived_on_demand`], the directories.
+    pub fn dirs_revived_on_demand(&self) -> u64 {
+        self.census.dir_reopens.load(Ordering::Relaxed)
+            - self.census.promotions.load(Ordering::Relaxed)
     }
 
     /// How many inodes are live. Diagnostics only.
@@ -2638,6 +2945,12 @@ fn descriptor_red_headroom() -> usize {
     (ceiling / 32).min(descriptor_budget() / 4).max(64)
 }
 
+/// The fewest descriptors a share's budget is ever lowered to, by a relief
+/// for a full file table ([`Registry::relieve_system`]). Low enough that the
+/// share stops taking the table, and high enough that a share which has been
+/// relieved does not thrash on every open.
+const LOWEST_BUDGET: usize = 1024;
+
 /// How many metadata descriptors one share may hold open.
 ///
 /// The guest decides how many inodes it remembers, and it is under no
@@ -2684,7 +2997,15 @@ fn descriptor_budget() -> usize {
     // either machine.
     let ceiling = crate::sys::descriptor_ceiling();
     let reserve = (ceiling / 8).max(2048);
-    ((ceiling.saturating_sub(reserve) / 4) * 3).max(1024) as usize
+    let own = (ceiling.saturating_sub(reserve) / 4) * 3;
+    // A fifth of the Mac's file table at most. The process's ceiling is a
+    // third to a half of the table, and every program on the Mac opens from
+    // the table, so three quarters of the ceiling let a cache take a third
+    // of the machine's files (#95: 160,000 of 491,520, the table then filled
+    // by another program, and the user logged out). On a stock Mac the
+    // ceiling is the smaller bound and nothing changes: 6,144 either way.
+    let table = crate::sys::file_table().map_or(u64::MAX, |(_, most)| most / 5);
+    own.min(table).max(1024) as usize
 }
 
 /// `prefix/name`, or `name` alone under a resident directory.
@@ -2730,6 +3051,12 @@ mod tests {
             Registry::new(fd, st.st_dev as i64, st.st_ino)
         }
 
+        fn registry_in(&self, pool: &Pool) -> Registry {
+            let fd = crate::sys::open_root(&self.0).unwrap();
+            let st = crate::sys::stat_fd(fd.as_raw_fd()).unwrap();
+            Registry::in_pool(fd, st.st_dev as i64, st.st_ino, pool)
+        }
+
         /// A real file, and the numbers the filesystem gave it.
         ///
         /// Real rather than fabricated because the registry now verifies that a
@@ -2738,6 +3065,15 @@ mod tests {
         fn file(&self, name: &str) -> (OwnedFd, i64, u64) {
             let path = self.0.join(name);
             std::fs::write(&path, name.as_bytes()).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            let fd = crate::sys::open_path(&path, 0, 0).unwrap();
+            (fd, meta.dev() as i64, meta.ino())
+        }
+
+        /// A real directory, and the numbers the filesystem gave it.
+        fn dir(&self, name: &str) -> (OwnedFd, i64, u64) {
+            let path = self.0.join(name);
+            std::fs::create_dir(&path).unwrap();
             let meta = std::fs::metadata(&path).unwrap();
             let fd = crate::sys::open_path(&path, 0, 0).unwrap();
             (fd, meta.dev() as i64, meta.ino())
@@ -2929,14 +3265,55 @@ mod tests {
     /// answering to the same nodeid and the same numbers, and the next use
     /// reopens it.
     #[test]
+    fn a_name_promised_away_twice_stays_gone_until_both_apply() {
+        // An unlink, a create of the name and an unlink again, all queued:
+        // the first unlink applying must not take the second's promise.
+        let scratch = Scratch::new("gone-twice");
+        let reg = scratch.registry();
+        let (fd, dev, ino) = scratch.dir("d");
+        let dir = reg
+            .get(reg.insert(fd, dev, ino, true, false, None))
+            .unwrap();
+        dir.add_pending_gone(b"f");
+        dir.add_pending_gone(b"f");
+        dir.remove_pending_gone(b"f");
+        assert!(
+            dir.name_pending_gone(b"f"),
+            "the second promise went with the first"
+        );
+        dir.remove_pending_gone(b"f");
+        assert!(!dir.name_pending_gone(b"f"));
+        assert!(!dir.has_promises());
+    }
+
+    #[test]
+    fn a_file_holds_no_descriptor() {
+        // A file is reached by its parent and name, or its identity, each
+        // time it is needed; only a directory, which every name inside it is
+        // reached through, keeps one.
+        let scratch = Scratch::new("file-unheld");
+        let reg = scratch.registry();
+        let root_held = reg.descriptor_usage().0;
+        let (fd, dev, ino) = scratch.file("plain");
+        let id = reg.insert(fd, dev, ino, false, false, None);
+        assert_eq!(reg.descriptor_usage().0, root_held);
+        let inode = reg.get(id).unwrap();
+        let reference = inode.reference().expect("a file reopens when needed");
+        let st = crate::sys::stat_fd(reference.raw_fd()).unwrap();
+        assert_eq!((st.st_dev as i64, st.st_ino), (dev, ino));
+        drop(reference);
+        assert_eq!(reg.descriptor_usage().0, root_held);
+    }
+
+    #[test]
     fn a_parked_inode_comes_back() {
         let scratch = Scratch::new("park-revive");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("parked");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("parked");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
 
-        assert!(inode.park(), "an ordinary file must be parkable");
+        assert!(inode.park(), "a directory must be parkable");
         assert!(
             inode.fd.read().unwrap().is_none(),
             "parking must actually let the descriptor go"
@@ -2955,41 +3332,25 @@ mod tests {
     fn a_parked_inode_whose_name_was_taken_is_stale() {
         let scratch = Scratch::new("park-stolen");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("victim");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("victim");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
 
         let path = scratch.0.join("victim");
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"someone else").unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
 
         assert_eq!(
             inode.reference().err(),
             Some(crate::errno::linux::ESTALE),
-            "a reopen that lands on another file must not be handed out"
+            "a reopen that lands on another directory must not be handed out"
         );
     }
 
     /// An unlinked file has no path to be reopened by, and its descriptor is
     /// the only thing keeping the guest's open handle working. Parking it
     /// would lose the file.
-    #[test]
-    fn an_unlinked_inode_is_never_parked() {
-        let scratch = Scratch::new("park-unlinked");
-        let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("doomed");
-        let id = reg.insert(fd, dev, ino, false, false, None);
-        std::fs::remove_file(scratch.0.join("doomed")).unwrap();
-
-        let inode = reg.get(id).unwrap();
-        assert!(
-            !inode.park(),
-            "a file with no links must keep its descriptor"
-        );
-        assert!(inode.reference().is_ok());
-    }
-
     /// A parked inode revives across a rename.
     ///
     /// The remembered path is stale the moment anything moves the file, and
@@ -3001,14 +3362,14 @@ mod tests {
     fn a_parked_inode_survives_being_renamed() {
         let scratch = Scratch::new("volfs");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("original");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("original");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
         std::fs::rename(scratch.0.join("original"), scratch.0.join("moved")).unwrap();
         let reference = inode
             .reference()
-            .expect("a renamed file is still the same file");
+            .expect("a renamed directory is still the same directory");
         let st = crate::sys::stat_fd(reference.raw_fd()).unwrap();
         assert_eq!(
             st.st_ino, ino,
@@ -3021,14 +3382,14 @@ mod tests {
     fn a_parked_inode_does_not_survive_deletion() {
         let scratch = Scratch::new("volfs-gone");
         let reg = scratch.registry();
-        let (fd, dev, ino) = scratch.file("doomed");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("doomed");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         let inode = reg.get(id).unwrap();
         assert!(inode.park());
-        std::fs::remove_file(scratch.0.join("doomed")).unwrap();
+        std::fs::remove_dir(scratch.0.join("doomed")).unwrap();
         assert!(
             inode.reference().is_err(),
-            "a deleted file must not revive as anything"
+            "a deleted directory must not revive as anything"
         );
     }
 
@@ -3045,8 +3406,8 @@ mod tests {
         let reg = scratch.registry();
         let root_held = reg.descriptor_usage().0;
 
-        let (fd, dev, ino) = scratch.file("counted");
-        let id = reg.insert(fd, dev, ino, false, false, None);
+        let (fd, dev, ino) = scratch.dir("counted");
+        let id = reg.insert(fd, dev, ino, true, false, None);
         assert_eq!(reg.descriptor_usage().0, root_held + 1);
 
         let inode = reg.get(id).unwrap();
@@ -3180,6 +3541,197 @@ mod tests {
         );
     }
 
+    /// A share as a pool asks it for relief: its registry, enrolled.
+    struct Share(Arc<Registry>);
+
+    impl Release for Share {
+        fn release_device(&self, dev: i64) -> usize {
+            self.0.release_device(dev, |_| {})
+        }
+
+        fn relieve_device(&self, _dev: i64) -> usize {
+            0
+        }
+
+        fn relieve_system(&self) -> usize {
+            self.0.relieve_system(|_| {})
+        }
+
+        fn reclaim_unless(&self, asking: &Registry) {
+            if !std::ptr::eq(Arc::as_ptr(&self.0), asking) {
+                self.0.reclaim_if_over_budget();
+            }
+        }
+    }
+
+    /// A share enrolled in `pool`, over a scratch directory of its own.
+    fn enrolled(scratch: &Scratch, pool: &Pool, budget: usize) -> Arc<Share> {
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        share.0.census.budget.store(budget, Ordering::Relaxed);
+        share
+    }
+
+    /// A lowered budget is a loan: once the window has passed with the Mac's
+    /// table no more than three quarters full, as it is on a machine running
+    /// tests, it doubles back a step at a time, to where it was.
+    #[test]
+    fn a_lowered_budget_is_raised_again_once_the_table_has_room() {
+        let scratch = Scratch::new("system-recover");
+        let pool = Pool::default();
+        let share = enrolled(&scratch, &pool, 4096);
+        let enfile = crate::errno::linux::ENFILE;
+        pool.relieve_system(enfile);
+        *pool.relieved.lock().unwrap() =
+            Some(std::time::Instant::now() - crate::remote::RELIEF_EVERY);
+        pool.relieve_system(enfile);
+        assert_eq!(share.0.descriptor_usage().1, 1024);
+
+        // Inside the window, nothing moves.
+        assert_eq!(share.0.descriptor_usage().1, 1024);
+        let window_passed = || {
+            *pool.squeeze.moved.lock().unwrap() = Some(std::time::Instant::now() - RECOVER_EVERY);
+        };
+        window_passed();
+        assert_eq!(share.0.descriptor_usage().1, 2048, "not raised a step");
+        window_passed();
+        assert_eq!(share.0.descriptor_usage().1, 4096, "not raised back");
+        window_passed();
+        assert_eq!(
+            share.0.descriptor_usage().1,
+            4096,
+            "raised past where it was"
+        );
+    }
+
+    /// The budget is the pool's and each share sweeps only its own, so a
+    /// share that filled the budget and went quiet used to keep it, while a
+    /// busy share beside it parked everything it opened. The busy share now
+    /// has the quiet one sweep.
+    #[test]
+    fn a_quiet_share_holding_the_pools_budget_is_swept_by_a_busy_one() {
+        let quiet_dir = Scratch::new("pool-quiet");
+        let busy_dir = Scratch::new("pool-busy");
+        let pool = Pool::default();
+        let quiet = enrolled(&quiet_dir, &pool, 256);
+        let busy = enrolled(&busy_dir, &pool, 256);
+        for n in 0..256 {
+            let (fd, dev, ino) = quiet_dir.dir(&format!("q{n}"));
+            quiet.0.insert(fd, dev, ino, true, false, None);
+        }
+        let held_quiet = quiet.0.census.held.load(Ordering::Relaxed);
+        assert!(held_quiet >= 250, "the quiet share held only {held_quiet}");
+        for n in 0..64 {
+            let (fd, dev, ino) = busy_dir.dir(&format!("b{n}"));
+            busy.0.insert(fd, dev, ino, true, false, None);
+        }
+        assert!(
+            busy.0.census.held.load(Ordering::Relaxed) < 8,
+            "the busy share held its directories with the pool at its budget"
+        );
+
+        // The busy share's requests sweep, paced, as they would.
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(SWEEP_EVERY_MS as u64 + 10));
+            busy.0.reclaim_if_over_budget();
+        }
+
+        let held_quiet_after = quiet.0.census.held.load(Ordering::Relaxed);
+        assert!(
+            held_quiet_after <= 224,
+            "the quiet share still holds {held_quiet_after} of the pool's 256"
+        );
+        assert!(pool.descriptors() <= 256);
+    }
+
+    /// `ENFILE` is the Mac's table on its own disks. On a network volume it
+    /// may be the server's, and is the table's only when the table is nearly
+    /// full, which it is not on a machine running tests.
+    #[test]
+    fn enfile_is_the_macs_table_on_its_own_disks_and_the_servers_otherwise() {
+        use crate::errno::linux::{EAGAIN, EMFILE, ENFILE, ENOENT};
+        assert_eq!(Shortage::of(ENFILE, None), Some(Shortage::Table));
+        assert_eq!(Shortage::of(EMFILE, None), None, "EMFILE is the process's");
+        assert_eq!(Shortage::of(ENOENT, None), None);
+        assert_eq!(Shortage::of(EAGAIN, Some(7)), Some(Shortage::Volume(7)));
+        assert_eq!(Shortage::of(EMFILE, Some(7)), Some(Shortage::Volume(7)));
+        assert_eq!(Shortage::of(ENFILE, Some(7)), Some(Shortage::Volume(7)));
+        assert_eq!(Shortage::of(ENOENT, Some(7)), None);
+    }
+
+    /// A full file table is the whole machine's, so every share in the pool
+    /// lets go of what it holds, and holds a lower budget from then on.
+    #[test]
+    fn a_full_file_table_halves_the_budget_and_parks_what_is_held() {
+        let scratch = Scratch::new("system-full");
+        let pool = Pool::default();
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(&pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        let reg = share.0.clone();
+        reg.census.budget.store(4096, Ordering::Relaxed);
+        for n in 0..300 {
+            let (fd, dev, ino) = scratch.dir(&format!("s{n}"));
+            reg.insert(fd, dev, ino, true, false, None);
+        }
+        assert!(reg.descriptor_usage().0 >= 300);
+
+        let closed = pool.relieve_system(crate::errno::linux::ENFILE);
+
+        let (open, budget) = reg.descriptor_usage();
+        assert_eq!(budget, 2048);
+        assert!(closed >= 300, "closed only {closed}");
+        assert!(open < 300, "still holding {open} descriptors");
+        assert_eq!(pool.descriptors(), open);
+    }
+
+    /// Workers refused by one shortage are one event: the first lets go and
+    /// halves the budget, the rest inside the window do not halve it again.
+    /// Once the window has passed, the next shortage halves it again, and it
+    /// stops at the floor.
+    #[test]
+    fn a_relief_inside_its_window_is_not_repeated_and_the_floor_holds() {
+        let scratch = Scratch::new("system-window");
+        let pool = Pool::default();
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(&pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        let reg = share.0.clone();
+        reg.census.budget.store(4096, Ordering::Relaxed);
+        let enfile = crate::errno::linux::ENFILE;
+
+        pool.relieve_system(enfile);
+        assert_eq!(reg.descriptor_usage().1, 2048);
+        assert_eq!(pool.relieve_system(enfile), 0, "inside the window");
+        assert_eq!(reg.descriptor_usage().1, 2048);
+
+        // As if a second had passed since the last relief.
+        let window_passed = || {
+            *pool.relieved.lock().unwrap() =
+                Some(std::time::Instant::now() - crate::remote::RELIEF_EVERY);
+        };
+        window_passed();
+        pool.relieve_system(enfile);
+        assert_eq!(reg.descriptor_usage().1, 1024);
+        window_passed();
+        pool.relieve_system(enfile);
+        assert_eq!(reg.descriptor_usage().1, 1024, "never below the floor");
+    }
+
+    /// A budget already under the floor is a deliberate small one (a test's,
+    /// or an operator's), and a relief does not raise it.
+    #[test]
+    fn a_relief_never_raises_a_budget_already_under_the_floor() {
+        let scratch = Scratch::new("system-small");
+        let pool = Pool::default();
+        let share = Arc::new(Share(Arc::new(scratch.registry_in(&pool))));
+        pool.enroll(Arc::downgrade(&share) as Weak<dyn Release>);
+        let reg = share.0.clone();
+        reg.census.budget.store(512, Ordering::Relaxed);
+
+        pool.relieve_system(crate::errno::linux::ENFILE);
+
+        assert_eq!(reg.descriptor_usage().1, 512);
+    }
+
     /// The budget has to be under what the kernel will actually allow, or it
     /// is not a budget at all — which is how a package tree three copies deep
     /// produced EMFILE inside the guest on a file that was plainly there.
@@ -3190,6 +3742,12 @@ mod tests {
         assert!(
             budget < ceiling,
             "budget {budget} must be under the ceiling {ceiling}"
+        );
+        // And the Mac's table, which every program opens from (#95).
+        let (_, table) = crate::sys::file_table().unwrap();
+        assert!(
+            budget <= (table / 5).max(1024),
+            "budget {budget} takes more than a fifth of the Mac's table of {table}"
         );
     }
 }

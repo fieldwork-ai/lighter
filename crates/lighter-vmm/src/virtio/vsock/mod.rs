@@ -2870,10 +2870,15 @@ mod tests {
     /// test by @petrfilip).
     #[test]
     fn a_half_closed_client_still_receives_the_guest_reply() {
+        // Generous, because a loaded CI runner can take seconds to schedule
+        // the pump's threads: a 5 s read timeout once expired there with
+        // neither the reply nor its EOF, and the read reported WouldBlock,
+        // which said nothing about which. A hang still fails, and says so.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
         let shared = Arc::new(VsockShared::new());
         let (socket, mut client) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
             .unwrap();
         let key = shared.open(2375, socket.try_clone().unwrap());
         shared.lock().conns.get_mut(&key).unwrap().state = State::Established;
@@ -2895,11 +2900,32 @@ mod tests {
             last.flags = shutdown::SEND;
             Vsock::handle(&mut inner, last);
         }
+        let deadline = std::time::Instant::now() + PATIENCE;
         let mut received = Vec::new();
-        client.read_to_end(&mut received).unwrap();
-        assert_eq!(received, b"reply");
+        let mut buf = [0u8; 64];
+        let ended = loop {
+            match client.read(&mut buf) {
+                Ok(0) => break true,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("the client's read failed: {e}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+        };
+        assert_eq!(
+            received, b"reply",
+            "what the half-closed client received from the guest"
+        );
+        assert!(
+            ended,
+            "the reply arrived, but no end-of-stream in {PATIENCE:?}"
+        );
         finished
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(PATIENCE)
             .expect("the pump returns once the reply is written");
     }
 

@@ -91,6 +91,32 @@ fn check_size(rc: libc::ssize_t) -> Result<usize> {
     }
 }
 
+static REFUSED_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REFUSED_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Test seam: the next `count` opens made here fail with `errno` before they
+/// reach the kernel, as an open does when the Mac's file table is full.
+///
+/// The table belongs to the whole machine, so a test cannot fill it without
+/// breaking everything else on it. This makes a share see the refusal
+/// instead. Nothing calls it outside the tests.
+#[doc(hidden)]
+pub fn refuse_next_opens(errno: i32, count: usize) {
+    REFUSED_ERRNO.store(errno, std::sync::atomic::Ordering::Relaxed);
+    REFUSED_OPENS.store(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The seam's check, first in every open: `Err` while refusals remain.
+///
+/// A single relaxed read when none are pending, which every open pays.
+fn refused_open() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    match REFUSED_OPENS.try_update(Relaxed, Relaxed, |n| n.checked_sub(1)) {
+        Ok(_) => Err(REFUSED_ERRNO.load(Relaxed)),
+        Err(_) => Ok(()),
+    }
+}
+
 /// A guest-supplied name, validated before it can reach a syscall.
 ///
 /// The three rules are not stylistic. An empty name resolves to the directory
@@ -131,6 +157,7 @@ pub fn path_of(fd: RawFd) -> Result<PathBuf> {
 /// Never follows a final symlink, and never blocks: a FIFO opened for reading
 /// waits for a writer, and a server thread that did so would be gone for good.
 pub fn open_reference(parent: RawFd, name: &CStr, is_symlink: bool) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = if is_symlink {
         // O_EVTONLY cannot be combined with O_SYMLINK; the latter already
         // refuses to follow.
@@ -152,6 +179,7 @@ pub fn open_reference(parent: RawFd, name: &CStr, is_symlink: bool) -> Result<Ow
 /// Whether that path still names the same file is the caller's question to ask,
 /// not this function's to answer.
 pub fn open_reference_path(path: &Path, is_symlink: bool) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = if is_symlink {
         O_SYMLINK | libc::O_CLOEXEC | libc::O_NONBLOCK
     } else {
@@ -182,6 +210,20 @@ pub fn descriptor_ceiling() -> u64 {
         u64::MAX
     };
     soft.min(sysctl_u64(c"kern.maxfilesperproc").unwrap_or(10_240))
+}
+
+/// The Mac's file table: how many files are open across the whole machine,
+/// and the most that may be (`kern.num_files`, `kern.maxfiles`).
+///
+/// Every process's descriptors come out of the one table, and a full table
+/// fails opens everywhere with `ENFILE`, which is how a Mac logs its user
+/// out; a process's own ceiling ([`descriptor_ceiling`]) is a third to a half
+/// of it.
+pub fn file_table() -> Option<(u64, u64)> {
+    Some((
+        sysctl_u64(c"kern.num_files")?,
+        sysctl_u64(c"kern.maxfiles")?,
+    ))
 }
 
 /// Raises this process's descriptor limit as far as the system allows.
@@ -309,16 +351,46 @@ pub fn identity_path(fd: RawFd) -> Result<PathBuf> {
 /// [`identity_path`]). The path is the fallback for a filesystem with no
 /// `/.vol`, and the error reported is the fallback's, which is what this
 /// function has always returned.
-pub fn reopen(reference: RawFd, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+///
+/// The path is only where the file last was, and another file may have
+/// taken it since: a Mac program saving over a file (writing a temporary
+/// and renaming it into place) leaves the name naming the new file, and the
+/// guest read the new file's bytes through the old one's nodeid. So what
+/// the path opens is handed back only if it is the same file, and is
+/// `ESTALE` otherwise. The same file is the same numbers where the volume's
+/// numbers identify a file (`numbers_identify`), and the same birth time
+/// where they do not: Samba without file ids numbers a file by its name, so
+/// a file moved there has new numbers and is still itself, and the numbers
+/// alone read every file renamed into place as gone (m16).
+pub fn reopen(
+    reference: RawFd,
+    linux_flags: u32,
+    mode: u32,
+    numbers_identify: bool,
+) -> Result<OwnedFd> {
     if let Ok(fd) = identity_path(reference).and_then(|p| open_path(&p, linux_flags, mode)) {
         return Ok(fd);
     }
     let path = path_of(reference)?;
-    open_path(&path, linux_flags, mode)
+    let fd = open_path(&path, linux_flags, mode)?;
+    let (was, now) = (stat_fd(reference)?, stat_fd(fd.as_raw_fd())?);
+    let same = if numbers_identify {
+        (was.st_dev, was.st_ino) == (now.st_dev, now.st_ino)
+    } else {
+        was.st_dev == now.st_dev
+            && (was.st_birthtime, was.st_birthtime_nsec)
+                == (now.st_birthtime, now.st_birthtime_nsec)
+    };
+    if same {
+        Ok(fd)
+    } else {
+        Err(crate::errno::linux::ESTALE)
+    }
 }
 
 /// Opens a host path with flags expressed in the *guest's* numbering.
 pub fn open_path(path: &Path, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+    refused_open()?;
     let c = cpath(path)?;
     let flags = translate_open_flags(linux_flags) | libc::O_CLOEXEC;
     // SAFETY: a valid NUL-terminated path; `mode` is only consulted when the
@@ -341,6 +413,7 @@ pub fn open_path(path: &Path, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
 /// `list`), and this costs one name lookup where a reopen by path walked the
 /// whole path from the root.
 pub fn open_directory_self(dir: RawFd) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: a live directory descriptor and a constant path.
     let raw = check(unsafe { libc::openat(dir, c".".as_ptr(), flags) })?;
@@ -350,6 +423,7 @@ pub fn open_directory_self(dir: RawFd) -> Result<OwnedFd> {
 
 /// Opens a name under a directory for real I/O.
 pub fn openat_path(parent: RawFd, name: &CStr, linux_flags: u32, mode: u32) -> Result<OwnedFd> {
+    refused_open()?;
     let flags = translate_open_flags(linux_flags) | libc::O_CLOEXEC;
     // SAFETY: valid name, live directory descriptor.
     let raw = check(unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::c_uint) })?;
@@ -520,12 +594,39 @@ pub fn readlink_at(parent: RawFd, name: &CStr) -> Result<Vec<u8>> {
 /// between reading the path and using it is the same window every other
 /// path-based syscall has, and the alternative is not supporting device nodes
 /// and FIFOs at all.
+/// A FIFO, or a regular file, under a directory. Relative to the directory's
+/// descriptor, like every other call here: rebuilt as a whole path, a FIFO
+/// deeper than macOS's 1,024 characters failed with the ENOSPC of the
+/// F_GETPATH that would not fit it, where a file at the same depth was made
+/// (pjdfstest mkfifo/03). A regular file is created rather than mknod'd,
+/// which Linux allows and macOS does not.
 pub fn mknod_at(parent: RawFd, name: &CStr, mode: u32, rdev: u32) -> Result<()> {
-    let mut path = path_of(parent)?;
-    path.push(OsStr::from_bytes(name.to_bytes()));
-    let c = cpath(&path)?;
-    // SAFETY: a valid NUL-terminated path.
-    check(unsafe { libc::mknod(c.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t) }).map(|_| ())
+    if mode & libc::S_IFMT as u32 == libc::S_IFREG as u32 || mode & libc::S_IFMT as u32 == 0 {
+        let flags =
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: valid name, live directory descriptor.
+        let fd = check(unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                flags,
+                (mode & 0o7777) as libc::c_uint,
+            )
+        })?;
+        // SAFETY: the descriptor just opened.
+        unsafe { libc::close(fd) };
+        return Ok(());
+    }
+    // SAFETY: valid name, live directory descriptor.
+    check(unsafe {
+        libc::mknodat(
+            parent,
+            name.as_ptr(),
+            mode as libc::mode_t,
+            rdev as libc::dev_t,
+        )
+    })
+    .map(|_| ())
 }
 
 pub fn chmod_at(parent: RawFd, name: &CStr, mode: u32) -> Result<()> {
@@ -1150,6 +1251,34 @@ pub fn raise_server_qos() {
 
 #[cfg(test)]
 mod tests {
+    /// A Mac program saving over a file renames another file onto its name.
+    /// A reopen of the old one must never come back as the new one.
+    #[test]
+    fn a_reopen_never_hands_back_the_file_that_took_the_name() {
+        let dir = std::env::temp_dir().join(format!("lighter-sys-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"old").unwrap();
+        let reference = open_path(&path, 0, 0).unwrap();
+        std::fs::write(dir.join("f.tmp"), b"new").unwrap();
+        std::fs::rename(dir.join("f.tmp"), &path).unwrap();
+        match reopen(reference.as_raw_fd(), 0, 0, true) {
+            Ok(fd) => {
+                let mut buf = [0u8; 8];
+                let n =
+                    unsafe { libc::pread(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+                assert_eq!(
+                    &buf[..n as usize],
+                    b"old",
+                    "a reopen handed back another file"
+                );
+            }
+            Err(errno) => assert_eq!(errno, crate::errno::linux::ESTALE),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// The bug this test exists for: Linux O_APPEND is bit 0o2000, which on

@@ -34,6 +34,7 @@ pub mod linux {
     pub const ENAMETOOLONG: i32 = 36;
     pub const ENOSYS: i32 = 38;
     pub const ENOTEMPTY: i32 = 39;
+    pub const ELOOP: i32 = 40;
     pub const ENODATA: i32 = 61;
     pub const EPROTO: i32 = 71;
     pub const EOVERFLOW: i32 = 75;

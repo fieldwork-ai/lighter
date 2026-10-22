@@ -146,6 +146,16 @@ slab()
 pins(held, 64 << 20, True)
 time.sleep(1)
 pins(held, 64 << 20, True)
+# Where the allocator places a pass's pages is the guest's choice, and two
+# passes left 318 free blocks once where 29 is usual (2026-10-20, the M1). A
+# pass pins one page in 64 of what it maps, so a few more cost little: a
+# bounded number, until the guest is below the gate's line of 128 with room
+# to spare, and never a loop that follows the guest as it frees.
+for _ in range(4):
+    if free_blocks() < 96:
+        break
+    time.sleep(1)
+    pins(held, 64 << 20, False)
 print("fragmented", free_blocks(), meminfo("Slab:") >> 20, flush=True)
 while True:
     time.sleep(3600)

@@ -50,7 +50,7 @@ const FLOOR: usize = 8;
 /// How long after letting go a refusal is taken to be the same shortage.
 /// Every worker refused at once would otherwise each let go and each halve
 /// the allowance, sixteen halvings for one shortage.
-const RELIEF_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const RELIEF_EVERY: Duration = Duration::from_secs(1);
 
 /// One network volume, as every share of a process sees it.
 #[derive(Debug)]
@@ -236,6 +236,16 @@ impl Remotes {
 pub fn is_refusal(errno: i32) -> bool {
     use crate::errno::linux;
     errno == linux::EMFILE || errno == linux::ENFILE || errno == linux::EAGAIN
+}
+
+/// Whether an open failed because the Mac's own file table is full, which is
+/// `ENFILE`. On a local share every share of the machine answers it, by
+/// letting go of what it holds and holding less from then on
+/// ([`crate::inode::Pool::relieve_system`]). A network volume's refusal is
+/// handled as [`is_refusal`] describes instead: its server is out of handles,
+/// and that volume's allowance is lowered.
+pub fn is_full_table(errno: i32) -> bool {
+    errno == crate::errno::linux::ENFILE
 }
 
 #[cfg(test)]
