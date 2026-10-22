@@ -2294,13 +2294,9 @@ impl Server {
         // failed ENOTEMPTY on an M1 in every run.
         if let Some(nodeid) = parent.pending_child(name.to_bytes())
             && let Some(inode) = self.registry.get(nodeid)
+            && let Some(entry) = self.answer_promise(parent, &inode, nodeid)?
         {
-            self.registry.count_lookup(nodeid);
-            return Ok(if inode.is_pending() {
-                self.pending_entry(parent, &inode, nodeid)
-            } else {
-                self.promised_entry(parent, &inode, nodeid)?
-            });
+            return Ok(entry);
         }
         let entry = self.entry_with_reference(parent, st, mark, || {
             let is_symlink = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
@@ -2802,17 +2798,11 @@ impl Server {
                 "NAME-DEBUG lookup"
             );
         }
+        // Released as its promise was kept, it is the host's to answer for.
         if let Some(nodeid) = parent.pending_child(name.to_bytes())
             && let Some(inode) = self.registry.get(nodeid)
+            && let Some(entry) = self.answer_promise(&parent, &inode, nodeid)?
         {
-            let entry = if inode.is_pending() {
-                self.registry.count_lookup(nodeid);
-                self.pending_entry(&parent, &inode, nodeid)
-            } else {
-                // Promised here by a queued rename: a real file, answering
-                // under a name the host does not have yet.
-                self.promised_entry(&parent, &inode, nodeid)?
-            };
             return Ok(self.entry_reply(&entry));
         }
         if parent.name_pending_gone(name.to_bytes()) {
@@ -4383,12 +4373,10 @@ impl Server {
         ));
         parent.settled_by(seq);
         target.settled_by(seq);
-        let entry = if target.is_pending() {
-            self.registry.count_lookup(nodeid);
-            self.pending_entry(parent, target, nodeid)
-        } else {
-            self.promised_entry(parent, target, nodeid)?
-        };
+        // Held by the link's own promise, it cannot have been released.
+        let entry = self
+            .answer_promise(parent, target, nodeid)?
+            .ok_or(linux::ESTALE)?;
         Ok(Some(self.entry_reply(&entry)))
     }
 
@@ -5146,6 +5134,35 @@ impl Server {
     /// The entry for a bound inode reached through the overlay — a file a
     /// queued rename has promised to this name. It counts as a lookup, as
     /// any reply naming a nodeid does.
+    /// The entry for an inode the guest is promised under a name, pending
+    /// or promised by a queued rename or link, counted as the one lookup the
+    /// reply is; `None` if it was released before it could be.
+    ///
+    /// Counted first. A promise kept meanwhile finishes a forget it had put
+    /// off and releases an inode no lookup holds, and the stat a promised
+    /// file is answered with takes a round trip on a network volume: counted
+    /// after it, a lookup of a WAL segment whose rename landed in between
+    /// named a nodeid the server had just forgotten, and the guest's writes
+    /// to it failed ENOENT (m16, SMB with file ids, 5 to 30 of 100).
+    fn answer_promise(
+        &self,
+        parent: &Inode,
+        inode: &std::sync::Arc<Inode>,
+        nodeid: u64,
+    ) -> Result<Option<EntryOut>, i32> {
+        if !self.registry.count_lookup(nodeid) {
+            return Ok(None);
+        }
+        if inode.is_pending() {
+            return Ok(Some(self.pending_entry(parent, inode, nodeid)));
+        }
+        self.promised_entry(parent, inode, nodeid)
+            .map(Some)
+            .inspect_err(|_| self.registry.forget(nodeid, 1))
+    }
+
+    /// The entry a file promised under a name by a queued rename or link
+    /// answers with, from the host. Counted by [`Server::answer_promise`].
     fn promised_entry(
         &self,
         parent: &Inode,
@@ -5153,7 +5170,6 @@ impl Server {
         nodeid: u64,
     ) -> Result<EntryOut, i32> {
         let attr = self.attr_of(nodeid, inode)?;
-        self.registry.count_lookup(nodeid);
         let entry_valid = self
             .policy
             .validity(parent.dev(), parent.ino(), Answer::File);
@@ -5667,15 +5683,11 @@ impl Server {
                     None
                 } else if let Some(id) = parent.pending_child(&entry.name)
                     && let Some(inode) = self.registry.get(id)
+                    && let Ok(Some(found)) = self.answer_promise(&parent, &inode, id)
                 {
                     // Promised here: answered from the promise, and counted
                     // as the lookup the kernel takes it for.
-                    if inode.is_pending() {
-                        self.registry.count_lookup(id);
-                        Some(self.pending_entry(&parent, &inode, id))
-                    } else {
-                        self.promised_entry(&parent, &inode, id).ok()
-                    }
+                    Some(found)
                 } else {
                     self.checked_name(&entry.name)
                         .and_then(|name| self.entry(&parent, &name))

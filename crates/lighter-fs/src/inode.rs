@@ -2242,15 +2242,17 @@ impl Registry {
 
     /// A reply named this nodeid outside the usual paths: count it, so the
     /// kernel's FORGET total and ours agree.
-    pub fn count_lookup(&self, id: u64) {
-        if let Some(inode) = self.by_id[shard(id)]
-            .lock()
-            .expect("inode table poisoned")
-            .get(&id)
-        {
-            let mut lookups = inode.lookups.lock().expect("lookup count poisoned");
-            *lookups = lookups.saturating_add(1);
-        }
+    ///
+    /// Whether it was: an inode already released is not brought back by it,
+    /// and a reply must not name it.
+    pub fn count_lookup(&self, id: u64) -> bool {
+        let table = self.by_id[shard(id)].lock().expect("inode table poisoned");
+        let Some(inode) = table.get(&id) else {
+            return false;
+        };
+        let mut lookups = inode.lookups.lock().expect("lookup count poisoned");
+        *lookups = lookups.saturating_add(1);
+        true
     }
 
     /// The nodeid for a host identity, without counting it as a lookup.
