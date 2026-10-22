@@ -34,7 +34,7 @@ Before publishing:
 3. Complete one controlled full benchmark suite on each of M1 and M5, with three repetitions per timed case. Monitor `fseventsd` without resetting it and reject competing VMs. Investigate flagged cases with focused checks. Keep raw diagnostics local; commit selected benchmark CSVs and environment metadata, a concise results/limitations summary, and the release source/artifact hashes. Do not commit qualification archives or attach them to the release.
 4. Update `packaging/lighter.rb` with the final archive URL and SHA256. Verify Homebrew ownership, repeated `post_install`, preserved signatures and refusal of direct upgrades from the Cellar. Prepare the Homebrew tap PR using the same formula.
 5. Raise the qualified `dev` → `main` PR with test evidence and release notes. Keep the built archive and bootstrap immutable while the PR is reviewed. `main` moves only through this PR.
-6. After the main PR merges, tag the qualified release source and publish `v<version>` with **both** `lighter-<version>-arm64.tar.gz` and the signed standalone `lighter-<version>-arm64` bootstrap attached. The installer requires the bootstrap; publishing only the archive breaks installation. For the 0.5.0 transition, coordinate merge and immediate publication: the new installer cannot use 0.4.1, which has no standalone bootstrap asset. Publish SHA256 values in the release notes. Never replace a published asset with different bytes under the same version.
+6. After the main PR merges, tag the qualified release source and publish `v<version>` with `lighter-<version>-arm64.tar.gz`, the signed standalone `lighter-<version>-arm64` bootstrap and `lighter-<version>-guest-source.tar` attached. The installer requires the bootstrap; publishing only the archive breaks installation. The guest source is what the GPL asks for in return for shipping Linux and the Alpine packages: a release without it is not one we may distribute. For the 0.5.0 transition, coordinate merge and immediate publication: the new installer cannot use 0.4.1, which has no standalone bootstrap asset. Publish SHA256 values in the release notes. Never replace a published asset with different bytes under the same version.
 7. Confirm the public assets download and pass their hashes, then make the tap PR ready to merge. Homebrew 6 requires testing a formula inside a tap; use an isolated tap checkout and restore its original branch afterward.
 
 The archive contains a manifest sealed inside the signed app. It authenticates the external CLI, kernel, root filesystem and kernel version. Package without AppleDouble sidecars (`COPYFILE_DISABLE=1`); the notarization staple remains an ordinary app resource. A missing or invalid signature, manifest or guest hash must fail before stopping an existing VM.
@@ -48,6 +48,15 @@ starting a VM. Manual extraction followed by a successful VM boot does not
 replace that consumer check. Repacking an unpublished archive is permissible
 when every signed file and the stapled ticket remain unchanged; preserve the
 original attempt, record both hashes, and qualify the final archive.
+
+## Licences
+
+A release ships other people's code, and what their licences ask for is part of the release, made by the packager rather than remembered:
+
+- **`THIRD-PARTY-NOTICES`**, in the archive (`scripts/notices.py`): the Rust crates in the Mac binary and the guest's own programs, from `cargo-about` under the policy in `licenses/about.toml`; the C and C++ libraries linked beside them (`licenses/native.json`, their texts in `licenses/native/`); Linux; every Alpine package in the root filesystem, read from the image's own apk database; and the copyleft licence texts those packages require (`licenses/spdx/`).
+- **`lighter-<version>-guest-source.tar`**, beside it (`scripts/guest-source.sh`): the kernel.org tarball the Image was built from, checked against kernel.org's hashes, with lighter's patches, configuration and build scripts; and Alpine's own source package (`abuild srcpkg`) for every package in the root filesystem, at the aports commit each recorded. Shipping the source is what lets lighter make no written offer.
+
+They need `cargo-about` (`cargo install --locked cargo-about --features cli`), `debugfs` (`brew install e2fsprogs`) and docker. A pin that moves in `host/*/build.sh` or `guest/torch-mps/build.sh` stops the packager until `licenses/native.json` and `scripts/fetch-native-licenses.py` follow it, and a crate under a licence the policy does not accept fails CI before it reaches a release.
 
 ## After
 

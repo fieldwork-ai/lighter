@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Built in the guest's own containers, not here; named so that cargo, run on
+# their manifests from the host (cargo-about, for the release notices), knows
+# they are not this workspace's.
+exclude = ["guest/agent", "guest/ane-ep"]
 
 [workspace.package]
 version = "0.13.8"

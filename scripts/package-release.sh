@@ -8,7 +8,9 @@
 #   share/lighter/Image     (guest kernel)
 #   share/lighter/rootfs.ext4 (sparse Alpine rootfs)
 #   share/lighter/entitlements.plist
-#   LICENSE-MIT, LICENSE-APACHE, NOTICE, README.md
+#   LICENSE-MIT, LICENSE-APACHE, NOTICE, THIRD-PARTY-NOTICES, README.md
+# and dist/lighter-<version>-guest-source.tar, the guest's complete source,
+# published beside it (scripts/guest-source.sh).
 #
 # The binaries are signed with Apple Developer ID Application and submitted to
 # Apple's notarytool so Gatekeeper accepts them without quarantine blocks.
@@ -149,6 +151,14 @@ for artifact in guest/out/Image guest/out/rootfs.ext4; do
 	[ -f "$artifact" ] || { echo "error: $artifact is missing; run 'make guest'" >&2; exit 1; }
 done
 
+# What the release owes the authors of what it ships, made before anything
+# is signed so that a licence problem fails here rather than after
+# notarization: the notices go in the archive, the guest's source beside it.
+echo "==> Writing third-party notices"
+python3 scripts/notices.py "$VERSION" "$STAGE/THIRD-PARTY-NOTICES"
+echo "==> Building the guest source archive"
+scripts/guest-source.sh "$VERSION"
+
 cp target/release/lighter "$STAGE/bin/lighter"
 cp guest/out/Image guest/out/rootfs.ext4 guest/out/kernel.version "$STAGE/share/lighter/"
 cp LICENSE-MIT LICENSE-APACHE NOTICE README.md "$STAGE/"
@@ -276,6 +286,7 @@ echo
 echo "==> Release artifact ready:"
 echo "    File:   $TARBALL ($SIZE)"
 echo "    SHA256: $SHA"
+echo "    Guest source: dist/lighter-$VERSION-guest-source.tar ($(du -h "dist/lighter-$VERSION-guest-source.tar" | cut -f1))"
 echo
 echo "Formula update (packaging/lighter.rb):"
 echo "  url \"https://github.com/fieldwork-ai/lighter/releases/download/v$VERSION/lighter-$VERSION-arm64.tar.gz\""

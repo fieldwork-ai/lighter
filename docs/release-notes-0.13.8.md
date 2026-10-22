@@ -49,4 +49,5 @@ Or `lighter update download` then `lighter upgrade --restart` if you installed w
 ## Also
 
 - Linux remains **6.18.52**. Guest patches 0057 (the guest says which files are open) and 0058 (the video driver keeps a reply to a command apart from the program waiting for it, which a decoder that answers at once could otherwise leave unusable until restart) are new, and 0004 refuses to clone a file onto itself, which it could not do correctly. The data epoch remains **1**.
+- The third-party notices this release owes (`lighter-0.13.8-THIRD-PARTY-NOTICES.txt`) and the complete source of its Linux guest, Linux with lighter's patches and every Alpine package in it (`lighter-0.13.8-guest-source.tar`), are attached to it. From 0.13.9 the notices are in the archive itself.
 - A new qualification gate, m21, holds shared folders to a local disk: the open-file probes, fsx with every operation, and pjdfstest against a list of what a shared folder fails by design. pjdfstest's failures went from 3,077 to 525, the same 525 every run, against 2,772 on OrbStack; what remains follows from a Mac file belonging to whoever asks, as on Docker Desktop.

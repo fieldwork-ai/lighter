@@ -35,6 +35,13 @@ jobs:
         run: |
           ulimit -S -n 10240
           cargo test --all
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Every shipped crate's licence is one the release may carry
+        # Also that each linked C or C++ library's notices match the version
+        # its build script pins (licenses/native.json).
+        run: python3 scripts/notices.py --check
       - name: Shell scripts parse
         run: |
           for script in scripts/*.sh scripts/gates/*.sh benchmarks/*.sh guest/*/build.sh; do

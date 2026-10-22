@@ -2,4 +2,11 @@ lighter
 Copyright 2026 Fieldwork AI Inc.
 
 This product is dual-licensed under the MIT License (LICENSE-MIT) or the
-Apache License, Version 2.0 (LICENSE-APACHE), at your option.
+Apache License, Version 2.0 (LICENSE-APACHE), at your option, except the
+guest kernel patches in guest/kernel/patches, which are under the licence of
+the Linux files they change, and the crates vendored in third_party/, which
+keep their own licences.
+
+A release archive includes software by third parties, listed with their
+licences in THIRD-PARTY-NOTICES. The source of its Linux guest is published
+with the release as lighter-<version>-guest-source.tar.
