@@ -3537,6 +3537,37 @@ fn a_rename_that_must_not_replace_works_on_a_drive_that_cannot_refuse() {
     assert_eq!(std::fs::read(drive.mount.join("taken")).unwrap(), b"kept");
 }
 
+/// A file the host renames at once (a rename with flags, and every rename
+/// on a network volume) is reached afterwards by its new name. The guest's
+/// own rename moved its name, so it never looks the file up again; placed at
+/// its old name, the file was found only by reviving it by identity, which a
+/// network volume has none of: a WAL segment renamed into place on SMB with
+/// file ids read `ENOENT`, or the next file made under the old name.
+#[test]
+fn a_file_renamed_at_once_is_reached_by_its_new_name() {
+    let mut guest = Guest::new("renamed-at-once");
+    std::fs::write(guest.host("f"), b"moved").unwrap();
+    let f = guest.lookup(1, "f").unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u64.to_le_bytes());
+    body.extend_from_slice(&fuse::rename::NOREPLACE.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(b"f\0g\0");
+    guest.call(op::RENAME2, 1, &body).expect("rename f to g");
+    std::fs::write(guest.host("f"), b"another file").unwrap();
+
+    let before = guest.server.revived_on_demand();
+    let reply = guest.call(op::GETATTR, f, &[0u8; 16]).expect("getattr");
+    let size = u64::from_le_bytes(reply[24..32].try_into().unwrap());
+    assert_eq!(size, 5, "the moved file's size");
+    assert_eq!(guest.read(f, 0, 0, 64).expect("read"), b"moved");
+    assert_eq!(
+        guest.server.revived_on_demand(),
+        before,
+        "reached by its old name and revived"
+    );
+}
+
 /// `/Users` and `/Volumes` are root's, so the marker that says a share holds
 /// records cannot go on their roots. A share like that reads records from
 /// the start: before, every owner a container recorded in the home folder

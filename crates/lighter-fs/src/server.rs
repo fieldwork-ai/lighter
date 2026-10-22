@@ -4075,29 +4075,39 @@ impl Server {
         }
         phase("rename-us-3-settle-names", t2);
         let t3 = std::time::Instant::now();
-        // Renumbered after, where its volume numbers files by name.
-        let moved = if self.registry.identifies_by_birth(old_parent.dev()) {
-            old_parent
-                .under_name(&old, sys::stat_at)
-                .ok()
-                .and_then(|st| {
-                    self.registry
-                        .identified(st.st_dev as i64, st.st_ino, birth(&st))
-                })
-        } else {
-            None
+        // What the rename moves is found before it and placed after it,
+        // on every volume. A file holds no descriptor, so its place is how
+        // the next request on it is served, and the guest, whose own rename
+        // moved its name, never looks it up again to correct it. Placed only
+        // where it had to be renumbered (Samba without file ids), a file
+        // renamed into place on any other volume was opened by its old name:
+        // `ENOENT`, or the next file made there (`ESTALE`), and on SMB with
+        // file ids 30 of 100 WAL segments failed m16. An exchange moves both.
+        let identify = |dir: &Arc<Inode>, name: &CStr| {
+            dir.under_name(name, sys::stat_at).ok().and_then(|st| {
+                self.registry
+                    .identified(st.st_dev as i64, st.st_ino, birth(&st))
+            })
         };
+        let moved = identify(&old_parent, &old);
+        let swapped = (flags & crate::fuse::rename::EXCHANGE != 0)
+            .then(|| identify(&new_parent, &new))
+            .flatten();
         old_parent.under_name(&old, |old_dir, old_at| {
             new_parent.under_name(&new, |new_dir, new_at| {
                 sys::rename_at(old_dir, old_at, new_dir, new_at, flags)
             })
         })?;
-        if let Some(moved) = moved
-            && let Ok(st) = new_parent.under_name(&new, sys::stat_at)
-        {
-            moved.set_place(&new_parent, &new);
-            self.registry
-                .renumber(moved.id(), st.st_dev as i64, st.st_ino, birth(&st));
+        for (inode, parent, name) in [(moved, &new_parent, &new), (swapped, &old_parent, &old)] {
+            let Some(inode) = inode else { continue };
+            inode.set_place(parent, name);
+            // Renumbered too, where its volume numbers files by name.
+            if self.registry.identifies_by_birth(parent.dev())
+                && let Ok(st) = parent.under_name(name, sys::stat_at)
+            {
+                self.registry
+                    .renumber(inode.id(), st.st_dev as i64, st.st_ino, birth(&st));
+            }
         }
         phase("rename-us-4-host", t3);
         phase("rename-us-total", t0);
