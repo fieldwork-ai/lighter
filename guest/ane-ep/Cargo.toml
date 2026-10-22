@@ -3,6 +3,7 @@ name = "lighter_ane_ep"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 # Not a workspace member: it is a Linux artifact that lives in the guest's
 # root filesystem, built by build.sh, and it links against nothing — no libc

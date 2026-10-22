@@ -223,4 +223,8 @@ make gates            # the milestone gates: real VMs, end to end
 
 ## Licence
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. Two parts of this repository are not lighter's own and keep their licences: the guest kernel's patches (`guest/kernel/patches`), which change Linux and are under the licence of the files they change, GPL-2.0 for most of it, and the crates vendored in `third_party/` (`v4l2r`, MIT; `virtio-media`, BSD-3-Clause).
+
+A release also ships other people's software: the libraries built into lighter, and the Linux guest. Each release archive lists them with their licences in `THIRD-PARTY-NOTICES`, and the guest's complete source is published with each release as `lighter-<version>-guest-source.tar`.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in lighter by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions. [CONTRIBUTING.md](CONTRIBUTING.md) says how to report a bug and send a change.

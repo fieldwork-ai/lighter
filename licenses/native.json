@@ -1,0 +1,62 @@
+{
+  "about": "The C and C++ code built into what a release ships, beside the Rust crates cargo-about finds. Each component's version is pinned by a line in a build script (`pin`); scripts/notices.py refuses to write notices when the two disagree, and scripts/fetch-native-licenses.sh fetches each `files` entry into licenses/native/ at the pinned version.",
+  "components": [
+    {
+      "name": "MoltenVK", "part": "host", "license": "Apache-2.0",
+      "url": "https://github.com/KhronosGroup/MoltenVK",
+      "version": "1.4.2", "pin": {"file": "host/gpu/build.sh", "var": "MVK_VERSION"},
+      "files": [{"path": "MoltenVK/LICENSE", "url": "https://raw.githubusercontent.com/KhronosGroup/MoltenVK/v{version}/LICENSE"}]
+    },
+    {
+      "name": "SPIRV-Cross", "part": "host", "license": "Apache-2.0", "within": "MoltenVK",
+      "url": "https://github.com/KhronosGroup/SPIRV-Cross",
+      "version": "6c09849fe88c48eaed08413aa022aaa136a3a057", "pin": {"within": "MoltenVK", "revision": "ExternalRevisions/SPIRV-Cross_repo_revision"},
+      "files": [{"path": "SPIRV-Cross/LICENSE", "url": "https://raw.githubusercontent.com/KhronosGroup/SPIRV-Cross/{version}/LICENSE"}]
+    },
+    {
+      "name": "SPIRV-Tools", "part": "host", "license": "Apache-2.0", "within": "MoltenVK",
+      "url": "https://github.com/KhronosGroup/SPIRV-Tools",
+      "version": "0d6fd73ca73830ccab5fa1f00ed5ed40124e2c55", "pin": {"within": "MoltenVK", "revision": "ExternalRevisions/SPIRV-Tools_repo_revision"},
+      "files": [{"path": "SPIRV-Tools/LICENSE", "url": "https://raw.githubusercontent.com/KhronosGroup/SPIRV-Tools/{version}/LICENSE"}]
+    },
+    {
+      "name": "cereal", "part": "host", "license": "BSD-3-Clause", "within": "MoltenVK",
+      "url": "https://github.com/USCiLab/cereal",
+      "version": "a56bad8bbb770ee266e930c95d37fff2a5be7fea", "pin": {"within": "MoltenVK", "revision": "ExternalRevisions/cereal_repo_revision"},
+      "files": [{"path": "cereal/LICENSE", "url": "https://raw.githubusercontent.com/USCiLab/cereal/{version}/LICENSE"}]
+    },
+    {
+      "name": "Vulkan-Headers", "part": "host", "license": "Apache-2.0 OR MIT", "within": "MoltenVK",
+      "url": "https://github.com/KhronosGroup/Vulkan-Headers",
+      "version": "e3b1eec08173d6b825cd3ac88c885a63b621504a", "pin": {"within": "MoltenVK", "revision": "ExternalRevisions/Vulkan-Headers_repo_revision"},
+      "files": [{"path": "Vulkan-Headers/LICENSE.md", "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Headers/{version}/LICENSE.md"}]
+    },
+    {
+      "name": "virglrenderer", "part": "host", "license": "MIT",
+      "url": "https://gitlab.freedesktop.org/virgl/virglrenderer",
+      "version": "32dac0c", "pin": {"file": "host/gpu/build.sh", "var": "VIRGL_COMMIT"},
+      "files": [{"path": "virglrenderer/COPYING", "url": "https://gitlab.freedesktop.org/virgl/virglrenderer/-/raw/{version}/COPYING"}]
+    },
+    {
+      "name": "ONNX Runtime", "part": "host", "license": "MIT",
+      "url": "https://github.com/microsoft/onnxruntime",
+      "version": "1.30.0", "pin": {"file": "host/ane/build.sh", "var": "ORT_VERSION"},
+      "files": [
+        {"path": "onnxruntime/LICENSE", "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v{version}/LICENSE"},
+        {"path": "onnxruntime/ThirdPartyNotices.txt", "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v{version}/ThirdPartyNotices.txt"}
+      ]
+    },
+    {
+      "name": "ggml (llama.cpp)", "part": "host", "license": "MIT",
+      "url": "https://github.com/ggml-org/llama.cpp",
+      "version": "1af554f", "pin": {"file": "host/metal/build.sh", "var": "LLAMA_COMMIT"},
+      "files": [{"path": "llama.cpp/LICENSE", "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/{version}/LICENSE"}]
+    },
+    {
+      "name": "PyTorch (headers compiled into the lighter-mps wheels)", "part": "guest", "license": "BSD-3-Clause",
+      "url": "https://github.com/pytorch/pytorch",
+      "version": "2.14.0", "pin": {"file": "guest/torch-mps/build.sh", "var": "LIGHTER_TORCH_VERSION"},
+      "files": [{"path": "pytorch/LICENSE", "url": "https://raw.githubusercontent.com/pytorch/pytorch/v{version}/LICENSE"}]
+    }
+  ]
+}

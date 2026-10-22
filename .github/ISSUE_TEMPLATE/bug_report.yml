@@ -1,0 +1,38 @@
+name: Bug report
+description: Something lighter does wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead. Exact commands and output help most.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The smallest steps, compose file or image that shows it. Say if it happens every time.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: lighter doctor
+      description: The output of `lighter doctor`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: machine.log
+      description: The lines of `~/.lighter/machine.log` from around when it happened.
+      render: text
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS
+      description: The model, its chip and memory, and the macOS version (Apple menu > About This Mac).
+      placeholder: Mac Studio, M5 Ultra, 256 GB, macOS 27.0.1
+    validations:
+      required: true
