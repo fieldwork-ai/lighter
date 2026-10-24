@@ -63,11 +63,18 @@ class Lighter < Formula
     EOS
   end
 
+  # What `lighter install`'s own agent runs. The machine is lighter.app's
+  # executable rather than bin/lighter because macOS gives Local Network
+  # permission to the bundle: started as the bare binary, it reached the Mac's
+  # router and no other device on its network (#101). Its log is the one
+  # `lighter doctor` and bug reports ask for.
   service do
-    run [opt_bin/"lighter", "run"]
+    run [opt_pkgshare/"lighter.app/Contents/MacOS/lighter", "run"]
+    environment_variables LIGHTER_GUEST_DIR: opt_pkgshare
     keep_alive successful_exit: false
-    log_path var/"log/lighter.log"
-    error_log_path var/"log/lighter.log"
+    process_type :interactive
+    log_path "#{Dir.home}/.lighter/machine.log"
+    error_log_path "#{Dir.home}/.lighter/machine.log"
   end
 
   test do

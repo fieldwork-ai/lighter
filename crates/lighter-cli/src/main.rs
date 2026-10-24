@@ -29,6 +29,7 @@ mod paths;
 mod release;
 mod run;
 mod service;
+mod spawn;
 mod storage_status;
 mod updates;
 mod upgrade;
@@ -313,6 +314,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             Ok(std::process::ExitCode::SUCCESS)
         }
         Command::Run => {
+            bundle::enter();
             run::machine()?;
             Ok(std::process::ExitCode::SUCCESS)
         }
