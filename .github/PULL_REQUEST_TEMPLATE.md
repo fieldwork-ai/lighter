@@ -18,4 +18,4 @@
 
 - [ ] `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`
 - [ ] Touches the machine, the guest or a device: `make test-hv`, `make quick` and the gates it affects, on (Mac model, macOS version):
-- [ ] My contribution is licensed under MIT OR Apache-2.0 (kernel patches: the licence of the files they change), as CONTRIBUTING.md says
+- [ ] My contribution is dual-licensed under MIT or Apache 2.0 (kernel patches: GPL-2.0)
