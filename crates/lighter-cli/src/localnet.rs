@@ -18,6 +18,13 @@
 //! doctor asks the running machine to connect to a device on the network
 //! that is not the gateway and reports what it got, because only a connect
 //! made by the machine's own process tests the machine's own permission.
+//!
+//! The permission is the bundle's, so the machine is always the bundle's
+//! executable (`bundle::enter`), and always asked about as itself rather
+//! than as whatever started it (`spawn`): until #101 a machine `brew
+//! services` started was the bare `bin/lighter`, never asked and never
+//! allowed, and one started from a shell borrowed the shell's app's
+//! permission and lost it when that app quit.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
@@ -265,7 +272,7 @@ pub fn doctor_finding(home: &Path, pid: Option<u32>) -> (bool, String, Option<St
                     false,
                     format!("denied; the machine cannot reach {ip} ({why}) while this shell can"),
                     Some(
-                        "allow lighter in System Settings › Privacy & Security › Local Network, then `lighter stop` and `lighter start`"
+                        "allow lighter.app in System Settings › Privacy & Security › Local Network, then `lighter restart`"
                             .into(),
                     ),
                 );

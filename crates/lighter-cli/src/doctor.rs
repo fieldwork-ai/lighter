@@ -393,13 +393,31 @@ pub fn run() -> Vec<Finding> {
     // not subject, so a check from here against the router would pass while
     // every camera, printer and NAS failed.
     findings.push({
-        let pid = paths::home()
+        let identity = paths::home()
             .ok()
-            .and_then(|home| crate::instance::Identity::read(&home).ok().flatten())
-            .map(|identity| identity.pid());
-        let (ok, detail, remedy) = match paths::home() {
-            Ok(home) => crate::localnet::doctor_finding(&home, pid),
-            Err(e) => (true, format!("untested: {e}"), None),
+            .and_then(|home| crate::instance::Identity::read(&home).ok().flatten());
+        let pid = identity.as_ref().map(|identity| identity.pid());
+        // Outside its bundle the machine is not what macOS gives the
+        // permission to, so allowing lighter in System Settings cannot help
+        // it: a machine an older lighter started that way (`brew services`
+        // before 0.13.9, #101), or one whose bundle could not be had.
+        let outside = identity
+            .and_then(|identity| identity.executable().ok())
+            .filter(|exe| !crate::bundle::contains(exe));
+        let (ok, detail, remedy) = match (paths::home(), outside) {
+            (_, Some(exe)) => (
+                false,
+                format!(
+                    "the machine runs as {}, outside lighter.app, which is what macOS gives Local Network permission to",
+                    exe.display()
+                ),
+                Some(
+                    "`lighter restart`, or `brew update && brew services restart lighter` if `brew services` starts it"
+                        .into(),
+                ),
+            ),
+            (Ok(home), None) => crate::localnet::doctor_finding(&home, pid),
+            (Err(e), None) => (true, format!("untested: {e}"), None),
         };
         // A warning, never a failure: `lighter start` must not refuse over
         // a permission macOS grants only to a machine that is running and
