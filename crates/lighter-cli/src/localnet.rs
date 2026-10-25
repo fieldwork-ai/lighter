@@ -20,11 +20,14 @@
 //! made by the machine's own process tests the machine's own permission.
 //!
 //! The permission is the bundle's, so the machine is always the bundle's
-//! executable (`bundle::enter`), and always asked about as itself rather
-//! than as whatever started it (`spawn`): until #101 a machine `brew
-//! services` started was the bare `bin/lighter`, never asked and never
-//! allowed, and one started from a shell borrowed the shell's app's
-//! permission and lost it when that app quit.
+//! executable (`bundle::enter`): until #101 a machine `brew services`
+//! started was the bare `bin/lighter`, never asked and never allowed. One
+//! `lighter start` spawns from a shell is the shell's app's responsibility
+//! instead, and has its permission. That is kept on purpose: Terminal and
+//! ssh are exempt, so such a machine reaches the network on a Mac that has
+//! never been asked about lighter.app, as every gate and every headless Mac
+//! is. Spawned disclaiming that responsibility (tried for #101), it was asked
+//! about as itself, and on the M1 over ssh reached nothing.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
@@ -272,7 +275,7 @@ pub fn doctor_finding(home: &Path, pid: Option<u32>) -> (bool, String, Option<St
                     false,
                     format!("denied; the machine cannot reach {ip} ({why}) while this shell can"),
                     Some(
-                        "allow lighter.app in System Settings › Privacy & Security › Local Network, then `lighter restart`"
+                        "allow lighter.app in System Settings › Privacy & Security › Local Network, then `lighter restart`; one started from an app's terminal has that app's permission instead"
                             .into(),
                     ),
                 );

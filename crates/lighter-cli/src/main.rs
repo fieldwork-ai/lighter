@@ -29,7 +29,6 @@ mod paths;
 mod release;
 mod run;
 mod service;
-mod spawn;
 mod storage_status;
 mod updates;
 mod upgrade;

@@ -260,25 +260,35 @@ pub fn start(_config: &Config, wait: Duration) -> anyhow::Result<u32> {
     let exe = crate::bundle::ensure()?;
     drop(bundle_phase);
     let guest = paths::guest_dir()?;
+    let mut command = std::process::Command::new(exe);
+    command.arg("run");
+    command.env("LIGHTER_GUEST_DIR", &guest);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log)?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file.try_clone()?))
+        .stderr(std::process::Stdio::from(log_file));
 
-    // In a session of its own, so the machine is not killed when the
-    // terminal that started it goes away, and responsible for itself, so it
-    // has `lighter.app`'s Local Network permission rather than the
-    // terminal's (`spawn`).
+    // A new session, so the machine is not killed when the terminal that
+    // started it goes away.
+    // SAFETY: `setsid` in the child between fork and exec, which is
+    // async-signal-safe and is exactly what this hook is for.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
     let spawn_phase = lighter_vmm::boot_timing::Phase::new("cli_spawn");
     let mut child = if crate::service::start_registered()? {
         None
     } else {
-        Some(crate::spawn::spawn(
-            &exe,
-            &["run".as_ref()],
-            &[("LIGHTER_GUEST_DIR", guest.as_os_str())],
-            &log_file,
-        )?)
+        Some(command.spawn()?)
     };
     drop(spawn_phase);
     let _readiness = lighter_vmm::boot_timing::Phase::new("cli_docker_readiness");
