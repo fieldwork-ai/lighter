@@ -7,8 +7,8 @@
 //! to the first nameserver in `resolv.conf`, which knows none of that: a
 //! VPN's internal SRV record, or a `.local` service a container browses
 //! for, was not found. Now each goes where the Mac's configuration sends
-//! its name ([`route`]): to that nameserver, whose reply is exact, or, for
-//! `.local`, to multicast DNS ([`local`]).
+//! its name ([`route`]): to that resolver's nameservers, whose reply is
+//! exact, or, for `.local`, to multicast DNS ([`local`]).
 //!
 //! `.local` is asked both of the Mac's resolver and by a multicast query
 //! from here ([`local`]), since each has given nothing where the other
@@ -435,11 +435,11 @@ fn read_name(msg: &[u8], mut at: usize) -> Option<(String, usize)> {
 }
 
 /// Where the Mac sends a question for a name: to multicast DNS, or to a
-/// nameserver.
+/// resolver's nameservers, in its order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     Mdns,
-    Server(std::net::SocketAddr),
+    Servers(Vec<std::net::SocketAddr>),
 }
 
 /// A resolver from the Mac's DNS configuration (`scutil --dns`).
@@ -518,7 +518,10 @@ fn route_in(resolvers: &[Resolver], name: &str) -> Option<Route> {
     if chosen.mdns {
         return Some(Route::Mdns);
     }
-    Some(Route::Server(*chosen.nameservers.first()?))
+    if chosen.nameservers.is_empty() {
+        return None;
+    }
+    Some(Route::Servers(chosen.nameservers.clone()))
 }
 
 /// Where the Mac would send a question for `name`, from its configuration
@@ -689,16 +692,16 @@ resolver #1
         let resolvers = parse_resolvers(SCUTIL);
         assert_eq!(resolvers.len(), 5, "the scoped copies left out");
         let at = |ip: &str| {
-            Some(Route::Server(
+            Some(Route::Servers(vec![
                 (ip.parse::<std::net::IpAddr>().unwrap(), 53).into(),
-            ))
+            ]))
         };
         let scoped = |ip: &str| {
             let v6: std::net::Ipv6Addr = ip.parse().unwrap();
             let index = unsafe { libc::if_nametoindex(c"en0".as_ptr()) };
-            Some(Route::Server(
+            Some(Route::Servers(vec![
                 std::net::SocketAddrV6::new(v6, 53, 0, index).into(),
-            ))
+            ]))
         };
         assert_eq!(
             route_in(&resolvers, "example.com"),
@@ -715,6 +718,19 @@ resolver #1
             "with its interface"
         );
         assert_eq!(route_in(&resolvers, "printer.local"), Some(Route::Mdns));
+        let without_tailscale: Vec<Resolver> = resolvers
+            .iter()
+            .filter(|r| r.order != 101600)
+            .cloned()
+            .collect();
+        assert_eq!(
+            route_in(&without_tailscale, "example.com"),
+            Some(Route::Servers(vec![
+                "[2a02:6b67:ea05:9200::1]:53".parse().unwrap(),
+                "192.168.50.1:53".parse().unwrap(),
+            ])),
+            "every nameserver of the resolver, in its order: the first may be down"
+        );
         assert_eq!(
             route_in(&resolvers, "notcorp.example"),
             at("100.100.100.100"),
