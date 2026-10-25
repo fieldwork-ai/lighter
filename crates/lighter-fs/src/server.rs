@@ -5096,6 +5096,13 @@ impl Server {
     /// empty, once in a dozen boots. Read first, the promise is either still
     /// there and laid over, or already kept and the stat shows it.
     fn attr_of(&self, nodeid: u64, inode: &Inode) -> Result<Attr, i32> {
+        // A queued unlink of one of its names will lower its count, and the
+        // host's count is the past until it lands, as GETATTR knows. Read
+        // here regardless, a link to it promised after an unlink of it (the
+        // same name back, pjdfstest link/03: nlink 3 for two names) answered
+        // with both, and the guest kept that count for as long as the reply
+        // said it could. Waited for only while such an unlink is queued.
+        self.settle_while(inode, |inode| inode.meta_shadowed());
         // A link's promise is added to the host's count, not laid over it as
         // a size is, so a link landing between the two reads was counted
         // twice (pjdfstest link/00 and link/03: three names, nlink 4). The
