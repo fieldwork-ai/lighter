@@ -180,6 +180,9 @@ const HEADROOM_FRACTION: u64 = 4;
 /// How long a floor set by an unplug the guest could not finish holds before
 /// a shrink may try under it again, if the guest has not grown meanwhile.
 const UNPLUG_FLOOR_HOLD: Duration = Duration::from_secs(600);
+/// How long a ceiling set by a growth the guest could not plug holds before
+/// the range may offer past it again, if the guest has not changed size.
+const PLUG_CEILING_HOLD: Duration = Duration::from_secs(600);
 /// While the Mac is under pressure short of Critical, a range grows by
 /// `GROW_STEP_MIN` at most this often, whatever asks: under the throttle's
 /// give-up of three seconds, so a burst held at the edge is still met by
@@ -217,6 +220,7 @@ impl MemoryPolicy {
             mem,
             last_line: Mutex::new(GuestLine::default()),
             unplug_floor: Mutex::new(None),
+            plug_ceiling: Mutex::new(None),
             grew_pressed: Mutex::new(None),
             vsock: Some(vsock.clone()),
             reclaiming: Arc::new(AtomicBool::new(false)),
@@ -468,6 +472,15 @@ struct Steering {
     /// the guest's driver retrying a minute's worth of migration every time
     /// a line has spare.
     unplug_floor: Mutex<Option<(u64, Instant)>>,
+    /// What was plugged when a growth went the driver's longest retry with
+    /// no block plugged towards it, and when: the range offers no more than
+    /// that until the guest's size moves or the hold has passed. An offer the guest
+    /// cannot meet stays outstanding, and an outstanding growth is a plug in
+    /// flight to `size_range`, which waits for it: on 2026-10-26 a guest
+    /// whose driver had refused its 450th block held 57 GiB for nine hours
+    /// with 55 of them free, the range never shrinking and the balloon,
+    /// which waits for the range, never offered a page.
+    plug_ceiling: Mutex<Option<(u64, Instant)>>,
     /// When the range last grew while the Mac was under pressure (`Pace`).
     grew_pressed: Mutex<Option<Instant>>,
     /// The way to the guest's agent, for a reclaim request ahead of the
@@ -588,12 +601,22 @@ impl Steering {
             }
             floor.map_or(0, |(at, _)| at)
         };
+        let ceiling = {
+            let mut ceiling = self.plug_ceiling.lock().expect("plug ceiling poisoned");
+            if ceiling
+                .is_some_and(|(at, since)| plugged != at || since.elapsed() >= PLUG_CEILING_HOLD)
+            {
+                *ceiling = None;
+            }
+            ceiling.map_or(u64::MAX, |(at, _)| at)
+        };
         let decision = size_range(
             Range {
                 plugged,
                 requested: state.requested_bytes(),
                 total: state.total_bytes(),
-                region: state.region_bytes(),
+                // A ceiling is the range ending where the guest stopped.
+                region: state.region_bytes().min(ceiling),
                 held: mem.held(),
                 floor,
                 pace,
@@ -1002,6 +1025,26 @@ impl Steering {
                 "virtio-mem: an unplug the guest could not finish; this is the floor until it grows"
             );
             *self.unplug_floor.lock().expect("unplug floor poisoned") =
+                Some((plugged, Instant::now()));
+            mem.request(plugged);
+            return;
+        }
+        // A growth the guest has not plugged a block of in the driver's
+        // longest retry is one it cannot make. The offer comes back to what is plugged, so the
+        // range is no longer waiting on it, and growth stops there until
+        // the guest's size moves or the hold has passed; the next growth is a
+        // new offer, which is what the driver needs to try again.
+        if let Some(mem) = &self.mem
+            && mem.plug_stalled()
+        {
+            let state = mem.state();
+            let plugged = state.plugged_bytes();
+            tracing::warn!(
+                plugged_mib = plugged >> 20,
+                requested_mib = state.requested_bytes() >> 20,
+                "virtio-mem: a growth the guest could not plug; this is the ceiling until it changes size or ten minutes pass"
+            );
+            *self.plug_ceiling.lock().expect("plug ceiling poisoned") =
                 Some((plugged, Instant::now()));
             mem.request(plugged);
             return;
@@ -2078,6 +2121,7 @@ mod tests {
             mem: None,
             last_line: Mutex::new(GuestLine::default()),
             unplug_floor: Mutex::new(None),
+            plug_ceiling: Mutex::new(None),
             grew_pressed: Mutex::new(None),
             vsock: None,
             reclaiming: Arc::new(AtomicBool::new(false)),
@@ -2089,6 +2133,49 @@ mod tests {
             guest_pages: AtomicU32::new(0),
         };
         (steering, transport)
+    }
+
+    /// A growth the guest never plugs is taken back, and the
+    /// range still gives spare memory back after it. The 2026-10-26 guest's
+    /// driver refused its 450th block and the range, waiting on that plug,
+    /// held 57 GiB with 55 free for nine hours.
+    #[test]
+    fn a_growth_the_guest_cannot_plug_does_not_hold_the_range_in() {
+        use crate::irq::NullIrq;
+        use crate::memory::GuestMemory;
+        use crate::virtio::mem::{Mem, MemState, PLUG_STALLED_AFTER_MS, skip_ms_for_tests};
+
+        let (mut steering, _) = steering_for_tests(2 * GIB);
+        let state = Arc::new(MemState::new(2 * GIB, 2 * GIB, 4 * GIB, 0));
+        let control = MemControl::new(
+            state.clone(),
+            Arc::new(Mutex::new(VirtioMmio::new(
+                Box::new(Mem::new(state.clone())),
+                Arc::new(GuestMemory::detached()),
+                Arc::new(NullIrq),
+            ))),
+        );
+        steering.mem = Some(control.clone());
+
+        control.request(3 * GIB);
+        state.plug_for_tests(2 * GIB);
+        skip_ms_for_tests(PLUG_STALLED_AFTER_MS + 1);
+        steering.resize_again();
+        assert_eq!(state.requested_bytes(), 2 * GIB);
+
+        // Work short of memory asks again; the range stays where the guest
+        // stopped rather than offering what it cannot plug.
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 2 * GIB);
+
+        // Quiet with most of it free: the range comes down.
+        assert!(steering.guest_sizes(line(3000, 3500), false, false));
+        assert!(state.requested_bytes() < 2 * GIB);
+
+        // A guest whose size has moved off the ceiling may grow past it.
+        state.plug_for_tests(3 * GIB / 2);
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 5 * GIB / 2);
     }
 
     fn target_mib(transport: &Arc<Mutex<VirtioMmio>>) -> u64 {

@@ -84,6 +84,10 @@ pub struct MemState {
     grown_at: AtomicU64,
     /// When the offer last changed, in the same milliseconds.
     changed_at: AtomicU64,
+    /// When the guest last plugged a block, in the same milliseconds: a
+    /// growth the guest is working through moves this, one it cannot make
+    /// does not (`MemControl::plug_stalled`).
+    plugged_at: AtomicU64,
 }
 
 impl MemState {
@@ -105,6 +109,7 @@ impl MemState {
             blocks: Mutex::new(vec![false; (region / BLOCK_SIZE) as usize]),
             grown_at: AtomicU64::new(u64::MAX),
             changed_at: AtomicU64::new(0),
+            plugged_at: AtomicU64::new(monotonic_ms()),
         }
     }
 
@@ -298,6 +303,22 @@ impl MemControl {
                 > STUCK_AFTER_MS
     }
 
+    /// Whether a growth has gone `PLUG_STALLED_AFTER_MS` with no block
+    /// plugged towards it. A driver that answers an offer with -ENOSPC (too
+    /// much of its memory counted offline, or no usable block left) does not
+    /// retry until the offer changes, and the same offer again is no offer.
+    /// Measured from the later of the offer and the last plug, so a large
+    /// growth the guest is still working through is not one it cannot make.
+    pub fn plug_stalled(&self) -> bool {
+        let state = &self.state;
+        let since = state
+            .changed_at
+            .load(Ordering::Relaxed)
+            .max(state.plugged_at.load(Ordering::Relaxed));
+        state.requested_bytes() > state.plugged_bytes()
+            && monotonic_ms().saturating_sub(since) > PLUG_STALLED_AFTER_MS
+    }
+
     /// Offers the whole range and waits, briefly, for the guest to hold it.
     ///
     /// For the moment before a container starts: what runs in it sizes
@@ -348,13 +369,43 @@ const PLUG_ALL_WAIT: std::time::Duration = std::time::Duration::from_millis(1500
 const HOLD_AFTER_GROWTH_MS: u64 = 5_000;
 /// How long an unplug may stay unfinished before it is given up.
 const STUCK_AFTER_MS: u64 = 60_000;
+/// How long a growth may go without a block plugged towards it before it is
+/// given up: past the driver's own retry after a plug it could not do now
+/// (-ENOMEM or -EBUSY: fifty seconds, doubling to five minutes), so only a
+/// growth the driver has stopped trying is taken for one it cannot make.
+pub(crate) const PLUG_STALLED_AFTER_MS: u64 = 330_000;
 
 fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
+    let ms = START
         .get_or_init(std::time::Instant::now)
         .elapsed()
-        .as_millis() as u64
+        .as_millis() as u64;
+    #[cfg(test)]
+    let ms = ms + SKIPPED_MS.get();
+    ms
+}
+
+#[cfg(test)]
+thread_local! {
+    static SKIPPED_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl MemState {
+    /// The guest plugging the range's first `bytes`, as the device's ACK does.
+    pub(crate) fn plug_for_tests(&self, bytes: u64) {
+        let mut blocks = self.blocks.lock().expect("virtio-mem blocks poisoned");
+        blocks[..(bytes / BLOCK_SIZE) as usize].fill(true);
+        self.plugged.store(bytes, Ordering::Relaxed);
+        self.plugged_at.store(monotonic_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Moves this thread's clock on, for the waits measured in minutes.
+#[cfg(test)]
+pub(crate) fn skip_ms_for_tests(ms: u64) {
+    SKIPPED_MS.set(SKIPPED_MS.get() + ms);
 }
 
 /// The base and the range for a guest of `total` bytes that boots on `base`.
@@ -453,6 +504,9 @@ impl Mem {
                 }
                 blocks[span].fill(true);
                 self.state.plugged.fetch_add(wanted, Ordering::Relaxed);
+                self.state
+                    .plugged_at
+                    .store(monotonic_ms(), Ordering::Relaxed);
                 (RESP_ACK, 0)
             }
             REQ_UNPLUG => {
@@ -586,6 +640,11 @@ impl VirtioDevice for Mem {
             .expect("virtio-mem blocks poisoned");
         blocks.fill(false);
         self.state.plugged.store(0, Ordering::Relaxed);
+        // The driver that comes back plugs the offer again from nothing;
+        // that is a growth starting now, not one that has stalled.
+        self.state
+            .plugged_at
+            .store(monotonic_ms(), Ordering::Relaxed);
     }
 }
 
@@ -701,6 +760,56 @@ mod tests {
         state.set_requested_bytes(0);
         state.available.store(4 * BLOCK_SIZE, Ordering::Release);
         assert_eq!(state.requested_bytes(), 0);
+    }
+
+    #[test]
+    fn a_growth_with_no_block_plugged_for_long_has_stalled() {
+        use crate::irq::NullIrq;
+
+        let state = Arc::new(MemState::new(1 << 30, 1 << 30, 8 * BLOCK_SIZE, 0));
+        let control = MemControl::new(
+            state.clone(),
+            Arc::new(Mutex::new(VirtioMmio::new(
+                Box::new(Mem::new(state.clone())),
+                Arc::new(GuestMemory::detached()),
+                Arc::new(NullIrq),
+            ))),
+        );
+        let mut device = Mem::new(state.clone());
+        let plug = |device: &mut Mem, block: u64| {
+            let mut request = [0u8; REQ_LEN];
+            request[0..2].copy_from_slice(&REQ_PLUG.to_le_bytes());
+            request[8..16].copy_from_slice(&(state.addr() + block * BLOCK_SIZE).to_le_bytes());
+            request[16..18].copy_from_slice(&1u16.to_le_bytes());
+            device.handle(&request, &GuestMemory::detached()).0
+        };
+
+        control.request(4 * BLOCK_SIZE);
+        assert!(!control.plug_stalled());
+        // A large growth the guest is still working through: longer than
+        // the wait since the offer, never as long since its last plug.
+        let part = PLUG_STALLED_AFTER_MS * 2 / 3;
+        skip_ms_for_tests(part);
+        assert_eq!(plug(&mut device, 0), RESP_ACK);
+        skip_ms_for_tests(part);
+        assert!(!control.plug_stalled());
+        assert_eq!(plug(&mut device, 1), RESP_ACK);
+        // Then the driver's longest retry with nothing plugged: it gave up.
+        skip_ms_for_tests(PLUG_STALLED_AFTER_MS + 1);
+        assert!(control.plug_stalled());
+        // A reset is a driver starting over, not a growth that stalled.
+        device.reset();
+        assert!(!control.plug_stalled());
+        assert_eq!(plug(&mut device, 0), RESP_ACK);
+        assert_eq!(plug(&mut device, 1), RESP_ACK);
+        // Taken back to what is plugged, nothing is outstanding.
+        control.request(state.plugged_bytes());
+        assert!(!control.plug_stalled());
+        // An unplug outstanding is `stuck`'s, not this.
+        control.request(BLOCK_SIZE);
+        skip_ms_for_tests(STUCK_AFTER_MS + 1);
+        assert!(!control.plug_stalled());
+        assert!(control.stuck());
     }
 
     #[test]
