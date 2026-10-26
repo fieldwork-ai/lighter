@@ -20,10 +20,10 @@
 //! `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE` offered, one the guest has promised
 //! not to touch.
 //!
-//! The host decides the size (`MemState::set_requested_bytes`, then the
-//! transport's configuration-change interrupt); the guest only ever asks to
-//! plug or unplug within it. Who decides, and from what, is the memory
-//! policy's business, not this file's.
+//! The host decides the size (`MemControl::offer`, then `tell_guest`, which
+//! puts it in the configuration and raises the configuration-change
+//! interrupt); the guest only ever asks to plug or unplug within it. Who
+//! decides, and from what, is the memory policy's business, not this file's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -67,6 +67,13 @@ pub struct MemState {
     addr: u64,
     region: u64,
     requested: AtomicU64,
+    /// The offer as the guest was last told it, which is what its
+    /// configuration reads. It moves only with the configuration's
+    /// generation, under the transport: the driver reads the offer in two
+    /// halves, and only a new generation between them has it read again. An
+    /// offer read live could be half of each, and a shrink across 4 GiB
+    /// from 0x1_0800_0000 to 0xf800_0000 then read as 128 MiB.
+    told: AtomicU64,
     /// Prefix safe for guest access. Eager/background modes publish completed
     /// backing; demand mode can expose the range once first-access handlers
     /// are installed. Only this memory may be offered to Linux.
@@ -102,6 +109,7 @@ impl MemState {
             addr,
             region,
             requested: AtomicU64::new(Self::round(requested.min(region))),
+            told: AtomicU64::new(Self::round(requested.min(region))),
             available: AtomicU64::new(region),
             preparation_cancelled: Mutex::new(false),
             preparation_changed: Condvar::new(),
@@ -184,10 +192,19 @@ impl MemState {
         self.plugged.load(Ordering::Relaxed)
     }
 
+    /// Puts the latest offer in the configuration and moves its generation.
+    /// It takes the transport, held, because the guest's configuration reads
+    /// take it too: told and generation then move between two reads, never
+    /// within one (`told`).
+    fn tell(&self, transport: &mut VirtioMmio) {
+        self.told
+            .store(self.requested.load(Ordering::Relaxed), Ordering::Relaxed);
+        transport.notify_config_change();
+    }
+
     /// Offers `bytes` of the range, rounded down to whole blocks and capped
-    /// at the range. The guest reads it when told the configuration changed,
-    /// so the caller raises that on the device's transport.
-    pub fn set_requested_bytes(&self, bytes: u64) -> u64 {
+    /// at the range. The guest reads it once told (`MemControl::tell_guest`).
+    fn set_requested_bytes(&self, bytes: u64) -> u64 {
         let rounded = Self::round(bytes.min(self.region));
         self.requested.store(rounded, Ordering::Relaxed);
         rounded
@@ -283,8 +300,8 @@ impl MemControl {
         if rounded > before {
             self.state.grown_at.store(now, Ordering::Relaxed);
         }
-        // Logged as made, not as told: offers reach the guest in whichever
-        // order they get the transport, and the log reads as the offers stood.
+        // Logged as made, not as told: tells can go out in either order (each
+        // tells the latest offer), and the log reads as the offers stood.
         tracing::info!(
             requested_mib = rounded >> 20,
             plugged_mib = self.state.plugged_bytes() >> 20,
@@ -295,10 +312,12 @@ impl MemControl {
 
     /// Tells the guest the offer changed (`offer`).
     pub(crate) fn tell_guest(&self) {
-        self.transport
-            .lock()
-            .expect("virtio-mem transport poisoned")
-            .notify_config_change();
+        self.state.tell(
+            &mut self
+                .transport
+                .lock()
+                .expect("virtio-mem transport poisoned"),
+        );
     }
 
     fn round_to_blocks(bytes: u64) -> u64 {
@@ -365,10 +384,7 @@ impl MemControl {
         while self.state.plugged_bytes() != region && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
             if poked.elapsed() >= std::time::Duration::from_millis(100) {
-                self.transport
-                    .lock()
-                    .expect("virtio-mem transport poisoned")
-                    .notify_config_change();
+                self.tell_guest();
                 poked = std::time::Instant::now();
             }
         }
@@ -636,7 +652,12 @@ impl VirtioDevice for Mem {
         config[24..32].copy_from_slice(&self.state.region.to_le_bytes());
         config[32..40].copy_from_slice(&self.state.available.load(Ordering::Acquire).to_le_bytes());
         config[40..48].copy_from_slice(&self.state.plugged_bytes().to_le_bytes());
-        config[48..56].copy_from_slice(&self.state.requested_bytes().to_le_bytes());
+        let told = self
+            .state
+            .told
+            .load(Ordering::Relaxed)
+            .min(self.state.available.load(Ordering::Acquire));
+        config[48..56].copy_from_slice(&told.to_le_bytes());
         let start = offset as usize;
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = config.get(start + i).copied().unwrap_or(0);
@@ -831,6 +852,48 @@ mod tests {
         skip_ms_for_tests(STUCK_AFTER_MS + 1);
         assert!(!control.plug_stalled());
         assert!(control.stuck());
+    }
+
+    /// The driver reads the offer as two halves, between two reads of the
+    /// configuration's generation, and reads it again only if the generation
+    /// moved. An offer made between the halves is not read until the guest
+    /// is told of it, and then with a new generation.
+    #[test]
+    fn the_guest_reads_an_offer_whole() {
+        use crate::bus::MmioDevice;
+        use crate::irq::NullIrq;
+
+        let gib = 1u64 << 30;
+        let state = Arc::new(MemState::new(gib, gib, 8 * gib, 4 * gib + BLOCK_SIZE));
+        let transport = Arc::new(Mutex::new(VirtioMmio::new(
+            Box::new(Mem::new(state.clone())),
+            Arc::new(GuestMemory::detached()),
+            Arc::new(NullIrq),
+        )));
+        let control = MemControl::new(state.clone(), transport.clone());
+        // One MMIO read, as one exit makes it: the transport taken for it.
+        let read = |offset: u64| {
+            let mut word = [0u8; 4];
+            transport.lock().unwrap().read(offset, &mut word);
+            u64::from(u32::from_le_bytes(word))
+        };
+        const GENERATION: u64 = 0x0fc;
+        const REQUESTED: u64 = 0x100 + 48;
+
+        let generation = read(GENERATION);
+        let low = read(REQUESTED);
+        // A shrink across 4 GiB, offered between the two halves.
+        assert!(control.offer(4 * gib - BLOCK_SIZE).is_some());
+        let high = read(REQUESTED + 4);
+        assert_eq!(read(GENERATION), generation);
+        assert_eq!(high << 32 | low, 4 * gib + BLOCK_SIZE);
+
+        control.tell_guest();
+        assert_ne!(read(GENERATION), generation);
+        assert_eq!(
+            read(REQUESTED + 4) << 32 | read(REQUESTED),
+            4 * gib - BLOCK_SIZE
+        );
     }
 
     #[test]
