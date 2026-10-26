@@ -255,12 +255,27 @@ impl MemControl {
     /// offered after rounding; the guest plugs or unplugs towards it in its
     /// own time, and `plugged_bytes` says how far it has got.
     pub fn request(&self, bytes: u64) -> u64 {
+        match self.offer(bytes) {
+            Some(rounded) => {
+                self.tell_guest();
+                rounded
+            }
+            None => self.state.requested_bytes(),
+        }
+    }
+
+    /// `request` without telling the guest: what was offered after rounding,
+    /// or none when the offer did not change. Telling it (`tell_guest`) takes
+    /// the transport, which the vCPU holds through its pass over the queue,
+    /// a block's page releases at a time on a big unplug.
+    #[must_use]
+    pub(crate) fn offer(&self, bytes: u64) -> Option<u64> {
         let before = self.state.requested_bytes();
         // The same offer again is no offer: it would restart the clock that
         // says an unplug is stuck (`stuck`), and wake the guest's driver into
         // another pass at blocks it could not unplug a second ago.
         if Self::round_to_blocks(bytes.min(self.state.region_bytes())) == before {
-            return before;
+            return None;
         }
         let rounded = self.state.set_requested_bytes(bytes);
         let now = monotonic_ms();
@@ -268,16 +283,22 @@ impl MemControl {
         if rounded > before {
             self.state.grown_at.store(now, Ordering::Relaxed);
         }
-        self.transport
-            .lock()
-            .expect("virtio-mem transport poisoned")
-            .notify_config_change();
+        // Logged as made, not as told: offers reach the guest in whichever
+        // order they get the transport, and the log reads as the offers stood.
         tracing::info!(
             requested_mib = rounded >> 20,
             plugged_mib = self.state.plugged_bytes() >> 20,
             "virtio-mem offer"
         );
-        rounded
+        Some(rounded)
+    }
+
+    /// Tells the guest the offer changed (`offer`).
+    pub(crate) fn tell_guest(&self) {
+        self.transport
+            .lock()
+            .expect("virtio-mem transport poisoned")
+            .notify_config_change();
     }
 
     fn round_to_blocks(bytes: u64) -> u64 {
