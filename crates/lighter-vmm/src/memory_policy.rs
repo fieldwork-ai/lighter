@@ -229,6 +229,7 @@ impl MemoryPolicy {
             level: AtomicU32::new(Pressure::Normal as u32),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
+            resize_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
         });
         memory_guest(vsock, steering.clone())?;
@@ -499,6 +500,12 @@ struct Steering {
     compression: Mutex<CompressionState>,
     // Publish targets in the same order they are computed from current state.
     apply_lock: Mutex<()>,
+    // One decision about the range at a time. The line, a container's start
+    // and the poll each size it, and a decision reads the floor, the ceiling
+    // and what is offered at different moments: a line that read no ceiling
+    // just before the poll set one, then read the offer the poll had taken
+    // back, grew straight past it and waited on that plug again.
+    resize_lock: Mutex<()>,
     guest_pages: AtomicU32,
 }
 
@@ -582,6 +589,7 @@ impl Steering {
     /// free pages, fragmented by what ran, a host page at a time.
     fn guest_sizes(&self, line: GuestLine, need: bool, release: bool) -> bool {
         let Some(mem) = &self.mem else { return false };
+        let _resize = self.resize_lock.lock().expect("range sizing poisoned");
         *self.last_line.lock().expect("last line poisoned") = line;
         let state = mem.state();
         let plugged = state.plugged_bytes();
@@ -1012,6 +1020,7 @@ impl Steering {
 
     /// The guest's last line, applied again: for the shrink a hold deferred.
     fn resize_again(&self) {
+        let resize = self.resize_lock.lock().expect("range sizing poisoned");
         // An unplug the driver has not finished in a minute is one it cannot
         // finish — a block holding a page that will not move — and it keeps
         // trying, at a cost in CPU. The offer goes back up to what is
@@ -1030,10 +1039,11 @@ impl Steering {
             return;
         }
         // A growth the guest has not plugged a block of in the driver's
-        // longest retry is one it cannot make. The offer comes back to what is plugged, so the
-        // range is no longer waiting on it, and growth stops there until
-        // the guest's size moves or the hold has passed; the next growth is a
-        // new offer, which is what the driver needs to try again.
+        // longest retry is one it cannot make. The offer comes back to what
+        // is plugged, so the range is no longer waiting on it, and growth
+        // stops there until the guest's size moves or the hold has passed;
+        // the next growth is a new offer, which is what the driver needs to
+        // try again.
         if let Some(mem) = &self.mem
             && mem.plug_stalled()
         {
@@ -1049,6 +1059,7 @@ impl Steering {
             mem.request(plugged);
             return;
         }
+        drop(resize);
         if self.mem.as_ref().is_some_and(|m| !m.held()) {
             let line = *self.last_line.lock().expect("last line poisoned");
             if line.spare_mib > 0 {
@@ -2130,17 +2141,16 @@ mod tests {
             level: AtomicU32::new(NORMAL),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
+            resize_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
         };
         (steering, transport)
     }
 
-    /// A growth the guest never plugs is taken back, and the
-    /// range still gives spare memory back after it. The 2026-10-26 guest's
-    /// driver refused its 450th block and the range, waiting on that plug,
-    /// held 57 GiB with 55 free for nine hours.
-    #[test]
-    fn a_growth_the_guest_cannot_plug_does_not_hold_the_range_in() {
+    /// A machine with a range of 4 GiB beside a base of 2, offered 3 and
+    /// holding 2, whose guest stopped plugging long enough ago to have
+    /// given up: the state the 2026-10-26 guest was in at its 450th block.
+    fn stalled_growth() -> (Steering, Arc<crate::virtio::mem::MemState>) {
         use crate::irq::NullIrq;
         use crate::memory::GuestMemory;
         use crate::virtio::mem::{Mem, MemState, PLUG_STALLED_AFTER_MS, skip_ms_for_tests};
@@ -2156,10 +2166,19 @@ mod tests {
             ))),
         );
         steering.mem = Some(control.clone());
-
         control.request(3 * GIB);
         state.plug_for_tests(2 * GIB);
         skip_ms_for_tests(PLUG_STALLED_AFTER_MS + 1);
+        (steering, state)
+    }
+
+    /// A growth the guest never plugs is taken back, and the range still
+    /// gives spare memory back after it. The 2026-10-26 guest's driver
+    /// refused its 450th block and the range, waiting on that plug, held
+    /// 57 GiB with 55 free for nine hours.
+    #[test]
+    fn a_growth_the_guest_cannot_plug_does_not_hold_the_range_in() {
+        let (steering, state) = stalled_growth();
         steering.resize_again();
         assert_eq!(state.requested_bytes(), 2 * GIB);
 
@@ -2176,6 +2195,28 @@ mod tests {
         state.plug_for_tests(3 * GIB / 2);
         assert!(steering.guest_sizes(line(0, 0), true, false));
         assert_eq!(state.requested_bytes(), 5 * GIB / 2);
+    }
+
+    /// A ceiling lapses after its hold even if the guest's size never moved,
+    /// so a guest whose driver could plug again is offered more.
+    #[test]
+    fn a_ceiling_lapses_after_its_hold() {
+        let (steering, state) = stalled_growth();
+        steering.resize_again();
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 2 * GIB);
+
+        let set = Instant::now() - PLUG_CEILING_HOLD;
+        steering
+            .plug_ceiling
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("the stall set a ceiling")
+            .1 = set;
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 3 * GIB);
+        assert!(steering.plug_ceiling.lock().unwrap().is_none());
     }
 
     fn target_mib(transport: &Arc<Mutex<VirtioMmio>>) -> u64 {
