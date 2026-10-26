@@ -1,0 +1,77 @@
+virtio_mem: offline_size counts a block's page array both ways
+
+Patch 0024 adds hot-plugged blocks with their page array inside them
+(MHP_MEMMAP_ON_MEMORY). Adding a block counts the whole of it into
+offline_size, but the memory notifier is told only the pages past the
+array: online_pages() is handed nr_pages less the block's vmemmap pages,
+and so is the MEM_ONLINE notification. Each online therefore takes 126 MiB
+back out of the 128 MiB a block put in, and 2 MiB per plugged block stays
+behind in offline_size for as long as the block is plugged (offlining it
+puts 126 MiB back and removing it takes the 128 out).
+
+offline_size is what virtio_mem_could_add_memory() checks against its
+threshold of 1 GiB before every plug. After 448 blocks the residue is
+896 MiB and the 449th still fits (896 + 128 = 1024); the 450th does not,
+and the plug request returns -ENOSPC. The main loop does not retry
+-ENOSPC: it waits for the device's next configuration change. So a guest
+can never hold more than 449 blocks (2 GiB of base and 56 GiB of range)
+whatever it is offered, and the request it could not meet stays
+outstanding with nothing to say so. Seen on a 64 GB Mac with
+cooperative resources: plugged 0xe08000000, requested 0xe10000000, no
+plug, no retry timer, no message, while the host waited for that plug
+for nine hours and did nothing else with the range.
+
+The notifier now counts the block's page array with its pages, using the
+lookup 0024 added for the unplug path, so onlining and offlining move
+offline_size by exactly what adding and removing do.
+
+diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
+index ee45897..cfbcb33 100644
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -285,6 +285,7 @@ static void virtio_mem_fake_offline_cancel_offline(unsigned long pfn,
+ static void virtio_mem_retry(struct virtio_mem *vm);
+ static int virtio_mem_create_resource(struct virtio_mem *vm);
+ static void virtio_mem_delete_resource(struct virtio_mem *vm);
++static unsigned long virtio_mem_vmemmap_pages(unsigned long pfn);
+ 
+ /*
+  * Register a virtio-mem device so it will be considered for the online_page
+@@ -983,6 +984,19 @@ static void virtio_mem_bbm_notify_cancel_offline(struct virtio_mem *vm,
+ 	virtio_mem_fake_offline_cancel_offline(pfn, nr_pages);
+ }
+ 
++/*
++ * What onlining or offlining the pages of a notification moves in or out of
++ * offline_size: the pages, and the block's own page array when it carries
++ * one (memmap_on_memory). Adding counts the whole block, and the notifier is
++ * told only the pages past the array, so without it each online leaves the
++ * array's size behind in offline_size.
++ */
++static unsigned long virtio_mem_notified_size(struct memory_notify *mhp)
++{
++	return PFN_PHYS(mhp->nr_pages +
++			virtio_mem_vmemmap_pages(mhp->start_pfn));
++}
++
+ /*
+  * This callback will either be called synchronously from add_memory() or
+  * asynchronously (e.g., triggered via user space). We have to be careful
+@@ -1063,7 +1077,7 @@ static int virtio_mem_memory_notifier_cb(struct notifier_block *nb,
+ 		if (vm->in_sbm)
+ 			virtio_mem_sbm_notify_offline(vm, id);
+ 
+-		atomic64_add(size, &vm->offline_size);
++		atomic64_add(virtio_mem_notified_size(mhp), &vm->offline_size);
+ 		/*
+ 		 * Trigger the workqueue. Now that we have some offline memory,
+ 		 * maybe we can handle pending unplug requests.
+@@ -1078,7 +1092,7 @@ static int virtio_mem_memory_notifier_cb(struct notifier_block *nb,
+ 		if (vm->in_sbm)
+ 			virtio_mem_sbm_notify_online(vm, id, mhp->start_pfn);
+ 
+-		atomic64_sub(size, &vm->offline_size);
++		atomic64_sub(virtio_mem_notified_size(mhp), &vm->offline_size);
+ 		/*
+ 		 * Start adding more memory once we onlined half of our
+ 		 * threshold. Don't trigger if it's possibly due to our actipn
