@@ -20,10 +20,10 @@
 //! `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE` offered, one the guest has promised
 //! not to touch.
 //!
-//! The host decides the size (`MemState::set_requested_bytes`, then the
-//! transport's configuration-change interrupt); the guest only ever asks to
-//! plug or unplug within it. Who decides, and from what, is the memory
-//! policy's business, not this file's.
+//! The host decides the size (`MemControl::offer`, then `tell_guest`, which
+//! puts it in the configuration and raises the configuration-change
+//! interrupt); the guest only ever asks to plug or unplug within it. Who
+//! decides, and from what, is the memory policy's business, not this file's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -67,6 +67,13 @@ pub struct MemState {
     addr: u64,
     region: u64,
     requested: AtomicU64,
+    /// The offer as the guest was last told it, which is what its
+    /// configuration reads and what its plugs are checked against. It moves only with the configuration's
+    /// generation, under the transport: the driver reads the offer in two
+    /// halves, and only a new generation between them has it read again. An
+    /// offer read live could be half of each, and a shrink across 4 GiB
+    /// from 0x1_0800_0000 to 0xf800_0000 then read as 128 MiB.
+    told: AtomicU64,
     /// Prefix safe for guest access. Eager/background modes publish completed
     /// backing; demand mode can expose the range once first-access handlers
     /// are installed. Only this memory may be offered to Linux.
@@ -84,6 +91,10 @@ pub struct MemState {
     grown_at: AtomicU64,
     /// When the offer last changed, in the same milliseconds.
     changed_at: AtomicU64,
+    /// When the guest last plugged a block, in the same milliseconds: a
+    /// growth the guest is working through moves this, one it cannot make
+    /// does not (`MemControl::plug_stalled`).
+    plugged_at: AtomicU64,
 }
 
 impl MemState {
@@ -98,6 +109,7 @@ impl MemState {
             addr,
             region,
             requested: AtomicU64::new(Self::round(requested.min(region))),
+            told: AtomicU64::new(Self::round(requested.min(region))),
             available: AtomicU64::new(region),
             preparation_cancelled: Mutex::new(false),
             preparation_changed: Condvar::new(),
@@ -105,6 +117,7 @@ impl MemState {
             blocks: Mutex::new(vec![false; (region / BLOCK_SIZE) as usize]),
             grown_at: AtomicU64::new(u64::MAX),
             changed_at: AtomicU64::new(0),
+            plugged_at: AtomicU64::new(monotonic_ms()),
         }
     }
 
@@ -136,6 +149,14 @@ impl MemState {
 
     pub fn requested_bytes(&self) -> u64 {
         self.requested
+            .load(Ordering::Relaxed)
+            .min(self.available.load(Ordering::Acquire))
+    }
+
+    /// The offer as the guest's configuration shows it (`told`), within
+    /// what is ready to be plugged.
+    fn told_bytes(&self) -> u64 {
+        self.told
             .load(Ordering::Relaxed)
             .min(self.available.load(Ordering::Acquire))
     }
@@ -179,10 +200,19 @@ impl MemState {
         self.plugged.load(Ordering::Relaxed)
     }
 
+    /// Puts the latest offer in the configuration and moves its generation.
+    /// It takes the transport, held, because the guest's configuration reads
+    /// take it too: told and generation then move between two reads, never
+    /// within one (`told`).
+    fn tell(&self, transport: &mut VirtioMmio) {
+        self.told
+            .store(self.requested.load(Ordering::Relaxed), Ordering::Relaxed);
+        transport.notify_config_change();
+    }
+
     /// Offers `bytes` of the range, rounded down to whole blocks and capped
-    /// at the range. The guest reads it when told the configuration changed,
-    /// so the caller raises that on the device's transport.
-    pub fn set_requested_bytes(&self, bytes: u64) -> u64 {
+    /// at the range. The guest reads it once told (`MemControl::tell_guest`).
+    fn set_requested_bytes(&self, bytes: u64) -> u64 {
         let rounded = Self::round(bytes.min(self.region));
         self.requested.store(rounded, Ordering::Relaxed);
         rounded
@@ -250,12 +280,27 @@ impl MemControl {
     /// offered after rounding; the guest plugs or unplugs towards it in its
     /// own time, and `plugged_bytes` says how far it has got.
     pub fn request(&self, bytes: u64) -> u64 {
+        match self.offer(bytes) {
+            Some(rounded) => {
+                self.tell_guest();
+                rounded
+            }
+            None => self.state.requested_bytes(),
+        }
+    }
+
+    /// `request` without telling the guest: what was offered after rounding,
+    /// or none when the offer did not change. Telling it (`tell_guest`) takes
+    /// the transport, which the vCPU holds through its pass over the queue,
+    /// a block's page releases at a time on a big unplug.
+    #[must_use]
+    pub(crate) fn offer(&self, bytes: u64) -> Option<u64> {
         let before = self.state.requested_bytes();
         // The same offer again is no offer: it would restart the clock that
         // says an unplug is stuck (`stuck`), and wake the guest's driver into
         // another pass at blocks it could not unplug a second ago.
         if Self::round_to_blocks(bytes.min(self.state.region_bytes())) == before {
-            return before;
+            return None;
         }
         let rounded = self.state.set_requested_bytes(bytes);
         let now = monotonic_ms();
@@ -263,16 +308,24 @@ impl MemControl {
         if rounded > before {
             self.state.grown_at.store(now, Ordering::Relaxed);
         }
-        self.transport
-            .lock()
-            .expect("virtio-mem transport poisoned")
-            .notify_config_change();
+        // Logged as made, not as told: tells can go out in either order (each
+        // tells the latest offer), and the log reads as the offers stood.
         tracing::info!(
             requested_mib = rounded >> 20,
             plugged_mib = self.state.plugged_bytes() >> 20,
             "virtio-mem offer"
         );
-        rounded
+        Some(rounded)
+    }
+
+    /// Tells the guest the offer changed (`offer`).
+    pub(crate) fn tell_guest(&self) {
+        self.state.tell(
+            &mut self
+                .transport
+                .lock()
+                .expect("virtio-mem transport poisoned"),
+        );
     }
 
     fn round_to_blocks(bytes: u64) -> u64 {
@@ -296,6 +349,22 @@ impl MemControl {
         state.requested_bytes() < state.plugged_bytes()
             && monotonic_ms().saturating_sub(state.changed_at.load(Ordering::Relaxed))
                 > STUCK_AFTER_MS
+    }
+
+    /// Whether a growth has gone `PLUG_STALLED_AFTER_MS` with no block
+    /// plugged towards it. A driver that answers an offer with -ENOSPC (too
+    /// much of its memory counted offline, or no usable block left) does not
+    /// retry until the offer changes, and the same offer again is no offer.
+    /// Measured from the later of the offer and the last plug, so a large
+    /// growth the guest is still working through is not one it cannot make.
+    pub fn plug_stalled(&self) -> bool {
+        let state = &self.state;
+        let since = state
+            .changed_at
+            .load(Ordering::Relaxed)
+            .max(state.plugged_at.load(Ordering::Relaxed));
+        state.requested_bytes() > state.plugged_bytes()
+            && monotonic_ms().saturating_sub(since) > PLUG_STALLED_AFTER_MS
     }
 
     /// Offers the whole range and waits, briefly, for the guest to hold it.
@@ -323,10 +392,7 @@ impl MemControl {
         while self.state.plugged_bytes() != region && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
             if poked.elapsed() >= std::time::Duration::from_millis(100) {
-                self.transport
-                    .lock()
-                    .expect("virtio-mem transport poisoned")
-                    .notify_config_change();
+                self.tell_guest();
                 poked = std::time::Instant::now();
             }
         }
@@ -348,13 +414,43 @@ const PLUG_ALL_WAIT: std::time::Duration = std::time::Duration::from_millis(1500
 const HOLD_AFTER_GROWTH_MS: u64 = 5_000;
 /// How long an unplug may stay unfinished before it is given up.
 const STUCK_AFTER_MS: u64 = 60_000;
+/// How long a growth may go without a block plugged towards it before it is
+/// given up: past the driver's own retry after a plug it could not do now
+/// (-ENOMEM or -EBUSY: fifty seconds, doubling to five minutes), so only a
+/// growth the driver has stopped trying is taken for one it cannot make.
+pub(crate) const PLUG_STALLED_AFTER_MS: u64 = 330_000;
 
 fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
+    let ms = START
         .get_or_init(std::time::Instant::now)
         .elapsed()
-        .as_millis() as u64
+        .as_millis() as u64;
+    #[cfg(test)]
+    let ms = ms + SKIPPED_MS.get();
+    ms
+}
+
+#[cfg(test)]
+thread_local! {
+    static SKIPPED_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl MemState {
+    /// The guest plugging the range's first `bytes`, as the device's ACK does.
+    pub(crate) fn plug_for_tests(&self, bytes: u64) {
+        let mut blocks = self.blocks.lock().expect("virtio-mem blocks poisoned");
+        blocks[..(bytes / BLOCK_SIZE) as usize].fill(true);
+        self.plugged.store(bytes, Ordering::Relaxed);
+        self.plugged_at.store(monotonic_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Moves this thread's clock on, for the waits measured in minutes.
+#[cfg(test)]
+pub(crate) fn skip_ms_for_tests(ms: u64) {
+    SKIPPED_MS.set(SKIPPED_MS.get() + ms);
 }
 
 /// The base and the range for a guest of `total` bytes that boots on `base`.
@@ -446,13 +542,22 @@ impl Mem {
                 if blocks[span.clone()].iter().any(|&b| b) {
                     return (RESP_NACK, 0);
                 }
+                // Against what the guest was told, not a lower offer it has
+                // yet to be told of: the driver retries a NACK at once and
+                // without reading the configuration again, so such a plug
+                // would spin, NACKed, until the host's tell got the
+                // transport. A block plugged past the lower offer is taken
+                // back once the guest is told.
                 let plugged = self.state.plugged_bytes();
                 let wanted = count as u64 * BLOCK_SIZE;
-                if plugged + wanted > self.state.requested_bytes() {
+                if plugged + wanted > self.state.told_bytes() {
                     return (RESP_NACK, 0);
                 }
                 blocks[span].fill(true);
                 self.state.plugged.fetch_add(wanted, Ordering::Relaxed);
+                self.state
+                    .plugged_at
+                    .store(monotonic_ms(), Ordering::Relaxed);
                 (RESP_ACK, 0)
             }
             REQ_UNPLUG => {
@@ -561,7 +666,7 @@ impl VirtioDevice for Mem {
         config[24..32].copy_from_slice(&self.state.region.to_le_bytes());
         config[32..40].copy_from_slice(&self.state.available.load(Ordering::Acquire).to_le_bytes());
         config[40..48].copy_from_slice(&self.state.plugged_bytes().to_le_bytes());
-        config[48..56].copy_from_slice(&self.state.requested_bytes().to_le_bytes());
+        config[48..56].copy_from_slice(&self.state.told_bytes().to_le_bytes());
         let start = offset as usize;
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = config.get(start + i).copied().unwrap_or(0);
@@ -586,12 +691,26 @@ impl VirtioDevice for Mem {
             .expect("virtio-mem blocks poisoned");
         blocks.fill(false);
         self.state.plugged.store(0, Ordering::Relaxed);
+        // The driver that comes back plugs the offer again from nothing;
+        // that is a growth starting now, not one that has stalled.
+        self.state
+            .plugged_at
+            .store(monotonic_ms(), Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest asking to plug block `block` of the range.
+    fn plug(device: &mut Mem, state: &MemState, block: u64) -> u16 {
+        let mut request = [0u8; REQ_LEN];
+        request[0..2].copy_from_slice(&REQ_PLUG.to_le_bytes());
+        request[8..16].copy_from_slice(&(state.addr() + block * BLOCK_SIZE).to_le_bytes());
+        request[16..18].copy_from_slice(&1u16.to_le_bytes());
+        device.handle(&request, &GuestMemory::detached()).0
+    }
 
     #[test]
     fn backing_wait_requires_the_whole_range_and_shutdown_wakes_it() {
@@ -701,6 +820,125 @@ mod tests {
         state.set_requested_bytes(0);
         state.available.store(4 * BLOCK_SIZE, Ordering::Release);
         assert_eq!(state.requested_bytes(), 0);
+    }
+
+    #[test]
+    fn a_growth_with_no_block_plugged_for_long_has_stalled() {
+        use crate::irq::NullIrq;
+
+        let state = Arc::new(MemState::new(1 << 30, 1 << 30, 8 * BLOCK_SIZE, 0));
+        let control = MemControl::new(
+            state.clone(),
+            Arc::new(Mutex::new(VirtioMmio::new(
+                Box::new(Mem::new(state.clone())),
+                Arc::new(GuestMemory::detached()),
+                Arc::new(NullIrq),
+            ))),
+        );
+        let mut device = Mem::new(state.clone());
+
+        control.request(4 * BLOCK_SIZE);
+        assert!(!control.plug_stalled());
+        // A large growth the guest is still working through: longer than
+        // the wait since the offer, never as long since its last plug.
+        let part = PLUG_STALLED_AFTER_MS * 2 / 3;
+        skip_ms_for_tests(part);
+        assert_eq!(plug(&mut device, &state, 0), RESP_ACK);
+        skip_ms_for_tests(part);
+        assert!(!control.plug_stalled());
+        assert_eq!(plug(&mut device, &state, 1), RESP_ACK);
+        // Then the driver's longest retry with nothing plugged: it gave up.
+        skip_ms_for_tests(PLUG_STALLED_AFTER_MS + 1);
+        assert!(control.plug_stalled());
+        // A reset is a driver starting over, not a growth that stalled.
+        device.reset();
+        assert!(!control.plug_stalled());
+        assert_eq!(plug(&mut device, &state, 0), RESP_ACK);
+        assert_eq!(plug(&mut device, &state, 1), RESP_ACK);
+        // Taken back to what is plugged, nothing is outstanding.
+        control.request(state.plugged_bytes());
+        assert!(!control.plug_stalled());
+        // An unplug outstanding is `stuck`'s, not this.
+        control.request(BLOCK_SIZE);
+        skip_ms_for_tests(STUCK_AFTER_MS + 1);
+        assert!(!control.plug_stalled());
+        assert!(control.stuck());
+    }
+
+    /// The driver reads the offer as two halves, between two reads of the
+    /// configuration's generation, and reads it again only if the generation
+    /// moved. An offer made between the halves is not read until the guest
+    /// is told of it, and then with a new generation.
+    #[test]
+    fn the_guest_reads_an_offer_whole() {
+        use crate::bus::MmioDevice;
+        use crate::irq::NullIrq;
+
+        let gib = 1u64 << 30;
+        let state = Arc::new(MemState::new(gib, gib, 8 * gib, 4 * gib + BLOCK_SIZE));
+        let transport = Arc::new(Mutex::new(VirtioMmio::new(
+            Box::new(Mem::new(state.clone())),
+            Arc::new(GuestMemory::detached()),
+            Arc::new(NullIrq),
+        )));
+        let control = MemControl::new(state.clone(), transport.clone());
+        // One MMIO read, as one exit makes it: the transport taken for it.
+        let read = |offset: u64| {
+            let mut word = [0u8; 4];
+            transport.lock().unwrap().read(offset, &mut word);
+            u64::from(u32::from_le_bytes(word))
+        };
+        const GENERATION: u64 = 0x0fc;
+        const REQUESTED: u64 = 0x100 + 48;
+
+        let generation = read(GENERATION);
+        let low = read(REQUESTED);
+        // A shrink across 4 GiB, offered between the two halves.
+        assert!(control.offer(4 * gib - BLOCK_SIZE).is_some());
+        let high = read(REQUESTED + 4);
+        assert_eq!(read(GENERATION), generation);
+        assert_eq!(high << 32 | low, 4 * gib + BLOCK_SIZE);
+
+        control.tell_guest();
+        assert_ne!(read(GENERATION), generation);
+        assert_eq!(
+            read(REQUESTED + 4) << 32 | read(REQUESTED),
+            4 * gib - BLOCK_SIZE
+        );
+    }
+
+    /// A plug is checked against the offer the guest was told: within it
+    /// after a lower offer it has not been told of yet, and not past it
+    /// into a higher one.
+    #[test]
+    fn a_plug_is_checked_against_what_the_guest_was_told() {
+        use crate::irq::NullIrq;
+
+        let state = Arc::new(MemState::new(1 << 30, 1 << 30, 8 * BLOCK_SIZE, 0));
+        let control = MemControl::new(
+            state.clone(),
+            Arc::new(Mutex::new(VirtioMmio::new(
+                Box::new(Mem::new(state.clone())),
+                Arc::new(GuestMemory::detached()),
+                Arc::new(NullIrq),
+            ))),
+        );
+        let mut device = Mem::new(state.clone());
+
+        control.request(4 * BLOCK_SIZE);
+        assert_eq!(plug(&mut device, &state, 0), RESP_ACK);
+        // A shrink the guest has not been told of: its next plug, within
+        // what it was told, is not refused.
+        assert!(control.offer(BLOCK_SIZE).is_some());
+        assert_eq!(plug(&mut device, &state, 1), RESP_ACK);
+        // Told, it plugs no more; the extra block goes back as any shrink's.
+        control.tell_guest();
+        assert_eq!(plug(&mut device, &state, 2), RESP_NACK);
+        // A growth it has not been told of is not plugged into.
+        assert!(control.offer(4 * BLOCK_SIZE).is_some());
+        assert_eq!(plug(&mut device, &state, 2), RESP_NACK);
+        control.tell_guest();
+        assert_eq!(plug(&mut device, &state, 2), RESP_ACK);
     }
 
     #[test]

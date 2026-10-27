@@ -180,6 +180,9 @@ const HEADROOM_FRACTION: u64 = 4;
 /// How long a floor set by an unplug the guest could not finish holds before
 /// a shrink may try under it again, if the guest has not grown meanwhile.
 const UNPLUG_FLOOR_HOLD: Duration = Duration::from_secs(600);
+/// How long a ceiling set by a growth the guest could not plug holds before
+/// the range may offer past it again, if the guest has not changed size.
+const PLUG_CEILING_HOLD: Duration = Duration::from_secs(600);
 /// While the Mac is under pressure short of Critical, a range grows by
 /// `GROW_STEP_MIN` at most this often, whatever asks: under the throttle's
 /// give-up of three seconds, so a burst held at the edge is still met by
@@ -217,6 +220,7 @@ impl MemoryPolicy {
             mem,
             last_line: Mutex::new(GuestLine::default()),
             unplug_floor: Mutex::new(None),
+            plug_ceiling: Mutex::new(None),
             grew_pressed: Mutex::new(None),
             vsock: Some(vsock.clone()),
             reclaiming: Arc::new(AtomicBool::new(false)),
@@ -225,6 +229,7 @@ impl MemoryPolicy {
             level: AtomicU32::new(Pressure::Normal as u32),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
+            resize_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
         });
         memory_guest(vsock, steering.clone())?;
@@ -334,12 +339,14 @@ pub struct MakeWhole(Arc<Steering>);
 
 impl MakeWhole {
     pub fn call(&self) -> std::io::Result<()> {
-        if self.0.mem.is_none() {
+        let Some(mem) = &self.0.mem else {
             return Ok(());
-        }
+        };
         self.0.guest_offers(0, true);
-        let line = *self.0.last_line.lock().expect("last line poisoned");
-        let _ = self.0.guest_sizes(line, false, false);
+        self.0.sizing(mem, || {
+            let line = *self.0.last_line.lock().expect("last line poisoned");
+            ((), self.0.size_locked(mem, line, false, false).1)
+        });
         Ok(())
     }
 }
@@ -468,6 +475,15 @@ struct Steering {
     /// the guest's driver retrying a minute's worth of migration every time
     /// a line has spare.
     unplug_floor: Mutex<Option<(u64, Instant)>>,
+    /// What was plugged when a growth went the driver's longest retry with
+    /// no block plugged towards it, and when: the range offers no more than
+    /// that until the guest's size moves or the hold has passed. An offer the guest
+    /// cannot meet stays outstanding, and an outstanding growth is a plug in
+    /// flight to `size_range`, which waits for it: on 2026-10-26 a guest
+    /// whose driver had refused its 450th block held 57 GiB for nine hours
+    /// with 55 of them free, the range never shrinking and the balloon,
+    /// which waits for the range, never offered a page.
+    plug_ceiling: Mutex<Option<(u64, Instant)>>,
     /// When the range last grew while the Mac was under pressure (`Pace`).
     grew_pressed: Mutex<Option<Instant>>,
     /// The way to the guest's agent, for a reclaim request ahead of the
@@ -486,6 +502,17 @@ struct Steering {
     compression: Mutex<CompressionState>,
     // Publish targets in the same order they are computed from current state.
     apply_lock: Mutex<()>,
+    // One decision about the range at a time. The line, a container's start
+    // and the poll each size it, and a decision reads the floor, the ceiling
+    // and what is offered at different moments: a line that read no ceiling
+    // just before the poll set one, then read the offer the poll had taken
+    // back, grew straight past it and waited on that plug again. The guest's
+    // last line is read under it too: one read before it can be older than
+    // a line sized meanwhile, and was then sized for again and written back.
+    // The guest is told of an offer once it is let go: telling it waits on
+    // the vCPU's pass over the queue, and a container's start (`MakeWhole`,
+    // on the Docker request) would wait behind every other path's.
+    resize_lock: Mutex<()>,
     guest_pages: AtomicU32,
 }
 
@@ -569,7 +596,33 @@ impl Steering {
     /// free pages, fragmented by what ran, a host page at a time.
     fn guest_sizes(&self, line: GuestLine, need: bool, release: bool) -> bool {
         let Some(mem) = &self.mem else { return false };
-        *self.last_line.lock().expect("last line poisoned") = line;
+        self.sizing(mem, || {
+            *self.last_line.lock().expect("last line poisoned") = line;
+            self.size_locked(mem, line, need, release)
+        })
+    }
+
+    /// Decides under the sizing lock (`resize_lock`), then tells the guest
+    /// of the offer the decision made, if it made one.
+    fn sizing<T>(&self, mem: &MemControl, decide: impl FnOnce() -> (T, Option<u64>)) -> T {
+        let (decided, offer) = {
+            let _resize = self.resize_lock.lock().expect("range sizing poisoned");
+            decide()
+        };
+        if offer.is_some() {
+            mem.tell_guest();
+        }
+        decided
+    }
+
+    /// `guest_sizes`' decision: whether the line was taken, and the offer.
+    fn size_locked(
+        &self,
+        mem: &MemControl,
+        line: GuestLine,
+        need: bool,
+        release: bool,
+    ) -> (bool, Option<u64>) {
         let state = mem.state();
         let plugged = state.plugged_bytes();
         let pace = self.pace();
@@ -588,12 +641,22 @@ impl Steering {
             }
             floor.map_or(0, |(at, _)| at)
         };
+        let ceiling = {
+            let mut ceiling = self.plug_ceiling.lock().expect("plug ceiling poisoned");
+            if ceiling
+                .is_some_and(|(at, since)| plugged != at || since.elapsed() >= PLUG_CEILING_HOLD)
+            {
+                *ceiling = None;
+            }
+            ceiling.map_or(u64::MAX, |(at, _)| at)
+        };
         let decision = size_range(
             Range {
                 plugged,
                 requested: state.requested_bytes(),
                 total: state.total_bytes(),
-                region: state.region_bytes(),
+                // A ceiling is the range ending where the guest stopped.
+                region: state.region_bytes().min(ceiling),
                 held: mem.held(),
                 floor,
                 pace,
@@ -607,11 +670,10 @@ impl Steering {
                     *self.grew_pressed.lock().expect("pressed growth poisoned") =
                         Some(Instant::now());
                 }
-                mem.request(target);
-                true
+                (true, mem.offer(target))
             }
-            Sizing::Wait => true,
-            Sizing::Pass => false,
+            Sizing::Wait => (true, None),
+            Sizing::Pass => (false, None),
         }
     }
 
@@ -989,13 +1051,17 @@ impl Steering {
 
     /// The guest's last line, applied again: for the shrink a hold deferred.
     fn resize_again(&self) {
+        let Some(mem) = &self.mem else { return };
+        self.sizing(mem, || ((), self.resize_again_locked(mem)));
+    }
+
+    /// `resize_again`'s decision: the offer, if it made one.
+    fn resize_again_locked(&self, mem: &MemControl) -> Option<u64> {
         // An unplug the driver has not finished in a minute is one it cannot
         // finish — a block holding a page that will not move — and it keeps
         // trying, at a cost in CPU. The offer goes back up to what is
         // plugged, and the block stays until the next shrink asks again.
-        if let Some(mem) = &self.mem
-            && mem.stuck()
-        {
+        if mem.stuck() {
             let plugged = mem.state().plugged_bytes();
             tracing::info!(
                 plugged_mib = plugged >> 20,
@@ -1003,15 +1069,34 @@ impl Steering {
             );
             *self.unplug_floor.lock().expect("unplug floor poisoned") =
                 Some((plugged, Instant::now()));
-            mem.request(plugged);
-            return;
+            return mem.offer(plugged);
         }
-        if self.mem.as_ref().is_some_and(|m| !m.held()) {
-            let line = *self.last_line.lock().expect("last line poisoned");
-            if line.spare_mib > 0 {
-                let _ = self.guest_sizes(line, false, false);
-            }
+        // A growth the guest has not plugged a block of in the driver's
+        // longest retry is one it cannot make. The offer comes back to what
+        // is plugged, so the range is no longer waiting on it, and growth
+        // stops there until the guest's size moves or the hold has passed;
+        // the next growth is a new offer, which is what the driver needs to
+        // try again.
+        if mem.plug_stalled() {
+            let state = mem.state();
+            let plugged = state.plugged_bytes();
+            tracing::warn!(
+                plugged_mib = plugged >> 20,
+                requested_mib = state.requested_bytes() >> 20,
+                "virtio-mem: a growth the guest could not plug; this is the ceiling until it changes size or ten minutes pass"
+            );
+            *self.plug_ceiling.lock().expect("plug ceiling poisoned") =
+                Some((plugged, Instant::now()));
+            return mem.offer(plugged);
         }
+        if mem.held() {
+            return None;
+        }
+        let line = *self.last_line.lock().expect("last line poisoned");
+        if line.spare_mib == 0 {
+            return None;
+        }
+        self.size_locked(mem, line, false, false).1
     }
 
     fn apply(&self) {
@@ -2078,6 +2163,7 @@ mod tests {
             mem: None,
             last_line: Mutex::new(GuestLine::default()),
             unplug_floor: Mutex::new(None),
+            plug_ceiling: Mutex::new(None),
             grew_pressed: Mutex::new(None),
             vsock: None,
             reclaiming: Arc::new(AtomicBool::new(false)),
@@ -2086,9 +2172,198 @@ mod tests {
             level: AtomicU32::new(NORMAL),
             compression: Mutex::new(CompressionState::default()),
             apply_lock: Mutex::new(()),
+            resize_lock: Mutex::new(()),
             guest_pages: AtomicU32::new(0),
         };
         (steering, transport)
+    }
+
+    /// A machine with a range of 4 GiB beside a base of 2, offered 3 and
+    /// holding 2, whose guest stopped plugging long enough ago to have
+    /// given up: the state the 2026-10-26 guest was in at its 450th block.
+    fn stalled_growth() -> (
+        Steering,
+        Arc<crate::virtio::mem::MemState>,
+        Arc<Mutex<VirtioMmio>>,
+    ) {
+        use crate::virtio::mem::{PLUG_STALLED_AFTER_MS, skip_ms_for_tests};
+
+        let (steering, state, transport) = range_steering();
+        steering.mem.as_ref().expect("a range").request(3 * GIB);
+        state.plug_for_tests(2 * GIB);
+        skip_ms_for_tests(PLUG_STALLED_AFTER_MS + 1);
+        (steering, state, transport)
+    }
+
+    /// A machine with a range of 4 GiB beside a base of 2 and none of it
+    /// offered yet, and the transport its guest is told through.
+    fn range_steering() -> (
+        Steering,
+        Arc<crate::virtio::mem::MemState>,
+        Arc<Mutex<VirtioMmio>>,
+    ) {
+        use crate::irq::NullIrq;
+        use crate::memory::GuestMemory;
+        use crate::virtio::mem::{Mem, MemState};
+
+        let (mut steering, _) = steering_for_tests(2 * GIB);
+        let state = Arc::new(MemState::new(2 * GIB, 2 * GIB, 4 * GIB, 0));
+        let transport = Arc::new(Mutex::new(VirtioMmio::new(
+            Box::new(Mem::new(state.clone())),
+            Arc::new(GuestMemory::detached()),
+            Arc::new(NullIrq),
+        )));
+        steering.mem = Some(MemControl::new(state.clone(), transport.clone()));
+        (steering, state, transport)
+    }
+
+    /// `size` reads the guest's line only once it holds the sizing lock.
+    /// The line is held here until `size` has the lock, then changed: code
+    /// that read it before taking the lock never takes the lock while this
+    /// waits, and is caught by the deadline.
+    fn reads_the_line_under_the_sizing_lock(size: impl FnOnce(Arc<Steering>) + Send + 'static) {
+        let (steering, _, _) = range_steering();
+        let steering = Arc::new(steering);
+        let mut line_now = steering.last_line.lock().unwrap();
+        let sizing = {
+            let steering = steering.clone();
+            std::thread::spawn(move || size(steering))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let lock_held = || steering.resize_lock.try_lock().is_err();
+        // Held twice, a while apart: a lock taken and let go on the way to
+        // reading the line is not held both times.
+        while !(lock_held() && {
+            std::thread::sleep(Duration::from_millis(10));
+            lock_held()
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "the line was read before the sizing lock was held"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *line_now = line(0, 4000);
+        drop(line_now);
+        sizing.join().unwrap();
+    }
+
+    #[test]
+    fn a_container_start_reads_the_line_under_the_sizing_lock() {
+        reads_the_line_under_the_sizing_lock(|steering| MakeWhole(steering).call().unwrap());
+    }
+
+    #[test]
+    fn a_shrink_asked_again_reads_the_line_under_the_sizing_lock() {
+        reads_the_line_under_the_sizing_lock(|steering| steering.resize_again());
+    }
+
+    /// A container's start does not wait for the guest to be told of an
+    /// offer `offering` made: the guest's vCPU holds the transport here
+    /// while `offering` tells it, as it does through a pass over the queue.
+    /// The start makes no offer of its own here, since it would wait to tell
+    /// that one; the test says so if it does.
+    fn a_start_does_not_wait_on(
+        steering: Steering,
+        state: Arc<crate::virtio::mem::MemState>,
+        transport: Arc<Mutex<VirtioMmio>>,
+        offering: impl FnOnce(Arc<Steering>) + Send + 'static,
+    ) {
+        let steering = Arc::new(steering);
+        let before = state.requested_bytes();
+        let vcpu = transport.lock().unwrap();
+        let offering = {
+            let steering = steering.clone();
+            std::thread::spawn(move || offering(steering))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.requested_bytes() == before {
+            assert!(Instant::now() < deadline, "nothing was offered");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let offered = state.requested_bytes();
+        let (sent, received) = std::sync::mpsc::channel();
+        let whole = MakeWhole(steering.clone());
+        std::thread::spawn(move || {
+            whole.call().unwrap();
+            sent.send(()).unwrap();
+        });
+        let returned = received.recv_timeout(Duration::from_secs(5));
+        let after = state.requested_bytes();
+        drop(vcpu);
+        offering.join().unwrap();
+        assert_eq!(after, offered, "the start made an offer of its own");
+        assert!(
+            returned.is_ok(),
+            "the start waited for the guest to be told"
+        );
+    }
+
+    #[test]
+    fn a_container_start_does_not_wait_on_a_lines_offer() {
+        let (steering, state, transport) = range_steering();
+        a_start_does_not_wait_on(steering, state, transport, |steering| {
+            assert!(steering.guest_sizes(line(0, 0), true, false));
+        });
+    }
+
+    #[test]
+    fn a_container_start_does_not_wait_on_a_polls_offer() {
+        use crate::virtio::mem::{PLUG_STALLED_AFTER_MS, skip_ms_for_tests};
+
+        let (steering, state, transport) = stalled_growth();
+        a_start_does_not_wait_on(steering, state, transport, |steering| {
+            // The clock skip is the thread's own.
+            skip_ms_for_tests(PLUG_STALLED_AFTER_MS + 1);
+            steering.resize_again();
+        });
+    }
+
+    /// A growth the guest never plugs is taken back, and the range still
+    /// gives spare memory back after it. The 2026-10-26 guest's driver
+    /// refused its 450th block and the range, waiting on that plug, held
+    /// 57 GiB with 55 free for nine hours.
+    #[test]
+    fn a_growth_the_guest_cannot_plug_does_not_hold_the_range_in() {
+        let (steering, state, _) = stalled_growth();
+        steering.resize_again();
+        assert_eq!(state.requested_bytes(), 2 * GIB);
+
+        // Work short of memory asks again; the range stays where the guest
+        // stopped rather than offering what it cannot plug.
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 2 * GIB);
+
+        // Quiet with most of it free: the range comes down.
+        assert!(steering.guest_sizes(line(3000, 3500), false, false));
+        assert!(state.requested_bytes() < 2 * GIB);
+
+        // A guest whose size has moved off the ceiling may grow past it.
+        state.plug_for_tests(3 * GIB / 2);
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 5 * GIB / 2);
+    }
+
+    /// A ceiling lapses after its hold even if the guest's size never moved,
+    /// so a guest whose driver could plug again is offered more.
+    #[test]
+    fn a_ceiling_lapses_after_its_hold() {
+        let (steering, state, _) = stalled_growth();
+        steering.resize_again();
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 2 * GIB);
+
+        let set = Instant::now() - PLUG_CEILING_HOLD;
+        steering
+            .plug_ceiling
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("the stall set a ceiling")
+            .1 = set;
+        assert!(steering.guest_sizes(line(0, 0), true, false));
+        assert_eq!(state.requested_bytes(), 3 * GIB);
+        assert!(steering.plug_ceiling.lock().unwrap().is_none());
     }
 
     fn target_mib(transport: &Arc<Mutex<VirtioMmio>>) -> u64 {
