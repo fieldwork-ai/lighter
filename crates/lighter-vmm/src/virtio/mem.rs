@@ -68,7 +68,7 @@ pub struct MemState {
     region: u64,
     requested: AtomicU64,
     /// The offer as the guest was last told it, which is what its
-    /// configuration reads. It moves only with the configuration's
+    /// configuration reads and what its plugs are checked against. It moves only with the configuration's
     /// generation, under the transport: the driver reads the offer in two
     /// halves, and only a new generation between them has it read again. An
     /// offer read live could be half of each, and a shrink across 4 GiB
@@ -149,6 +149,14 @@ impl MemState {
 
     pub fn requested_bytes(&self) -> u64 {
         self.requested
+            .load(Ordering::Relaxed)
+            .min(self.available.load(Ordering::Acquire))
+    }
+
+    /// The offer as the guest's configuration shows it (`told`), within
+    /// what is ready to be plugged.
+    fn told_bytes(&self) -> u64 {
+        self.told
             .load(Ordering::Relaxed)
             .min(self.available.load(Ordering::Acquire))
     }
@@ -534,9 +542,15 @@ impl Mem {
                 if blocks[span.clone()].iter().any(|&b| b) {
                     return (RESP_NACK, 0);
                 }
+                // Against what the guest was told, not a lower offer it has
+                // yet to be told of: the driver retries a NACK at once and
+                // without reading the configuration again, so such a plug
+                // would spin, NACKed, until the host's tell got the
+                // transport. A block plugged past the lower offer is taken
+                // back once the guest is told.
                 let plugged = self.state.plugged_bytes();
                 let wanted = count as u64 * BLOCK_SIZE;
-                if plugged + wanted > self.state.requested_bytes() {
+                if plugged + wanted > self.state.told_bytes() {
                     return (RESP_NACK, 0);
                 }
                 blocks[span].fill(true);
@@ -652,12 +666,7 @@ impl VirtioDevice for Mem {
         config[24..32].copy_from_slice(&self.state.region.to_le_bytes());
         config[32..40].copy_from_slice(&self.state.available.load(Ordering::Acquire).to_le_bytes());
         config[40..48].copy_from_slice(&self.state.plugged_bytes().to_le_bytes());
-        let told = self
-            .state
-            .told
-            .load(Ordering::Relaxed)
-            .min(self.state.available.load(Ordering::Acquire));
-        config[48..56].copy_from_slice(&told.to_le_bytes());
+        config[48..56].copy_from_slice(&self.state.told_bytes().to_le_bytes());
         let start = offset as usize;
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = config.get(start + i).copied().unwrap_or(0);
@@ -693,6 +702,15 @@ impl VirtioDevice for Mem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest asking to plug block `block` of the range.
+    fn plug(device: &mut Mem, state: &MemState, block: u64) -> u16 {
+        let mut request = [0u8; REQ_LEN];
+        request[0..2].copy_from_slice(&REQ_PLUG.to_le_bytes());
+        request[8..16].copy_from_slice(&(state.addr() + block * BLOCK_SIZE).to_le_bytes());
+        request[16..18].copy_from_slice(&1u16.to_le_bytes());
+        device.handle(&request, &GuestMemory::detached()).0
+    }
 
     #[test]
     fn backing_wait_requires_the_whole_range_and_shutdown_wakes_it() {
@@ -818,13 +836,6 @@ mod tests {
             ))),
         );
         let mut device = Mem::new(state.clone());
-        let plug = |device: &mut Mem, block: u64| {
-            let mut request = [0u8; REQ_LEN];
-            request[0..2].copy_from_slice(&REQ_PLUG.to_le_bytes());
-            request[8..16].copy_from_slice(&(state.addr() + block * BLOCK_SIZE).to_le_bytes());
-            request[16..18].copy_from_slice(&1u16.to_le_bytes());
-            device.handle(&request, &GuestMemory::detached()).0
-        };
 
         control.request(4 * BLOCK_SIZE);
         assert!(!control.plug_stalled());
@@ -832,18 +843,18 @@ mod tests {
         // the wait since the offer, never as long since its last plug.
         let part = PLUG_STALLED_AFTER_MS * 2 / 3;
         skip_ms_for_tests(part);
-        assert_eq!(plug(&mut device, 0), RESP_ACK);
+        assert_eq!(plug(&mut device, &state, 0), RESP_ACK);
         skip_ms_for_tests(part);
         assert!(!control.plug_stalled());
-        assert_eq!(plug(&mut device, 1), RESP_ACK);
+        assert_eq!(plug(&mut device, &state, 1), RESP_ACK);
         // Then the driver's longest retry with nothing plugged: it gave up.
         skip_ms_for_tests(PLUG_STALLED_AFTER_MS + 1);
         assert!(control.plug_stalled());
         // A reset is a driver starting over, not a growth that stalled.
         device.reset();
         assert!(!control.plug_stalled());
-        assert_eq!(plug(&mut device, 0), RESP_ACK);
-        assert_eq!(plug(&mut device, 1), RESP_ACK);
+        assert_eq!(plug(&mut device, &state, 0), RESP_ACK);
+        assert_eq!(plug(&mut device, &state, 1), RESP_ACK);
         // Taken back to what is plugged, nothing is outstanding.
         control.request(state.plugged_bytes());
         assert!(!control.plug_stalled());
@@ -894,6 +905,40 @@ mod tests {
             read(REQUESTED + 4) << 32 | read(REQUESTED),
             4 * gib - BLOCK_SIZE
         );
+    }
+
+    /// A plug is checked against the offer the guest was told: within it
+    /// after a lower offer it has not been told of yet, and not past it
+    /// into a higher one.
+    #[test]
+    fn a_plug_is_checked_against_what_the_guest_was_told() {
+        use crate::irq::NullIrq;
+
+        let state = Arc::new(MemState::new(1 << 30, 1 << 30, 8 * BLOCK_SIZE, 0));
+        let control = MemControl::new(
+            state.clone(),
+            Arc::new(Mutex::new(VirtioMmio::new(
+                Box::new(Mem::new(state.clone())),
+                Arc::new(GuestMemory::detached()),
+                Arc::new(NullIrq),
+            ))),
+        );
+        let mut device = Mem::new(state.clone());
+
+        control.request(4 * BLOCK_SIZE);
+        assert_eq!(plug(&mut device, &state, 0), RESP_ACK);
+        // A shrink the guest has not been told of: its next plug, within
+        // what it was told, is not refused.
+        assert!(control.offer(BLOCK_SIZE).is_some());
+        assert_eq!(plug(&mut device, &state, 1), RESP_ACK);
+        // Told, it plugs no more; the extra block goes back as any shrink's.
+        control.tell_guest();
+        assert_eq!(plug(&mut device, &state, 2), RESP_NACK);
+        // A growth it has not been told of is not plugged into.
+        assert!(control.offer(4 * BLOCK_SIZE).is_some());
+        assert_eq!(plug(&mut device, &state, 2), RESP_NACK);
+        control.tell_guest();
+        assert_eq!(plug(&mut device, &state, 2), RESP_ACK);
     }
 
     #[test]
