@@ -25,6 +25,8 @@ The notifier now counts the block's page array with its pages, using the
 lookup 0024 added for the unplug path, so onlining and offlining move
 offline_size by exactly what adding and removing do.
 
+Signed-off-by: Petr Filip <filip@tix.cz>
+
 diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
 index ee45897..cfbcb33 100644
 --- a/drivers/virtio/virtio_mem.c
