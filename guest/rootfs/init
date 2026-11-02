@@ -667,13 +667,8 @@ fi
 # kernel carries the netfilter modules for exactly this.
 #
 # The userland proxy stays on (Alpine 3.22 ships docker-proxy). Off, Docker
-# 28 insists on br_netfilter for hairpin traffic and will not start without
-# it, and br_netfilter is the one thing this guest must not have: it runs the
-# IP prerouting hooks in bridge context for a container's frames, where the
-# socket TPROXY assigns does not survive into routing, so a container's UDP
-# never reached the agent while it was on — and Docker turns it on at every
-# bridge network it makes, so a knob turned off here did not stay off. The
-# kernel does not carry it. Published ports still reach a container by DNAT
+# 28 turns bridged netfilter on for hairpin traffic, which this namespace
+# must never have (below). Published ports still reach a container by DNAT
 # (the agent connects to the guest's own address, which Docker's nat OUTPUT
 # chain rewrites); docker-proxy only carries what DNAT cannot, one container
 # reaching another's published port through the host's own address.
@@ -727,6 +722,22 @@ fi
 # what Docker reports; dockerd only needs to be allowed the bind. How the
 # Mac's connections then reach the container is the output chain's (below).
 sysctl -q -w net.ipv4.ip_nonlocal_bind=1 net.ipv6.ip_nonlocal_bind=1 2>/dev/null || true
+# Bridged netfilter stays off in this namespace, and dockerd cannot turn it
+# on. The kernel carries it for Kubernetes nodes in containers, whose own
+# namespaces have it on by default; here, on, the IP prerouting hooks run in
+# bridge context for a container's frames, before ip_rcv_core() drops the
+# socket TPROXY assigned, and every datagram the divert took reached no
+# socket: a container's IPv6 UDP from boot (the switch defaults on), and all
+# its UDP once dockerd made a network with inter-container traffic off. Each
+# switch is bound read-only over itself, so dockerd's write fails and such a
+# network is refused, as it was on a kernel without br_netfilter.
+for switch in iptables ip6tables arptables; do
+	switch=/proc/sys/net/bridge/bridge-nf-call-$switch
+	[ -e "$switch" ] || continue
+	echo 0 >"$switch"
+	mount --bind "$switch" "$switch" && mount -o remount,bind,ro "$switch" \
+		|| echo "INIT bridge_netfilter_pin=failed"
+done
 # `lighter.dockerd_debug` on the command line: dockerd's debug log, whose
 # timestamps are how a container start is taken apart.
 dockerd_debug=""
