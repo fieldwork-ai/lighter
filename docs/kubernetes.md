@@ -109,10 +109,72 @@ iptables kube-proxy. An additional two-node 1.37.0 configuration uses
 loading, Helm install/upgrade/uninstall, Service DNS, external HTTPS, cross-node
 TCP/UDP, host port access, Mac shares, PVCs and VM restart recovery.
 
-Kubernetes conformance, HA control planes, dual-stack clusters, custom CNIs,
-LoadBalancer/Ingress controllers, amd64 nodes and k3d are outside this matrix.
-The host engine's CRI plugins remain disabled: Kubernetes uses the containerd
-inside each kind node.
+Gate m22 (`scripts/gates/m22-kubernetes.sh`) adds two clusters whose network
+plugins need more of the kernel than kindnet: k3d as created with no flags, and
+kind with Cilium replacing kube-proxy (both below). For each it checks Service
+DNS and HTTP from pods on both nodes, names outside the cluster, a deny-all
+NetworkPolicy that blocks and then lifts, and a container's own UDP through
+the guest beside the cluster.
+
+Kubernetes conformance, HA control planes, dual-stack clusters, CNIs other
+than kindnet, flannel and Cilium, LoadBalancer controllers and amd64 nodes are
+outside this matrix. The host engine's CRI plugins remain disabled: Kubernetes
+uses the containerd inside each node.
+
+## k3d
+
+k3d runs k3s with its defaults: flannel over VXLAN between nodes, and
+kube-router enforcing NetworkPolicy. No flags are needed:
+
+```sh
+brew install k3d
+k3d cluster create dev --agents 1
+kubectl get nodes
+```
+
+Gate m22 uses k3d 5.9.0 with `rancher/k3s:v1.35.5-k3s1`. Before 0.13.9 the
+server restarted in a loop on `failed to create vxlan device: operation not
+supported`, and the workarounds (flannel's host-gw backend) left a pod unable
+to reach a Service whose endpoint was on its own node and NetworkPolicy
+unenforced (#106).
+
+## Cilium
+
+Cilium installs into a kind cluster created without kindnet, with or without
+kube-proxy:
+
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes: [{role: control-plane}, {role: worker}]
+networking: {disableDefaultCNI: true, kubeProxyMode: none}
+```
+
+```sh
+kind create cluster --name cilium --config kind.yaml
+helm repo add cilium https://helm.cilium.io
+helm install cilium cilium/cilium --version 1.20.2 -n kube-system \
+  --set kubeProxyReplacement=true \
+  --set k8sServiceHost=cilium-control-plane --set k8sServicePort=6443
+```
+
+The guest's kernel carries what Cilium's agent checks for at start and loads:
+the net_cls classid behind `bpf_get_cgroup_classid()`, BTF for its CO-RE
+programs (`/sys/kernel/btf/vmlinux`), VXLAN and GENEVE, the TPROXY, socket
+and CT extensions its L7 proxy diverts with, and the BPF socket iterators it
+closes client sockets to a deleted Service backend with (#108).
+
+## The guest's own network namespace
+
+The kernel carries bridged netfilter (`br_netfilter`) for the nodes, whose own
+network namespaces have it on by default. The guest's own namespace never
+does: lighter carries a container's UDP by TPROXY, and with bridged netfilter
+on, the kernel runs the IP hooks in bridge context and then drops the socket
+TPROXY assigned. Init turns its three switches off and binds them read-only,
+so dockerd cannot turn them back on. The one visible effect is that a Docker
+network with inter-container traffic off
+(`-o com.docker.network.bridge.enable_icc=false`) is refused, as it was before
+the kernel carried bridged netfilter.
 
 ## Stop, restart and update
 
