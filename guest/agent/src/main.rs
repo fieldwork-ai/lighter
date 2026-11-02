@@ -1016,6 +1016,7 @@ fn serve_tcp_proxy(port: u16) -> std::process::ExitCode {
         }
     };
     println!("AGENT tcp-proxy port={port}");
+    streams::CARRIED.publish("/run/lighter/streams-outbound");
     streams::serve(OwnedFd::from(listener), streams::Route::Outbound, stream_env(joiner()))
 }
 
@@ -1177,6 +1178,7 @@ fn serve_inbound(port: u32) -> std::process::ExitCode {
         }
     };
     println!("AGENT inbound port={port}");
+    streams::CARRIED.publish("/run/lighter/streams-inbound");
     streams::serve(listener.into_fd(), streams::Route::Inbound, stream_env(joiner()))
 }
 
@@ -1346,6 +1348,17 @@ fn handle_control(line: &str) -> String {
         // available, whether the guest is stalling for it, and whether it
         // is in pieces (`memory_report`).
         (Some("memory"), _) => memory_report(),
+        // How streams were carried, inbound (published ports) and outbound:
+        // joined in the kernel or copied, and the last join it refused, as
+        // each stream process last wrote it (`streams::Carried`).
+        (Some("streams"), _) => ["inbound", "outbound"]
+            .iter()
+            .map(|route| {
+                let line = std::fs::read_to_string(format!("/run/lighter/streams-{route}"))
+                    .unwrap_or_else(|_| "none\n".into());
+                format!("streams {route} {line}")
+            })
+            .collect(),
         // The host is compressing our pages: give back that much page cache,
         // coldest first, from the cgroup every container lives in. The
         // kernel frees it in bulk and free page reporting returns it to the
