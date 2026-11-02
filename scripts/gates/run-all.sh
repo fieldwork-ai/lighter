@@ -35,6 +35,7 @@ GATES=(
 	"m21 a shared folder is a local disk:m21-posix.sh"
 	"m17 the machine on the network:m17-lan.sh"
 	"m18 the Mac reaches containers:m18-direct.sh"
+	"m22 kubernetes in containers:m22-kubernetes.sh"
 	"m19 network changes (opt-in):m19-network-change.sh"
 	"m9  gpu:m9-gpu.sh"
 	"m10 neural engine:m10-ane.sh"
