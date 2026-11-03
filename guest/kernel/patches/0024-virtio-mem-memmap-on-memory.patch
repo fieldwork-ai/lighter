@@ -26,8 +26,18 @@ after fifty seconds and fails again). The core already keeps those pages
 out of what it offlines (memory_block_offline() starts past them), so the
 driver's own walk starts past them too, on the way in and on the way back.
 
+And the count of what is added but not yet online. The driver adds a
+block only while what it added and Linux has not onlined (offline_size)
+stays under a threshold, a gigabyte here; it counts a block in whole when
+it adds it and out in whole when it removes it, but onlining and
+offlining report only the pages past the page array. Two megabytes of
+every plugged block stayed counted as offline, and at 449 blocks the next
+one no longer fit: the driver returned -ENOSPC, which it does not retry,
+and the guest never grew again however much the host offered (#104). The
+notifier counts the page array with the pages it reports.
+
 diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
-index 1688ecd..ee45897 100644
+index 1688ecd..2d06a3a 100644
 --- a/drivers/virtio/virtio_mem.c
 +++ b/drivers/virtio/virtio_mem.c
 @@ -654,7 +654,8 @@ static int virtio_mem_add_memory(struct virtio_mem *vm, uint64_t addr,
@@ -40,8 +50,8 @@ index 1688ecd..ee45897 100644
  	if (rc) {
  		atomic64_sub(size, &vm->offline_size);
  		dev_warn(&vm->vdev->dev, "adding memory failed: %d\n", rc);
-@@ -2148,6 +2149,24 @@ static int virtio_mem_sbm_unplug_request(struct virtio_mem *vm, uint64_t diff)
- 	return rc;
+@@ -982,6 +983,24 @@ static void virtio_mem_bbm_notify_cancel_offline(struct virtio_mem *vm,
+ 	virtio_mem_fake_offline_cancel_offline(pfn, nr_pages);
  }
  
 +/*
@@ -63,9 +73,40 @@ index 1688ecd..ee45897 100644
 +}
 +
  /*
-  * Try to offline and remove a big block from Linux and unplug it. Will fail
-  * with -EBUSY if some memory is busy and cannot get unplugged.
-@@ -2179,11 +2198,16 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
+  * This callback will either be called synchronously from add_memory() or
+  * asynchronously (e.g., triggered via user space). We have to be careful
+@@ -1062,7 +1081,13 @@ static int virtio_mem_memory_notifier_cb(struct notifier_block *nb,
+ 		if (vm->in_sbm)
+ 			virtio_mem_sbm_notify_offline(vm, id);
+ 
+-		atomic64_add(size, &vm->offline_size);
++		/*
++		 * The block's own page array was counted in when it was added
++		 * and goes out when it is removed, but the core never onlines or
++		 * offlines it, so it is not in @size.
++		 */
++		atomic64_add(size + PFN_PHYS(virtio_mem_vmemmap_pages(mhp->start_pfn)),
++			     &vm->offline_size);
+ 		/*
+ 		 * Trigger the workqueue. Now that we have some offline memory,
+ 		 * maybe we can handle pending unplug requests.
+@@ -1077,7 +1102,14 @@ static int virtio_mem_memory_notifier_cb(struct notifier_block *nb,
+ 		if (vm->in_sbm)
+ 			virtio_mem_sbm_notify_online(vm, id, mhp->start_pfn);
+ 
+-		atomic64_sub(size, &vm->offline_size);
++		/*
++		 * As for MEM_OFFLINE: the page array was counted in with the
++		 * block. Leaving it counted kept 2 MiB per block offline for as
++		 * long as the block was plugged, and with a 1 GiB threshold the
++		 * driver refused to add the 450th block (-ENOSPC, never retried).
++		 */
++		atomic64_sub(size + PFN_PHYS(virtio_mem_vmemmap_pages(mhp->start_pfn)),
++			     &vm->offline_size);
+ 		/*
+ 		 * Start adding more memory once we onlined half of our
+ 		 * threshold. Don't trigger if it's possibly due to our actipn
+@@ -2179,11 +2211,16 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
  	virtio_mem_bbm_set_bb_state(vm, bb_id, VIRTIO_MEM_BBM_BB_FAKE_OFFLINE);
  
  	for (pfn = start_pfn; pfn < end_pfn; pfn += PAGES_PER_SECTION) {
@@ -83,7 +124,7 @@ index 1688ecd..ee45897 100644
  		if (rc) {
  			end_pfn = pfn;
  			goto rollback;
-@@ -2208,10 +2232,13 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
+@@ -2208,10 +2245,13 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
  
  rollback:
  	for (pfn = start_pfn; pfn < end_pfn; pfn += PAGES_PER_SECTION) {
@@ -99,7 +140,7 @@ index 1688ecd..ee45897 100644
  	virtio_mem_bbm_set_bb_state(vm, bb_id, VIRTIO_MEM_BBM_BB_ADDED);
  	mutex_unlock(&vm->hotplug_mutex);
 diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
-index b7030bc..e8d238a 100644
+index 9fdfb2d..4d1c16c 100644
 --- a/mm/memory_hotplug.c
 +++ b/mm/memory_hotplug.c
 @@ -48,7 +48,7 @@ enum {

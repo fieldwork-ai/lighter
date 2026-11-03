@@ -7,13 +7,15 @@
 //! a VPN configured — the same answer a Mac process gets, at the same
 //! speed. The names Docker promises, `host.docker.internal` and the
 //! gateway, are answered here directly. Anything else (MX, TXT, SRV) is
-//! forwarded raw to the first nameserver in resolv.conf, since the system
-//! resolver has no API for those.
+//! asked of the nameservers the Mac's configuration picks for the name, since
+//! the system resolver has no API for those: in order, the next each second
+//! the last has not answered, as the Mac's own resolver moves past one that
+//! is down (`ask`).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::virtio::vsock::{Accepted, VsockShared};
 
@@ -29,20 +31,24 @@ const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
-/// The first nameserver in the Mac's resolver configuration, for record
-/// types the system resolver cannot answer.
-fn nameserver() -> SocketAddr {
+/// The nameservers in the Mac's resolver configuration, for a name its
+/// configuration routes nowhere in particular.
+fn nameservers() -> Vec<SocketAddr> {
     let text = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    for line in text.lines() {
-        let mut words = line.split_whitespace();
-        if words.next() == Some("nameserver")
-            && let Some(addr) = words.next()
-            && let Ok(ip) = addr.parse::<IpAddr>()
-        {
-            return SocketAddr::new(ip, 53);
-        }
+    let servers: Vec<SocketAddr> = text
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some("nameserver"))
+                .then(|| words.next()?.parse::<IpAddr>().ok())
+                .flatten()
+        })
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect();
+    if servers.is_empty() {
+        return vec![SocketAddr::new(Ipv4Addr::new(1, 1, 1, 1).into(), 53)];
     }
-    SocketAddr::new(Ipv4Addr::new(1, 1, 1, 1).into(), 53)
+    servers
 }
 
 /// Starts answering the agent's DNS stream: each accepted stream goes to
@@ -122,11 +128,14 @@ pub fn answer(
                     let answer = crate::sysdns::local(&q.name, q.qtype, Duration::from_secs(1));
                     deliver(id, records_reply(&query, &q, answer));
                 }
-                Some(crate::sysdns::Route::Server(server)) => match forward_to(&query, server) {
-                    Some(reply) => deliver(id, reply),
-                    None => forward_raw(query, id, deliver),
-                },
-                None => forward_raw(query, id, deliver),
+                Some(crate::sysdns::Route::Servers(servers)) => deliver(
+                    id,
+                    ask(&query, &servers).unwrap_or_else(|| failure(&query, &q)),
+                ),
+                None => deliver(
+                    id,
+                    ask(&query, &nameservers()).unwrap_or_else(|| failure(&query, &q)),
+                ),
             }
         });
         return None;
@@ -315,51 +324,113 @@ fn local_addrs(answer: crate::sysdns::Answer, want_v6: bool) -> Vec<IpAddr> {
     out
 }
 
-/// A question sent as it is to `server`, and its reply if one comes within
-/// three seconds.
-fn forward_to(query: &[u8], server: SocketAddr) -> Option<Vec<u8>> {
-    let local: SocketAddr = if server.is_ipv6() {
-        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-    } else {
-        (Ipv4Addr::UNSPECIFIED, 0).into()
+/// How long a nameserver has to answer before the next is asked as well,
+/// and how long all of them have: past a second the Mac's resolver moves on
+/// too, and the whole stays inside the five seconds a container's resolver
+/// waits for an answer, so a SERVFAIL reaches it rather than a timeout.
+const NEXT_SERVER: Duration = Duration::from_secs(1);
+const ALL_SERVERS: Duration = Duration::from_secs(4);
+
+/// Asks `servers` in order, the next each [`NEXT_SERVER`] the ones asked
+/// have not answered, and returns the first reply to this question from
+/// any of them. A first nameserver that is down is what a Mac's network
+/// can have for hours: the Mac's resolver moves past it, and one that waited
+/// on it alone answered a container nothing (m3-streams, 2026-10-25).
+fn ask(query: &[u8], servers: &[SocketAddr]) -> Option<Vec<u8>> {
+    ask_within(query, servers, NEXT_SERVER, ALL_SERVERS)
+}
+
+fn ask_within(
+    query: &[u8],
+    servers: &[SocketAddr],
+    next: Duration,
+    all: Duration,
+) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    let bind = |ip: IpAddr| {
+        let socket = UdpSocket::bind((ip, 0)).ok()?;
+        socket.set_nonblocking(true).ok()?;
+        Some(socket)
     };
-    let udp = UdpSocket::bind(local).ok()?;
-    udp.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-    udp.connect(server).ok()?;
-    udp.send(query).ok()?;
+    let v4 = bind(Ipv4Addr::UNSPECIFIED.into());
+    let v6 = bind(Ipv6Addr::UNSPECIFIED.into());
+    let sockets: Vec<&UdpSocket> = [v4.as_ref(), v6.as_ref()].into_iter().flatten().collect();
+    let start = Instant::now();
+    let deadline = start + all;
+    let mut asked: Vec<SocketAddr> = Vec::new();
+    let mut pending = servers.iter();
+    let mut next_at = start;
     let mut buf = vec![0u8; 4096];
     loop {
-        let n = udp.recv(&mut buf).ok()?;
-        // The reply to this question: its id, and a response.
-        if n >= 12 && buf[0..2] == query[0..2] && buf[2] & 0x80 != 0 {
-            buf.truncate(n);
-            return Some(buf);
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        // A server that cannot be sent to, a family the Mac has no route
+        // for, costs no wait: the next is asked at once.
+        while now >= next_at {
+            let Some(&server) = pending.next() else {
+                break;
+            };
+            let socket = if server.is_ipv6() {
+                v6.as_ref()
+            } else {
+                v4.as_ref()
+            };
+            if socket.is_some_and(|s| s.send_to(query, server).is_ok()) {
+                asked.push(server);
+                next_at = now + next;
+            }
+        }
+        if asked.is_empty() && pending.len() == 0 {
+            return None;
+        }
+        let until = if pending.len() > 0 {
+            next_at.min(deadline)
+        } else {
+            deadline
+        };
+        let mut fds: Vec<libc::pollfd> = sockets
+            .iter()
+            .map(|s| libc::pollfd {
+                fd: s.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let wait = until
+            .saturating_duration_since(now)
+            .as_millis()
+            .clamp(1, 60_000) as libc::c_int;
+        // SAFETY: a valid array of pollfds for sockets alive for the call.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait) } <= 0 {
+            continue;
+        }
+        for socket in &sockets {
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                // The reply to this question, from a server it was asked of:
+                // its id, and a response.
+                let ours = asked
+                    .iter()
+                    .any(|s| s.ip() == from.ip() && s.port() == from.port());
+                if ours && n >= 12 && buf[0..2] == query[0..2] && buf[2] & 0x80 != 0 {
+                    buf.truncate(n);
+                    return Some(buf);
+                }
+            }
         }
     }
 }
 
-/// A non-address question, sent raw to the Mac's nameserver on a socket of
-/// its own; its reply, if one comes within a few seconds, is delivered.
-fn forward_raw(mut query: Vec<u8>, id: u16, deliver: Arc<dyn Fn(u16, Vec<u8>) + Send + Sync>) {
-    crate::workers::run("dns-forward", crate::qos::CONNECTION_STACK, move || {
-        let Ok(udp) = UdpSocket::bind("0.0.0.0:0") else {
-            return;
-        };
-        let _ = udp.set_read_timeout(Some(Duration::from_secs(5)));
-        let original = [query[0], query[1]];
-        query[0..2].copy_from_slice(&id.to_be_bytes());
-        if udp.send_to(&query, nameserver()).is_err() {
-            return;
-        }
-        let mut buf = vec![0u8; 4096];
-        if let Ok((n, _)) = udp.recv_from(&mut buf) {
-            buf.truncate(n);
-            if n >= 2 {
-                buf[0..2].copy_from_slice(&original);
-            }
-            deliver(id, buf);
-        }
-    });
+/// The answer when no nameserver gave one: SERVFAIL, what a resolver says
+/// when its upstream fails, so the container is told rather than left to
+/// time out.
+fn failure(query: &[u8], q: &Question) -> Vec<u8> {
+    let mut reply = records_reply(query, q, crate::sysdns::Answer::NoData);
+    reply[3] = (reply[3] & 0xf0) | 2;
+    reply
 }
 
 /// A parsed question: the name and what is asked about it.
@@ -543,6 +614,185 @@ mod tests {
             ]
         );
         assert!(family_of(addrs.iter().copied(), true, false).is_empty());
+    }
+
+    /// A nameserver on loopback that answers each question `answers` times,
+    /// first with whatever `stray` makes of it, then with the reply; or never.
+    struct Nameserver {
+        addr: SocketAddr,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Makes a reply to another question, or something that is no reply.
+    type Stray = fn(&[u8]) -> Vec<u8>;
+
+    fn nameserver(answering: bool, stray: Option<Stray>) -> Nameserver {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !answering {
+                    continue;
+                }
+                if let Some(stray) = stray {
+                    let _ = socket.send_to(&stray(&buf[..n]), from);
+                }
+                let mut reply = buf[..n].to_vec();
+                reply[2] |= 0x80;
+                reply[3] = 0x83;
+                let _ = socket.send_to(&reply, from);
+            }
+        });
+        Nameserver { addr, asked }
+    }
+
+    fn asked(server: &Nameserver) -> usize {
+        server.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_nameserver_that_is_down_is_passed_over_for_the_next() {
+        let (down, up) = (nameserver(false, None), nameserver(true, None));
+        let query = query_for("lighter-nosuchname.example.com", 16);
+        let started = Instant::now();
+        let reply = ask_within(
+            &query,
+            &[down.addr, up.addr],
+            Duration::from_millis(300),
+            Duration::from_secs(4),
+        )
+        .expect("the second nameserver's answer");
+        let took = started.elapsed();
+        assert_eq!(reply[3] & 0x0f, 3, "its NXDOMAIN, as it said it");
+        assert!(
+            took >= Duration::from_millis(300),
+            "the first had its turn: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "and no more than its turn: {took:?}"
+        );
+        assert_eq!((asked(&down), asked(&up)), (1, 1));
+    }
+
+    #[test]
+    fn a_nameserver_that_answers_is_the_only_one_asked() {
+        let (first, second) = (nameserver(true, None), nameserver(true, None));
+        let query = query_for("example.com", 16);
+        let started = Instant::now();
+        assert!(
+            ask_within(
+                &query,
+                &[first.addr, second.addr],
+                Duration::from_millis(500),
+                Duration::from_secs(4)
+            )
+            .is_some()
+        );
+        assert!(started.elapsed() < Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!((asked(&first), asked(&second)), (1, 0));
+    }
+
+    #[test]
+    fn only_the_reply_to_this_question_is_taken() {
+        // Another question's reply, then a query rather than a reply, before the answer.
+        fn other_id(q: &[u8]) -> Vec<u8> {
+            let mut r = q.to_vec();
+            r[0] ^= 0xff;
+            r[2] |= 0x80;
+            r
+        }
+        fn not_a_reply(q: &[u8]) -> Vec<u8> {
+            q.to_vec()
+        }
+        for stray in [other_id as Stray, not_a_reply] {
+            let server = nameserver(true, Some(stray));
+            let query = query_for("example.com", 16);
+            let reply = ask_within(
+                &query,
+                &[server.addr],
+                Duration::from_millis(300),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(&reply[0..2], &query[0..2]);
+            assert_eq!(reply[3] & 0x0f, 3);
+        }
+    }
+
+    #[test]
+    fn a_reply_from_a_server_not_asked_is_not_taken() {
+        // The server asked stays silent; a socket beside it, on another
+        // port, answers the question exactly, to the address that asked.
+        let asked = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let impostor = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = asked.local_addr().unwrap();
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent = answered.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            if let Ok((n, from)) = asked.recv_from(&mut buf) {
+                let mut reply = buf[..n].to_vec();
+                reply[2] |= 0x80;
+                if impostor.send_to(&reply, from).is_ok() {
+                    sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        let query = query_for("example.com", 16);
+        assert!(
+            ask_within(
+                &query,
+                &[addr],
+                Duration::from_millis(100),
+                Duration::from_millis(600)
+            )
+            .is_none()
+        );
+        assert!(
+            answered.load(std::sync::atomic::Ordering::SeqCst),
+            "the impostor did answer"
+        );
+    }
+
+    #[test]
+    fn no_answer_from_any_is_a_servfail_in_time() {
+        let (a, b) = (nameserver(false, None), nameserver(false, None));
+        let query = query_for("example.com", 16);
+        let started = Instant::now();
+        assert!(
+            ask_within(
+                &query,
+                &[a.addr, b.addr],
+                Duration::from_millis(100),
+                Duration::from_millis(500)
+            )
+            .is_none()
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(500) && took < Duration::from_millis(900),
+            "{took:?}"
+        );
+        assert_eq!((asked(&a), asked(&b)), (1, 1));
+        let q = parse_question(&query).unwrap();
+        let reply = failure(&query, &q);
+        assert_eq!(&reply[0..2], &query[0..2]);
+        assert_eq!(reply[2] & 0x80, 0x80, "a response");
+        assert_eq!(reply[3] & 0x0f, 2, "SERVFAIL");
+        assert_eq!(&reply[12..], &query[12..], "to the question asked");
+    }
+
+    #[test]
+    fn the_real_budget_fits_inside_a_containers_wait() {
+        // musl and dig wait five seconds for the agent's answer.
+        assert!(ALL_SERVERS < Duration::from_secs(5));
+        assert!(NEXT_SERVER < ALL_SERVERS);
     }
 
     fn query_for(name: &str, qtype: u16) -> Vec<u8> {

@@ -92,6 +92,49 @@ fn with_budget(budget: &str) -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
+/// One request to `server`, and its reply or errno: what [`Guest::call`]
+/// does, for a test that must call while another thread holds the server.
+fn request(
+    server: &Server,
+    unique: u64,
+    caller: (u32, u32),
+    opcode: u32,
+    nodeid: u64,
+    body: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, i32> {
+    let mut request = Vec::with_capacity(fuse::IN_HEADER_LEN + body.len());
+    request.extend_from_slice(&((fuse::IN_HEADER_LEN + body.len()) as u32).to_le_bytes());
+    request.extend_from_slice(&opcode.to_le_bytes());
+    request.extend_from_slice(&unique.to_le_bytes());
+    request.extend_from_slice(&nodeid.to_le_bytes());
+    request.extend_from_slice(&caller.0.to_le_bytes()); // uid
+    request.extend_from_slice(&caller.1.to_le_bytes()); // gid
+    request.extend_from_slice(&1u32.to_le_bytes()); // pid
+    request.extend_from_slice(&0u32.to_le_bytes()); // total_extlen
+    request.extend_from_slice(body);
+
+    let mut buffer = Buffer::new(limit);
+    let written = server.dispatch(&request, &mut buffer);
+    if written == 0 {
+        return Ok(Vec::new());
+    }
+    let reply = buffer.bytes;
+    let len = u32::from_le_bytes(reply[0..4].try_into().unwrap()) as usize;
+    let error = i32::from_le_bytes(reply[4..8].try_into().unwrap());
+    let replied = u64::from_le_bytes(reply[8..16].try_into().unwrap());
+    assert_eq!(replied, unique, "reply must name the request it answers");
+    assert_eq!(
+        len,
+        reply.len(),
+        "header length must match what was written"
+    );
+    if error != 0 {
+        return Err(-error);
+    }
+    Ok(reply[fuse::OUT_HEADER_LEN..].to_vec())
+}
+
 struct Guest {
     server: Server,
     unique: u64,
@@ -165,39 +208,15 @@ impl Guest {
         limit: usize,
     ) -> Result<Vec<u8>, i32> {
         self.unique += 1;
-        let mut request = Vec::with_capacity(fuse::IN_HEADER_LEN + body.len());
-        request.extend_from_slice(&((fuse::IN_HEADER_LEN + body.len()) as u32).to_le_bytes());
-        request.extend_from_slice(&opcode.to_le_bytes());
-        request.extend_from_slice(&self.unique.to_le_bytes());
-        request.extend_from_slice(&nodeid.to_le_bytes());
-        request.extend_from_slice(&self.caller.0.to_le_bytes()); // uid
-        request.extend_from_slice(&self.caller.1.to_le_bytes()); // gid
-        request.extend_from_slice(&1u32.to_le_bytes()); // pid
-        request.extend_from_slice(&0u32.to_le_bytes()); // total_extlen
-        request.extend_from_slice(body);
-
-        let mut buffer = Buffer::new(limit);
-        let written = self.server.dispatch(&request, &mut buffer);
-        if written == 0 {
-            return Ok(Vec::new());
-        }
-        let reply = buffer.bytes;
-        let len = u32::from_le_bytes(reply[0..4].try_into().unwrap()) as usize;
-        let error = i32::from_le_bytes(reply[4..8].try_into().unwrap());
-        let unique = u64::from_le_bytes(reply[8..16].try_into().unwrap());
-        assert_eq!(
-            unique, self.unique,
-            "reply must name the request it answers"
-        );
-        assert_eq!(
-            len,
-            reply.len(),
-            "header length must match what was written"
-        );
-        if error != 0 {
-            return Err(-error);
-        }
-        Ok(reply[fuse::OUT_HEADER_LEN..].to_vec())
+        request(
+            &self.server,
+            self.unique,
+            self.caller,
+            opcode,
+            nodeid,
+            body,
+            limit,
+        )
     }
 
     fn lookup(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
@@ -557,6 +576,42 @@ fn a_link_is_acknowledged_and_reaches_the_host() {
     guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
     assert_eq!(std::fs::metadata(guest.host("b")).unwrap().nlink(), 2);
     assert_eq!(std::fs::read(guest.host("b")).unwrap(), b"shared");
+}
+
+/// A link made back under a name whose unlink is still queued, as
+/// pjdfstest link/03 does, is acknowledged with the count the host will
+/// have: two names, not the unlinked one as well. The guest keeps the
+/// reply's count, so a wrong one was what `stat` said (nlink 3), two runs in
+/// forty on a busy Mac.
+#[test]
+fn a_link_back_over_a_queued_unlink_counts_each_name_once() {
+    use std::os::unix::fs::MetadataExt;
+    let mut guest = Guest::new("link-over-unlink");
+    let (nodeid, _fh) = guest.create(1, "a", CREATE_RDWR).unwrap();
+    let mut body = nodeid.to_le_bytes().to_vec();
+    body.extend_from_slice(&name_body("b"));
+    guest.call(op::LINK, 1, &body).expect("link");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::metadata(guest.host("a")).unwrap().nlink(), 2);
+    // The unlink stays queued until the link is waiting on it, which is
+    // the moment the race left to timing.
+    guest.server.hold_apply();
+    guest.call(op::UNLINK, 1, &name_body("b")).expect("unlink");
+    guest.unique += 1;
+    let unique = guest.unique;
+    let reply = std::thread::scope(|s| {
+        let server = &guest.server;
+        s.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            server.release_apply();
+        });
+        request(server, unique, (0, 0), op::LINK, 1, &body, 1 << 20)
+    })
+    .expect("link");
+    let nlink = u32::from_le_bytes(reply[40 + 64..40 + 68].try_into().unwrap());
+    assert_eq!(nlink, 2, "a and b, once each");
+    guest.call(op::SYNCFS, 1, &[0u8; 8]).expect("syncfs");
+    assert_eq!(std::fs::metadata(guest.host("a")).unwrap().nlink(), 2);
 }
 
 /// Two names for one file are one inode. A guest that saw two would disagree

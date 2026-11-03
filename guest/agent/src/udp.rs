@@ -201,11 +201,6 @@ pub fn serve(port: u16, host: crate::Fd, v6: bool) -> std::io::Result<()> {
     let buf: libc::c_int = 16 << 20;
     // SAFETY: a live socket and an int-sized option value.
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, std::ptr::addr_of!(buf).cast(), size_of::<libc::c_int>() as libc::socklen_t) };
-    // The bridge's netfilter call runs the IP prerouting hooks in the
-    // bridge's context for traffic off docker0, where a socket TPROXY
-    // assigns does not survive into routing: every datagram counted as
-    // "no port". dockerd turns it on at start; off again here, and in init.
-    let _ = std::fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "0");
     let (level, option) = if v6 { (libc::SOL_IPV6, IPV6_RECVORIGDSTADDR) } else { (libc::SOL_IP, libc::IP_RECVORIGDSTADDR) };
     // SAFETY: a live socket and an int-sized option value.
     if unsafe { libc::setsockopt(fd, level, option, std::ptr::addr_of!(one).cast(), size_of::<libc::c_int>() as libc::socklen_t) } < 0 {

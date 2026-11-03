@@ -13,12 +13,68 @@
 //! the next start. Nothing else changes: same binary, same arguments, and
 //! `LIGHTER_GUEST_DIR` is passed explicitly because the copy cannot find the
 //! guest image by walking up from its own path the way a checkout build can.
+//!
+//! The bundle is also what macOS gives Local Network permission to: its
+//! `Info.plist` declares why the machine wants it, and System Settings lists
+//! it as `lighter.app`. A bare executable has neither, so it is never asked
+//! and never allowed, and the machine it runs reaches the Mac's gateway and
+//! no other device on the network (#101: started by `brew services`, whose
+//! agent named `bin/lighter`). So the machine is always the bundle's
+//! executable, however it was started ([`enter`]).
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 const ICON: &[u8] = include_bytes!("../../../assets/lighter.icns");
 
 const INFO_PLIST: &str = include_str!("../../../assets/Info.plist");
+
+/// Makes this process the bundle's executable, for `lighter run` started by
+/// anything other than `lighter start`: a launchd agent someone else wrote,
+/// or a shell. An exec, not a spawn: the process launchd started, and is
+/// watching, stays the one that becomes the machine. Returns only when this
+/// already is the bundle's executable, or the bundle cannot be had, in which
+/// case the machine runs as it is and `lighter doctor` says what it lacks.
+pub fn enter() {
+    let Ok(exe) = crate::paths::executable() else {
+        return;
+    };
+    if contains(&exe) {
+        return;
+    }
+    // Without a guest there is no machine to run, and `run` says so better.
+    let Ok(guest) = crate::paths::guest_dir() else {
+        return;
+    };
+    let target = match ensure() {
+        Ok(target) => target,
+        Err(e) => {
+            eprintln!(
+                "lighter: running outside lighter.app, without Local Network permission: {e}"
+            );
+            return;
+        }
+    };
+    let e = std::process::Command::new(&target)
+        .args(std::env::args_os().skip(1))
+        .env("LIGHTER_GUEST_DIR", &guest)
+        .exec();
+    eprintln!(
+        "lighter: could not run {}, so running outside lighter.app, without Local Network permission: {e}",
+        target.display()
+    );
+}
+
+/// Whether `exe` is the executable of an app bundle: `<name>.app/Contents/MacOS/<exe>`.
+pub fn contains(exe: &Path) -> bool {
+    let mut ancestors = exe.ancestors().skip(1);
+    ancestors.next().and_then(Path::file_name) == Some("MacOS".as_ref())
+        && ancestors.next().and_then(Path::file_name) == Some("Contents".as_ref())
+        && ancestors
+            .next()
+            .and_then(Path::extension)
+            .is_some_and(|ext| ext == "app")
+}
 
 /// Builds or refreshes the bundle, returning the path of the executable
 /// inside it.
@@ -162,4 +218,30 @@ fn sign(source: &Path, bundle: &Path) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&plist);
     anyhow::ensure!(status.success(), "codesign failed on {}", bundle.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains;
+    use std::path::Path;
+
+    #[test]
+    fn only_a_bundles_own_executable_is_in_it() {
+        for inside in [
+            "/opt/homebrew/Cellar/lighter/0.13.9/share/lighter/lighter.app/Contents/MacOS/lighter",
+            "/Users/someone/.lighter/lighter.app/Contents/MacOS/lighter",
+        ] {
+            assert!(contains(Path::new(inside)), "{inside}");
+        }
+        for outside in [
+            "/opt/homebrew/Cellar/lighter/0.13.9/bin/lighter",
+            "/Users/someone/src/lighter/target/release/lighter",
+            "/Users/someone/lighter.app/lighter",
+            "/Users/someone/lighter.app/Contents/lighter",
+            "/Users/someone/lighter/Contents/MacOS/lighter",
+            "lighter",
+        ] {
+            assert!(!contains(Path::new(outside)), "{outside}");
+        }
+    }
 }

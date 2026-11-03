@@ -39,12 +39,14 @@ remote 'PATH=/opt/homebrew/bin:$PATH; command -v pnpm >/dev/null || npm install 
 remote 'PATH=/opt/homebrew/bin:$PATH; command -v yarn >/dev/null || npm install -g yarn@1.22.22 --force'
 
 step "Copying the repository"
-# Not the build output, not the guest images, not the results: those are either
-# reproducible there or specific to here.
+# Not the build output, not the guest images, not this Mac's gate results:
+# those are either reproducible there or specific to here. The record's CSVs
+# go, since m5's report reads them; `.git` either way, since in a worktree it
+# is a file naming a path only this Mac has.
 rsync -a --delete \
 	--exclude target/ --exclude guest/out/ --exclude guest/build/ --exclude guest/src/ \
-	--exclude .git/ --exclude .logs/ --exclude .context/ --exclude vendor/ \
-	--exclude 'benchmarks/results/*.csv' --exclude 'benchmarks/results/*.log' \
+	--exclude .git --exclude .logs/ --exclude .context/ --exclude vendor/ \
+	--exclude 'benchmarks/results/gate-*.csv' --exclude 'benchmarks/results/*.log' \
 	"$ROOT/" "$HOST:$REMOTE_DIR/"
 
 step "Guest artifacts"

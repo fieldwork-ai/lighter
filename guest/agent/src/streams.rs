@@ -61,6 +61,74 @@ const KEEPALIVE: [libc::c_int; 3] = [30, 10, 3];
 /// sees any connections left queued.
 const ACCEPT_BATCH: usize = 256;
 
+/// How this process's streams with bytes to carry were carried: joined in
+/// the kernel, or copied here (no join on this kernel or boot, a Mac end
+/// already gone, or a join the kernel refused), with the last refusal. For
+/// `lighter doctor`, through a file the control agent reads (`publish`):
+/// a stream copied when it could have been joined is a quarter of the
+/// throughput and nothing else says so (#107).
+pub struct Carried {
+    joined: std::sync::atomic::AtomicU64,
+    copied: std::sync::atomic::AtomicU64,
+    refused: std::sync::atomic::AtomicU64,
+    last_refusal: std::sync::Mutex<String>,
+}
+
+pub static CARRIED: Carried = Carried {
+    joined: std::sync::atomic::AtomicU64::new(0),
+    copied: std::sync::atomic::AtomicU64::new(0),
+    refused: std::sync::atomic::AtomicU64::new(0),
+    last_refusal: std::sync::Mutex::new(String::new()),
+};
+
+impl Carried {
+    fn count(&self, counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn refused(&self, error: &io::Error) {
+        self.count(&self.refused);
+        *self.last_refusal.lock().expect("refusal poisoned") = error.to_string();
+    }
+
+    /// One line: `joined=1 copied=2 refused=0 last=<the error, to the end>`.
+    pub fn line(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "joined={} copied={} refused={} last={}\n",
+            self.joined.load(Relaxed),
+            self.copied.load(Relaxed),
+            self.refused.load(Relaxed),
+            self.last_refusal.lock().expect("refusal poisoned"),
+        )
+    }
+
+    /// Writes `line` to `path` every second it changed, through a rename so
+    /// a reader never sees half of one.
+    pub fn publish(&'static self, path: &'static str) {
+        let _ = std::thread::Builder::new()
+            .name("carried".into())
+            .spawn(move || {
+                if let Some(dir) = std::path::Path::new(path).parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let mut last = String::new();
+                loop {
+                    let line = self.line();
+                    if line != last {
+                        let partial = format!("{path}.partial");
+                        if std::fs::write(&partial, &line).is_ok()
+                            && std::fs::rename(&partial, path).is_ok()
+                        {
+                            last = line;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            });
+    }
+}
+
 pub fn serve(listener: OwnedFd, route: Route, env: Env) -> std::process::ExitCode {
     let mut lp = match Loop::new(listener, route, env) {
         Ok(lp) => lp,
@@ -846,10 +914,12 @@ impl Conn {
             if !data {
                 return Some(Step::Close);
             }
+            CARRIED.count(&CARRIED.copied);
             self.state = State::Copying;
             return Some(Step::Wait);
         }
         let Some(joiner) = env.joiner else {
+            CARRIED.count(&CARRIED.copied);
             self.state = State::Copying;
             return Some(Step::Wait);
         };
@@ -862,10 +932,12 @@ impl Conn {
         let (tcp, other) = if self.a_tcp { (a, b) } else { (b, a) };
         match joiner.join(tcp, other) {
             Ok(joined) => {
+                CARRIED.count(&CARRIED.joined);
                 self.joined = Some(joined);
                 self.state = State::Joined;
             }
             Err(failure) => {
+                CARRIED.refused(&failure.error);
                 // A peer can close between polling and map insertion. Those
                 // ordinary copying fallbacks must not produce a log per
                 // request.
@@ -879,6 +951,7 @@ impl Conn {
                     if let Some(joined) = failure.joined {
                         joiner.release(joined);
                     }
+                    CARRIED.count(&CARRIED.copied);
                     self.state = State::Copying;
                 } else {
                     // Closed before the slots go back (`close`).
@@ -1446,6 +1519,28 @@ fn take_queued(from: RawFd) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carried_counts_read_as_one_line() {
+        let carried = Carried {
+            joined: std::sync::atomic::AtomicU64::new(0),
+            copied: std::sync::atomic::AtomicU64::new(0),
+            refused: std::sync::atomic::AtomicU64::new(0),
+            last_refusal: std::sync::Mutex::new(String::new()),
+        };
+        assert_eq!(carried.line(), "joined=0 copied=0 refused=0 last=\n");
+        carried.count(&carried.joined);
+        carried.count(&carried.joined);
+        carried.refused(&io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        carried.count(&carried.copied);
+        assert_eq!(
+            carried.line(),
+            format!(
+                "joined=2 copied=1 refused=1 last={}\n",
+                io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+            )
+        );
+    }
 
     /// The probe the joined path asks a Mac end with: a peer that stopped
     /// sending still reads, and nothing reaches it; one that stopped

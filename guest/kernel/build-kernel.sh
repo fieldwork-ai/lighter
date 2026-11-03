@@ -79,7 +79,7 @@ if [ "${KERNEL_HZ:-}" = 1000 ]; then
 fi
 # `Image-trace` (KERNEL_TRACE=1): ftrace and the tracepoints, so an idle
 # guest's timer expiries and work items can be read by function; the
-# shipped kernels carry none of it.
+# shipped kernels carry tracing for BPF but no function tracer.
 if [ "${KERNEL_TRACE:-}" = 1 ]; then
 	log "Tracing: ftrace and tracepoints in this image"
 	./scripts/config --file .config --enable FTRACE --enable TRACING --enable TRACEPOINTS \
@@ -122,6 +122,15 @@ required=(
 	CONFIG_INET
 	CONFIG_NFT_COMPAT
 	CONFIG_NETFILTER_XT_MATCH_STATISTIC
+	CONFIG_BRIDGE_NETFILTER
+	CONFIG_VXLAN
+	CONFIG_IP_SET
+	CONFIG_NETFILTER_XT_SET
+	CONFIG_NETFILTER_XT_MATCH_PHYSDEV
+	CONFIG_NETFILTER_XT_TARGET_TPROXY
+	CONFIG_CGROUP_NET_CLASSID
+	CONFIG_DEBUG_INFO_BTF
+	CONFIG_BPF_EVENTS
 	CONFIG_USBIP_VHCI_HCD
 	CONFIG_USB_ACM
 	CONFIG_USB_SERIAL_CH341

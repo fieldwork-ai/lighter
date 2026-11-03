@@ -62,7 +62,7 @@ pub fn config_file() -> anyhow::Result<PathBuf> {
 /// `/opt/homebrew/bin/lighter`), and `current_exe` answers with the link:
 /// "beside the executable" then means beside the link, where there is no
 /// `share`, and a fresh install could not start.
-fn executable() -> anyhow::Result<PathBuf> {
+pub fn executable() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
 }

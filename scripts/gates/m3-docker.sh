@@ -282,6 +282,57 @@ table inet sandbox {
 EOF' 2>&1)"
 echo "$nft_out" | grep -q NFT-OK && pass "a container loads an nftables firewall (ct state, log, limit, reject, dnat, masquerade)" || fail "nftables in a container: $(echo "$nft_out" | grep -m1 -i "error\|No such" || echo "$nft_out" | tail -1)"
 
+# Bridged netfilter: built in for Kubernetes nodes in containers, never on in
+# the guest's own namespace. On there, the IP prerouting hooks run in bridge
+# context, ip_rcv_core() then drops the socket TPROXY assigned, and every
+# datagram the divert took reached no socket: a container's IPv6 UDP from
+# boot, its IPv4 UDP once a network with inter-container traffic off made
+# dockerd turn the switch on. Init pins all three off, read-only.
+guest_ns() { docker run --rm --privileged --pid=host alpine:3.21 nsenter -t 1 -m -n sh -c "$1" 2>&1; }
+switches="$(guest_ns 'for s in iptables ip6tables arptables; do printf "%s=%s " $s "$(cat /proc/sys/net/bridge/bridge-nf-call-$s)"; done; grep -c " /proc/sys/net/bridge/bridge-nf-call-[a-z0-9]* ro," /proc/self/mountinfo; { echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables; } 2>/dev/null && echo WRITABLE; true')"
+[ "$switches" = "iptables=0 ip6tables=0 arptables=0 3" ] \
+	&& pass "bridged netfilter: off in the guest's namespace, all three switches read-only" \
+	|| fail "bridged netfilter in the guest's namespace: $(echo $switches)"
+if noicc="$(docker network create -o com.docker.network.bridge.enable_icc=false lighter-gate-noicc 2>&1)"; then
+	docker network rm lighter-gate-noicc >/dev/null 2>&1
+	fail "a network with inter-container traffic off was created: dockerd could turn bridged netfilter on"
+else
+	echo "$noicc" | grep -q "read-only file system" \
+		&& pass "a network with inter-container traffic off is refused, as without br_netfilter" \
+		|| fail "icc=false network refused for another reason: $noicc"
+fi
+# UDP from a container to a resolver of its own (through the divert, not
+# Docker's embedded resolver, which never crosses the bridge), on the default
+# bridge and a user network; IPv6 where the Mac has a route for it.
+docker network create --ipv6 lighter-gate-udp >/dev/null
+udp_ok=1
+v6=""
+route -n get -inet6 2606:4700:4700::1111 >/dev/null 2>&1 && v6=2606:4700:4700::1111
+for net in bridge lighter-gate-udp; do
+	for server in 1.1.1.1 $v6; do
+		docker run --rm --network "$net" alpine:3.21 nslookup -timeout=3 example.com "$server" >/dev/null 2>&1 \
+			|| { udp_ok=0; fail "UDP from a container on $net to $server"; }
+	done
+done
+docker network rm lighter-gate-udp >/dev/null
+[ "$udp_ok" = 1 ] && pass "a container's UDP reaches a resolver of its own on the default bridge and a user network (IPv4${v6:+ and IPv6})"
+# A node's namespace gets what its network plugins load: a VXLAN link (flannel,
+# Cilium), ipset (kube-router), bridged netfilter on by default in its own
+# namespace, the kernel's BTF, bpf_get_cgroup_classid() for socket programs
+# (Cilium's start check) and tracing programs (its socket iterators).
+k8s="$(docker run --rm --privileged alpine:3.21 sh -c '
+	apk add -q bpftool ipset >/dev/null 2>&1
+	ip link add vx-gate type vxlan id 42 dstport 4789 dev eth0 && echo VXLAN
+	ipset create gate hash:ip && echo IPSET
+	[ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" = 1 ] && echo BRNF
+	[ -s /sys/kernel/btf/vmlinux ] && echo BTF
+	bpftool feature probe kernel 2>/dev/null | awk "/^eBPF helpers supported for program type/ { in_type = /cgroup_sock_addr:/ } in_type && /bpf_get_cgroup_classid/ { found = 1 } END { exit !found }" && echo CLASSID
+	bpftool feature probe kernel 2>/dev/null | grep -q "eBPF program_type tracing is available" && echo TRACING; true' 2>&1)"
+for want in VXLAN IPSET BRNF BTF CLASSID TRACING; do
+	echo "$k8s" | grep -qx "$want" || { fail "a node container lacks $want: $(echo "$k8s" | grep -v -x -E 'VXLAN|IPSET|BRNF|BTF|CLASSID|TRACING' | tail -2)"; k8s_failed=1; }
+done
+[ -z "${k8s_failed:-}" ] && pass "a node container gets VXLAN, ipset, bridged netfilter in its own namespace, BTF, the cgroup classid helper and tracing programs"
+
 # A larger configured disk applies to one that already exists: `lighter config
 # --disk` once only sized an image as it was created. Power off, boot again at
 # 20 GiB with the data disk growable, and the image, the filesystem inside it

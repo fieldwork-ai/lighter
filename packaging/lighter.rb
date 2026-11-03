@@ -11,8 +11,8 @@
 class Lighter < Formula
   desc "Docker for macOS, on a virtual machine built for it"
   homepage "https://github.com/fieldwork-ai/lighter"
-  url "https://github.com/fieldwork-ai/lighter/releases/download/v0.13.8/lighter-0.13.8-arm64.tar.gz"
-  sha256 "d8e7b1b2d982f5a8f0e574b1934bae3d2fe17006458b0b4ba9243e1aa8d7f04e"
+  url "https://github.com/fieldwork-ai/lighter/releases/download/v0.13.9/lighter-0.13.9-arm64.tar.gz"
+  sha256 "f5b77fac2e25fc36c845bb6a90f2662ca8c6cd1914b0167df8f740b805e6d0a6"
   license any_of: ["MIT", "Apache-2.0"]
 
   # Apple Silicon only, and not by omission: there is no Intel path and there
@@ -63,11 +63,18 @@ class Lighter < Formula
     EOS
   end
 
+  # What `lighter install`'s own agent runs. The machine is lighter.app's
+  # executable rather than bin/lighter because macOS gives Local Network
+  # permission to the bundle: started as the bare binary, it reached the Mac's
+  # router and no other device on its network (#101). Its log is the one
+  # `lighter doctor` and bug reports ask for.
   service do
-    run [opt_bin/"lighter", "run"]
+    run [opt_pkgshare/"lighter.app/Contents/MacOS/lighter", "run"]
+    environment_variables LIGHTER_GUEST_DIR: opt_pkgshare
     keep_alive successful_exit: false
-    log_path var/"log/lighter.log"
-    error_log_path var/"log/lighter.log"
+    process_type :interactive
+    log_path "#{Dir.home}/.lighter/machine.log"
+    error_log_path "#{Dir.home}/.lighter/machine.log"
   end
 
   test do

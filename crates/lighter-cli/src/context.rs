@@ -191,8 +191,9 @@ mod tests {
 }
 
 /// Against the real docker CLI, in a private `DOCKER_CONFIG` so no real
-/// context is touched: `LIGHTER_TEST_LIVE_SOCKET` names a daemon socket that
-/// answers. `cargo test -p lighter-cli context_round_trip -- --ignored`.
+/// context is touched, with a daemon of its own that answers what `answers`
+/// asks (`_ping` and `version`). `cargo test -p lighter-cli context_round_trip
+/// -- --ignored`.
 #[cfg(test)]
 mod live {
     use super::*;
@@ -206,12 +207,61 @@ mod live {
         assert!(status.success(), "docker {args:?}");
     }
 
+    /// A daemon that answers the docker CLI's ping and version, enough for
+    /// it to count as live: a real one needed a machine running beside the
+    /// test, named in the environment, and failed without it.
+    fn answering_daemon(path: &std::path::Path) {
+        use std::io::{BufRead, BufReader, Write};
+        let _ = std::fs::remove_file(path);
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    loop {
+                        let mut request = String::new();
+                        if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                            line.clear();
+                        }
+                        let body = if request.contains("/version") {
+                            r#"{"Version":"28.3.3","ApiVersion":"1.51","MinAPIVersion":"1.24","Os":"linux","Arch":"arm64"}"#
+                        } else {
+                            "OK"
+                        };
+                        let head = request.starts_with("HEAD ");
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+                            if body == "OK" {
+                                "text/plain"
+                            } else {
+                                "application/json"
+                            },
+                            body.len(),
+                            if head { "" } else { body }
+                        );
+                        if writer.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     #[test]
     #[ignore]
     fn context_round_trip() {
-        let live = std::env::var("LIGHTER_TEST_LIVE_SOCKET").expect("LIGHTER_TEST_LIVE_SOCKET");
         let dir = std::env::temp_dir().join(format!("lighter-context-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.sock");
+        answering_daemon(&live);
+        let live = live.display();
         // SAFETY: the only test in this binary run that touches the environment.
         unsafe { std::env::set_var("DOCKER_CONFIG", &dir) };
         let saved = dir.join("previous-context");

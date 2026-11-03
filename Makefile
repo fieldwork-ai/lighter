@@ -123,6 +123,10 @@ guest: ## Build the guest kernel, agent, initramfs, and root filesystem
 	@guest/initramfs/build.sh
 	@guest/rootfs/build.sh
 
+.PHONY: gate-m22
+gate-m22: ## M22: Kubernetes in containers beyond kindnet: k3d, and kind with Cilium
+	@scripts/gates/m22-kubernetes.sh
+
 .PHONY: gate-m6-memory
 gate-m6-memory: ## M6: memory tracks load, and idling costs nothing
 	@scripts/gates/m6-memory.sh

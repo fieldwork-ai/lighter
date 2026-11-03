@@ -7,7 +7,7 @@ members = ["crates/*"]
 exclude = ["guest/agent", "guest/ane-ep"]
 
 [workspace.package]
-version = "0.13.8"
+version = "0.13.9"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -15,11 +15,11 @@ repository = "https://github.com/fieldwork-ai/lighter"
 authors = ["Nick Rogers"]
 
 [workspace.dependencies]
-lighter-hv = { path = "crates/lighter-hv", version = "0.13.8" }
-lighter-vmm = { path = "crates/lighter-vmm", version = "0.13.8" }
-lighter-docker = { path = "crates/lighter-docker", version = "0.13.8" }
-lighter-fs = { path = "crates/lighter-fs", version = "0.13.8" }
-lighter-vmnet = { path = "crates/lighter-vmnet", version = "0.13.8" }
+lighter-hv = { path = "crates/lighter-hv", version = "0.13.9" }
+lighter-vmm = { path = "crates/lighter-vmm", version = "0.13.9" }
+lighter-docker = { path = "crates/lighter-docker", version = "0.13.9" }
+lighter-fs = { path = "crates/lighter-fs", version = "0.13.9" }
+lighter-vmnet = { path = "crates/lighter-vmnet", version = "0.13.9" }
 
 anyhow = "1"
 thiserror = "2"

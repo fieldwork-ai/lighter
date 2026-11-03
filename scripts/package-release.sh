@@ -151,14 +151,6 @@ for artifact in guest/out/Image guest/out/rootfs.ext4; do
 	[ -f "$artifact" ] || { echo "error: $artifact is missing; run 'make guest'" >&2; exit 1; }
 done
 
-# What the release owes the authors of what it ships, made before anything
-# is signed so that a licence problem fails here rather than after
-# notarization: the notices go in the archive, the guest's source beside it.
-echo "==> Writing third-party notices"
-python3 scripts/notices.py "$VERSION" "$STAGE/THIRD-PARTY-NOTICES"
-echo "==> Building the guest source archive"
-scripts/guest-source.sh "$VERSION"
-
 cp target/release/lighter "$STAGE/bin/lighter"
 cp guest/out/Image guest/out/rootfs.ext4 guest/out/kernel.version "$STAGE/share/lighter/"
 cp LICENSE-MIT LICENSE-APACHE NOTICE README.md "$STAGE/"
@@ -225,6 +217,17 @@ codesign --verify --verbose=2 --deep "$APP"
 codesign --verify --verbose=2 -R='anchor apple generic and identifier "dev.lighter.bridge" and certificate leaf[subject.OU] = "N7N6BNF95K"' "$APP/Contents/MacOS/lighter-bridge"
 codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.vm.networking" \
 	|| { echo "error: lighter.app does not carry com.apple.vm.networking" >&2; exit 1; }
+echo "==> Signed: the screen may be locked from here"
+
+# What the release owes the authors of what it ships: the notices go in the
+# archive, the guest's source beside it. After signing, which is the one step
+# that needs the screen unlocked, so the slow guest source does not hold it
+# there; before notarization, so a licence problem fails here rather than
+# after Apple has been asked.
+echo "==> Writing third-party notices"
+python3 scripts/notices.py "$VERSION" "$STAGE/THIRD-PARTY-NOTICES"
+echo "==> Building the guest source archive"
+scripts/guest-source.sh "$VERSION"
 
 # --- notarize ----------------------------------------------------------------
 if [ -z "$SKIP_NOTARIZE" ]; then

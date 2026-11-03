@@ -313,6 +313,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             Ok(std::process::ExitCode::SUCCESS)
         }
         Command::Run => {
+            bundle::enter();
             run::machine()?;
             Ok(std::process::ExitCode::SUCCESS)
         }

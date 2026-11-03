@@ -6,6 +6,8 @@
 # from the toolchain, and pinning Debian here would just add a stale-base chore.
 FROM debian:bookworm-slim
 
+# dwarves is pahole, which makes BTF from the build's DWARF; python3 is for
+# the libbpf headers resolve_btfids is built against.
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	bc \
 	bison \
@@ -13,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	ca-certificates \
 	cpio \
 	curl \
+	dwarves \
 	flex \
 	git \
 	gzip \
@@ -20,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	libelf-dev \
 	libssl-dev \
 	patch \
+	python3 \
 	rsync \
 	xz-utils \
 	&& rm -rf /var/lib/apt/lists/*

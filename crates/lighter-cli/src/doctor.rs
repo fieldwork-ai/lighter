@@ -393,13 +393,31 @@ pub fn run() -> Vec<Finding> {
     // not subject, so a check from here against the router would pass while
     // every camera, printer and NAS failed.
     findings.push({
-        let pid = paths::home()
+        let identity = paths::home()
             .ok()
-            .and_then(|home| crate::instance::Identity::read(&home).ok().flatten())
-            .map(|identity| identity.pid());
-        let (ok, detail, remedy) = match paths::home() {
-            Ok(home) => crate::localnet::doctor_finding(&home, pid),
-            Err(e) => (true, format!("untested: {e}"), None),
+            .and_then(|home| crate::instance::Identity::read(&home).ok().flatten());
+        let pid = identity.as_ref().map(|identity| identity.pid());
+        // Outside its bundle the machine is not what macOS gives the
+        // permission to, so allowing lighter in System Settings cannot help
+        // it: a machine an older lighter started that way (`brew services`
+        // before 0.13.9, #101), or one whose bundle could not be had.
+        let outside = identity
+            .and_then(|identity| identity.executable().ok())
+            .filter(|exe| !crate::bundle::contains(exe));
+        let (ok, detail, remedy) = match (paths::home(), outside) {
+            (_, Some(exe)) => (
+                false,
+                format!(
+                    "the machine runs as {}, outside lighter.app, which is what macOS gives Local Network permission to",
+                    exe.display()
+                ),
+                Some(
+                    "`lighter restart`, or `brew update && brew services restart lighter` if `brew services` starts it"
+                        .into(),
+                ),
+            ),
+            (Ok(home), None) => crate::localnet::doctor_finding(&home, pid),
+            (Err(e), None) => (true, format!("untested: {e}"), None),
         };
         // A warning, never a failure: `lighter start` must not refuse over
         // a permission macOS grants only to a machine that is running and
@@ -445,6 +463,15 @@ pub fn run() -> Vec<Finding> {
         && let Some(link) = &report.link
     {
         findings.push(link_finding(link));
+    }
+
+    // How the guest carried streams: joined in its kernel, or copied by its
+    // agent at a fraction of the throughput, which nothing else shows (#107).
+    if matches!(crate::machine::running_pid(), Ok(Some(_)))
+        && let Ok(reply) = crate::machine::control("streams")
+        && let Some(finding) = streams_finding(&Carried::parse(&reply))
+    {
+        findings.push(finding);
     }
 
     // A custom home never owns the global context; its machine is reached
@@ -556,6 +583,105 @@ fn link_finding(link: &crate::storage_status::Link) -> Finding {
     )
 }
 
+/// How one of the guest's stream processes carried its streams, from the
+/// agent's one-line `streams` verb: `streams inbound joined=1 copied=2
+/// refused=0 outbound joined=5 copied=0 refused=0 last=<error>`, a route
+/// standing alone before it has carried anything, and the last refusal at the
+/// end, to the end of the line.
+#[derive(Debug, Default, PartialEq)]
+struct Carried {
+    route: String,
+    joined: u64,
+    copied: u64,
+    refused: u64,
+    last: String,
+}
+
+impl Carried {
+    fn parse(reply: &str) -> Vec<Carried> {
+        let Some(rest) = reply.trim_end().strip_prefix("streams") else {
+            return Vec::new();
+        };
+        let (counts, last) = rest.split_once(" last=").unwrap_or((rest, ""));
+        let mut carried: Vec<Carried> = Vec::new();
+        for word in counts.split_whitespace() {
+            let Some((key, value)) = word.split_once('=') else {
+                carried.push(Carried {
+                    route: word.to_string(),
+                    ..Carried::default()
+                });
+                continue;
+            };
+            let (Some(route), Ok(value)) = (carried.last_mut(), value.parse()) else {
+                continue;
+            };
+            match key {
+                "joined" => route.joined = value,
+                "copied" => route.copied = value,
+                "refused" => route.refused = value,
+                _ => {}
+            }
+        }
+        let last = last.trim();
+        if let Some(route) = carried.iter_mut().find(|c| c.refused > 0) {
+            route.last = last.to_string();
+        }
+        carried
+    }
+}
+
+fn streams_finding(carried: &[Carried]) -> Option<Finding> {
+    if carried.is_empty() {
+        return None;
+    }
+    let name = |route: &str| {
+        match route {
+            "inbound" => "published ports",
+            "outbound" => "outbound",
+            other => other,
+        }
+        .to_string()
+    };
+    let parts: Vec<String> = carried
+        .iter()
+        .map(|c| {
+            format!(
+                "{}: {} joined, {} copied",
+                name(&c.route),
+                c.joined,
+                c.copied
+            )
+        })
+        .collect();
+    let mut detail = parts.join("; ");
+    let refused: u64 = carried.iter().map(|c| c.refused).sum();
+    if refused > 0 {
+        let last = carried
+            .iter()
+            .filter(|c| c.refused > 0 && !c.last.is_empty())
+            .map(|c| c.last.as_str())
+            .next_back()
+            .unwrap_or("see `lighter logs`");
+        detail.push_str(&format!(
+            "; {refused} join{} refused, the last: {last}",
+            if refused == 1 { "" } else { "s" }
+        ));
+    }
+    // Copied with nothing ever joined or refused is a guest with no kernel
+    // join at all on this boot: every stream at the copying path's speed.
+    let never_joined = carried.iter().all(|c| c.joined == 0 && c.refused == 0)
+        && carried.iter().any(|c| c.copied > 0);
+    Some(if never_joined {
+        Finding::warn(
+            "streams",
+            detail,
+            "no stream is joined in the guest's kernel on this boot; `lighter logs` says why (\"streams copy in this process\")",
+        )
+    } else {
+        Finding::good("streams", detail)
+    })
+}
+
 /// Formats the findings the way `lighter doctor` prints them.
 pub fn report(findings: &[Finding]) -> String {
     let mut out = String::new();
@@ -619,6 +745,47 @@ fn free_space_gib() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streams_read_as_what_was_joined_and_copied() {
+        let reply = "streams inbound joined=12 copied=3 refused=2 outbound joined=40 copied=1 refused=0 last=Operation not supported (os error 95)\n";
+        let carried = Carried::parse(reply);
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0].route, "inbound");
+        assert_eq!(
+            (carried[0].joined, carried[0].copied, carried[0].refused),
+            (12, 3, 2)
+        );
+        assert_eq!(carried[0].last, "Operation not supported (os error 95)");
+        assert_eq!(carried[1].route, "outbound");
+        assert_eq!((carried[1].joined, carried[1].copied), (40, 1));
+        let finding = streams_finding(&carried).unwrap();
+        assert!(!finding.warn);
+        assert_eq!(
+            finding.detail,
+            "published ports: 12 joined, 3 copied; outbound: 40 joined, 1 copied; 2 joins refused, the last: Operation not supported (os error 95)"
+        );
+        // A stream process that has carried nothing yet.
+        assert_eq!(
+            Carried::parse("streams inbound outbound joined=1 copied=0 refused=0 last=\n"),
+            vec![
+                Carried {
+                    route: "inbound".into(),
+                    ..Carried::default()
+                },
+                Carried {
+                    route: "outbound".into(),
+                    joined: 1,
+                    ..Carried::default()
+                },
+            ]
+        );
+        // Copied and never joined: no kernel join on this boot.
+        let copying =
+            Carried::parse("streams inbound joined=0 copied=9 refused=0 outbound last=\n");
+        assert!(streams_finding(&copying).unwrap().warn);
+        assert!(streams_finding(&Carried::parse("")).is_none());
+    }
 
     #[test]
     fn the_guests_memory_warns_only_when_it_is_short() {
