@@ -759,6 +759,29 @@ fn offer_memory(
 /// the last ten seconds, and how many free blocks of 256 KiB or more the
 /// page allocator holds — none is a fragmented guest, whose memory is
 /// there but not in pieces large enough for a full-size receive buffer.
+fn streams_report() -> String {
+    streams_line(|route| std::fs::read_to_string(format!("/run/lighter/streams-{route}")).unwrap_or_default())
+}
+
+fn streams_line(written_by: impl Fn(&str) -> String) -> String {
+    let mut line = String::from("streams");
+    let mut last = String::new();
+    for route in ["inbound", "outbound"] {
+        let written = written_by(route);
+        let (counts, refusal) = written.trim_end().split_once(" last=").unwrap_or((written.trim_end(), ""));
+        line.push(' ');
+        line.push_str(route);
+        if !counts.is_empty() {
+            line.push(' ');
+            line.push_str(counts);
+        }
+        if last.is_empty() {
+            last = refusal.to_string();
+        }
+    }
+    format!("{line} last={last}\n")
+}
+
 fn memory_report() -> String {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let field = |name: &str| -> u64 {
@@ -1348,17 +1371,13 @@ fn handle_control(line: &str) -> String {
         // available, whether the guest is stalling for it, and whether it
         // is in pieces (`memory_report`).
         (Some("memory"), _) => memory_report(),
-        // How streams were carried, inbound (published ports) and outbound:
-        // joined in the kernel or copied, and the last join it refused, as
-        // each stream process last wrote it (`streams::Carried`).
-        (Some("streams"), _) => ["inbound", "outbound"]
-            .iter()
-            .map(|route| {
-                let line = std::fs::read_to_string(format!("/run/lighter/streams-{route}"))
-                    .unwrap_or_else(|_| "none\n".into());
-                format!("streams {route} {line}")
-            })
-            .collect(),
+        // How streams were carried, as each stream process last wrote it
+        // (`streams::Carried`): one line, since the control protocol is one,
+        // `streams inbound joined=1 copied=0 refused=0 outbound joined=5
+        // copied=0 refused=0 last=<error>`, a route that has written nothing
+        // yet standing alone, and the last refusal published ports' if they
+        // have one, else outbound's.
+        (Some("streams"), _) => streams_report(),
         // The host is compressing our pages: give back that much page cache,
         // coldest first, from the cgroup every container lives in. The
         // kernel frees it in bulk and free page reporting returns it to the
@@ -1658,6 +1677,26 @@ impl Write for Fd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streams_answer_in_one_line() {
+        let line = super::streams_line(|route| match route {
+            "inbound" => "joined=12 copied=3 refused=2 last=Operation not supported (os error 95)\n".into(),
+            _ => String::new(),
+        });
+        assert_eq!(
+            line,
+            "streams inbound joined=12 copied=3 refused=2 outbound last=Operation not supported (os error 95)\n"
+        );
+        let line = super::streams_line(|route| match route {
+            "inbound" => "joined=1 copied=0 refused=0 last=\n".into(),
+            _ => "joined=4 copied=1 refused=1 last=Broken pipe (os error 32)\n".into(),
+        });
+        assert_eq!(
+            line,
+            "streams inbound joined=1 copied=0 refused=0 outbound joined=4 copied=1 refused=1 last=Broken pipe (os error 32)\n"
+        );
+    }
+
     /// skwiz0d's guest at the stall (#84): 3.1 GB available and not one
     /// free block of 256 KiB in the main zone; the DMA zone held 37.
     #[test]

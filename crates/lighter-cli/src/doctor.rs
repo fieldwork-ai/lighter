@@ -584,9 +584,10 @@ fn link_finding(link: &crate::storage_status::Link) -> Finding {
 }
 
 /// How one of the guest's stream processes carried its streams, from the
-/// agent's `streams` verb: `streams inbound joined=1 copied=2 refused=0
-/// last=<error>` per process, or `streams inbound none` before it has
-/// carried one.
+/// agent's one-line `streams` verb: `streams inbound joined=1 copied=2
+/// refused=0 outbound joined=5 copied=0 refused=0 last=<error>`, a route
+/// standing alone before it has carried anything, and the last refusal at the
+/// end, to the end of the line.
 #[derive(Debug, Default, PartialEq)]
 struct Carried {
     route: String,
@@ -598,32 +599,34 @@ struct Carried {
 
 impl Carried {
     fn parse(reply: &str) -> Vec<Carried> {
-        reply
-            .lines()
-            .filter_map(|line| {
-                let rest = line.strip_prefix("streams ")?;
-                let (route, rest) = rest.split_once(' ')?;
-                let (counts, last) = rest.split_once(" last=").unwrap_or((rest, ""));
-                let mut carried = Carried {
-                    route: route.to_string(),
-                    last: last.trim().to_string(),
+        let Some(rest) = reply.trim_end().strip_prefix("streams") else {
+            return Vec::new();
+        };
+        let (counts, last) = rest.split_once(" last=").unwrap_or((rest, ""));
+        let mut carried: Vec<Carried> = Vec::new();
+        for word in counts.split_whitespace() {
+            let Some((key, value)) = word.split_once('=') else {
+                carried.push(Carried {
+                    route: word.to_string(),
                     ..Carried::default()
-                };
-                for pair in counts.split_whitespace() {
-                    let Some((key, value)) = pair.split_once('=') else {
-                        continue;
-                    };
-                    let Ok(value) = value.parse() else { continue };
-                    match key {
-                        "joined" => carried.joined = value,
-                        "copied" => carried.copied = value,
-                        "refused" => carried.refused = value,
-                        _ => {}
-                    }
-                }
-                Some(carried)
-            })
-            .collect()
+                });
+                continue;
+            };
+            let (Some(route), Ok(value)) = (carried.last_mut(), value.parse()) else {
+                continue;
+            };
+            match key {
+                "joined" => route.joined = value,
+                "copied" => route.copied = value,
+                "refused" => route.refused = value,
+                _ => {}
+            }
+        }
+        let last = last.trim();
+        if let Some(route) = carried.iter_mut().find(|c| c.refused > 0) {
+            route.last = last.to_string();
+        }
+        carried
     }
 }
 
@@ -745,7 +748,7 @@ mod tests {
 
     #[test]
     fn streams_read_as_what_was_joined_and_copied() {
-        let reply = "streams inbound joined=12 copied=3 refused=2 last=Operation not supported (os error 95)\nstreams outbound joined=40 copied=1 refused=0 last=\n";
+        let reply = "streams inbound joined=12 copied=3 refused=2 outbound joined=40 copied=1 refused=0 last=Operation not supported (os error 95)\n";
         let carried = Carried::parse(reply);
         assert_eq!(carried.len(), 2);
         assert_eq!(carried[0].route, "inbound");
@@ -754,6 +757,8 @@ mod tests {
             (12, 3, 2)
         );
         assert_eq!(carried[0].last, "Operation not supported (os error 95)");
+        assert_eq!(carried[1].route, "outbound");
+        assert_eq!((carried[1].joined, carried[1].copied), (40, 1));
         let finding = streams_finding(&carried).unwrap();
         assert!(!finding.warn);
         assert_eq!(
@@ -762,16 +767,24 @@ mod tests {
         );
         // A stream process that has carried nothing yet.
         assert_eq!(
-            Carried::parse("streams inbound none\n")[0],
-            Carried {
-                route: "inbound".into(),
-                ..Carried::default()
-            }
+            Carried::parse("streams inbound outbound joined=1 copied=0 refused=0 last=\n"),
+            vec![
+                Carried {
+                    route: "inbound".into(),
+                    ..Carried::default()
+                },
+                Carried {
+                    route: "outbound".into(),
+                    joined: 1,
+                    ..Carried::default()
+                },
+            ]
         );
         // Copied and never joined: no kernel join on this boot.
-        let copying = Carried::parse("streams inbound joined=0 copied=9 refused=0 last=\n");
+        let copying =
+            Carried::parse("streams inbound joined=0 copied=9 refused=0 outbound last=\n");
         assert!(streams_finding(&copying).unwrap().warn);
-        assert!(streams_finding(&[]).is_none());
+        assert!(streams_finding(&Carried::parse("")).is_none());
     }
 
     #[test]
