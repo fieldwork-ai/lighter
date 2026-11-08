@@ -50,8 +50,11 @@ A drop-in replacement for Docker Desktop, OrbStack and Colima:
 
 ```bash
 brew tap fieldwork-ai/tap
+brew trust fieldwork-ai/tap
 brew install lighter
 ```
+
+Homebrew 7 loads formulae only from taps you have trusted, so `brew trust` is needed once, before the first install or upgrade from this tap.
 
 Or with the one-line installer:
 
