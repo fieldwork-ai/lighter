@@ -69,6 +69,7 @@ while machines using them are running.
 Homebrew owns installations in its Cellar:
 
 ```sh
+brew trust fieldwork-ai/tap    # once, on Homebrew 7 or later
 brew upgrade fieldwork-ai/tap/lighter
 lighter restart
 ```

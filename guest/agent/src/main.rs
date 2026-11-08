@@ -1680,12 +1680,12 @@ mod tests {
     #[test]
     fn streams_answer_in_one_line() {
         let line = super::streams_line(|route| match route {
-            "inbound" => "joined=12 copied=3 refused=2 last=Operation not supported (os error 95)\n".into(),
+            "inbound" => "joined=12 copied=3 closed=1 refused=2 last=the TCP socket (CLOSE-WAIT): Operation not supported (os error 95)\n".into(),
             _ => String::new(),
         });
         assert_eq!(
             line,
-            "streams inbound joined=12 copied=3 refused=2 outbound last=Operation not supported (os error 95)\n"
+            "streams inbound joined=12 copied=3 closed=1 refused=2 outbound last=the TCP socket (CLOSE-WAIT): Operation not supported (os error 95)\n"
         );
         let line = super::streams_line(|route| match route {
             "inbound" => "joined=1 copied=0 refused=0 last=\n".into(),

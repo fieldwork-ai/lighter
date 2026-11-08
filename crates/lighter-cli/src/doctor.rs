@@ -593,6 +593,9 @@ struct Carried {
     route: String,
     joined: u64,
     copied: u64,
+    /// Of those copied, the ones already closed one way when there was a
+    /// byte to carry, which the kernel cannot join; none before 0.13.10.
+    closed: u64,
     refused: u64,
     last: String,
 }
@@ -618,6 +621,7 @@ impl Carried {
             match key {
                 "joined" => route.joined = value,
                 "copied" => route.copied = value,
+                "closed" => route.closed = value,
                 "refused" => route.refused = value,
                 _ => {}
             }
@@ -645,8 +649,13 @@ fn streams_finding(carried: &[Carried]) -> Option<Finding> {
     let parts: Vec<String> = carried
         .iter()
         .map(|c| {
+            let closed = if c.closed > 0 {
+                format!(" ({} of them already closed one way)", c.closed)
+            } else {
+                String::new()
+            };
             format!(
-                "{}: {} joined, {} copied",
+                "{}: {} joined, {} copied{closed}",
                 name(&c.route),
                 c.joined,
                 c.copied
@@ -669,8 +678,9 @@ fn streams_finding(carried: &[Carried]) -> Option<Finding> {
     }
     // Copied with nothing ever joined or refused is a guest with no kernel
     // join at all on this boot: every stream at the copying path's speed.
+    // Streams already closed one way are copied on any guest.
     let never_joined = carried.iter().all(|c| c.joined == 0 && c.refused == 0)
-        && carried.iter().any(|c| c.copied > 0);
+        && carried.iter().any(|c| c.copied > c.closed);
     Some(if never_joined {
         Finding::warn(
             "streams",
@@ -780,6 +790,20 @@ mod tests {
                 },
             ]
         );
+        // 0.13.10: the streams copied because they had already closed one
+        // way, apart from refusals, which say which end.
+        let carried = Carried::parse(
+            "streams inbound joined=89 copied=1 closed=1 refused=0 outbound joined=159 copied=104 closed=101 refused=3 last=the stream to the Mac: Operation not supported (os error 95)\n",
+        );
+        assert_eq!((carried[1].closed, carried[1].refused), (101, 3));
+        assert_eq!(
+            streams_finding(&carried).unwrap().detail,
+            "published ports: 89 joined, 1 copied (1 of them already closed one way); outbound: 159 joined, 104 copied (101 of them already closed one way); 3 joins refused, the last: the stream to the Mac: Operation not supported (os error 95)"
+        );
+        // Copied only because they had closed: not a guest without joins.
+        let closed_only =
+            Carried::parse("streams inbound joined=0 copied=2 closed=2 refused=0 outbound last=\n");
+        assert!(!streams_finding(&closed_only).unwrap().warn);
         // Copied and never joined: no kernel join on this boot.
         let copying =
             Carried::parse("streams inbound joined=0 copied=9 refused=0 outbound last=\n");
