@@ -152,18 +152,20 @@ if grep -q 'HTTP fixture ready' "$LIGHTER_HOME/http.log"; then
 	# A client that writes its request and shuts its side at once leaves the
 	# guest's socket in CLOSE_WAIT before there is a byte to carry, which
 	# sockmap refuses: it is copied, and doctor counts it as closed, not as a
-	# refused join (#107, where they were 40% of a Mac's outbound streams).
+	# refused join (#107, where they were 40% of a Mac's outbound streams),
+	# including those whose FIN lands between the agent's look and the join.
+	# One whose FIN comes after a join is joined, which is as right.
 	streams() { "$LIGHTER" doctor 2>/dev/null | grep -E '^  [a-z ]+streams ' ; }
 	count() { sed -nE "s/.*outbound: [0-9]+ joined, [0-9]+ copied( \(([0-9]+) of them already closed one way\))?.*/\2/p" <<<"$1"; }
 	refusals() { sed -nE 's/.*; ([0-9]+) joins? refused.*/\1/p' <<<"$1"; }
 	before="$(streams)"
-	$D run --rm alpine:3.21 sh -c 'for i in 1 2 3 4 5; do printf "GET / HTTP/1.0\r\n\r\n" | nc host.docker.internal 18099 >/dev/null; done' >/dev/null 2>&1
+	$D run --rm alpine:3.21 sh -c 'for i in $(seq 30); do printf "GET / HTTP/1.0\r\n\r\n" | nc host.docker.internal 18099 >/dev/null; done' >/dev/null 2>&1
 	sleep 2
 	after="$(streams)"
 	closed_now=$(( $(count "$after" | grep . || echo 0) - $(count "$before" | grep . || echo 0) ))
 	refused_now=$(( $(refusals "$after" | grep . || echo 0) - $(refusals "$before" | grep . || echo 0) ))
-	[ "$closed_now" -ge 5 ] && [ "$refused_now" -eq 0 ] \
-		&& pass "five half-closing clients are copied as closed, with no join refused" \
+	[ "$closed_now" -gt 0 ] && [ "$refused_now" -eq 0 ] \
+		&& pass "30 half-closing clients: copied as closed or joined, none refused" \
 		|| fail "half-closing clients: closed +${closed_now}, refused +${refused_now} ($(echo $after))"
 else
 	fail "the host HTTP fixture did not start"

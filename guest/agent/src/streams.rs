@@ -946,8 +946,7 @@ impl Conn {
         // server that answers and closes. Copying is the right path for those;
         // asking the kernel first only made a refusal of each (#107: 103 of
         // a Mac's 263 outbound streams).
-        let state = tcp_state(tcp);
-        if state != Some(TCP_ESTABLISHED) {
+        if !established(tcp_state(tcp)) {
             CARRIED.count(&CARRIED.closed);
             CARRIED.count(&CARRIED.copied);
             self.state = State::Copying;
@@ -960,13 +959,20 @@ impl Conn {
                 self.state = State::Joined;
             }
             Err(failure) => {
-                // Which end the kernel would not take: the TCP socket closed
-                // since it was looked at, or the stream to the Mac.
-                let side = match tcp_state(tcp) {
-                    Some(TCP_ESTABLISHED) => "the stream to the Mac".to_string(),
-                    state => format!("the TCP socket ({})", tcp_state_name(state)),
-                };
-                CARRIED.refused(&side, &failure.error);
+                let state = tcp_state(tcp);
+                // The TCP socket closed one way between the look above and
+                // the join, its FIN a moment behind the bytes: the same
+                // stream as one the look caught, copied, and no refusal.
+                if failure.can_fallback && !established(state) {
+                    if let Some(joined) = failure.joined {
+                        joiner.release(joined);
+                    }
+                    CARRIED.count(&CARRIED.closed);
+                    CARRIED.count(&CARRIED.copied);
+                    self.state = State::Copying;
+                    return Some(Step::Wait);
+                }
+                CARRIED.refused(&refused_end(state), &failure.error);
                 // A peer can close between polling and map insertion. Those
                 // ordinary copying fallbacks must not produce a log per
                 // request.
@@ -1382,6 +1388,21 @@ fn tcp_state(fd: RawFd) -> Option<u8> {
     (rc == 0 && len > 0).then(|| unsafe { info.assume_init() }.tcpi_state)
 }
 
+fn established(state: Option<u8>) -> bool {
+    state == Some(TCP_ESTABLISHED)
+}
+
+/// Which end the kernel would not join, for `doctor`: the stream to the Mac
+/// when the TCP socket is still established, else the TCP socket and its
+/// state.
+fn refused_end(state: Option<u8>) -> String {
+    if established(state) {
+        "the stream to the Mac".to_string()
+    } else {
+        format!("the TCP socket ({})", tcp_state_name(state))
+    }
+}
+
 /// The state's name as `ss` prints it, for `doctor`.
 fn tcp_state_name(state: Option<u8>) -> &'static str {
     match state {
@@ -1612,6 +1633,15 @@ mod tests {
                 io::Error::from_raw_os_error(libc::EOPNOTSUPP)
             )
         );
+    }
+
+    #[test]
+    fn a_refusal_names_the_end_the_kernel_would_not_take() {
+        assert_eq!(refused_end(Some(TCP_ESTABLISHED)), "the stream to the Mac");
+        assert_eq!(refused_end(Some(8)), "the TCP socket (CLOSE-WAIT)");
+        assert_eq!(refused_end(None), "the TCP socket (unknown)");
+        assert!(established(Some(TCP_ESTABLISHED)));
+        assert!(!established(Some(8)) && !established(None));
     }
 
     /// A socket whose peer has sent its FIN is not established, and is
