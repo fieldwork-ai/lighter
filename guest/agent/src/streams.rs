@@ -70,34 +70,44 @@ const ACCEPT_BATCH: usize = 256;
 pub struct Carried {
     joined: std::sync::atomic::AtomicU64,
     copied: std::sync::atomic::AtomicU64,
+    /// Of those copied, the ones whose TCP socket had already closed one way
+    /// when there was a byte to carry, which the kernel cannot join.
+    closed: std::sync::atomic::AtomicU64,
     refused: std::sync::atomic::AtomicU64,
     last_refusal: std::sync::Mutex<String>,
 }
 
-pub static CARRIED: Carried = Carried {
-    joined: std::sync::atomic::AtomicU64::new(0),
-    copied: std::sync::atomic::AtomicU64::new(0),
-    refused: std::sync::atomic::AtomicU64::new(0),
-    last_refusal: std::sync::Mutex::new(String::new()),
-};
+pub static CARRIED: Carried = Carried::new();
 
 impl Carried {
+    const fn new() -> Carried {
+        Carried {
+            joined: std::sync::atomic::AtomicU64::new(0),
+            copied: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicU64::new(0),
+            refused: std::sync::atomic::AtomicU64::new(0),
+            last_refusal: std::sync::Mutex::new(String::new()),
+        }
+    }
+
     fn count(&self, counter: &std::sync::atomic::AtomicU64) {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn refused(&self, error: &io::Error) {
+    fn refused(&self, side: &str, error: &io::Error) {
         self.count(&self.refused);
-        *self.last_refusal.lock().expect("refusal poisoned") = error.to_string();
+        *self.last_refusal.lock().expect("refusal poisoned") = format!("{side}: {error}");
     }
 
-    /// One line: `joined=1 copied=2 refused=0 last=<the error, to the end>`.
+    /// One line: `joined=1 copied=2 closed=1 refused=0 last=<the error, to
+    /// the end>`.
     pub fn line(&self) -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "joined={} copied={} refused={} last={}\n",
+            "joined={} copied={} closed={} refused={} last={}\n",
             self.joined.load(Relaxed),
             self.copied.load(Relaxed),
+            self.closed.load(Relaxed),
             self.refused.load(Relaxed),
             self.last_refusal.lock().expect("refusal poisoned"),
         )
@@ -930,6 +940,19 @@ impl Conn {
         // can only be closed, and the client gets an empty reply (27 in 600
         // requests to a published HTTP/1.0 server, until this order).
         let (tcp, other) = if self.a_tcp { (a, b) } else { (b, a) };
+        // sockmap takes only an established TCP socket, and one whose peer
+        // has already sent its FIN is in CLOSE_WAIT: a client that writes its
+        // request and shuts its side at once (`nc`, HTTP/1.0 tools), or a
+        // server that answers and closes. Copying is the right path for those;
+        // asking the kernel first only made a refusal of each (#107: 103 of
+        // a Mac's 263 outbound streams).
+        let state = tcp_state(tcp);
+        if state != Some(TCP_ESTABLISHED) {
+            CARRIED.count(&CARRIED.closed);
+            CARRIED.count(&CARRIED.copied);
+            self.state = State::Copying;
+            return Some(Step::Wait);
+        }
         match joiner.join(tcp, other) {
             Ok(joined) => {
                 CARRIED.count(&CARRIED.joined);
@@ -937,7 +960,13 @@ impl Conn {
                 self.state = State::Joined;
             }
             Err(failure) => {
-                CARRIED.refused(&failure.error);
+                // Which end the kernel would not take: the TCP socket closed
+                // since it was looked at, or the stream to the Mac.
+                let side = match tcp_state(tcp) {
+                    Some(TCP_ESTABLISHED) => "the stream to the Mac".to_string(),
+                    state => format!("the TCP socket ({})", tcp_state_name(state)),
+                };
+                CARRIED.refused(&side, &failure.error);
                 // A peer can close between polling and map insertion. Those
                 // ordinary copying fallbacks must not produce a log per
                 // request.
@@ -1331,6 +1360,46 @@ fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 }
 
 /// Each descriptor's current readiness, without waiting.
+/// Linux's TCP_ESTABLISHED, the one state sockmap joins.
+const TCP_ESTABLISHED: u8 = 1;
+
+/// A TCP socket's state, from `TCP_INFO`'s first byte; none if it cannot be
+/// read.
+fn tcp_state(fd: RawFd) -> Option<u8> {
+    let mut info = std::mem::MaybeUninit::<libc::tcp_info>::zeroed();
+    let mut len = size_of::<libc::tcp_info>() as libc::socklen_t;
+    // SAFETY: a buffer of the size given, which the kernel fills up to `len`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            info.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    // SAFETY: zeroed, and filled by the kernel when the call succeeded.
+    (rc == 0 && len > 0).then(|| unsafe { info.assume_init() }.tcpi_state)
+}
+
+/// The state's name as `ss` prints it, for `doctor`.
+fn tcp_state_name(state: Option<u8>) -> &'static str {
+    match state {
+        Some(1) => "ESTAB",
+        Some(2) => "SYN-SENT",
+        Some(3) => "SYN-RECV",
+        Some(4) => "FIN-WAIT-1",
+        Some(5) => "FIN-WAIT-2",
+        Some(6) => "TIME-WAIT",
+        Some(7) => "CLOSE",
+        Some(8) => "CLOSE-WAIT",
+        Some(9) => "LAST-ACK",
+        Some(10) => "LISTEN",
+        Some(11) => "CLOSING",
+        _ => "unknown",
+    }
+}
+
 fn poll_now<const N: usize>(fds: &[RawFd; N], events: libc::c_short) -> [libc::c_short; N] {
     let mut p = fds.map(|fd| libc::pollfd { fd, events, revents: 0 });
     // SAFETY: live descriptors in a pollfd array of the length given.
@@ -1522,24 +1591,45 @@ mod tests {
 
     #[test]
     fn carried_counts_read_as_one_line() {
-        let carried = Carried {
-            joined: std::sync::atomic::AtomicU64::new(0),
-            copied: std::sync::atomic::AtomicU64::new(0),
-            refused: std::sync::atomic::AtomicU64::new(0),
-            last_refusal: std::sync::Mutex::new(String::new()),
-        };
-        assert_eq!(carried.line(), "joined=0 copied=0 refused=0 last=\n");
+        let carried = Carried::new();
+        assert_eq!(
+            carried.line(),
+            "joined=0 copied=0 closed=0 refused=0 last=\n"
+        );
         carried.count(&carried.joined);
         carried.count(&carried.joined);
-        carried.refused(&io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        carried.count(&carried.closed);
+        carried.count(&carried.copied);
+        carried.refused(
+            "the TCP socket (CLOSE-WAIT)",
+            &io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+        );
         carried.count(&carried.copied);
         assert_eq!(
             carried.line(),
             format!(
-                "joined=2 copied=1 refused=1 last={}\n",
+                "joined=2 copied=2 closed=1 refused=1 last=the TCP socket (CLOSE-WAIT): {}\n",
                 io::Error::from_raw_os_error(libc::EOPNOTSUPP)
             )
         );
+    }
+
+    /// A socket whose peer has sent its FIN is not established, and is
+    /// copied rather than offered to sockmap, which refuses it.
+    #[test]
+    fn a_half_closed_peer_is_read_as_not_established() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(tcp_state(server.as_raw_fd()), Some(TCP_ESTABLISHED));
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut waited = 0;
+        while tcp_state(server.as_raw_fd()) == Some(TCP_ESTABLISHED) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+        assert_eq!(tcp_state(server.as_raw_fd()), Some(8));
+        assert_eq!(tcp_state_name(tcp_state(server.as_raw_fd())), "CLOSE-WAIT");
     }
 
     /// The probe the joined path asks a Mac end with: a peer that stopped
