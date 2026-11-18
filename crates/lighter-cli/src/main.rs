@@ -341,7 +341,9 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
         // The context stays on lighter across a restart: going back to the
         // previous one and returning would lose it if its daemon were down.
         Command::Restart => {
-            stop_machine()?;
+            // Its code is success whether or not a machine was running; a
+            // failure to stop one is the error.
+            let _ = stop_machine()?;
             start(Duration::from_secs(120))
         }
         Command::Status => status(),
