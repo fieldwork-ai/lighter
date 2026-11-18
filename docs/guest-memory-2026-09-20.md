@@ -117,6 +117,25 @@ above the order, so lowering the order at runtime left the fragments unreported 
 minute measured (1872 MiB against 1349 on the M5); patch 0035 has the order's setter request a
 cycle.
 
+The rest order holds only at rest: once the containers use half a core in a tick the agent
+reports at the kernel's two megabytes, and goes back eight seconds after they last did. A load
+that is never eight seconds light (agent sandboxes, builds and language servers with a heavy
+tick every second or two) never went back: on a 64 GiB guest the Mac held 9.6 GiB freed in runs
+under two megabytes for 35 hours (#112). Since 0.13.11 each minute at the churn order ends in a
+drain (`memory_policy::ReportingOrder`): the rest order at the hurried delay, which takes each
+free list whole in one cycle, for two seconds, then the churn order again. Freed memory waits a
+minute at most, whatever the load looks like. On the M1 (4 GiB guest, six containers keeping
+half a core busy and freeing about 150 MiB a minute in short runs) each drain took the Mac's
+footprint down 75–150 MiB; averaged over fifteen minutes it held 2378 and 2362 MiB against 2404
+and 2448, for 3 s more VMM CPU in fifteen minutes, and the installs and memory case read as the
+current rule's (pnpm 7.5 and 7.6 s against 7.5 and 7.7, peaks 4073–4337 against 4153–4323).
+
+Never reporting at two megabytes was measured as well, and was better again under the steady
+load (2294 and 2282 MiB against 2443 and 2446; 8 s more VMM CPU in ten minutes) without the
+installs running away (peaks 3949 and 4112 against 3783 and 4024). The churn order was kept for
+now because what it was introduced for, a 16 GiB guest's installs on the M5, has not been
+measured without it; if it does nothing there, the drain and the churn order can both go.
+
 What a minute after an install leaves, on the M5's 16 GiB guest after the filesystem cases
 (1410 MiB against 604 idle, 2026-09-21): the guest keeps a quarter of RAM free when nothing
 runs and the balloon holds the rest, so the remainder is not free memory the host was never
