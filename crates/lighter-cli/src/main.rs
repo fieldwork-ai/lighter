@@ -145,6 +145,9 @@ enum Command {
         /// Print the address without opening a browser.
         #[arg(long)]
         no_open: bool,
+        /// Do not let the page open a shell in a container.
+        #[arg(long)]
+        no_exec: bool,
     },
     /// The Neural Engine service, run as a child of `lighter start`.
     #[command(hide = true, name = "ane-host")]
@@ -358,7 +361,11 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             start(Duration::from_secs(120))
         }
         Command::Status => status(),
-        Command::Ui { port, no_open } => ui::serve(port, !no_open),
+        Command::Ui {
+            port,
+            no_open,
+            no_exec,
+        } => ui::serve(port, !no_open, !no_exec),
         Command::Usb { action } => match action {
             UsbAction::List => usb::list(),
             UsbAction::Attach { spec, force } => usb::attach(&spec, force),
