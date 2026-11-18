@@ -281,7 +281,7 @@ pub fn machine() -> anyhow::Result<()> {
         }) {
             Ok((card, plan, names)) => {
                 cmdline.push_str(&plan.kernel_arg());
-                tracing::info!(subnet = %plan.subnet, mac = %lighter_vmnet::helper::mac_text(plan.mac), "the link is up");
+                tracing::info!(subnet = %plan.subnet, mac = %lighter_vmnet::mac_text(plan.mac), "the link is up");
                 let _ = std::fs::remove_file(home.join("link-error"));
                 Some((Arc::new(card), plan, names))
             }
@@ -612,8 +612,8 @@ fn start_lan(
     let interface = crate::lan::interface(&config.lan_interface)?;
     let address = crate::lan::address_for_guest(&config.lan_address, &interface)?;
     let mac = crate::lan::mac(home).map_err(|e| format!("cannot keep the LAN card's MAC: {e}"))?;
-    let (lan, how) = crate::lan::connect(&interface, mac)?;
-    tracing::info!(%interface, %address, how, "LAN card bridged");
+    let lan = crate::lan::connect(&interface, mac)?;
+    tracing::info!(%interface, %address, "LAN card bridged");
     let mut args = format!(" lighter.lan={address}");
     if let Some((mac_ip, _)) = crate::lan::mac_address(&interface) {
         args.push_str(&format!(" lighter.lan_avoid={mac_ip}"));

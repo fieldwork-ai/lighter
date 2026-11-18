@@ -98,7 +98,7 @@ static struct lighter_bridge *start(xpc_object_t desc, const char *what, int fd,
 		return NULL;
 	}
 	b->fd = fd;
-	b->queue = dispatch_queue_create("dev.lighter.bridge", DISPATCH_QUEUE_SERIAL);
+	b->queue = dispatch_queue_create("dev.lighter.vmnet", DISPATCH_QUEUE_SERIAL);
 	dispatch_semaphore_t started = dispatch_semaphore_create(0);
 	__block vmnet_return_t status = VMNET_FAILURE;
 	__block uint64_t mtu = 0, max_packet = 0;

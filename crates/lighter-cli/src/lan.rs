@@ -1,36 +1,15 @@
 //! The machine on the Mac's network: choosing the card, holding the MAC,
-//! bridging through vmnet in this process (a release, which holds
-//! `com.apple.vm.networking`) or through the root helper (a build of one's
-//! own), and installing that helper (`sudo lighter lan enable`).
+//! and bridging through vmnet in this process, which needs
+//! `com.apple.vm.networking`. A release's lighter.app holds it; the ad hoc
+//! bundle a checkout builds cannot, and starts without the card.
 
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-const LABEL: &str = "dev.lighter.bridge";
-const HELPER: &str = "/Library/PrivilegedHelperTools/dev.lighter.bridge";
-const PLIST: &str = "/Library/LaunchDaemons/dev.lighter.bridge.plist";
-const LOG: &str = "/var/log/dev.lighter.bridge.log";
-/// What an installed helper must be: Fieldwork's, notarized.
-const HELPER_REQUIREMENT: &str =
-    "anchor apple generic and certificate leaf[subject.OU] = \"N7N6BNF95K\"";
-
-/// The helper's socket: the installed one's, or `LIGHTER_BRIDGE_SOCKET`
-/// for a helper run by hand (`lighter-bridge --socket … --any-client`).
-pub fn socket() -> PathBuf {
-    std::env::var_os("LIGHTER_BRIDGE_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(lighter_vmnet::helper::SOCKET))
-}
-
-/// Whether the helper is installed.
-pub fn installed() -> bool {
-    Path::new(PLIST).exists() && Path::new(HELPER).exists()
-}
-
-/// Whether this installation's machine bridges by itself, needing no helper:
-/// a release's lighter.app holds `com.apple.vm.networking`; the ad hoc
-/// bundle a checkout builds cannot.
-pub fn needs_no_helper() -> bool {
+/// Whether this installation's machine can bridge: a release's lighter.app
+/// holds `com.apple.vm.networking`; the ad hoc bundle a checkout builds
+/// cannot.
+pub fn can_bridge() -> bool {
     crate::paths::guest_dir()
         .map(|guest| guest.join("lighter.app"))
         .is_ok_and(|app| carries_vm_networking(&app))
@@ -183,153 +162,31 @@ pub fn address_for_guest(configured: &str, interface: &str) -> Result<String, St
 pub fn mac(home: &Path) -> std::io::Result<[u8; 6]> {
     let path = home.join("lan-mac");
     if let Ok(text) = std::fs::read_to_string(&path)
-        && let Some(mac) = lighter_vmnet::helper::parse_mac(text.trim())
+        && let Some(mac) = lighter_vmnet::parse_mac(text.trim())
     {
         return Ok(mac);
     }
     let mac = lighter_vmm::lan::random_mac();
-    std::fs::write(&path, lighter_vmnet::helper::mac_text(mac) + "\n")?;
+    std::fs::write(&path, lighter_vmnet::mac_text(mac) + "\n")?;
     Ok(mac)
 }
 
-/// Bridges `interface`: in this process when vmnet allows it (root, or
-/// lighter with `com.apple.vm.networking`), through the helper otherwise.
-pub fn connect(
-    interface: &str,
-    mac: [u8; 6],
-) -> Result<(lighter_vmm::lan::Lan, &'static str), String> {
-    let refused = match lighter_vmm::lan::Lan::in_process(interface, mac) {
-        Ok(lan) => return Ok((lan, "in process")),
-        Err(why) => why,
-    };
-    let socket = socket();
-    if !socket.exists() {
-        return Err(
-            if std::env::current_exe().is_ok_and(|exe| carries_vm_networking(&exe)) {
-                format!("vmnet would not bridge {interface}: {refused}")
-            } else {
-                "lighter's network helper is not installed: run `sudo lighter lan enable`".into()
-            },
-        );
-    }
-    lighter_vmm::lan::Lan::via_helper(&socket, interface, mac)
-        .map(|lan| (lan, "through the helper"))
-        .map_err(|e| format!("the network helper refused: {e}"))
-}
-
-/// `sudo lighter lan enable`: installs the helper as a launchd daemon that
-/// serves the user who ran sudo (and any earlier ones).
-pub fn enable() -> anyhow::Result<std::process::ExitCode> {
-    // SAFETY: plain geteuid.
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("lighter: run it with sudo: `sudo lighter lan enable`");
-        return Ok(std::process::ExitCode::FAILURE);
-    }
-    let uid: u32 = match std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok()) {
-        Some(uid) if uid != 0 => uid,
-        _ => {
-            eprintln!(
-                "lighter: run it with sudo from the account that uses lighter, so the helper knows whom to serve"
-            );
-            return Ok(std::process::ExitCode::FAILURE);
+/// Bridges `interface` in this process.
+pub fn connect(interface: &str, mac: [u8; 6]) -> Result<lighter_vmm::lan::Lan, String> {
+    lighter_vmm::lan::Lan::in_process(interface, mac).map_err(|refused| {
+        if std::env::current_exe().is_ok_and(|exe| carries_vm_networking(&exe)) {
+            format!("vmnet would not bridge {interface}: {refused}")
+        } else {
+            "this lighter cannot put the machine on the network: it needs com.apple.vm.networking, which a release holds and a build of your own cannot".into()
         }
-    };
-    let source = bundled_helper()
-        .ok_or_else(|| anyhow::anyhow!("this installation has no lighter-bridge beside it"))?;
-    let verified = std::process::Command::new("/usr/bin/codesign")
-        .args(["--verify", "--strict", &format!("-R={HELPER_REQUIREMENT}")])
-        .arg(&source)
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if !verified.success() {
-        eprintln!(
-            "lighter: {} is not signed by Fieldwork, so it is not installed as root. A build of your own runs by hand: `sudo {} --socket /tmp/lighter-bridge.sock --allow-uid {uid} --any-client`, with LIGHTER_BRIDGE_SOCKET=/tmp/lighter-bridge.sock",
-            source.display(),
-            source.display()
-        );
-        return Ok(std::process::ExitCode::FAILURE);
-    }
-    let mut uids = allowed_uids();
-    if !uids.contains(&uid) {
-        uids.push(uid);
-    }
-    // A first install has nothing to unload, and launchctl says so on
-    // stderr ("Boot-out failed: 3: No such process").
-    let _ = std::process::Command::new("/bin/launchctl")
-        .args(["bootout", &format!("system/{LABEL}")])
-        .stderr(std::process::Stdio::null())
-        .status();
-    std::fs::create_dir_all("/Library/PrivilegedHelperTools")?;
-    let staging = format!("{HELPER}.new");
-    std::fs::copy(&source, &staging)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
-    let c = std::ffi::CString::new(staging.as_str())?;
-    // SAFETY: chown of a path we just wrote, to root:wheel.
-    unsafe { libc::chown(c.as_ptr(), 0, 0) };
-    std::fs::rename(&staging, HELPER)?;
-    std::fs::write(PLIST, plist(&uids))?;
-    std::fs::set_permissions(PLIST, std::fs::Permissions::from_mode(0o644))?;
-    let loaded = std::process::Command::new("/bin/launchctl")
-        .args(["bootstrap", "system", PLIST])
-        .status()?;
-    if !loaded.success() {
-        anyhow::bail!("launchctl could not load {PLIST}");
-    }
-    println!(
-        "lighter's network helper is installed, for user {}.",
-        uids.iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    println!("Turn LAN mode on with `lighter config --lan on` and `lighter restart`.");
-    Ok(std::process::ExitCode::SUCCESS)
-}
-
-/// `sudo lighter lan disable`: removes the helper.
-pub fn disable() -> anyhow::Result<std::process::ExitCode> {
-    // SAFETY: plain geteuid.
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("lighter: run it with sudo: `sudo lighter lan disable`");
-        return Ok(std::process::ExitCode::FAILURE);
-    }
-    // A first install has nothing to unload, and launchctl says so on
-    // stderr ("Boot-out failed: 3: No such process").
-    let _ = std::process::Command::new("/bin/launchctl")
-        .args(["bootout", &format!("system/{LABEL}")])
-        .stderr(std::process::Stdio::null())
-        .status();
-    for path in [PLIST, HELPER, lighter_vmnet::helper::SOCKET] {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    println!("lighter's network helper is removed. Machines with LAN mode on start without it.");
-    Ok(std::process::ExitCode::SUCCESS)
+    })
 }
 
 /// `lighter lan status`.
 pub fn status() -> anyhow::Result<std::process::ExitCode> {
-    if installed() {
-        let uids = allowed_uids();
+    if !can_bridge() {
         println!(
-            "  helper     installed ({HELPER}), serving user {}",
-            uids.iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    } else if needs_no_helper() {
-        println!("  helper     not needed: this lighter bridges by itself");
-    } else {
-        println!("  helper     not installed (`sudo lighter lan enable`)");
-    }
-    if installed() && needs_no_helper() {
-        println!(
-            "             this lighter bridges by itself; `sudo lighter lan disable` removes the helper"
+            "  bridging   not possible: this lighter lacks com.apple.vm.networking, which a release holds"
         );
     }
     let interfaces = lighter_vmnet::interfaces();
@@ -355,72 +212,6 @@ pub fn status() -> anyhow::Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// The helper shipped with this lighter: inside `lighter.app`, whose
-/// signature covers it, beside the app's own binary or reached from the
-/// installation's `bin`; beside the binary in a checkout.
-fn bundled_helper() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    let dir = exe.parent()?;
-    [
-        dir.join("lighter-bridge"),
-        dir.join("../share/lighter/lighter.app/Contents/MacOS/lighter-bridge"),
-    ]
-    .into_iter()
-    .find(|p| p.exists())
-}
-
-/// The users the installed helper serves, from its plist.
-fn allowed_uids() -> Vec<u32> {
-    let Ok(text) = std::fs::read_to_string(PLIST) else {
-        return Vec::new();
-    };
-    let strings: Vec<&str> = text
-        .split("<string>")
-        .skip(1)
-        .filter_map(|s| s.split("</string>").next())
-        .collect();
-    strings
-        .windows(2)
-        .filter(|w| w[0] == "--allow-uid")
-        .filter_map(|w| w[1].parse().ok())
-        .collect()
-}
-
-fn plist(uids: &[u32]) -> String {
-    let args: String = uids
-        .iter()
-        .map(|u| format!("\n\t\t<string>--allow-uid</string>\n\t\t<string>{u}</string>"))
-        .collect();
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>{LABEL}</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>{HELPER}</string>{args}
-	</array>
-	<key>Sockets</key>
-	<dict>
-		<key>Listeners</key>
-		<dict>
-			<key>SockPathName</key>
-			<string>{socket}</string>
-			<key>SockPathMode</key>
-			<integer>438</integer>
-		</dict>
-	</dict>
-	<key>StandardErrorPath</key>
-	<string>{LOG}</string>
-</dict>
-</plist>
-"#,
-        socket = lighter_vmnet::helper::SOCKET
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,18 +231,6 @@ mod tests {
                 .unwrap()
                 .ends_with("/24")
         );
-    }
-
-    #[test]
-    fn the_plist_names_its_users_and_the_socket() {
-        let text = plist(&[501, 502]);
-        assert!(text.contains("<string>--allow-uid</string>\n\t\t<string>501</string>"));
-        assert!(
-            text.contains("<integer>438</integer>"),
-            "0666: the helper checks who connects itself"
-        );
-        assert!(text.contains(lighter_vmnet::helper::SOCKET));
-        assert!(!text.contains("--any-client"));
     }
 
     #[test]

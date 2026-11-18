@@ -13,6 +13,10 @@
 #                containers still resolve through the guest
 #   peer       — a published container sees a LAN client as itself, and
 #                loopback as the guest
+#   below 1024 — `-p 127.0.0.1:81:80` (macOS keeps it for root, #113): with a
+#                helper that serves this build, it answers on loopback and
+#                nowhere else; without one it stays closed and `doctor` says
+#                it waits for the helper, not that something holds it
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -531,6 +535,40 @@ for _ in range(20):
 	[ "$reply" = udp-ll ] && pass "udp: a link-local caller ($LL_IP) is answered" || fail "udp: a link-local caller got: ${reply:-nothing}"
 	$D rm -f m3-ll >/dev/null 2>&1
 fi
+
+echo "==> A port below 1024 on loopback (#113)"
+# A helper serves this build if one was started by hand for it
+# (LIGHTER_HELPER_SOCKET, `lighter-helper --any-client`), or if one is
+# installed and this is a release, whose signature the installed one asks for.
+helper=""
+if [ -n "${LIGHTER_HELPER_SOCKET:-}" ] && [ -S "$LIGHTER_HELPER_SOCKET" ]; then
+	helper="by hand"
+elif [ -S /var/run/dev.lighter.helper.sock ] && [ -n "${LIGHTER_BIN:-}" ]; then
+	helper="installed"
+fi
+$D rm -f m3-low >/dev/null 2>&1
+$D run -d --name m3-low -p 127.0.0.1:81:80 alpine:3.21 sh -c 'while true; do printf "HTTP/1.0 200 OK\r\nContent-Length: 13\r\n\r\n%s\n" "$(hostname)" | nc -l -p 80; done' >/dev/null 2>&1
+if [ -n "$helper" ]; then
+	code=""
+	# The forward is retried at most every thirty seconds.
+	for _ in $(seq 1 40); do code="$(http http://127.0.0.1:81/hostname)"; [ "$code" = 200 ] && break; sleep 1; done
+	[ "$code" = 200 ] && pass "127.0.0.1:81 answers through the helper ($helper)" || fail "127.0.0.1:81 through the helper ($helper): ${code:-nothing}"
+	if [ -n "$LAN_IP" ]; then
+		code="$(http "http://$LAN_IP:81/hostname")"
+		[ "$code" != 200 ] && pass "and not on the LAN address" || fail "127.0.0.1:81 also answers on $LAN_IP"
+	fi
+	"$LIGHTER" doctor 2>&1 | grep -q "waiting for lighter's helper" && fail "doctor still waits for the helper" || pass "doctor does not list it"
+else
+	sleep 3
+	code="$(http http://127.0.0.1:81/hostname)"
+	[ "$code" != 200 ] && pass "127.0.0.1:81 stays closed with no helper for this build" || fail "127.0.0.1:81 answered with no helper"
+	advice="$("$LIGHTER" doctor 2>&1 | grep -A1 "waiting for lighter's helper" || true)"
+	grep -q "tcp 81" <<<"$advice" && grep -q "sudo lighter helper install" <<<"$advice" \
+		&& pass "doctor says it waits for the helper, and how to install it" \
+		|| fail "doctor on 127.0.0.1:81: $("$LIGHTER" doctor 2>&1 | grep -A1 'published ports')"
+	skip "a helper for this build (LIGHTER_HELPER_SOCKET, or an installed one with LIGHTER_BIN): the helper path was not checked"
+fi
+$D rm -f m3-low >/dev/null 2>&1
 
 echo "==> HTTP immediately after connection bursts"
 if python3 scripts/test-publish-burst.py --docker-host "unix://$LIGHTER_HOME/docker.sock"; then

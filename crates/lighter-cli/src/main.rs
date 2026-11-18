@@ -17,6 +17,7 @@ mod bundle;
 mod config;
 mod context;
 mod doctor;
+mod helper;
 mod installation;
 mod instance;
 mod lan;
@@ -74,13 +75,25 @@ enum UsbAction {
 
 #[derive(Subcommand)]
 enum LanAction {
-    /// Install lighter's network helper (run with sudo). Only a build of
-    /// your own needs it: a release puts the machine on the network itself.
+    /// Which network cards can be bridged, and which is the Mac's primary.
+    Status,
+    /// LAN mode no longer needs a helper; says so, and what the helper is for now.
+    #[command(hide = true)]
     Enable,
-    /// Remove the helper (run with sudo).
+    /// Renamed `sudo lighter helper uninstall`.
+    #[command(hide = true)]
     Disable,
-    /// Whether the helper is needed or installed, and which network cards
-    /// can be bridged.
+}
+
+#[derive(Subcommand)]
+enum HelperAction {
+    /// Install lighter's helper (run with sudo), which opens ports below
+    /// 1024 published on one address, such as 127.0.0.1:80. macOS keeps
+    /// those for root; every other port needs no helper.
+    Install,
+    /// Remove the helper (run with sudo).
+    Uninstall,
+    /// Whether the helper is installed.
     Status,
 }
 
@@ -106,10 +119,15 @@ enum Command {
         #[command(subcommand)]
         action: UsbAction,
     },
-    /// The machine on the Mac's network (LAN mode): its helper.
+    /// The machine on the Mac's network (LAN mode).
     Lan {
         #[command(subcommand)]
         action: LanAction,
+    },
+    /// lighter's root helper, for ports below 1024 published on one address.
+    Helper {
+        #[command(subcommand)]
+        action: HelperAction,
     },
     /// Restart the machine.
     Restart,
@@ -157,6 +175,7 @@ enum Command {
         disk: Option<u64>,
         /// Who can reach a published port: the network (`lan`, as Docker
         /// does) or loopback (`localhost`); explicit bind addresses take precedence.
+        /// Under `localhost`, ports below 1024 need `sudo lighter helper install`.
         #[arg(long, value_enum)]
         publish: Option<config::Publish>,
         /// Whether the guest has a GPU (`on`, the default, or `off`).
@@ -186,8 +205,8 @@ enum Command {
         unshare: Vec<String>,
         /// Put the machine on the Mac's network with a card of its own, so a
         /// host-network container can discover and be discovered (`on` or
-        /// `off`, the default). A build of your own needs `sudo lighter lan
-        /// enable` once; a release needs nothing.
+        /// `off`, the default). Needs a release: a build of your own lacks
+        /// com.apple.vm.networking.
         #[arg(long, value_enum)]
         lan: Option<config::Toggle>,
         /// Which of the Mac's network cards LAN mode bridges (`auto`, the
@@ -334,9 +353,28 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
         },
         Command::UsbKeeper { parent } => usb::keeper(parent),
         Command::Lan { action } => match action {
-            LanAction::Enable => lan::enable(),
-            LanAction::Disable => lan::disable(),
             LanAction::Status => lan::status(),
+            LanAction::Enable => {
+                // Not an install: the instructions of 0.12 still say this,
+                // and following them should not leave a root daemon nobody
+                // asked for.
+                println!(
+                    "LAN mode needs no helper: a release puts the machine on the network itself (`lighter config --lan on`, then `lighter restart`)."
+                );
+                println!(
+                    "lighter's helper now does one other thing, opening ports below 1024 published on one address such as 127.0.0.1:80: `sudo lighter helper install` if you need that."
+                );
+                Ok(std::process::ExitCode::SUCCESS)
+            }
+            LanAction::Disable => {
+                eprintln!("lighter: `lan disable` is now `sudo lighter helper uninstall`");
+                helper::uninstall()
+            }
+        },
+        Command::Helper { action } => match action {
+            HelperAction::Install => helper::install(),
+            HelperAction::Uninstall => helper::uninstall(),
+            HelperAction::Status => helper::status(),
         },
         Command::AneHost { port, cache } => {
             ane_host::serve(port, &cache)?;

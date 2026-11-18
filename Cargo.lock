@@ -377,15 +377,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lighter-bridge"
-version = "0.13.10"
-dependencies = [
- "cc",
- "libc",
- "lighter-vmnet",
-]
-
-[[package]]
 name = "lighter-cli"
 version = "0.13.10"
 dependencies = [
@@ -394,6 +385,7 @@ dependencies = [
  "flate2",
  "libc",
  "lighter-docker",
+ "lighter-helper",
  "lighter-hv",
  "lighter-vmm",
  "lighter-vmnet",
@@ -427,6 +419,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lighter-helper"
+version = "0.13.10"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "lighter-hv"
 version = "0.13.10"
 dependencies = [
@@ -442,6 +442,7 @@ dependencies = [
  "libc",
  "lighter-docker",
  "lighter-fs",
+ "lighter-helper",
  "lighter-hv",
  "lighter-vmnet",
  "thiserror 2.0.20",

@@ -128,7 +128,7 @@ echo "==> Signing identity: $IDENTITY"
 
 # --- build -------------------------------------------------------------------
 echo "==> Building lighter-cli release binary"
-cargo build --release -p lighter-cli -p lighter-bridge
+cargo build --release -p lighter-cli -p lighter-helper
 built_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "lighter-cli"))')"
 [ "$built_version" = "$VERSION" ] || { echo "error: requested version differs from workspace version"; exit 1; }
 # The checkout can be the user's daily-driver wrapper target. Building
@@ -161,11 +161,11 @@ cp entitlements.plist "$STAGE/share/lighter/"
 APP="$STAGE/share/lighter/lighter.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/lighter "$APP/Contents/MacOS/lighter"
-# LAN mode's root helper rides inside the app, so that the app's signature
-# and notarization cover it and the release manifest, which earlier
-# lighters verify by its exact list, does not change (`sudo lighter lan
-# enable` installs it).
-cp target/release/lighter-bridge "$APP/Contents/MacOS/lighter-bridge"
+# The root helper rides inside the app, so that the app's signature and
+# notarization cover it and the release manifest, which earlier lighters
+# verify by its exact list, does not change (`sudo lighter helper install`
+# installs it).
+cp target/release/lighter-helper "$APP/Contents/MacOS/lighter-helper"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 cp assets/lighter.icns "$APP/Contents/Resources/lighter.icns"
 # What lets the app hold com.apple.vm.networking (entitlements-app.plist).
@@ -196,11 +196,11 @@ manifest = dict(schema=1, version=sys.argv[2], kernel_version=(root/'share/light
 PYMANIFEST
 # Nested code is signed before the bundle that seals it.
 codesign --sign "$IDENTITY" --keychain "$KEYCHAIN" \
-	--identifier dev.lighter.bridge \
+	--identifier dev.lighter.helper \
 	--force \
 	--options runtime \
 	--timestamp \
-	"$APP/Contents/MacOS/lighter-bridge"
+	"$APP/Contents/MacOS/lighter-helper"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist"
 
@@ -214,7 +214,7 @@ codesign --sign "$IDENTITY" --keychain "$KEYCHAIN" \
 echo "==> Verifying signatures"
 codesign --verify --verbose=2 "$STAGE/bin/lighter"
 codesign --verify --verbose=2 --deep "$APP"
-codesign --verify --verbose=2 -R='anchor apple generic and identifier "dev.lighter.bridge" and certificate leaf[subject.OU] = "N7N6BNF95K"' "$APP/Contents/MacOS/lighter-bridge"
+codesign --verify --verbose=2 -R='anchor apple generic and identifier "dev.lighter.helper" and certificate leaf[subject.OU] = "N7N6BNF95K"' "$APP/Contents/MacOS/lighter-helper"
 codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.vm.networking" \
 	|| { echo "error: lighter.app does not carry com.apple.vm.networking" >&2; exit 1; }
 echo "==> Signed: the screen may be locked from here"

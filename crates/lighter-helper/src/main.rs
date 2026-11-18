@@ -1,29 +1,28 @@
-//! lighter's root helper: a machine's card on the Mac's network.
+//! lighter's root helper: the sockets macOS keeps from a process that is
+//! not root.
 //!
-//! vmnet's bridged mode needs root or `com.apple.vm.networking`. Until
-//! lighter holds the entitlement, this does that one thing for it, as root:
-//! for a client that is lighter, run by a user allowed to, it bridges one of
-//! the Mac's network cards and passes back a socket of frames (see
-//! `lighter_vmnet::helper` for the conversation). Nothing else.
+//! For a client that is lighter, run by a user allowed to, it binds a port
+//! below 1024 on one of the Mac's addresses and passes the socket back
+//! (see the library for why, and for the conversation). Nothing else: the
+//! socket is the client's from then on, and the helper holds nothing.
 //!
-//! Installed by `sudo lighter lan enable` as a launchd daemon whose socket
-//! launchd owns, so it runs only while a machine uses it; `--socket` runs
-//! it by hand for development, where `--any-client` admits unsigned builds.
+//! Installed by `sudo lighter helper install` as a launchd daemon whose
+//! socket launchd owns, so it runs only while asked; `--socket` runs it by
+//! hand for development, where `--any-client` admits unsigned builds.
 
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::raw::{c_char, c_int};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use lighter_vmnet::helper;
+use lighter_helper::Request;
 
-/// lighter, as Apple's notarization signs it.
+/// lighter's machine, as Apple's notarization signs it: the process that
+/// publishes ports.
 const REQUIREMENT: &str = "anchor apple generic and identifier \"dev.lighter.machine\" and certificate leaf[subject.OU] = \"N7N6BNF95K\"";
-/// Bridges at once, across every client.
-const MOST_BRIDGES: usize = 8;
-/// How long the helper stays after its last client, when launchd started it.
+/// How long the helper stays after its last request, when launchd started it.
 const IDLE_EXIT: Duration = Duration::from_secs(60);
 
 unsafe extern "C" {
@@ -61,33 +60,33 @@ fn main() -> std::process::ExitCode {
             "--any-client" => any_client = true,
             "--version" => {
                 println!(
-                    "lighter-bridge {} (protocol {})",
+                    "lighter-helper {} (protocol {})",
                     env!("CARGO_PKG_VERSION"),
-                    helper::VERSION
+                    lighter_helper::VERSION
                 );
                 return std::process::ExitCode::SUCCESS;
             }
             other => {
-                eprintln!("lighter-bridge: unknown argument {other}");
+                eprintln!("lighter-helper: unknown argument {other}");
                 return std::process::ExitCode::from(2);
             }
         }
     }
     // SAFETY: plain geteuid.
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!("lighter-bridge: must run as root (vmnet's bridged mode needs it)");
+        eprintln!("lighter-helper: must run as root (ports below 1024 need it)");
         return std::process::ExitCode::from(1);
     }
     let launched = socket.is_none();
     if launched && any_client {
         eprintln!(
-            "lighter-bridge: --any-client is for a helper run by hand, never an installed one"
+            "lighter-helper: --any-client is for a helper run by hand, never an installed one"
         );
         return std::process::ExitCode::from(2);
     }
     if any_client {
         eprintln!(
-            "lighter-bridge: WARNING: admitting any client, signed or not (development only)"
+            "lighter-helper: WARNING: admitting any client, signed or not (development only)"
         );
     }
     let listener = match &socket {
@@ -101,7 +100,7 @@ fn main() -> std::process::ExitCode {
                     l
                 }
                 Err(e) => {
-                    eprintln!("lighter-bridge: cannot listen on {path}: {e}");
+                    eprintln!("lighter-helper: cannot listen on {path}: {e}");
                     return std::process::ExitCode::from(1);
                 }
             }
@@ -109,14 +108,12 @@ fn main() -> std::process::ExitCode {
         None => match activated() {
             Some(l) => l,
             None => {
-                eprintln!("lighter-bridge: no socket from launchd (run with --socket by hand)");
+                eprintln!("lighter-helper: no socket from launchd (run with --socket by hand)");
                 return std::process::ExitCode::from(1);
             }
         },
     };
-    let policy = Arc::new(Policy { uids, any_client });
-    let active = Arc::new(AtomicUsize::new(0));
-    serve(listener, policy, active, launched);
+    serve(listener, Arc::new(Policy { uids, any_client }), launched);
     std::process::ExitCode::SUCCESS
 }
 
@@ -137,10 +134,12 @@ fn activated() -> Option<UnixListener> {
     Some(unsafe { UnixListener::from_raw_fd(fd) })
 }
 
-fn serve(listener: UnixListener, policy: Arc<Policy>, active: Arc<AtomicUsize>, launched: bool) {
+/// Answers clients one at a time: each is a bind, done in microseconds,
+/// and nothing is held between them.
+fn serve(listener: UnixListener, policy: Arc<Policy>, launched: bool) {
     let fd = listener.as_raw_fd();
     loop {
-        if launched && active.load(Ordering::Acquire) == 0 && !readable(fd, IDLE_EXIT) {
+        if launched && !readable(fd, IDLE_EXIT) {
             // Idle: launchd starts us again at the next connection.
             return;
         }
@@ -151,13 +150,17 @@ fn serve(listener: UnixListener, policy: Arc<Policy>, active: Arc<AtomicUsize>, 
                 continue;
             }
         };
-        let (policy, active) = (policy.clone(), active.clone());
-        std::thread::spawn(move || {
-            if let Err(why) = client(&stream, &policy, &active) {
-                let _ = helper::send_line_with_fd(&stream, &format!("error {why}\n"), None);
-                eprintln!("lighter-bridge: refused a client: {why}");
+        match client(&stream, &policy) {
+            Ok(done) => eprintln!("lighter-helper: {done}"),
+            Err(why) => {
+                let _ = lighter_helper::send_line_with_fd(
+                    &stream,
+                    &lighter_helper::error_line(&why),
+                    None,
+                );
+                eprintln!("lighter-helper: refused a client: {why}");
             }
-        });
+        }
     }
 }
 
@@ -172,17 +175,17 @@ fn readable(fd: RawFd, wait: Duration) -> bool {
     unsafe { libc::poll(&mut p, 1, wait.as_millis() as c_int) > 0 }
 }
 
-/// One client: who it is, what it asks for, and its bridge until it goes.
-fn client(stream: &UnixStream, policy: &Policy, active: &AtomicUsize) -> Result<(), String> {
+/// One client: who it is, what it asks for, and the answer.
+fn client(stream: &UnixStream, policy: &Policy) -> Result<String, io::Error> {
     let (mut uid, mut gid) = (0u32, 0u32);
     // SAFETY: out-pointers for the peer's credentials.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-        return Err("no peer credentials".into());
+        return Err(io::Error::other("no peer credentials"));
     }
     if uid != 0 && !policy.uids.contains(&uid) {
-        return Err(format!(
-            "user {uid} may not use lighter's network helper (`sudo lighter lan enable` as them)"
-        ));
+        return Err(io::Error::other(format!(
+            "user {uid} may not use lighter's helper (`sudo lighter helper install` as them)"
+        )));
     }
     if !policy.any_client {
         let requirement = std::ffi::CString::new(REQUIREMENT).expect("requirement");
@@ -201,58 +204,27 @@ fn client(stream: &UnixStream, policy: &Policy, active: &AtomicUsize) -> Result<
             let why = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
-            return Err(why);
+            return Err(io::Error::other(why));
         }
     }
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-    let line = helper::read_hello(stream).map_err(|e| format!("no hello: {e}"))?;
-    let (version, interface, mac) = helper::parse_hello(&line)?;
-    if version != helper::VERSION {
-        return Err(format!(
-            "version {version} asked of a helper that speaks {}; run `sudo lighter lan enable` again",
-            helper::VERSION
-        ));
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let line = lighter_helper::read_hello(stream)
+        .map_err(|e| io::Error::other(format!("no hello: {e}")))?;
+    let (version, request) = lighter_helper::parse_hello(&line).map_err(io::Error::other)?;
+    if version != lighter_helper::VERSION {
+        return Err(io::Error::other(format!(
+            "version {version} asked of a helper that speaks {}; run `sudo lighter helper install` again",
+            lighter_helper::VERSION
+        )));
     }
-    if !lighter_vmnet::interfaces().contains(&interface) {
-        return Err(format!("{interface} cannot be bridged"));
-    }
-    if active.fetch_add(1, Ordering::AcqRel) >= MOST_BRIDGES {
-        active.fetch_sub(1, Ordering::AcqRel);
-        return Err(format!("{MOST_BRIDGES} bridges are already running"));
-    }
-    let result = (|| {
-        let (bridge, near) = lighter_vmnet::Bridge::start(&interface, mac)?;
-        helper::send_line_with_fd(
-            stream,
-            &format!("ok {} {}\n", bridge.mtu, bridge.max_packet),
-            Some(near.as_raw_fd()),
-        )
-        .map_err(|e| e.to_string())?;
-        drop(near);
-        eprintln!(
-            "lighter-bridge: bridged {interface} for user {uid} ({})",
-            helper::mac_text(mac)
-        );
-        // The connection carries nothing more: its end is the bridge's.
-        stream.set_read_timeout(None).map_err(|e| e.to_string())?;
-        let mut byte = [0u8; 1];
-        loop {
-            // SAFETY: a one-byte read on a live socket.
-            let n = unsafe { libc::read(stream.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
-            if n <= 0 {
-                break;
-            }
+    match request {
+        Request::Bind(kind, addr) => {
+            lighter_helper::permitted(addr).map_err(io::Error::other)?;
+            // The OS's error as it is, errno and all: the client tells a
+            // port held elsewhere by it.
+            let socket = lighter_helper::bind_socket_as_root(addr, kind)?;
+            lighter_helper::send_line_with_fd(stream, "ok\n", Some(socket.as_raw_fd()))?;
+            Ok(format!("bound {kind:?} {addr} for user {uid}"))
         }
-        let c = bridge.counters();
-        eprintln!(
-            "lighter-bridge: released {interface} for user {uid}: {} in, {} out, {} dropped",
-            c.to_guest, c.to_network, c.dropped
-        );
-        drop(bridge);
-        Ok(())
-    })();
-    active.fetch_sub(1, Ordering::AcqRel);
-    result
+    }
 }
