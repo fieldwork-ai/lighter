@@ -325,6 +325,30 @@ pub fn get_json_until(
     serde_json::from_slice(&bytes).map_err(|e| HttpError::Malformed(e.to_string()))
 }
 
+/// Sends a bodyless POST (`/containers/{id}/start`) and returns the status
+/// code. Docker answers these with 204 or 304 and no body worth reading, so
+/// only the status line is read and the connection is closed after it.
+pub fn post(socket: &Path, path: &str) -> Result<u16, HttpError> {
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let mut stream =
+        Connection::connect(socket, deadline, None).map_err(|source| HttpError::Connect {
+            path: socket.display().to_string(),
+            source,
+        })?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: docker\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let mut status = String::new();
+    BufReader::new(stream).read_line(&mut status)?;
+    status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| HttpError::Malformed(format!("bad status line {:?}", status.trim())))
+}
+
 /// Calls `on_event` for each newline-delimited JSON object as it arrives.
 ///
 /// Returns when the stream ends, which is how a dropped connection surfaces:

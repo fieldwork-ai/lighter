@@ -31,6 +31,7 @@ mod release;
 mod run;
 mod service;
 mod storage_status;
+mod ui;
 mod updates;
 mod upgrade;
 mod usb;
@@ -135,6 +136,16 @@ enum Command {
     Status,
     /// Check that this Mac can run lighter, and say what to fix if not.
     Doctor,
+    /// Open a status page in the browser, served from 127.0.0.1 while this
+    /// command runs.
+    Ui {
+        /// The port to listen on; 0 picks a free one.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Print the address without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// The Neural Engine service, run as a child of `lighter start`.
     #[command(hide = true, name = "ane-host")]
     AneHost {
@@ -347,6 +358,7 @@ fn dispatch(command: Command) -> anyhow::Result<std::process::ExitCode> {
             start(Duration::from_secs(120))
         }
         Command::Status => status(),
+        Command::Ui { port, no_open } => ui::serve(port, !no_open),
         Command::Usb { action } => match action {
             UsbAction::List => usb::list(),
             UsbAction::Attach { spec, force } => usb::attach(&spec, force),
