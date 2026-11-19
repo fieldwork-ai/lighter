@@ -325,6 +325,168 @@ pub fn get_json_until(
     serde_json::from_slice(&bytes).map_err(|e| HttpError::Malformed(e.to_string()))
 }
 
+/// A whole response to a one-off request.
+#[derive(Debug)]
+pub struct Response {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+/// Sends one request and reads the whole response, whatever its status.
+///
+/// For callers that relay Docker's answer rather than interpret it: an
+/// error status is a response here, not an `Err`, and the body is bytes
+/// because not every endpoint answers in JSON (container logs are a framed
+/// binary stream). `body` goes out with a JSON content type when given.
+pub fn request(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Response, HttpError> {
+    let deadline = Instant::now() + timeout;
+    let mut stream =
+        Connection::connect(socket, deadline, None).map_err(|source| HttpError::Connect {
+            path: socket.display().to_string(),
+            source,
+        })?;
+    let body = body.unwrap_or_default();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| HttpError::Malformed(format!("bad status line {:?}", line.trim())))?;
+    let mut framing = None;
+    let mut content_type = String::new();
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 {
+            return Err(HttpError::Malformed("headers ended early".into()));
+        }
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.to_ascii_lowercase().as_str() {
+            "transfer-encoding" if value.to_ascii_lowercase().contains("chunked") => {
+                framing = Some(Body::Chunked);
+            }
+            "content-length" => {
+                let len = value
+                    .parse()
+                    .map_err(|_| HttpError::Malformed(format!("bad content-length {value:?}")))?;
+                framing = Some(Body::Length(len));
+            }
+            "content-type" => content_type = value.to_string(),
+            _ => {}
+        }
+    }
+    let mut bytes = Vec::new();
+    match framing {
+        Some(Body::Length(len)) => {
+            bytes.resize(len, 0);
+            reader.read_exact(&mut bytes)?;
+        }
+        Some(Body::Chunked) => {
+            while let Some(chunk) = read_chunk(&mut reader)? {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        // `Connection: close` was asked for, so the body ends with the
+        // connection (a 204 has none at all).
+        None => {
+            reader.read_to_end(&mut bytes)?;
+        }
+    }
+    Ok(Response {
+        status,
+        content_type,
+        body: bytes,
+    })
+}
+
+/// Sends a request whose connection Docker then takes over as a raw stream
+/// both ways (`/exec/{id}/start`), and returns it once the response's headers
+/// are read: a reader that holds whatever of the stream came with them, and a
+/// handle to write into it.
+///
+/// Plain blocking sockets rather than [`Connection`]: the stream lives as long
+/// as the program at the other end does, so it has no deadline, and its two
+/// directions are used from two threads.
+pub fn hijack(
+    socket: &Path,
+    path: &str,
+    body: &[u8],
+) -> Result<(BufReader<UnixStream>, UnixStream), HttpError> {
+    let stream = UnixStream::connect(socket).map_err(|source| HttpError::Connect {
+        path: socket.display().to_string(),
+        source,
+    })?;
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+    stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+    let mut writer = stream.try_clone()?;
+    write!(
+        writer,
+        "POST {path} HTTP/1.1\r\nHost: docker\r\nContent-Type: application/json\r\n\
+         Connection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )?;
+    writer.write_all(body)?;
+    writer.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader.read_line(&mut status)?;
+    let upgraded = status.contains(" 101") || status.contains(" 200");
+    let mut length = 0;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 {
+            return Err(HttpError::Malformed("headers ended early".into()));
+        }
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some(len) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = len.trim().parse().unwrap_or(0);
+        }
+    }
+    if !upgraded {
+        // Docker says why in a short JSON body: "container is not running".
+        let mut why = vec![0; length.min(4096)];
+        reader.read_exact(&mut why)?;
+        let why = serde_json::from_slice::<serde_json::Value>(&why)
+            .ok()
+            .and_then(|v| v.get("message")?.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        return Err(HttpError::Status {
+            status: format!("{} {why}", status.trim()),
+            path: path.to_string(),
+        });
+    }
+    reader.get_ref().set_read_timeout(None)?;
+    Ok((reader, writer))
+}
+
 /// Calls `on_event` for each newline-delimited JSON object as it arrives.
 ///
 /// Returns when the stream ends, which is how a dropped connection surfaces:
@@ -478,6 +640,73 @@ mod tests {
 
     fn is_timeout(error: &HttpError) -> bool {
         matches!(error, HttpError::Io(e) | HttpError::Connect { source: e, .. } if e.kind() == io::ErrorKind::TimedOut)
+    }
+
+    #[test]
+    fn a_request_relays_any_status_and_every_framing() {
+        let cases: [(&str, u16, &[u8]); 3] = [
+            ("HTTP/1.1 204 No Content\r\n\r\n", 204, b""),
+            (
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                404,
+                b"{}",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+                200,
+                b"abcde",
+            ),
+        ];
+        for (reply, status, body) in cases {
+            let server = Server::new(move |mut stream| {
+                stream.write_all(reply.as_bytes()).unwrap();
+            });
+            let response = request(
+                &server.path,
+                "DELETE",
+                "/containers/x",
+                None,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!((response.status, response.body.as_slice()), (status, body));
+        }
+    }
+
+    #[test]
+    fn a_hijacked_stream_carries_bytes_both_ways() {
+        let server = Server::new(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 101 UPGRADED\r\nUpgrade: tcp\r\n\r\nhello")
+                .unwrap();
+            let mut ping = [0; 4];
+            stream.read_exact(&mut ping).unwrap();
+            assert_eq!(&ping, b"ping");
+            stream.write_all(b" world").unwrap();
+        });
+        let (mut reader, mut writer) = hijack(&server.path, "/exec/x/start", b"").unwrap();
+        let mut hello = [0; 5];
+        reader.read_exact(&mut hello).unwrap();
+        writer.write_all(b"ping").unwrap();
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+        assert_eq!((&hello, rest.as_str()), (b"hello", " world"));
+    }
+
+    #[test]
+    fn a_refused_hijack_says_why() {
+        let server = Server::new(|mut stream| {
+            let body = br#"{"message":"container abc is not running"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let error = hijack(&server.path, "/exec/x/start", b"").unwrap_err();
+        assert!(error.to_string().contains("is not running"), "{error}");
     }
 
     #[test]
