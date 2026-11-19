@@ -8,9 +8,9 @@
 //! SSDP and DHCP, be discovered, be reached at an address of its own.
 //!
 //! Frames come from a vmnet bridged interface relayed to a datagram socket,
-//! one frame per datagram (`lighter_vmnet`). The relay runs in this process
-//! when lighter holds `com.apple.vm.networking`, and in the root helper
-//! (`lighter-bridge`) otherwise; the card sees the same socket either way.
+//! one frame per datagram (`lighter_vmnet`). The relay runs in this process,
+//! which needs `com.apple.vm.networking`: a release's lighter.app holds it,
+//! and a build of one's own starts without the card.
 //!
 //! The same card carries the link ([`Lan::host_link`]): a vmnet host-only
 //! network of the Mac and the machine alone, which is what lets the Mac
@@ -18,14 +18,12 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::virtio::net::{Inbox, Net, Outbox};
 
-/// What keeps the bridge up: the helper's connection, or the relay itself.
+/// What keeps the bridge up: the relay.
 enum Keep {
-    Helper(#[allow(dead_code)] lighter_vmnet::helper::Held),
     InProcess(#[allow(dead_code)] lighter_vmnet::Bridge),
     #[cfg(test)]
     Nothing,
@@ -37,7 +35,7 @@ impl std::fmt::Debug for Lan {
             f,
             "Lan({} {})",
             self.interface,
-            lighter_vmnet::helper::mac_text(self.mac)
+            lighter_vmnet::mac_text(self.mac)
         )
     }
 }
@@ -58,21 +56,6 @@ pub struct Lan {
 }
 
 impl Lan {
-    /// Asks the root helper at `socket` to bridge `interface`.
-    pub fn via_helper(socket: &Path, interface: &str, mac: [u8; 6]) -> io::Result<Lan> {
-        let held = lighter_vmnet::helper::connect(socket, interface, mac)?;
-        let frames = held.frames.try_clone()?;
-        let mtu = held.mtu.clamp(576, 9000) as u16;
-        Ok(Lan::with(
-            frames,
-            mtu,
-            interface,
-            "lan",
-            mac,
-            Keep::Helper(held),
-        ))
-    }
-
     /// Bridges `interface` in this process, which needs root or
     /// `com.apple.vm.networking`.
     pub fn in_process(interface: &str, mac: [u8; 6]) -> Result<Lan, String> {

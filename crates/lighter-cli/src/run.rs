@@ -238,6 +238,26 @@ pub fn machine() -> anyhow::Result<()> {
             }
         }
     }
+    // The user's Docker settings (`docker_settings`): their folder, shared
+    // read-only, when the file is there and parses; init hands it to dockerd.
+    // What it was at this start is kept, for `doctor` to say when it changes.
+    let _ = std::fs::remove_file(crate::docker_settings::stamp_file(&home));
+    match crate::docker_settings::local(&home) {
+        crate::docker_settings::Local::Valid => {
+            shares.push(Share {
+                tag: crate::docker_settings::TAG.to_string(),
+                path: crate::docker_settings::dir(&home),
+            });
+            cmdline.push_str(" lighter.docker_config");
+            if let Some(stamp) = crate::docker_settings::stamp(&home) {
+                let _ = std::fs::write(crate::docker_settings::stamp_file(&home), stamp);
+            }
+        }
+        crate::docker_settings::Local::Invalid(why) => {
+            tracing::warn!(%why, "the Docker settings file is not valid JSON; Docker starts without it")
+        }
+        crate::docker_settings::Local::Absent => {}
+    }
     // The kernel join of a stream's two sockets: on unless `LIGHTER_SOCKMAP=0`,
     // which keeps the agent's copying path measurable.
     if std::env::var("LIGHTER_SOCKMAP")
@@ -281,7 +301,7 @@ pub fn machine() -> anyhow::Result<()> {
         }) {
             Ok((card, plan, names)) => {
                 cmdline.push_str(&plan.kernel_arg());
-                tracing::info!(subnet = %plan.subnet, mac = %lighter_vmnet::helper::mac_text(plan.mac), "the link is up");
+                tracing::info!(subnet = %plan.subnet, mac = %lighter_vmnet::mac_text(plan.mac), "the link is up");
                 let _ = std::fs::remove_file(home.join("link-error"));
                 Some((Arc::new(card), plan, names))
             }
@@ -612,8 +632,8 @@ fn start_lan(
     let interface = crate::lan::interface(&config.lan_interface)?;
     let address = crate::lan::address_for_guest(&config.lan_address, &interface)?;
     let mac = crate::lan::mac(home).map_err(|e| format!("cannot keep the LAN card's MAC: {e}"))?;
-    let (lan, how) = crate::lan::connect(&interface, mac)?;
-    tracing::info!(%interface, %address, how, "LAN card bridged");
+    let lan = crate::lan::connect(&interface, mac)?;
+    tracing::info!(%interface, %address, "LAN card bridged");
     let mut args = format!(" lighter.lan={address}");
     if let Some((mac_ip, _)) = crate::lan::mac_address(&interface) {
         args.push_str(&format!(" lighter.lan_avoid={mac_ip}"));

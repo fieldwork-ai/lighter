@@ -38,8 +38,39 @@ use std::time::Duration;
 /// port are always the same number, and a two-port version invites exactly
 /// the mistake described on [`Published`].
 pub trait PortMapper: Send + Sync {
-    fn expose(&self, published: Published) -> Result<(), String>;
+    fn expose(&self, published: Published) -> Result<(), Refusal>;
     fn unexpose(&self, published: Published) -> Result<(), String>;
+}
+
+/// Why the Mac would not open a published port: what `lighter doctor`
+/// advises on. Each has its own remedy, and advising the wrong one sent a
+/// user looking for another process on a port that only root could bind
+/// (#113).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// Something else on the Mac holds it (`EADDRINUSE`), on this address
+    /// or, for another user's socket, on any.
+    Held,
+    /// A port below 1024 on one address, which macOS keeps for root
+    /// (`EACCES`), with lighter's helper, which binds it, not installed.
+    NeedsHelper,
+    Other,
+}
+
+/// A binding the Mac refused, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub cause: Cause,
+    pub detail: String,
+}
+
+impl Refusal {
+    pub fn new(cause: Cause, detail: impl Into<String>) -> Self {
+        Refusal {
+            cause,
+            detail: detail.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -259,6 +290,7 @@ pub struct Unforwarded {
     pub proto: Proto,
     pub port: u16,
     pub addrs: Vec<IpAddr>,
+    pub cause: Cause,
     pub reason: String,
 }
 
@@ -521,7 +553,7 @@ fn apply(desired: &HashSet<Published>, mapper: &dyn PortMapper, forwards: &mut F
             match mapper.expose(published) {
                 Ok(()) => opened.push(published),
                 Err(e) => {
-                    refused = Some(format!("{published}: {e}"));
+                    refused = Some((e.cause, format!("{published}: {}", e.detail)));
                     break;
                 }
             }
@@ -536,7 +568,7 @@ fn apply(desired: &HashSet<Published>, mapper: &dyn PortMapper, forwards: &mut F
                     tracing::info!(port = was.port, "a port that could not be forwarded now is");
                 }
             }
-            Some(reason) => {
+            Some((cause, reason)) => {
                 let open: Vec<Published> = members
                     .iter()
                     .filter(|m| forwards.forwarded.contains(m))
@@ -551,6 +583,7 @@ fn apply(desired: &HashSet<Published>, mapper: &dyn PortMapper, forwards: &mut F
                     proto: key.0,
                     port: key.1,
                     addrs: members.iter().map(|m| m.addr).collect(),
+                    cause,
                     reason,
                 };
                 // Once per failure, not once per retry: the same refusal
@@ -577,9 +610,12 @@ mod tests {
     }
 
     impl PortMapper for Mapper {
-        fn expose(&self, published: Published) -> Result<(), String> {
+        fn expose(&self, published: Published) -> Result<(), Refusal> {
             if self.refuse.lock().unwrap().contains(&published) {
-                return Err("Address already in use (os error 48)".into());
+                return Err(Refusal::new(
+                    Cause::Held,
+                    "Address already in use (os error 48)",
+                ));
             }
             self.open.lock().unwrap().insert(published);
             Ok(())
@@ -617,6 +653,7 @@ mod tests {
         assert_eq!(failed[0].port, 9000);
         assert_eq!(failed[0].addrs.len(), 2);
         assert!(failed[0].reason.contains("Address already in use"));
+        assert_eq!(failed[0].cause, Cause::Held);
 
         mapper.refuse.lock().unwrap().clear();
         apply(&desired, &mapper, &mut forwards);

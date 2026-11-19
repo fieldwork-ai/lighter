@@ -450,50 +450,7 @@ fn connect_nonblocking(addr: SocketAddr) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-/// The address family and the `sockaddr` bytes for a socket address, with
-/// their length, for the libc calls that take one.
-pub(crate) fn sockaddr_bytes(addr: SocketAddr) -> (libc::c_int, Vec<u8>, libc::socklen_t) {
-    match addr {
-        SocketAddr::V4(a) => {
-            let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            sin.sin_len = size_of::<libc::sockaddr_in>() as u8;
-            sin.sin_family = libc::AF_INET as u8;
-            sin.sin_port = a.port().to_be();
-            sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::addr_of!(sin).cast::<u8>(),
-                    size_of::<libc::sockaddr_in>(),
-                )
-            }
-            .to_vec();
-            (
-                libc::AF_INET,
-                bytes,
-                size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        }
-        SocketAddr::V6(a) => {
-            let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-            sin6.sin6_len = size_of::<libc::sockaddr_in6>() as u8;
-            sin6.sin6_family = libc::AF_INET6 as u8;
-            sin6.sin6_port = a.port().to_be();
-            sin6.sin6_addr.s6_addr = a.ip().octets();
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::addr_of!(sin6).cast::<u8>(),
-                    size_of::<libc::sockaddr_in6>(),
-                )
-            }
-            .to_vec();
-            (
-                libc::AF_INET6,
-                bytes,
-                size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )
-        }
-    }
-}
+pub(crate) use lighter_helper::sockaddr_bytes;
 
 /// After a non-blocking connect signals writable: did it succeed?
 fn connect_result(fd: RawFd) -> io::Result<()> {

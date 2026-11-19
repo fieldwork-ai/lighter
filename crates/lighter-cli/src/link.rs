@@ -94,7 +94,7 @@ impl Link {
         format!(
             " lighter.link={}/16,{},{:x}:{:x}:{:x}",
             self.subnet,
-            lighter_vmnet::helper::mac_text(self.mac),
+            lighter_vmnet::mac_text(self.mac),
             g[0],
             g[1],
             g[2]
@@ -105,7 +105,7 @@ impl Link {
         format!(
             "{}/16 {} {}\n",
             self.subnet,
-            lighter_vmnet::helper::mac_text(self.mac),
+            lighter_vmnet::mac_text(self.mac),
             self.network
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -116,7 +116,7 @@ impl Link {
     fn parse(text: &str) -> Option<Link> {
         let mut words = text.split_whitespace();
         let subnet = parse_subnet(words.next()?).ok()?;
-        let mac = lighter_vmnet::helper::parse_mac(words.next()?)?;
+        let mac = lighter_vmnet::parse_mac(words.next()?)?;
         let hex = words.next()?;
         if hex.len() != 32 {
             return None;

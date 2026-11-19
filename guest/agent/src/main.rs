@@ -302,7 +302,7 @@ fn bound_container_cache() {
         .map(|c| c.split_whitespace().any(|w| w == "lighter.reporting=fast"))
         .unwrap_or(false);
     if always_fast {
-        set_reporting(100, 5);
+        set_reporting(100, 5, Compaction::Full);
     }
     // `lighter.reporting_order=<n>`: the smallest order reporting returns at
     // rest. Five (128 KiB runs) rather than the kernel's nine (two
@@ -322,13 +322,16 @@ fn bound_container_cache() {
         .map(|o| o as u32)
         .unwrap_or(3);
     // The kernel's own order, two megabytes, while the containers work.
-    const CHURN_ORDER: u32 = 9;
+    // `lighter.churn_order=<n>` changes it, for the A/B (#112).
+    let churn_order = cmdline_value("lighter.churn_order")
+        .map(|o| o as u32)
+        .unwrap_or(9);
     // The rest settings from the start, not from the first trim: the kernel
     // boots with proactive compaction at 20.
     if !always_fast {
-        set_reporting(2000, rest_order);
+        set_reporting(2000, rest_order, Compaction::Off);
     }
-    let mut at_rest = !always_fast;
+    let mut reporting = memory_policy::ReportingOrder::new(!always_fast);
     // Ticks since the containers last used half a core (the rest order's mark).
     let mut light_for = 0u32;
     // The engine's cgroup (init puts dockerd there): the image layers it
@@ -443,10 +446,10 @@ fn bound_container_cache() {
         if hurried && !always_fast
             && (populated || idle_for == 0 || idle_trim.elapsed_ticks() >= TRIM_AFTER[1] + 17 * TICKS_PER_SEC)
         {
-            set_reporting(2000, if heavy { CHURN_ORDER } else { rest_order });
+            set_reporting(2000, if heavy { churn_order } else { rest_order }, Compaction::Off);
             hurried = false;
             fragments_at = 0;
-            at_rest = !heavy;
+            reporting.reset(!heavy);
         } else if hurried && fragments_at != 0 && idle_trim.elapsed_ticks() >= fragments_at {
             // The burst's second phase: the bulk is back, the fragments go
             // at the same pace at the rest order. Lowering the order is
@@ -454,7 +457,7 @@ fn bound_container_cache() {
             // 0035); at the rest pace they would wait for the next free
             // large enough to ask, which on an idle guest was longer than
             // the minute the Mac is measured over.
-            set_reporting(100, rest_order);
+            set_reporting(100, rest_order, Compaction::Full);
             fragments_at = 0;
         }
         // The rest order only at rest. Reporting 128 KiB runs while an
@@ -469,13 +472,24 @@ fn bound_container_cache() {
         // the churn order once the containers have used half a core in a
         // tick, and the rest order once they have been under that for eight
         // seconds.
+        //
+        // And a drain each minute the churn order lasts (`ReportingOrder`):
+        // everything free down to the rest order, reported at once (a delay
+        // under 2000 ms takes each free list whole in one cycle, and
+        // lowering the order starts the cycle, patch 0035), then the churn
+        // order again (#112). On the M1 under a load freeing 150 MiB a minute
+        // in short runs, each drain took the footprint down 75-150 MiB, for
+        // 3 s of VMM CPU in fifteen minutes; installs read as before
+        // (docs/guest-memory-2026-09-20.md).
         if !always_fast && !hurried {
-            if at_rest && heavy {
-                set_reporting(2000, CHURN_ORDER);
-                at_rest = false;
-            } else if !at_rest && light_for >= 8 * TICKS_PER_SEC {
-                set_reporting(2000, rest_order);
-                at_rest = true;
+            match reporting.tick(heavy, light_for, step) {
+                Some(memory_policy::Reporting::Rest) => set_reporting(2000, rest_order, Compaction::Off),
+                Some(memory_policy::Reporting::Churn) => set_reporting(2000, churn_order, Compaction::Off),
+                // Not with the hurried setting's full compaction: that is
+                // for a guest whose containers just stopped, and these are
+                // working.
+                Some(memory_policy::Reporting::Drain) => set_reporting(100, rest_order, Compaction::Off),
+                None => {}
             }
         }
         // Two seconds idle: offer the host what is free beyond a reserve,
@@ -599,7 +613,7 @@ fn bound_container_cache() {
         // read 1872 MiB a minute after the install against 1349 with the
         // whole burst at 3.
         if !memory_policy::populated(std::path::Path::new(containers)) {
-            set_reporting(100, 5);
+            set_reporting(100, 5, Compaction::Full);
             hurried = true;
             fragments_at = idle_trim.elapsed_ticks() + 4 * TICKS_PER_SEC;
             compact_until_reportable();
@@ -878,18 +892,31 @@ fn cmdline_value(key: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+/// How hard the background compactor works while reporting runs.
+#[derive(Clone, Copy)]
+enum Compaction {
+    /// None: the kernel's 20 has kcompactd wake twice a second on an idle
+    /// guest to check a fragmentation score nothing is changing (2 of the 38
+    /// wakeups a second an idle guest made). At rest the trims compact
+    /// explicitly; while the containers work, their own allocations are
+    /// what it would be competing with.
+    Off,
+    /// Full strength, for the hurried spell after a trim, when what was
+    /// freed is wanted back in reportable runs at once.
+    Full,
+}
+
 /// The kernel's delay before a free page reporting cycle (patch 0019), the
 /// smallest order it reports, and how hard the background compactor works
-/// meanwhile: hurried reporting goes with full-strength compaction, the
-/// churn setting with the kernel's default.
-fn set_reporting(delay_ms: u32, order: u32) {
+/// meanwhile. A delay under 2000 ms also reports each free list whole in one
+/// cycle, where 2000 reports a sixteenth of it a cycle.
+fn set_reporting(delay_ms: u32, order: u32, compaction: Compaction) {
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_delay_ms", delay_ms.to_string());
     let _ = std::fs::write("/sys/module/page_reporting/parameters/page_reporting_order", order.to_string());
-    // At rest, none: the kernel's 20 has kcompactd wake twice a second on an
-    // idle guest to check a fragmentation score nothing is changing (2 of
-    // the 38 wakeups a second an idle guest made). The trims compact
-    // explicitly, and the hurried setting has it at full strength.
-    let proactiveness = if delay_ms < 2000 { "100" } else { "0" };
+    let proactiveness = match compaction {
+        Compaction::Off => "0",
+        Compaction::Full => "100",
+    };
     let _ = std::fs::write("/proc/sys/vm/compaction_proactiveness", proactiveness);
 }
 
@@ -1344,6 +1371,14 @@ fn agent_restarts(record: &str) -> String {
     counts.iter().map(|(n, c)| format!("{n}={c}")).collect::<Vec<_>>().join(" ")
 }
 
+/// The answer to `docker-config`, from init's record: one line.
+fn docker_config_report(record: Option<&str>) -> String {
+    match record.map(str::trim) {
+        None | Some("") => "docker-config none\n".into(),
+        Some(state) => format!("docker-config {}\n", state.replace(['\n', '\r'], " ")),
+    }
+}
+
 fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
@@ -1353,6 +1388,11 @@ fn handle_control(line: &str) -> String {
         (Some("listeners"), _) => listeners::report(),
         // The LAN card's state, for `lighter status` and `doctor`.
         (Some("lan"), _) => listeners::lan_report(),
+        // What init made of the user's Docker settings (`~/.lighter/docker/
+        // daemon.json`): `docker-config applied`, `refused <dockerd's
+        // reason>`, `unmounted`, or `none` when it was given none.
+        (Some("docker-config"), _) => docker_config_report(
+            std::fs::read_to_string("/run/lighter/docker-config").ok().as_deref()),
         // Which agents init has had to restart, and how often: one line,
         // `restarts tcp-proxy=2 dns=1`, or `restarts none`.
         (Some("restarts"), _) => format!("restarts {}\n", agent_restarts(
@@ -1677,6 +1717,19 @@ impl Write for Fd {
 
 #[cfg(test)]
 mod tests {
+    /// init's record, as one line the CLI parses (`docker_settings::Applied`).
+    #[test]
+    fn the_docker_settings_report_is_one_line() {
+        use super::docker_config_report;
+        assert_eq!(docker_config_report(None), "docker-config none\n");
+        assert_eq!(docker_config_report(Some("")), "docker-config none\n");
+        assert_eq!(docker_config_report(Some("applied\n")), "docker-config applied\n");
+        assert_eq!(
+            docker_config_report(Some("refused unable to configure the Docker daemon with file x: y\r\n")),
+            "docker-config refused unable to configure the Docker daemon with file x: y\n"
+        );
+    }
+
     #[test]
     fn streams_answer_in_one_line() {
         let line = super::streams_line(|route| match route {

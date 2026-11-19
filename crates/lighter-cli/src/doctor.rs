@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 
 use crate::paths;
 
+#[derive(Debug)]
 pub struct Finding {
     pub ok: bool,
     pub what: String,
@@ -22,7 +23,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn good(what: &str, detail: impl Into<String>) -> Finding {
+    pub(crate) fn good(what: &str, detail: impl Into<String>) -> Finding {
         Finding {
             ok: true,
             what: what.into(),
@@ -44,7 +45,7 @@ impl Finding {
     /// Something the user should fix that nothing here can refuse to run
     /// over: a permission that macOS grants only to a machine that is
     /// running and has asked, for one.
-    fn warn(what: &str, detail: impl Into<String>, remedy: &str) -> Finding {
+    pub(crate) fn warn(what: &str, detail: impl Into<String>, remedy: &str) -> Finding {
         Finding {
             ok: true,
             what: what.into(),
@@ -318,10 +319,10 @@ pub fn run() -> Vec<Finding> {
                 Some(crate::machine::LanState::Missing(why)) => Finding::warn(
                     "LAN",
                     format!("not on the network: {why}"),
-                    if crate::lan::installed() || crate::lan::needs_no_helper() {
+                    if crate::lan::can_bridge() {
                         "check `lighter lan status`, then `lighter restart`"
                     } else {
-                        "install lighter's network helper with `sudo lighter lan enable`, then `lighter restart`"
+                        "LAN mode needs a release: a build of your own lacks com.apple.vm.networking"
                     },
                 ),
                 None => Finding::warn("LAN", "the machine does not say", "`lighter restart`"),
@@ -370,22 +371,18 @@ pub fn run() -> Vec<Finding> {
                 "off: `lighter config --direct on` reaches containers at their own addresses and as NAME.lighter.local",
             ));
         }
-        findings.push(if report.unforwarded.is_empty() {
-            Finding::good("published ports", "all forwarded")
-        } else {
-            let ports: Vec<String> = report
-                .unforwarded
-                .iter()
-                .map(|p| format!("{} {} ({})", p.proto, p.port, p.reason))
-                .collect();
-            Finding::warn(
-                "published ports",
-                format!("not forwarded, retrying: {}", ports.join("; ")),
-                "something else on the Mac holds these ports, such as Tailscale Serve or another \
-                 user's process: macOS refuses lighter the port on every address while it holds \
-                 one. lighter opens them as soon as it lets go",
-            )
-        });
+        findings.extend(published_ports(&report.unforwarded));
+        let applied = crate::machine::control("docker-config")
+            .ok()
+            .and_then(|reply| crate::docker_settings::InGuest::parse(&reply));
+        findings.extend(crate::docker_settings::finding(&home, applied));
+        if crate::helper::old_installed() {
+            findings.push(Finding::warn(
+                "helper",
+                "the network helper of lighter 0.13.10 and earlier is still installed, and nothing uses it",
+                "`sudo lighter helper uninstall` removes it (and `sudo lighter helper install` replaces it, if you publish ports below 1024 on one address)",
+            ));
+        }
     }
 
     // Only a connect made by the machine's own process tests the machine's
@@ -752,9 +749,133 @@ fn free_space_gib() -> Option<u64> {
     Some(st.f_bavail * u64::from(st.f_bsize) / (1 << 30))
 }
 
+/// The published ports the machine could not forward, a finding for each
+/// cause, since each has its own remedy (#113); one line when all are open.
+fn published_ports(unforwarded: &[crate::storage_status::Unforwarded]) -> Vec<Finding> {
+    use crate::storage_status::Cause;
+    if unforwarded.is_empty() {
+        return vec![Finding::good("published ports", "all forwarded")];
+    }
+    let mut findings = Vec::new();
+    // A machine before 0.13.11 says no cause; macOS's own word for a port
+    // only root may bind tells that case from the rest.
+    let needs = |p: &crate::storage_status::Unforwarded| {
+        p.cause == Cause::NeedsHelper
+            || (p.cause == Cause::Unknown && p.reason.contains("Permission denied (os error 13)"))
+    };
+    let pick = |want: &dyn Fn(&crate::storage_status::Unforwarded) -> bool| -> Vec<String> {
+        unforwarded
+            .iter()
+            .filter(|p| want(p))
+            .map(|p| format!("{} {} ({})", p.proto, p.port, p.reason))
+            .collect()
+    };
+    let needs_helper = pick(&needs);
+    if !needs_helper.is_empty() {
+        findings.push(Finding::warn(
+            "published ports",
+            format!(
+                "not forwarded, waiting for lighter's helper: {}",
+                needs_helper.join("; ")
+            ),
+            "macOS lets only root bind a port below 1024 to one address, loopback included: \
+             `sudo lighter helper install` lets lighter open them, and a running machine does \
+             within half a minute. Publishing on every address (`80:80`, with `--publish lan`) \
+             needs no helper but reaches the network",
+        ));
+    }
+    // The rest of an older machine's refusals were the ones this advice was
+    // written for.
+    let held = pick(&|p| p.cause == Cause::Held || (p.cause == Cause::Unknown && !needs(p)));
+    if !held.is_empty() {
+        findings.push(Finding::warn(
+            "published ports",
+            format!("not forwarded, retrying: {}", held.join("; ")),
+            "something else on the Mac holds these ports, such as Tailscale Serve or another \
+             user's process: macOS refuses lighter the port on every address while it holds \
+             one. lighter opens them as soon as it lets go",
+        ));
+    }
+    let other = pick(&|p| p.cause == Cause::Other);
+    if !other.is_empty() {
+        findings.push(Finding::warn(
+            "published ports",
+            format!("not forwarded, retrying: {}", other.join("; ")),
+            "`lighter logs` has the machine's side; a refusal through lighter's helper is also \
+             in /var/log/dev.lighter.helper.log",
+        ));
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unforwarded(
+        port: u16,
+        cause: crate::storage_status::Cause,
+    ) -> crate::storage_status::Unforwarded {
+        crate::storage_status::Unforwarded {
+            proto: "tcp".into(),
+            port,
+            addrs: vec!["127.0.0.1".into()],
+            cause,
+            reason: format!("tcp 127.0.0.1:{port}: cannot listen on 127.0.0.1:{port}: x"),
+        }
+    }
+
+    /// A port only root may bind is not blamed on another process (#113),
+    /// and each cause gets its own advice.
+    #[test]
+    fn each_cause_of_a_closed_port_gets_its_own_advice() {
+        use crate::storage_status::Cause;
+        let all_open = published_ports(&[]);
+        assert_eq!(all_open.len(), 1);
+        assert!(all_open[0].ok && !all_open[0].warn);
+
+        let findings = published_ports(&[
+            unforwarded(80, Cause::NeedsHelper),
+            unforwarded(9000, Cause::Held),
+        ]);
+        assert_eq!(findings.len(), 2);
+        let helper = findings
+            .iter()
+            .find(|f| f.detail.contains("tcp 80"))
+            .unwrap();
+        assert!(
+            helper
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("sudo lighter helper install")
+        );
+        assert!(!helper.remedy.as_deref().unwrap().contains("Tailscale"));
+        assert!(!helper.detail.contains("9000"));
+        let held = findings
+            .iter()
+            .find(|f| f.detail.contains("tcp 9000"))
+            .unwrap();
+        assert!(held.remedy.as_deref().unwrap().contains("Tailscale"));
+
+        // An older machine says no cause: the advice it always had, but for
+        // a port only root may bind, which it names in its own words.
+        let old = published_ports(&[unforwarded(9000, Cause::Unknown)]);
+        assert!(old[0].remedy.as_deref().unwrap().contains("Tailscale"));
+        let mut root_only = unforwarded(80, Cause::Unknown);
+        root_only.reason =
+            "tcp 127.0.0.1:80: cannot listen on 127.0.0.1:80: Permission denied (os error 13)"
+                .into();
+        let old = published_ports(&[root_only]);
+        assert_eq!(old.len(), 1);
+        assert!(
+            old[0]
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("sudo lighter helper install")
+        );
+    }
 
     #[test]
     fn streams_read_as_what_was_joined_and_copied() {

@@ -4,12 +4,9 @@
 //! and [`Bridge::host_link`] on a network of the Mac and the guest alone;
 //! each gives back the near end of a `SOCK_DGRAM` socket pair: each datagram
 //! read from it is a frame from the network, and each written is a frame
-//! for it. The relay (`relay.c`) holds the far end. Starting a bridged
-//! interface needs root, or `com.apple.vm.networking`; the root helper runs
-//! this and passes the near end on, and a lighter with the entitlement runs
-//! it itself. Either way the VMM sees the same socket.
-
-pub mod helper;
+//! for it. The relay (`relay.c`) holds the far end. Starting either needs
+//! `com.apple.vm.networking` (or root): a release's lighter.app holds it,
+//! and a build of one's own, which cannot, starts without the card.
 
 use std::ffi::{CStr, CString};
 use std::net::Ipv4Addr;
@@ -222,6 +219,25 @@ pub fn socket_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok((a, b))
 }
 
+/// A MAC address as text, `02:6c:69:67:68:74`.
+pub fn mac_text(mac: [u8; 6]) -> String {
+    mac.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// A MAC address from its text, six colon-separated hex bytes.
+pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let parts: Vec<u8> = text
+        .split(':')
+        .filter_map(|p| u8::from_str_radix(p, 16).ok())
+        .collect();
+    <[u8; 6]>::try_from(parts.as_slice())
+        .ok()
+        .filter(|_| text.split(':').count() == 6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +252,15 @@ mod tests {
         let mut got = vec![0u8; 2048];
         let n = unsafe { libc::recv(b.as_raw_fd(), got.as_mut_ptr().cast(), got.len(), 0) };
         assert_eq!(n, 1514);
+    }
+
+    #[test]
+    fn a_mac_round_trips() {
+        let mac = [0x02, 0x6c, 0x69, 0x67, 0x68, 0x74];
+        assert_eq!(parse_mac(&mac_text(mac)), Some(mac));
+        assert_eq!(parse_mac("02:00:00"), None);
+        assert_eq!(parse_mac("02:00:00:00:00:01:07"), None);
+        assert_eq!(parse_mac("zz:00:00:00:00:01"), None);
     }
 
     #[test]

@@ -41,7 +41,32 @@ pub struct Unforwarded {
     pub proto: String,
     pub port: u16,
     pub addrs: Vec<String>,
+    /// Why, as advice turns on it. `Unknown` from a machine before 0.13.11.
+    #[serde(default)]
+    pub cause: Cause,
     pub reason: String,
+}
+
+/// `lighter_docker::Cause`, as the status socket carries it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Cause {
+    Held,
+    NeedsHelper,
+    Other,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<lighter_docker::Cause> for Cause {
+    fn from(cause: lighter_docker::Cause) -> Self {
+        match cause {
+            lighter_docker::Cause::Held => Cause::Held,
+            lighter_docker::Cause::NeedsHelper => Cause::NeedsHelper,
+            lighter_docker::Cause::Other => Cause::Other,
+        }
+    }
 }
 
 /// What the vsock link's warden has done since the machine started: the
@@ -166,6 +191,7 @@ impl Server {
                                     },
                                     port: u.port,
                                     addrs: u.addrs.iter().map(|a| a.to_string()).collect(),
+                                    cause: u.cause.into(),
                                     reason: u.reason,
                                 })
                                 .collect()
@@ -247,6 +273,27 @@ pub fn query(home: &Path, pid: u32) -> io::Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A machine before 0.13.11 sends no cause, and a later one may send
+    /// a cause this CLI does not know: both read as unknown, not a failure
+    /// to read the status at all.
+    #[test]
+    fn a_cause_this_cli_does_not_know_is_unknown() {
+        let old: Unforwarded =
+            serde_json::from_str(r#"{"proto":"tcp","port":80,"addrs":["127.0.0.1"],"reason":"x"}"#)
+                .unwrap();
+        assert_eq!(old.cause, Cause::Unknown);
+        let newer: Unforwarded = serde_json::from_str(
+            r#"{"proto":"tcp","port":80,"addrs":["127.0.0.1"],"cause":"later","reason":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.cause, Cause::Unknown);
+        let now: Unforwarded = serde_json::from_str(
+            r#"{"proto":"tcp","port":80,"addrs":["127.0.0.1"],"cause":"needs-helper","reason":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(now.cause, Cause::NeedsHelper);
+    }
 
     #[test]
     fn status_is_on_demand_authenticated_and_removed_on_shutdown() {

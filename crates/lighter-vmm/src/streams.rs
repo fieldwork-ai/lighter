@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use lighter_docker::{Proto, Published};
+use lighter_docker::{Cause, Proto, Published, Refusal};
 
 use crate::virtio::vsock::{Accepted, ConnKey, VsockShared, pump};
 
@@ -212,60 +212,53 @@ fn reach(addr: IpAddr) -> IpAddr {
     }
 }
 
-/// A bound socket of `kind` (`SOCK_STREAM` or `SOCK_DGRAM`) on `addr`.
-///
-/// Not the standard library's bind, for one option it cannot set: a v6
-/// socket here is v6 only, so that the `0.0.0.0` and `::` bindings Docker
-/// reports for one publish can both be bound on the same port. Listeners
-/// also get `SO_REUSEADDR`, as the standard library's do, so a port can be
-/// republished while its last connections are still in TIME_WAIT.
-pub(crate) fn bind_socket(addr: SocketAddr, kind: libc::c_int) -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-    let (family, sockaddr, len) = crate::reactor::sockaddr_bytes(addr);
-    // SAFETY: a plain socket(2) call.
-    let fd = unsafe { libc::socket(family, kind, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a fresh descriptor we own.
-    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-    // SAFETY: fcntl on a live descriptor.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    let one: libc::c_int = 1;
-    // SAFETY: setsockopt with an int of the size it is told.
-    unsafe {
-        if family == libc::AF_INET6 {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_V6ONLY,
-                (&one as *const libc::c_int).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            );
+/// A socket of `kind` bound on `addr` for a published port: here, or, for
+/// a port below 1024 on one address, which macOS keeps for root (#113), by
+/// lighter's helper. Refusals say why, for `lighter doctor`'s advice.
+fn bind(addr: SocketAddr, kind: lighter_helper::Kind) -> Result<std::os::fd::OwnedFd, Refusal> {
+    let what = match kind {
+        lighter_helper::Kind::Tcp => "listen on",
+        lighter_helper::Kind::Udp => "bind udp",
+    };
+    let refused = |e: io::Error| {
+        let cause = if e.raw_os_error() == Some(libc::EADDRINUSE) {
+            Cause::Held
+        } else {
+            Cause::Other
+        };
+        Refusal::new(cause, format!("cannot {what} {addr}: {e}"))
+    };
+    match lighter_helper::bind_socket(addr, kind) {
+        Ok(fd) => Ok(fd),
+        Err(e)
+            if e.raw_os_error() == Some(libc::EACCES)
+                && lighter_helper::permitted(addr).is_ok() =>
+        {
+            lighter_helper::bind(&lighter_helper::socket(), kind, addr).map_err(|h| {
+                // No helper: no socket, or one left behind that nothing
+                // listens on (launchd's job gone, a helper run by hand ended).
+                if matches!(h.raw_os_error(), Some(libc::ENOENT | libc::ECONNREFUSED)) {
+                    return Refusal::new(Cause::NeedsHelper, format!("cannot {what} {addr}: {e}"));
+                }
+                let mut refusal = refused(h);
+                refusal.detail = format!("{} (through lighter's helper)", refusal.detail);
+                refusal
+            })
         }
-        if kind == libc::SOCK_STREAM {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                (&one as *const libc::c_int).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+        Err(e) => Err(refused(e)),
     }
-    // SAFETY: the sockaddr bytes are a correctly built sockaddr of `len`.
-    if unsafe { libc::bind(fd, sockaddr.as_ptr().cast(), len) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(owned)
 }
 
-fn listen(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+fn listen(addr: SocketAddr) -> Result<std::net::TcpListener, Refusal> {
     use std::os::fd::AsRawFd;
-    let fd = bind_socket(addr, libc::SOCK_STREAM)?;
+    let fd = bind(addr, lighter_helper::Kind::Tcp)?;
     // SAFETY: listen on a bound socket we own.
     if unsafe { libc::listen(fd.as_raw_fd(), 128) } < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        return Err(Refusal::new(
+            Cause::Other,
+            format!("cannot listen on {addr}: {e}"),
+        ));
     }
     Ok(std::net::TcpListener::from(fd))
 }
@@ -293,12 +286,12 @@ impl PortMapper {
         })
     }
 
-    fn expose_tcp(&self, published: Published, addr: SocketAddr) -> Result<(), String> {
+    fn expose_tcp(&self, published: Published, addr: SocketAddr) -> Result<(), Refusal> {
         let mut listeners = self.listeners.lock().expect("port mapper poisoned");
         if listeners.contains_key(&published) {
             return Ok(());
         }
-        let listener = listen(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+        let listener = listen(addr)?;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         listeners.insert(published, Some(stop.clone()));
         let shared = self.shared.clone();
@@ -331,7 +324,7 @@ impl PortMapper {
                     });
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Refusal::new(Cause::Other, e.to_string()))?;
         tracing::info!(%published, %addr, %dst, "port published through a stream");
         Ok(())
     }
@@ -340,18 +333,18 @@ impl PortMapper {
 impl PortMapper {
     /// A published UDP port: a socket bound here, owned by the reactor,
     /// which carries each client's datagrams to the agent as a flow.
-    fn expose_udp(&self, published: Published, addr: SocketAddr) -> Result<(), String> {
+    fn expose_udp(&self, published: Published, addr: SocketAddr) -> Result<(), Refusal> {
         let mut listeners = self.listeners.lock().expect("port mapper poisoned");
         if listeners.contains_key(&published) {
             return Ok(());
         }
         let reactor = REACTOR
             .get()
-            .ok_or_else(|| "the reactor is not running".to_string())?;
-        let fd = bind_socket(addr, libc::SOCK_DGRAM)
-            .map_err(|e| format!("cannot bind udp {addr}: {e}"))?;
-        let socket = std::net::UdpSocket::from(fd);
-        socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+            .ok_or_else(|| Refusal::new(Cause::Other, "the reactor is not running"))?;
+        let socket = std::net::UdpSocket::from(bind(addr, lighter_helper::Kind::Udp)?);
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| Refusal::new(Cause::Other, e.to_string()))?;
         crate::sockbuf::widen(&socket);
         let dst = SocketAddr::new(guest_address(published.addr), published.port);
         reactor.publish_udp(published, socket, dst);
@@ -362,7 +355,7 @@ impl PortMapper {
 }
 
 impl lighter_docker::PortMapper for PortMapper {
-    fn expose(&self, published: Published) -> Result<(), String> {
+    fn expose(&self, published: Published) -> Result<(), Refusal> {
         let addr = SocketAddr::new(bind_address(published.addr, self.scope), published.port);
         match published.proto {
             Proto::Tcp => self.expose_tcp(published, addr),

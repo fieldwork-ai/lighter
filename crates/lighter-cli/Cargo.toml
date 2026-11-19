@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 lighter-vmnet.workspace = true
+lighter-helper.workspace = true
 lighter-hv.workspace = true
 lighter-vmm.workspace = true
 lighter-docker.workspace = true

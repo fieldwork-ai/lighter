@@ -785,7 +785,7 @@ impl Machine {
                         .service_queue(virtio::net::TX_QUEUE);
                 },
             )?;
-            tracing::info!(interface = card.interface(), mac = %lighter_vmnet::helper::mac_text(card.mac()), "the machine's wired card is up");
+            tracing::info!(interface = card.interface(), mac = %lighter_vmnet::mac_text(card.mac()), "the machine's wired card is up");
         }
         if let (Some(network), Some(slot)) = (&network, net_slot) {
             let rx_transport = virtio_devices[slot].clone();

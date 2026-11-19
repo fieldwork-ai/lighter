@@ -331,6 +331,34 @@ fi
 "$LIGHTER" stop >/dev/null 2>&1 || fail "the machine without a local CLI did not stop"
 
 echo
+echo "==> Docker settings in lighter's home (#111)"
+# ~/.lighter/docker/daemon.json, which upgrades do not replace: applied at
+# start, and one dockerd refuses costs only itself, never the machine's
+# Docker, with dockerd's reason in start's output and doctor's.
+SETTINGS="$LIGHTER_HOME/docker/daemon.json"
+mkdir -p "$LIGHTER_HOME/docker"
+echo '{"default-address-pools":[{"base":"10.231.0.0/16","size":24}]}' >"$SETTINGS"
+"$LIGHTER" start >"$LIGHTER_HOME/settings.log" 2>&1 || fail "start with Docker settings failed"
+if docker network create m8-pool >/dev/null 2>&1 \
+	&& docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' m8-pool | grep -qE '^10\.231\.[0-9]+\.0/24$'; then
+	pass "a new network is a /24 from the pool the settings name"
+else
+	fail "the settings' address pool was not used: $(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' m8-pool 2>&1)"
+fi
+docker network rm m8-pool >/dev/null 2>&1
+grep -q "Docker settings from" "$LIGHTER_HOME/settings.log" && pass "start says they apply" || fail "start did not say the settings apply"
+echo '{"m8-no-such-option": true}' >"$SETTINGS"
+"$LIGHTER" restart >"$LIGHTER_HOME/settings.log" 2>&1 || fail "restart with refused settings failed"
+if docker info >/dev/null 2>&1 && grep -q "m8-no-such-option" "$LIGHTER_HOME/settings.log" \
+	&& "$LIGHTER" doctor 2>&1 | grep -q "warn .*docker settings .*would not start"; then
+	pass "settings dockerd refuses: Docker runs without them, and start and doctor say why"
+else
+	fail "refused settings: $(grep -A1 'docker settings' "$LIGHTER_HOME/settings.log")"
+fi
+rm -f "$SETTINGS"
+"$LIGHTER" stop >/dev/null 2>&1 || fail "the machine with settings did not stop"
+
+echo
 if [ "$FAILED" -eq 0 ]; then
 	printf '\033[32mmilestone 8 gate passed\033[0m — a day of work, and a night of sleep.\n'
 	exit 0
