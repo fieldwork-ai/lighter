@@ -1371,6 +1371,14 @@ fn agent_restarts(record: &str) -> String {
     counts.iter().map(|(n, c)| format!("{n}={c}")).collect::<Vec<_>>().join(" ")
 }
 
+/// The answer to `docker-config`, from init's record: one line.
+fn docker_config_report(record: Option<&str>) -> String {
+    match record.map(str::trim) {
+        None | Some("") => "docker-config none\n".into(),
+        Some(state) => format!("docker-config {}\n", state.replace(['\n', '\r'], " ")),
+    }
+}
+
 fn handle_control(line: &str) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
@@ -1380,6 +1388,11 @@ fn handle_control(line: &str) -> String {
         (Some("listeners"), _) => listeners::report(),
         // The LAN card's state, for `lighter status` and `doctor`.
         (Some("lan"), _) => listeners::lan_report(),
+        // What init made of the user's Docker settings (`~/.lighter/docker/
+        // daemon.json`): `docker-config applied`, `refused <dockerd's
+        // reason>`, `unmounted`, or `none` when it was given none.
+        (Some("docker-config"), _) => docker_config_report(
+            std::fs::read_to_string("/run/lighter/docker-config").ok().as_deref()),
         // Which agents init has had to restart, and how often: one line,
         // `restarts tcp-proxy=2 dns=1`, or `restarts none`.
         (Some("restarts"), _) => format!("restarts {}\n", agent_restarts(
@@ -1704,6 +1717,19 @@ impl Write for Fd {
 
 #[cfg(test)]
 mod tests {
+    /// init's record, as one line the CLI parses (`docker_settings::Applied`).
+    #[test]
+    fn the_docker_settings_report_is_one_line() {
+        use super::docker_config_report;
+        assert_eq!(docker_config_report(None), "docker-config none\n");
+        assert_eq!(docker_config_report(Some("")), "docker-config none\n");
+        assert_eq!(docker_config_report(Some("applied\n")), "docker-config applied\n");
+        assert_eq!(
+            docker_config_report(Some("refused unable to configure the Docker daemon with file x: y\r\n")),
+            "docker-config refused unable to configure the Docker daemon with file x: y\n"
+        );
+    }
+
     #[test]
     fn streams_answer_in_one_line() {
         let line = super::streams_line(|route| match route {

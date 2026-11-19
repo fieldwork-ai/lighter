@@ -238,6 +238,26 @@ pub fn machine() -> anyhow::Result<()> {
             }
         }
     }
+    // The user's Docker settings (`docker_settings`): their folder, shared
+    // read-only, when the file is there and parses; init hands it to dockerd.
+    // What it was at this start is kept, for `doctor` to say when it changes.
+    let _ = std::fs::remove_file(crate::docker_settings::stamp_file(&home));
+    match crate::docker_settings::local(&home) {
+        crate::docker_settings::Local::Valid => {
+            shares.push(Share {
+                tag: crate::docker_settings::TAG.to_string(),
+                path: crate::docker_settings::dir(&home),
+            });
+            cmdline.push_str(" lighter.docker_config");
+            if let Some(stamp) = crate::docker_settings::stamp(&home) {
+                let _ = std::fs::write(crate::docker_settings::stamp_file(&home), stamp);
+            }
+        }
+        crate::docker_settings::Local::Invalid(why) => {
+            tracing::warn!(%why, "the Docker settings file is not valid JSON; Docker starts without it")
+        }
+        crate::docker_settings::Local::Absent => {}
+    }
     // The kernel join of a stream's two sockets: on unless `LIGHTER_SOCKMAP=0`,
     // which keeps the agent's copying path measurable.
     if std::env::var("LIGHTER_SOCKMAP")

@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 
 use crate::paths;
 
+#[derive(Debug)]
 pub struct Finding {
     pub ok: bool,
     pub what: String,
@@ -22,7 +23,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn good(what: &str, detail: impl Into<String>) -> Finding {
+    pub(crate) fn good(what: &str, detail: impl Into<String>) -> Finding {
         Finding {
             ok: true,
             what: what.into(),
@@ -44,7 +45,7 @@ impl Finding {
     /// Something the user should fix that nothing here can refuse to run
     /// over: a permission that macOS grants only to a machine that is
     /// running and has asked, for one.
-    fn warn(what: &str, detail: impl Into<String>, remedy: &str) -> Finding {
+    pub(crate) fn warn(what: &str, detail: impl Into<String>, remedy: &str) -> Finding {
         Finding {
             ok: true,
             what: what.into(),
@@ -371,6 +372,10 @@ pub fn run() -> Vec<Finding> {
             ));
         }
         findings.extend(published_ports(&report.unforwarded));
+        let applied = crate::machine::control("docker-config")
+            .ok()
+            .and_then(|reply| crate::docker_settings::InGuest::parse(&reply));
+        findings.extend(crate::docker_settings::finding(&home, applied));
         if crate::helper::old_installed() {
             findings.push(Finding::warn(
                 "helper",

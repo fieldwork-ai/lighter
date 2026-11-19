@@ -16,6 +16,7 @@ mod ane_host;
 mod bundle;
 mod config;
 mod context;
+mod docker_settings;
 mod doctor;
 mod helper;
 mod installation;
@@ -530,6 +531,19 @@ fn start(timeout: Duration) -> anyhow::Result<std::process::ExitCode> {
     let socket = paths::docker_socket()?;
     let version = machine::docker_version(&socket)?;
     outln!("Docker {version}");
+    // The user's Docker settings: said when they apply, and loudly when
+    // Docker could not take them, since it then runs without them.
+    let home = paths::home()?;
+    let applied = machine::control("docker-config")
+        .ok()
+        .and_then(|reply| docker_settings::InGuest::parse(&reply));
+    if let Some(finding) = docker_settings::finding(&home, applied) {
+        if finding.warn {
+            eprint!("{}", doctor::report(&[finding]));
+        } else {
+            outln!("Docker settings {}", finding.detail);
+        }
+    }
     if paths::is_default_home() && docker_available {
         context::install(&socket, &paths::previous_context()?)?;
         outln!("Running as pid {pid}; the docker CLI now points at it.");
